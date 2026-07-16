@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
+  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunOutput, RunStatus, SampleResult,
 } from '../types/api'
@@ -202,6 +202,8 @@ export const api = {
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
+  saveTableEdit: (id: string, edit: CatalogEdit) =>
+    req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/edit`, { method: 'PUT', body: JSON.stringify(edit) }),
   unregisterTable: (id: string) => req<{ ok: boolean }>(`/catalog/tables/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   unregisterTables: (ids: string[]) =>
     req<{ deleted: string[]; missing: string[] }>('/catalog/tables/delete', { method: 'POST', body: JSON.stringify({ ids }) }),

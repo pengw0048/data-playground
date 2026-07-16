@@ -1109,4 +1109,60 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
   })
+
+  test('catalog edits retain drafts on conflict and protect dirty dismissal', async ({ page }) => {
+    const filename = `atomic-catalog-${Date.now()}.csv`
+    const uploaded = await page.request.post('/api/catalog/upload', {
+      headers: { 'X-Upload-Filename': filename, 'Content-Type': 'text/csv' },
+      data: 'id,value\n1,alpha\n2,beta\n',
+    })
+    expect(uploaded.ok()).toBeTruthy()
+    const created = await uploaded.json()
+    const current = await page.request.get(`/api/catalog/tables/${encodeURIComponent(created.id)}`)
+    expect(current.ok()).toBeTruthy()
+    const original = await current.json()
+    try {
+      await page.goto('/#/files')
+      await page.getByTestId('rail-tables').click()
+      await openCatalogTable(page, original.name)
+
+      await page.getByTestId('detail-name').fill('my staged catalog edit')
+      await page.getByTestId('detail-pk-id').click()
+      const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {
+        data: {
+          expectedRevision: original.metadataRevision,
+          name: original.name,
+          folder: original.folder ?? '',
+          tags: original.tags ?? [],
+          owner: original.owner ?? null,
+          description: 'saved by another editor',
+          declaredKey: [],
+        },
+      })
+      expect(concurrent.ok(), await concurrent.text()).toBeTruthy()
+
+      await page.getByTestId('detail-save').click()
+      await expect(page.getByText('Another editor saved changes first.')).toBeVisible()
+      await expect(page.getByTestId('detail-name')).toHaveValue('my staged catalog edit')
+      await page.getByRole('button', { name: 'Reapply', exact: true }).click()
+      await expect(page.getByText('Unsaved changes')).toHaveCount(0)
+
+      await page.getByTestId('detail-name').fill('dirty draft')
+      page.once('dialog', async (dialog) => {
+        expect(dialog.message()).toBe('Discard unsaved catalog edits?')
+        await dialog.dismiss()
+      })
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toBeVisible()
+
+      const saved = await page.request.get(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+      expect(saved.ok()).toBeTruthy()
+      const body = await saved.json()
+      expect(body.name).toBe('my staged catalog edit')
+      expect(body.keys.some((key: { confidence: string; columns: string[] }) =>
+        key.confidence === 'declared' && key.columns.join(',') === 'id')).toBeTruthy()
+    } finally {
+      await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+    }
+  })
 })

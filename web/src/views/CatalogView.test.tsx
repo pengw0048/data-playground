@@ -6,14 +6,17 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
-  setTableMetadata: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
+  setTableMetadata: vi.fn(), saveTableEdit: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
   catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
 }))
-vi.mock('../api/client', () => ({ api: mocks }))
+vi.mock('../api/client', () => ({
+  api: mocks,
+  KernelError: class KernelError extends Error { status = 0 },
+}))
 
 const store = vi.hoisted(() => ({
   addToCanvas: vi.fn(), rememberTables: vi.fn(), uploadDataset: vi.fn(), pushToast: vi.fn(),
-  kernelInfo: { capabilities: ['catalog.folder_mutation'] },  // folder mutation UI is capability-gated
+  kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] },  // catalog mutation UI is capability-gated
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
@@ -32,6 +35,7 @@ import { CatalogView } from './CatalogView'
 
 const TABLE: CatalogTable = {
   id: 't1', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
+  metadataRevision: 'm1_orders',
   columns: [{ name: 'order_id', type: 'int', capabilities: ['key'] }],
 }
 const TABLE_2: CatalogTable = {
@@ -65,6 +69,7 @@ describe('CatalogView request and mutation truth', () => {
     })
     mocks.table.mockResolvedValue(TABLE)
     mocks.setTableMetadata.mockResolvedValue(TABLE)
+    mocks.saveTableEdit.mockResolvedValue({ ...TABLE, metadataRevision: 'm1_test' })
     mocks.unregisterTable.mockResolvedValue({ ok: true })
     mocks.catalogFolders.mockResolvedValue([])
     mocks.createFolder.mockResolvedValue({ path: 'archive' })
@@ -147,7 +152,7 @@ describe('CatalogView request and mutation truth', () => {
         hasMore: true, truncated: true, completeness: 'page',
         notPreviewable: false, wire: 'dataset',
       })
-    mocks.setTableMetadata
+    mocks.saveTableEdit
       .mockRejectedValueOnce(new Error('HTTP 409: concurrent edit'))
       .mockResolvedValueOnce({ ...TABLE, folder: 'curated/sales' })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
@@ -230,7 +235,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [], tables: [] })
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
-    mocks.setTableMetadata.mockResolvedValue(TABLE)
+    mocks.saveTableEdit.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
     mocks.registerDataset.mockResolvedValue(TABLE)
     mocks.catalogFolders.mockResolvedValue([])
@@ -265,8 +270,46 @@ describe('CatalogView selection, register modal, and rename', () => {
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'daily orders' } })
     fireEvent.click(screen.getByTestId('detail-save'))
-    await waitFor(() => expect(mocks.setTableMetadata).toHaveBeenCalledWith('t1',
+    await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenCalledWith('t1',
       expect.objectContaining({ name: 'daily orders' })))
+  })
+
+  it('stages keys with metadata and offers reload or reapply after a conflict', async () => {
+    const conflict = Object.assign(new Error('catalog metadata changed'), { status: 409 })
+    mocks.saveTableEdit.mockRejectedValueOnce(conflict).mockResolvedValueOnce({ ...TABLE, name: 'reapplied', metadataRevision: 'm1_new' })
+    mocks.table.mockResolvedValue({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'reapplied' } })
+    fireEvent.click(screen.getByTestId('detail-pk-order_id'))
+    fireEvent.click(screen.getByTestId('detail-save'))
+    expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Reapply'))
+    await waitFor(() => expect(mocks.saveTableEdit).toHaveBeenLastCalledWith('t1', expect.objectContaining({
+      expectedRevision: 'm1_other', name: 'reapplied', declaredKey: ['order_id'],
+    })))
+  })
+
+  it('keeps recovery available when conflict refresh fails and protects Escape dismissal', async () => {
+    const conflict = Object.assign(new Error('catalog metadata changed'), { status: 409 })
+    mocks.saveTableEdit.mockRejectedValueOnce(conflict)
+    mocks.table.mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    render(<CatalogView />)
+    fireEvent.click(await screen.findByText('orders'))
+    fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(confirm).toHaveBeenCalledWith('Discard unsaved catalog edits?')
+    expect(screen.getByRole('dialog', { name: 'orders' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('detail-save'))
+    expect(await screen.findByText('Another editor saved changes first.')).toBeInTheDocument()
+    expect(screen.getByText('Reload')).toBeInTheDocument()
+    expect(screen.queryByText('Reapply')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText('Reload'))
+    await waitFor(() => expect(screen.getByTestId('detail-name')).toHaveValue('other editor'))
   })
 
   it('creates an empty folder from the tree', async () => {
@@ -324,7 +367,7 @@ describe('CatalogView folder child request identity', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     vi.clearAllMocks()
-    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] }
     mocks.tablesPage.mockResolvedValue({ items: [], total: 0, hasMore: false })
     mocks.facets.mockResolvedValue({ folders: [], tags: [], owners: [] })
     mocks.searchCatalog.mockResolvedValue([])
@@ -478,7 +521,7 @@ describe('CatalogView folder child request identity', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(oldSignal).toBeDefined())
-    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] }
     view.rerender(<CatalogView />)
 
     await waitFor(() => expect(oldSignal?.aborted).toBe(true))
@@ -512,7 +555,7 @@ describe('CatalogView folder child request identity', () => {
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledWith('A', expect.anything()))
 
     blockCommit = true
-    store.kernelInfo = { capabilities: ['catalog.folder_mutation'] }
+    store.kernelInfo = { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] }
     await act(async () => {
       startTransition(() => view.rerender(<Shell version={1} />))
     })

@@ -176,6 +176,74 @@
         "title": "CatalogBrowse",
         "type": "object"
       },
+      "CatalogEdit": {
+        "description": "One complete staged built-in catalog edit, guarded by its read revision.",
+        "properties": {
+          "declaredKey": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Declaredkey",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expectedRevision": {
+            "title": "Expectedrevision",
+            "type": "string"
+          },
+          "folder": {
+            "default": "",
+            "title": "Folder",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
+          "tags": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "title": "CatalogEdit",
+        "type": "object"
+      },
       "CatalogFolder": {
         "description": "A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY\nfolder exist and be renamed/deleted, so a folder can be created up front and filled later.",
         "properties": {
@@ -338,6 +406,17 @@
               }
             ],
             "title": "Meta"
+          },
+          "metadataRevision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadatarevision"
           },
           "missing": {
             "default": false,
@@ -7164,6 +7243,98 @@
           }
         },
         "summary": "Get Table"
+      }
+    },
+    "/api/catalog/tables/{table_id}/edit": {
+      "put": {
+        "description": "Atomically save a staged built-in table edit, guarded by its opaque CAS revision.\n\nThis route intentionally does not extend the external CatalogProvider SPI. A provider that does\nnot ship the same built-in implementation is truthful rather than accepting two separate writes.",
+        "operationId": "save_table_edit_api_catalog_tables__table_id__edit_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogEdit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogTable"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Save Table Edit"
       }
     },
     "/api/catalog/tables/{table_id}/key": {
