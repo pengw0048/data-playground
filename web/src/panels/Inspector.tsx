@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { previewPlanIdentity, useStore, nodeRunnable, roleCanEdit } from '../store/graph'
-import { getSpec } from '../nodes/registry'
+import {
+  fullRunUnavailableReason, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit,
+} from '../store/graph'
+import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
 import { useSchemaWarnings } from '../nodes/fields'
 import { codeHash } from '../nodes/schema'
@@ -29,6 +31,11 @@ const BUILTIN_KINDS = new Set([
 // any non-built-in kind is contract-capable as well. Relational/io/annotation nodes are always typed.
 const CONTRACT_KINDS = new Set(['transform', 'vector-search'])
 export const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
+export const canDeclareNodeSchema = (kind: string, outputCount: number) => (
+  canDeclareSchemaKind(kind)
+  && !['source', 'write', 'note', 'section'].includes(kind)
+  && outputCount === 1
+)
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
 // generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
@@ -93,10 +100,14 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const codeParams = (bspec?.params ?? []).filter((p) => p.type === 'code')
   const cfg = node.data.config as Record<string, unknown>
   const invalid = nodeInvalidReason(node)
+  const outputPorts = nodeOutputs(node)
+  const fullRunUnavailable = fullRunUnavailableReason(useStore.getState().doc, nodeId)
 
   // a code op / plugin kind can carry a declared/inferred schema contract; relational ops are always
   // statically typed, and source/write/note/section are handled elsewhere.
-  const canDeclareSchema = canDeclareSchemaKind(kind) && !['source', 'write', 'note', 'section'].includes(kind)
+  const schemaCapableKind = canDeclareSchemaKind(kind) && !['source', 'write', 'note', 'section'].includes(kind)
+  const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
+  const perPortSchemaDeferred = schemaCapableKind && outputPorts.length > 1
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
   // server-resolved schema — but only for a contract-capable, non-bypassed node (a bypassed node passes
   // its input through, so its declaration doesn't describe its output). null = untyped, undefined = unknown.
@@ -191,11 +202,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       <Section title="Ports">
         <div className="flex flex-col gap-1 text-[11.5px] text-muted-foreground">
           {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} schema={inputSchemaFor(p.id)} />)}
-          {(spec?.outputs ?? []).map((p, i) => (
+          {outputPorts.map((p, i) => (
             <PortRow key={`out-${p.id}`} dir="out" name={portName(p)} wire={p.wire}
-              schema={i === 0 ? (outSchema === undefined ? undefined : outSchema) : undefined} />
+              schema={outputPorts.length === 1 && i === 0
+                ? (outSchema === undefined ? undefined : outSchema) : undefined} />
           ))}
-          {(spec?.inputs ?? []).length === 0 && (spec?.outputs ?? []).length === 0 && <span>—</span>}
+          {(spec?.inputs ?? []).length === 0 && outputPorts.length === 0 && <span>—</span>}
         </div>
         {/* editable output ports: only on the section (its driver script emit()s to named ports) —
             fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
@@ -205,10 +217,23 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
           user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
       {canDeclareSchema && <EditOnly enabled={canEdit}><SchemaContract nodeId={nodeId} runnable={runnable && !invalid} /></EditOnly>}
+      {perPortSchemaDeferred && (
+        <Section title="Output schema (contract)">
+          <div className="text-[11px] leading-relaxed text-muted-foreground">
+            This node has multiple named outputs. Node-wide schema contracts are unavailable because
+            they would assign one schema to every port; per-port schema contracts are deferred.
+          </div>
+        </Section>
+      )}
 
       {/* actions */}
       <Section title="Actions">
         {invalid && <div className="mb-1.5 text-[11px] text-amber-700">⚠ {invalid}</div>}
+        {fullRunUnavailable && (
+          <div className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">
+            {fullRunUnavailable}
+          </div>
+        )}
         {!invalid && warnings.map((w, i) => (
           <div key={i} className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">⚠ {w} — not found in the input schema</div>
         ))}
@@ -216,7 +241,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid || !!fullRunUnavailable) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />
@@ -231,26 +256,72 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 
 // Add / rename / remove a section's named output ports (config.outputs). The store drops edges
 // leaving a port that no longer exists, so a rename/remove can't strand an invisible wire.
+function outputPortError(outputs: string[]): string | undefined {
+  if (outputs.length > 64) return 'A Section can declare at most 64 output ports.'
+  for (const [index, output] of outputs.entries()) {
+    if (!output) return `Output port ${index + 1} cannot be empty.`
+    if (output.length > 128) return `Output port ${index + 1} must be 128 characters or fewer.`
+    if (output.trim() !== output) return `Output port ${index + 1} cannot contain surrounding whitespace.`
+    if (outputs.indexOf(output) !== index) return `Output port “${output}” is duplicated. Port IDs must be unique.`
+  }
+  return undefined
+}
+
+function nextOutputPortId(outputs: string[]): string {
+  const used = new Set(outputs)
+  let suffix = Math.max(2, outputs.length + 1)
+  while (used.has(`out${suffix}`)) suffix += 1
+  return `out${suffix}`
+}
+
 function OutputPortsEditor({ nodeId }: { nodeId: string }) {
   // select the stored value (stable ref) — NOT a freshly-built array, which would loop forever
   const raw = useStore((s) => (s.doc.nodes.find((n) => n.id === nodeId)?.data.config as { outputs?: unknown } | undefined)?.outputs)
-  const outputs = Array.isArray(raw) && raw.length ? raw.map(String) : ['out']
+  const storedOutputs = Array.isArray(raw) && raw.length ? raw.map(String) : ['out']
+  const storedSignature = JSON.stringify(storedOutputs)
+  const [draft, setDraft] = useState(storedOutputs)
+  const [validationError, setValidationError] = useState(() => outputPortError(storedOutputs))
   const updateConfig = useStore((s) => s.updateConfig)
-  const commit = (next: string[]) => updateConfig(nodeId, { outputs: next })
+  useEffect(() => {
+    setDraft(storedOutputs)
+    setValidationError(outputPortError(storedOutputs))
+    // The serialized value is the stable dependency; storedOutputs is rebuilt by the selector render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, storedSignature])
+
+  const edit = (next: string[]) => {
+    setDraft(next)
+    setValidationError(outputPortError(next))
+  }
+  const commit = (next: string[]) => {
+    const error = outputPortError(next)
+    setDraft(next)
+    setValidationError(error)
+    if (error) return
+    if (JSON.stringify(next) !== storedSignature) updateConfig(nodeId, { outputs: next })
+  }
   return (
     <div className="mt-2 flex flex-col gap-1">
       <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground">OUTPUT PORTS (emit)</Label>
-      {outputs.map((name, i) => (
+      {draft.map((name, i) => (
         <div key={i} className="flex items-center gap-1">
-          <Input value={name} onChange={(e) => commit(outputs.map((x, j) => (j === i ? e.target.value.replace(/\s+/g, '_') : x)))}
+          <Input value={name} aria-invalid={validationError ? true : undefined}
+            onChange={(e) => edit(draft.map((x, j) => (j === i ? e.target.value.replace(/\s+/g, '_') : x)))}
+            onBlur={() => commit(draft)}
+            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur() } }}
             className={cn(miniInputClass, 'dp-mono flex-1 text-[11px] md:text-[11px]')} />
-          {outputs.length > 1 && (
-            <Button variant="ghost" size="icon" onClick={() => commit(outputs.filter((_, j) => j !== i))} title="Remove port"
+          {draft.length > 1 && (
+            <Button variant="ghost" size="icon" onClick={() => commit(draft.filter((_, j) => j !== i))} title="Remove port"
               className="h-5 w-5 flex-none text-muted-foreground [&_svg]:size-3"><Icon name="close" size={11} /></Button>
           )}
         </div>
       ))}
-      <Button variant="outline" size="sm" onClick={() => commit([...outputs, `out${outputs.length + 1}`])}
+      {validationError && <div role="alert" className="text-[10.5px] leading-snug text-destructive">{validationError}</div>}
+      {!validationError && draft.length === 64 && (
+        <div role="status" className="text-[10.5px] leading-snug text-muted-foreground">Maximum 64 output ports reached.</div>
+      )}
+      <Button variant="outline" size="sm" disabled={draft.length >= 64 || !!validationError}
+        onClick={() => commit([...draft, nextOutputPortId(draft)])}
         className="h-auto gap-1 self-start border-dashed px-2 py-1 text-[10.5px] font-medium text-muted-foreground shadow-none [&_svg]:size-3">
         <Icon name="plus" size={11} /> add port
       </Button>

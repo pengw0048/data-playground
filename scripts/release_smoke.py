@@ -215,9 +215,22 @@ def run_purchases_smoke(base: str) -> dict[str, Any]:
             f"(seeded purchases-per-user should yield one row per user_id)"
         )
 
-    uri = status_body.get("outputUri")
-    if not uri:
-        raise SmokeError(f"run {run_id} done but missing outputUri: {status_body}")
+    outputs = status_body.get("outputs")
+    if not isinstance(outputs, list) or len(outputs) != 1:
+        raise SmokeError(f"run {run_id} done without exactly one named output: {status_body}")
+    output = outputs[0]
+    if not isinstance(output, dict):
+        raise SmokeError(f"run {run_id} returned an invalid named output: {output!r}")
+    if (output.get("nodeId"), output.get("portId"), output.get("publicationKind"),
+            output.get("outcome")) != ("agg", "out", "result", "committed"):
+        raise SmokeError(f"run {run_id} returned an unexpected named-output contract: {output}")
+    uri = output.get("uri")
+    if not isinstance(uri, str) or not uri:
+        raise SmokeError(f"run {run_id} committed output has no URI: {output}")
+    if output.get("rows") != total:
+        raise SmokeError(
+            f"run output rows {output.get('rows')!r} != run totalRows {total}"
+        )
     _, sample = _request(base, "POST", "/api/data/sample", {"uri": uri, "k": 50})
     if not isinstance(sample, dict):
         raise SmokeError(f"/api/data/sample returned {sample!r}")
@@ -229,7 +242,7 @@ def run_purchases_smoke(base: str) -> dict[str, Any]:
         raise SmokeError(
             f"sample rowCount {sample.get('rowCount')!r} != run totalRows {total}"
         )
-    return {"runId": run_id, "totalRows": total, "outputUri": uri}
+    return {"runId": run_id, "totalRows": total, "output": output}
 
 
 def main(argv: list[str] | None = None) -> int:

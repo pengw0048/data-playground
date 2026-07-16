@@ -82,6 +82,9 @@ from hub.models import (CatalogPublicationReceipt, PerNodeStatus, ResourceSpec, 
                         RunStatus, WorkerInfo)
 from hub.placement import node_requires, satisfies
 from hub.process_scope import OwnedProcessScope, owned_process_popen_kwargs
+from hub.run_outputs import (commit_output, effective_run_target, initialize_run_outputs,
+                             preflight_run_output_target, require_single_run_output,
+                             settle_uncommitted_outputs, sole_output)
 from hub.sqlpolicy import (
     FragmentKind,
     SQLPolicyError,
@@ -1038,6 +1041,9 @@ class RayRunner:
         self.on_status = getattr(self.base, "on_status", None)
         self.on_complete = getattr(self.base, "on_complete", None)
         self.runs: dict[str, RunStatus] = {}
+        # Supervisors retain mutable owners in ``runs``. Public reads use validated snapshots that are
+        # replaced atomically only after one coherent status transition has been assembled.
+        self._published_statuses: dict[str, RunStatus] = {}
         self._cancel: dict[str, threading.Event] = {}
         self._cancel_ack: set[str] = set()
         # A driver whose OS process group cannot yet be fenced must remain non-terminal. Keep every
@@ -1150,14 +1156,16 @@ class RayRunner:
             return False
         with self._lock:
             self._recovery_blocked.discard(run_id)
-            self._settled.setdefault(run_id, threading.Event()).set()
+            settled = self._settled.setdefault(run_id, threading.Event())
             supervising = run_id in self._supervising
+        self._publish_status_snapshot(status, settle_event=settled)
         if not supervising:
-            self._prune_terminal_runs()
+            self._prune_terminal_runs(preserve_run_id=run_id)
         return True
 
     def status(self, run_id: str) -> RunStatus:
-        st = self.runs.get(run_id)
+        with self._lock:
+            st = self.runs.get(run_id)
         if st is None:
             st = self._reattach_job(run_id)
         if st is None:
@@ -1168,15 +1176,17 @@ class RayRunner:
         if (st.status in ("queued", "running") and ref and ref.backend == _JOBS_BACKEND
                 and run_id not in self._recovery_blocked):
             # Terminal publication commits the canonical SQL status before the winning supervisor copies
-            # it into this process-local object. Read that fence before deciding the run still needs a
-            # supervisor so a status poll cannot expose stale live state or restart settled work.
+            # it into this process-local object and snapshot. Read that fence before deciding the run
+            # still needs a supervisor so a status poll cannot expose stale live state or restart settled
+            # work.
             self._refresh_durable_terminal(st)
             if st.status in ("queued", "running"):
                 self._ensure_jobs_supervisor(run_id)
-        return st
+        return self._status_snapshot(run_id)
 
-    def cancel(self, run_id: str) -> RunStatus:
-        st = self.runs.get(run_id)
+    def cancel(self, run_id: str) -> RunStatus | None:
+        with self._lock:
+            st = self.runs.get(run_id)
         if st and run_id in self._recovery_blocked:
             self._refresh_durable_terminal(st)
         ref = getattr(st, "backend_ref", None) if st else None
@@ -1185,22 +1195,23 @@ class RayRunner:
 
             if not metadb.request_backend_cancel(run_id):
                 self._refresh_durable_terminal(st)
-                return self.runs.get(run_id, st)
+                return self._status_snapshot_or_none(run_id)
             if self._refresh_durable_terminal(st):
-                return st
+                return self._status_snapshot(run_id)
             if run_id in self._cancel:
                 self._cancel[run_id].set()
             suffix = "cancellation recorded; repair the malformed durable binding before remote stop can resume"
             if suffix not in (st.error or ""):
                 st.error = f"{st.error}; {suffix}" if st.error else suffix
                 metadb.save_run_state(run_id, st.model_dump())
+                self._publish_status_snapshot(st)
             self._refresh_durable_terminal(st)
-            return st
+            return self._status_snapshot(run_id)
         if st and ref and ref.backend == _JOBS_BACKEND and st.status in ("queued", "running"):
             from hub import metadb
             if not metadb.request_backend_cancel(run_id):
                 self._refresh_durable_terminal(st)
-                return self.runs.get(run_id, st)
+                return self._status_snapshot_or_none(run_id)
             ev = self._cancel.get(run_id)
             if ev:
                 ev.set()
@@ -1213,14 +1224,15 @@ class RayRunner:
                 current = self.runs.get(run_id, st)
                 if not acknowledged and current.status in ("queued", "running"):
                     if self._refresh_durable_terminal(current):
-                        return current
+                        return self._status_snapshot(run_id)
                     # Do not make the synchronous API response depend on the supervisor winning a polling
                     # boundary race. The supervisor persists the same diagnostic and keeps reattaching.
                     current.error = self._cancel_timeout_error()
                     metadb.save_run_state(current.run_id, current.model_dump())
+                    self._publish_status_snapshot(current)
                     self._refresh_durable_terminal(current)
-                return current
-            return self.runs.get(run_id, st)
+                return self._status_snapshot(run_id)
+            return self._status_snapshot(run_id)
         if st and st.status in ("queued", "running"):
             ev = self._cancel.get(run_id)
             if ev:
@@ -1228,7 +1240,7 @@ class RayRunner:
             # Cancellation is only a request here.  A clean terminal `done` receipt may already have
             # crossed the data commit point, and an unreaped driver may still publish.  The supervisor
             # arbitrates that race after wait() proves the driver stopped.
-        return st
+        return self._status_snapshot_or_none(run_id)
 
     def cancel_acknowledged(self, run_id: str) -> bool:
         st = self.runs.get(run_id)
@@ -1845,8 +1857,10 @@ class RayRunner:
 
     def _install_jobs_status(self, status: RunStatus, binding: dict | None = None) -> None:
         run_id = status.run_id
+        snapshot = RunStatus.model_validate(status.model_dump())
         with self._lock:
             self.runs[run_id] = status
+            self._published_statuses[run_id] = snapshot
             self._cancel.setdefault(run_id, threading.Event())
             self._settled.setdefault(run_id, threading.Event())
             if binding:
@@ -1860,21 +1874,28 @@ class RayRunner:
         if hasattr(self.deps, "run_index"):
             self.deps.run_index[run_id] = self
         if status.status in ("done", "failed", "cancelled"):
-            self._prune_terminal_runs()
+            self._prune_terminal_runs(preserve_run_id=run_id)
 
-    def _prune_terminal_runs(self) -> None:
+    def _prune_terminal_runs(self, *, preserve_run_id: str | None = None) -> None:
         from hub.plugins.runner import _MAX_RUNS
 
         terminal = {"done", "failed", "cancelled"}
         with self._lock:
-            for run_id, status in list(self.runs.items()):
-                if status.status in terminal:
+            for run_id in list(self.runs):
+                if ((published := self._published_statuses.get(run_id)) is not None
+                        and published.status in terminal):
                     self._cancel.pop(run_id, None)
             while len(self.runs) > _MAX_RUNS:
-                victim = next((rid for rid, status in self.runs.items() if status.status in terminal), None)
+                victim = next((
+                    rid for rid in self.runs
+                    if rid != preserve_run_id
+                    and (published := self._published_statuses.get(rid)) is not None
+                    and published.status in terminal
+                ), None)
                 if victim is None:
                     break
                 self.runs.pop(victim, None)
+                self._published_statuses.pop(victim, None)
                 self._cancel.pop(victim, None)
                 self._settled.pop(victim, None)
                 self._backend_refs.pop(victim, None)
@@ -1907,6 +1928,7 @@ class RayRunner:
                     metadb.save_run_state(run_id, status.model_dump())
                 except Exception:  # the next status/recovery pass still retries process-locally
                     pass
+                self._publish_status_snapshot(status)
             return False
 
     def _recover_jobs(self) -> None:
@@ -1990,6 +2012,8 @@ class RayRunner:
                     continue
                 with self._lock:
                     self.runs[run_id] = blocked
+                    self._published_statuses[run_id] = RunStatus.model_validate(
+                        blocked.model_dump())
                     self._backend_refs[run_id] = dict(ref)
                     self._cancel.setdefault(run_id, threading.Event())
                     if ref.get("cancel_requested"):
@@ -2087,6 +2111,7 @@ class RayRunner:
         requirement fails before dispatch."""
         from hub import compiler
         from hub.backends import require_destination_credential_support
+        expected_output = require_single_run_output(graph, output_node, self.node_specs)
         plan = compiler.compile_plan(
             graph, output_node, self.deps.registry, self.node_specs, self.deps.node_ir)
         require_destination_credential_support(
@@ -2097,14 +2122,19 @@ class RayRunner:
             )
         run_id = run_id or f"unit_{uuid.uuid4().hex}"
         ir = lower_to_ir(graph, output_node, self.node_specs, self.deps.node_ir)
-        status = RunStatus(run_id=run_id, status="queued", placement="distributed", target_node_id=output_node,
-                           per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)])
+        status = RunStatus(
+            run_id=run_id, status="queued", placement="distributed",
+            target_node_id=output_node,
+            per_node=[PerNodeStatus(node_id=output_node, status="queued", label=output_node)],
+            outputs=[expected_output],
+        )
         req = requires.model_dump() if hasattr(requires, "model_dump") else requires
         with self._lock:
             prior = self.runs.get(run_id)
             if prior is not None:
-                return prior  # one in-process owner for an explicit attempt ID
+                return self._published_statuses[run_id].model_copy(deep=True)
             self.runs[run_id] = status
+            self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
             self._cancel_ack.discard(run_id)
         reason = self._source_unsupported_reason(graph, output_node, ir)
         reason = reason or self._ray_unsupported_reason(ir)
@@ -2130,27 +2160,34 @@ class RayRunner:
             status.error = self._stable_exception(
                 "Object attempt allocation failed", e, "object_attempt_allocation_failed"
             )
+            settle_uncommitted_outputs(status, "failed", status.error)
             for item in status.per_node:
                 item.status = "failed"
-            return status
+            self._emit(graph, status)
+            return self._status_snapshot(run_id)
         committed = read_manifest(attempt_uri)
         if (committed is not None and committed.get("runId") == run_id
                 and validate_shards(attempt_uri, committed)
                 and self.base._output_exists(attempt_uri)):
-            status.status, status.output_uri = "done", attempt_uri
-            status.rows_processed = status.total_rows = int(committed["rows"])
+            status.status = "done"
+            status.rows_processed = int(committed["rows"])
+            commit_output(status, uri=attempt_uri, rows=status.rows_processed)
+            status.total_rows = status.rows_processed
             status.progress = 1.0
             for item in status.per_node:
                 item.status = "done"
-            return status
+            self._emit(graph, status)
+            return self._status_snapshot(run_id)
         if attempt_has_commit_record(attempt_uri) or attempt_has_contents(attempt_uri):
             status.status = "failed"
             status.error = (
                 "Ray attempt prefix already exists without an exact committed inventory; "
                 "refusing to overwrite an immutable or possibly live attempt")
+            settle_uncommitted_outputs(status, "failed", status.error)
             for item in status.per_node:
                 item.status = "failed"
-            return status
+            self._emit(graph, status)
+            return self._status_snapshot(run_id)
         if reason:
             return self._materialize_local(  # non-clean → local engine, same reserved status/attempt
                 graph, output_node, attempt_uri, run_id, status=status)
@@ -2161,7 +2198,7 @@ class RayRunner:
         # the atomic publication boundary; an interrupted attempt can leave only an unreferenced orphan.
         threading.Thread(target=self._supervise, args=(run_id, graph, output_node, status),
                          kwargs={"materialize_uri": attempt_uri, "requires": req}, daemon=True).start()
-        return status
+        return self._status_snapshot(run_id)
 
     def _materialize_local(self, graph, output_node, attempt_uri, run_id=None, status=None) -> RunStatus:
         """Non-clean region fallback under the same immutable handoff contract as distributed Ray.
@@ -2176,23 +2213,30 @@ class RayRunner:
         status = status or RunStatus(
             run_id=run_id, status="running", placement="local", target_node_id=output_node,
             per_node=[PerNodeStatus(node_id=output_node, status="running", label=output_node)])
+        if not status.outputs:
+            initialize_run_outputs(status, graph, output_node, self.node_specs)
         status.status, status.placement = "running", "local"
         for item in status.per_node:
             item.status = "running"
         with self._lock:
             self.runs.setdefault(run_id, status)
+            self._published_statuses.setdefault(
+                run_id, RunStatus.model_validate(status.model_dump()))
         owns_prefix = False
         try:
             committed = read_manifest(attempt_uri)
             if (committed is not None and committed.get("runId") == run_id
                     and validate_shards(attempt_uri, committed)
                     and self.base._output_exists(attempt_uri)):
-                status.status, status.output_uri = "done", attempt_uri
-                status.rows_processed = status.total_rows = int(committed["rows"])
+                status.status = "done"
+                status.rows_processed = int(committed["rows"])
+                commit_output(status, uri=attempt_uri, rows=status.rows_processed)
+                status.total_rows = status.rows_processed
                 status.progress = 1.0
                 for p in status.per_node:
                     p.status = "done"
-                return status
+                self._publish_status_snapshot(status)
+                return self._status_snapshot(run_id)
             if attempt_has_commit_record(attempt_uri) or attempt_has_contents(attempt_uri):
                 raise RuntimeError(
                     "attempt prefix already exists without an exact committed inventory; use a new run ID")
@@ -2214,8 +2258,10 @@ class RayRunner:
                     schema = list(zip(rel.columns, (str(t) for t in rel.types)))
                     write_manifest(
                         attempt_uri, run_id=run_id, rows=int(result.get("rows") or 0), schema=schema)
-            status.status, status.output_uri = "done", attempt_uri
-            status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+            status.status = "done"
+            status.rows_processed = int(result.get("rows") or 0)
+            commit_output(status, uri=attempt_uri, rows=status.rows_processed)
+            status.total_rows = status.rows_processed
             status.progress = 1.0
         except Exception as e:  # noqa: BLE001
             if owns_prefix:
@@ -2224,9 +2270,12 @@ class RayRunner:
             status.error = self._stable_exception(
                 "Ray local materialization failed", e, "local_materialization_failed"
             )
+            settle_uncommitted_outputs(status, "failed", status.error)
+            status.total_rows = None
         for p in status.per_node:
             p.status = status.status
-        return status
+        self._publish_status_snapshot(status)
+        return self._status_snapshot(run_id)
 
     def _ray_unsupported_reason(self, ir) -> str | None:
         policy_con = _secure_duckdb_connection()
@@ -2448,6 +2497,7 @@ class RayRunner:
 
     def _unsupported_status(self, graph, target, reason, *, run_id=None, plan=None) -> RunStatus:
         run_id = run_id or f"run_{uuid.uuid4().hex}"
+        output_target = effective_run_target(plan, target) if plan is not None else target
         per_node = ([PerNodeStatus(node_id=s.node_id, status="failed", label=s.label) for s in plan.steps]
                     if plan is not None else
                     [PerNodeStatus(node_id=target, status="failed", label=target)])
@@ -2455,10 +2505,12 @@ class RayRunner:
             run_id=run_id,
             status="failed",
             placement="distributed",
-            target_node_id=target,
+            target_node_id=output_target,
             per_node=per_node,
             error=f"Ray execution was explicitly required but is unsupported: {reason}",
         )
+        initialize_run_outputs(status, graph, output_target, self.node_specs)
+        settle_uncommitted_outputs(status, "failed", status.error)
         with self._lock:
             self.runs[run_id] = status
         self._emit(graph, status)
@@ -2467,7 +2519,7 @@ class RayRunner:
                 self.on_complete(graph, target, status)
             except Exception:  # noqa: BLE001
                 pass
-        return status
+        return self._status_snapshot(run_id)
 
     def _resolve_sink_targets(self, ir) -> dict[str, str]:
         """Resolve and validate logical sinks on the hub, before the isolated driver is dispatched."""
@@ -2664,6 +2716,11 @@ class RayRunner:
         from hub.placement import graph_requires
         from hub.backends import require_destination_credential_support
 
+        output_target = preflight_run_output_target(plan, target_node_id)
+        if output_target is not None:
+            # RayRunner is independently callable. Reject before credential resolution, IR lowering,
+            # sink preflight/attempt allocation, durable binding, or remote submission.
+            require_single_run_output(graph, output_target, self.node_specs)
         require_destination_credential_support(
             self, plan, graph, getattr(self.deps, "workspace", ""))
 
@@ -2678,6 +2735,34 @@ class RayRunner:
         requires = graph_requires(graph, self.node_specs, nodes=cone)
         reason = reason or self._gpu_type_conflict_reason(graph, cone)
         reason = reason or self._resource_unsupported_reason(requires, ir)
+        if output_target is None and not any(step.kind == "write" for step in plan.steps):
+            return self._unsupported_status(
+                graph, target_node_id,
+                "whole-graph execution has no publishable output target; select a single-output "
+                "node, add an explicit write sink, or run the selected target locally",
+                run_id=run_id, plan=plan,
+            )
+        non_catalog_result = (
+            output_target is not None
+            and g.node_map(graph)[output_target].type != "write"
+        )
+        if non_catalog_result:
+            raw_requires = (
+                requires.model_dump() if hasattr(requires, "model_dump") else (requires or {})
+            )
+            labels = raw_requires.get("labels") or {}
+            reason = (
+                "whole-graph non-write results are owned by the local backend; add an explicit "
+                "write sink for Ray execution or run this target locally"
+            )
+            if (self.jobs_address or labels
+                    or self._requires_ray(requires, graph, target_node_id)):
+                return self._unsupported_status(
+                    graph, target_node_id, reason,
+                    run_id=run_id, plan=plan,
+                )
+            return self.base.run(
+                plan, graph, target_node_id, placement, run_id=run_id)
         if reason and self._requires_ray(requires, graph, target_node_id):
             return self._unsupported_status(graph, target_node_id, reason, run_id=run_id, plan=plan)
         if reason:
@@ -2709,7 +2794,8 @@ class RayRunner:
         run_id = run_id or f"run_{uuid.uuid4().hex}"
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per_node,
-                           target_node_id=target_node_id)
+                           target_node_id=output_target)
+        initialize_run_outputs(status, graph, output_target, self.node_specs)
         if self.jobs_address:
             sink_attempts = self._claim_sink_attempts(
                 ir, sink_targets, run_id, require_live_preallocation=True
@@ -2727,6 +2813,7 @@ class RayRunner:
             )
         with self._lock:
             self.runs[run_id] = status
+            self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
             self._cancel[run_id] = threading.Event()
             self._cancel_ack.discard(run_id)
         self._emit(graph, status)
@@ -2748,7 +2835,7 @@ class RayRunner:
                     self.on_complete(graph, target_node_id, status)
                 except Exception:  # noqa: BLE001
                     pass
-            return status
+            return self._status_snapshot(run_id)
         # PROCESS ISOLATION: run Ray in a fresh subprocess (its main thread inits Ray BEFORE any DuckDB),
         # so the app's shared DuckDB connection never coexists with Ray in one process. The parent only
         # spawns + polls a status file (no DuckDB here), so it can't deadlock. (Ray inline in-process
@@ -2757,7 +2844,7 @@ class RayRunner:
                          kwargs={"requires": requires.model_dump(), "sink_targets": sink_targets,
                                  "sink_attempts": sink_attempts},
                          daemon=True).start()
-        return status
+        return self._status_snapshot(run_id)
 
     def _start_jobs(self, status: RunStatus, graph, target, *, sink_targets=None, sink_contracts=None,
                     source_attempts=None, materialize_uri=None, requires=None) -> RunStatus:
@@ -2793,14 +2880,41 @@ class RayRunner:
             # Persist backend_ref before the asynchronous submit. This is the restart handoff point.
             self._emit(graph, status)
             self._ensure_jobs_supervisor(status.run_id)
-        return status
+        return self._status_snapshot(status.run_id)
 
     def _emit(self, graph, status) -> None:
+        if status.status in ("failed", "cancelled"):
+            settle_uncommitted_outputs(
+                status, "cancelled" if status.status == "cancelled" else "failed",
+                status.error)
+            status.total_rows = None
+        snapshot = RunStatus.model_validate(status.model_dump())
         if self.on_status:
             try:
                 self.on_status(graph, status)
-            except Exception:  # noqa: BLE001 — never let persistence break a run
+            except Exception:  # noqa: BLE001 — persistence/recovery owns durable terminal guarantees
                 pass
+        self._publish_status_snapshot(status, snapshot=snapshot)
+
+    def _publish_status_snapshot(
+            self, status: RunStatus, *, snapshot: RunStatus | None = None,
+            settle_event: threading.Event | None = None) -> None:
+        """Publish one coherent observation without replacing the supervisor's mutable owner."""
+        snapshot = snapshot or RunStatus.model_validate(status.model_dump())
+        with self._lock:
+            if status.run_id in self.runs:
+                self._published_statuses[status.run_id] = snapshot
+            if settle_event is not None:
+                settle_event.set()
+
+    def _status_snapshot(self, run_id: str) -> RunStatus:
+        with self._lock:
+            return self._published_statuses[run_id].model_copy(deep=True)
+
+    def _status_snapshot_or_none(self, run_id: str) -> RunStatus | None:
+        with self._lock:
+            snapshot = self._published_statuses.get(run_id)
+            return snapshot.model_copy(deep=True) if snapshot is not None else None
 
     def _register_outputs(self, graph, result, job: dict | None = None, *,
                           expected_targets=None, expected_attempts=None) -> None:
@@ -3181,15 +3295,51 @@ class RayRunner:
         status.status = terminal
         if terminal == "done":
             status.progress, status.error = 1.0, None
+            # The compact fence deliberately has no retained artifact detail. Represent that honestly
+            # as a targetless terminal rather than pairing a successful target with a fabricated URI.
+            status.target_node_id = None
+            status.outputs = []
+            status.total_rows = None
         elif terminal == "cancelled":
             status.error = None
         else:
             status.error = "Run failed (code=terminal_details_pruned)"
         if terminal != "done":
-            status.output_uri = status.output_table = None
+            settle_uncommitted_outputs(
+                status, "cancelled" if terminal == "cancelled" else "failed",
+                status.error)
+            status.total_rows = None
         for node in status.per_node:
             node.status = "done" if terminal == "done" else terminal
         return True
+
+    @staticmethod
+    def _apply_public_result(status: RunStatus, result: dict) -> None:
+        """Map the private Ray v3 artifact into the public RunOutput collection.
+
+        The artifact's ``output_uri``/``output_table`` keys intentionally remain private version-3
+        fields. They never leak as top-level RunStatus fields.
+        """
+        status.rows_processed = int(result.get("rows") or 0)
+        if status.status == "done":
+            expected = sole_output(status)
+            if expected is None:
+                if status.target_node_id is not None:
+                    raise RuntimeError("successful Ray result has no expected public output")
+                status.total_rows = None
+                return
+            uri = result.get("output_uri")
+            if not uri:
+                raise RuntimeError("successful Ray result has no published output URI")
+            committed = commit_output(
+                status, uri=str(uri), table=result.get("output_table"),
+                rows=status.rows_processed)
+            status.total_rows = committed.rows
+            return
+        settle_uncommitted_outputs(
+            status, "cancelled" if status.status == "cancelled" else "failed",
+            status.error)
+        status.total_rows = None
 
     def _apply_job_result(self, status: RunStatus, result: dict, *, remote: bool = True) -> None:
         status.status = result["status"]
@@ -3198,8 +3348,7 @@ class RayRunner:
              else "Ray Jobs artifact rejected (code=artifact_contract_invalid)")
             if result.get("error") else None
         )
-        status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
-        status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+        self._apply_public_result(status, result)
         if status.status == "done":
             status.progress = 1.0
         for node in status.per_node:
@@ -3295,6 +3444,7 @@ class RayRunner:
                     time.sleep(self._jobs_poll_s)
                     continue
                 self._copy_status(status, RunStatus.model_validate(canonical["result"]))
+                self._publish_status_snapshot(status)
                 return
             if claim == "busy":
                 time.sleep(self._jobs_poll_s)
@@ -3383,6 +3533,7 @@ class RayRunner:
                             "catalog_publication_busy",
                         )
                         metadb.save_run_state(status.run_id, status.model_dump())
+                        self._publish_status_snapshot(status)
                         time.sleep(self._jobs_poll_s)
                         continue
                     except Exception as e:
@@ -3393,6 +3544,7 @@ class RayRunner:
                             "publication_preflight_unavailable",
                         )
                         metadb.save_run_state(status.run_id, status.model_dump())
+                        self._publish_status_snapshot(status)
                         time.sleep(self._jobs_poll_s)
                         continue
                     if stage == "quarantined":
@@ -3418,11 +3570,13 @@ class RayRunner:
                         "publication_effect_unavailable",
                     )
                     metadb.save_run_state(status.run_id, status.model_dump())
+                    self._publish_status_snapshot(status)
                     time.sleep(self._jobs_poll_s)
                     continue
                 if metadb.finish_backend_publication(
                         status.run_id, ref.attempt_id, owner, candidate.model_dump()):
                     self._copy_status(status, candidate)
+                    self._publish_status_snapshot(status)
                     telemetry_graph = None
                     try:
                         telemetry_graph = self._jobs_graph_from_durable_sql(ref, candidate)
@@ -3476,6 +3630,7 @@ class RayRunner:
                     if (winner.run_id == status.run_id
                             and winner.status in ("done", "failed", "cancelled")):
                         self._copy_status(status, winner)
+                        self._publish_status_snapshot(status)
                         return True
                 except (TypeError, ValueError):
                     pass
@@ -3496,6 +3651,7 @@ class RayRunner:
         if binding.get("submission_state") in _RESULT_RECONCILIATION_STATES:
             status.error = reason + "; waiting for durable result reconciliation"
             metadb.save_run_state(status.run_id, status.model_dump())
+            self._publish_status_snapshot(status)
             return False
         try:
             settled_result_fence = binding.get("submission_state") == "result_fenced"
@@ -3529,6 +3685,7 @@ class RayRunner:
                     if state is not None and state not in _JOB_TERMINAL:
                         status.error = reason + "; remote job quarantined, waiting for STOPPED"
                         metadb.save_run_state(status.run_id, status.model_dump())
+                        self._publish_status_snapshot(status)
                         return False
                 binding = self._refresh_jobs_binding(status.run_id)
                 if (state is None or state in _JOB_TERMINAL) and binding.get(
@@ -3542,6 +3699,7 @@ class RayRunner:
                 control_error, "quarantine_control_unavailable",
             )
             metadb.save_run_state(status.run_id, status.model_dump())
+            self._publish_status_snapshot(status)
             return False
 
         try:
@@ -3562,6 +3720,7 @@ class RayRunner:
 
         status.error = message
         metadb.save_run_state(status.run_id, status.model_dump())
+        self._publish_status_snapshot(status)
 
     def _note_jobs_control_observed(self, status: RunStatus, ref: RunBackendRef) -> None:
         """Advance durable liveness after a successful Jobs status/list observation, at bounded rate."""
@@ -4280,6 +4439,7 @@ class RayRunner:
                     status.status = visible
                     from hub import metadb
                     metadb.save_run_state(status.run_id, status.model_dump())
+                    self._publish_status_snapshot(status)
                     last_visible = visible
                 time.sleep(self._jobs_poll_s)
 
@@ -4339,10 +4499,12 @@ class RayRunner:
             )
         finally:
             if status.status in ("done", "failed", "cancelled"):
-                settled.set()
+                self._publish_status_snapshot(status, settle_event=settled)
+            else:
+                self._publish_status_snapshot(status)
             with self._lock:
                 self._supervising.discard(run_id)
-            self._prune_terminal_runs()
+            self._prune_terminal_runs(preserve_run_id=run_id)
             # Every non-terminal exit, including an early return after a transient quarantine/control
             # failure, must retain an autonomous supervisor. API status polling is not a liveness owner.
             if status.status in ("queued", "running"):
@@ -4420,7 +4582,8 @@ class RayRunner:
                            ]:
         """Parent side: spawn the isolated Ray driver, poll its status file, mirror the result. Touches
         NO DuckDB (only subprocess + files + the DB-backed on_status/on_complete hooks) → never deadlocks.
-        `materialize_uri` set = region mode (write target → that uri); else whole-graph mode (write node).
+        `materialize_uri` is the exact allocated handoff for a placed region; whole-graph runs publish
+        their declared write sink instead.
         `requires` = the region's resource need, forwarded to the driver → per-task Ray placement.
         `sink_targets` is the hub-resolved write-step-id → logical URI map; `sink_attempts` carries the
         exact parent-claimed physical URI for worker-direct sinks. Region mode omits both."""
@@ -4593,7 +4756,8 @@ class RayRunner:
                 if state.get("supervisor_error") and not cancel_requested:
                     status.status = "failed"
                     status.error = state["supervisor_error"]
-                    status.output_uri = status.output_table = None
+                    settle_uncommitted_outputs(status, "failed", status.error)
+                    status.total_rows = None
                 else:
                     self._settle_popen_result(
                         graph, status, state["result"], state["returncode"], **kwargs)
@@ -4649,7 +4813,7 @@ class RayRunner:
         if result and result.get("status") == "done" and returncode != 0:
             status.status = "failed"
             status.error = "Ray driver exited unsuccessfully after writing a terminal receipt"
-            status.output_uri = status.output_table = None
+            self._apply_public_result(status, {"status": "failed", "rows": 0})
             return
         # A clean done receipt wins a late cancellation because its data commit point has already
         # crossed. Without that receipt, a fenced driver's cancellation request wins over a crash or
@@ -4658,11 +4822,12 @@ class RayRunner:
                 result and result.get("status") == "done" and returncode == 0):
             status.status = "cancelled"
             status.error = None
-            status.output_uri = status.output_table = None
+            self._apply_public_result(status, {"status": "cancelled", "rows": 0})
             return
         if not (result and result.get("status") in ("done", "failed", "cancelled")):
             status.status = "failed"
             status.error = "Ray driver exited without a terminal status (code=driver_result_missing)"
+            self._apply_public_result(status, {"status": "failed", "rows": 0})
             return
         should_publish = (
             result["status"] == "done"
@@ -4690,11 +4855,7 @@ class RayRunner:
         # Local Popen driver shares the hub's host and trust boundary, so its failure text is surfaced
         # verbatim; only cross-boundary Jobs results are reduced to a stable code by _apply_job_result.
         status.error = shared_error or (str(result["error"]) if result.get("error") else None)
-        if status.status == "done":
-            status.output_uri, status.output_table = result.get("output_uri"), result.get("output_table")
-        else:
-            status.output_uri = status.output_table = None
-        status.rows_processed = status.total_rows = int(result.get("rows") or 0)
+        self._apply_public_result(status, result)
         if status.status == "done":
             status.progress = 1.0
 

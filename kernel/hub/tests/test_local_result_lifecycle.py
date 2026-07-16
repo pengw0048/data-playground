@@ -74,12 +74,26 @@ def _ready_result(storage: LocalStorage, run_id: str) -> str:
 
 
 def _done_doc(run_id: str, uri: str) -> dict:
-    return {
+    from hub.models import RunStatus
+    return RunStatus.model_validate({
         "run_id": run_id,
         "status": "done",
-        "output_uri": uri,
-        "output_table": None,
-    }
+        "target_node_id": "target",
+        "total_rows": 1,
+        "outputs": [{
+            "node_id": "target",
+            "port_id": "out",
+            "wire": "dataset",
+            "publication_kind": "result",
+            "outcome": "committed",
+            "uri": uri,
+            "rows": 1,
+        }],
+    }).model_dump()
+
+
+def _cache_doc(run_id: str, uri: str) -> dict:
+    return {"outputs": _done_doc(run_id, uri)["outputs"]}
 
 
 def _publish_run(storage: LocalStorage, run_id: str, uri: str) -> tuple[str, str, dict]:
@@ -142,7 +156,8 @@ def test_terminal_commit_then_raise_is_proved_by_exact_receipt(storage):
     )
     assert calls == 1
     assert storage.release_result(uri, run_id) is True
-    assert metadb.get_run_state(run_id) == doc
+    from hub.models import RunStatus
+    assert metadb.get_run_state(run_id) == RunStatus.model_validate(doc).model_dump()
 
     metadb.delete_canvas_cascade(canvas_id)
     storage.prune_results(limit=10)
@@ -748,7 +763,8 @@ def test_region_mixed_source_cap_fails_before_local_or_object_acquisition(
 @pytest.mark.parametrize("target_kind", ["reserved", "hardlink"])
 def test_subprocess_without_resolver_preflights_local_sink_namespace(
         storage, monkeypatch, tmp_path, target_kind):
-    from hub.models import CompilePlan, Graph, PlanStep
+    from hub.models import CompilePlan, Graph, PlanStep, RunStatus
+    from hub.run_outputs import require_single_run_output
     from hub.subprocess_runner import SubprocessRunner
 
     run_id = f"run-{uuid.uuid4().hex}"
@@ -777,9 +793,13 @@ def test_subprocess_without_resolver_preflights_local_sink_namespace(
         str(tmp_path), str(tmp_path), catalog=object(), storage=storage,
         resolve_adapter=None,
     )
+    status = RunStatus(
+        run_id=run_id, status="queued", target_node_id="write",
+        outputs=[require_single_run_output(graph, "write", runner.node_specs)],
+    )
     try:
         with pytest.raises(ValueError, match="reserved"):
-            runner._claim_sink_contracts(plan, graph, run_id)
+            runner._claim_sink_contracts(plan, graph, run_id, status)
     finally:
         if alias.exists():
             alias.unlink()
@@ -1005,7 +1025,7 @@ def test_primary_writer_run_must_publish_before_secondary_owners(storage):
     run_id = f"run-{uuid.uuid4().hex}"
     uri = _ready_result(storage, run_id)
     with pytest.raises(RuntimeError, match="exact writer run"):
-        metadb.put_result(f"early-cache-{uuid.uuid4().hex}", {"uri": uri})
+        metadb.put_result(f"early-cache-{uuid.uuid4().hex}", _cache_doc(run_id, uri))
 
     wrong_run = f"run-{uuid.uuid4().hex}"
     user_id, canvas_id = _create_canvas()
@@ -1020,7 +1040,7 @@ def test_primary_writer_run_must_publish_before_secondary_owners(storage):
     metadb.bind_run_owner(run_id, user_id, canvas_id)
     metadb.save_run_state(run_id, _done_doc(run_id, uri), canvas_id=canvas_id)
     assert storage.release_result(uri, run_id) is True
-    metadb.put_result(f"late-cache-{uuid.uuid4().hex}", {"uri": uri})
+    metadb.put_result(f"late-cache-{uuid.uuid4().hex}", _cache_doc(run_id, uri))
 
 
 def test_nested_section_sources_are_durable_owner_candidates(storage):
@@ -1100,7 +1120,7 @@ def test_section_runtime_cannot_override_lifecycle_owner_fields(
 
 def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit(
         storage, tmp_path):
-    from hub.models import Graph, RunStatus
+    from hub.models import Graph, GraphNode, RunOutput, RunStatus
     from hub.subprocess_runner import SubprocessRunner
 
     run_id = f"run-{uuid.uuid4().hex}"
@@ -1109,12 +1129,7 @@ def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit
     job_dir = tmp_path / "terminal-rejection"
     job_dir.mkdir()
     status_file = job_dir / "status.json"
-    status_file.write_text(json.dumps(RunStatus(
-        run_id="child",
-        status="done",
-        per_node=[],
-        output_uri=uri,
-    ).model_dump()))
+    status_file.write_text(json.dumps(_done_doc("child", uri)))
 
     class FinishedProcess:
         returncode = 0
@@ -1134,13 +1149,20 @@ def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit
         if status.status == "done":
             raise metadb.RunStatePublicationRejected("run owner was deleted")
 
-    graph = Graph(id="terminal-rejection", version=1, nodes=[], edges=[])
+    graph = Graph(
+        id="terminal-rejection", version=1,
+        nodes=[GraphNode(id="target", type="source")], edges=[])
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), storage=storage)
     runner.publication_retry_wait = lambda _delay: pytest.fail(
         "definitive owner rejection must not retry")
-    runner.on_status = reject_done
     runner.runs[run_id] = RunStatus(
-        run_id=run_id, status="running", placement="local", per_node=[])
+        run_id=run_id, status="running", placement="local", per_node=[],
+        target_node_id="target",
+        outputs=[RunOutput(
+            node_id="target", port_id="out", wire="dataset",
+            publication_kind="result", outcome="pending")])
+    runner._emit(graph, runner.runs[run_id])
+    runner.on_status = reject_done
     runner._local_results[run_id] = {
         "uri": uri,
         "cache_key": None,
@@ -1158,7 +1180,7 @@ def test_subprocess_terminal_owner_rejection_aborts_result_without_failed_reemit
 
     final = runner.status(run_id)
     assert final.status == "failed"
-    assert final.output_uri is None and final.output_table is None
+    assert all(output.uri is None and output.table is None for output in final.outputs)
     assert emitted == ["done"]
     assert _artifact(uri) is None and not pathlib.Path(uri).exists()
     assert run_id not in runner._local_results

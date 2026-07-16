@@ -85,6 +85,11 @@ capability.
 Placed-region output: workers write an immutable directory/prefix of Parquet shards;
 `_DP_SUCCESS.json` is written last.
 
+Whole-graph non-write target: Ray does not yet own a durable result-publication lifecycle. Automatic
+placement delegates this shape to the local backend; an explicit Ray/GPU/custom-resource pin or Ray
+Jobs configuration fails before allocation or submission. Add a write sink to publish through Ray, or
+run the selected node locally to receive a committed non-catalog `RunOutput`.
+
 Whole-graph unpartitioned Parquet overwrite: workers write an immutable attempt prefix; the
 returned/catalog URI is that completed prefix, not the stable logical filename.
 

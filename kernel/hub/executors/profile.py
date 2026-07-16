@@ -61,10 +61,11 @@ def _stat(arr: pa.ChunkedArray, n: int, t: pa.DataType) -> dict:
     return out
 
 
-def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
+def _full_stats(
+        engine: BuildEngine, node_id: str, port_id: str | None = None) -> ProfileResult:
     """Whole-dataset stats via one out-of-core DuckDB aggregate scan: exact count/nulls/min/max/mean,
     HLL distinct. Column refs use the view's DuckDB-deduped names (join outputs can share a name)."""
-    rel = engine.relation(node_id)
+    rel = engine.relation(node_id, port_id)
     fields = list(rel.limit(0).to_arrow_table().schema)  # arrow types, positional — no row scan
     display = _dedupe_names([f.name for f in fields])
     con = db.conn()
@@ -109,13 +110,20 @@ def _full_stats(engine: BuildEngine, node_id: str) -> ProfileResult:
 def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                  node_builders=None, node_specs=None, cache=None, full: bool = False,
                  storage=None, scope_callback=None, *, process_isolated: bool = False,
-                 source_leases_preclaimed: bool = False) -> ProfileResult:
+                 source_leases_preclaimed: bool = False,
+                 port_id: str | None = None) -> ProfileResult:
     if not g.is_acyclic(graph):
         return ProfileResult(error=True, reason="graph has a cycle — control flow must be encapsulated")
     if node_specs:
         errs = g.type_errors(graph, node_specs)
         if errs:
             return ProfileResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
+        try:
+            selected_port = g.require_output_port(graph, node_id, node_specs, port_id).id
+        except (KeyError, ValueError) as exc:
+            return ProfileResult(error=True, reason=str(exc).strip("'"))
+    else:
+        selected_port = port_id
 
     from hub import auth
     if (auth.auth_enabled()
@@ -148,7 +156,7 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                     holder["scope"] = scope
                     if scope_callback is not None:
                         scope_callback(scope)
-                    return _full_stats(eng, node_id)
+                    return _full_stats(eng, node_id, selected_port)
 
         def on_timeout() -> None:
             sc = holder.get("scope")
@@ -181,7 +189,7 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                 owner=f"profile:{uuid.uuid4().hex}"):
             with db.run_scope() as scope:
                 holder["scope"] = scope
-                tbl = engine.relation(node_id).limit(PROFILE_ROWS).to_arrow_table()
+                tbl = engine.relation(node_id, selected_port).limit(PROFILE_ROWS).to_arrow_table()
                 names = _dedupe_names(tbl.column_names)
                 if names != tbl.column_names:
                     tbl = tbl.rename_columns(names)

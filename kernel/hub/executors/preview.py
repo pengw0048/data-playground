@@ -29,7 +29,7 @@ _CODE_CELL_KINDS = ("transform", "section")
 
 def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                  node_builders=None, node_specs=None, offset: int = 0, cache=None,
-                 storage=None) -> SampleResult:
+                 storage=None, port_id: str | None = None) -> SampleResult:
     # clean, up-front graph checks (don't rely on a Python RecursionError for cycles)
     if not g.is_acyclic(graph):
         return SampleResult(error=True, reason="graph has a cycle — control flow must be encapsulated (§5.7)")
@@ -37,6 +37,12 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         errs = g.type_errors(graph, node_specs)
         if errs:
             return SampleResult(error=True, reason="incompatible connection: " + "; ".join(errs[:3]))
+        try:
+            selected_port = g.require_output_port(graph, node_id, node_specs, port_id).id
+        except (KeyError, ValueError) as exc:
+            return SampleResult(error=True, reason=str(exc).strip("'"))
+    else:
+        selected_port = port_id
 
     from hub import auth
     if auth.auth_enabled() and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id)):
@@ -63,7 +69,7 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                 # true end, even when the total is an exact multiple of the page size). NOTE: offset
                 # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
                 # over such a node may not be perfectly consistent — acceptable for a bounded preview.
-                rows, cols = engine.rows(node_id, k + 1, offset)
+                rows, cols = engine.rows(node_id, k + 1, offset, selected_port)
                 has_more = len(rows) > k
                 return SampleResult(columns=cols, rows=rows[:k], row_count=len(rows[:k]), has_more=has_more, truncated=True)
 

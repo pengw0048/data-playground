@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import UUID4, BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+from pydantic import (
+    UUID4, BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator,
+)
 from pydantic.alias_generators import to_camel
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
@@ -374,6 +376,53 @@ class RunBackendRef(Wire):
     durable: bool = True
 
 
+class RunOutput(Wire):
+    """One declared output port and its durable publication state.
+
+    Port metadata is a snapshot, not a live lookup: history remains intelligible after a node spec or
+    Section declaration changes.  A URI becomes public only after publication commits; pending and
+    terminal non-committed outcomes therefore cannot carry storage or catalog identities.
+    """
+
+    node_id: str = Field(min_length=1, max_length=256)
+    port_id: str = Field(min_length=1, max_length=128)
+    port_label: str | None = Field(default=None, max_length=256)
+    wire: WireType
+    publication_kind: Literal["result", "catalog"]
+    outcome: Literal["pending", "committed", "failed", "skipped", "cancelled"]
+    uri: str | None = Field(default=None, max_length=8192)
+    table: str | None = Field(default=None, max_length=512)
+    rows: int | None = Field(default=None, ge=0)
+    error: str | None = Field(default=None, max_length=4096)
+
+    @model_validator(mode="after")
+    def _publication_shape(self) -> "RunOutput":
+        if self.port_id != self.port_id.strip():
+            raise ValueError("run output portId cannot contain surrounding whitespace")
+        if self.outcome == "committed":
+            if not self.uri:
+                raise ValueError("a committed run output requires a URI")
+            if self.publication_kind == "catalog" and not self.table:
+                raise ValueError("a committed catalog output requires a table identity")
+            if self.publication_kind == "result" and self.table is not None:
+                raise ValueError("a non-catalog run output cannot carry a table identity")
+        elif self.uri is not None or self.table is not None:
+            raise ValueError("a non-committed run output cannot expose a URI or table identity")
+        return self
+
+
+def validate_run_output_rows(
+        outputs: list[RunOutput], rows: int | None, *, field_name: str) -> None:
+    """Validate the one scalar row-count projection shared by live status and history."""
+    if rows is None:
+        return
+    committed = [output for output in outputs if output.outcome == "committed"]
+    if (len(outputs) != 1 or len(committed) != 1 or committed[0].rows is None
+            or rows != committed[0].rows):
+        raise ValueError(
+            f"{field_name} requires one committed output and must equal its row count")
+
+
 class RunStatus(Wire):
     run_id: str
     status: Literal["queued", "running", "done", "failed", "cancelled"]
@@ -390,8 +439,10 @@ class RunStatus(Wire):
     progress: float | None = None       # 0..1 fraction of steps complete (deterministic; any backend can report)
     stalled: bool = False               # running but no step has completed for a while (a soft "stuck?" hint)
     error: str | None = None
-    output_uri: str | None = None
-    output_table: str | None = None
+    # Ordinary runs publish the declaration-ordered expected port set from their first live status.
+    # #263 keeps that set to exactly one until the local/subprocess multi-output state machines land.
+    # Profile jobs are inspection jobs and deliberately keep this collection empty.
+    outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     # A profile result is present only on a successful full-profile job. ``plan_digest`` is the fixed-size
     # SHA-256 of the server-authoritative execution/source identity, so durable status never duplicates
     # the raw graph while still fencing results to the exact data revision that was profiled.
@@ -404,6 +455,91 @@ class RunStatus(Wire):
     # that omit it still deserialize; durable copy also lives on run_states / run_records.
     request_id: str | None = None
     backend_ref: RunBackendRef | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_singular_output_fields(cls, value):
+        if isinstance(value, dict) and any(
+                key in value for key in ("output_uri", "outputUri", "output_table", "outputTable")):
+            raise ValueError("singular run output fields are not part of the public contract")
+        return value
+
+    @model_validator(mode="after")
+    def _output_collection(self) -> "RunStatus":
+        keys = [(output.node_id, output.port_id) for output in self.outputs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("run outputs must have unique (nodeId, portId) identities")
+        if self.job_type == "profile":
+            if self.outputs:
+                raise ValueError("profile jobs cannot publish run outputs")
+            if self.total_rows is not None:
+                raise ValueError("profile jobs report result rows only through profile.rowCount")
+        if self.job_type == "run":
+            if self.outputs and self.target_node_id is None:
+                raise ValueError("run outputs require a targetNodeId")
+            if self.target_node_id is not None and any(
+                    output.node_id != self.target_node_id for output in self.outputs):
+                raise ValueError("every run output nodeId must match targetNodeId")
+            if self.status == "done" and self.target_node_id is not None:
+                if not self.outputs or any(
+                        output.outcome != "committed" for output in self.outputs):
+                    raise ValueError(
+                        "a successful targeted run requires committed outputs")
+            validate_run_output_rows(
+                self.outputs, self.total_rows, field_name="totalRows")
+            if self.status in ("done", "failed", "cancelled") and any(
+                    output.outcome == "pending" for output in self.outputs):
+                raise ValueError("a terminal run cannot retain pending outputs")
+        return self
+
+
+class RunHistoryRecord(Wire):
+    """Bounded, explicit response model for one durable run-history row."""
+
+    id: str
+    run_id: str | None = None
+    request_id: str | None = None
+    job_type: Literal["run", "profile"]
+    status: Literal["done", "failed", "cancelled"]
+    target_node_id: str | None = None
+    rows: int | None = Field(default=None, ge=0)
+    ms: int | None = Field(default=None, ge=0)
+    error: str | None = None
+    outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
+    per_node: list[PerNodeStatus] | None = None
+    created_at: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_singular_output_fields(cls, value):
+        if isinstance(value, dict) and any(
+                key in value for key in ("output_uri", "outputUri", "output_table", "outputTable")):
+            raise ValueError("singular run-history output fields are not part of the public contract")
+        return value
+
+    @model_validator(mode="after")
+    def _unique_outputs(self) -> "RunHistoryRecord":
+        keys = [(output.node_id, output.port_id) for output in self.outputs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("run-history outputs must have unique (nodeId, portId) identities")
+        if any(output.outcome == "pending" for output in self.outputs):
+            raise ValueError("finished run history cannot retain pending outputs")
+        if self.job_type == "profile":
+            if self.outputs or self.rows is not None:
+                raise ValueError("profile history stores result rows only in the profile status")
+        else:
+            if self.outputs and self.target_node_id is None:
+                raise ValueError("run-history outputs require a targetNodeId")
+            if self.target_node_id is not None and any(
+                    output.node_id != self.target_node_id for output in self.outputs):
+                raise ValueError("every history output nodeId must match targetNodeId")
+            if self.status == "done" and self.target_node_id is not None:
+                if not self.outputs or any(
+                        output.outcome != "committed" for output in self.outputs):
+                    raise ValueError(
+                        "successful targeted run history requires committed outputs")
+            validate_run_output_rows(self.outputs, self.rows, field_name="history rows")
+        return self
 
 
 class PlanStep(Wire):
@@ -500,7 +636,9 @@ MAX_CODE_LEN = 200_000  # chars, per code/SQL field on a node
 
 
 class GraphNode(Wire):
-    id: str
+    # RunOutput snapshots persist this identity with the same bound. Enforce it at graph ingress so a
+    # structurally valid graph cannot fail only after execution output initialization.
+    id: str = Field(min_length=1, max_length=256)
     type: str
     position: Position = Position(x=0, y=0)
     data: dict[str, Any] = {}
@@ -568,6 +706,7 @@ class PreviewRequest(Wire):
 
     graph: Graph
     node_id: str
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
 

@@ -235,8 +235,9 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
         if status.total_rows is not None or status.ms is not None:
             head += f"  ({status.total_rows if status.total_rows is not None else '?'} rows"
             head += f", {status.ms} ms)" if status.ms is not None else ")"
-        if status.output_table:
-            head += f"  →  {status.output_table}"
+        if len(status.outputs) == 1 and status.outputs[0].outcome == "committed":
+            output = status.outputs[0]
+            head += f"  →  {output.table or output.uri}"
         print(head)
         for p in (status.per_node or []):
             line = f"  {p.node_id}: {p.status}"

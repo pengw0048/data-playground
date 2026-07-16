@@ -6,7 +6,7 @@ import type {
 import type {
   CatalogTable, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate, RunStatus, SampleResult,
 } from '../types/api'
-import { getSpec } from '../nodes/registry'
+import { getSpec, nodeOutputs } from '../nodes/registry'
 import { registerGenericNodes, nodeInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
@@ -92,6 +92,15 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
   return walk(id)
 }
 
+export const MULTI_OUTPUT_FULL_RUN_UNAVAILABLE =
+  'Full runs for multi-output nodes are not available yet. Preview a named output instead.'
+
+/** Full runs stay atomic in #263; preview/profile can address a named port independently. */
+export function fullRunUnavailableReason(doc: CanvasDoc, id: string): string | undefined {
+  const node = doc.nodes.find((candidate) => candidate.id === id)
+  return node && nodeOutputs(node).length > 1 ? MULTI_OUTPUT_FULL_RUN_UNAVAILABLE : undefined
+}
+
 /** A node is disabled if it, or ANY of its upstream ancestors, is flagged disabled — disabling a
  * node turns off everything downstream of it (the whole branch stops), mirroring ComfyUI. */
 export function isDisabled(doc: CanvasDoc, id: string): boolean {
@@ -149,6 +158,7 @@ function mergeIntoCatalog(set: (fn: (s: Store) => Partial<Store>) => void, table
 export interface PreviewState {
   canvasId: string
   nodeId: string
+  portId?: string
   planIdentity: string
   requestGeneration: number
   loading?: boolean
@@ -177,7 +187,7 @@ function compareIdentityText(a: string, b: string): number {
 // positions, edge ids, selection, and transient node status are presentation-only; requirements,
 // executable node data, wiring, and section containment affect execution. Titles are included because
 // metric output and section-child aliases execute from them.
-function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string): string {
+function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: string): string {
   const executableNodes = doc.nodes.filter((node) => node.type !== 'note' && node.type !== 'code')
   const byId = new Map(executableNodes.map((node) => [node.id, node]))
   const incoming = new Map<string, string[]>()
@@ -239,31 +249,38 @@ function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string): string {
     schema: 1,
     canvasId: doc.id,
     targetNodeId: nodeId,
+    targetPortId: portId,
     requirements: [...(doc.requirements ?? [])].sort(),
     nodes,
     edges,
   }))
 }
 
-export function previewPlanIdentity(doc: CanvasDoc, nodeId: string): string {
-  return targetExecutionPlanIdentity(doc, nodeId)
+export function previewPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: string): string {
+  return targetExecutionPlanIdentity(doc, nodeId, portId)
 }
 
 export function profilePlanIdentity(doc: CanvasDoc, nodeId: string): string {
   return targetExecutionPlanIdentity(doc, nodeId)
 }
 
-export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string): boolean {
+export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string, portId = preview.portId): boolean {
   return preview.canvasId === doc.id
     && preview.nodeId === nodeId
+    && preview.portId === portId
     && doc.nodes.some((node) => node.id === nodeId)
-    && preview.planIdentity === previewPlanIdentity(doc, nodeId)
+    && preview.planIdentity === previewPlanIdentity(doc, nodeId, portId)
 }
 
 // Schema hints and editor completions must follow the same reuse rule as the data panel. Otherwise
 // a preview made for an earlier graph could leak stale columns into the graph now being edited.
 export function currentPreviews(doc: CanvasDoc, previews: Record<string, PreviewState>): Record<string, PreviewState> {
-  return Object.fromEntries(Object.entries(previews).filter(([nodeId, preview]) => previewIsCurrent(preview, doc, nodeId)))
+  return Object.fromEntries(Object.entries(previews).filter(([nodeId, preview]) => {
+    const node = doc.nodes.find((candidate) => candidate.id === nodeId)
+    // Until schemas become port-addressed, a selected multi-output preview is valid for Data only.
+    // Do not let its columns masquerade as one node-wide schema for every source handle.
+    return !!node && nodeOutputs(node).length <= 1 && previewIsCurrent(preview, doc, nodeId)
+  }))
 }
 interface RunState {
   estimate?: RunEstimate
@@ -379,8 +396,7 @@ function sanitizeUnverifiedProfileStatus(status: RunStatus): RunStatus {
     stalled: undefined,
     error: undefined,
     profile: undefined,
-    outputUri: undefined,
-    outputTable: undefined,
+    outputs: [],
   }
 }
 
@@ -677,7 +693,7 @@ interface Store {
   closePanel: (id: string) => void
 
   // -- execution --
-  runPreview: (id: string, offset?: number) => Promise<void>
+  runPreview: (id: string, offset?: number, portId?: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
   run: (id: string, confirmed?: boolean) => Promise<void>
@@ -1057,12 +1073,23 @@ export const useStore = create<Store>((set, get) => ({
         return n
       })
       // If this edit shrinks/renames the node's declared output ports, drop edges leaving a port
-      // that no longer exists — otherwise they become invisible orphans (no handle to select) and
-      // fail the run with "output port not produced". A null sourceHandle maps to the default port.
+      // that no longer exists. When a previously single-output Section becomes multi-output, bind an
+      // old implicit edge to that exact former port; never leave a missing sourceHandle that the new
+      // graph contract would reject or guess on the backend.
       let edges = s.doc.edges
-      if (Array.isArray(patch.outputs)) {
-        const ports = new Set((patch.outputs as unknown[]).map((h) => String(h)))
-        edges = edges.filter((e) => e.source !== id || e.sourceHandle == null || ports.has(e.sourceHandle))
+      const previousNode = s.doc.nodes.find((node) => node.id === id)
+      const editedNode = nodes.find((node) => node.id === id)
+      if (editedNode?.type === 'section' && Array.isArray(patch.outputs)) {
+        const ports = new Set(nodeOutputs(editedNode).map((port) => port.id))
+        const previousPorts = previousNode ? nodeOutputs(previousNode) : []
+        edges = edges.flatMap((edge) => {
+          if (edge.source !== id) return [edge]
+          const priorPortId = edge.sourceHandle
+            ?? (previousPorts.length === 1 ? previousPorts[0].id : undefined)
+          return priorPortId && ports.has(priorPortId)
+            ? [{ ...edge, sourceHandle: priorPortId }]
+            : []
+        })
       }
       return { doc: { ...s.doc, nodes, edges } }
     })
@@ -1267,24 +1294,30 @@ export const useStore = create<Store>((set, get) => ({
   closePanel: (id) =>
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
 
-  runPreview: async (id: string, offset = 0) => {
+  runPreview: async (id: string, offset = 0, requestedPortId?: string) => {
     // offset lives in the preview state (single source of truth) so an external Refresh (which
     // re-fetches page 0) and the panel's page controls never disagree.
     const doc = get().doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (!node) return
-    const planIdentity = previewPlanIdentity(doc, id)
+    const ports = nodeOutputs(node)
+    const currentPortId = get().previews[id]?.portId
+    const defaultPortId = ports.find((port) => port.id === 'out')?.id ?? ports[0]?.id
+    const portId = requestedPortId ?? (ports.length > 1
+      ? ports.find((port) => port.id === currentPortId)?.id ?? defaultPortId
+      : undefined)
+    const planIdentity = previewPlanIdentity(doc, id, portId)
     const requestGeneration = ++_previewRequestGeneration
     const isCurrent = () => {
       const state = get()
       const preview = state.previews[id]
       return preview?.requestGeneration === requestGeneration
-        && previewIsCurrent(preview, state.doc, id)
+        && previewIsCurrent(preview, state.doc, id, portId)
     }
     set((s) => ({
       previews: {
         ...s.previews,
-        [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, loading: true, offset },
+        [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, loading: true, offset },
       },
       openPanels: { [id]: 'data' },
     }))
@@ -1294,17 +1327,17 @@ export const useStore = create<Store>((set, get) => ({
       // A chart renders its whole series at once, so fetch up to the backend's grouped cap (2000)
       // instead of a 50-row page (which silently truncated bar/scatter to the first 50 points).
       const k = node.type === 'chart' ? 2000 : 50
-      const result = await api.preview(doc, id, k, offset)
+      const result = await api.preview(doc, id, k, offset, portId)
       if (!isCurrent()) return
       set((s) => ({
-        previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, result, offset } },
+        previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, result, offset } },
       }))
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({
         previews: {
           ...s.previews,
-          [id]: { canvasId: doc.id, nodeId: id, planIdentity, requestGeneration, error: (e as Error).message, offset },
+          [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, error: (e as Error).message, offset },
         },
       }))
     }
@@ -1315,6 +1348,11 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    const unavailable = fullRunUnavailableReason(get().doc, id)
+    if (unavailable) {
+      get().pushToast(unavailable, 'info')
+      return
+    }
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
@@ -1333,6 +1371,11 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   estimate: async (id) => {
+    const unavailable = fullRunUnavailableReason(get().doc, id)
+    if (unavailable) {
+      get().pushToast(unavailable, 'info')
+      return
+    }
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
     try {
       const estimate = await api.estimate(get().doc, id)
@@ -1346,6 +1389,11 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false) => {
     if (!roleCanEdit(get().canvasRole)) return
+    const unavailable = fullRunUnavailableReason(get().doc, id)
+    if (unavailable) {
+      get().pushToast(unavailable, 'info')
+      return
+    }
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
@@ -1374,10 +1422,16 @@ export const useStore = create<Store>((set, get) => ({
     // a section's contained children are run by the section, not as top-level sinks
     const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
-    const runnable = sinks.filter((n) => !hasInvalidUpstream(doc, n.id))
+    const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id))
+    const runnable = valid.filter((n) => !fullRunUnavailableReason(doc, n.id))
     runnable.forEach((n) => get().requestRun(n.id))
-    const skipped = sinks.length - runnable.length
-    if (skipped) get().pushToast(`Skipped ${skipped} pipeline${skipped > 1 ? 's' : ''} with a required field still empty`, 'info')
+    const invalidSkipped = sinks.length - valid.length
+    const multiOutputSkipped = valid.length - runnable.length
+    if (invalidSkipped) get().pushToast(`Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with a required field still empty`, 'info')
+    if (multiOutputSkipped) get().pushToast(
+      `Skipped ${multiOutputSkipped} multi-output pipeline${multiOutputSkipped > 1 ? 's' : ''}. ${MULTI_OUTPUT_FULL_RUN_UNAVAILABLE}`,
+      'info',
+    )
   },
 
   cancelRun: async (id) => {

@@ -159,7 +159,7 @@ def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
     assert final.profile is not None and not final.profile.sampled
     assert final.profile.row_count == 3
     assert [column.name for column in final.profile.columns] == ["x", "y"]
-    assert final.total_rows == final.rows_processed == 3
+    assert final.total_rows is None and final.rows_processed == 3
     assert final.target_node_id == "source"
     assert final.plan_digest == _digest("real-profile")
     assert final.profile_attempt_order == 7
@@ -249,7 +249,7 @@ import json, os, sys
 job = json.load(open(sys.argv[1]))
 payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
-    "rows_processed": 2, "total_rows": 2, "ms": 1, "placement": "local",
+    "rows_processed": 2, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
     "profile": {"columns": [], "row_count": 2, "sampled": False,
                 "not_previewable": False, "error": False}
@@ -393,7 +393,7 @@ import json, os, sys
 job = json.load(open(sys.argv[1]))
 payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
-    "rows_processed": 3, "total_rows": 3, "ms": 1, "placement": "local",
+    "rows_processed": 3, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
     "profile": {"columns": [], "row_count": 3, "sampled": False,
                 "not_previewable": False, "error": False}
@@ -724,7 +724,9 @@ payload = {{
     "run_id": "forged-child", "status": "done", "job_type": "run",
     "target_node_id": "forged-target", "rows_processed": 4, "total_rows": 4,
     "ms": 1, "placement": "distributed", "per_node": [], "progress": 1.0,
-    "output_uri": "/forged", "output_table": "forged",
+    "outputs": [{{"node_id": "forged-target", "port_id": "forged-port",
+                 "wire": "dataset", "publication_kind": "result",
+                 "outcome": "committed", "uri": "/forged", "rows": 4}}],
     "profile": {{"columns": [], "row_count": 4, "sampled": False,
                 "not_previewable": False, "error": False}},
     "plan_digest": {('0' * 64)!r}, "profile_attempt_order": 999,
@@ -769,7 +771,7 @@ for _ in range(10):
     assert final.profile_attempt_order == 3
     assert final.request_id == "parent-request"
     assert final.placement == "local"
-    assert final.output_uri is final.output_table is None
+    assert final.outputs == [] and final.total_rows is None
     assert terminal_observations and all(code is not None for code in terminal_observations)
     assert processes[0].poll() == 0
     assert marker.stat().st_size == side_effect_size
@@ -980,7 +982,7 @@ import json, os, sys, time
 job = json.load(open(sys.argv[1]))
 payload = {
     "run_id": "child", "status": "done", "job_type": "profile",
-    "rows_processed": 9, "total_rows": 9, "ms": 1, "placement": "local",
+    "rows_processed": 9, "ms": 1, "placement": "local",
     "per_node": [], "progress": 1.0,
     "profile": {"columns": [], "row_count": 9, "sampled": False,
                 "not_previewable": False, "error": False}
@@ -1039,7 +1041,9 @@ time.sleep(0.5)
         "request_id": "request-fixed-id",
     }
     first = runner.run(_graph(), "source", **kwargs)
-    assert runner.run(_graph(), "source", **kwargs) is first
+    second = runner.run(_graph(), "source", **kwargs)
+    assert second is not first
+    assert second.model_dump() == first.model_dump()
 
     with pytest.raises(ValueError, match="different identity"):
         runner.run(_graph(), "source", **{

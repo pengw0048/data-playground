@@ -177,14 +177,20 @@ def test_moto_isolated_backends_read_parent_published_managed_source(
         completed = _wait_for_reaped_terminal(runner, started.run_id)
         assert completed.status == "done", completed.error
         assert completed.total_rows == table.num_rows
-        assert pq.read_table(completed.output_uri).to_pydict() == table.to_pydict()
+        assert len(completed.outputs) == 1
+        completed_output = completed.outputs[0]
+        assert completed_output.outcome == "committed"
+        assert completed_output.rows == table.num_rows
+        assert pq.read_table(completed_output.uri).to_pydict() == table.to_pydict()
 
         unit_output = tmp_path / f"{backend}-unit.parquet"
         unit_started = runner.run_unit(graph, "source", str(unit_output))
         unit_completed = _wait_for_reaped_terminal(runner, unit_started.run_id)
         assert unit_completed.status == "done", unit_completed.error
         assert unit_completed.total_rows == table.num_rows
-        assert unit_completed.output_uri == str(unit_output)
+        assert len(unit_completed.outputs) == 1
+        assert unit_completed.outputs[0].uri == str(unit_output)
+        assert unit_completed.outputs[0].rows == table.num_rows
         assert pq.read_table(unit_output).to_pydict() == table.to_pydict()
 
         assert len(job_dirs) == 2

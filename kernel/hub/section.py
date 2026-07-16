@@ -167,6 +167,8 @@ def run_section(engine, node, inputs):
             raise SectionError(
                 f"emit() expects a relation for port '{port}', got {type(rel).__name__}. "
                 "Use emit(rel) for the default output, or emit('port', rel) for a named port.")
+        if port in outs:
+            raise SectionError(f"section emitted output port '{port}' more than once")
         outs[port] = rel
 
     ns = sandbox._namespace()

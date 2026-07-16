@@ -667,7 +667,13 @@ def data_sample(req: SampleRequest) -> SampleResult:
 @router.post("/pipelines/import", response_model=PipelineImport)
 def import_pipeline(req: ImportRequest) -> PipelineImport:
     try:
-        result = get_deps().importer.import_pipeline(req.config, req.params)
+        deps = get_deps()
+        result = deps.importer.import_pipeline(req.config, req.params)
+        if result.graph:
+            invalid = g.validation_error(
+                result.graph, deps.node_specs, deps.node_builders)
+            if invalid:
+                raise ValueError(invalid[0])
         # auto-lay-out an imported graph the importer didn't position (so nodes don't stack at 0,0); an
         # importer that set its own positions keeps them. Inside the try so a bad graph → 400, not 500.
         if result.graph and result.graph.nodes and all(n.position.x == 0 and n.position.y == 0 for n in result.graph.nodes):

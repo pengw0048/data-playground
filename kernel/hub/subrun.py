@@ -184,7 +184,7 @@ def _run_profile_job(job: dict, deps, graph, status_file: str, external_cancel) 
             job_type="profile",
             target_node_id=node_id,
             rows_processed=rows,
-            total_rows=rows if state == "done" else None,
+            total_rows=None,
             ms=elapsed_ms,
             placement="local",
             per_node=[PerNodeStatus(
@@ -325,12 +325,21 @@ def main() -> int:
         # write the target node's relation to a given uri — how a placed region executes on its worker.
         mat_uri = job.get("materializeUri")
         if mat_uri:
+            from hub.models import RunStatus
+            from hub.run_outputs import (
+                commit_output, require_single_run_output, settle_uncommitted_outputs)
+            target = job.get("target")
+            expected_output = require_single_run_output(
+                graph, target, deps.node_specs)
+            status = RunStatus(
+                run_id="child", status="running", target_node_id=target,
+                placement="local", per_node=[], outputs=[expected_output])
             if external_cancel and external_cancel():
-                _atomic_write(status_file, {"run_id": "child", "status": "cancelled", "per_node": [],
-                                            "rows_processed": 0, "ms": 0, "placement": "local"})
+                status.status = "cancelled"
+                settle_uncommitted_outputs(status, "cancelled")
+                _atomic_write(status_file, status.model_dump())
                 return 1
-            _atomic_write(status_file, {"run_id": "child", "status": "running", "per_node": [],
-                                        "rows_processed": 0, "ms": 0, "placement": "local"})
+            _atomic_write(status_file, status.model_dump())
             from hub import db
             from hub.executors.engine import BuildEngine
             from hub.plugins.runner import _CancelToken
@@ -348,22 +357,25 @@ def main() -> int:
                     try:
                         eng = BuildEngine(graph, deps.resolve_adapter, deps.registry, full=True,
                                              node_builders=deps.node_builders, node_specs=deps.node_specs,
-                                             pushdown=True, output_node=job.get("target"))
-                        rel = eng.relation(job.get("target"))
+                                             pushdown=True, output_node=target)
+                        rel = eng.relation(target)
                         rows = _materialize_region(
                             deps, rel, mat_uri, _CancelToken(external_cancel), external_cancel,
                             job.get("runId") or "child")
                     finally:
                         monitor_done.set()
-            except Exception:
-                if external_cancel and external_cancel():
-                    _atomic_write(status_file, {"run_id": "child", "status": "cancelled", "per_node": [],
-                                                "rows_processed": 0, "ms": 0, "placement": "local"})
-                    return 1
-                raise
-            _atomic_write(status_file, {"run_id": "child", "status": "done", "per_node": [],
-                                        "rows_processed": rows, "total_rows": rows,
-                                        "ms": 0, "placement": "local", "output_uri": mat_uri})
+            except Exception as exc:  # noqa: BLE001 — emit a complete per-port terminal receipt
+                cancelled = bool(external_cancel and external_cancel())
+                status.status = "cancelled" if cancelled else "failed"
+                status.error = None if cancelled else f"{type(exc).__name__}: {exc}"
+                settle_uncommitted_outputs(status, status.status, status.error)
+                _atomic_write(status_file, status.model_dump())
+                return 1
+            status.rows_processed = rows
+            status.total_rows = rows
+            commit_output(status, uri=mat_uri, rows=rows)
+            status.status = "done"
+            _atomic_write(status_file, status.model_dump())
             return 0
         plan = compiler.compile_plan(graph, job.get("target"), deps.registry, deps.node_specs, deps.node_ir)
         if external_cancel and external_cancel():

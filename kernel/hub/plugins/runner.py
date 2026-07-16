@@ -27,6 +27,19 @@ from hub.models import (
     RunEstimate,
     RunStatus,
 )
+from hub.run_outputs import (
+    apply_cached_output,
+    commit_output,
+    committed_output_snapshot,
+    discard_unpublished_outputs,
+    initialize_run_outputs,
+    outputs_cache_document,
+    preflight_output_table,
+    preflight_run_output_target,
+    settle_uncommitted_outputs,
+    sole_committed_document_output,
+    sole_output,
+)
 
 _CONFIRM_ROWS = 5_000_000   # fallback gate when byte size is unknown but the row count is known
 _CONFIRM_BYTES = 2 << 30    # 2 GiB — the primary confirm signal: a full pass moving this much data
@@ -196,6 +209,10 @@ class LocalRunner:
         self.node_builders = node_builders if node_builders is not None else {}
         self.node_specs = node_specs if node_specs is not None else {}
         self.runs: dict[str, RunStatus] = {}
+        # Public readers never touch the execution-owned mutable RunStatus in ``runs``.  Writers publish
+        # one validated deep snapshot at each coherent _emit boundary, and status()/cancel() copy only
+        # that snapshot.  The live object remains available to the worker and synchronous callbacks.
+        self._published_statuses: dict[str, RunStatus] = {}
         self._cancel: dict[str, _CancelToken] = {}
         self._scopes: dict[str, object] = {}  # run_id -> db._Scope, so cancel interrupts THIS run's cursor
         self._cache: dict[str, dict] = {}
@@ -260,21 +277,27 @@ class LocalRunner:
                 return None, None
         else:
             doc = self._cache_get(key)
-        if doc and doc.get("uri"):
+        cached_output = sole_committed_document_output(doc)
+        if doc is not None and cached_output is None:
+            if cache_pin is not None:
+                cache_pin.close()
+            return None, None
+        if cached_output is not None:
+            uri = str(cached_output.uri)
             from hub import metadb
-            if metadb.object_attempt_uri_shape(doc["uri"]):
+            if metadb.object_attempt_uri_shape(uri):
                 if cache_pin is None:
                     return None, None  # managed reuse requires an atomic DB-backed ownership pin
             acquire_local = getattr(self.storage, "acquire_result_read", None)
             managed_local = getattr(self.storage, "requires_result_read", None)
             if (callable(acquire_local) and callable(managed_local)
-                    and managed_local(doc["uri"])):
+                    and managed_local(uri)):
                 local_guard = None
                 try:
-                    local_guard = acquire_local(doc["uri"], f"cache:{run_id or owner}")
+                    local_guard = acquire_local(uri, f"cache:{run_id or owner}")
                     # The ephemeral reader is acquired before this first existence check. A ready
                     # registry row with a missing file is a cache miss, not a lease that survives forever.
-                    if not self._output_exists(doc["uri"]):
+                    if not self._output_exists(uri):
                         local_guard.close()
                         if cache_pin is not None:
                             cache_pin.close()
@@ -297,7 +320,8 @@ class LocalRunner:
                 self.result_put(key, doc)
             except Exception:  # noqa: BLE001 — never let caching break a successful run
                 from hub import metadb
-                if doc.get("uri") and metadb.object_attempt_is_managed(doc["uri"]):
+                output = sole_committed_document_output(doc)
+                if output is not None and metadb.object_attempt_is_managed(output.uri):
                     raise
                 pass
             return
@@ -326,27 +350,31 @@ class LocalRunner:
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None, cancel_check=None,
             request_id: str | None = None, attempt_id: str | None = None) -> RunStatus:
-        if sum(step.kind == "write" for step in plan.steps) > 1:
-            raise RuntimeError(
-                "local runs support one write sink until atomic multi-sink publication is enabled")
+        output_target = preflight_run_output_target(plan, target_node_id)
         if any(step.kind == "write" for step in plan.steps):
             from hub.plugins.catalog import unmanaged_publication_supported
             if not unmanaged_publication_supported(self.catalog):
                 raise RuntimeError(
                     "local write sinks require catalog registration with read-back support")
+        # The validation precedes run-id creation, storage/catalog allocation, and worker launch.
+        if output_target is not None:
+            from hub.run_outputs import require_single_run_output
+            require_single_run_output(graph, output_target, self.node_specs)
         run_id = run_id or f"run_{uuid.uuid4().hex[:10]}"  # a kernel passes the hub-minted id (authoritative)
         per_node = [PerNodeStatus(node_id=s.node_id, status="queued", label=s.label) for s in plan.steps]
         # attempt_id is accepted for OPS-01 port parity (managed publication stamps its own attempts).
         _ = attempt_id
         status = RunStatus(run_id=run_id, status="queued", placement=placement, per_node=per_node,
-                           target_node_id=target_node_id, request_id=request_id)
+                           target_node_id=output_target, request_id=request_id)
+        initialize_run_outputs(status, graph, output_target, self.node_specs)
         with self._lock:
             self.runs[run_id] = status
+            self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
             self._cancel[run_id] = _CancelToken(cancel_check)
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
         threading.Thread(target=self._execute_guarded, args=(run_id, plan, graph, target_node_id), daemon=True).start()
-        return status
+        return self.status(run_id)
 
     def _execute_guarded(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
         """Worker-thread backstop. The daemon thread has no other terminalization, so any escape from
@@ -362,6 +390,7 @@ class LocalRunner:
             if status is None or status.status in ("done", "failed", "cancelled"):
                 return
             status.status, status.error = "failed", f"{type(e).__name__}: {e}"
+            settle_uncommitted_outputs(status, "failed", status.error)
             for p in status.per_node:
                 if p.status not in ("done", "failed", "cancelled"):
                     p.status = "failed"
@@ -372,12 +401,16 @@ class LocalRunner:
 
     def _emit(self, graph: Graph, status: RunStatus, *, strict: bool = False) -> None:
         """Fire the on_status hook (DB-backed live status); never let persistence break a run."""
+        snapshot = RunStatus.model_validate(status.model_dump())
         if self.on_status:
             try:
                 self.on_status(graph, status)
             except Exception:  # noqa: BLE001
                 if strict:
                     raise
+        with self._lock:
+            if status.run_id in self.runs:
+                self._published_statuses[status.run_id] = snapshot
 
     def _complete(self, graph: Graph, target: str | None, status: RunStatus, *, strict: bool = False) -> None:
         if self.on_complete:
@@ -393,10 +426,13 @@ class LocalRunner:
         early isn't dropped mid-flight by 100 later submissions (which would 404 its status poll)."""
         _terminal = {"done", "failed", "cancelled"}
         while len(self.runs) > _MAX_RUNS:
-            victim = next((rid for rid, st in self.runs.items() if st.status in _terminal), None)
+            victim = next((rid for rid in self.runs
+                           if (published := self._published_statuses.get(rid)) is not None
+                           and published.status in _terminal), None)
             if victim is None:
                 break  # everything retained is still in-flight — exceed the cap rather than drop a live run
             self.runs.pop(victim, None)
+            self._published_statuses.pop(victim, None)
             self._cancel.pop(victim, None)
             self._scopes.pop(victim, None)
         while len(self._cache) > _MAX_RUNS:
@@ -501,7 +537,9 @@ class LocalRunner:
             for item in status.per_node:
                 item.status = status.status
             status.ms = int((time.time() - started) * 1000)
-            status.total_rows = 0
+            status.total_rows = None
+            settle_uncommitted_outputs(
+                status, "cancelled" if cancel.is_set() else "failed", status.error)
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
@@ -522,6 +560,7 @@ class LocalRunner:
         except Exception as e:  # noqa: BLE001 — any resolution error is a clean run failure, not a strand
             release_guards()
             status.status, status.error = "failed", str(e)
+            settle_uncommitted_outputs(status, "failed", status.error)
             self._emit(graph, status)
             with self._lock:
                 self._cancel.pop(run_id, None)
@@ -557,6 +596,8 @@ class LocalRunner:
                     if cancel.is_set():
                         release_cache_pin_before_terminal()
                         status.status = "cancelled"
+                        settle_uncommitted_outputs(status, "cancelled")
+                        status.total_rows = None
                         for p in status.per_node:
                             if p.status != "done":
                                 p.status = "cancelled"
@@ -585,7 +626,9 @@ class LocalRunner:
                     elif step.kind == "assert":
                         rows_seen = self._check_assert(nm[step.node_id], engine)  # violation count; may raise
                     else:
-                        engine.relation(step.node_id)  # build (lazy) — cheap
+                        # Build every declared output, but do not select one for a multi-output
+                        # intermediate. Its downstream edge owns the explicit source-port choice.
+                        engine.build(step.node_id)  # build (lazy) — cheap
                         self._check_schema(nm[step.node_id], engine)  # enforce a pinned contract (may raise)
                     if pn:
                         pn.status = "done"
@@ -611,14 +654,15 @@ class LocalRunner:
                     last_step_published = False
 
                 # Resolve the last-instruction race explicitly. If no output crossed its commit point,
-                # cancellation wins before `done`. Once output_uri is set, publication/reuse already won;
+                # cancellation wins before `done`. Once a RunOutput is committed, publication/reuse won;
                 # report done truthfully (the CLI still exits 124/130 and includes that terminal state)
                 # rather than claim cancelled while a committed artifact exists.
                 if cancel.is_set():
                     from hub import metadb
                     local_managed = getattr(self.storage, "is_managed_result_uri", None)
-                    provisional_uri = (provisional_result.output_uri
-                                       if provisional_result is not None else status.output_uri)
+                    provisional_output = sole_output(
+                        provisional_result or status, committed=True)
+                    provisional_uri = provisional_output.uri if provisional_output is not None else None
                     managed_full_result = bool(
                         target and nm.get(target) and nm[target].type not in ("write", "assert")
                         and provisional_uri
@@ -638,8 +682,8 @@ class LocalRunner:
                         elif metadb.object_attempt_uri_shape(provisional_uri):
                             _safe_abandon_attempt(provisional_uri)
                         if provisional_result is not None:
-                            provisional_result.output_uri = provisional_result.output_table = None
-                        status.output_uri = status.output_table = None
+                            discard_unpublished_outputs(provisional_result, "cancelled")
+                        settle_uncommitted_outputs(status, "cancelled")
                     if managed_full_result or not provisional_uri:
                         raise RuntimeError("run cancelled before completion")
                 if not last_step_published:
@@ -651,14 +695,15 @@ class LocalRunner:
                 # set the final counts BEFORE flipping to 'done' — a client polls in another thread and
                 # reads a terminal status eagerly; the finally sets these too late, so a poll could
                 # otherwise observe status='done' with total_rows still None or ms still 0 (a flaky race).
-                status.total_rows = rows_seen
                 status.progress = 1.0
                 status.stalled = False
                 status.ms = int((time.time() - started) * 1000)
                 from hub import metadb
                 local_managed = getattr(self.storage, "is_managed_result_uri", None)
                 result_binding = provisional_result or status
-                result_uri = result_binding.output_uri
+                result_output = sole_output(result_binding, committed=True)
+                result_uri = result_output.uri if result_output is not None else None
+                status.total_rows = result_output.rows if result_output is not None else None
                 managed_result = bool(
                     target and nm.get(target) and nm[target].type not in ("write", "assert")
                     and result_uri
@@ -672,8 +717,8 @@ class LocalRunner:
                     # cache pointer, keep any cache-hit pin through best-effort history persistence, and
                     # never expose terminal done when the primary durable terminal write fails.
                     persisted = status.model_copy(deep=True)
-                    persisted.output_uri = result_binding.output_uri
-                    persisted.output_table = result_binding.output_table
+                    persisted.outputs = [output.model_copy(deep=True)
+                                         for output in result_binding.outputs]
                     persisted.status = "done"
                     persisted_doc = persisted.model_dump()
                     local_result = bool(
@@ -686,7 +731,6 @@ class LocalRunner:
                             status.status = "running"
                             status.stalled = True
                             status.error = "terminal publication is retrying"
-                            status.output_uri = status.output_table = None
 
                     if local_result:
                         _persist_local_result_done(
@@ -712,14 +756,12 @@ class LocalRunner:
                     self._complete(graph, target, status)
                 else:
                     if provisional_result is not None:
-                        status.output_uri = provisional_result.output_uri
-                        status.output_table = provisional_result.output_table
+                        status.outputs = [output.model_copy(deep=True)
+                                          for output in provisional_result.outputs]
                     status.status = "done"
                 if cacheable:
                     try:
-                        self._cache_put(phash, {
-                            "rows": rows_seen, "uri": status.output_uri,
-                            "table": status.output_table})
+                        self._cache_put(phash, outputs_cache_document(status))
                     except Exception:  # the durable RunState/history owners already committed
                         pass
             except Exception as e:  # noqa: BLE001
@@ -741,32 +783,37 @@ class LocalRunner:
                     except Exception:  # metadata uncertainty retains the process/file fence
                         logging.getLogger("hub").exception(
                             "managed local result abort failed after run error")
-                    if provisional_result is not None and provisional_result.output_uri == owned_local:
-                        provisional_result.output_uri = provisional_result.output_table = None
-                    if status.output_uri == owned_local:
-                        status.output_uri = status.output_table = None
+                    provisional_output = (sole_output(provisional_result, committed=True)
+                                          if provisional_result is not None else None)
+                    if provisional_output is not None and provisional_output.uri == owned_local:
+                        discard_unpublished_outputs(provisional_result, "failed")
+                    status_output = sole_output(status, committed=True)
+                    if status_output is not None and status_output.uri == owned_local:
+                        discard_unpublished_outputs(status, "failed")
                 failed_binding = provisional_result or status
+                failed_output = sole_output(failed_binding, committed=True)
+                failed_uri = failed_output.uri if failed_output is not None else None
                 cached_local_uri = getattr(cache_pin, "uri", None)
-                status_local_uri = (failed_binding.output_uri[len("file://"):]
-                                    if (failed_binding.output_uri
-                                        and failed_binding.output_uri.startswith("file://"))
-                                    else failed_binding.output_uri)
+                status_local_uri = (failed_uri[len("file://"):]
+                                    if failed_uri and failed_uri.startswith("file://") else failed_uri)
                 if cached_local_uri is not None and status_local_uri == cached_local_uri:
-                    failed_binding.output_uri = failed_binding.output_table = None
-                    status.output_uri = status.output_table = None
-                if (failed_binding.output_uri
-                        and metadb.object_attempt_uri_shape(failed_binding.output_uri)):
-                    _safe_abandon_attempt(failed_binding.output_uri)
-                    failed_binding.output_uri = failed_binding.output_table = None
-                    status.output_uri = status.output_table = None
+                    discard_unpublished_outputs(failed_binding, "failed")
+                    discard_unpublished_outputs(status, "failed")
+                    failed_uri = None
+                if failed_uri and metadb.object_attempt_uri_shape(failed_uri):
+                    _safe_abandon_attempt(failed_uri)
+                    discard_unpublished_outputs(failed_binding, "failed")
+                    discard_unpublished_outputs(status, "failed")
                 if cancel.is_set():
                     status.status = "cancelled"  # an interrupted step is a cancel, not a failure
+                    settle_uncommitted_outputs(status, "cancelled")
                     for p in status.per_node:  # settle interrupted + not-yet-started nodes too
                         if p.status != "done":
                             p.status = "cancelled"
                 else:
                     status.status = "failed"
                     msg = f"{type(e).__name__}: {e}"
+                    settle_uncommitted_outputs(status, "failed", msg)
                     hint = _diagnose(str(e))
                     tail = f"\nHint: {hint}" if hint else ""
                     # steps run sequentially, so the one still 'running' is exactly where it broke — attribute
@@ -795,7 +842,9 @@ class LocalRunner:
                     except OSError:
                         pass
                 status.ms = int((time.time() - started) * 1000)
-                status.total_rows = rows_seen
+                committed_output = sole_output(status, committed=True)
+                status.total_rows = (committed_output.rows
+                                     if committed_output is not None else None)
                 if not terminal_persisted and not terminal_rejected:
                     self._emit(graph, status)  # persist terminal state after all commit-point work
                 with self._lock:
@@ -816,8 +865,9 @@ class LocalRunner:
                             "managed local result writer release failed")
 
     def _count(self, engine: BuildEngine, node_id: str, cached: dict | None) -> int:
-        if cached and cached.get("rows") is not None:
-            return cached["rows"]
+        cached_output = sole_committed_document_output(cached)
+        if cached_output is not None and cached_output.rows is not None:
+            return cached_output.rows
         return int(engine.relation(node_id).aggregate("count(*) AS n").fetchone()[0])
 
     @staticmethod
@@ -849,11 +899,15 @@ class LocalRunner:
         Materialization is part of the run contract: a write/commit failure propagates and fails the run
         instead of reporting `done` with an artifact the UI cannot reopen."""
         forced_uri = self.forced_result_uri
-        if not forced_uri and cached and cached.get("uri") and self._output_exists(cached["uri"]):
-            status.output_uri = cached["uri"]
-            status.output_table = cached.get("table")
-            return int(cached.get("rows") or 0)
-        rel = engine.relation(node_id)
+        cached_output = sole_committed_document_output(cached)
+        if (not forced_uri and cached_output is not None
+                and self._output_exists(str(cached_output.uri))
+                and apply_cached_output(status, cached) is not None):
+            return int(cached_output.rows or 0)
+        expected = sole_output(status)
+        if expected is None:
+            raise RuntimeError("full-result materialization requires one expected output")
+        rel = engine.relation(node_id, expected.port_id)
         from hub.plugins.adapters import is_object_uri
         begin_local = getattr(self.storage, "begin_result", None)
         managed_local = getattr(self.storage, "requires_result_read", None)
@@ -930,9 +984,9 @@ class LocalRunner:
                 raise
         else:
             res = self._adapter_write(self.resolve_adapter(uri), uri, rel, "overwrite", cancel)
-        status.output_uri = res.get("uri", uri)
-        status.output_table = None  # a run result, not a catalog table (don't clutter the Tables view)
-        return int(res.get("rows") or 0)
+        rows = int(res.get("rows") or 0)
+        commit_output(status, uri=res.get("uri", uri), rows=rows)
+        return rows
 
     def _check_assert(self, node, engine: BuildEngine) -> int:
         """A data-quality gate: the node's relation is the VIOLATING rows (predicate not TRUE). Count them;
@@ -942,7 +996,9 @@ class LocalRunner:
         severity = cfg.get("severity")
         title = (node.data.get("title") if isinstance(node.data, dict) else None) or node.id
         try:
-            viol = int(engine.relation(node.id).aggregate("count(*) AS n").fetchone()[0])
+            # Assert exposes passing rows on ``pass`` and violations on ``out``. The quality gate is
+            # specifically about violations, so never rely on a multi-output default.
+            viol = int(engine.relation(node.id, "out").aggregate("count(*) AS n").fetchone()[0])
         except Exception as e:  # noqa: BLE001 — a predicate that isn't a per-row boolean (missing column,
             # non-castable value, aggregate) can't evaluate. 'warn' is non-blocking, so it must NOT fail the
             # run (the non-enforcing column-reference warning already flags a bad column on the card).
@@ -1025,10 +1081,15 @@ class LocalRunner:
                       cached: dict | None, cancel: _CancelToken, pre_publish=None) -> int:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         from hub import destinations
-        from hub.sinks import SinkCommit, SinkSpec, commit_sink, preflight_sink
+        from hub.sinks import (
+            SinkCommit, SinkSpec, commit_sink, expected_sink_uri, preflight_sink,
+        )
         spec = SinkSpec.from_config(cfg, node.data.get("title") if isinstance(node.data, dict) else None)
         if cancel.is_set():
             raise RuntimeError("run cancelled before output commit")
+        # The table identity is known before destination resolution, allocation, or an adapter write.
+        # Reject a snapshot that cannot enter the public contract before any irreversible sink effect.
+        preflight_output_table(status, spec.name)
         # Bind this destination's credential at the object-store open (the scope cursor already
         # snapshotted it via the run-level binding; this makes the per-write credential explicit).
         os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
@@ -1037,9 +1098,11 @@ class LocalRunner:
                 db.ensure_object_store(os_cfg)
         # content-addressed skip: an identical overwrite plan already wrote this, so re-running is a
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
-        if spec.mode != "append" and cached and cached.get("table") and cached.get("uri") and self._output_exists(cached["uri"]):
-            status.output_uri, status.output_table = cached["uri"], cached["table"]
-            return int(cached.get("rows") or 0)
+        cached_output = sole_committed_document_output(cached)
+        if (spec.mode != "append" and cached_output is not None and cached_output.table
+                and self._output_exists(str(cached_output.uri))
+                and apply_cached_output(status, cached) is not None):
+            return int(cached_output.rows or 0)
 
         inc = g.incoming(graph, node.id)
         if not inc:
@@ -1085,10 +1148,14 @@ class LocalRunner:
                         logical_uri, namespace, generation, attempt_id),
                 )
                 attempt_uri = handle["uri"]
-            physical_uri = (attempt_uri if spec.partition_by else
-                            attempt_uri.rstrip("/") + "/part-00000.parquet")
-            kwargs = {"partition_by": spec.partition_by} if spec.partition_by else {}
             try:
+                # The immutable attempt is the published identity and is known before its writer
+                # starts. Locally allocated attempts are discarded if even that identity is invalid.
+                committed_output_snapshot(
+                    status, uri=attempt_uri, table=spec.name, rows=0)
+                physical_uri = (attempt_uri if spec.partition_by else
+                                attempt_uri.rstrip("/") + "/part-00000.parquet")
+                kwargs = {"partition_by": spec.partition_by} if spec.partition_by else {}
                 result = self._adapter_write(
                     logical_adapter, physical_uri, parent_rel, spec.mode, cancel, **kwargs)
                 rows = int(result.get("rows") or 0)
@@ -1101,6 +1168,14 @@ class LocalRunner:
                     discard_attempt(attempt_uri)
                 raise
         else:
+            # Built-in sink semantics have a deterministic published URI. Custom adapters may return
+            # another URI, which is checked authoritatively immediately after their write below.
+            committed_output_snapshot(
+                status,
+                uri=expected_sink_uri(spec, logical_uri, logical_adapter),
+                table=spec.name,
+                rows=0,
+            )
             committed = commit_sink(
                 spec, parent_rel, self.workspace, self.storage, self.resolve_adapter,
                 target_uri=forced_target,
@@ -1108,6 +1183,11 @@ class LocalRunner:
                     adapter, uri, rel, mode, cancel, **kwargs
                 ),
             )
+
+        # Adapter-returned identities are untrusted. Validate the exact public snapshot before the
+        # cancellation/publication fence and, critically, before catalog registration.
+        committed_snapshot = committed_output_snapshot(
+            status, uri=committed.uri, table=committed.name, rows=committed.rows)
 
         try:
             if pre_publish is not None:
@@ -1135,8 +1215,7 @@ class LocalRunner:
                 if managed_parquet and not parent_owned:
                     _safe_abandon_attempt(attempt_uri)
                 raise RuntimeError("sink publication failed") from exc
-        status.output_uri = committed.uri
-        status.output_table = committed.name
+        status.outputs = [committed_snapshot]
         return committed.rows
 
     def _source_uri(self, nm_node: str, graph: Graph) -> str | None:
@@ -1147,17 +1226,22 @@ class LocalRunner:
         return None
 
     def status(self, run_id: str) -> RunStatus:
-        return self.runs[run_id]
+        with self._lock:
+            return self._published_statuses[run_id].model_copy(deep=True)
 
     def cancel(self, run_id: str) -> RunStatus:
-        st = self.runs[run_id]
-        # Request cancellation only. The worker publishes the terminal `cancelled` state after it has
-        # unwound past every possible commit point, so a caller can treat terminal status as acknowledgement
-        # instead of returning while this thread may still publish.
-        if st.status in ("queued", "running"):
-            if run_id in self._cancel:
-                self._cancel[run_id].set()
-            scope = self._scopes.get(run_id)
-            if scope is not None:
-                scope.interrupt()  # abort THIS run's cursor (base-conn interrupt wouldn't touch it)
-        return st
+        with self._lock:
+            st = self.runs[run_id]
+            # Request cancellation only. The worker publishes the terminal `cancelled` state after it has
+            # unwound past every possible commit point, so a caller can treat terminal status as acknowledgement
+            # instead of returning while this thread may still publish.
+            if st.status in ("queued", "running"):
+                cancel = self._cancel.get(run_id)
+                if cancel is not None:
+                    cancel.set()
+                scope = self._scopes.get(run_id)
+            else:
+                scope = None
+        if scope is not None:
+            scope.interrupt()  # abort THIS run's cursor (base-conn interrupt wouldn't touch it)
+        return self.status(run_id)

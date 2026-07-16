@@ -57,6 +57,18 @@ def schema_for_graph(graph: Graph, resolve_adapter, registry,
             owner=f"schema:{uuid.uuid4().hex}"):
         with db.run_scope():
             for n in graph.nodes:
+                if node_specs and n.type in node_specs:
+                    try:
+                        ports = g.effective_output_ports_for_node(n, node_specs[n.type])
+                    except ValueError:
+                        out[n.id] = None
+                        continue
+                    if len(ports) > 1:
+                        # The schema response is node-keyed, not port-keyed. Until #266 introduces
+                        # durable per-port schema identity, returning one declaration for a named-output
+                        # node would silently assign it to every port.
+                        out[n.id] = None
+                        continue
                 # a declared code op: its OWN port is the declared contract, verbatim (exact user types) —
                 # unless disabled (emits nothing) or bypassed (passes input through), where the declaration
                 # doesn't apply; those fall through to the chain check / engine passthrough below.

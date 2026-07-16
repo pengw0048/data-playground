@@ -20,7 +20,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from hub.models import CatalogQuery
+from hub import graph as graph_mod
+from hub.models import CatalogQuery, GraphNode
 
 
 class GraphOpError(ValueError):
@@ -46,56 +47,138 @@ def add_node(graph: dict, node_specs, node_id: str, kind: str,
     spec = node_specs.get(kind)
     if spec is None:
         raise GraphOpError(f"unknown node kind '{kind}'")
-    graph.setdefault("nodes", []).append({
+    candidate = {
         "id": node_id, "type": kind, "position": {"x": 0, "y": 0},
         "data": {"title": title or kind, "config": dict(config or {})},
-    })
+    }
+    try:
+        node = GraphNode.model_validate(candidate)
+        outputs = graph_mod.effective_output_ports_for_node(node, spec)
+    except ValueError as exc:
+        # Validate before mutating the working graph: an invalid dynamic declaration must not leave
+        # behind a half-created node when an agent retries with corrected arguments.
+        raise GraphOpError(str(exc)) from exc
+    graph.setdefault("nodes", []).append(candidate)
     return {"node_id": node_id,
             "inputs": [{"id": p.id, "wire": p.wire} for p in spec.inputs],
-            "outputs": [{"id": p.id, "wire": p.wire} for p in spec.outputs]}
+            "outputs": [{"id": p.id, "label": p.label, "wire": p.wire}
+                        for p in outputs]}
 
 
 def connect(graph: dict, node_specs, edge_id: str, source_id: str, target_id: str,
-            target_handle: str | None = None) -> dict:
+            target_handle: str | None = None, source_handle: str | None = None) -> dict:
     """Wire `source_id`'s output to `target_id`'s input (a specific `target_handle` for a multi-input
     node like `join`). Refuses a duplicate wire into a single-fan-in port; a `multi` port (e.g.
     `union`) accepts many DISTINCT sources but still refuses the exact same source twice. The edge
     carries the source port's wire type so the typed-wire checks and the frontend agree on what flows
-    down it."""
+    down it. A multi-output source always requires ``source_handle``; no actor may guess its first port.
+    """
     src, tgt = find_node(graph, source_id), find_node(graph, target_id)
     if not src or not tgt:
         raise GraphOpError("source_id or target_id not found")
     port = _target_port(node_specs, tgt.get("type"), target_handle)
+    if port is None:
+        raise GraphOpError(f"'{tgt.get('type')}' has no input port")
     # a named handle that matches no input port would silently fall back to the first port — reject it
     # so a mistyped handle surfaces instead of mis-wiring.
-    if target_handle and port is not None and port.id != target_handle:
+    if target_handle is not None and port is not None and port.id != target_handle:
         raise GraphOpError(f"'{tgt.get('type')}' has no input handle '{target_handle}'")
+    sspec = node_specs.get(src.get("type"))
+    if sspec is None:
+        raise GraphOpError(f"unknown source node kind '{src.get('type')}'")
+    try:
+        source_ports = graph_mod.effective_output_ports_for_node(
+            GraphNode.model_validate(src), sspec)
+    except ValueError as exc:
+        raise GraphOpError(str(exc)) from exc
+    if source_handle is None:
+        if len(source_ports) != 1:
+            raise GraphOpError(
+                f"source node '{source_id}' has multiple outputs; source_handle is required")
+        source_port = source_ports[0]
+    else:
+        source_port = next((candidate for candidate in source_ports
+                            if candidate.id == source_handle), None)
+        if source_port is None:
+            raise GraphOpError(
+                f"'{src.get('type')}' has no output handle '{source_handle}'")
+    canonical_source_handle = source_port.id
+    canonical_target_handle = port.id
+    default_source_handle = source_ports[0].id if len(source_ports) == 1 else None
+    default_target = _target_port(node_specs, tgt.get("type"), None)
+    default_target_handle = default_target.id if default_target is not None else None
     is_multi = bool(getattr(port, "multi", False))
     edges = graph.setdefault("edges", [])
     # even a multi port rejects the EXACT same wire twice (same source → same target+handle) — feeding
     # a source into a `union` twice would silently double that source's rows.
     if any(e.get("source") == source_id and e.get("target") == target_id
-           and (e.get("targetHandle") or None) == (target_handle or None) for e in edges):
+           and (e.get("sourceHandle") or default_source_handle) == canonical_source_handle
+           and (e.get("targetHandle") or default_target_handle) == canonical_target_handle
+           for e in edges):
         raise GraphOpError(f"{source_id} is already wired to {target_handle or 'in'} of {target_id}")
     if not is_multi and any(e.get("target") == target_id
-                            and (e.get("targetHandle") or None) == (target_handle or None)
+                            and (e.get("targetHandle") or default_target_handle)
+                            == canonical_target_handle
                             for e in edges):
         raise GraphOpError(f"input {target_handle or 'in'} of {target_id} is already connected")
-    sspec = node_specs.get(src.get("type"))
-    wire = sspec.outputs[0].wire if sspec and sspec.outputs else "dataset"
+    wire = source_port.wire
     edges.append({"id": edge_id, "source": source_id, "target": target_id,
-                  "sourceHandle": None, "targetHandle": target_handle, "data": {"wire": wire}})
-    return {"ok": True, "edge_id": edge_id, "wire": wire}
+                  "sourceHandle": canonical_source_handle,
+                  "targetHandle": canonical_target_handle,
+                  "data": {"wire": wire}})
+    return {"ok": True, "edge_id": edge_id, "wire": wire,
+            "source_handle": canonical_source_handle,
+            "target_handle": canonical_target_handle}
 
 
-def set_config(graph: dict, node_id: str, config: dict) -> dict:
-    """Merge `config` (param name -> value) into an existing node's config, leaving other params be."""
+def set_config(graph: dict, node_specs, node_id: str, config: dict) -> dict:
+    """Merge config atomically and preserve only edges whose named output still exists."""
     n = find_node(graph, node_id)
     if not n:
         raise GraphOpError("node_id not found")
-    cfg = n.setdefault("data", {}).setdefault("config", {})
-    cfg.update(config or {})
-    return {"ok": True, "config": cfg}
+    spec = node_specs.get(n.get("type"))
+    if spec is None:
+        raise GraphOpError(f"unknown node kind '{n.get('type')}'")
+    data = dict(n.get("data") or {})
+    old_config = data.get("config")
+    cfg = dict(old_config) if isinstance(old_config, dict) else {}
+    try:
+        cfg.update(dict(config or {}))
+    except (TypeError, ValueError) as exc:
+        raise GraphOpError("config must be an object") from exc
+    candidate = dict(n)
+    candidate["data"] = {**data, "config": cfg}
+    try:
+        candidate_node = GraphNode.model_validate(candidate)
+        new_ports = graph_mod.effective_output_ports_for_node(candidate_node, spec)
+    except ValueError as exc:
+        raise GraphOpError(str(exc)) from exc
+    try:
+        old_ports = graph_mod.effective_output_ports_for_node(
+            GraphNode.model_validate(n), spec)
+    except ValueError:
+        # A valid edit may repair a graph written by an older/broken actor. Unknown implicit edges
+        # have no trustworthy prior port identity and are dropped below instead of being guessed.
+        old_ports = []
+
+    n["data"] = candidate["data"]
+    removed_edges = 0
+    if n.get("type") == "section" and "outputs" in (config or {}):
+        new_port_ids = {port.id for port in new_ports}
+        retained = []
+        for edge in graph.get("edges", []):
+            if edge.get("source") != node_id:
+                retained.append(edge)
+                continue
+            prior_port = edge.get("sourceHandle")
+            if prior_port is None and len(old_ports) == 1:
+                prior_port = old_ports[0].id
+            if prior_port in new_port_ids:
+                retained.append({**edge, "sourceHandle": prior_port})
+            else:
+                removed_edges += 1
+        graph["edges"] = retained
+    return {"ok": True, "config": cfg, "removed_edges": removed_edges}
 
 
 def remove_node(graph: dict, node_id: str) -> dict:
@@ -188,15 +271,21 @@ def join_hints(deps, left: str, right: str) -> dict:
 
 
 def validate_graph(deps, graph: dict) -> dict:
-    """Static checks over a working graph WITHOUT running it: typed-wire errors (incompatible
-    connections) and, per `join` node, its measured cardinality + a fan-out warning. Raises on a
-    malformed graph — the caller wraps it."""
+    """Static graph validity plus join cardinality, without executing the pipeline."""
     from hub import graph as gmod
     from hub import relationships as rel
     from hub.executors.schema import schema_for_graph
     from hub.models import Graph
 
     g = Graph.model_validate(graph)
+    invalid = gmod.validation_error(
+        g, deps.node_specs, getattr(deps, "node_builders", {}))
+    if invalid:
+        return {
+            "errors": [invalid[0]],
+            "type_errors": gmod.type_errors(g, deps.node_specs),
+            "joins": {},
+        }
     out: dict[str, Any] = {"type_errors": gmod.type_errors(g, deps.node_specs)}
     cols = schema_for_graph(
         g, deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,

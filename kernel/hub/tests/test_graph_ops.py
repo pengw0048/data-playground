@@ -27,12 +27,33 @@ def test_add_node_unknown_kind_raises():
         graph_ops.add_node(_empty(), SPECS, "x_1", "frobnicate")
 
 
+def test_add_section_returns_effective_dynamic_outputs_in_declaration_order():
+    g = _empty()
+    out = graph_ops.add_node(
+        g, SPECS, "section_1", "section", config={"outputs": ["left", "right"]})
+    assert out["outputs"] == [
+        {"id": "left", "label": "left", "wire": "dataset"},
+        {"id": "right", "label": "right", "wire": "dataset"},
+    ]
+    assert [node["id"] for node in g["nodes"]] == ["section_1"]
+
+
+def test_add_section_rejects_invalid_outputs_without_partially_mutating_graph():
+    g = _empty()
+    with pytest.raises(graph_ops.GraphOpError, match="duplicate output port"):
+        graph_ops.add_node(
+            g, SPECS, "section_1", "section", config={"outputs": ["same", "same"]})
+    assert g["nodes"] == []
+
+
 def test_connect_records_source_wire_and_guards_duplicates():
     g = _empty()
     graph_ops.add_node(g, SPECS, "source_1", "source")
     graph_ops.add_node(g, SPECS, "filter_1", "filter")
     out = graph_ops.connect(g, SPECS, "e_1", "source_1", "filter_1")
     assert out["wire"] == "dataset" and len(g["edges"]) == 1
+    assert g["edges"][0]["sourceHandle"] == "out"
+    assert g["edges"][0]["targetHandle"] == "in"
     # a second wire into the same single-fan-in input is refused
     with pytest.raises(graph_ops.GraphOpError):
         graph_ops.connect(g, SPECS, "e_2", "source_1", "filter_1")
@@ -76,6 +97,60 @@ def test_connect_unknown_target_handle_raises():
         graph_ops.connect(g, SPECS, "e_1", "source_1", "join_1", target_handle="zzz")
 
 
+def test_connect_empty_target_handle_is_explicit_and_invalid():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.add_node(g, SPECS, "filter_1", "filter")
+
+    with pytest.raises(graph_ops.GraphOpError, match="no input handle"):
+        graph_ops.connect(g, SPECS, "e_1", "source_1", "filter_1", target_handle="")
+
+    assert g["edges"] == []
+
+
+def test_connect_multi_output_requires_and_persists_source_handle():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "check", "assert")
+    graph_ops.add_node(g, SPECS, "filter_1", "filter")
+    with pytest.raises(graph_ops.GraphOpError, match="source_handle is required"):
+        graph_ops.connect(g, SPECS, "missing", "check", "filter_1")
+
+    out = graph_ops.connect(
+        g, SPECS, "passes", "check", "filter_1", source_handle="pass")
+    assert out["source_handle"] == "pass"
+    assert g["edges"] == [{
+        "id": "passes", "source": "check", "target": "filter_1",
+        "sourceHandle": "pass", "targetHandle": "in", "data": {"wire": "dataset"},
+    }]
+
+
+def test_connect_rejects_unknown_source_handle():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "check", "assert")
+    graph_ops.add_node(g, SPECS, "filter_1", "filter")
+    with pytest.raises(graph_ops.GraphOpError, match="no output handle 'bogus'"):
+        graph_ops.connect(
+            g, SPECS, "e", "check", "filter_1", source_handle="bogus")
+
+
+def test_connect_canonicalizes_omitted_and_explicit_default_port_aliases():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "source_1", "source")
+    graph_ops.add_node(g, SPECS, "source_2", "source")
+    graph_ops.add_node(g, SPECS, "union_1", "union")
+    graph_ops.connect(g, SPECS, "first", "source_1", "union_1")
+    with pytest.raises(graph_ops.GraphOpError, match="already wired"):
+        graph_ops.connect(
+            g, SPECS, "source-alias", "source_1", "union_1",
+            target_handle="in", source_handle="out")
+
+    graph_ops.add_node(g, SPECS, "filter_1", "filter")
+    graph_ops.connect(g, SPECS, "input", "source_1", "filter_1")
+    with pytest.raises(graph_ops.GraphOpError, match="already connected"):
+        graph_ops.connect(
+            g, SPECS, "target-alias", "source_2", "filter_1", target_handle="in")
+
+
 def test_layout_new_ignores_section_child_coords_for_anchor():
     # a section child's position is parent-relative; it must not skew the absolute anchor for new nodes
     g = _empty()
@@ -92,11 +167,39 @@ def test_layout_new_ignores_section_child_coords_for_anchor():
 def test_set_config_merges_leaving_other_params():
     g = _empty()
     graph_ops.add_node(g, SPECS, "filter_1", "filter", config={"predicate": "a > 0"})
-    graph_ops.set_config(g, "filter_1", {"note": "keep"})
+    graph_ops.set_config(g, SPECS, "filter_1", {"note": "keep"})
     cfg = g["nodes"][0]["data"]["config"]
     assert cfg == {"predicate": "a > 0", "note": "keep"}
     with pytest.raises(graph_ops.GraphOpError):
-        graph_ops.set_config(g, "nope", {"x": 1})
+        graph_ops.set_config(g, SPECS, "nope", {"x": 1})
+
+
+def test_set_config_validates_section_outputs_before_mutating():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "section_1", "section", config={"outputs": ["out"]})
+
+    with pytest.raises(graph_ops.GraphOpError, match="duplicate output"):
+        graph_ops.set_config(g, SPECS, "section_1", {"outputs": ["left", "left"]})
+
+    assert g["nodes"][0]["data"]["config"]["outputs"] == ["out"]
+
+
+def test_set_config_canonicalizes_or_drops_section_output_edges():
+    g = _empty()
+    graph_ops.add_node(g, SPECS, "section_1", "section", config={"outputs": ["out"]})
+    graph_ops.add_node(g, SPECS, "left_target", "filter")
+    graph_ops.add_node(g, SPECS, "removed_target", "filter")
+    graph_ops.connect(g, SPECS, "kept", "section_1", "left_target")
+    graph_ops.connect(g, SPECS, "removed", "section_1", "removed_target")
+    g["edges"][0].pop("sourceHandle")
+    g["edges"][1]["sourceHandle"] = "removed"
+
+    result = graph_ops.set_config(
+        g, SPECS, "section_1", {"outputs": ["out", "right"]})
+
+    assert result["removed_edges"] == 1
+    assert [(edge["id"], edge["sourceHandle"]) for edge in g["edges"]] == [
+        ("kept", "out")]
 
 
 def test_remove_node_drops_node_and_its_edges():

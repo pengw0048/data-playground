@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub.backends import ExecutionBackend
-from hub.models import CompilePlan, Graph, Placement, RunEstimate, RunStatus
+from hub.models import CompilePlan, Graph, Placement, RunEstimate, RunOutput, RunStatus
 from hub.observability import (
     ALLOWED_METRIC_LABEL_KEYS,
     SCHEMA_VERSION,
@@ -54,6 +54,18 @@ def _labels_for(name: MetricName) -> dict[str, str]:
     if name in (MetricName.RUN_QUEUE_DELAY_MS, MetricName.RUN_RETRIES, MetricName.RUN_CANCEL_LATENCY_MS):
         return {"backend": "local", "error_class": "none", "outcome": "success", "placement": "local"}
     return {"status": "done", "outcome": "success", "placement": "local", "error_class": "none"}
+
+
+def _committed_output(rows: int) -> RunOutput:
+    return RunOutput(
+        node_id="n",
+        port_id="out",
+        wire="dataset",
+        publication_kind="result",
+        outcome="committed",
+        uri=f"/tmp/observability-result-{rows}.parquet",
+        rows=rows,
+    )
 
 
 def test_metric_and_audit_models_carry_schema_version_and_match_catalog():
@@ -252,12 +264,16 @@ def test_run_persists_request_id_on_durable_record(tmp_path):
     (tmp_path / "data").mkdir(exist_ok=True)
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"), maintain_storage=False)
     g = Graph(id=canvas_id, version=1, nodes=[], edges=[])
-    st = RunStatus(run_id="run_persist01", status="done", total_rows=3, ms=11,
+    st = RunStatus(run_id="run_persist01", status="done", target_node_id="n",
+                   total_rows=3, ms=11,
                    placement="local", request_id="req_persisted_01",
+                   outputs=[_committed_output(3)],
                    per_node=[PerNodeStatus(node_id="n", status="done", rows=3, ms=11)])
     _persist_run(d, g, "n", st)
     rows = metadb.list_runs(canvas_id)
     assert rows and rows[0]["requestId"] == "req_persisted_01"
+    assert rows[0]["outputs"][0]["uri"] == "/tmp/observability-result-3.parquet"
+    assert not ({"outputUri", "outputTable"} & rows[0].keys())
     assert metadb.run_request_id("run_persist01") == "req_persisted_01"
 
 
@@ -307,8 +323,10 @@ def test_faulty_and_blocking_sinks_do_not_change_run_results(tmp_path):
     add_metric_sink(good_metric)
 
     g = Graph(id="no_such_canvas", version=1, nodes=[], edges=[])
-    st = RunStatus(run_id="run_iso01", status="done", total_rows=7, ms=5, placement="local",
+    st = RunStatus(run_id="run_iso01", status="done", target_node_id="n",
+                   total_rows=7, ms=5, placement="local",
                    request_id="req_iso",
+                   outputs=[_committed_output(7)],
                    per_node=[PerNodeStatus(node_id="n", status="done", rows=7, ms=5)])
     t0 = time.perf_counter()
     try:
@@ -319,6 +337,7 @@ def test_faulty_and_blocking_sinks_do_not_change_run_results(tmp_path):
         assert metric_received.wait(timeout=1)
         assert st.status == "done" and st.total_rows == 7 and st.ms == 5
         assert good[0]["run_id"] == "run_iso01" and good[0]["request_id"] == "req_iso"
+        assert good[0]["outputs"][0]["uri"] == "/tmp/observability-result-7.parquet"
         assert any(m.name == MetricName.RUN_FINISHED for m in metrics)
     finally:
         blocked.set()
@@ -336,17 +355,21 @@ def test_legacy_telemetry_sink_still_receives_finished_run_records(tmp_path):
     Registry(d).add_telemetry_sink(got.append)
     g = Graph(id="no_such_canvas", version=1, nodes=[], edges=[])
     _persist_run(d, g, "n", RunStatus(
-        run_id="run_legacy01", status="done", total_rows=2, ms=3, placement="local",
+        run_id="run_legacy01", status="done", target_node_id="n",
+        total_rows=2, ms=3, placement="local",
         request_id="req_legacy",
+        outputs=[_committed_output(2)],
         per_node=[PerNodeStatus(node_id="n", status="done", rows=2, ms=3)]))
     assert drain_sinks()
     assert len(got) == 1
     assert got[0]["run_id"] == "run_legacy01"
     assert got[0]["request_id"] == "req_legacy"
     assert set(got[0]) >= {
-        "canvas_id", "target_node_id", "run_id", "request_id", "status", "rows", "ms",
-        "error", "output_table", "placement", "per_node",
+        "canvas_id", "target_node_id", "run_id", "request_id", "job_type", "status",
+        "rows", "ms", "error", "outputs", "placement", "per_node",
     }
+    assert got[0]["outputs"][0]["port_id"] == "out"
+    assert not ({"output_uri", "output_table"} & got[0].keys())
 
 
 def test_request_id_middleware_asgi_unit():

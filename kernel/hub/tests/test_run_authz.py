@@ -628,18 +628,21 @@ def test_viewer_can_read_completed_output_history_mcp_and_websocket(authed):
     assert response.status_code == 200, response.text
     run_id = response.json()["runId"]
     owner_status = _wait_for_terminal(run_id)
-    assert owner_status["status"] == "done" and owner_status["outputUri"]
+    assert owner_status["status"] == "done"
+    assert len(owner_status["outputs"]) == 1
+    owner_output = owner_status["outputs"][0]
+    assert owner_output["outcome"] == "committed" and owner_output["uri"]
 
     viewer_status = client.get(f"/api/run/{run_id}", headers=_hdr("authz_viewer"))
     assert viewer_status.status_code == 200
-    assert viewer_status.json()["outputUri"] == owner_status["outputUri"]
+    assert viewer_status.json()["outputs"] == owner_status["outputs"]
     history = client.get("/api/canvas/authz_canvas/runs", headers=_hdr("authz_viewer"))
     assert history.status_code == 200
     assert any(row["status"] == "done" and row["targetNodeId"] == "s" for row in history.json())
 
     mcp_status = _mcp_tool("authz_viewer", "run_status", {"runId": run_id})
     assert mcp_status.get("isError") is not True
-    assert mcp_status["structuredContent"]["outputUri"] == owner_status["outputUri"]
+    assert mcp_status["structuredContent"]["outputs"] == owner_status["outputs"]
     mcp_sample = _mcp_tool("authz_viewer", "sample_result", {"runId": run_id, "limit": 1})
     assert mcp_sample.get("isError") is not True and len(mcp_sample["structuredContent"]["rows"]) == 1
 

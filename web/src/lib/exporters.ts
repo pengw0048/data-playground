@@ -1,6 +1,7 @@
 // Real exports — download the node's data or the whole canvas. No stubs.
 import { api } from '../api/client'
 import { previewIsCurrent, previewPlanIdentity, useStore } from '../store/graph'
+import { nodeOutputs } from '../nodes/registry'
 
 const exportRequestGeneration = new Map<string, number>()
 let nextExportRequestGeneration = 0
@@ -31,22 +32,32 @@ export async function exportNode(id: string) {
   const { doc } = initial
   const node = doc.nodes.find((n) => n.id === id)
   if (!node) return
-  const name = (node.data.title || node.type).replace(/[^a-z0-9_-]+/gi, '_')
+  const ports = nodeOutputs(node)
+  const cached = initial.previews[id]
+  const selectedPortId = ports.length > 1
+    ? ports.find((port) => port.id === cached?.portId)?.id
+    : undefined
+  if (ports.length > 1 && !selectedPortId) {
+    initial.pushToast('Choose an output in Data before exporting this multi-output node.', 'info')
+    return
+  }
+  const baseName = (node.data.title || node.type).replace(/[^a-z0-9_-]+/gi, '_')
+  const portName = selectedPortId?.replace(/[^a-z0-9_-]+/gi, '_')
+  const name = portName ? `${baseName}-${portName}` : baseName
   const requestKey = `${doc.id}\u0000${id}`
   const generation = ++nextExportRequestGeneration
   exportRequestGeneration.set(requestKey, generation)
-  const planIdentity = previewPlanIdentity(doc, id)
-  const cached = initial.previews[id]
-  let res = cached && previewIsCurrent(cached, doc, id) ? cached.result : undefined
+  const planIdentity = previewPlanIdentity(doc, id, selectedPortId)
+  let res = cached && previewIsCurrent(cached, doc, id, selectedPortId) ? cached.result : undefined
   if (!res) {
     try {
-      res = await api.preview(doc, id, 500)
+      res = await api.preview(doc, id, 500, 0, selectedPortId)
     } catch (error) {
       if (exportRequestGeneration.get(requestKey) === generation) {
         exportRequestGeneration.delete(requestKey)
         const current = useStore.getState()
         if (!current.doc.nodes.some((candidate) => candidate.id === id)
-            || previewPlanIdentity(current.doc, id) !== planIdentity) {
+            || previewPlanIdentity(current.doc, id, selectedPortId) !== planIdentity) {
           current.pushToast('Export cancelled — the graph changed while the sample was loading. Try again.', 'info')
         } else {
           current.pushToast(
@@ -65,7 +76,7 @@ export async function exportNode(id: string) {
   if (exportRequestGeneration.get(requestKey) !== generation) return
   exportRequestGeneration.delete(requestKey)
   if (!current.doc.nodes.some((candidate) => candidate.id === id)
-      || previewPlanIdentity(current.doc, id) !== planIdentity) {
+      || previewPlanIdentity(current.doc, id, selectedPortId) !== planIdentity) {
     current.pushToast('Export cancelled — the graph changed while the sample was loading. Try again.', 'info')
     return
   }

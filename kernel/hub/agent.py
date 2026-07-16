@@ -161,8 +161,8 @@ When you DO build:
 - Call list_catalog and list_node_kinds first to see the datasets (with their columns + primary-key \
 candidates) and node kinds.
 - Every pipeline starts from a `source` node whose `uri` is a catalog table's uri.
-- Connect with `connect(source_id, target_id)`. Multi-input nodes (e.g. `join`) expose named \
-input handles — pass target_handle.
+- Connect with `connect(source_id, target_id)`. Multi-output sources require source_handle; multi-input \
+nodes (e.g. `join`) expose named input handles — pass target_handle.
 - BEFORE joining two datasets, call `join_hints(left_uri, right_uri)` — don't guess the key. It \
 gives the right key column(s) and the MEASURED cardinality. A 1:N / N:M join multiplies rows, so if \
 you then need one row per parent, add an `aggregate`. Set the join's `on` (same-named keys) or \
@@ -170,7 +170,8 @@ you then need one row per parent, add an `aggregate`. Set the join's `on` (same-
 - Configure with the params shown by list_node_kinds. For a `filter`, set `predicate` to a SQL \
 boolean expression over the columns. For `sql`, write a query using `input` as the table name. For \
 `transform`, write a Python function `def fn(row): ...` (mode "map") that returns the row.
-- Use `preview(node_id)` to verify a step. Under the default metadata-only egress policy it may \
+- Use `preview(node_id, port_id=...)` to verify a step. `port_id` is required when the node has \
+multiple outputs; use the exact declared output id. Under the default metadata-only egress policy it may \
 return columns and row count without sample values — that is intentional. Adapt using metadata \
 when values are withheld.
 - Build the MINIMUM graph that achieves the outcome. Don't add nodes they didn't ask for.
@@ -277,36 +278,41 @@ try:
 
     @_agent.tool
     def connect(ctx: RunContext[_Ctx], source_id: str, target_id: str,
-                target_handle: str | None = None) -> dict:
-        """Connect one node's output to another node's input. target_handle picks a multi-input handle (e.g. join 'a'/'b')."""
+                target_handle: str | None = None,
+                source_handle: str | None = None) -> dict:
+        """Connect ports. source_handle is required for a multi-output source; target_handle selects a named input."""
         try:
             out = graph_ops.connect(ctx.deps.wg, ctx.deps.kdeps.node_specs, _new_id(ctx.deps, "e"),
-                                    source_id, target_id, target_handle)
+                                    source_id, target_id, target_handle, source_handle)
         except graph_ops.GraphOpError as e:
             out = {"error": str(e)}
         return _finish(ctx.deps, "connect",
-                       {"source_id": source_id, "target_id": target_id, "target_handle": target_handle}, out)
+                       {"source_id": source_id, "target_id": target_id,
+                        "source_handle": source_handle, "target_handle": target_handle}, out)
 
     @_agent.tool
     def set_config(ctx: RunContext[_Ctx], node_id: str, config: dict) -> dict:
         """Merge config values into an existing node."""
         try:
-            out = graph_ops.set_config(ctx.deps.wg, node_id, config)
+            out = graph_ops.set_config(
+                ctx.deps.wg, ctx.deps.kdeps.node_specs, node_id, config)
         except graph_ops.GraphOpError as e:
             out = {"error": str(e)}
         return _finish(ctx.deps, "set_config", {"node_id": node_id, "config": config}, out)
 
     @_agent.tool
-    def preview(ctx: RunContext[_Ctx], node_id: str) -> dict:
+    def preview(ctx: RunContext[_Ctx], node_id: str, port_id: str | None = None) -> dict:
         """Preview a node over a small sample. Returns columns and up to 8 rows when policy allows;
-        under metadata-only, columns and row count stay but sample values are withheld."""
+        port_id is required for a multi-output node and must name an exact declared output. Under
+        metadata-only, columns and row count stay but sample values are withheld."""
         d = ctx.deps.kdeps
         if not graph_ops.find_node(ctx.deps.wg, node_id):
             out: dict = {"error": "node_id not found"}
         else:
             try:
                 res = preview_node(Graph(**ctx.deps.wg), node_id, 8, d.resolve_adapter, d.registry,
-                                   d.node_builders, d.node_specs, storage=d.storage)
+                                   d.node_builders, d.node_specs, storage=d.storage,
+                                   port_id=port_id)
                 if res.not_previewable:
                     out = {"not_previewable": True, "reason": res.reason}
                 elif res.error:
@@ -315,7 +321,7 @@ try:
                     out = {"columns": [c.name for c in res.columns], "rows": res.rows[:8], "row_count": res.row_count}
             except Exception as e:  # noqa: BLE001
                 out = {"error": f"{type(e).__name__}: {e}"}
-        return _finish(ctx.deps, "preview", {"node_id": node_id}, out)
+        return _finish(ctx.deps, "preview", {"node_id": node_id, "port_id": port_id}, out)
 
 except ImportError:  # pydantic_ai not installed — agent_status() reports it; run_agent raises
     _agent = None

@@ -340,7 +340,7 @@ def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_
     # The KEY requirement: a destination's credId (its resolved cfg) — not the global default — is
     # what the write path binds at the object-store open.
     from hub import db, destinations
-    from hub.models import Graph, PerNodeStatus, RunStatus
+    from hub.models import Graph, PerNodeStatus, RunOutput, RunStatus
     from hub.plugins.runner import LocalRunner, _CancelToken
 
     DEST_CFG = {"region": "dest-region"}     # distinctive, non-secret so resolve is a pass-through
@@ -362,8 +362,13 @@ def test_destination_cred_reaches_ensure_object_store_on_write(monkeypatch, tmp_
     node = {n.id: n for n in graph.nodes}["write"]
     runner = LocalRunner(lambda _uri: object(), {}, object(), str(tmp_path))
     assert runner.supports_selected_destination_credentials() is True
-    status = RunStatus(run_id="r", status="running",
-                       per_node=[PerNodeStatus(node_id="write", status="running", label="write")])
+    status = RunStatus(
+        run_id="r", status="running", target_node_id="write",
+        per_node=[PerNodeStatus(node_id="write", status="running", label="write")],
+        outputs=[RunOutput(
+            node_id="write", port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="pending")],
+    )
 
     # no incoming edge -> _commit_write binds the destination's credential, then returns before any
     # real object I/O; that binding is exactly what a real write would run on.

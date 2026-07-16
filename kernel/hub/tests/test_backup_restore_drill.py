@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
 from hub import handoff, metadb
+from hub.models import RunOutput
 from hub.storage import LocalStorage
 
 
@@ -155,13 +156,29 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     Path(artifact_uri).write_bytes(b"drill-local-result-bytes")
     storage.commit_result(artifact_uri, run_id)
     metadb.bind_run_owner(run_id, metadb.DEFAULT_USER_ID, canvas_id)
+    run_output = RunOutput(
+        node_id="n1",
+        port_id="out",
+        wire="dataset",
+        publication_kind="result",
+        outcome="committed",
+        uri=artifact_uri,
+        rows=1,
+    ).model_dump()
     metadb.save_run_state(
         run_id,
-        {"run_id": run_id, "status": "done", "output_uri": artifact_uri, "output_table": None},
+        {
+            "run_id": run_id,
+            "status": "done",
+            "target_node_id": "n1",
+            "total_rows": 1,
+            "outputs": [run_output],
+        },
         canvas_id=canvas_id,
     )
     assert storage.release_result(artifact_uri, run_id) is True
-    metadb.record_run(canvas_id, "n1", "done", rows=1, run_id=run_id, output_uri=artifact_uri)
+    metadb.record_run(
+        canvas_id, "n1", "run", "done", rows=1, outputs=[run_output], run_id=run_id)
     artifact_rel = str(Path(artifact_uri).resolve().relative_to(Path(storage.root).resolve()))
 
     object_store_cred = metadb.cred_upsert(
@@ -223,10 +240,16 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         assert json.loads(canvas.doc)["nodes"][0]["id"] == "n1"
         runs = list(session.scalars(
             select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == info["canvas_id"])))
-        assert any(row.run_id == info["run_id"] and row.output_uri == info["artifact_uri"]
-                   for row in runs)
+        assert any(
+            row.run_id == info["run_id"]
+            and json.loads(row.outputs)[0]["uri"] == info["artifact_uri"]
+            for row in runs
+        )
         state = session.get(metadb.RunState, info["run_id"])
         assert state is not None and state.status == "done"
+        state_doc = json.loads(state.doc)
+        assert state_doc["outputs"][0]["uri"] == info["artifact_uri"]
+        assert not ({"output_uri", "output_table"} & state_doc.keys())
         artifact = session.get(metadb.LocalResultArtifact, info["artifact_uri"])
         assert artifact is not None and artifact.state == "ready"
         setting = session.scalar(select(metadb.Setting).where(

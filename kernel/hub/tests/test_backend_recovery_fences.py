@@ -11,7 +11,7 @@ from sqlalchemy import event, select
 
 from hub import metadb
 from hub.job_artifacts import RAY_JOB_CONTRACT_VERSION, canonical_json
-from hub.models import RunStatus
+from hub.models import RunOutput, RunStatus
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -93,14 +93,33 @@ def _backend_ref(ref: dict) -> dict:
 
 def _run_status(
         run_id: str, ref: dict, status: str, error: str | None = None) -> dict:
+    outcome = {
+        "queued": "pending",
+        "running": "pending",
+        "done": "committed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }[status]
+    output_uri = f"{ref['result_uri']}.parquet" if status == "done" else None
     return RunStatus(
         run_id=run_id,
         status=status,
+        target_node_id="target",
         rows_processed=0,
         total_rows=0 if status == "done" else None,
         per_node=[],
         progress=1.0 if status == "done" else None,
         error=error,
+        outputs=[RunOutput(
+            node_id="target",
+            port_id="out",
+            wire="dataset",
+            publication_kind="result",
+            outcome=outcome,
+            uri=output_uri,
+            rows=0 if status == "done" else None,
+            error=error if outcome in ("failed", "cancelled") else None,
+        )],
         backend_ref=_backend_ref(ref),
     ).model_dump()
 
@@ -122,7 +141,8 @@ def _begin_terminal(
             "status": "done",
             "rows": 0,
             "error": None,
-            "output_uri": None,
+            # Private Ray v3 artifact fields are mapped once into the public RunOutput above.
+            "output_uri": f"{ref['result_uri']}.parquet",
             "output_table": None,
             "outputs": [],
         }

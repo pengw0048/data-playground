@@ -21,6 +21,9 @@ from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph
+from hub.run_outputs import (
+    UnsupportedRunOutputs, preflight_run_output_target, require_single_run_output,
+)
 from hub.security import current_user
 from hub.settings import settings
 from hub.storage import ManagedSourceReadError
@@ -71,35 +74,10 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
     return cid, role
 
 
-def _unknown_kind_error(graph, deps) -> str | None:
-    """P0-DATA-02: a node whose kind isn't registered (a missing plugin, a misspelling) used to compile
-    and execute as a silent passthrough — the pipeline reports success while omitting the work. Return a
-    human error naming the first offender, or None if every kind is recognized."""
-    unknown = graph_mod.unknown_kinds(graph, set(deps.node_specs) | set(deps.node_builders))
-    if not unknown:
-        return None
-    nid, t = unknown[0]
-    return f"unknown node kind '{t}' (node '{nid}') — install its plugin or remove the node"
-
-
 def _invalid_graph(graph, deps, target_node_id: str | None = None) -> tuple[str, bool] | None:
-    """The single validation path for every API that consumes a caller-supplied graph.
-
-    Returns ``(message, acyclic)`` so compile can preserve its error-plan contract while the other
-    endpoints consistently reject the same malformed graph with HTTP 400.
-    """
-    unknown = _unknown_kind_error(graph, deps)
-    if unknown:
-        return unknown, True  # preserve P0-DATA-02's existing error text and compile semantics
-    structural = graph_mod.structural_errors(graph, deps.node_specs, target_node_id)
-    if structural:
-        return "invalid graph: " + "; ".join(structural[:5]), True
-    errs = graph_mod.type_errors(graph, deps.node_specs)
-    if errs:
-        return "incompatible connection: " + "; ".join(errs[:5]), True
-    if not graph_mod.is_acyclic(graph):
-        return "graph has a cycle — control flow must be encapsulated (§5.7)", False
-    return None
+    """Compatibility wrapper around the shared graph-ingress validator."""
+    return graph_mod.validation_error(
+        graph, deps.node_specs, deps.node_builders, target_node_id)
 
 
 def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
@@ -112,6 +90,45 @@ def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
             code=APIErrorCode.INVALID_GRAPH,
             retryable=False,
         )
+
+
+def _inspection_port(graph, node_id: str, port_id: str | None, deps) -> str:
+    """Validate a single-relation request before it can acquire a source or compute resource."""
+    try:
+        return graph_mod.require_output_port(graph, node_id, deps.node_specs, port_id).id
+    except KeyError as exc:
+        raise APIError(
+            400, str(exc).strip("'"), code=APIErrorCode.OUTPUT_PORT_NOT_FOUND,
+            retryable=False,
+        ) from exc
+    except ValueError as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.OUTPUT_PORT_REQUIRED,
+            retryable=False,
+        ) from exc
+
+
+def _require_single_backend_output(graph, node_id: str, deps) -> None:
+    try:
+        require_single_run_output(graph, node_id, deps.node_specs)
+    except ValueError as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.MULTI_OUTPUT_UNSUPPORTED,
+            retryable=False,
+        ) from exc
+
+
+def _run_output_preflight(plan, graph, requested_target: str | None, deps) -> str | None:
+    try:
+        output_target = preflight_run_output_target(plan, requested_target)
+    except UnsupportedRunOutputs as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.MULTI_OUTPUT_UNSUPPORTED,
+            retryable=False,
+        ) from exc
+    if output_target is not None:
+        _require_single_backend_output(graph, output_target, deps)
+    return output_target
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
@@ -132,15 +149,17 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
+    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     k = req.k if req.k is not None else settings.preview_k
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return SampleResult(**kb.preview(req.graph, req.node_id, k, max(0, req.offset)))  # on the canvas's warm kernel
+            return SampleResult(**kb.preview(
+                req.graph, req.node_id, k, max(0, req.offset), port_id))
         except Exception as e:  # noqa: BLE001 — kernel unreachable / spawn timeout → a clean error, not a raw 500
             return SampleResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
     return preview_node(req.graph, req.node_id, k,
                         deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
-                        offset=max(0, req.offset), storage=deps.storage)
+                        offset=max(0, req.offset), storage=deps.storage, port_id=port_id)
 
 
 @router.post("/run/profile", response_model=ProfileResult)
@@ -154,13 +173,16 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
+    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return ProfileResult(**kb.profile(req.graph, req.node_id, full=False))  # bounded sample on the warm kernel
+            return ProfileResult(**kb.profile(
+                req.graph, req.node_id, full=False, port_id=port_id))
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
             return ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
     return profile_node(req.graph, req.node_id, deps.resolve_adapter, deps.registry,
-                        deps.node_builders, deps.node_specs, full=False, storage=deps.storage)
+                        deps.node_builders, deps.node_specs, full=False, storage=deps.storage,
+                        port_id=port_id)
 
 
 def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
@@ -223,6 +245,7 @@ def estimate_full_profile(req: ProfileEstimateRequest,
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
+    _require_single_backend_output(req.graph, req.node_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
     # Pin one managed-source generation across both observations. Their internal scopes remain useful
     # in direct-call paths, while this outer lease prevents size and digest from describing two different
@@ -243,6 +266,7 @@ def current_profile_identity(req: ProfileIdentityRequest,
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
+    _require_single_backend_output(req.graph, req.node_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
     return ProfileIdentity(plan_digest=_profile_plan_digest(req.graph, req.node_id, deps))
 
@@ -333,6 +357,10 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
         else:
             graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
             _reject_invalid(req.graph, deps, req.node_id)
+            # Port identity is not part of the durable full-profile state machine until #266. New
+            # dispatches reject before source acquisition or run-id allocation. Immutable replay above
+            # deliberately adopts its stored terminal result without revalidating a changed graph.
+            _require_single_backend_output(req.graph, req.node_id, deps)
             _require_full_profile_containment(req.graph, req.node_id, deps)
 
             # Keep managed inputs pinned from identity minting until the kernel-side process runner has
@@ -777,6 +805,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _run_output_preflight(plan, req.graph, req.target_node_id, deps)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
     _require_destination_credential_preflight(deps, runner, plan, req.graph)
@@ -818,6 +847,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
+    _run_output_preflight(plan, graph, target_node_id, deps)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone

@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  estimate: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
+  estimate: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -21,6 +21,8 @@ vi.mock('../api/client', () => ({
             ? apiMocks.preview
             : property === 'estimate'
               ? apiMocks.estimate
+              : property === 'run'
+                ? apiMocks.run
               : property === 'profileEstimate'
                 ? apiMocks.profileEstimate
               : property === 'profileIdentity'
@@ -41,7 +43,9 @@ vi.mock('../api/client', () => ({
   setApiUser: vi.fn(),
 }))
 
-import { previewPlanIdentity, profilePlanIdentity, useStore } from './graph'
+import {
+  currentPreviews, fullRunUnavailableReason, previewPlanIdentity, profilePlanIdentity, useStore,
+} from './graph'
 import { KernelError } from '../api/client'
 
 const storage = new Map<string, string>()
@@ -74,6 +78,10 @@ describe('graph store — core authority ops', () => {
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
+    apiMocks.run.mockReset().mockResolvedValue({
+      runId: 'run-store-test', status: 'running', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
     apiMocks.profileEstimate.mockReset().mockResolvedValue({
       rows: 10, bytes: 100, placement: 'local', needsConfirm: false, planDigest: 'a'.repeat(64),
     })
@@ -117,6 +125,45 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(0)  // back to the empty baseline
   })
 
+  it('does not treat a non-Section config.outputs field as a port declaration', () => {
+    const plugin = NODE('plugin', 'configured-plugin')
+    const sink = NODE('sink', 'write')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [plugin, sink],
+        edges: [{
+          id: 'plugin-sink', source: 'plugin', sourceHandle: 'declared',
+          target: 'sink', targetHandle: 'in', data: { wire: 'dataset' },
+        }],
+      },
+    })
+
+    useStore.getState().updateConfig('plugin', { outputs: ['unrelated-config-value'] })
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['plugin-sink'])
+  })
+
+  it('binds an implicit Section edge to its former sole port when outputs become named', () => {
+    const section = NODE('section', 'section')
+    section.data.config = { outputs: ['out'] }
+    const keep = NODE('keep', 'write')
+    const drop = NODE('drop', 'write')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [section, keep, drop],
+        edges: [
+          { id: 'implicit', source: 'section', target: 'keep', data: { wire: 'dataset' } },
+          { id: 'removed', source: 'section', sourceHandle: 'old', target: 'drop', data: { wire: 'dataset' } },
+        ],
+      },
+    })
+
+    useStore.getState().updateConfig('section', { outputs: ['left', 'out'] })
+
+    expect(useStore.getState().doc.edges).toEqual([expect.objectContaining({
+      id: 'implicit', sourceHandle: 'out',
+    })])
+  })
+
   it('loads unsupported historical shapes verbatim instead of silently migrating them', () => {
     const legacy = {
       id: 'legacy', version: 1, nodes: [{
@@ -153,6 +200,71 @@ describe('graph store — core authority ops', () => {
     apiMocks.preview.mockResolvedValueOnce(previewResult('view'))
     await useStore.getState().runPreview('filter')
     expect(useStore.getState().previews.filter?.result?.rows).toEqual([{ value: 'view' }])
+  })
+
+  it('binds multi-output preview freshness to the selected port and preserves it on refresh', async () => {
+    let finishPass!: (result: ReturnType<typeof previewResult>) => void
+    let finishOut!: (result: ReturnType<typeof previewResult>) => void
+    apiMocks.preview
+      .mockResolvedValueOnce(previewResult('default out'))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishPass = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOut = resolve }))
+    const section = NODE('section', 'section')
+    section.data.config = { outputs: ['pass', 'out'] }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [section], edges: [] }
+    useStore.setState({ doc })
+
+    expect(previewPlanIdentity(doc, 'section', 'pass')).not.toBe(previewPlanIdentity(doc, 'section', 'out'))
+    await useStore.getState().runPreview('section')
+    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out')
+    const pass = useStore.getState().runPreview('section', 0, 'pass')
+    const out = useStore.getState().runPreview('section', 0, 'out')
+    finishOut(previewResult('selected out'))
+    await out
+    finishPass(previewResult('stale pass'))
+    await pass
+
+    expect(useStore.getState().previews.section).toMatchObject({
+      portId: 'out', result: previewResult('selected out'),
+    })
+    apiMocks.preview.mockResolvedValueOnce(previewResult('refreshed out'))
+    await useStore.getState().runPreview('section')
+    expect(apiMocks.preview).toHaveBeenLastCalledWith(doc, 'section', 50, 0, 'out')
+    expect(useStore.getState().previews.section).toMatchObject({
+      portId: 'out', result: previewResult('refreshed out'),
+    })
+    expect(currentPreviews(doc, useStore.getState().previews)).toEqual({})
+  })
+
+  it('gates every full-run entry point for a multi-output node before backend work', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events.parquet' }
+    const section = NODE('section', 'section')
+    section.data.config = {
+      outputs: ['left', 'right'], script: "emit(inputs['in'], 'left')", params: {}, maxRuns: 200,
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, section],
+      edges: [{ id: 'source-section', source: 'source', target: 'section', data: { wire: 'dataset' as const } }],
+    }
+    useStore.setState({ doc })
+
+    expect(fullRunUnavailableReason(doc, 'section')).toMatch(/Preview a named output instead/)
+    await useStore.getState().requestRun('section')
+    await useStore.getState().estimate('section')
+    await useStore.getState().run('section')
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.section).toBeUndefined()
+    expect(useStore.getState().toasts).toHaveLength(3)
+    expect(useStore.getState().toasts.every((toast) => toast.kind === 'info')).toBe(true)
+
+    useStore.setState({ toasts: [] })
+    useStore.getState().rerunAll()
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(useStore.getState().toasts).toHaveLength(1)
+    expect(useStore.getState().toasts[0].msg).toMatch(/Skipped 1 multi-output pipeline/)
   })
 
   it('uses one deterministic target execution identity for previews and profiles', () => {
@@ -907,7 +1019,10 @@ describe('graph store — core authority ops', () => {
       .mockResolvedValueOnce({
         ...running, status: 'cancelled', rowsProcessed: 999, totalRows: 999,
         profile: { columns: [], rowCount: 999, sampled: false },
-        outputUri: '/must/not/leak.parquet',
+        outputs: [{
+          nodeId: 'source', portId: 'out', wire: 'dataset', publicationKind: 'result',
+          outcome: 'committed', uri: '/must/not/leak.parquet', rows: 999,
+        }],
       })
 
     await useStore.getState().startFullProfile('source')
@@ -921,7 +1036,7 @@ describe('graph store — core authority ops', () => {
       status: { runId: running.runId, status: 'cancelled', rowsProcessed: 0, ms: 0, perNode: [] },
     }))
     expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
-    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputs).toEqual([])
   })
 
   it('reconciles a compact cancellation terminal through the durable exact-attempt projection', async () => {
@@ -1222,7 +1337,10 @@ describe('graph store — core authority ops', () => {
       planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 2, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 2, sampled: false },
-      outputUri: '/unverified/result.parquet', outputTable: 'unverified',
+      outputs: [{
+        nodeId: 'source', portId: 'out', wire: 'dataset', publicationKind: 'catalog',
+        outcome: 'committed', uri: '/unverified/result.parquet', table: 'unverified', rows: 2,
+      }],
     }
     apiMocks.activeRuns.mockResolvedValueOnce([recovered])
     let finishIdentity!: (identity: { planDigest: string }) => void
@@ -1239,7 +1357,7 @@ describe('graph store — core authority ops', () => {
       status: { runId: recovered.runId, profileAttemptOrder: 2 },
     })
     expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
-    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputs).toEqual([])
     expect(useStore.getState().profileJobs.source.status).toMatchObject({
       rowsProcessed: 0, ms: 0, perNode: [],
     })
@@ -1260,7 +1378,10 @@ describe('graph store — core authority ops', () => {
       planDigest: 'a'.repeat(64), profileAttemptOrder: 4,
       rowsProcessed: 0, totalRows: 10, ms: 0, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 999, sampled: false },
-      outputUri: '/must/not/leak.parquet', outputTable: 'must_not_leak',
+      outputs: [{
+        nodeId: 'source', portId: 'out', wire: 'dataset', publicationKind: 'catalog',
+        outcome: 'committed', uri: '/must/not/leak.parquet', table: 'must_not_leak', rows: 999,
+      }],
     }
     apiMocks.activeRuns.mockResolvedValueOnce([recovered])
     apiMocks.profileIdentity.mockRejectedValue(new Error('identity unavailable'))
@@ -1279,7 +1400,7 @@ describe('graph store — core authority ops', () => {
       },
     })
     expect(useStore.getState().profileJobs.source.status?.profile).toBeUndefined()
-    expect(useStore.getState().profileJobs.source.status?.outputUri).toBeUndefined()
+    expect(useStore.getState().profileJobs.source.status?.outputs).toEqual([])
     expect(useStore.getState().profileJobs.source.status).toMatchObject({
       rowsProcessed: 0, ms: 0, perNode: [],
     })

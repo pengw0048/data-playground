@@ -15,7 +15,9 @@ import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useSchemaWarnings } from './fields'
-import { useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind } from '../store/graph'
+import {
+  fullRunUnavailableReason, useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind,
+} from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
 
@@ -45,6 +47,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
+  const fullRunUnavailable = useStore((s) => fullRunUnavailableReason(s.doc, id))
   // hover drives the action shelf. The shelf is a DOM descendant of this wrapper (just positioned
   // below it), so the wrapper's own enter/leave already covers card↔shelf travel — moving between
   // them never leaves the subtree, so onMouseLeave doesn't fire. A short grace delay on leave then
@@ -205,9 +208,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={invalid ?? (!runnable ? 'Connect a source to run' : busy ? 'Stop' : 'Run up to here')}
+              label={busy ? 'Stop' : invalid ?? fullRunUnavailable ?? (!runnable ? 'Connect a source to run' : 'Run up to here')}
               active={openPanel === 'run'}
-              disabled={!canEdit || ((!runnable || !!invalid) && !busy)}
+              disabled={!canEdit || ((!runnable || !!invalid || !!fullRunUnavailable) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}

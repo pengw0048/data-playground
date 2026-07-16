@@ -29,9 +29,10 @@ function result(value: string): SampleResult {
   }
 }
 
-function boundPreview(doc: CanvasDoc, nodeId: string, value: string): PreviewState {
+function boundPreview(doc: CanvasDoc, nodeId: string, value: string, portId?: string): PreviewState {
   return {
-    canvasId: doc.id, nodeId, planIdentity: previewPlanIdentity(doc, nodeId), requestGeneration: 1,
+    canvasId: doc.id, nodeId, portId,
+    planIdentity: previewPlanIdentity(doc, nodeId, portId), requestGeneration: 1,
     offset: 0, result: result(value),
   }
 }
@@ -89,7 +90,7 @@ describe('node sample export freshness', () => {
 
     await exportNode('target')
 
-    expect(apiMocks.preview).toHaveBeenCalledWith(currentDoc, 'target', 500)
+    expect(apiMocks.preview).toHaveBeenCalledWith(currentDoc, 'target', 500, 0, undefined)
     expect(downloads).toHaveLength(2)
     expect(await blobs[0].text()).toContain('fresh')
     expect(await blobs[0].text()).not.toContain('stale')
@@ -111,6 +112,35 @@ describe('node sample export freshness', () => {
 
     expect(apiMocks.preview).not.toHaveBeenCalled()
     expect(downloads).toEqual(['target.json', 'target.csv'])
+  })
+
+  it('exports the visible named output with port-bound identity and filenames', async () => {
+    const doc = pipeline()
+    doc.nodes[1].type = 'section'
+    doc.nodes[1].data.config = { outputs: ['left', 'right'] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', 'visible right', 'right') },
+    })
+
+    await exportNode('target')
+
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(downloads).toEqual(['target-right.json', 'target-right.csv'])
+    expect(await blobs[0].text()).toContain('visible right')
+  })
+
+  it('requires a visible named output before exporting a multi-output node', async () => {
+    const doc = pipeline()
+    doc.nodes[1].type = 'section'
+    doc.nodes[1].data.config = { outputs: ['left', 'out', 'right'] }
+    useStore.setState({ doc, previews: {} })
+
+    await exportNode('target')
+
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(downloads).toEqual([])
+    expect(useStore.getState().toasts.at(-1)?.msg).toMatch(/choose an output in data/i)
   })
 
   it('drops a refreshed export when the graph changes before its response arrives', async () => {

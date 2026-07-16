@@ -129,6 +129,23 @@ the capability unless the backend uses the selected Cred rather than silently fa
 credentials. A remote backend also owns truthful cancellation, deadlines, resource limits, worker trust,
 and operational documentation for the shapes it claims.
 
+Every public `RunStatus` uses the same named-output contract. `outputs` is a declaration-ordered array
+of `RunOutput` snapshots (`nodeId`, `portId`, `portLabel`, `wire`, `publicationKind`, `outcome`, and the
+committed publication fields); there are no singular `outputUri` or `outputTable` fields. An ordinary
+run exposes its expected output as `pending` in the first observable status, and every terminal status
+settles it as `committed`, `failed`, `cancelled`, or `skipped`. A successful targeted run must contain a
+committed output. Profile jobs are inspection jobs: they set `jobType="profile"`, keep `outputs=[]` and
+`totalRows=null`, and report their row count only in `profile.rowCount`.
+
+The collection shape is intentionally future-facing, but the current execution/publication state
+machines support exactly one output. A backend must reject a target with zero or multiple declared
+ports, and a full run with multiple write sinks, before allocating a run identity, worker, job, or
+artifact. It must not choose the first port or write as a fallback. Multi-output materialization is a
+separate capability and cannot be advertised merely by returning more array elements. The private Ray
+Jobs v3 result artifact still contains `output_uri`, `output_table`, and step-level `outputs` for its
+versioned worker/supervisor protocol; those keys are not plugin SPI and must be translated into public
+`RunOutput` values only after publication is attested.
+
 `reg.add_capability(cap)` declares a column capability. Optional `detect(col) -> bool` tags matching
 columns via `tag_columns`. Optional `viewer = {"kind": …}` adds a declarative viewer tab the SPA
 renders generically (`grid` for media, `json` for pretty-printed cells), surfaced through
@@ -181,8 +198,10 @@ it. Default is `NullImporter` (501). Core auto-lays out an imported graph left u
 Built-in `local` / `s3` / `gs` go through the same registry.
 
 `reg.add_telemetry_sink(fn)` exports finished-run telemetry. `fn(record: dict)` is called once per
-finished run with `canvas_id`, `run_id`, `request_id`, `status`, `rows`, `ms`, `error`, `output_table`,
-`placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`). Core ships no exporter. A sink that
+finished run with `canvas_id`, `run_id`, `request_id`, `job_type`, `status`, `rows`, `ms`, `error`,
+declaration-ordered `outputs`, `placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`).
+Each output snapshots `node_id`, `port_id`, its declared label/wire, publication kind, outcome, and only
+after commit its URI/table/row count. Core ships no exporter. A sink that
 raises is caught and logged, never failing the run. Delivery is best-effort and asynchronous through a
 finite per-sink queue; overload drops the newest event with a rate-limited warning. It stays alongside
 the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md) and

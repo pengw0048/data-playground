@@ -347,6 +347,7 @@ class BuildEngine:
                  schema_only: bool = False, warm=None, warm_scope: str = "",
                  pushdown: bool = False, output_node: str | None = None):
         self.graph = graph
+        self._nodes = g.node_map(graph)
         self.resolve_adapter = resolve_adapter
         self.registry = registry
         self.sample_k = sample_k
@@ -378,16 +379,51 @@ class BuildEngine:
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
 
     # -- public ------------------------------------------------------------ #
-    def relation(self, node_id: str, handle: str | None = None) -> Relation:
+    def build(self, node_id: str) -> None:
+        """Build and validate every declared output without selecting one relation.
+
+        Execution walks every plan step eagerly, including multi-output intermediates.  Selection is
+        a consumer operation and must happen only when an edge or inspection request names a port.
+        """
         if node_id not in self._cache:
-            self._cache[node_id] = self._warm_or_lower(node_id)
+            built = self._warm_or_lower(node_id)
+            self._validate_built_outputs(node_id, built)
+            self._cache[node_id] = built
+
+    def relation(self, node_id: str, handle: str | None = None) -> Relation:
+        self.build(node_id)
         return self._pick(node_id, self._cache[node_id], handle)
+
+    def _validate_built_outputs(self, node_id: str, built) -> None:
+        """Require runtime named outputs to match the declaration exactly."""
+        if not self.node_specs:
+            return
+        node = self._nodes[node_id]
+        ports = g.effective_output_ports_for_node(node, self.node_specs[node.type])
+        declared = [port.id for port in ports]
+        if not isinstance(built, dict):
+            if len(declared) != 1:
+                raise RuntimeError(
+                    f"node '{node_id}' declared named outputs {declared!r} but returned one relation")
+            return
+        runtime = list(built)
+        missing = [port_id for port_id in declared if port_id not in built]
+        extra = [port_id for port_id in runtime if port_id not in declared]
+        if missing or extra:
+            parts = []
+            if missing:
+                parts.append(f"missing {missing!r}")
+            if extra:
+                parts.append(f"unexpected {extra!r}")
+            raise RuntimeError(
+                f"node '{node_id}' emitted outputs that do not match its declaration: "
+                + "; ".join(parts))
 
     def _warm_or_lower(self, node_id: str):
         """Build a node — reusing the warm cache when set. A hit skips the whole upstream subgraph; a
         cacheable miss is materialized (row-capped) for the next preview. Keyed by the shared plan_hash
         so any edit invalidates it; only single-output, cacheable nodes are cached."""
-        node = g.node_map(self.graph)[node_id]
+        node = self._nodes[node_id]
         if self.warm is None:
             return self._lower(node)
         from hub.plan_key import plan_cacheable, plan_hash
@@ -405,20 +441,28 @@ class BuildEngine:
         return built
 
     def _pick(self, node_id: str, built, handle: str | None) -> Relation:
-        # single-output nodes build a bare Relation and ignore the handle; multi-output nodes
-        # build {port -> Relation}, so route by the edge's source_handle (default port = "out").
+        node = self._nodes[node_id]
+        ports = (g.effective_output_ports_for_node(node, self.node_specs[node.type])
+                 if self.node_specs and node.type in self.node_specs else [])
+        # Single-output nodes build a bare Relation; an explicit handle must still identify that port.
+        # Multi-output nodes build {port -> Relation}; omitting a handle is never a first-entry shortcut.
         if not isinstance(built, dict):
+            if handle is not None and ports and handle != ports[0].id:
+                raise NotPreviewable(
+                    node, f"output port '{handle}' was not produced")
             return built
         if handle is not None and handle in built:
             return built[handle]
         if handle is None:
-            # explicit key check — a DuckDB relation is falsy when it has 0 rows (defines __len__),
-            # so `built.get("out") or …` would wrongly skip an empty default port (and force a count).
-            return built["out"] if "out" in built else next(iter(built.values()))
-        raise NotPreviewable(g.node_map(self.graph)[node_id], f"output port '{handle}' was not produced")
+            if len(built) == 1:
+                return built[next(iter(built))]
+            raise NotPreviewable(
+                node, "select an output port for this multi-output node")
+        raise NotPreviewable(node, f"output port '{handle}' was not produced")
 
-    def rows(self, node_id: str, k: int, offset: int = 0) -> tuple[list[dict], list[ColumnSchema]]:
-        tbl = self.relation(node_id).limit(k, offset).to_arrow_table()
+    def rows(self, node_id: str, k: int, offset: int = 0,
+             handle: str | None = None) -> tuple[list[dict], list[ColumnSchema]]:
+        tbl = self.relation(node_id, handle).limit(k, offset).to_arrow_table()
         # a join over columns that share a name (e.g. both inputs have `id`) yields duplicate
         # column names; de-dup so no column is silently dropped when rows become dicts.
         names = _dedupe_names(tbl.column_names)
@@ -470,7 +514,7 @@ class BuildEngine:
         outs = g.outgoing(self.graph, node.id)
         if len(outs) != 1:
             return None, None
-        consumer = g.node_map(self.graph).get(outs[0].target)
+        consumer = self._nodes.get(outs[0].target)
         if consumer is None or _disabled(consumer) or _bypassed(consumer):
             return None, None
         ccfg = _cfg(consumer)
@@ -591,9 +635,18 @@ class BuildEngine:
             v = self._view(parent, "as")
             # no predicate → ZERO violations (`WHERE false`, not `return parent`: this port is the VIOLATING
             # rows, so passing the input through would count every row as a violation). WHERE keeps the schema.
-            if pred:
-                validate_fragment(FragmentKind.PREDICATE, pred, con=db.conn())
-            violations = db.conn().sql(f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
+            try:
+                if pred:
+                    validate_fragment(FragmentKind.PREDICATE, pred, con=db.conn())
+                violations = db.conn().sql(
+                    f"SELECT * FROM {v} WHERE {f'({pred}) IS NOT TRUE' if pred else 'false'}")
+            except Exception:
+                # A warn-severity Assert is deliberately non-blocking during a full run. Its pass port
+                # must remain usable by downstream nodes even when the diagnostic predicate cannot be
+                # evaluated; sampled inspection still reports the predicate error instead of hiding it.
+                if not self.full or cfg.get("severity") == "error":
+                    raise
+                violations = parent.limit(0)
             return {"out": violations, "pass": parent}
 
         if t == "select":
@@ -1030,7 +1083,7 @@ class BuildEngine:
         inc = g.incoming(self.graph, node.id)
         if len(inc) != 1:
             return None
-        src = g.node_map(self.graph).get(inc[0].source)
+        src = self._nodes.get(inc[0].source)
         if src is None or src.type != "source":
             return None
         uri = (src.data.get("config", {}) if isinstance(src.data, dict) else {}).get("uri", "")

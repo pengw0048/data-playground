@@ -100,7 +100,7 @@ Redaction rules: never include raw row values, plaintext secrets, or credential-
 
 | Seam | Registrar | Payload | Notes |
 | --- | --- | --- | --- |
-| Finished-run telemetry (legacy) | `Registry.add_telemetry_sink(fn)` | `dict` with `canvas_id`, `target_node_id`, `run_id`, `status`, `rows`, `ms`, `error`, `output_table`, `placement`, `per_node`, and **`request_id`** | Best-effort asynchronous callback. Reference consumer: [`examples/plugins/dp_run_log`](../examples/plugins/dp_run_log/). |
+| Finished-run telemetry (legacy) | `Registry.add_telemetry_sink(fn)` | `dict` with `canvas_id`, `target_node_id`, `run_id`, `job_type`, `status`, `rows`, `ms`, `error`, declaration-ordered `outputs`, `placement`, `per_node`, and **`request_id`** | Best-effort asynchronous callback. Reference consumer: [`examples/plugins/dp_run_log`](../examples/plugins/dp_run_log/). |
 | Metrics | `Registry.add_metric_sink(fn)` / `hub.observability.add_metric_sink` | `MetricEvent` | In-memory sink for tests: `InMemoryObservabilitySink`. |
 | Audit | `Registry.add_audit_sink(fn)` / `hub.observability.add_audit_sink` | `AuditEvent` | Same isolation guarantees. |
 

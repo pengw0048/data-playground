@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from hub import handoff, metadb
 from hub.job_artifacts import RAY_JOB_CONTRACT_VERSION
-from hub.models import RunBackendRef, RunStatus
+from hub.models import RunBackendRef, RunOutput, RunStatus
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -46,14 +46,33 @@ def _status(run_id: str, status: str = "queued", ref: dict | None = None) -> dic
         doc["backend_ref"] = {
             key: ref[key] for key in ("backend", "attempt_id", "submission_id")
         }
+        doc["target_node_id"] = "target"
+        doc["outputs"] = [RunOutput(
+            node_id="target",
+            port_id="out",
+            wire="dataset",
+            publication_kind="result",
+            outcome="pending",
+        ).model_dump()]
     return doc
 
 
 def _terminal_status(run_id: str, status: str, ref: dict, *, error: str | None = None) -> dict:
+    output_uri = f"{ref['result_uri']}.parquet"
     return RunStatus(
         run_id=run_id, status=status, per_node=[], error=error,
+        target_node_id="target",
         rows_processed=0, total_rows=0,
         progress=1.0 if status == "done" else None,
+        outputs=[RunOutput(
+            node_id="target",
+            port_id="out",
+            wire="dataset",
+            publication_kind="result",
+            outcome="committed",
+            uri=output_uri,
+            rows=0,
+        )],
         backend_ref=RunBackendRef(
             backend=ref["backend"], cluster_ref=ref.get("cluster_ref"),
             submission_id=ref["submission_id"], attempt_id=ref["attempt_id"],
@@ -353,7 +372,11 @@ def test_finish_accepts_matching_terminal_fence_after_status_detail_is_pruned(mo
         "contract_version": RAY_JOB_CONTRACT_VERSION,
         "attempt_id": ref["attempt_id"], "submission_id": ref["submission_id"],
         "envelope_sha256": envelope_sha256, "status": "done", "rows": 0,
-        "error": None, "output_uri": None, "output_table": None, "outputs": [],
+        "error": None,
+        # Private Ray v3 artifact fields are mapped once into the public RunOutput above.
+        "output_uri": f"{ref['result_uri']}.parquet",
+        "output_table": None,
+        "outputs": [],
     }
     assert metadb.begin_backend_publication_effects(
         run_id, ref["attempt_id"], owner, done,

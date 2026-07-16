@@ -5,7 +5,7 @@ plugin. This one appends one JSON line per finished run; an OTel / StatsD / ware
 SAME shape — swap the file append for an OTLP export or an INSERT. The sink receives a normalized
 record per finished run:
 
-    {canvas_id, run_id, status, rows, ms, error, output_table, placement,
+    {canvas_id, run_id, job_type, status, rows, ms, error, outputs, placement,
      per_node: [{node_id, label, status, rows, ms}, ...]}
 
 A sink that raises is caught by the core and logged, never failing the run. Delivery is best-effort
