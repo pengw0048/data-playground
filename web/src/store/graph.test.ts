@@ -300,7 +300,7 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().requestRun('section')
     expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'section')
     expect(apiMocks.run).toHaveBeenCalledWith(
-      expect.objectContaining({ id: doc.id }), 'section', false,
+      expect.objectContaining({ id: doc.id }), 'section', false, expect.any(String),
     )
     await vi.waitFor(() => expect(useStore.getState().doc.nodes[1].data.status).toBe('latest'))
 
@@ -313,7 +313,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.run.mockClear()
     await useStore.getState().run('section')
     expect(apiMocks.run).toHaveBeenCalledWith(
-      expect.objectContaining({ id: doc.id }), 'section', false,
+      expect.objectContaining({ id: doc.id }), 'section', false, expect.any(String),
     )
 
     apiMocks.estimate.mockClear()

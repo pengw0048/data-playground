@@ -166,6 +166,11 @@ def resolve_config(node: GraphNode) -> dict:
                 for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
         opts = {k: v for k, v in opts.items() if k != "header" or v in ("yes", "no")}  # header must be yes/no
         c = {"uri": cfg.get("uri")}
+        # Hub-only local-run admission evidence.  It is written only onto the private dispatch copy
+        # after source resolution; accepting it here lets the default engine open that exact revision
+        # without exposing a client-side Source configuration surface.
+        if isinstance(cfg.get("_input_revision_id"), str) and cfg["_input_revision_id"]:
+            c["_input_revision_id"] = cfg["_input_revision_id"]
         if opts:
             c["options"] = opts
         return c

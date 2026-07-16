@@ -54,12 +54,13 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0004_local_run_input_admissions", "0003_repair_historical_metadata"),
         ("0003_repair_historical_metadata", "0002_managed_file_revs"),
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0003_repair_historical_metadata"]
-    assert metadb.expected_schema_head() == "0003_repair_historical_metadata"
+    assert scripts.get_heads() == ["0004_local_run_input_admissions"]
+    assert metadb.expected_schema_head() == "0004_local_run_input_admissions"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -71,6 +72,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0003_repair_historical_metadata.py": (
             "66165953789dbc0d2c46c8c8a5f5605c0e9c62b0393235062c8929500aca5b54"
+        ),
+        "0004_local_run_input_admissions.py": (
+            "d47eb32ac70084eab237d48a9f5678bfdc4d09057e47d8cbb727e9d4770026a1"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import uuid
@@ -142,6 +143,9 @@ class RunRecord(Base):
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Ordered, secret-free source evidence captured before local dispatch.  It is intentionally
+    # separate from status so bounded live-state eviction cannot erase reproducibility evidence.
+    input_manifest: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Declaration-ordered RunOutput snapshots.  The pre-1.0 baseline stores the collection directly;
     # there are no singular compatibility columns or migration shims.
     outputs: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default="[]")
@@ -201,6 +205,23 @@ class RunState(Base):
         CheckConstraint(
             "profile_attempt_order IS NULL OR profile_attempt_order >= 1",
             name="ck_run_state_profile_attempt_positive"),
+    )
+
+
+class RunInputAdmission(Base):
+    """One idempotent local full-run admission and its immutable source manifest."""
+    __tablename__ = "run_input_admissions"
+    run_id: Mapped[str] = mapped_column(String, primary_key=True)
+    creator_id: Mapped[str] = mapped_column(String, nullable=False)
+    canvas_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    submission_id: Mapped[str] = mapped_column(String, nullable=False)
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest: Mapped[str] = mapped_column(Text, nullable=False)
+    dispatched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        UniqueConstraint("creator_id", "canvas_id", "submission_id", name="uq_run_input_admission_submission"),
     )
 
 
@@ -2592,6 +2613,75 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
 _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
+_RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
+
+
+def local_run_submission_id(uid: str, canvas_id: str | None, submission_id: str) -> str:
+    canonical = "\x00".join(("local-run-submission-v1", str(uid), str(canvas_id or ""), str(submission_id).lower()))
+    return f"run_{hashlib.sha256(canonical.encode()).hexdigest()[:48]}"
+
+
+def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: str,
+                           target_node_id: str | None, intent_sha256: str,
+                           manifest: list[dict[str, str]]) -> tuple[str, bool]:
+    """Atomically retain one exact local admission, or adopt the identical prior submission.
+
+    The manifest is validated as secret-free, ordered primitive evidence before it crosses the durable
+    boundary.  A different intent under the same client submission id is a conflict, never a new run.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", str(intent_sha256)):
+        raise ValueError("local run admission requires a SHA-256 intent")
+    if not isinstance(manifest, list) or any(
+            not isinstance(item, dict) or set(item) != {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
+            or any(not isinstance(value, str) or not value for value in item.values())
+            for item in manifest):
+        raise ValueError("local run input manifest is invalid")
+    payload = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(payload.encode("utf-8")) > _RUN_INPUT_MANIFEST_MAX_BYTES:
+        raise ValueError("local run input manifest exceeds the durable limit")
+    uid, canvas = str(uid), str(canvas_id) if canvas_id is not None else None
+    run_id = local_run_submission_id(uid, canvas, submission_id)
+    with session() as s:
+        if canvas is not None and s.get(Canvas, canvas, with_for_update=True) is None:
+            raise RuntimeError("local run canvas does not exist")
+        existing = s.get(RunInputAdmission, run_id, with_for_update=True)
+        if existing is not None:
+            if (existing.creator_id != uid or existing.canvas_id != canvas
+                    or existing.target_node_id != target_node_id
+                    or existing.intent_sha256 != intent_sha256):
+                raise RuntimeError("local run submission does not match its persisted admission")
+            return run_id, False
+        s.add(RunInputAdmission(
+            run_id=run_id, creator_id=uid, canvas_id=canvas,
+            submission_id=str(submission_id).lower(), target_node_id=target_node_id,
+            intent_sha256=intent_sha256, manifest=payload,
+        ))
+        return run_id, True
+
+
+def local_run_input_manifest(run_id: str) -> list[dict[str, str]] | None:
+    with session() as s:
+        row = s.get(RunInputAdmission, str(run_id))
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row.manifest)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("persisted local run input manifest is invalid") from exc
+    if not isinstance(parsed, list):
+        raise RuntimeError("persisted local run input manifest is invalid")
+    return [dict(item) for item in parsed]
+
+
+def mark_local_run_dispatched(run_id: str) -> bool:
+    with session() as s:
+        row = s.get(RunInputAdmission, str(run_id), with_for_update=True)
+        if row is None:
+            return False
+        if row.dispatched_at is None:
+            row.dispatched_at = _db_now(s)
+            return True
+        return False
 
 
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
@@ -2640,6 +2730,8 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     rec.target_node_id, rec.job_type, rec.status = (
         history.target_node_id, history.job_type, history.status)
     rec.rows, rec.ms, rec.error = history.rows, history.ms, history.error
+    admission = s.get(RunInputAdmission, str(run_id)) if run_id else None
+    rec.input_manifest = admission.manifest if admission is not None else None
     rec.outputs = output_payload
     rec.profile = json.dumps(history.profile.model_dump(), default=str) if history.profile else None
     rec.per_node = (json.dumps(
@@ -2654,6 +2746,10 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         s, "run_record", rid, _result_doc_refs({"outputs": output_docs}))
     for obj in stale:
         _replace_attempt_ref(s, "run_record", obj.id, None)
+        if obj.run_id:
+            admission = s.get(RunInputAdmission, obj.run_id, with_for_update=True)
+            if admission is not None:
+                s.delete(admission)
         s.delete(obj)
     if stale:
         _lock_local_result_registry(s)
@@ -2722,6 +2818,9 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         runs = list(s.scalars(select(RunRecord).where(
             RunRecord.canvas_id == canvas_id
         ).order_by(RunRecord.id).with_for_update()))
+        admissions = list(s.scalars(select(RunInputAdmission).where(
+            RunInputAdmission.canvas_id == canvas_id
+        ).order_by(RunInputAdmission.run_id).with_for_update()))
         versions = list(s.scalars(select(CanvasVersion).where(
             CanvasVersion.canvas_id == canvas_id
         ).order_by(CanvasVersion.id).with_for_update()))
@@ -2741,6 +2840,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
         for sh in shares:
             s.delete(sh)
+        for admission in admissions:
+            s.delete(admission)
         for r in runs:
             _replace_attempt_ref(s, "run_record", r.id, None)
             local_owners.append(("run_record", r.id))
@@ -2809,6 +2910,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "targetNodeId": r.target_node_id, "jobType": r.job_type, "rows": r.rows,
                  "ms": r.ms, "error": r.error,
                  "outputs": json.loads(r.outputs),
+                 "inputManifest": json.loads(r.input_manifest) if r.input_manifest else None,
                  "profile": json.loads(r.profile) if r.profile else None,
                  "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
