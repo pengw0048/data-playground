@@ -1,6 +1,7 @@
 import { test, expect } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
+import { goToWorkspace, workspaceResource } from './support/workspace'
 
 test.describe('researcher golden workflow @ux-smoke', () => {
   test('targets the chosen canvas and labels/downloads only the visible preview page', async ({ page }) => {
@@ -37,15 +38,17 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     await expect(page.locator('.react-flow__node', { hasText: 'UX secondary source' })).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: 'UX primary source' })).toHaveCount(0)
 
-    await page.goto('/#/files')
-    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
     page.once('dialog', async (dialog) => {
       expect(dialog.message()).toContain('UX secondary canvas')
       expect(dialog.message()).toContain("can't be undone")
       await dialog.dismiss()
     })
-    await page.getByRole('button', { name: 'Delete UX secondary canvas' }).click()
-    await expect(page.getByRole('button', { name: 'Open UX secondary canvas' })).toBeVisible()
+    await page.getByTestId('file-menu').click()
+    await page.getByText('Delete this file').click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+
+    await goToWorkspace(page)
+    await expect(await workspaceResource(page, 'canvas', 'UX secondary canvas')).toBeVisible()
   })
 
   test('a changed graph invalidates the old result instead of treating it as current', async ({ page }) => {

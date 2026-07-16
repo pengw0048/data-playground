@@ -2,6 +2,7 @@ import { test, expect, type Page, type Locator } from '@playwright/test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { MIN_VIEWPORT } from '../support/min-viewport'
+import { backToWorkspace, workspaceResource } from './support/workspace'
 
 // Smoke that every core desktop surface remains visible, unclipped, and operable at the declared
 // minimum viewport (docs/BROWSER_SUPPORT.md ↔ web/support/min-viewport.ts).
@@ -25,12 +26,11 @@ async function expectFullyInViewport(page: Page, loc: Locator, label: string) {
   expect(box.y + box.height, `${label} clipped on the bottom`).toBeLessThanOrEqual(vp.height + 0.5)
 }
 
-async function goToFilesShell(page: Page) {
+async function goToWorkspaceShell(page: Page) {
   await page.goto('/')
   await expect(page.getByTestId('toolbar')).toBeVisible()
-  await page.getByTestId('app-menu').click()
-  await page.getByText('Back to files').click()
-  await expect(page.getByTestId('rail-files')).toBeVisible()
+  await backToWorkspace(page)
+  await expect(page.getByTestId('rail-workspace')).toBeVisible()
 }
 
 async function openCanvasWithSource(page: Page) {
@@ -43,16 +43,11 @@ async function openCanvasWithSource(page: Page) {
   await page.getByText('New file').click()
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
-  await page.getByTestId('app-menu').click()
-  await page.getByText('Back to files').click()
-  await expect(page.getByTestId('rail-files')).toBeVisible()
+  await backToWorkspace(page)
 
-  await page.getByTestId('rail-tables').click()
-  await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-  // The full UX fixture replaces the small smoke catalog, so search instead of relying on its order.
+  // The full UX fixture replaces the small smoke catalog, so follow bounded load-more pages.
   const starterTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
-  await page.getByTestId('catalog-search').fill(starterTable)
-  await page.getByRole('button', { name: `Open table ${starterTable}`, exact: true }).click()
+  await (await workspaceResource(page, 'dataset', starterTable)).click()
   await page.getByTestId('detail-use').click()
   await expect(page.getByTestId('toolbar')).toBeVisible()
   await expect(page.locator('.react-flow__node')).toHaveCount(1)
@@ -74,20 +69,18 @@ test.describe('minimum viewport support', () => {
     const vp = page.viewportSize()
     expect(vp, 'Playwright project must pin MIN_VIEWPORT').toEqual(MIN_VIEWPORT)
 
-    await goToFilesShell(page)
+    await goToWorkspaceShell(page)
 
-    // Navigation rail: three destinations plus Settings (Relationships is reached from a table drawer).
-    for (const id of ['rail-files', 'rail-tables', 'rail-transforms', 'rail-settings'] as const) {
+    // Navigation rail: Workspace, Transforms, and Settings (Relationships is reached from a dataset drawer).
+    for (const id of ['rail-workspace', 'rail-transforms', 'rail-settings'] as const) {
       await expectFullyInViewport(page, page.getByTestId(id), id)
     }
 
     // Rail destinations are operable (click each, land on its surface, return).
-    await page.getByTestId('rail-tables').click()
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
-    await page.getByTestId('rail-files').click()
-    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
+    await page.getByTestId('rail-workspace').click()
+    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
 
     // Settings from the rail.
     await page.getByTestId('rail-settings').click()

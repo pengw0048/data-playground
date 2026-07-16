@@ -1,19 +1,12 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
+import { goToWorkspace, workspaceResource } from './support/workspace'
 
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
-const catalogTables = /\/api\/catalog\/tables(?:\?|$)/
+const workspaceRoot = /\/api\/workspace\/containers\/workspace-local-root(?:\?|$)/
 
-async function goToTables(page: Page) {
-  await page.goto('/#/files')
-  await page.getByTestId('rail-tables').click()
-  await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-}
-
-async function openCatalogTable(page: Page, name: string) {
-  await page.getByTestId('catalog-search').fill(name)
-  const table = page.getByRole('button', { name: `Open table ${name}`, exact: true })
-  await expect(table).toBeVisible({ timeout: 15_000 })
-  await table.click()
+async function openWorkspaceTable(page: Page, name: string) {
+  await (await workspaceResource(page, 'dataset', name)).click()
+  await expect(page.getByRole('dialog', { name })).toBeVisible()
 }
 
 async function namedTable(request: APIRequestContext, name: string) {
@@ -42,16 +35,14 @@ test.describe('full researcher acceptance matrix', () => {
   test.skip(!fullProfile, 'full fixtures are exercised by the scheduled, release, and matrix-changing PR workflow')
 
   test('uses the large catalog, relationship-dense, and temporal/multimodal fixtures', async ({ page }) => {
-    await goToTables(page)
-    await openCatalogTable(page, 'catalog_119')
-    await expect(page.getByRole('dialog', { name: 'catalog_119' })).toBeVisible()
+    await goToWorkspace(page)
+    await openWorkspaceTable(page, 'catalog_119')
 
-    // Search the real catalog rather than assuming fixture order. The three synchronized streams all
-    // need to remain discoverable after the 120-entry catalog is present.
+    // Traverse the bounded Workspace pages rather than assuming fixture order. The three synchronized
+    // streams all need to remain discoverable after the 120-entry catalog is present.
     for (const name of ['episodes', 'frames', 'audio_windows']) {
       await page.getByRole('button', { name: 'Close' }).click()
-      await openCatalogTable(page, name)
-      await expect(page.getByRole('dialog', { name })).toBeVisible()
+      await openWorkspaceTable(page, name)
     }
 
     const [left, right] = await Promise.all([
@@ -65,7 +56,7 @@ test.describe('full researcher acceptance matrix', () => {
     expect(declared.ok()).toBeTruthy()
 
     await page.getByRole('button', { name: 'Close' }).click()
-    await openCatalogTable(page, left.name)
+    await openWorkspaceTable(page, left.name)
     await page.getByTestId('detail-relationships').click()
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible()
     await expect(page.locator('.react-flow__node', { hasText: left.name })).toBeVisible()
@@ -75,18 +66,18 @@ test.describe('full researcher acceptance matrix', () => {
   test('injects the declared slow, unavailable, permission, stale, partial-failure, and recovery states', async ({ page }) => {
     let releaseSlow: (() => void) | undefined
     const slow = new Promise<void>((resolve) => { releaseSlow = resolve })
-    await page.route(catalogTables, async (route) => { await slow; await route.continue() }, { times: 1 })
-    await goToTables(page)
-    await expect(page.getByText('Loading…', { exact: true }).last()).toBeVisible()
+    await page.route(workspaceRoot, async (route) => { await slow; await route.continue() }, { times: 1 })
+    const workspaceReady = goToWorkspace(page)
+    await expect(page.getByText('Loading Workspace…', { exact: true })).toBeVisible()
     releaseSlow!()
-    await page.getByTestId('catalog-search').fill('catalog_119')
-    await expect(page.getByRole('button', { name: 'Open table catalog_119', exact: true })).toBeVisible({ timeout: 15_000 })
+    await workspaceReady
+    await expect(await workspaceResource(page, 'dataset', 'catalog_119')).toBeVisible()
 
-    await page.route(catalogTables, (route) => route.fulfill({ status: 503, body: 'unavailable' }), { times: 1 })
-    await page.getByTestId('catalog-search').fill('episodes')
-    await expect(page.getByText(/Couldn't load the catalog: Service Unavailable/i)).toBeVisible()
-    await page.getByTestId('catalog-retry').click()
-    await expect(page.getByRole('button', { name: 'Open table episodes', exact: true })).toBeVisible({ timeout: 15_000 })
+    await page.route(workspaceRoot, (route) => route.fulfill({ status: 503, body: 'unavailable' }), { times: 1 })
+    await page.getByTestId('workspace-reload').click()
+    await expect(page.getByText(/Couldn't load this Workspace location: Service Unavailable/i)).toBeVisible()
+    await page.getByRole('button', { name: 'Retry' }).click()
+    await expect(await workspaceResource(page, 'dataset', 'episodes')).toBeVisible()
 
     const inspector = await freshSource(page, 'events')
     await page.route('**/api/run/preview', (route) => route.fulfill({
