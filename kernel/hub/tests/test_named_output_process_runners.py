@@ -174,6 +174,30 @@ def test_subprocess_multi_output_preallocation_failure_aborts_owned_prefix(
     assert runner._local_results == {}
 
 
+def test_subprocess_object_backed_multi_output_remains_fail_closed(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    runner.storage = SimpleNamespace(
+        output_uri=lambda name, ext: f"s3://results/{name}{ext}")
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
+                     "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
+    monkeypatch.setattr(runner, "_spawn", lambda *_a: calls.append("spawn"))
+
+    with pytest.raises(RuntimeError, match="do not support named multi-output"):
+        runner.run(
+            _plan(("branches", "section"), target="branches"),
+            graph, "branches", "local")
+
+    assert calls == []
+
+
 def test_subprocess_run_unit_rejects_multi_output_before_plan_or_claim(
         tmp_path, monkeypatch):
     runner = _runner(tmp_path)

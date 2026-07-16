@@ -534,8 +534,42 @@ class SubprocessRunner:
                     job_extra["resultNamespaceId"] = self.storage.namespace_id
                     job_extra["resultNamespaceIdentity"] = list(identity)
                 else:
-                    raise RuntimeError(
-                        "isolated named outputs require local managed result storage")
+                    logical_uri = self.storage.output_uri(
+                        f"__result_{run_id}", ".parquet")
+                    from hub.plugins.adapters import is_object_uri
+                    if not is_object_uri(logical_uri):
+                        raise RuntimeError(
+                            "isolated named outputs require local managed result storage")
+                    if len(expected_outputs) != 1:
+                        raise RuntimeError(
+                            "object-backed isolated results do not support named multi-output runs")
+                    if self.resolve_adapter is None:
+                        raise RuntimeError(
+                            "object-backed subprocess results require a parent adapter resolver")
+                    if self.on_status is None:
+                        raise RuntimeError(
+                            "object-backed subprocess results require authoritative parent run persistence")
+                    from hub.plan_key import plan_cacheable, plan_hash
+                    phash = plan_hash(graph, target_node_id, self.resolve_adapter)
+                    cacheable = plan_cacheable(graph, target_node_id, self.node_builders)
+                    logical_uri = self.storage.output_uri(f"__result_{phash}", ".parquet")
+                    from hub.handoff import allocate_attempt, physical_attempt_uri
+                    handle = allocate_attempt(
+                        logical_uri=logical_uri, kind="region", run_id=run_id,
+                        allocation_key=f"subprocess-full-result:{run_id}:{phash}",
+                        uri_factory=lambda namespace, generation, attempt_id: physical_attempt_uri(
+                            logical_uri, namespace, generation, attempt_id),
+                    )
+                    self._object_results[run_id] = {
+                        "uri": handle["uri"], "cache_key": phash if cacheable else None,
+                        "run_state_owner": True,
+                    }
+                    output = expected_outputs[0]
+                    job_extra["forcedResults"] = [{
+                        "nodeId": output.node_id,
+                        "portId": output.port_id,
+                        "uri": handle["uri"],
+                    }]
             return self._spawn(status, job_extra, graph, target_node_id)
         except Exception as exc:
             if isinstance(exc, _SpawnSetupError) and not exc.reaped:

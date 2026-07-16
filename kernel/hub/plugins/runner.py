@@ -1174,10 +1174,12 @@ class LocalRunner:
         committed_output_snapshot(
             status, port_id=port_id, uri=uri, rows=0)
         if is_object_uri(logical_uri):
-            from hub.handoff import allocate_attempt, physical_attempt_uri, write_manifest
+            from hub.handoff import (
+                allocate_attempt, is_attempt_uri, physical_attempt_uri, write_manifest)
             parent_owned = bool(forced_uri)
             if parent_owned:
-                raise RuntimeError("isolated forced results support only local managed storage")
+                if not is_attempt_uri(logical_uri):
+                    raise RuntimeError("parent-provided object result URI is not an exact attempt")
             else:
                 handle = allocate_attempt(
                     logical_uri=logical_uri, kind="region", run_id=status.run_id,

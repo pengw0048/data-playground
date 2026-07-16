@@ -261,9 +261,18 @@ def main() -> int:
             raise RuntimeError("isolated forced result contract is missing or malformed")
         else:
             deps.runner.forced_results = forced_results
+        from hub.plugins.adapters import is_object_uri
+        forced_object = bool(
+            forced_results and len(forced_results) == 1
+            and isinstance(forced_results[0], dict)
+            and isinstance(forced_results[0].get("uri"), str)
+            and is_object_uri(forced_results[0].get("uri")))
         identity = job.get("resultNamespaceIdentity")
         if forced_results is None:
             identity = None
+        elif forced_object:
+            if identity is not None or job.get("resultNamespaceId") is not None:
+                raise RuntimeError("object result contract cannot carry a local namespace")
         elif (not forced_results or not isinstance(identity, list) or len(identity) != 2
               or not all(isinstance(part, int) for part in identity)):
             raise RuntimeError("local result namespace identity is malformed")
@@ -277,12 +286,16 @@ def main() -> int:
                 raise RuntimeError("isolated forced result contract is malformed")
             node_id, port_id, uri = result.get("nodeId"), result.get("portId"), result.get("uri")
             if (not isinstance(node_id, str) or not isinstance(port_id, str)
-                    or not isinstance(uri, str) or not deps.storage.is_managed_result_uri(uri)
+                    or not isinstance(uri, str)
+                    or (not forced_object and not deps.storage.is_managed_result_uri(uri))
                     or (node_id, port_id) in seen_forced):
                 raise RuntimeError("isolated forced result contract is malformed")
             seen_forced.add((node_id, port_id))
             fd = result.get("lockFd")
-            if getattr(deps.storage, "lock_supported", False) and fd is None:
+            if forced_object and (fd is not None or result.get("lockToken") is not None):
+                raise RuntimeError("object result contract cannot carry a local writer lock")
+            if (not forced_object and getattr(deps.storage, "lock_supported", False)
+                    and fd is None):
                 raise RuntimeError("local result writer lock was not inherited")
             if fd is None:
                 continue
