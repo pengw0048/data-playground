@@ -7,6 +7,7 @@ Split out of main.py. All routes are authed: main includes this router with
 from __future__ import annotations
 
 import contextlib
+import datetime
 import glob
 import os
 import re
@@ -20,11 +21,12 @@ from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from hub import db, graph as g, metadb
-from hub.backends import CatalogLineageFactExporter
+from hub.api_errors import APIError, APIErrorCode
+from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, is_object_uri, path_of, relation_columns,
+    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, path_of, relation_columns,
 )
 from hub.plugins.importer import ImporterNotConfigured
 from hub.settings import settings
@@ -37,6 +39,9 @@ from hub.models import (
     CatalogQuery,
     CatalogTable,
     ColumnSchema,
+    DatasetRevision,
+    DatasetRevisionPage,
+    DatasetRevisionResolution,
     Facets,
     ImportRequest,
     JoinSuggestion,
@@ -301,6 +306,75 @@ def get_table(table_id: str) -> CatalogTable:
         return get_deps().catalog.get_table(table_id)
     except KeyError:
         raise HTTPException(404, f"table '{table_id}' not found")
+
+
+def _revision_adapter(uri: str) -> DatasetRevisionAdapter:
+    adapter = get_deps().resolve_adapter(uri)
+    if not isinstance(adapter, DatasetRevisionAdapter):
+        raise APIError(501, "dataset_revision_history_unavailable",
+                       code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
+    return adapter
+
+
+def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
+    table = get_table(table_id)
+    binding = metadb.catalog_revision_binding_for_uri(table.uri)
+    if binding is None:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return table, binding
+
+
+def _revision(dataset_id: str, raw: dict) -> DatasetRevision:
+    return DatasetRevision(dataset_id=dataset_id, revision_id=str(raw["revision_id"]),
+                           committed_at=raw.get("committed_at"))
+
+
+@router.get("/catalog/tables/{table_id}/revisions", response_model=DatasetRevisionPage)
+def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
+                           cursor: str | None = Query(None, max_length=256)) -> DatasetRevisionPage:
+    """A bounded newest-first page of provider-native history for one current registration."""
+    table, binding = _revision_binding_for_table(table_id)
+    try:
+        rows, next_cursor = _revision_adapter(table.uri).revision_history(
+            table.uri, limit=limit, cursor=cursor)
+    except RevisionUnavailable:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return DatasetRevisionPage(items=[_revision(binding["dataset_id"], row) for row in rows],
+                               next_cursor=next_cursor, has_more=next_cursor is not None)
+
+
+@router.get("/catalog/tables/{table_id}/revisions/resolve", response_model=DatasetRevisionResolution)
+def resolve_dataset_revision(table_id: str,
+                             as_of: datetime.datetime | None = Query(None, alias="asOf")) -> DatasetRevisionResolution:
+    """Resolve latest or an as-of instant to immutable provider evidence without opening head later."""
+    table, binding = _revision_binding_for_table(table_id)
+    try:
+        raw = _revision_adapter(table.uri).resolve_revision(table.uri, as_of=as_of)
+    except RevisionUnavailable:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return DatasetRevisionResolution(dataset_id=binding["dataset_id"],
+                                     revision_id=str(raw["revision_id"]),
+                                     committed_at=raw.get("committed_at"),
+                                     selector="as_of" if as_of is not None else "latest")
+
+
+@router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionResolution)
+def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionResolution:
+    """Verify one persisted dataset/revision binding exactly; unavailable never means current head."""
+    binding = metadb.catalog_revision_binding(dataset_id)
+    if binding is None:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    try:
+        _revision_adapter(binding["uri"]).open_revision(binding["uri"], revision_id)
+    except RevisionUnavailable:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return DatasetRevisionResolution(dataset_id=binding["dataset_id"], revision_id=revision_id,
+                                     selector="exact")
 
 
 @router.put("/catalog/tables/{table_id}/metadata", response_model=CatalogTable)

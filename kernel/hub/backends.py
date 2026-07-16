@@ -312,6 +312,14 @@ class DatasetPreviewAdapter(Protocol):
 
 
 @runtime_checkable
+class DatasetRevisionAdapter(Protocol):
+    """Optional exact-revision capability; all provider IDs and cursors stay opaque to callers."""
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]: ...
+    def resolve_revision(self, uri: str, *, as_of: "datetime.datetime | None" = None) -> dict: ...
+    def open_revision(self, uri: str, revision_id: str) -> Relation: ...
+
+
+@runtime_checkable
 class CatalogProvider(Protocol):
     """The dataset catalog — browse/search/resolve/lineage + write-back, built to scale to thousands of
     tables. Swap the WHOLE provider via `reg.set_catalog(obj)` to back it with an external metadata

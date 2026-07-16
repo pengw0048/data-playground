@@ -141,6 +141,35 @@ class CatalogTable(Wire):
     usage: int = 0  # how often this dataset has been read (popularity signal; drives "most used" sort)
 
 
+class DatasetRevision(Wire):
+    """One immutable provider-native dataset revision."""
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+    committed_at: datetime.datetime | None = None
+    retention_owner: Literal["provider"] = "provider"
+
+
+class DatasetRevisionPage(Wire):
+    items: list[DatasetRevision] = Field(default_factory=list, max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=256)
+    has_more: bool = False
+
+    @model_validator(mode="after")
+    def validate_cursor_state(self) -> "DatasetRevisionPage":
+        if self.has_more != (self.next_cursor is not None):
+            raise ValueError("dataset revision page continuation state is inconsistent")
+        return self
+
+
+class DatasetRevisionResolution(Wire):
+    """Evidence that a latest/as-of request resolved to an immutable native revision."""
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+    committed_at: datetime.datetime | None = None
+    retention_owner: Literal["provider"] = "provider"
+    selector: Literal["latest", "as_of", "exact"]
+
+
 class CatalogPublicationReceipt(Wire):
     """Durable acknowledgement returned by an idempotent catalog output publication."""
     idempotency_key: str

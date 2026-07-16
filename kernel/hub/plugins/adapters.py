@@ -15,6 +15,7 @@ import hashlib
 import os
 import threading
 import uuid
+import datetime
 from collections.abc import Callable
 
 import duckdb
@@ -30,6 +31,10 @@ CancelCheck = Callable[[], bool]
 
 class BoundedPreviewUnsupported(RuntimeError):
     """The adapter cannot prove that this URI can be read within the interactive preview budget."""
+
+
+class RevisionUnavailable(RuntimeError):
+    """An exact provider-native revision cannot be opened; callers must never fall back to head."""
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -852,6 +857,61 @@ class LanceAdapter:
             return f"lance-v{self._dataset(uri).version}"
         except Exception:  # noqa: BLE001
             return _fingerprint_path(_read_uri(uri))
+
+    @staticmethod
+    def _revision_id(value) -> str:
+        try:
+            version = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+        if version < 1 or str(version) != str(value):
+            raise RevisionUnavailable("revision_unavailable")
+        return str(version)
+
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
+        """Return a bounded newest-first native page; the cursor is the last native version seen."""
+        try:
+            bounded = max(1, min(int(limit), 100))
+            before = int(self._revision_id(cursor)) if cursor is not None else None
+            rows = []
+            for entry in reversed(self._dataset(uri).versions()):
+                revision_id = self._revision_id(entry.get("version"))
+                if before is not None and int(revision_id) >= before:
+                    continue
+                rows.append({"revision_id": revision_id, "committed_at": entry.get("timestamp")})
+                if len(rows) == bounded + 1:
+                    break
+            has_more = len(rows) > bounded
+            items = rows[:bounded]
+            return items, (items[-1]["revision_id"] if has_more and items else None)
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def resolve_revision(self, uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+        try:
+            if as_of is None:
+                dataset = self._dataset(uri)
+            else:
+                import lance
+                dataset = lance.dataset(path_of(uri), asof=as_of)
+            return {"revision_id": self._revision_id(dataset.version), "committed_at": None}
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def open_revision(self, uri: str, revision_id: str) -> Relation:
+        try:
+            import lance
+            dataset = lance.dataset(path_of(uri), version=int(self._revision_id(revision_id)))
+            dataset.schema  # Lance can defer a missing-version error until the first metadata access.
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+        return db.conn().from_arrow(dataset.scanner().to_reader())
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:

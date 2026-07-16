@@ -8467,6 +8467,29 @@ def catalog_get(token: str) -> dict | None:
         return _row_to_doc(r, [t.tag for t in s.scalars(select(CatalogTag).where(CatalogTag.uri == r.uri))])
 
 
+def catalog_revision_binding(dataset_id: str) -> dict | None:
+    """Resolve one persisted opaque registration identity to its current URI.
+
+    A re-registration gets a new ``registration_id``. Unregister deletes the old row, so a stale
+    exact-revision reference cannot be rebound merely because a path or name was reused.
+    """
+    with session() as s:
+        entry = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
+        if entry is None:
+            return None
+        return {"dataset_id": entry.registration_id, "uri": entry.uri}
+
+
+def catalog_revision_binding_for_uri(uri: str) -> dict | None:
+    """Return the persisted opaque identity for one currently registered exact URI."""
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None:
+            return None
+        return {"dataset_id": entry.registration_id, "uri": entry.uri}
+
+
 def catalog_get_many(uris: list[str]) -> dict[str, dict]:
     """{uri: doc} for a batch of uris — used to name lineage-graph nodes in one round-trip."""
     if not uris:
