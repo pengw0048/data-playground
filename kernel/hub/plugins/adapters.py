@@ -769,6 +769,85 @@ class DuckDBAdapter:
             os.replace(target, os.path.join(base, part))
 
 
+class ManagedLocalFileRevisionAdapter:
+    """Revision provider for core-owned local artifacts recorded by the catalog ledger."""
+
+    name = "managed-local-file"
+    retention_owner = "core"
+
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_history(uri, limit=limit, cursor=cursor)
+        except (KeyError, ValueError) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def resolve_revision(self, uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_resolve(uri, as_of=as_of)
+        except KeyError as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def open_revision(self, uri: str, revision_id: str) -> Relation:
+        from hub import metadb
+
+        try:
+            artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
+            return DuckDBAdapter().scan(artifact_uri)
+        except (KeyError, OSError, duckdb.Error) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
+        """Read bounded facts and preview from one exact immutable local Parquet artifact."""
+        from hub import metadb
+
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            detail = metadb.managed_local_file_revision_detail(uri, revision_id)
+            artifact_uri = detail["artifact_uri"]
+            parquet = pq.ParquetFile(artifact_uri)
+            bounded = max(1, min(int(preview_limit), 100))
+            batch = next(parquet.iter_batches(batch_size=bounded + 1), None)
+            preview = (pa.Table.from_batches([batch]) if batch is not None
+                       else pa.Table.from_batches([], schema=parquet.schema_arrow))
+            table = detail["table"]
+            return {
+                "revision_id": detail["revision_id"],
+                "committed_at": detail["committed_at"],
+                "parent_revision_id": detail["parent_revision_id"],
+                "producer_operation": "overwrite",
+                "columns": table.columns,
+                "row_count": parquet.metadata.num_rows,
+                "data_file_count": 1,
+                "total_bytes": os.path.getsize(artifact_uri),
+                "fragment_count": None,
+                "preview_table": preview,
+            }
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+
+def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAdapter | None:
+    """Select the ledger-backed provider only for the exact current managed local head."""
+    from hub import metadb
+
+    try:
+        metadb.managed_local_file_revision_history(uri, limit=1)
+    except (KeyError, ValueError):
+        return None
+    return _MANAGED_LOCAL_FILE_REVISION_ADAPTER
+
+
+_MANAGED_LOCAL_FILE_REVISION_ADAPTER = ManagedLocalFileRevisionAdapter()
+
+
 class LanceAdapter:
     """Lance is open source, so it is a CORE adapter. pylance loaded lazily.
 

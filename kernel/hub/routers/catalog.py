@@ -26,7 +26,8 @@ from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, path_of, relation_columns,
+    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, managed_local_file_revision_adapter,
+    path_of, relation_columns,
 )
 from hub.plugins.importer import ImporterNotConfigured
 from hub.sampling import provenance_for_dataset
@@ -315,6 +316,8 @@ def get_table(table_id: str) -> CatalogTable:
 
 
 def _revision_adapter(uri: str) -> DatasetRevisionAdapter:
+    if managed := managed_local_file_revision_adapter(uri):
+        return managed
     adapter = get_deps().resolve_adapter(uri)
     if not isinstance(adapter, DatasetRevisionAdapter):
         raise APIError(501, "dataset_revision_history_unavailable",
@@ -331,9 +334,10 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
     return table, binding
 
 
-def _revision(dataset_id: str, raw: dict) -> DatasetRevision:
+def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> DatasetRevision:
     return DatasetRevision(dataset_id=dataset_id, revision_id=str(raw["revision_id"]),
-                           committed_at=raw.get("committed_at"))
+                           committed_at=raw.get("committed_at"),
+                           retention_owner=getattr(adapter, "retention_owner", "provider"))
 
 
 @router.get("/catalog/tables/{table_id}/revisions", response_model=DatasetRevisionPage)
@@ -342,12 +346,13 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
     """A bounded newest-first page of provider-native history for one current registration."""
     table, binding = _revision_binding_for_table(table_id)
     try:
-        rows, next_cursor = _revision_adapter(table.uri).revision_history(
-            table.uri, limit=limit, cursor=cursor)
+        adapter = _revision_adapter(table.uri)
+        rows, next_cursor = adapter.revision_history(table.uri, limit=limit, cursor=cursor)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    return DatasetRevisionPage(items=[_revision(binding["dataset_id"], row) for row in rows],
+    return DatasetRevisionPage(items=[
+        _revision(binding["dataset_id"], row, adapter) for row in rows],
                                next_cursor=next_cursor, has_more=next_cursor is not None)
 
 
@@ -357,13 +362,16 @@ def resolve_dataset_revision(table_id: str,
     """Resolve latest or an as-of instant to immutable provider evidence without opening head later."""
     table, binding = _revision_binding_for_table(table_id)
     try:
-        raw = _revision_adapter(table.uri).resolve_revision(table.uri, as_of=as_of)
+        adapter = _revision_adapter(table.uri)
+        raw = adapter.resolve_revision(table.uri, as_of=as_of)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionResolution(dataset_id=binding["dataset_id"],
                                      revision_id=str(raw["revision_id"]),
                                      committed_at=raw.get("committed_at"),
+                                     retention_owner=getattr(
+                                         adapter, "retention_owner", "provider"),
                                      selector="as_of" if as_of is not None else "latest")
 
 
@@ -375,8 +383,9 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
+        adapter = _revision_adapter(binding["uri"])
         with db.base_guard():
-            raw = _revision_adapter(binding["uri"]).revision_detail(
+            raw = adapter.revision_detail(
                 binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
@@ -387,6 +396,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
         committed_at=raw.get("committed_at"), parent_revision_id=raw.get("parent_revision_id"),
         producer_operation=raw.get("producer_operation"),
+        retention_owner=getattr(adapter, "retention_owner", "provider"),
         summary=DatasetRevisionSummary(
             row_count=raw.get("row_count"), data_file_count=raw.get("data_file_count"),
             total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),

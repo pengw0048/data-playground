@@ -62,8 +62,8 @@ Key endpoints under `/api`:
   provider page that exceeds `limit`, returns IDs at or before `afterId`, is not strictly increasing,
   or advertises a continuation that does not advance to the last returned ID.
 - `GET /catalog/tables/{id}/revisions?limit&cursor` — bounded newest-first native revision history
-  for adapters that support it. `datasetId`, `revisionId`, and the cursor are opaque; retention remains
-  provider-owned.
+  for adapters that support it. `datasetId`, `revisionId`, and the cursor are opaque; `retentionOwner`
+  distinguishes provider-native history from core-retained managed files.
 - `GET /catalog/tables/{id}/revisions/resolve?asOf=` — resolves latest or an RFC 3339 instant to one
   immutable native version. `GET /catalog/revisions/{datasetId}/{revisionId}` returns bounded schema,
   row/file/byte facts, a retained parent when known, and a fixed 100-row preview from that exact

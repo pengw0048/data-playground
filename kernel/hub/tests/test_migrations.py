@@ -47,15 +47,16 @@ def _normalized_default(value) -> str | None:
     return "now()" if normalized == "current_timestamp" else normalized
 
 
-def test_migration_graph_is_one_pre_1_0_baseline():
+def test_migration_graph_has_one_linear_head():
     scripts = ScriptDirectory.from_config(metadb._alembic_cfg())
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0001_schema_baseline"]
-    assert metadb.expected_schema_head() == "0001_schema_baseline"
+    assert scripts.get_heads() == ["0002_managed_file_revs"]
+    assert metadb.expected_schema_head() == "0002_managed_file_revs"
 
 
 def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):

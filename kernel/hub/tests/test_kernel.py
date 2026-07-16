@@ -736,7 +736,8 @@ def test_run_write_and_lineage():
     assert _output_field(st, "table", outcome="committed") == "images_valid"
     assert st["totalRows"] and st["totalRows"] < 500  # filtered out invalids
     lin = client.get("/api/catalog/lineage", params={"uri": _uri("images")}).json()
-    assert any(e["child"].endswith("images_valid.parquet") for e in lin["edges"])
+    assert _output_field(st, "uri", outcome="committed") in {
+        edge["child"] for edge in lin["edges"]}
     destination = _output_field(st, "uri", outcome="committed")
     with metadb.session() as session:
         facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
@@ -4383,11 +4384,14 @@ def test_section_multi_output_routes_by_port(tmp_path):
 
 def test_run_history_persisted_with_canvas(tmp_path):
     # a finished run is recorded under its canvas (survives restart) + exposed at /canvas/{id}/runs
+    import uuid
+
     from hub import metadb
     p = _seq_parquet(tmp_path)
+    output_name = f"hist_out_{uuid.uuid4().hex}"
     client.put("/api/canvas/hist_canvas", json={"id": "hist_canvas", "name": "h", "version": 1, "nodes": [], "edges": []})  # persist the canvas
     g = {"id": "hist_canvas", "version": 1, "nodes": [
-        N("src", "source", {"uri": p}), N("wr", "write", {"name": "hist_out"}),
+        N("src", "source", {"uri": p}), N("wr", "write", {"name": output_name}),
     ], "edges": [E("src", "wr")]}
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
     assert st["status"] == "done"
@@ -4398,7 +4402,7 @@ def test_run_history_persisted_with_canvas(tmp_path):
             break
         time.sleep(0.05)
     assert runs and runs[0]["status"] == "done"
-    assert _output_field(runs[0], "table", outcome="committed") == "hist_out"
+    assert _output_field(runs[0], "table", outcome="committed") == output_name
     history_uri = _output_field(runs[0], "uri", outcome="committed")
     status_uri = _output_field(st, "uri", outcome="committed")
     assert runs[0]["runId"] == st["runId"] and history_uri == status_uri

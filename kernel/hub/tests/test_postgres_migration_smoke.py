@@ -73,7 +73,7 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     with metadb.engine().connect() as connection:
         command.downgrade(metadb._alembic_cfg(connection), "-1")
     behind = metadb._current_schema_heads()
-    assert behind == ()
+    assert behind == ("0001_schema_baseline",)
 
     service = subprocess.run(
         [sys.executable, "-c", "from hub import metadb; metadb.init_db()"],
@@ -83,10 +83,8 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     assert "metadata schema is not at required Alembic head" in (service.stderr + service.stdout)
     assert metadb._current_schema_heads() == behind
 
-    # A pre-baseline database is intentionally unsupported. Recreate the dedicated database instead
-    # of weakening the migration guard that rejects non-empty, unversioned metadata stores.
-    reset_engine = _reset_postgres(url)
-    reset_engine.dispose()
+    # The explicit migration command upgrades the supported prior baseline without service startup
+    # silently mutating a behind production schema.
     restore = subprocess.run(
         [sys.executable, "-m", "hub.cli", "migrate", "--workspace", str(tmp_path)],
         env=first_env, text=True, capture_output=True, timeout=60,
