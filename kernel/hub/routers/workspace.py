@@ -20,7 +20,13 @@ from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
-from hub.models import CredUpsert, RunHistoryRecord, RunStatus
+from hub.models import (
+    CredUpsert,
+    RunHistoryRecord,
+    RunStatus,
+    WorkspaceBrowsePage,
+    WorkspaceResourceResolution,
+)
 from hub.security import RequestIdentity, current_identity, current_user
 
 router = APIRouter()
@@ -368,6 +374,27 @@ def whoami(uid: str = Depends(current_user)) -> dict:
         # of showing controls that then fail — so the client never lies about a doomed action (UX-01).
         caps = ["global_settings"] if _can_manage_global(uid) else []
         return {"id": u.id, "name": u.name, "email": u.email, "capabilities": caps}
+
+
+@router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
+def browse_workspace_container(container_id: str, limit: int = 50, cursor: str | None = None,
+                               uid: str = Depends(current_user)) -> dict:
+    """One bounded, mixed local Workspace page; this route never invokes provider mutation APIs."""
+    try:
+        return metadb.workspace_browse(container_id, uid=uid, limit=limit, cursor=cursor)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/workspace/resources/{resource_id}", response_model=WorkspaceResourceResolution)
+def resolve_workspace_resource(resource_id: str, uid: str = Depends(current_user)) -> dict:
+    """Resolve a stable local resource reference plus its bounded navigation ancestors."""
+    try:
+        return metadb.workspace_resolve(resource_id, uid=uid)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 @router.get("/canvas")
