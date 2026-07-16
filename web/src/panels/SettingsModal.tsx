@@ -6,7 +6,7 @@ import {
   type SettingChange,
   type SettingsSnapshot,
 } from '../api/client'
-import type { PluginInfo, ResourceSpec } from '../types/api'
+import type { PluginConfigField, PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
 import { cn } from '@/lib/utils'
@@ -48,15 +48,49 @@ type SaveFailure = {
   message: string
 }
 
+type PluginEdits = Record<string, Record<string, unknown>>
+type CanonicalPluginValue = { valid: true; value: unknown } | { valid: false }
+
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 
 const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right)
+
+const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key)
+
+function effectivePluginValue(field: PluginConfigField, stored: unknown): unknown {
+  return stored == null || stored === '' ? (field.default ?? '') : stored
+}
+
+function canonicalPluginValue(field: PluginConfigField, value: unknown): CanonicalPluginValue {
+  if (value === null) return { valid: true, value: null }
+  if (field.type === 'bool') return { valid: true, value: value === true || value === 'true' }
+  if (field.type === 'int' || field.type === 'float') {
+    if (typeof value === 'string' && !value.trim()) return { valid: false }
+    const number = typeof value === 'number' ? value : Number(value)
+    const valid = field.type === 'int' ? Number.isSafeInteger(number) : Number.isFinite(number)
+    return valid ? { valid: true, value: number } : { valid: false }
+  }
+  const text = String(value)
+  return field.type !== 'select' || !field.options || field.options.includes(text)
+    ? { valid: true, value: text }
+    : { valid: false }
+}
+
+function hasInvalidPluginEdit(pluginEdits: PluginEdits, plugins: PluginInfo[]): boolean {
+  return Object.entries(pluginEdits).some(([pack, fields]) => {
+    const schema = plugins.find((plugin) => plugin.name === pack)?.config ?? []
+    return Object.entries(fields).some(([key, value]) => {
+      const field = schema.find((candidate) => candidate.key === key)
+      return Boolean(field && !field.secret && !canonicalPluginValue(field, value).valid)
+    })
+  })
+}
 
 function stagedSettings(
   baseline: SettingsSnapshot | null,
   global: Record<string, unknown>,
   user: Record<string, unknown>,
-  pluginEdits: Record<string, Record<string, string>>,
+  pluginEdits: PluginEdits,
   plugins: PluginInfo[],
   canGlobal: boolean,
 ): SettingChange[] {
@@ -87,10 +121,16 @@ function stagedSettings(
     for (const [pack, fields] of Object.entries(pluginEdits)) {
       const schema = plugins.find((plugin) => plugin.name === pack)?.config ?? []
       for (const [key, value] of Object.entries(fields)) {
-        if (schema.find((field) => field.key === key)?.secret && !value) continue
+        const field = schema.find((candidate) => candidate.key === key)
+        if (!field || (field.secret && !value)) continue
+        const canonical = canonicalPluginValue(field, value)
+        if (!canonical.valid) continue
         const settingKey = `plugin.${pack}.${key}`
-        if (!sameJson(value, baseline.global[settingKey] ?? '')) {
-          changes.push({ scope: 'global', key: settingKey, value })
+        const stored = baseline.global[settingKey]
+        if (canonical.value === null) {
+          if (stored != null && stored !== '') changes.push({ scope: 'global', key: settingKey, value: null })
+        } else if (!sameJson(canonical.value, effectivePluginValue(field, stored))) {
+          changes.push({ scope: 'global', key: settingKey, value: canonical.value })
         }
       }
     }
@@ -124,7 +164,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [credForm, setCredForm] = useState<CredForm>(emptyCredForm('object_store'))
   const [newUser, setNewUser] = useState({ name: '', password: '' })
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
-  const [pcfg, setPcfg] = useState<Record<string, Record<string, string>>>({})  // pack → edited { key: value }
+  const [pcfg, setPcfg] = useState<PluginEdits>({})  // pack → edited { key: value }, null = use environment/default
   const [active, setActive] = useState('agent')
   // /api/me is authoritative. Missing capabilities must fail closed: open/single-user mode also
   // receives global_settings, so there is no need for a permissive fallback while identity loads.
@@ -183,9 +223,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   }, [active, canGlobal])
 
   // The revisioned Settings snapshot is the save baseline; /plugins contributes field schema only.
-  const pval = (pack: string, key: string) =>
-    pcfg[pack]?.[key] ?? String(g[`plugin.${pack}.${key}`] ?? '')
-  const setPval = (pack: string, key: string, v: string) =>
+  const rawPval = (pack: string, key: string) => {
+    const edits = pcfg[pack]
+    if (edits && hasOwn(edits, key)) return edits[key]
+    return g[`plugin.${pack}.${key}`]
+  }
+  const pval = (pack: string, field: PluginConfigField) =>
+    effectivePluginValue(field, rawPval(pack, field.key))
+  const setPval = (pack: string, key: string, v: unknown) =>
     setPcfg((prev) => ({ ...prev, [pack]: { ...(prev[pack] ?? {}), [key]: v } }))
   const configurable = plugins.filter((p) => (p.config?.length ?? 0) > 0)
 
@@ -199,8 +244,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     () => stagedSettings(baseline, g, u, pcfg, plugins, canGlobal),
     [baseline, canGlobal, g, pcfg, plugins, u],
   )
+  const invalidPluginEdit = useMemo(() => hasInvalidPluginEdit(pcfg, plugins), [pcfg, plugins])
   const save = async () => {
-    if (loading || loadError || saving || !baseline || changes.length === 0) return
+    if (loading || loadError || saving || invalidPluginEdit || !baseline || changes.length === 0) return
     const submitted = changes
 
     setSaving(true)
@@ -272,7 +318,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span role="status" aria-live="polite" className={cn('text-[11.5px]', changes.length ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
             {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : savedMsg}
           </span>
-          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || invalidPluginEdit || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 
@@ -540,12 +586,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         return (
                           <Field key={f.key} label={f.label}>
                             {f.type === 'select' && f.options ? (
-                              <Select value={pval(p.name, f.key)} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                              <Select value={String(pval(p.name, f))} onValueChange={(v) => setPval(p.name, f.key, v)}>
                                 <SelectTrigger aria-label={f.label}><SelectValue placeholder={ph} /></SelectTrigger>
                                 <SelectContent>{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
                               </Select>
                             ) : f.type === 'bool' ? (
-                              <Select value={pval(p.name, f.key) || 'false'} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                              <Select value={String(pval(p.name, f))} onValueChange={(v) => setPval(p.name, f.key, v)}>
                                 <SelectTrigger aria-label={f.label}><SelectValue /></SelectTrigger>
                                 <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
                               </Select>
@@ -553,13 +599,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                               <Input
                                 type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
                                 value={f.secret
-                                  ? (pcfg[p.name]?.[f.key] ?? (storedRef == null ? '' : String(storedRef)))
-                                  : pval(p.name, f.key)}
+                                  ? String(pcfg[p.name]?.[f.key] ?? storedRef ?? '')
+                                  : String(pval(p.name, f))}
                                 placeholder={ph}
                                 aria-label={f.label}
                                 onChange={(e) => setPval(p.name, f.key, e.target.value)}
                               />
                             )}
+                            {!f.secret && <div className="mt-1 flex items-center gap-2 text-[10.5px] text-muted-foreground">
+                              {rawPval(p.name, f.key) == null || rawPval(p.name, f.key) === ''
+                                ? <span>Using environment/default.</span>
+                                : <Button variant="link" className="h-auto p-0 text-[10.5px]" onClick={() => setPval(p.name, f.key, null)}>Use environment/default</Button>}
+                            </div>}
+                            {!f.secret && pcfg[p.name] && hasOwn(pcfg[p.name], f.key) && !canonicalPluginValue(f, rawPval(p.name, f.key)).valid && <div className="mt-1 text-[10.5px] text-destructive">Enter a finite {f.type === 'int' ? 'integer' : 'number'}.</div>}
                             {f.secret && <div className="mt-1 text-[10.5px] text-muted-foreground">Secret reference only (`env:VAR` / `file:/path`). Blank on save leaves the stored reference unchanged.</div>}
                             {f.help && <div className="mt-1 text-[10.5px] text-muted-foreground">{f.help}</div>}
                           </Field>
