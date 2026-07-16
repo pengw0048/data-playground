@@ -2647,6 +2647,12 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
     with session() as s:
         if canvas is not None and s.get(Canvas, canvas, with_for_update=True) is None:
             raise RuntimeError("local run canvas does not exist")
+        if canvas is not None and s.get_bind().dialect.name == "sqlite":
+            # SQLite ignores SELECT ... FOR UPDATE. Take its single writer lock before observing the
+            # admission so concurrent first submissions converge instead of racing duplicate INSERTs.
+            s.execute(update(Canvas).where(
+                Canvas.id == canvas,
+            ).values(updated_at=Canvas.updated_at))
         existing = s.get(RunInputAdmission, run_id, with_for_update=True)
         if existing is not None:
             if (existing.creator_id != uid or existing.canvas_id != canvas

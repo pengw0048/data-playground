@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import uuid
 import threading
+import time
+import uuid
 from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
+from sqlalchemy import event
 
 from hub import db, metadb
 from hub.models import Graph, RunEstimate, RunStatus
@@ -104,6 +106,48 @@ def test_manifest_rejects_secret_or_noncanonical_fields():
             manifest=[{"node_id": "source", "dataset_id": "dataset", "revision_id": "1",
                        "provider": "lance", "resolved_at": "now", "secret": "nope"}],
         )
+
+
+def test_concurrent_fresh_sqlite_admissions_converge_on_one_row():
+    with metadb.session() as session:
+        session.add(metadb.Canvas(id="admission-race", owner_id="local", name="race"))
+    manifest = [{
+        "node_id": "source", "dataset_id": "dataset", "revision_id": "revision",
+        "provider": "lance", "resolved_at": "now",
+    }]
+    start = threading.Barrier(2)
+    results: list[tuple[str, bool]] = []
+    errors: list[BaseException] = []
+
+    def delay_new_admission(session, _flush_context, _instances) -> None:
+        if any(isinstance(obj, metadb.RunInputAdmission) for obj in session.new):
+            time.sleep(0.2)
+
+    def submit() -> None:
+        try:
+            start.wait(timeout=5)
+            results.append(metadb.admit_local_run_inputs(
+                uid="local", canvas_id="admission-race", submission_id=str(submission_id),
+                target_node_id="source", intent_sha256="d" * 64, manifest=manifest,
+            ))
+        except BaseException as exc:
+            errors.append(exc)
+
+    submission_id = uuid.uuid4()
+    event.listen(metadb._Session.class_, "before_flush", delay_new_admission)
+    try:
+        threads = [threading.Thread(target=submit) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+    finally:
+        event.remove(metadb._Session.class_, "before_flush", delay_new_admission)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len({run_id for run_id, _created in results}) == 1
+    assert sorted(created for _run_id, created in results) == [False, True]
 
 
 def _local_start_context(monkeypatch):
