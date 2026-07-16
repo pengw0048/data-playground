@@ -541,6 +541,49 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
+  test('settings keeps dirty edits across owned dismissals and warns before unload', async ({ page }) => {
+    await page.goto('/')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    const settings = page.getByTestId('settings-modal')
+    const model = page.getByPlaceholder('anthropic/claude-opus-4-8')
+    await expect(model).toBeVisible()
+    await model.fill('unsaved-settings-model')
+
+    expect(await page.evaluate(() => {
+      const event = new Event('beforeunload', { cancelable: true })
+      window.dispatchEvent(event)
+      return event.defaultPrevented
+    })).toBe(true)
+
+    await page.keyboard.press('Escape')
+    const confirm = page.getByTestId('settings-discard-confirmation')
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Keep editing' }).click()
+    await expect(model).toBeFocused()
+    await expect(model).toHaveValue('unsaved-settings-model')
+
+    // Click the Dialog overlay, outside the centered Settings surface.
+    await page.mouse.click(5, 300)
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Keep editing' }).click()
+    await expect(model).toHaveValue('unsaved-settings-model')
+
+    await settings.getByRole('button', { name: 'Close' }).click()
+    await expect(confirm).toBeVisible()
+    await confirm.getByRole('button', { name: 'Discard' }).click()
+    await expect(settings).toHaveCount(0)
+    await expect(page.getByTestId('app-menu')).toBeFocused()
+
+    // A clean modal still closes immediately with no confirmation.
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    await expect(settings).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(settings).toHaveCount(0)
+    await expect(confirm).toHaveCount(0)
+  })
+
   test('settings manages destinations', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()               // Settings lives in the app menu now

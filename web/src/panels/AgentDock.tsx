@@ -98,7 +98,7 @@ export function AgentDock() {
               <b>Agent unavailable</b> — {llm.reason ?? 'no model configured'}.<br />
               Set a model in <b>Settings → Agent</b>.
               <div className="mt-2.5">
-                <button data-testid="agent-configure" onClick={() => window.dispatchEvent(new CustomEvent('dp-open-settings'))}
+                <button data-testid="agent-configure" onClick={(event) => window.dispatchEvent(new CustomEvent('dp-open-settings', { detail: event.currentTarget }))}
                   className="inline-flex items-center gap-[5px] rounded-lg bg-[#6b4bd6] px-3 py-1.5 text-xs font-semibold text-white">
                   <Icon name="settings" size={12} /> Configure a model
                 </button>
