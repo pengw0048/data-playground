@@ -118,7 +118,7 @@ function fullResultExportPath(runId: string, nodeId: string, portId: string, fil
   return `/run/${encodeURIComponent(runId)}/export?${params.toString()}`
 }
 
-export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[] }
+export interface BackendPort { id: string; label?: string; wire: string; accepts?: string[]; multi?: boolean }
 export interface BackendParam { name: string; type: string; default?: unknown; options?: string[]; label?: string; lang?: string; required?: boolean; showWhen?: { param: string; in: string[] } }
 export interface BackendNodeSpec {
   kind: string; title: string; category: string; tag?: string

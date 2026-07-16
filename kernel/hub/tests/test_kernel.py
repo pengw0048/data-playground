@@ -156,6 +156,10 @@ def test_nodes_endpoint():
             "dedup", "write", "metric", "vector-search"} <= set(specs)
     assert specs["aggregate"]["previewable"] is False
     assert specs["filter"]["params"][0]["name"] == "predicate"
+    assert specs["union"]["inputs"] == [{
+        "id": "in", "label": None, "wire": "dataset",
+        "accepts": ["dataset", "sample"], "multi": True,
+    }]
 
 
 def test_catalog_and_capabilities():
@@ -1717,6 +1721,69 @@ def test_plugin_run_applies_lowering(tmp_path):
     out = client.post("/api/data/sample", json={"uri": get_deps().catalog.get_table("tbl_plugin_out").uri, "k": 3}).json()
     assert "c" in [c["name"] for c in out["columns"]]           # plugin build was applied
     assert all(row["c"] == 42 for row in out["rows"])           # transformed, not passthrough
+
+
+def test_plugin_multi_input_descriptor_round_trips_and_executes_in_edge_order(tmp_path):
+    """A plugin-declared multi port stays multi through API registration, persistence, and execution."""
+    import duckdb
+    from hub import db
+    from hub.sdk import NodeSpec, PortSpec
+
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    duckdb.connect().execute(
+        f"COPY (SELECT 'first' AS source, 1 AS ordinal) TO '{first}' (FORMAT PARQUET)")
+    duckdb.connect().execute(
+        f"COPY (SELECT 'second' AS source, 2 AS ordinal) TO '{second}' (FORMAT PARQUET)")
+
+    deps = get_deps()
+    kind = "plugin_multi_input_contract"
+    spec = NodeSpec(
+        kind=kind, title="plugin multi input", category="compute",
+        inputs=[PortSpec(id="items", label="Items", wire="dataset", multi=True)],
+        outputs=[PortSpec(id="out", wire="dataset")], params=[],
+    )
+
+    def build(engine, _node, inputs):
+        views = [engine._view(rel, f"plugin_multi_{index}") for index, rel in enumerate(inputs)]
+        return db.conn().sql(" UNION ALL ".join(f"SELECT * FROM {view}" for view in views))
+
+    prior_spec = deps.node_specs.get(kind)
+    prior_builder = deps.node_builders.get(kind)
+    deps.node_specs[kind] = spec
+    deps.node_builders[kind] = build
+    canvas_id = "plugin-multi-input-contract"
+    graph = {"id": canvas_id, "name": "plugin multi input", "version": 1, "nodes": [
+        N("first", "source", {"uri": str(first)}),
+        N("second", "source", {"uri": str(second)}),
+        N("combine", kind, {}),
+    ], "edges": [E("first", "combine", th="items"), E("second", "combine", th="items")]}
+    try:
+        descriptor = next(item for item in client.get("/api/nodes").json() if item["kind"] == kind)
+        assert descriptor["inputs"][0]["multi"] is True
+
+        saved = client.put(f"/api/canvas/{canvas_id}", json=graph)
+        assert saved.status_code == 200 and saved.json()["ok"]
+        restored = client.get(f"/api/canvas/{canvas_id}")
+        assert restored.status_code == 200
+        assert restored.json()["edges"] == graph["edges"]
+
+        result = client.post("/api/run/preview", json={"graph": restored.json(), "nodeId": "combine", "k": 10})
+        assert result.status_code == 200, result.text
+        assert result.json()["rows"] == [
+            {"source": "first", "ordinal": 1},
+            {"source": "second", "ordinal": 2},
+        ]
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+        if prior_spec is None:
+            deps.node_specs.pop(kind, None)
+        else:
+            deps.node_specs[kind] = prior_spec
+        if prior_builder is None:
+            deps.node_builders.pop(kind, None)
+        else:
+            deps.node_builders[kind] = prior_builder
 
 
 # --------------------------------------------------------------------------- #
