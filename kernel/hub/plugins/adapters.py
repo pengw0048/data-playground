@@ -769,6 +769,51 @@ class DuckDBAdapter:
             os.replace(target, os.path.join(base, part))
 
 
+class ManagedLocalFileRevisionAdapter:
+    """Revision provider for core-owned local artifacts recorded by the catalog ledger."""
+
+    name = "managed-local-file"
+
+    def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_history(uri, limit=limit, cursor=cursor)
+        except (KeyError, ValueError) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def resolve_revision(self, uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_resolve(uri, as_of=as_of)
+        except KeyError as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+    def open_revision(self, uri: str, revision_id: str) -> Relation:
+        from hub import metadb
+
+        try:
+            artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
+            return DuckDBAdapter().scan(artifact_uri)
+        except (KeyError, OSError, duckdb.Error) as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
+
+def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAdapter | None:
+    """Select the ledger-backed provider only for the exact current managed local head."""
+    from hub import metadb
+
+    try:
+        metadb.managed_local_file_revision_history(uri, limit=1)
+    except (KeyError, ValueError):
+        return None
+    return _MANAGED_LOCAL_FILE_REVISION_ADAPTER
+
+
+_MANAGED_LOCAL_FILE_REVISION_ADAPTER = ManagedLocalFileRevisionAdapter()
+
+
 class LanceAdapter:
     """Lance is open source, so it is a CORE adapter. pylance loaded lazily.
 

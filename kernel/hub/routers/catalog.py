@@ -26,7 +26,8 @@ from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, path_of, relation_columns,
+    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, managed_local_file_revision_adapter,
+    path_of, relation_columns,
 )
 from hub.plugins.importer import ImporterNotConfigured
 from hub.sampling import provenance_for_dataset
@@ -311,6 +312,8 @@ def get_table(table_id: str) -> CatalogTable:
 
 
 def _revision_adapter(uri: str) -> DatasetRevisionAdapter:
+    if managed := managed_local_file_revision_adapter(uri):
+        return managed
     adapter = get_deps().resolve_adapter(uri)
     if not isinstance(adapter, DatasetRevisionAdapter):
         raise APIError(501, "dataset_revision_history_unavailable",

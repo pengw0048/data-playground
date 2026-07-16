@@ -62,8 +62,8 @@ def _safe_abandon_attempt(uri: str) -> None:
         discard_attempt(uri)
 
 
-def _is_core_managed_sink(spec, uri: str, adapter) -> bool:
-    """The one sink shape whose immutable attempt lifecycle is owned by the core control plane."""
+def _is_core_managed_object_sink(spec, uri: str, adapter) -> bool:
+    """The object-store sink shape whose immutable attempt lifecycle is core-owned."""
     from hub.plugins.adapters import is_object_uri
 
     return (
@@ -71,6 +71,31 @@ def _is_core_managed_sink(spec, uri: str, adapter) -> bool:
         and spec.extension.lower() in (".parquet", ".pq")
         and adapter.__class__.__module__ == "hub.plugins.adapters"
     )
+
+
+def _is_core_managed_local_file_sink(spec, uri: str, adapter, storage) -> bool:
+    """The default local overwrite shape published through the local revision ledger."""
+    from hub.plugins.adapters import is_object_uri
+
+    return (
+        not is_object_uri(uri) and spec.mode == "overwrite"
+        and not spec.partition_by
+        and spec.extension.lower() in (".parquet", ".pq")
+        and adapter.__class__.__module__ == "hub.plugins.adapters"
+        and callable(getattr(storage, "begin_result", None))
+        and callable(getattr(storage, "commit_result", None))
+    )
+
+
+# Existing isolated-object transport imports this private predicate; keep its object-only meaning.
+_is_core_managed_sink = _is_core_managed_object_sink
+
+
+def _safe_abort_local_result(storage, uri: str, run_id: str) -> None:
+    try:
+        storage.abort_result(uri, run_id)
+    except Exception:  # noqa: BLE001 — cleanup must not replace the original publication failure
+        logging.getLogger("hub").exception("managed local revision cleanup failed")
 
 
 def _catalog_publication_version(publication) -> str | None:
@@ -1428,12 +1453,20 @@ class LocalRunner:
             spec, self.workspace, self.storage, self.resolve_adapter,
             target_uri=forced_target)
         logical_adapter = self.resolve_adapter(logical_uri)
-        managed_parquet = _is_core_managed_sink(spec, logical_uri, logical_adapter)
+        managed_object = _is_core_managed_object_sink(spec, logical_uri, logical_adapter)
+        # The parent-owned isolated transport has its own output contract; this issue deliberately
+        # covers only the default in-process local writer.
+        from hub.plugins.catalog import InMemoryCatalog
+        managed_local = (
+            _is_core_managed_local_file_sink(spec, logical_uri, logical_adapter, self.storage)
+            and not parent_contract and type(self.catalog) is InMemoryCatalog
+        )
         parent_assigned_attempt = self.forced_sink_attempts.get(node.id)
-        if parent_assigned_attempt and not managed_parquet:
+        if parent_assigned_attempt and not managed_object:
             raise RuntimeError(
                 f"parent and child disagree on managed sink '{node.id}'")
-        if managed_parquet:
+        parent_owned = False
+        if managed_object:
             from hub.handoff import (allocate_attempt, discard_attempt, is_attempt_uri,
                                      physical_attempt_uri, write_manifest)
             parent_owned = parent_contract
@@ -1475,6 +1508,25 @@ class LocalRunner:
                 if not parent_owned:
                     discard_attempt(attempt_uri)
                 raise
+        elif managed_local:
+            from hub.plugins.catalog import core_managed_local_file_publisher
+            managed_publisher = core_managed_local_file_publisher(self.catalog)
+            if managed_publisher is None:
+                raise RuntimeError(
+                    "managed local-file writes require the core transactional catalog publisher")
+            attempt_uri = self.storage.begin_result(
+                f"managed-file:{logical_uri}", status.run_id)
+            try:
+                committed_output_snapshot(
+                    status, uri=attempt_uri, table=spec.name, rows=0)
+                result = self._adapter_write(
+                    logical_adapter, attempt_uri, parent_rel, spec.mode, cancel)
+                rows = int(result.get("rows") or 0)
+                self.storage.commit_result(attempt_uri, status.run_id)
+                committed = SinkCommit(name=spec.name, uri=attempt_uri, rows=rows)
+            except Exception:
+                _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
+                raise
         else:
             # Built-in sink semantics have a deterministic published URI. Custom adapters may return
             # another URI, which is checked authoritatively immediately after their write below.
@@ -1502,14 +1554,21 @@ class LocalRunner:
                 # An unmanaged adapter's successful return is already an externally visible mutation;
                 # publication wins from that point. Immutable managed attempts can still let cancel win
                 # before their pointer is published.
-                pre_publish(check_cancel=managed_parquet)
+                pre_publish(check_cancel=managed_object or managed_local)
         except Exception:
-            if managed_parquet and not parent_owned:
+            if managed_object and not parent_owned:
                 _safe_abandon_attempt(attempt_uri)
+            elif managed_local:
+                _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
             raise
-        if not (managed_parquet and parent_contract):
-            if managed_parquet:
+        if not (managed_object and parent_contract):
+            if managed_object:
                 publish = managed_publisher
+            elif managed_local:
+                publish = lambda **kwargs: managed_publisher(  # noqa: E731
+                    name=committed.name, logical_uri=logical_uri, artifact_uri=committed.uri,
+                    parents=kwargs.get("parents"), pipeline=kwargs.get("pipeline"),
+                    lineage=kwargs.get("lineage"))
             else:
                 from hub.plugins.catalog import publish_unmanaged_output_attested
                 publish = lambda **kwargs: publish_unmanaged_output_attested(  # noqa: E731
@@ -1520,14 +1579,18 @@ class LocalRunner:
                     pipeline="canvas", lineage=lineage)  # content-addressed version
             except Exception as exc:
                 logging.getLogger("hub").exception("sink publication failed")
-                if managed_parquet and not parent_owned:
+                if managed_object and not parent_owned:
                     _safe_abandon_attempt(attempt_uri)
+                elif managed_local:
+                    _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
                 raise RuntimeError("sink publication failed") from exc
             published_version = _catalog_publication_version(published)
             if published_version is not None:
                 committed_snapshot = committed_output_snapshot(
                     status, uri=committed.uri, table=committed.name,
                     version=published_version, rows=committed.rows)
+        if managed_local and not self.storage.release_result(attempt_uri, status.run_id):
+            raise RuntimeError("managed local revision publication is missing its durable owner")
         status.outputs = [committed_snapshot]
         return committed.rows
 
