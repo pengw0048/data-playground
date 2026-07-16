@@ -2404,13 +2404,44 @@ def test_ray_jobs_restart_reattaches_and_catalog_publication_has_one_winner(jobs
     metadb.drop_kernel(graph.id, "new-kernel")
 
 
-def test_same_state_control_recovery_clears_durable_error_without_write_churn(jobs_config):
+def test_same_state_control_recovery_clears_durable_error_without_write_churn(
+        jobs_config, monkeypatch):
     _module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    run_id = f"run_jobs_error_clear_{uuid.uuid4().hex}"
+
+    gate_next_poll = threading.Event()
+    poll_blocked = threading.Event()
+    release_poll = threading.Event()
+    original_get_job_status = client.get_job_status
+
+    def gated_get_job_status(submission_id: str):
+        if gate_next_poll.is_set():
+            gate_next_poll.clear()
+            poll_blocked.set()
+            assert release_poll.wait(5), "test did not release the gated Jobs status poll"
+        return original_get_job_status(submission_id)
+
+    monkeypatch.setattr(client, "get_job_status", gated_get_job_status)
+
+    error_injected = threading.Event()
+    recovery_published = threading.Event()
+    original_publish_snapshot = runner._publish_status_snapshot
+
+    def publish_snapshot(status, *, snapshot=None, settle_event=None):
+        original_publish_snapshot(
+            status, snapshot=snapshot, settle_event=settle_event)
+        observed = snapshot or status
+        if (error_injected.is_set() and observed.run_id == run_id
+                and observed.error is None):
+            recovery_published.set()
+
+    monkeypatch.setattr(runner, "_publish_status_snapshot", publish_snapshot)
+
     status = runner.run(
         plan, graph, "write", "distributed",
-        run_id=f"run_jobs_error_clear_{uuid.uuid4().hex}",
+        run_id=run_id,
     )
     ref = status.backend_ref
     assert ref is not None
@@ -2422,22 +2453,29 @@ def test_same_state_control_recovery_clears_durable_error_without_write_churn(jo
 
     # Freeze the next Jobs poll so the test observes the persisted error before the same RUNNING state
     # succeeds again. Recovery must clear that stale DB/UI error even though the visible label is unchanged.
-    with client.lock:
+    try:
+        gate_next_poll.set()
+        assert poll_blocked.wait(5), "Jobs supervisor did not reach the gated status poll"
+        error_injected.set()
         runner._persist_jobs_live_error(
             runner.runs[status.run_id], "Ray control temporarily unavailable")
         assert metadb.get_run_state(status.run_id)["error"] == "Ray control temporarily unavailable"
 
-    deadline = time.monotonic() + 2
-    while metadb.get_run_state(status.run_id)["error"] is not None and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert metadb.get_run_state(status.run_id)["error"] is None
-    cleared_at = _wait_run_state_updated_at_stable(status.run_id)
-    time.sleep(0.08)  # several 10ms same-state polls must not rewrite the full RunState document
-    with metadb.session() as session:
-        assert session.get(metadb.RunState, status.run_id).updated_at == cleared_at
+        release_poll.set()
+        assert recovery_published.wait(5), "successful Jobs poll did not publish recovered status"
+        assert metadb.get_run_state(status.run_id)["error"] is None
+        cleared_at = _wait_run_state_updated_at_stable(status.run_id)
+        time.sleep(0.08)  # several 10ms same-state polls must not rewrite the full RunState document
+        with metadb.session() as session:
+            assert session.get(metadb.RunState, status.run_id).updated_at == cleared_at
 
-    _complete(store, client, status)
-    assert _wait(runner, status.run_id).status == "done"
+        _complete(store, client, status)
+        assert _wait(runner, status.run_id).status == "done"
+    finally:
+        release_poll.set()
+        if runner.status(status.run_id).status in ("queued", "running"):
+            _complete(store, client, status)
+            _wait(runner, status.run_id)
 
 
 def test_jobs_stall_clock_uses_successful_control_observations_not_error_writes(jobs_config):
