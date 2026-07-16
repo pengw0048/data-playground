@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -42,8 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     workspace.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     telemetry_log.parent.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("DP_WORKSPACE", str(workspace))
-    os.environ.setdefault("DP_DATA_DIR", str(data_dir))
+    # The required paths define the isolated check.  Ambient runtime configuration must not redirect
+    # metadata into another database or activate a source/configured plugin instead of the wheel entry point.
+    os.environ["DP_WORKSPACE"] = str(workspace)
+    os.environ["DP_DATA_DIR"] = str(data_dir)
+    os.environ.pop("DP_DATABASE_URL", None)
+    os.environ.pop("DP_PLUGINS", None)
     os.environ["DP_RUN_LOG"] = str(telemetry_log)
 
     from hub import metadb
@@ -68,8 +73,9 @@ def main(argv: list[str] | None = None) -> int:
         if not deps.telemetry_sinks:
             return _failure("capability", "entry point did not register a telemetry sink")
 
+        probe_id = f"plugin-conformance-{uuid.uuid4().hex}"
         graph = Graph(id="plugin-conformance", version=1, nodes=[], edges=[])
-        status = RunStatus(run_id="plugin-conformance", status="done", job_type="run", per_node=[])
+        status = RunStatus(run_id=probe_id, status="done", job_type="run", per_node=[])
         _persist_run(deps, graph, None, status)
         if not drain_sinks():
             return _failure("capability", "telemetry delivery did not drain")

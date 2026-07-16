@@ -34,13 +34,20 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
         [uv, "pip", "install", "--python", str(python), str(core_wheel), str(plugin_wheel)], cwd=tmp_path)
     assert install.returncode == 0, install.stderr
 
-    env = os.environ.copy()
-    for key in tuple(env):
+    clean_env = os.environ.copy()
+    for key in tuple(clean_env):
         if key == "PYTHONPATH" or key.startswith("DP_"):
-            env.pop(key)
+            clean_env.pop(key)
     workspace = tmp_path / "workspace"
     secret = "token-should-not-leak"
     telemetry_log = workspace / f"{secret}.jsonl"
+    decoy_workspace = tmp_path / "decoy-workspace"
+    env = clean_env | {
+        "DP_WORKSPACE": str(decoy_workspace),
+        "DP_DATA_DIR": str(decoy_workspace / "data"),
+        "DP_DATABASE_URL": f"sqlite:///{decoy_workspace / 'metadata.db'}",
+        "DP_PLUGINS": "dp_run_log",
+    }
     checked = _run(
         [str(python), "-m", "hub.plugin_conformance", "dp-run-log",
          "--workspace", str(workspace), "--telemetry-log", str(telemetry_log)],
@@ -48,14 +55,26 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout.strip() == "plugin conformance passed"
     records = [json.loads(line) for line in telemetry_log.read_text().splitlines() if line.strip()]
-    assert any(record["run_id"] == "plugin-conformance" for record in records)
+    assert len(records) == 1
+    assert records[0]["run_id"].startswith("plugin-conformance-")
+    assert (workspace / "dataplay.db").exists()
+    assert not decoy_workspace.exists()
     assert secret not in checked.stdout + checked.stderr
+
+    repeated = _run(
+        [str(python), "-m", "hub.plugin_conformance", "dp-run-log",
+         "--workspace", str(workspace), "--telemetry-log", str(telemetry_log)],
+        cwd=tmp_path, env=env)
+    assert repeated.returncode == 0, repeated.stderr
+    repeated_records = [json.loads(line) for line in telemetry_log.read_text().splitlines() if line.strip()]
+    assert len(repeated_records) == 2
+    assert len({record["run_id"] for record in repeated_records}) == 2
 
     rejected = _run(
         [str(python), "-m", "hub.plugin_conformance", f"activation-{secret}",
          "--workspace", str(tmp_path / "failure-workspace"),
          "--telemetry-log", str(tmp_path / f"{secret}-failure.jsonl")],
-        cwd=tmp_path, env=env)
+        cwd=tmp_path, env=clean_env)
     assert rejected.returncode == 1
     assert rejected.stderr.strip() == "activation: entry point did not activate"
     assert secret not in rejected.stdout + rejected.stderr
@@ -66,7 +85,20 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
         [str(python), "-m", "hub.plugin_conformance", "dp-run-log",
          "--workspace", str(tmp_path / "capability-workspace"),
          "--telemetry-log", str(invalid_log)],
-        cwd=tmp_path, env=env)
+        cwd=tmp_path, env=clean_env)
     assert capability_failure.returncode == 1
     assert capability_failure.stderr.strip() == "capability: telemetry sink did not produce a valid JSONL record"
     assert secret not in capability_failure.stdout + capability_failure.stderr
+
+    stale_workspace = tmp_path / "stale-workspace"
+    stale_workspace.mkdir()
+    stale_log = stale_workspace / f"{secret}-stale.jsonl"
+    stale_log.write_text('{"run_id":"plugin-conformance"}\n')
+    stale_log.chmod(0o444)
+    stale_failure = _run(
+        [str(python), "-m", "hub.plugin_conformance", "dp-run-log",
+         "--workspace", str(stale_workspace), "--telemetry-log", str(stale_log)],
+        cwd=tmp_path, env=clean_env)
+    assert stale_failure.returncode == 1
+    assert stale_failure.stderr.strip() == "capability: telemetry sink did not receive the finished run"
+    assert secret not in stale_failure.stdout + stale_failure.stderr
