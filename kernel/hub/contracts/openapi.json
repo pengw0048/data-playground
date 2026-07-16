@@ -7868,6 +7868,16 @@
             }
           },
           {
+            "in": "query",
+            "name": "registration",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Registration",
+              "type": "boolean"
+            }
+          },
+          {
             "in": "header",
             "name": "x-dp-user",
             "required": false,
