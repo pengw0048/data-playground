@@ -117,7 +117,8 @@ def _runner(tmp_path, *, deadline_s: float = 10.0) -> ProfileProcessRunner:
     )
 
 
-def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str) -> int:
+def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str, *,
+                   live_kernel: bool = True) -> int:
     with metadb.session() as db:
         if db.get(metadb.User, "profile-owner") is None:
             db.add(metadb.User(id="profile-owner", name="Profile owner"))
@@ -126,6 +127,9 @@ def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str) -> int:
                 id=graph.id, owner_id="profile-owner", name="Profile process",
                 version=1, doc="{}",
             ))
+    if live_kernel:
+        claimed = metadb.claim_kernel(graph.id, "profile-kernel", "profile-test-token")
+        assert claimed["won"] is True
     token, attempt_order = metadb.preallocate_profile_run_owner(
         run_id, "profile-owner", graph.id, graph.id, "source", plan_digest,
     )
@@ -210,22 +214,38 @@ while not os.path.exists(job["cancelFile"]): time.sleep(0.01)
             graph, "source", plan_digest=digest,
             profile_attempt_order=attempt_order, run_id=run_id,
         )
-        _wait_until(
-            lambda: running_publications >= 4,
-            "unchanged running profile did not publish durable heartbeats",
-        )
-        time.sleep(0.12)
+        try:
+            _wait_until(
+                lambda: running_publications >= 4,
+                "unchanged running profile did not publish durable heartbeats",
+            )
+            # The real hub reaper runs in a process-global background thread. Prove deterministically
+            # that this kernel-owned fixture has the live lease its durable RunState claims, instead of
+            # depending on whether the 30-second reaper wakes during this isolated-metadata window.
+            assert metadb.reap_orphaned_runs(only_kernel_runs=True) == 0
+            time.sleep(0.12)
 
-        durable = metadb.get_run_state(run_id)
-        assert durable is not None and durable["status"] == "running"
-        assert durable["progress"] is None
-        assert metadb.run_stalled(run_id, 0.18) is False
-        assert transient_failed is True
-
-        runner.cancel(started.run_id)
-        assert _wait(runner, started.run_id).status == "cancelled"
-
-    _wait_for_supervisor_cleanup(runner, started.run_id)
+            durable = metadb.get_run_state(run_id)
+            assert durable is not None
+            assert durable["status"] == "running", durable.get("error")
+            assert durable["progress"] is None
+            assert metadb.run_stalled(run_id, 0.18) is False
+            assert transient_failed is True
+        finally:
+            runner.cancel(started.run_id)
+            cancelled = _wait(runner, started.run_id)
+            _wait_until(
+                lambda: (persisted := metadb.get_run_state(run_id)) is not None
+                and persisted["status"] == "cancelled",
+                "cancelled profile did not reach durable RunState",
+            )
+            _wait_until(
+                lambda: run_id in runner._terminal_publication_done,
+                "cancelled profile terminal publisher did not settle",
+            )
+            _wait_for_supervisor_cleanup(runner, started.run_id)
+        assert cancelled.status == "cancelled"
+        metadb.drop_kernel(graph.id, "profile-kernel")
 
 
 def test_full_profile_fails_closed_without_posix_group_containment(tmp_path, monkeypatch):
@@ -574,7 +594,8 @@ def test_late_profile_terminal_rejected_after_dead_kernel_fence(
         graph = _graph()
         run_id = "profile-late-after-reaper"
         plan_digest = _digest("late-after-reaper")
-        attempt_order = _admit_profile(metadb, graph, run_id, plan_digest)
+        attempt_order = _admit_profile(
+            metadb, graph, run_id, plan_digest, live_kernel=False)
         metadb.save_run_state(
             run_id,
             RunStatus(
