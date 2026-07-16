@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from hub import metadb
 from hub.main import app
@@ -206,10 +207,26 @@ def test_managed_local_single_unregister_api_preserves_revision_retention(
 
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
         catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
+    lock_order: list[str] = []
+    lock_registry = metadb._lock_local_result_registry
+    session_get = Session.get
+
+    def track_registry(session):
+        lock_order.append("registry")
+        return lock_registry(session)
+
+    def track_session_get(session, entity, ident, **kwargs):
+        if entity is metadb.LocalResultArtifact and kwargs.get("with_for_update"):
+            lock_order.append("artifact")
+        return session_get(session, entity, ident, **kwargs)
+
+    monkeypatch.setattr(metadb, "_lock_local_result_registry", track_registry)
+    monkeypatch.setattr(Session, "get", track_session_get)
     response = TestClient(app).delete(f"/api/catalog/tables/{table_id}")
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True}
+    assert lock_order.index("registry") < lock_order.index("artifact")
     assert metadb.catalog_get(table_id) is None
     with metadb.session() as session:
         logical = session.scalar(select(metadb.CatalogLogicalDataset).where(

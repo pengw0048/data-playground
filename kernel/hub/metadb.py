@@ -9528,6 +9528,10 @@ def _catalog_current_logical_ownership(
             raise RuntimeError("catalog unregister ownership changed concurrently")
         return "object"
     if revision is not None:
+        # Local lifecycle rows are always locked behind the registry. Object attempts (including all
+        # prefix members) must already be locked before entering this branch to preserve the global
+        # object -> local-registry -> local-artifact order.
+        _lock_local_result_registry(s)
         artifact = s.get(LocalResultArtifact, current_uri, with_for_update=True)
         ref = s.get(LocalResultReference, {
             "uri": current_uri,
@@ -9618,6 +9622,9 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
             select(CatalogLogicalDataset).where(
                 CatalogLogicalDataset.logical_id.in_(logical_ids))
             .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+        object_uris = {row.uri for row in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(uris)).order_by(ObjectAttempt.uri).with_for_update())} \
+            if uris else set()
         if _catalog_logicals_have_backend_publication_refs(s, logical_ids):
             raise RuntimeError(
                 "catalog unregister is blocked by an active backend publication")
@@ -9626,7 +9633,10 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
         if len(entries) != len(snapshot):
             raise RuntimeError("catalog prefix changed concurrently")
         ownerships: dict[str, str] = {}
-        for uri, logical_id in snapshot:
+        # Validate every object-backed head before the first managed-local helper takes the final
+        # lifecycle registry lock. This matters when one prefix contains both ownership types.
+        ordered_snapshot = sorted(snapshot, key=lambda item: (item[0] not in object_uris, item[0]))
+        for uri, logical_id in ordered_snapshot:
             if logical_id:
                 logical = logical_rows.get(logical_id)
                 if (logical is None or logical.state != "active"
