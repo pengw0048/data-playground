@@ -711,7 +711,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 }
 
 // ---- detail drawer: columns + metadata editor + lineage ---------------------
-function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn }: {
+export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
   onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void

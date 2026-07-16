@@ -1049,6 +1049,7 @@ def _bootstrap_metadata() -> None:
         for scope, scope_id in (("global", ""), ("user", DEFAULT_USER_ID)):
             if s.get(SettingRevision, (scope, scope_id)) is None:
                 s.add(SettingRevision(scope=scope, scope_id=scope_id, revision=0))
+        _workspace_backfill_root_placements_in_session(s)
     # The cleartext value is one-shot migration input. Never let a subsequently spawned workload
     # inherit it after the bootstrap transaction commits.
     if bootstrap:
@@ -2352,6 +2353,53 @@ def workspace_builtin_dataset_identity(uri: str) -> str:
         if entry is None:
             raise KeyError(f"registered dataset '{uri}' not found")
         return entry.registration_id
+
+
+def _workspace_ensure_root_placement_in_session(
+        s, *, target_kind: str, target_id: str, name: str) -> None:
+    """Give a local resource its canonical root placement without moving an existing one."""
+    if target_kind not in {"canvas", "dataset"}:
+        raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
+    root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
+    if root is None or not root.is_root:
+        raise RuntimeError("local Workspace root is missing from the metadata baseline")
+    values = {
+        "id": _uid(), "container_id": LOCAL_WORKSPACE_ROOT_ID,
+        "target_kind": target_kind, "target_id": target_id,
+        "name": _workspace_name(name), "ordinal": 0, "version": 1,
+    }
+    dialect = s.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+        raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+    s.execute(dialect_insert(WorkspacePlacement).values(**values).on_conflict_do_nothing(
+        index_elements=[WorkspacePlacement.target_kind, WorkspacePlacement.target_id]))
+
+
+def _workspace_follow_target_name_in_session(
+        s, *, target_kind: str, target_id: str, previous_name: str, name: str) -> None:
+    """Follow a target rename only while the placement still uses the prior derived name."""
+    previous, current = _workspace_name(previous_name), _workspace_name(name)
+    if previous == current:
+        return
+    s.execute(update(WorkspacePlacement).where(
+        WorkspacePlacement.target_kind == target_kind,
+        WorkspacePlacement.target_id == target_id,
+        WorkspacePlacement.name == previous,
+    ).values(name=current, version=WorkspacePlacement.version + 1))
+
+
+def _workspace_backfill_root_placements_in_session(s) -> None:
+    """One-way pre-1.0 migration of existing local resources into the Workspace root."""
+    for canvas_id, name in s.execute(select(Canvas.id, Canvas.name)).all():
+        _workspace_ensure_root_placement_in_session(
+            s, target_kind="canvas", target_id=canvas_id, name=name or "untitled")
+    for dataset_id, name in s.execute(select(CatalogEntry.registration_id, CatalogEntry.name)).all():
+        _workspace_ensure_root_placement_in_session(
+            s, target_kind="dataset", target_id=dataset_id, name=name or "dataset")
 
 
 def workspace_create_placement(container_id: str, *, target_kind: str, target_id: str,
@@ -8058,6 +8106,7 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
     tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
     payload = json.dumps(doc, default=str)
     entry = locked_entries.get(uri)
+    previous_entry_name = entry.name if entry is not None else None
     if entry is None:
         entry = CatalogEntry(
             uri=uri, name=name, doc=payload, tbl_id=tbl_id, folder=folder,
@@ -8087,6 +8136,12 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         destination_version,
         parent_snapshots, locked_logicals, locked_entries, canonical_lineage,
         lineage_publication_key)
+    _workspace_ensure_root_placement_in_session(
+        s, target_kind="dataset", target_id=entry.registration_id, name=entry.name)
+    if previous_entry_name is not None:
+        _workspace_follow_target_name_in_session(
+            s, target_kind="dataset", target_id=entry.registration_id,
+            previous_name=previous_entry_name, name=entry.name)
     return True
 
 
@@ -8487,6 +8542,7 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         if not target["known"]:
             raise RuntimeError("catalog governance target is not registered")
         logical, r = target["logical"], target["entry"]
+        previous_name = r.name
         try:
             doc = json.loads(r.doc)
         except (ValueError, TypeError):
@@ -8497,6 +8553,9 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
         r.folder, r.owner, r.description, r.doc = folder, owner, description, json.dumps(doc, default=str)
         if name:
             r.name = name
+            _workspace_follow_target_name_in_session(
+                s, target_kind="dataset", target_id=r.registration_id,
+                previous_name=previous_name, name=r.name)
         _materialize_folder(s, folder)  # curating into a folder makes it a first-class entity (#155)
         if logical is not None:
             logical.governance_doc = json.dumps(
@@ -8548,6 +8607,7 @@ def catalog_save_metadata_edit(
         if not target["known"]:
             raise RuntimeError("catalog governance target is not registered")
         logical, entry = target["logical"], target["entry"]
+        previous_name = entry.name
         try:
             doc = json.loads(entry.doc)
         except (ValueError, TypeError):
@@ -8572,6 +8632,9 @@ def catalog_save_metadata_edit(
         entry.doc = json.dumps(doc, default=str)
         if next_name:
             entry.name = next_name
+            _workspace_follow_target_name_in_session(
+                s, target_kind="dataset", target_id=entry.registration_id,
+                previous_name=previous_name, name=entry.name)
         _materialize_folder(s, folder)
         if logical is not None:
             logical.governance_doc = json.dumps(
@@ -10085,14 +10148,17 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
         existing = {u for (u,) in s.execute(select(CatalogEntry.uri).where(
             CatalogEntry.uri.in_([e["uri"] for e in entries]))).all()}
         local_owners: list[tuple[str, dict]] = []
+        inserted_entries: list[CatalogEntry] = []
         for e in entries:
             uri = e["uri"]
             if uri in existing:
                 continue
             doc = e.get("doc") or {}
             tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
-            s.add(CatalogEntry(uri=uri, name=e["name"], doc=json.dumps(doc, default=str), tbl_id=tbl_id,
-                               folder=folder, owner=owner, description=description, row_count=rows))
+            entry = CatalogEntry(uri=uri, name=e["name"], doc=json.dumps(doc, default=str), tbl_id=tbl_id,
+                                 folder=folder, owner=owner, description=description, row_count=rows)
+            s.add(entry)
+            inserted_entries.append(entry)
             for t in dict.fromkeys(tags):
                 s.add(CatalogTag(uri=uri, tag=t))
             for c in dict.fromkeys(cols):
@@ -10100,6 +10166,9 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
             local_owners.append((uri, doc))
             n += 1
         s.flush()
+        for entry in inserted_entries:
+            _workspace_ensure_root_placement_in_session(
+                s, target_kind="dataset", target_id=entry.registration_id, name=entry.name)
         for uri, doc in local_owners:
             sync_local_result_owner(s, "catalog_entry", uri, uri, doc)
     return n

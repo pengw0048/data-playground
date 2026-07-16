@@ -134,7 +134,7 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport }: { onS
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">
-        <DropdownMenuItem onSelect={() => setView('files')}><Icon name="chevronLeft" size={14} /> Back to files</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setView('workspace')}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}

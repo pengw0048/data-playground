@@ -1,5 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
+import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 // These specs encode, as assertions, the interaction/visual invariants behind bugs a human had
 // to find by hand (menu positioning, node overlap, disabled affordances, no forced popups, the
@@ -36,13 +37,9 @@ async function fresh(page: Page) {
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }
 
-// The catalog is paginated by usage. Search before selecting a starter dataset so every test stays
-// deterministic when the full acceptance fixture adds more than 100 tables ahead of the starter data.
-async function openCatalogTable(page: Page, name: string) {
-  await page.getByTestId('catalog-search').fill(name)
-  const table = page.getByRole('button', { name: `Open table ${name}`, exact: true })
-  await expect(table).toBeVisible({ timeout: 15_000 })
-  await table.click()
+// Workspace is bounded. Follow load-more pages before selecting a named dataset.
+async function openWorkspaceDataset(page: Page, name: string) {
+  await (await workspaceResource(page, 'dataset', name)).click()
 }
 
 // Prove the app's collab socket has joined THIS canvas before driving an out-of-band edit. The
@@ -352,15 +349,15 @@ test.describe('Data Playground canvas', () => {
     await page.getByRole('button', { name: 'Import', exact: true }).click()
     await importStarted
 
-    await page.evaluate(() => { location.hash = '#/files' })
+    await page.evaluate(() => { location.hash = '#/workspace' })
     await expect(page.getByRole('heading', { name: 'Import pipeline' })).toBeHidden()
-    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/workspace')
     releaseImport()
     await importRouteDone
     await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
 
     expect(destinationPosts).toBe(0)
-    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/workspace')
   })
 
   test('an import destination ID collision never activates or deletes the existing canvas', async ({ page }) => {
@@ -736,34 +733,22 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.monaco-editor')).toHaveCount(0) // Esc closes it
   })
 
-  test('the app menu goes to the files home; the rail navigates; new file returns to the canvas', async ({ page }) => {
+  test('the app menu goes to Workspace and the rail destinations remain operable', async ({ page }) => {
     await fresh(page)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    // files home
-    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
-    await expect(page.getByTestId('new-file')).toBeVisible()
-    // rail → Tables (shows the seeded catalog) and Transforms
-    await page.getByTestId('rail-tables').click()
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await page.getByTestId('catalog-search').fill('images')
-    await expect(page.getByRole('button', { name: 'Open table images', exact: true })).toBeVisible()
+    await backToWorkspace(page)
+    await expect(page.getByRole('button', { name: 'New canvas' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Add dataset' })).toBeDisabled()
+    await expect(await workspaceResource(page, 'dataset', 'images')).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
-    // back to recents → New file returns to the canvas editor
-    await page.getByTestId('rail-files').click()
-    await page.getByTestId('new-file').click()
-    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await page.getByTestId('rail-workspace').click()
+    await expect(page.getByRole('heading', { name: 'Workspace' })).toBeVisible()
   })
 
   test('the relationships graph opens focused from a table and widens to the catalog', async ({ page }) => {
     await fresh(page)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await page.getByTestId('rail-tables').click()
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    // search keeps this robust to list order, then open the dataset's drawer → View relationship graph
-    await openCatalogTable(page, 'events')
+    await backToWorkspace(page)
+    await openWorkspaceDataset(page, 'events')
     await page.getByTestId('detail-relationships').click()
     // the graph mounts focused on that table (its columns are visible on the entity)
     await expect(page.getByText('Relationships', { exact: true })).toBeVisible({ timeout: 10_000 })
@@ -774,68 +759,6 @@ test.describe('Data Playground canvas', () => {
     await page.getByTestId('er-clear-focus').click()
     const expandedTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'images'
     await expect(entities.filter({ hasText: expandedTable }).first()).toBeVisible({ timeout: 10_000 })
-  })
-
-  test('catalog folder A→B→A navigation ignores a late child response and preserves focus', async ({ page }) => {
-    for (const path of ['race-a', 'race-b']) {
-      const created = await page.request.post('/api/catalog/folders', {
-        data: { path }, headers: { 'X-DP-User': 'local' },
-      })
-      expect(created.ok()).toBeTruthy()
-    }
-
-    let aCalls = 0
-    let releaseFirstA!: () => void
-    const firstAHeld = new Promise<void>((resolve) => { releaseFirstA = resolve })
-    let markFirstAStarted!: () => void
-    const firstAStarted = new Promise<void>((resolve) => { markFirstAStarted = resolve })
-    let markFirstADone!: () => void
-    const firstADone = new Promise<void>((resolve) => { markFirstADone = resolve })
-    await page.route('**/api/catalog/tree*', async (route) => {
-      const prefix = new URL(route.request().url()).searchParams.get('prefix') ?? ''
-      if (prefix !== 'race-a' && prefix !== 'race-b') return route.continue()
-      if (prefix === 'race-b') {
-        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
-          prefix, folders: [{ name: 'b-current', path: 'race-b/b-current', tableCount: 0 }], tables: [],
-        }) })
-      }
-      aCalls += 1
-      if (aCalls > 1) {
-        return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
-          prefix, folders: [{ name: 'a-current', path: 'race-a/a-current', tableCount: 0 }], tables: [],
-        }) })
-      }
-      markFirstAStarted()
-      await firstAHeld
-      try {
-        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({
-          prefix, folders: [{ name: 'a-stale', path: 'race-a/a-stale', tableCount: 0 }], tables: [],
-        }) })
-      } catch { /* collapse aborted this generation before its deliberately late response */ }
-      markFirstADone()
-    })
-
-    await page.goto('/#/tables')
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await page.getByRole('button', { name: 'Expand folder race-a' }).click()
-    await firstAStarted
-    const firstABranch = page.getByRole('button', { name: 'Collapse folder race-a' }).locator('xpath=../..')
-    await expect(firstABranch.getByText('Loading…', { exact: true })).toBeVisible()
-
-    await page.getByRole('button', { name: 'Collapse folder race-a' }).click()
-    await page.getByRole('button', { name: 'Expand folder race-b' }).click()
-    await expect(page.getByText('📁 b-current', { exact: true })).toBeVisible()
-    await page.getByText('📁 race-b', { exact: true }).click()
-    await page.getByRole('button', { name: 'Expand folder race-a' }).click()
-    await expect(page.getByText('📁 a-current', { exact: true })).toBeVisible()
-
-    releaseFirstA()
-    await firstADone
-    await expect(page.getByText('📁 a-stale', { exact: true })).toHaveCount(0)
-    await expect(page.getByText('📁 a-current', { exact: true })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Collapse folder race-a' })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Collapse folder race-b' })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Remove filter 📁 race-b' })).toBeVisible()
   })
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
@@ -973,13 +896,12 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
-  test('identity lives on the files shell, not the canvas chrome — and no user switching', async ({ page }) => {
+  test('identity lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
     await page.goto('/')
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)
     await expect(page.getByTitle(/Signed in as/)).toHaveCount(0)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await expect(page.getByText('signed in')).toBeVisible() // identity indicator on the files shell
+    await backToWorkspace(page)
+    await expect(page.getByText('signed in')).toBeVisible() // identity indicator on the Workspace shell
     await expect(page.getByText('Switch user (dev)')).toHaveCount(0) // no switcher anywhere
     await expect(page.getByPlaceholder('new user…')).toHaveCount(0)
   })
@@ -1006,11 +928,9 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/#\/canvas\//) // editor URL is a canvas deep link
     const canvasHash = await page.evaluate(() => location.hash)
-    // navigate to the files home → URL updates
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
-    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/files')
+    // navigate to Workspace → URL updates
+    await backToWorkspace(page)
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/workspace')
     // browser Back returns to the canvas editor
     await page.goBack()
     await expect(page.getByTestId('toolbar')).toBeVisible()
@@ -1029,11 +949,9 @@ test.describe('Data Playground canvas', () => {
 
   test('the data viewer opens a row detail and paginates', async ({ page }) => {
     await fresh(page)
-    // start a pipeline from the seeded 'events' dataset via the Tables view
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await page.getByTestId('rail-tables').click()
-    await openCatalogTable(page, 'events')                     // opens the dataset detail drawer
+    // start a pipeline from the seeded 'events' dataset via Workspace
+    await backToWorkspace(page)
+    await openWorkspaceDataset(page, 'events')                 // opens the dataset detail drawer
     await page.getByTestId('detail-use').click()               // "Use" drops a source onto the canvas
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
@@ -1050,10 +968,8 @@ test.describe('Data Playground canvas', () => {
 
   test('editing a graph blocks rows from the previous preview until it is refreshed', async ({ page }) => {
     await fresh(page)
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await page.getByTestId('rail-tables').click()
-    await openCatalogTable(page, 'events')
+    await backToWorkspace(page)
+    await openWorkspaceDataset(page, 'events')
     await page.getByTestId('detail-use').click()
     await page.route('**/api/run/preview', (route) => route.fulfill({
       contentType: 'application/json',
@@ -1096,15 +1012,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.dp-modal-overlay').getByRole('button', { name: 'Workspace outputs' }).first()).toBeVisible()
   })
 
-  test('a table is registered and added to the canvas from the Tables view', async ({ page }) => {
+  test('a Workspace dataset is added to the canvas from its preserved detail surface', async ({ page }) => {
     await fresh(page) // empty new canvas is the current doc
-    await page.getByTestId('app-menu').click()
-    await page.getByText('Back to files').click()
-    await page.getByTestId('rail-tables').click()
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await expect(page.getByTestId('register-dataset')).toBeVisible() // register lives here, not only in Settings
+    await backToWorkspace(page)
     // clicking a dataset row opens its detail drawer; "Use" drops a source onto the canvas
-    await openCatalogTable(page, 'images')
+    await openWorkspaceDataset(page, 'images')
     await page.getByTestId('detail-use').click()
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
@@ -1122,9 +1034,8 @@ test.describe('Data Playground canvas', () => {
     expect(current.ok()).toBeTruthy()
     const original = await current.json()
     try {
-      await page.goto('/#/files')
-      await page.getByTestId('rail-tables').click()
-      await openCatalogTable(page, original.name)
+      await goToWorkspace(page)
+      await openWorkspaceDataset(page, original.name)
 
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()

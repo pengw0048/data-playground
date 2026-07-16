@@ -1,7 +1,8 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
+import { backToWorkspace, workspaceResource } from './support/workspace'
 
-// Accessibility gate for issue #118: keyboard contract on Files/Canvas + one axe smoke suite that
+// Accessibility gate for issue #118: keyboard contract on Workspace/Canvas + one axe smoke suite that
 // fails the build on serious/critical violations across the primary surfaces.
 
 async function fresh(page: Page) {
@@ -20,22 +21,10 @@ async function addNode(page: Page, category: string, kindTitle: string) {
   await menu.getByText(kindTitle, { exact: true }).click()
 }
 
-async function goFiles(page: Page) {
-  await page.getByTestId('app-menu').click()
-  await page.getByText('Back to files').click()
-  await expect(page.getByRole('heading', { name: 'Recents' })).toBeVisible()
-}
-
 async function openSettings(page: Page) {
   await page.getByTestId('app-menu').click()
   await page.getByText('Settings', { exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
-}
-
-/** Catalog rows load async; on a busy data_dir the seeded name may sit past the first page — search first. */
-async function expectCatalogTable(page: Page, name: string) {
-  await page.getByTestId('catalog-search').fill(name)
-  await expect(page.getByRole('button', { name: `Open table ${name}`, exact: true })).toBeVisible({ timeout: 15_000 })
 }
 
 /** Fail the build only on serious/critical axe hits; moderate/minor are documented in the PR.
@@ -81,20 +70,19 @@ test.describe('accessibility gate @ux-smoke', () => {
     await expectNoSeriousAxe(page, 'Canvas')
   })
 
-  test('axe smoke: Files', async ({ page }) => {
+  test('axe smoke: Workspace', async ({ page }) => {
     await fresh(page)
-    await goFiles(page)
-    await expect(page.getByTestId('new-file')).toBeVisible()
-    await expectNoSeriousAxe(page, 'Files')
+    await backToWorkspace(page)
+    await expect(page.getByRole('button', { name: 'New canvas' })).toBeDisabled()
+    await expectNoSeriousAxe(page, 'Workspace')
   })
 
-  test('axe smoke: Tables', async ({ page }) => {
+  test('axe smoke: Workspace dataset detail', async ({ page }) => {
     await fresh(page)
-    await goFiles(page)
-    await page.getByTestId('rail-tables').click()
-    await expect(page.getByRole('heading', { name: 'Tables' })).toBeVisible()
-    await expectCatalogTable(page, 'images')
-    await expectNoSeriousAxe(page, 'Tables')
+    await backToWorkspace(page)
+    await (await workspaceResource(page, 'dataset', 'images')).click()
+    await expect(page.getByRole('dialog', { name: 'images' })).toBeVisible()
+    await expectNoSeriousAxe(page, 'Workspace dataset detail', { keepOverlay: true })
   })
 
   test('axe smoke: Settings modal', async ({ page }) => {
@@ -131,12 +119,12 @@ test.describe('accessibility gate @ux-smoke', () => {
     await page.unroute(/\/run$/)
   })
 
-  test('keyboard: open a canvas from Files and focus a node', async ({ page }) => {
-    // Setup (pointer OK): a uniquely named canvas with one node, wait for autosave, then Files.
+  test('keyboard: open a canvas from Workspace and focus a node', async ({ page }) => {
+    // Setup (pointer OK): a uniquely named canvas with one node, wait for autosave, then Workspace.
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    // Rename so the Files Open control is unambiguous (many untitled canvases accumulate per e2e DB).
+    // Rename so the Workspace Open control is unambiguous (many untitled canvases accumulate per e2e DB).
     const canvasName = `a11y-keyboard-${Date.now()}`
     await page.getByTestId('file-menu').click()
     const nameInput = page.getByPlaceholder('untitled')
@@ -146,11 +134,11 @@ test.describe('accessibility gate @ux-smoke', () => {
     await expect(page.getByTestId('file-menu')).toContainText(canvasName)
     await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
     const canvasHash = await page.evaluate(() => location.hash)
-    await goFiles(page)
+    await backToWorkspace(page)
 
     // Click the heading so the next Tab starts a keyboard session (:focus-visible applies).
-    await page.getByRole('heading', { name: 'Recents' }).click()
-    const openCard = page.getByRole('button', { name: `Open ${canvasName}` })
+    await page.getByRole('heading', { name: 'Workspace' }).click()
+    const openCard = await workspaceResource(page, 'canvas', canvasName)
     expect(await tabUntil(page, openCard)).toBe(true)
     await expect(openCard).toBeFocused()
     const focusVisible = await openCard.evaluate((el) => el.matches(':focus-visible'))
@@ -176,11 +164,11 @@ test.describe('accessibility gate @ux-smoke', () => {
     expect(hasRing, `focused canvas node needs a visible focus ring; got ${JSON.stringify(ring)}`).toBe(true)
   })
 
-  test('keyboard: Space opens a recent file from Files', async ({ page }) => {
+  test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     await fresh(page)
-    await goFiles(page)
-    await page.getByRole('heading', { name: 'Recents' }).click()
-    const openCard = page.getByRole('button', { name: /^Open / }).first()
+    await backToWorkspace(page)
+    await page.getByRole('heading', { name: 'Workspace' }).click()
+    const openCard = page.getByRole('button', { name: /^Open canvas / }).first()
     expect(await tabUntil(page, openCard)).toBe(true)
     await page.keyboard.press('Space')
     await expect(page.getByTestId('toolbar')).toBeVisible({ timeout: 10_000 })
