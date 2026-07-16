@@ -4,6 +4,7 @@ import type {
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, RunEstimate, RunOutput, RunStatus, SampleResult,
+  WorkspaceBrowsePage, WorkspaceResourceResolution,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -189,6 +190,14 @@ export const api = {
     req<CatalogBrowse>(`/catalog/tree${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`, {
       signal: options?.signal,
     }),
+  workspaceBrowse: (containerId: string, params?: { cursor?: string; limit?: number }) => {
+    const query = new URLSearchParams()
+    if (params?.cursor) query.set('cursor', params.cursor)
+    if (params?.limit) query.set('limit', String(params.limit))
+    return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
+  },
+  workspaceResource: (resourceId: string) =>
+    req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`),
   // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
   catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
   createFolder: (path: string) =>

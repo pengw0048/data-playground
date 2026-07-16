@@ -3,20 +3,23 @@
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
 
-export interface Route { view: DpView; canvasId?: string }
+export interface Route { view: DpView; canvasId?: string; workspaceResourceId?: string }
 
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
   const [seg, id] = h.split('/')
   if (seg === 'canvas' && id) return { view: 'canvas', canvasId: decodeURIComponent(id) }
-  if (seg === 'files' || seg === 'tables' || seg === 'transforms' || seg === 'relationships') return { view: seg }
-  // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id) — matches the app's
-  // default landing; the files home is reachable via #/files.
+  if (seg === 'workspace') return { view: 'workspace', workspaceResourceId: id ? decodeURIComponent(id) : undefined }
+  // Recents and Tables are intentionally redirected to the single local Workspace explorer.
+  if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
+  if (seg === 'transforms' || seg === 'relationships') return { view: seg }
+  // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id).
   return { view: 'canvas' }
 }
 
-export function routeHash(view: DpView, canvasId?: string): string {
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string): string {
   return view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}` : `#/${view}`
+    + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
 }
 
 /** A shareable absolute link that opens straight into this canvas. */
@@ -26,11 +29,12 @@ export function canvasLink(id: string): string {
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterStore {
-  getState: () => { view: DpView; doc: { id: string }; setView: (v: DpView) => void; openFile: (id: string) => Promise<boolean> }
-  subscribe: (fn: (s: { view: DpView; doc: { id: string } }) => void) => void
+  getState: () => { view: DpView; doc: { id: string }; workspaceResourceId: string | null; setView: (v: DpView) => void; setWorkspaceResource: (id: string | null) => void; openFile: (id: string) => Promise<boolean> }
+  subscribe: (fn: (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null }) => void) => void
 }
 
-const hashFor = (s: { view: DpView; doc: { id: string } }) => routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined)
+const hashFor = (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null }) =>
+  routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined, s.view === 'workspace' ? s.workspaceResourceId ?? undefined : undefined)
 
 let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
@@ -52,6 +56,8 @@ export function initRouter(store: RouterStore): void {
             history.replaceState(null, '', hashFor(store.getState()))
           }
         } else if (st.view !== 'canvas') st.setView('canvas')
+      } else if (r.view === 'workspace' && (st.view !== 'workspace' || st.workspaceResourceId !== (r.workspaceResourceId ?? null))) {
+        st.setWorkspaceResource(r.workspaceResourceId ?? null)
       } else if (st.view !== r.view) {
         st.setView(r.view)
       }

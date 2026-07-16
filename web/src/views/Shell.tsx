@@ -6,15 +6,15 @@ import { color, radius, shadow } from '../theme/tokens'
 import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
 import { ERDiagram } from './ERDiagram'
-import { CatalogView } from './CatalogView'
+import { WorkspaceExplorer } from './WorkspaceExplorer'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 
-// The non-canvas app shell (Figma-style): a left rail with destinations + a content area. Renders
-// the Files home, the Tables catalog, or the Transforms catalog based on the store's `view`.
+// The non-canvas shell keeps local resources in one Workspace explorer. Transforms and relationship
+// inspection remain their existing secondary surfaces.
 export function Shell() {
   const view = useStore((s) => s.view)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -31,8 +31,7 @@ export function Shell() {
     <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
       <Rail onSettings={openSettings} />
       <main style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
-        {view === 'files' && <FilesContent />}
-        {view === 'tables' && <CatalogView />}
+        {view === 'workspace' && <WorkspaceExplorer />}
         {view === 'transforms' && <TransformsContent />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
@@ -64,8 +63,7 @@ function Rail({ onSettings }: { onSettings: (trigger: HTMLElement) => void }) {
         <span className="text-[13.5px] font-bold text-foreground">Data Playground</span>
       </div>
       <div className="flex flex-col gap-0.5">
-        {item('files', 'clock', 'Recents')}
-        {item('tables', 'db', 'Tables')}
+        {item('workspace', 'grid', 'Workspace')}
         {item('transforms', 'fx', 'Transforms')}
         {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}

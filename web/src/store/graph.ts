@@ -728,6 +728,8 @@ interface Store {
   setView: (v: DpView) => void
   erFocusUri: string | null                       // the table the relationship graph opens focused on (null = global)
   openRelationships: (uri: string | null) => void
+  workspaceResourceId: string | null
+  setWorkspaceResource: (resourceId: string | null) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -761,7 +763,7 @@ interface Store {
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
-export type DpView = 'canvas' | 'files' | 'tables' | 'transforms' | 'relationships'
+export type DpView = 'canvas' | 'workspace' | 'files' | 'tables' | 'transforms' | 'relationships'
 
 function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
@@ -939,6 +941,11 @@ export const useStore = create<Store>((set, get) => ({
   openRelationships: (uri) => {
     if (get().view !== 'relationships') _fileNavigationGeneration += 1
     set({ erFocusUri: uri, view: 'relationships' })
+  },
+  workspaceResourceId: null,
+  setWorkspaceResource: (resourceId) => {
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceResourceId: resourceId, view: 'workspace' })
   },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
@@ -1800,7 +1807,7 @@ export const useStore = create<Store>((set, get) => ({
       await get().refreshFiles()
       const files = get().files
       // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
-      // last-opened / newest / a fresh file. A #/tables|#/transforms|#/files link still loads a
+      // last-opened / newest / a fresh file. A #/workspace or #/transforms link still loads a
       // current canvas underneath, then switches to that shell view below.
       const route = parseHash()
       const last = localStorage.getItem(OPEN_KEY(me.id))

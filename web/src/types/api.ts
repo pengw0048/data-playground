@@ -96,6 +96,27 @@ export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: Fac
 export interface FolderNode { name: string; path: string; tableCount: number }
 export interface CatalogFolder { path: string }
 export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
+export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset'
+export interface WorkspaceResource {
+  id: string
+  kind: WorkspaceResourceKind
+  name: string
+  parentId?: string | null
+  placementId?: string | null
+  version?: number | null
+  detached: boolean
+}
+export interface WorkspaceBrowsePage {
+  container: WorkspaceResource
+  items: WorkspaceResource[]
+  nextCursor?: string | null
+  hasMore: boolean
+  completeness: 'complete' | 'page'
+}
+export interface WorkspaceResourceResolution {
+  resource: WorkspaceResource
+  ancestors: WorkspaceResource[]
+}
 export interface CatalogMetadata { folder?: string; tags?: string[]; owner?: string | null; description?: string | null; name?: string | null }
 export interface CatalogEdit { expectedRevision: string; folder: string; tags: string[]; owner: string | null; description: string | null; name?: string | null; declaredKey: string[] }
 export interface RegisterRequest { uri: string; name?: string; folder?: string; tags?: string[]; owner?: string; description?: string }
