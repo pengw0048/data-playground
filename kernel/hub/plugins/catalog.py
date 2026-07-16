@@ -285,9 +285,10 @@ class InMemoryCatalog:
         keys = ([KeyInfo(columns=list(declared), confidence="declared")] if declared else []) + inferred
         local = not is_object_uri(t.uri) and not t.uri.startswith("mem://")
         missing = local and not os.path.exists(path_of(t.uri))
-        if keys == t.keys and missing == t.missing:
+        revision = metadb.catalog_metadata_revision(t.model_dump(by_alias=True), declared)
+        if keys == t.keys and missing == t.missing and revision == t.metadata_revision:
             return t
-        return t.model_copy(update={"keys": keys, "missing": missing})
+        return t.model_copy(update={"keys": keys, "missing": missing, "metadata_revision": revision})
 
     @staticmethod
     def _to_table(doc: dict) -> CatalogTable:
@@ -852,6 +853,17 @@ class InMemoryCatalog:
 
     def set_declared_key(self, uri: str, columns: list[str] | None) -> None:
         metadb.catalog_set_declared_key(uri, list(columns or []))
+
+    def save_metadata_edit(self, uri: str, *, expected_revision: str, folder: str,
+                           tags: list[str], owner: str | None, description: str | None,
+                           name: str | None, declared_key: list[str]) -> CatalogTable:
+        """Built-in-only atomic save for the catalog drawer's staged editable fields."""
+        metadb.catalog_save_metadata_edit(
+            uri, expected_revision=expected_revision, folder=folder, tags=tags, owner=owner,
+            description=description, name=name, declared_key=declared_key)
+        table = self.get_table(uri)
+        self._embed_one(table)
+        return table
 
     def relationships(self, uri: str | None = None) -> list[Relationship]:
         try:

@@ -8705,6 +8705,53 @@ def test_declared_key_overrides_inference_and_grain():
     assert {tuple(k.columns) for k in d.catalog.get_table(ev.id).keys} == {("id",), ("user_id",)}
 
 
+def test_atomic_catalog_edit_commits_metadata_and_key_with_cas(monkeypatch):
+    """The drawer's one Save is all-or-nothing, and an older drawer cannot overwrite it."""
+    from hub import metadb
+
+    table_id = "tbl_events"
+    original = client.get(f"/api/catalog/tables/{table_id}").json()
+    original_key = next((key["columns"] for key in original["keys"]
+                         if key["confidence"] == "declared"), [])
+    changed = {
+        "expectedRevision": original["metadataRevision"],
+        "name": "events atomic", "folder": "curated/atomic", "tags": ["atomic", "gold"],
+        "owner": "catalog-team", "description": "one commit", "declaredKey": ["user_id"],
+    }
+    try:
+        saved = client.put(f"/api/catalog/tables/{table_id}/edit", json=changed)
+        assert saved.status_code == 200, saved.text
+        body = saved.json()
+        assert body["name"] == "events atomic"
+        assert body["folder"] == "curated/atomic"
+        assert body["tags"] == ["atomic", "gold"]
+        assert body["keys"][0]["columns"] == ["user_id"]
+        assert body["metadataRevision"] != original["metadataRevision"]
+
+        stale = client.put(f"/api/catalog/tables/{table_id}/edit", json=changed)
+        assert stale.status_code == 409
+        assert client.get(f"/api/catalog/tables/{table_id}").json()["name"] == "events atomic"
+
+        before_failure = client.get(f"/api/catalog/tables/{table_id}").json()
+        failing = {**changed, "expectedRevision": before_failure["metadataRevision"],
+                   "name": "must not persist", "declaredKey": []}
+        monkeypatch.setattr(metadb, "_sync_children", lambda *_args: (_ for _ in ()).throw(RuntimeError("injected failure")))
+        failing_client = TestClient(app, raise_server_exceptions=False)
+        failed = failing_client.put(f"/api/catalog/tables/{table_id}/edit", json=failing)
+        assert failed.status_code == 500
+        after_failure = client.get(f"/api/catalog/tables/{table_id}").json()
+        assert after_failure["name"] == before_failure["name"]
+        assert after_failure["folder"] == before_failure["folder"]
+        assert after_failure["keys"] == before_failure["keys"]
+    finally:
+        monkeypatch.undo()
+        client.put(f"/api/catalog/tables/{table_id}/metadata", json={
+            "name": original["name"], "folder": original["folder"], "tags": original["tags"],
+            "owner": original["owner"], "description": original["description"],
+        })
+        client.put(f"/api/catalog/tables/{table_id}/key", json={"columns": original_key})
+
+
 def test_relationship_crud_and_leads_join_analysis():
     # declared relationships persist (Settings, cross-instance) and TRUMP measurement in join analysis.
     ev, img = _uri("events"), _uri("images")

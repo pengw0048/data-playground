@@ -31,6 +31,7 @@ from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CatalogBrowse,
+    CatalogEdit,
     CatalogFolder,
     CatalogMetadata,
     CatalogPage,
@@ -326,6 +327,33 @@ def set_table_metadata(table_id: str, req: CatalogMetadata) -> CatalogTable:
             name=req.name if "name" in sent else None)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@router.put("/catalog/tables/{table_id}/edit", response_model=CatalogTable)
+def save_table_edit(table_id: str, req: CatalogEdit) -> CatalogTable:
+    """Atomically save a staged built-in table edit, guarded by its opaque CAS revision.
+
+    This route intentionally does not extend the external CatalogProvider SPI. A provider that does
+    not ship the same built-in implementation is truthful rather than accepting two separate writes.
+    """
+    from hub.plugins.catalog import InMemoryCatalog
+
+    cat = get_deps().catalog
+    if not isinstance(cat, InMemoryCatalog):
+        raise HTTPException(501, "this catalog provider does not support atomic metadata and key edits")
+    try:
+        table = cat.get_table(table_id)
+    except KeyError:
+        raise HTTPException(404, f"table '{table_id}' not found")
+    try:
+        return cat.save_metadata_edit(
+            table.uri, expected_revision=req.expected_revision, folder=req.folder, tags=req.tags,
+            owner=req.owner, description=req.description, name=req.name,
+            declared_key=req.declared_key)
+    except metadb.CatalogMetadataConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/catalog/lineage", response_model=LineageResult)

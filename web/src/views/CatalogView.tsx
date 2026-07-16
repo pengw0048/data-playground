@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useStore } from '../store/graph'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
@@ -718,6 +718,9 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
+  const catalogSource = useStore((s) => s.kernelInfo)
+  const atomicMetadataEditable = catalogSource?.capabilities?.includes('catalog.atomic_metadata_edit') ?? false
+  const [base, setBase] = useState(table)
   const [name, setName] = useState(table.name)
   const [folder, setFolder] = useState(table.folder ?? '')
   const [tags, setTags] = useState((table.tags ?? []).join(', '))
@@ -732,6 +735,9 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   const [preview, setPreview] = useState<SampleResult | null>(null)  // lazy: fetched on first expand only
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  const initialKey = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
+  const [declaredPk, setDeclaredPk] = useState(() => initialKey(table))
+  const [conflict, setConflict] = useState<CatalogTable | null>(null)
   const closeRef = useRef<HTMLButtonElement>(null)
   const lineageRequest = useRef(0)
   const previewRequest = useRef(0)
@@ -754,7 +760,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   }, [loadLineage])
   useEffect(() => { closeRef.current?.focus() }, [])
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') requestClose() }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
@@ -792,15 +798,44 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     catch (e) { pushToast(`Couldn't open linked dataset: ${errorMessage(e)}`, 'error') }
   }
 
-  const save = async () => {
+  const sameList = (left: string[], right: string[]) => left.length === right.length && left.every((item, i) => item === right[i])
+  const dirty = name !== base.name
+    || folder !== (base.folder ?? '')
+    || tags !== (base.tags ?? []).join(', ')
+    || owner !== (base.owner ?? '')
+    || description !== (base.description ?? '')
+    || !sameList(declaredPk, initialKey(base))
+
+  const requestClose = () => {
+    if (!dirty || window.confirm('Discard unsaved catalog edits?')) onClose()
+  }
+  const resetTo = (next: CatalogTable) => {
+    setBase(next); setName(next.name); setFolder(next.folder ?? ''); setTags((next.tags ?? []).join(', '))
+    setOwner(next.owner ?? ''); setDescription(next.description ?? ''); setDeclaredPk(initialKey(next)); setConflict(null)
+    onChanged(next)
+  }
+  const save = async (against = base) => {
+    if (!atomicMetadataEditable) return
+    if (!against.metadataRevision) {
+      pushToast('This catalog entry does not provide a revision for atomic editing', 'error')
+      return
+    }
     setBusy(true)
     try {
-      const next = await api.setTableMetadata(table.id, {
+      const next = await api.saveTableEdit(table.id, {
+        expectedRevision: against.metadataRevision,
         name: name.trim() || undefined, folder: folder.trim(), owner: owner.trim() || null, description: description.trim() || null,
-        tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
+        tags: tags.split(',').map((t) => t.trim()).filter(Boolean), declaredKey: declaredPk,
       })
-      pushToast('Saved', 'success'); onChanged(next)
-    } catch (e) { pushToast(errorMessage(e), 'error') }
+      resetTo(next); pushToast('Saved', 'success')
+    } catch (e) {
+      const status = e instanceof KernelError ? e.status
+        : (typeof e === 'object' && e !== null ? (e as { status?: number }).status : undefined)
+      if (status === 409) {
+        try { setConflict(await api.table(table.id)) } catch { /* retain the draft; Reload can retry */ }
+      }
+      pushToast(errorMessage(e), 'error')
+    }
     finally { setBusy(false) }
   }
   const lineageRoot = lin?.rootUri ?? table.uri
@@ -809,15 +844,13 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
   const lineageNode = (u: string) => lin?.nodes.find((n) => n.uri === u)
   const nameOf = (u: string) => lineageNode(u)?.name ?? u.split('/').slice(-1)[0]
 
-  const declaredPk = table.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
-  const togglePk = async (col: string) => {
+  const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
-    try { onChanged(await api.declareKey(table.id, next)) }
-    catch (e) { pushToast(errorMessage(e), 'error') }
+    setDeclaredPk(next)
   }
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
+    <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={requestClose}>
       <div role="dialog" aria-modal="true" aria-label={table.name}
         className="flex h-full w-[420px] flex-col overflow-y-auto border-l border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
@@ -827,7 +860,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
             <div className="truncate text-[10.5px] text-muted-foreground">{table.uri}</div>
           </div>
           <button onClick={() => onUse(table)} data-testid="detail-use" className="inline-flex items-center gap-1 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary"><Icon name="plus" size={12} /> Use</button>
-          <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
+          <button ref={closeRef} onClick={requestClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
         </div>
 
         <div className="flex flex-col gap-4 p-4 text-[12.5px]">
@@ -841,13 +874,19 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
           {/* organization editor */}
           <section className="flex flex-col gap-2 rounded-lg border border-border p-3">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Organization</div>
-            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
-            <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
-            <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
-            <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="team or person" className="dp-input" /></Field>
-            <Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="dp-input resize-y" /></Field>
+            <Field label="Name"><input value={name} onChange={(e) => setName(e.target.value)} disabled={!atomicMetadataEditable} placeholder="friendly name" className="dp-input" data-testid="detail-name" /></Field>
+            <Field label="Folder"><input value={folder} onChange={(e) => setFolder(e.target.value)} disabled={!atomicMetadataEditable} list="dp-folder-options" placeholder="prod/images" className="dp-input" data-testid="detail-folder" /></Field>
+            <Field label="Tags"><input value={tags} onChange={(e) => setTags(e.target.value)} disabled={!atomicMetadataEditable} placeholder="gold, pii (comma-separated)" className="dp-input" /></Field>
+            <Field label="Owner"><input value={owner} onChange={(e) => setOwner(e.target.value)} disabled={!atomicMetadataEditable} placeholder="team or person" className="dp-input" /></Field>
+            <Field label="Description"><textarea value={description} onChange={(e) => setDescription(e.target.value)} disabled={!atomicMetadataEditable} rows={2} className="dp-input resize-y" /></Field>
+            {!atomicMetadataEditable && <div className="text-[11px] text-muted-foreground">This catalog provider does not support atomic metadata and declared-key edits.</div>}
+            {atomicMetadataEditable && dirty && <div className="text-[11px] text-muted-foreground">Unsaved changes</div>}
+            {conflict && <div role="alert" className="flex items-center justify-between gap-2 rounded border border-destructive/30 px-2 py-1.5 text-[11px] text-destructive">
+              <span>Another editor saved changes first.</span>
+              <span className="flex gap-2"><button onClick={() => void (async () => { try { resetTo(await api.table(table.id)) } catch (e) { pushToast(errorMessage(e), 'error') } })()} className="font-semibold underline">Reload</button><button onClick={() => void save(conflict)} className="font-semibold underline">Reapply</button></span>
+            </div>}
             <div className="flex justify-end">
-              <button onClick={save} disabled={busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save'}</button>
+              <button onClick={() => void save()} disabled={!atomicMetadataEditable || busy || !dirty} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50" data-testid="detail-save">{busy ? 'Saving…' : 'Save'}</button>
             </div>
           </section>
 
@@ -859,7 +898,7 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
                 const isPk = declaredPk.includes(c.name)
                 return (
                   <div key={c.name} className="flex w-full items-center gap-1 border-b border-border/60 px-2 py-1 last:border-0 hover:bg-accent">
-                    <button onClick={() => void togglePk(c.name)} data-testid={`detail-pk-${c.name}`}
+                    <button onClick={() => togglePk(c.name)} disabled={!atomicMetadataEditable} data-testid={`detail-pk-${c.name}`}
                       title={isPk ? 'Declared primary key — click to clear' : 'Click to declare as the primary key'}
                       className={`w-5 shrink-0 text-center text-[11px] ${isPk ? '' : 'opacity-25 hover:opacity-70'}`}>🔑</button>
                     <button onClick={() => onColumn(c.name)} title={`Filter the list to tables with column "${c.name}"`}
