@@ -97,7 +97,7 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     assert metadb.schema_at_head() is True
     with metadb.engine().connect() as connection:
         assert "profile" in {
-            column["name"] for column in metadb.Base.metadata.tables["run_records"].columns
+            column.name for column in metadb.Base.metadata.tables["run_records"].columns
         }
         assert "profile" in {
             column["name"] for column in connection.dialect.get_columns(connection, "run_records")

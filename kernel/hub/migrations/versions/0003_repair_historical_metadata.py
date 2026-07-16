@@ -87,13 +87,24 @@ def upgrade() -> None:
     if "profile" not in columns:
         op.add_column("run_records", sa.Column("profile", sa.Text(), nullable=True))
 
-    bind.execute(sa.text("""
+    root_insert = sa.text("""
         INSERT INTO workspace_containers (id, parent_id, name, ordinal, version, is_root)
         SELECT :id, NULL, :name, 0, 1, :is_root
         WHERE NOT EXISTS (
-            SELECT 1 FROM workspace_containers WHERE id = :id
+            SELECT 1 FROM workspace_containers WHERE id = :existing_id
         )
-    """), {"id": "workspace-local-root", "name": "Workspace", "is_root": True})
+    """).bindparams(
+        sa.bindparam("id", type_=sa.String()),
+        sa.bindparam("existing_id", type_=sa.String()),
+        sa.bindparam("name", type_=sa.String()),
+        sa.bindparam("is_root", type_=sa.Boolean()),
+    )
+    bind.execute(root_insert, {
+        "id": "workspace-local-root",
+        "existing_id": "workspace-local-root",
+        "name": "Workspace",
+        "is_root": True,
+    })
 
 
 def downgrade() -> None:

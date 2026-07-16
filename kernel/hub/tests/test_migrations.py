@@ -62,13 +62,30 @@ def test_migration_graph_has_one_linear_head():
     assert metadb.expected_schema_head() == "0003_repair_historical_metadata"
 
 
+def test_committed_migration_revisions_are_immutable():
+    versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
+    expected_hashes = {
+        "0001_schema_baseline.py": "f8a793dd0af47e189939f1ce41ec39ae336009bf353e8ac8147fd961386c1e96",
+        "0002_managed_local_file_revisions.py": (
+            "c69ae2c9e2b6311261b694ecdd057008d5d6ffccd7e88bd3cbadfe04af7095f5"
+        ),
+        "0003_repair_historical_metadata.py": (
+            "66165953789dbc0d2c46c8c8a5f5605c0e9c62b0393235062c8929500aca5b54"
+        ),
+    }
+    revision_paths = {path.name: path for path in versions_path.glob("*.py")}
+
+    assert revision_paths.keys() == expected_hashes.keys(), (
+        "record every new forward migration in the immutable revision checksum guard"
+    )
+    for name, expected_hash in expected_hashes.items():
+        assert hashlib.sha256(revision_paths[name].read_bytes()).hexdigest() == expected_hash, (
+            "committed migration revisions are immutable; add a forward migration instead"
+        )
+
+
 def test_historical_baseline_upgrade_repairs_workspace_metadata_without_data_loss(tmp_path):
     """Exercise the exact old schema shape instead of fixing committed revision 0001 in place."""
-    baseline_path = Path(metadb._MIGRATIONS_DIR) / "versions" / "0001_schema_baseline.py"
-    assert hashlib.sha256(baseline_path.read_bytes()).hexdigest() == (
-        "f8a793dd0af47e189939f1ce41ec39ae336009bf353e8ac8147fd961386c1e96"
-    ), "committed migration revisions are immutable; add a forward migration instead"
-
     with _isolated_metadata(f"sqlite:///{tmp_path / 'historical.db'}"):
         with metadb.engine().connect() as connection:
             command.upgrade(metadb._alembic_cfg(connection), "0001_schema_baseline")
