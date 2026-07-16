@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  fullRunUnavailableReason, previewPlanIdentity, useStore, nodeRunnable, roleCanEdit,
+  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -101,7 +101,6 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const cfg = node.data.config as Record<string, unknown>
   const invalid = nodeInvalidReason(node)
   const outputPorts = nodeOutputs(node)
-  const fullRunUnavailable = fullRunUnavailableReason(useStore.getState().doc, nodeId)
 
   // a code op / plugin kind can carry a declared/inferred schema contract; relational ops are always
   // statically typed, and source/write/note/section are handled elsewhere.
@@ -229,11 +228,6 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* actions */}
       <Section title="Actions">
         {invalid && <div className="mb-1.5 text-[11px] text-amber-700">⚠ {invalid}</div>}
-        {fullRunUnavailable && (
-          <div className="mb-1.5 text-[11px] leading-relaxed text-muted-foreground">
-            {fullRunUnavailable}
-          </div>
-        )}
         {!invalid && warnings.map((w, i) => (
           <div key={i} className="mb-1.5 text-[11px] text-amber-700 dark:text-amber-300">⚠ {w} — not found in the input schema</div>
         ))}
@@ -241,7 +235,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid || !!fullRunUnavailable) && runState !== 'running')}
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />

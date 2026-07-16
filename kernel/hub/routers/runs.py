@@ -17,12 +17,14 @@ from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
+from hub.backends import backend_supports_named_multi_output_runs
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph
 from hub.run_outputs import (
-    UnsupportedRunOutputs, preflight_run_output_target, require_single_run_output,
+    UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
+    require_single_run_output,
 )
 from hub.security import current_user
 from hub.settings import settings
@@ -118,7 +120,7 @@ def _require_single_backend_output(graph, node_id: str, deps) -> None:
         ) from exc
 
 
-def _run_output_preflight(plan, graph, requested_target: str | None, deps) -> str | None:
+def _run_output_preflight(plan, requested_target: str | None) -> str | None:
     try:
         output_target = preflight_run_output_target(plan, requested_target)
     except UnsupportedRunOutputs as exc:
@@ -126,9 +128,39 @@ def _run_output_preflight(plan, graph, requested_target: str | None, deps) -> st
             400, str(exc), code=APIErrorCode.MULTI_OUTPUT_UNSUPPORTED,
             retryable=False,
         ) from exc
-    if output_target is not None:
-        _require_single_backend_output(graph, output_target, deps)
     return output_target
+
+
+def _require_backend_run_output_support(backend, graph, node_id: str, deps) -> bool:
+    """Admit a multi-output full run only when its selected execution owner opts in explicitly."""
+    outputs = expected_run_outputs(graph, node_id, deps.node_specs)
+    if len(outputs) <= 1:
+        return False
+    if backend_supports_named_multi_output_runs(backend):
+        return True
+    try:
+        backend_name = str(getattr(backend, "name", "unknown"))
+    except Exception:  # noqa: BLE001 - diagnostic metadata must not escape the admission error
+        backend_name = "unknown"
+    backend_name = backend_name.replace("\n", " ").replace("\r", " ")[:120]
+    raise APIError(
+        400,
+        f"Execution backend '{backend_name}' does not yet support multi-output full runs",
+        code=APIErrorCode.MULTI_OUTPUT_UNSUPPORTED,
+        retryable=False,
+    )
+
+
+def _controller_regions_for_run(
+        deps, graph, execution_target: str | None, output_target: str | None,
+        sizes: dict, multi_output: bool) -> list:
+    """Plan once through the controller's public ownership seam and enforce output capability."""
+    regions = deps.controller.plan_for_run(graph, execution_target, sizes=sizes)
+    if multi_output and output_target is not None and regions:
+        # RunController still has a singular final-publication state machine.  Treat it as the actual
+        # owner only when it will really split; collapsed plans continue through the selected runner.
+        _require_backend_run_output_support(deps.controller, graph, output_target, deps)
+    return regions
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
@@ -805,11 +837,18 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    _run_output_preflight(plan, req.graph, req.target_node_id, deps)
+    output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
+    multi_output = False
+    if output_target is not None:
+        multi_output = _require_backend_run_output_support(
+            runner, req.graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, req.graph)
-    rows, byts, _ = _cone_size(req.graph, req.target_node_id, deps)
+    rows, byts, sizes = _cone_size(req.graph, req.target_node_id, deps)
+    if multi_output:
+        _controller_regions_for_run(
+            deps, req.graph, req.target_node_id, output_target, sizes, multi_output=True)
     est = runner.estimate(plan, rows, byts)
     return est
 
@@ -847,15 +886,25 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    _run_output_preflight(plan, graph, target_node_id, deps)
+    output_target = _run_output_preflight(plan, target_node_id)
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone
+    multi_output = False
+    if output_target is not None:
+        multi_output = _require_backend_run_output_support(
+            runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
+    controller_regions = (_controller_regions_for_run(
+        deps, graph, target_node_id, output_target, sizes, multi_output=True)
+        if multi_output else None)
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
+    if controller_regions is None:
+        controller_regions = deps.controller.plan_for_run(
+            graph, target_node_id, sizes=sizes)
     from hub.observability import (
         AuditAction, AuditOutcome, emit_audit, get_request_id, invoke_backend_run,
     )
@@ -864,7 +913,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
     # widths the gate saw — not a second, coarse re-estimate.
-    overall = deps.controller.run(graph, target_node_id, uid, sizes=sizes, request_id=request_id)
+    overall = deps.controller.run(
+        graph, target_node_id, uid, sizes=sizes, request_id=request_id,
+        regions=controller_regions)
     identity_prebound = False
     if overall is not None:
         status, owner = overall, deps.controller

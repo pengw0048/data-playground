@@ -3829,6 +3829,13 @@ def test_section_multi_output_routes_by_port(tmp_path):
         N("wl", "write", {"name": "sec_low"}),
         N("wh", "write", {"name": "sec_high"}),
     ], "edges": [E("src", "sec"), E("sec", "wl", sh="low"), E("sec", "wh", sh="high")]}
+    direct = _poll(client.post("/api/run", json={
+        "graph": g, "targetNodeId": "sec", "confirmed": True,
+    }).json()["runId"])
+    assert direct["status"] == "done" and direct["totalRows"] is None
+    assert [output["portId"] for output in direct["outputs"]] == ["low", "high"]
+    assert [output["rows"] for output in direct["outputs"]] == [100, 100]
+
     _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wl", "confirmed": True}).json()["runId"])
     st = _poll(client.post("/api/run", json={"graph": g, "targetNodeId": "wh", "confirmed": True}).json()["runId"])
     assert st["status"] == "done"
@@ -3840,6 +3847,12 @@ def test_section_multi_output_routes_by_port(tmp_path):
     # writes the wrong port's data would pass a count-only check but fail here (min/max differ).
     assert stats("sec_low") == (100, 0, 99)      # the "low" port: v < 100
     assert stats("sec_high") == (100, 900, 999)  # the "high" port: v >= 900
+    assert duckdb.connect(":memory:").execute(
+        f"SELECT count(*), min(v), max(v) FROM read_parquet('{direct['outputs'][0]['uri']}')"
+    ).fetchone() == (100, 0, 99)
+    assert duckdb.connect(":memory:").execute(
+        f"SELECT count(*), min(v), max(v) FROM read_parquet('{direct['outputs'][1]['uri']}')"
+    ).fetchone() == (100, 900, 999)
 
 
 def test_run_history_persisted_with_canvas(tmp_path):
@@ -7421,6 +7434,57 @@ def test_section_nests_multiple_levels_by_parentid(tmp_path):
     assert out["rowCount"] == 300  # outer → inner → keep(v<300), nested two levels deep
 
 
+def test_section_child_multi_output_requires_and_honors_output_port(tmp_path):
+    p = _seq_parquet(tmp_path)
+    child = {
+        "id": "inner-filter", "type": "filter", "parentId": "inner",
+        "position": {"x": 0, "y": 0},
+        "data": {"title": "f", "config": {}},
+    }
+    inner = {
+        "id": "inner", "type": "section", "parentId": "outer",
+        "position": {"x": 0, "y": 0},
+        "data": {"title": "inner", "config": {
+            "outputs": ["low", "high"],
+            "script": (
+                "emit('low', run(f, data=inputs['in'], predicate='v < 10'))\n"
+                "emit('high', run(f, data=inputs['in'], predicate='v >= 990'))\n"
+            ),
+        }},
+    }
+
+    def graph(outer_script: str, output_name: str):
+        outer = {
+            "id": "outer", "type": "section", "position": {"x": 0, "y": 0},
+            "data": {"config": {"script": outer_script}},
+        }
+        return {"id": "c", "version": 1, "nodes": [
+            N("src", "source", {"uri": p}), outer, inner, child,
+            N("wr", "write", {"name": output_name}),
+        ], "edges": [E("src", "outer"), E("outer", "wr")]}
+
+    missing = _poll(client.post("/api/run", json={
+        "graph": graph("emit(run(inner, data=inputs['in']))\n", "section_missing_port"),
+        "targetNodeId": "wr", "confirmed": True,
+    }).json()["runId"])
+    assert missing["status"] == "failed"
+    assert "select an output port" in (missing.get("error") or "")
+
+    selected = _poll(client.post("/api/run", json={
+        "graph": graph(
+            "emit(run(inner, data=inputs['in'], output_port='high'))\n",
+            "section_selected_port",
+        ),
+        "targetNodeId": "wr", "confirmed": True,
+    }).json()["runId"])
+    assert selected["status"] == "done"
+    import duckdb
+    uri = get_deps().catalog.get_table("tbl_section_selected_port").uri
+    assert duckdb.connect(":memory:").execute(
+        f"SELECT count(*), min(v), max(v) FROM read_parquet('{uri}')").fetchone() == (
+            10, 990, 999)
+
+
 def test_plan_hash_includes_section_children():
     # regression: a node CONTAINED in a section (parent_id) carries the real behavior (its predicate /
     # transform code), but it isn't in the upstream chain — a naive chain hash collided (proven). The
@@ -8310,11 +8374,10 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
                            node_specs=d.node_specs, node_builders=d.node_builders)
         assert int(eng2.relation("a", "out").aggregate("count(*) AS n").fetchone()[0]) == total  # none satisfy → all
 
-    def run(pred, sev):
+    def run(pred, sev, target="f"):
         g = graph(pred, sev)
-        # Direct full runs of the multi-output Assert are deliberately unsupported. Target a
-        # single-output downstream consumer so this remains a test of Assert's execution gate.
-        st = d.runner.run(compile_plan(g, "f", d.registry, d.node_specs), g, "f", "local")
+        st = d.runner.run(
+            compile_plan(g, target, d.registry, d.node_specs), g, target, "local")
         for _ in range(200):
             s = d.runner.status(st.run_id)
             if s.status in ("done", "failed", "cancelled"):
@@ -8336,6 +8399,19 @@ def test_assert_node_surfaces_violations_and_gates_the_run():
     # a predicate that can't evaluate (missing column): warn is non-blocking (run succeeds); error fails clean
     assert run("no_such_col > 0", "warn").status == "done"
     assert run("no_such_col > 0", "error").status == "failed"
+
+    # A direct warn-severity Assert publishes both declared ports in NodeSpec order. Their independent
+    # row counts and contents remain on RunOutput; the ambiguous scalar totalRows stays null.
+    direct = run("id >= 5", "warn", "a")
+    assert direct.status == "done" and direct.total_rows is None
+    assert [output.port_id for output in direct.outputs] == ["pass", "out"]
+    assert [output.rows for output in direct.outputs] == [total, 5]
+    import duckdb
+    pass_uri, violations_uri = [output.uri for output in direct.outputs]
+    assert duckdb.connect(":memory:").execute(
+        f"SELECT min(id) FROM read_parquet('{pass_uri}')").fetchone()[0] == 0
+    assert duckdb.connect(":memory:").execute(
+        f"SELECT max(id) FROM read_parquet('{violations_uri}')").fetchone()[0] == 4
 
 
 def test_assert_named_ports_are_independently_previewable_and_profiled():

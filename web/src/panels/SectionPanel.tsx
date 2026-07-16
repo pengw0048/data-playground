@@ -5,7 +5,7 @@ import { color } from '../theme/tokens'
 const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
 
 // Editor for a `section` node: the driver script + its parentId-contained canvas nodes + params and a
-// maxRuns bound. The script calls contained nodes by title: run(alias, data=…, **cfg).
+// maxRuns bound. The script calls contained nodes by title: run(alias, data=…, output_port=…, **cfg).
 export function SectionPanel({ nodeId }: { nodeId: string }) {
   const nodes = useStore((s) => s.doc.nodes) // stable ref; filter in-body (a filtering selector returns a new array each render → infinite loop)
   const node = nodes.find((n) => n.id === nodeId)
@@ -24,7 +24,8 @@ export function SectionPanel({ nodeId }: { nodeId: string }) {
   return (
     <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 12 }}>
       <div style={{ fontSize: 11, color: color.text3, lineHeight: 1.5 }}>
-        A driver script over the contained nodes. Call a node by alias: <code>run(alias, data=inputs['in'], **cfg)</code>;
+        A driver script over the contained nodes. Call a node by alias: <code>run(alias, data=inputs['in'], output_port='port', **cfg)</code>;
+        choose <code>output_port</code> when that child has multiple outputs;
         read a scalar with <code>value(...)</code>; <code>concat([...])</code>; return results with <code>emit(rel)</code> or,
         for multiple output ports, <code>emit("port", rel)</code>. Loops are bounded by maxRuns. Not sample-previewable — runs on a full pass.
       </div>

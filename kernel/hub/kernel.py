@@ -59,6 +59,13 @@ def _liveness_busy(inflight_count: int, runs) -> bool:
         getattr(s, "status", None) in ("queued", "running") for s in runs.values())
 
 
+def _persist_kernel_run_state(metadata, graph, status, *, kernel_id: str) -> None:
+    """Persist one kernel-owned status with terminal region publication authority."""
+    metadata.save_run_state(
+        status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None),
+        kernel_id=kernel_id, publish_region=status.status in ("done", "failed"))
+
+
 def _rss_bytes() -> int | None:
     """Current resident set size in bytes, or None if unavailable (never faked)."""
     try:
@@ -261,9 +268,8 @@ def main() -> None:
     # single-writer: the kernel persists run_states stamped with OUR kernel_id (so the boot-time reaper
     # spares this run while we're alive). Wire it onto the runner that OWNS runs (the isolated child
     # manager when isolating), since that's what emits queued/progress/terminal for /run.
-    run_runner.on_status = lambda g, st: metadb.save_run_state(
-        st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid,
-        publish_region=st.status == "done")
+    run_runner.on_status = lambda g, st: _persist_kernel_run_state(
+        metadb, g, st, kernel_id=kid)
     profile_runner = deps.profile_runner
     profile_runner.on_status = lambda g, st: metadb.save_run_state(
         st.run_id, st.model_dump(), canvas_id=getattr(g, "id", None), kernel_id=kid)

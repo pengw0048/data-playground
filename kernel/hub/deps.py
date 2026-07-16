@@ -256,7 +256,7 @@ def _persist_run_state(graph, status) -> None:
     from hub import metadb
     metadb.save_run_state(
         status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None),
-        publish_region=status.status == "done")
+        publish_region=status.status in ("done", "failed"))
 
 
 def _result_get(key):
@@ -274,9 +274,8 @@ def _result_acquire(key, owner, ttl_seconds):
 def _result_put(key, doc) -> None:
     from hub import metadb
     from hub.handoff import prepare_attempt_commit
-    from hub.run_outputs import sole_committed_document_output
-    output = sole_committed_document_output(doc)
-    if output is not None:
+    from hub.run_outputs import committed_document_outputs
+    for output in committed_document_outputs(doc):
         prepare_attempt_commit(str(output.uri))
     metadb.put_result(key, doc)
 

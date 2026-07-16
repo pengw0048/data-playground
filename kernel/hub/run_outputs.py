@@ -1,8 +1,8 @@
 """Shared named-output contract helpers.
 
-This module intentionally supports the #263 single-publication execution boundary.  It validates and
-persists the collection shape now, while multi-output materialization/ownership remains fail-closed
-until the dedicated local and subprocess state-machine changes land.
+The public contract is an ordered collection even when a backend supports only one publication.  The
+helpers in this module preserve that declaration order, update one port without hiding its siblings,
+and admit cache documents only when the complete expected output set is committed.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def initialize_run_outputs(
     if status.job_type == "profile":
         status.outputs = []
         return
-    status.outputs = ([require_single_run_output(graph, node_id, node_specs)]
+    status.outputs = (expected_run_outputs(graph, node_id, node_specs)
                       if node_id is not None else [])
 
 
@@ -94,12 +94,23 @@ def sole_output(status: RunStatus, *, committed: bool = False) -> RunOutput | No
     return output
 
 
+def _selected_output(status: RunStatus, port_id: str | None) -> tuple[int, RunOutput]:
+    if port_id is None:
+        if len(status.outputs) != 1:
+            raise RuntimeError("a multi-output run requires an explicit output port")
+        return 0, status.outputs[0]
+    matches = [(index, output) for index, output in enumerate(status.outputs)
+               if output.port_id == port_id]
+    if len(matches) != 1:
+        raise RuntimeError(f"run does not expect output port '{port_id}'")
+    return matches[0]
+
+
 def committed_output_snapshot(
-        status: RunStatus, *, uri: str, rows: int, table: str | None = None) -> RunOutput:
+        status: RunStatus, *, uri: str, rows: int, table: str | None = None,
+        port_id: str | None = None) -> RunOutput:
     """Build and validate a committed snapshot without making it public."""
-    expected = sole_output(status)
-    if expected is None:
-        raise RuntimeError("run does not have exactly one expected output")
+    _index, expected = _selected_output(status, port_id)
     return RunOutput(
         node_id=expected.node_id,
         port_id=expected.port_id,
@@ -120,10 +131,32 @@ def preflight_output_table(status: RunStatus, table: str) -> None:
 
 
 def commit_output(
-        status: RunStatus, *, uri: str, rows: int, table: str | None = None) -> RunOutput:
-    committed = committed_output_snapshot(status, uri=uri, rows=rows, table=table)
-    status.outputs = [committed]
+        status: RunStatus, *, uri: str, rows: int, table: str | None = None,
+        port_id: str | None = None) -> RunOutput:
+    index, _expected = _selected_output(status, port_id)
+    committed = committed_output_snapshot(
+        status, uri=uri, rows=rows, table=table, port_id=port_id)
+    status.outputs[index] = committed
     return committed
+
+
+def settle_output(
+        status: RunStatus, port_id: str, outcome: str, error: str | None = None) -> None:
+    """Set one uncommitted port to a truthful terminal outcome without touching its siblings."""
+    if outcome not in ("failed", "skipped", "cancelled"):
+        raise ValueError(f"invalid non-committed output outcome '{outcome}'")
+    index, output = _selected_output(status, port_id)
+    if output.outcome == "committed":
+        raise RuntimeError(f"committed output port '{port_id}' cannot be relabelled")
+    status.outputs[index] = RunOutput(
+        node_id=output.node_id,
+        port_id=output.port_id,
+        port_label=output.port_label,
+        wire=output.wire,
+        publication_kind=output.publication_kind,
+        outcome=outcome,
+        error=_bounded_output_error(error),
+    )
 
 
 def settle_uncommitted_outputs(
@@ -133,7 +166,7 @@ def settle_uncommitted_outputs(
         raise ValueError(f"invalid non-committed output outcome '{outcome}'")
     settled: list[RunOutput] = []
     for output in status.outputs:
-        if output.outcome == "committed":
+        if output.outcome != "pending":
             settled.append(output)
             continue
         settled.append(RunOutput(
@@ -165,11 +198,12 @@ def discard_unpublished_outputs(
 
 
 def outputs_cache_document(status: RunStatus) -> dict:
-    output = sole_output(status, committed=True)
-    if output is None or output.rows is None:
+    if not status.outputs or any(
+            output.outcome != "committed" or output.rows is None
+            for output in status.outputs):
         raise RuntimeError(
-            "only one committed output with a known row count can enter the result cache")
-    return {"outputs": [output.model_dump()]}
+            "only a complete committed output set with known row counts can enter the result cache")
+    return {"outputs": [output.model_dump() for output in status.outputs]}
 
 
 def outputs_from_document(raw: Any) -> list[RunOutput]:
@@ -193,15 +227,36 @@ def sole_committed_document_output(raw: Any) -> RunOutput | None:
     return outputs[0]
 
 
+def committed_document_outputs(raw: Any) -> list[RunOutput]:
+    outputs = outputs_from_document(raw)
+    if not outputs or any(
+            output.outcome != "committed" or output.rows is None for output in outputs):
+        return []
+    return outputs
+
+
+def apply_cached_outputs(status: RunStatus, raw: Any) -> list[RunOutput] | None:
+    cached = committed_document_outputs(raw)
+    if not cached or len(cached) != len(status.outputs):
+        return None
+    expected_identity = [(
+        output.node_id, output.port_id, output.port_label,
+        output.wire, output.publication_kind,
+    ) for output in status.outputs]
+    cached_identity = [(
+        output.node_id, output.port_id, output.port_label,
+        output.wire, output.publication_kind,
+    ) for output in cached]
+    if cached_identity != expected_identity:
+        return None
+    status.outputs = [output.model_copy(deep=True) for output in cached]
+    return status.outputs
+
+
 def apply_cached_output(status: RunStatus, raw: Any) -> RunOutput | None:
-    cached = sole_committed_document_output(raw)
-    expected = sole_output(status)
-    if cached is None or cached.rows is None or expected is None:
+    if len(status.outputs) != 1:
         return None
-    if ((cached.node_id, cached.port_id, cached.port_label,
-         cached.wire, cached.publication_kind)
-            != (expected.node_id, expected.port_id, expected.port_label,
-                expected.wire, expected.publication_kind)):
+    applied = apply_cached_outputs(status, raw)
+    if applied is None:
         return None
-    return commit_output(
-        status, uri=str(cached.uri), table=cached.table, rows=int(cached.rows))
+    return applied[0]

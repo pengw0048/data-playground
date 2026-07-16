@@ -67,11 +67,11 @@ def _commit(handle: dict, *, version_id: str | None = None) -> list[dict]:
 
 def _run_output(
         uri: str | None = None, *, rows: int | None = None,
-        node_id: str = "source", table: str | None = None,
+        node_id: str = "source", port_id: str = "out", table: str | None = None,
         outcome: str = "committed", publication_kind: str | None = None) -> RunOutput:
     kind = publication_kind or ("catalog" if table is not None else "result")
     return RunOutput(
-        node_id=node_id, port_id="out", wire="dataset", publication_kind=kind,
+        node_id=node_id, port_id=port_id, wire="dataset", publication_kind=kind,
         outcome=outcome, uri=uri,
         table=table if outcome == "committed" else None, rows=rows,
     )
@@ -95,6 +95,11 @@ def _committed_output(status: RunStatus) -> RunOutput:
     return output
 
 
+def _only_pin(pin_ids: list[str] | None) -> str:
+    assert pin_ids is not None and len(pin_ids) == 1
+    return pin_ids[0]
+
+
 def _retire_result_cache(key: str) -> None:
     """Simulate bounded cache-row pruning without publishing a legacy null-URI tombstone."""
     with metadb.session() as session:
@@ -111,6 +116,13 @@ def _run_state_document(
     return RunStatus(
         run_id=run_id, status="done", target_node_id=node_id, total_rows=rows,
         outputs=[_run_output(uri, rows=rows, node_id=node_id, table=table)],
+    ).model_dump()
+
+
+def _pending_run_state_document(run_id: str, *, node_id: str = "source") -> dict:
+    return RunStatus(
+        run_id=run_id, status="running", target_node_id=node_id,
+        outputs=[_run_output(node_id=node_id, outcome="pending")],
     ).model_dump()
 
 
@@ -273,7 +285,7 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
     cache_key = f"pg-cache-race-{token}"
     metadb.put_result(cache_key, _cache_document(old["uri"]))
     barrier = threading.Barrier(2)
-    acquired: list[tuple[dict | None, str | None]] = []
+    acquired: list[tuple[dict | None, list[str] | None]] = []
     errors: list[BaseException] = []
 
     def acquire() -> None:
@@ -299,7 +311,8 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
             thread.join(timeout=8)
     assert all(not thread.is_alive() for thread in threads)
     assert errors == [] and len(acquired) == 1
-    doc, pin_id = acquired[0]
+    doc, pin_ids = acquired[0]
+    pin_id = _only_pin(pin_ids)
     pinned_output = sole_committed_document_output(doc)
     assert pinned_output is not None
     pinned_uri = pinned_output.uri
@@ -309,8 +322,9 @@ def test_postgres_cache_replacement_reader_pin_and_gc_are_atomic():
     assert _state(pinned_uri) == "published"
 
     run_id = f"pg-cache-reader-{token}"
+    metadb.save_run_state(run_id, _pending_run_state_document(run_id))
     metadb.save_run_state(run_id, _run_state_document(run_id, pinned_uri))
-    metadb.release_result_cache_pin(pin_id)
+    metadb.release_result_cache_pins([pin_id])
     assert _state(pinned_uri) == "published"
     _retire_terminal_run_state(run_id)
     _retire_result_cache(cache_key)
@@ -376,7 +390,7 @@ def test_postgres_gc_rechecks_refs_after_waiting_for_attempt_lock():
     with metadb.session() as session:
         attempt = session.get(metadb.ObjectAttempt, handle["uri"])
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "backend_publication", "ref_key": ref_key,
+            "ref_type": "backend_publication", "ref_key": ref_key, "ref_slot": "",
         })
         assert attempt is not None and attempt.state == "committed"
         assert ref is not None and ref.attempt_uri == handle["uri"]
@@ -384,7 +398,7 @@ def test_postgres_gc_rechecks_refs_after_waiting_for_attempt_lock():
     with metadb.session() as session:
         session.get(metadb.ObjectAttempt, handle["uri"], with_for_update=True)
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "backend_publication", "ref_key": ref_key,
+            "ref_type": "backend_publication", "ref_key": ref_key, "ref_slot": "",
         }, with_for_update=True)
         assert ref is not None
         session.delete(ref)
@@ -446,7 +460,7 @@ def test_postgres_quarantine_rechecks_refs_after_waiting_for_attempt_lock():
     with metadb.session() as session:
         attempt = session.get(metadb.ObjectAttempt, handle["uri"])
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "backend_publication", "ref_key": ref_key,
+            "ref_type": "backend_publication", "ref_key": ref_key, "ref_slot": "",
         })
         assert attempt is not None and attempt.state == "committed"
         assert ref is not None and ref.attempt_uri == handle["uri"]
@@ -454,7 +468,7 @@ def test_postgres_quarantine_rechecks_refs_after_waiting_for_attempt_lock():
     with metadb.session() as session:
         session.get(metadb.ObjectAttempt, handle["uri"], with_for_update=True)
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "backend_publication", "ref_key": ref_key,
+            "ref_type": "backend_publication", "ref_key": ref_key, "ref_slot": "",
         }, with_for_update=True)
         assert ref is not None
         session.delete(ref)
@@ -473,7 +487,8 @@ def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
         _commit(handle)
         cache_key = f"pg-pin-expiry-{token}"
         metadb.put_result(cache_key, _cache_document(handle["uri"]))
-        _doc, pin_id = metadb.acquire_result_cache_pin(cache_key, f"expiry-{index}", 30)
+        _doc, pin_ids = metadb.acquire_result_cache_pin(cache_key, f"expiry-{index}", 30)
+        pin_id = _only_pin(pin_ids)
         _retire_result_cache(cache_key)
         with metadb.session() as session:
             session.get(metadb.ObjectAttemptLease, pin_id).expires_at = \
@@ -483,7 +498,7 @@ def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
         def release() -> None:
             try:
                 barrier.wait(timeout=3)
-                metadb.release_result_cache_pin(pin_id)
+                metadb.release_result_cache_pins([pin_id])
             except BaseException as exc:  # noqa: BLE001 - asserted below
                 errors.append(exc)
 
@@ -503,7 +518,8 @@ def test_postgres_result_pin_release_and_expiry_cleanup_share_lock_order():
         assert all(not thread.is_alive() for thread in threads)
         with metadb.session() as session:
             assert session.get(metadb.ObjectAttemptRef, {
-                "ref_type": "result_reader", "ref_key": pin_id}) is None
+                "ref_type": "result_reader", "ref_key": pin_id, "ref_slot": "",
+            }) is None
             assert session.get(metadb.ObjectAttemptLease, pin_id) is None
             assert session.get(metadb.ObjectAttempt, handle["uri"]).state != "published"
     assert not any("lock timeout" in str(exc).lower() or "deadlock" in str(exc).lower()
@@ -802,7 +818,8 @@ def test_postgres_publish_and_unregister_share_one_lock_order():
             metadb.CatalogLogicalDataset, session.get(metadb.ObjectAttempt, old["uri"]).logical_id)
         assert logical_row.current_uri is None and logical_row.state == "unregistered"
         assert session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "catalog", "ref_key": logical_row.logical_id}) is None
+            "ref_type": "catalog", "ref_key": logical_row.logical_id, "ref_slot": "",
+        }) is None
     metadb.abandon_committed_object_attempt(new["uri"])
     metadb.quarantine_object_attempt(old["uri"], "test cleanup")
     metadb.quarantine_object_attempt(new["uri"], "test cleanup")
@@ -857,7 +874,8 @@ def test_postgres_publish_and_delete_prefix_fail_closed_without_deadlock():
         logical_row = session.get(
             metadb.CatalogLogicalDataset, session.get(metadb.ObjectAttempt, old["uri"]).logical_id)
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "catalog", "ref_key": logical_row.logical_id})
+            "ref_type": "catalog", "ref_key": logical_row.logical_id, "ref_slot": "",
+        })
         if current is None:
             assert logical_row.current_uri is None and ref is None
         else:
@@ -1002,6 +1020,8 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
     metadb.record_run(
         canvas_id, "n", "run", "done", rows=1,
         outputs=[history_output], run_id=run_id)
+    metadb.save_run_state(
+        run_id, _pending_run_state_document(run_id, node_id="n"), canvas_id=canvas_id)
     metadb.save_run_state(run_id, _run_state_document(run_id, uri, node_id="n"))
 
     with metadb.session() as session:
@@ -1022,6 +1042,181 @@ def test_attempt_refs_cover_cache_history_and_state_pruning(monkeypatch):
     _retire_result_cache(cache_b)
     assert _state(uri) == "superseded"
     metadb.quarantine_object_attempt(uri, "test cleanup")
+
+
+def test_named_output_cache_pins_and_replaces_complete_attempt_set():
+    old = [_handle(), _handle()]
+    new = [_handle(), _handle()]
+    for handle in (*old, *new):
+        _commit(handle)
+    key = f"named-cache-{uuid.uuid4().hex}"
+
+    def document(handles):
+        return {"outputs": [
+            _run_output(
+                handle["uri"], rows=index + 1, node_id="section",
+                port_id=port_id).model_dump()
+            for index, (handle, port_id) in enumerate(zip(handles, ("left", "right")))
+        ]}
+
+    metadb.put_result(key, document(old))
+    cached, pin_ids = metadb.acquire_result_cache_pin(key, "named-reader", 30)
+    assert cached == document(old)
+    assert pin_ids is not None and len(pin_ids) == 2
+    assert metadb.renew_result_cache_pins(pin_ids, 30) is True
+    with metadb.session() as session:
+        refs = list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_cache",
+            metadb.ObjectAttemptRef.ref_key == key,
+        ).order_by(metadb.ObjectAttemptRef.ref_slot)))
+        assert {ref.ref_slot: ref.attempt_uri for ref in refs} == {
+            metadb.run_output_ref_slot("section", "left"): old[0]["uri"],
+            metadb.run_output_ref_slot("section", "right"): old[1]["uri"],
+        }
+        reader_refs = list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_reader",
+            metadb.ObjectAttemptRef.ref_key.in_(pin_ids),
+        )))
+        assert {ref.attempt_uri for ref in reader_refs} == {
+            old[0]["uri"], old[1]["uri"],
+        }
+
+    metadb.put_result(key, document(new))
+    assert {_state(handle["uri"]) for handle in old} == {"published"}
+    metadb.release_result_cache_pins(pin_ids)
+    assert {_state(handle["uri"]) for handle in old} == {"superseded"}
+    _retire_result_cache(key)
+    assert {_state(handle["uri"]) for handle in new} == {"superseded"}
+    for handle in (*old, *new):
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_named_output_cache_member_failure_creates_no_partial_reader_pins():
+    handles = [_handle(), _handle()]
+    for handle in handles:
+        _commit(handle)
+    key = f"named-cache-miss-{uuid.uuid4().hex}"
+    doc = {"outputs": [
+        _run_output(
+            handle["uri"], rows=1, node_id="section",
+            port_id=port_id).model_dump()
+        for handle, port_id in zip(handles, ("left", "right"))
+    ]}
+    metadb.put_result(key, doc)
+    with metadb.session() as session:
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "result_cache",
+            "ref_key": key,
+            "ref_slot": metadb.run_output_ref_slot("section", "right"),
+        }, with_for_update=True)
+        assert ref is not None
+        session.delete(ref)
+    with pytest.raises(FileNotFoundError, match="incomplete lifecycle ownership"):
+        metadb.acquire_result_cache_pin(key, "incomplete-reader", 30)
+    with metadb.session() as session:
+        assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.ref_type == "result_reader",
+            metadb.ObjectAttemptRef.attempt_uri.in_([handle["uri"] for handle in handles]),
+        )))
+    metadb.put_result(key, doc)
+    _retire_result_cache(key)
+    for handle in handles:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_failed_named_output_run_owns_committed_prefix_in_state_and_history():
+    handle = _handle()
+    _commit(handle)
+    run_id = f"failed-named-{uuid.uuid4().hex}"
+    canvas_id = f"canvas-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
+            name="failed named output", version=1, doc="{}"))
+    pending = RunStatus(
+        run_id=run_id, status="running", target_node_id="section",
+        outputs=[
+            _run_output(
+                node_id="section", port_id=port_id, outcome="pending")
+            for port_id in ("left", "right")
+        ],
+    )
+    metadb.save_run_state(run_id, pending.model_dump(), canvas_id=canvas_id)
+    failed = RunStatus(
+        run_id=run_id, status="failed", target_node_id="section",
+        error="right publication failed",
+        outputs=[
+            _run_output(
+                handle["uri"], rows=3, node_id="section", port_id="left"),
+            _run_output(
+                node_id="section", port_id="right", outcome="failed"),
+        ],
+    )
+    metadb.save_run_state(
+        run_id, failed.model_dump(), canvas_id=canvas_id, publish_region=True)
+    metadb.record_run(
+        canvas_id, "section", "run", "failed",
+        error=failed.error, outputs=[output.model_dump() for output in failed.outputs],
+        run_id=run_id)
+    assert _state(handle["uri"]) == "published"
+    slot = metadb.run_output_ref_slot("section", "left")
+    with metadb.session() as session:
+        record = session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.run_id == run_id))
+        assert record is not None
+        refs = list(session.scalars(select(metadb.ObjectAttemptRef).where(
+            metadb.ObjectAttemptRef.attempt_uri == handle["uri"],
+        )))
+        assert {(ref.ref_type, ref.ref_key, ref.ref_slot) for ref in refs} == {
+            ("run_state", run_id, slot),
+            ("run_record", record.id, slot),
+        }
+
+    _retire_terminal_run_state(run_id)
+    assert _state(handle["uri"]) == "published"
+    metadb.delete_canvas_cascade(canvas_id)
+    assert _state(handle["uri"]) == "superseded"
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_kernel_status_wiring_publishes_failed_partial_region_output():
+    from hub.kernel import _persist_kernel_run_state
+
+    run_id = f"kernel-failed-named-{uuid.uuid4().hex}"
+    handle = _handle(run_id=run_id)
+    _commit(handle)
+    pending = RunStatus(
+        run_id=run_id, status="running", target_node_id="section",
+        outputs=[
+            _run_output(node_id="section", port_id=port_id, outcome="pending")
+            for port_id in ("left", "right")
+        ],
+    )
+    metadb.save_run_state(run_id, pending.model_dump())
+    failed = RunStatus(
+        run_id=run_id, status="failed", target_node_id="section",
+        error="right publication failed",
+        outputs=[
+            _run_output(
+                handle["uri"], rows=3, node_id="section", port_id="left"),
+            _run_output(
+                node_id="section", port_id="right", outcome="failed"),
+        ],
+    )
+
+    _persist_kernel_run_state(
+        metadb, object(), failed, kernel_id=f"kernel-{uuid.uuid4().hex}")
+
+    assert _state(handle["uri"]) == "published"
+    with metadb.session() as session:
+        ref = session.get(metadb.ObjectAttemptRef, {
+            "ref_type": "run_state",
+            "ref_key": run_id,
+            "ref_slot": metadb.run_output_ref_slot("section", "left"),
+        })
+        assert ref is not None and ref.attempt_uri == handle["uri"]
+    _retire_terminal_run_state(run_id)
+    metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_catalog_overwrite_keeps_stable_identity_and_governance():
@@ -1068,7 +1263,8 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
             metadb.CatalogLogicalDataset.current_uri == second["uri"]))
         assert logical_row is not None
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "catalog", "ref_key": logical_row.logical_id})
+            "ref_type": "catalog", "ref_key": logical_row.logical_id, "ref_slot": "",
+        })
         assert ref.attempt_uri == second["uri"]
     assert _state(first["uri"]) == "superseded"
     metadb.catalog_delete_entry(second["uri"])
@@ -1181,7 +1377,8 @@ def test_result_cache_pin_keeps_replaced_generation_published_until_run_owns_it(
     _commit(new)
     cache_key = f"cache-pin-{uuid.uuid4().hex}"
     metadb.put_result(cache_key, _cache_document(old["uri"]))
-    doc, pin_id = metadb.acquire_result_cache_pin(cache_key, "pin-reader", 30)
+    doc, pin_ids = metadb.acquire_result_cache_pin(cache_key, "pin-reader", 30)
+    pin_id = _only_pin(pin_ids)
     cached_output = sole_committed_document_output(doc)
     assert cached_output is not None and cached_output.uri == old["uri"] and pin_id
 
@@ -1189,15 +1386,18 @@ def test_result_cache_pin_keeps_replaced_generation_published_until_run_owns_it(
     assert _state(old["uri"]) == "published"
     with metadb.session() as session:
         assert session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "result_reader", "ref_key": pin_id}).attempt_uri == old["uri"]
+            "ref_type": "result_reader", "ref_key": pin_id, "ref_slot": "",
+        }).attempt_uri == old["uri"]
 
     run_id = f"cache-pin-run-{uuid.uuid4().hex}"
+    metadb.save_run_state(run_id, _pending_run_state_document(run_id))
     metadb.save_run_state(run_id, _run_state_document(run_id, old["uri"]))
-    metadb.release_result_cache_pin(pin_id)
+    metadb.release_result_cache_pins([pin_id])
     assert _state(old["uri"]) == "published", "terminal RunState replaced the temporary owner"
     with metadb.session() as session:
         assert session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "result_reader", "ref_key": pin_id}) is None
+            "ref_type": "result_reader", "ref_key": pin_id, "ref_slot": "",
+        }) is None
         assert session.get(metadb.ObjectAttemptLease, pin_id) is None
 
     _retire_terminal_run_state(run_id)
@@ -1211,19 +1411,22 @@ def test_done_run_state_is_primary_owner_for_noncacheable_committed_region():
     handle = _handle(logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/noncacheable.parquet")
     _commit(handle)
     run_id = f"noncacheable-{uuid.uuid4().hex}"
+    metadb.save_run_state(run_id, _pending_run_state_document(run_id))
     metadb.save_run_state(run_id, _run_state_document(run_id, handle["uri"]),
         publish_region=True)
     assert _state(handle["uri"]) == "published"
     with metadb.session() as session:
         ref = session.get(metadb.ObjectAttemptRef, {
-            "ref_type": "run_state", "ref_key": run_id})
+            "ref_type": "run_state", "ref_key": run_id,
+            "ref_slot": metadb.run_output_ref_slot("source", "out"),
+        })
         assert ref is not None and ref.attempt_uri == handle["uri"]
     _retire_terminal_run_state(run_id)
     assert _state(handle["uri"]) == "superseded"
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
-def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_terminal(
+def test_local_runner_terminal_owner_rejection_releases_cache_pin_before_terminal(
     tmp_path, caplog, monkeypatch
 ):
     pa = pytest.importorskip("pyarrow")
@@ -1265,9 +1468,9 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
     allow_release = threading.Event()
     release_calls = 0
 
-    release_pin = metadb.release_result_cache_pin
+    release_pins = metadb.release_result_cache_pins
 
-    def release_after_observation(pin_id):
+    def release_after_observation(pin_ids):
         nonlocal release_calls
         release_calls += 1
         if release_calls == 1:
@@ -1276,16 +1479,16 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
             raise RuntimeError("transient pin release failure")
         release_retry_started.set()
         assert allow_release.wait(timeout=5)
-        release_pin(pin_id)
+        release_pins(pin_ids)
 
-    monkeypatch.setattr(metadb, "release_result_cache_pin", release_after_observation)
+    monkeypatch.setattr(metadb, "release_result_cache_pins", release_after_observation)
 
     def persist(_graph, status):
         if status.status != "done":
             return
         persistence_started.set()
         assert allow_failure.wait(timeout=5)
-        raise RuntimeError("terminal persistence unavailable")
+        raise metadb.RunStatePublicationRejected("run owner was deleted")
 
     runner.on_status = persist
     caplog.set_level("ERROR", logger="hub")
@@ -1315,9 +1518,7 @@ def test_local_runner_terminal_persistence_failure_releases_cache_pin_before_ter
     final = runner.status(started.run_id)
     assert final.status == "failed"
     assert final.outputs[0].outcome == "failed" and final.outputs[0].uri is None
-    assert "full result publication failed" in (final.error or "")
-    assert "terminal persistence unavailable" not in (final.error or "")
-    assert "terminal persistence unavailable" in caplog.text
+    assert "run owner was deleted" in (final.error or "")
     with metadb.session() as session:
         assert not list(session.scalars(select(metadb.ObjectAttemptRef).where(
             metadb.ObjectAttemptRef.ref_type == "result_reader",
@@ -1374,15 +1575,15 @@ def test_local_runner_cancel_releases_cache_pin_before_terminal(
         assert allow_step.wait(timeout=5)
         return result
 
-    release_pin = metadb.release_result_cache_pin
+    release_pins = metadb.release_result_cache_pins
 
-    def release_after_observation(pin_id):
+    def release_after_observation(pin_ids):
         release_started.set()
         assert allow_release.wait(timeout=5)
-        release_pin(pin_id)
+        release_pins(pin_ids)
 
     monkeypatch.setattr(runner, "_cache_acquire", acquire_before_step)
-    monkeypatch.setattr(metadb, "release_result_cache_pin", release_after_observation)
+    monkeypatch.setattr(metadb, "release_result_cache_pins", release_after_observation)
     plan = compiler.compile_plan(
         graph, "source", deps.registry, deps.node_specs, deps.node_ir)
     started = runner.run(plan, graph, "source", "local")
@@ -1497,7 +1698,7 @@ def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
     cache_key = f"sqlite-cache-race-{uuid.uuid4().hex}"
     metadb.put_result(cache_key, _cache_document(old["uri"]))
     barrier = threading.Barrier(2)
-    acquired: list[tuple[dict | None, str | None]] = []
+    acquired: list[tuple[dict | None, list[str] | None]] = []
     errors: list[BaseException] = []
 
     def acquire() -> None:
@@ -1522,12 +1723,13 @@ def test_sqlite_cache_replacement_and_reader_pin_are_serialized():
         thread.join(timeout=8)
     assert all(not thread.is_alive() for thread in threads)
     assert errors == [] and len(acquired) == 1
-    doc, pin_id = acquired[0]
+    doc, pin_ids = acquired[0]
+    pin_id = _only_pin(pin_ids)
     acquired_output = sole_committed_document_output(doc)
     assert acquired_output is not None
     assert acquired_output.uri in (old["uri"], new["uri"]) and pin_id
     assert _state(acquired_output.uri) == "published"
-    metadb.release_result_cache_pin(pin_id)
+    metadb.release_result_cache_pins([pin_id])
     _retire_result_cache(cache_key)
     metadb.quarantine_object_attempt(old["uri"], "test cleanup")
     metadb.quarantine_object_attempt(new["uri"], "test cleanup")
@@ -1799,6 +2001,9 @@ def test_commit_crash_publish_lease_expires_and_secondary_pointers_fail_closed()
             canvas_id, "n", "run", "done", rows=1,
             outputs=[_run_output(uri, rows=1, node_id="n").model_dump()],
             run_id="secondary")
+    metadb.save_run_state(
+        "secondary", _pending_run_state_document("secondary", node_id="n"),
+        canvas_id=canvas_id)
     with pytest.raises(RuntimeError, match="only a published"):
         metadb.save_run_state("secondary", _run_state_document(
             "secondary", uri, node_id="n"))
@@ -2436,6 +2641,9 @@ def test_moto_versioned_s3_history_read_and_exact_sibling_safe_gc(
                 first["uri"], rows=1, node_id="n").model_dump()],
             run_id=run_id)
         metadb.save_run_state(
+            run_id, _pending_run_state_document(run_id, node_id="n"),
+            canvas_id=canvas_id)
+        metadb.save_run_state(
             run_id, _run_state_document(run_id, first["uri"], node_id="n"),
             canvas_id=canvas_id)
 
@@ -2714,7 +2922,9 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
             attempt = session.get(metadb.ObjectAttempt, output.uri)
             assert attempt is not None and attempt.state == "published"
             ref = session.get(metadb.ObjectAttemptRef, {
-                "ref_type": "run_state", "ref_key": final.run_id})
+                "ref_type": "run_state", "ref_key": final.run_id,
+                "ref_slot": metadb.run_output_ref_slot(output.node_id, output.port_id),
+            })
             assert ref is not None and ref.attempt_uri == output.uri
         phash = deps.runner._plan_hash(graph, "source")
         cache_deadline = time.monotonic() + 2
@@ -4083,11 +4293,11 @@ def test_local_cleanup_outages_do_not_replace_primary_failure_or_skip_finally(
         outputs=[_run_output(node_id="source", outcome="pending")])
     runner._cancel["run"] = _CancelToken()
 
-    def fail_result(_node_id, _engine, status, *_args):
-        status.outputs = [_run_output(attempt, rows=1, node_id="source")]
+    def fail_results(_node_id, _engine, _status, *_args):
+        runner._owned_object_result_uris["run"] = {attempt}
         raise RuntimeError("primary data failure")
 
-    runner._materialize_result = fail_result
+    runner._materialize_results = fail_results
     monkeypatch.setattr(handoff, "managed_read_lease", lambda *_args, **_kwargs: Lease())
     monkeypatch.setattr(
         metadb, "abandon_committed_object_attempt",

@@ -714,6 +714,7 @@ def upgrade() -> None:
         "object_attempt_refs",
         sa.Column("ref_type", sa.String(), nullable=False),
         sa.Column("ref_key", sa.String(), nullable=False),
+        sa.Column("ref_slot", sa.String(), nullable=False),
         sa.Column("attempt_uri", sa.String(), nullable=False),
         sa.Column("generation", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -721,7 +722,7 @@ def upgrade() -> None:
             ["attempt_uri"],
             ["object_attempts.uri"],
         ),
-        sa.PrimaryKeyConstraint("ref_type", "ref_key"),
+        sa.PrimaryKeyConstraint("ref_type", "ref_key", "ref_slot"),
     )
     op.create_index(
         op.f("ix_object_attempt_refs_attempt_uri"),

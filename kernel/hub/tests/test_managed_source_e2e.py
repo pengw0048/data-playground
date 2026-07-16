@@ -148,6 +148,7 @@ def test_moto_isolated_backends_read_parent_published_managed_source(
             assert source_attempt is not None and source_attempt.state == "published"
             assert session.get(metadb.ObjectAttemptRef, {
                 "ref_type": "catalog", "ref_key": source_attempt.logical_id,
+                "ref_slot": "",
             }).attempt_uri == attempt_uri
 
         def retained_job_dir(prefix="dp-run-"):

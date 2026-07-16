@@ -608,11 +608,56 @@ class ManagedReadLeaseGuard:
 
 
 class ManagedResultCachePinGuard(ManagedReadLeaseGuard):
-    """Renew one cache-reader lease and release its paired temporary ownership ref."""
+    """Renew and release one cache hit's complete object-pin set with one thread."""
+
+    def __init__(self, lease_ids: list[str] | str | None, ttl_seconds: float):
+        values = ([lease_ids] if isinstance(lease_ids, str)
+                  else list(lease_ids or []))
+        self.lease_ids = [str(lease_id) for lease_id in values if str(lease_id)]
+        if len(self.lease_ids) != len(set(self.lease_ids)):
+            raise ValueError("result cache pin IDs must be unique")
+        self.attestation = None
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = None
+        if self.lease_ids:
+            try:
+                self._thread = threading.Thread(
+                    target=self._renew_loop, daemon=True,
+                    name="dp-result-cache-pin-set")
+                self._thread.start()
+            except Exception:
+                try:
+                    self._release()
+                except Exception:  # noqa: BLE001 — preserve the thread-start failure
+                    logging.getLogger("hub").exception(
+                        "managed result cache pin rollback failed")
+                self._thread = None
+                raise
+
+    def _renew_loop(self) -> None:
+        from hub import metadb
+        while not self._stop.wait(max(0.1, self.ttl_seconds / 3.0)):
+            try:
+                if not metadb.renew_result_cache_pins(
+                        self.lease_ids, self.ttl_seconds):
+                    self._lost.set()
+                    return
+            except Exception:  # noqa: BLE001 — a reader cannot assume its deletion fence survived
+                self._lost.set()
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if self.lease_ids:
+            self._release()
 
     def _release(self) -> None:
         from hub import metadb
-        metadb.release_result_cache_pin(self.lease_id)
+        metadb.release_result_cache_pins(self.lease_ids)
 
 
 @contextlib.contextmanager

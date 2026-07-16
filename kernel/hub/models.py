@@ -440,7 +440,7 @@ class RunStatus(Wire):
     stalled: bool = False               # running but no step has completed for a while (a soft "stuck?" hint)
     error: str | None = None
     # Ordinary runs publish the declaration-ordered expected port set from their first live status.
-    # #263 keeps that set to exactly one until the local/subprocess multi-output state machines land.
+    # Backends that cannot preserve the complete set reject multi-output targets before allocation.
     # Profile jobs are inspection jobs and deliberately keep this collection empty.
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     # A profile result is present only on a successful full-profile job. ``plan_digest`` is the fixed-size

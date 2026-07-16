@@ -16,7 +16,7 @@ import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useSchemaWarnings } from './fields'
 import {
-  fullRunUnavailableReason, useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind,
+  useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind,
 } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -47,7 +47,6 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const rename = useStore((s) => s.rename)
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
-  const fullRunUnavailable = useStore((s) => fullRunUnavailableReason(s.doc, id))
   // hover drives the action shelf. The shelf is a DOM descendant of this wrapper (just positioned
   // below it), so the wrapper's own enter/leave already covers card↔shelf travel — moving between
   // them never leaves the subtree, so onMouseLeave doesn't fire. A short grace delay on leave then
@@ -158,7 +157,11 @@ export function NodeCard({ id, data, children, metaOverride }: {
             {/* last run stats — so a completed node carries its result (rows · time) at a glance */}
             {data.status === 'latest' && data.lastRun && (
               <div className="mt-0.5 truncate text-[10.5px] tabular-nums text-muted-foreground/85">
-                {data.lastRun.rows.toLocaleString()} {data.lastRun.rows === 1 ? 'row' : 'rows'} · {fmtMs(data.lastRun.ms)}
+                {data.lastRun.outputCount != null
+                  ? `${data.lastRun.outputCount.toLocaleString()} output${data.lastRun.outputCount === 1 ? '' : 's'}`
+                  : data.lastRun.rows != null
+                    ? `${data.lastRun.rows.toLocaleString()} ${data.lastRun.rows === 1 ? 'row' : 'rows'}`
+                    : 'Result'} · {fmtMs(data.lastRun.ms)}
                 {data.lastRun.placement === 'distributed' && ' · distributed'}
               </div>
             )}
@@ -208,9 +211,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={busy ? 'Stop' : invalid ?? fullRunUnavailable ?? (!runnable ? 'Connect a source to run' : 'Run up to here')}
+              label={busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : 'Run up to here')}
               active={openPanel === 'run'}
-              disabled={!canEdit || ((!runnable || !!invalid || !!fullRunUnavailable) && !busy)}
+              disabled={!canEdit || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}

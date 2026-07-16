@@ -92,15 +92,6 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
   return walk(id)
 }
 
-export const MULTI_OUTPUT_FULL_RUN_UNAVAILABLE =
-  'Full runs for multi-output nodes are not available yet. Preview a named output instead.'
-
-/** Full runs stay atomic in #263; preview/profile can address a named port independently. */
-export function fullRunUnavailableReason(doc: CanvasDoc, id: string): string | undefined {
-  const node = doc.nodes.find((candidate) => candidate.id === id)
-  return node && nodeOutputs(node).length > 1 ? MULTI_OUTPUT_FULL_RUN_UNAVAILABLE : undefined
-}
-
 /** A node is disabled if it, or ANY of its upstream ancestors, is flagged disabled — disabling a
  * node turns off everything downstream of it (the whole branch stops), mirroring ComfyUI. */
 export function isDisabled(doc: CanvasDoc, id: string): boolean {
@@ -1348,11 +1339,6 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
-    const unavailable = fullRunUnavailableReason(get().doc, id)
-    if (unavailable) {
-      get().pushToast(unavailable, 'info')
-      return
-    }
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
@@ -1371,11 +1357,6 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   estimate: async (id) => {
-    const unavailable = fullRunUnavailableReason(get().doc, id)
-    if (unavailable) {
-      get().pushToast(unavailable, 'info')
-      return
-    }
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
     try {
       const estimate = await api.estimate(get().doc, id)
@@ -1389,11 +1370,6 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false) => {
     if (!roleCanEdit(get().canvasRole)) return
-    const unavailable = fullRunUnavailableReason(get().doc, id)
-    if (unavailable) {
-      get().pushToast(unavailable, 'info')
-      return
-    }
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
     get().updateData(id, { status: 'running' })
@@ -1423,15 +1399,9 @@ export const useStore = create<Store>((set, get) => ({
     const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
     const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id))
-    const runnable = valid.filter((n) => !fullRunUnavailableReason(doc, n.id))
-    runnable.forEach((n) => get().requestRun(n.id))
+    valid.forEach((n) => get().requestRun(n.id))
     const invalidSkipped = sinks.length - valid.length
-    const multiOutputSkipped = valid.length - runnable.length
     if (invalidSkipped) get().pushToast(`Skipped ${invalidSkipped} pipeline${invalidSkipped > 1 ? 's' : ''} with a required field still empty`, 'info')
-    if (multiOutputSkipped) get().pushToast(
-      `Skipped ${multiOutputSkipped} multi-output pipeline${multiOutputSkipped > 1 ? 's' : ''}. ${MULTI_OUTPUT_FULL_RUN_UNAVAILABLE}`,
-      'info',
-    )
   },
 
   cancelRun: async (id) => {
@@ -2816,13 +2786,23 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
     applyPerNodeStatus(set, status.perNode)  // animate every node on the canvas, not just the target
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
       const phase = status.status === 'done' ? 'done' : status.status === 'failed' ? 'failed' : 'idle'
+      // rowsProcessed is execution work, not result cardinality. A named multi-output result is
+      // summarized by its number of outputs; a single output uses only measured result rows.
+      const resultRows = status.totalRows
+        ?? (status.outputs.length === 1 ? status.outputs[0]?.rows ?? undefined : undefined)
+      const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
       if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
       const g = get()
       g.updateData(nodeId, {
         status: status.status === 'done' ? 'latest' : status.status === 'failed' ? 'failed' : 'stale',
         lastRun: status.status === 'done'
-          ? { rows: status.totalRows ?? status.rowsProcessed, ms: status.ms, placement: status.placement }
+          ? {
+              ...(resultRows !== undefined ? { rows: resultRows } : {}),
+              ...(resultOutputCount !== undefined ? { outputCount: resultOutputCount } : {}),
+              ms: status.ms,
+              placement: status.placement,
+            }
           : undefined,
       })
       if (status.status === 'done') {
@@ -2832,8 +2812,13 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
           const version: NodeVersion = {
             id: `v_${Math.floor(performance.now())}`,
             ts: Date.now(),
-            rows: status.totalRows ?? undefined,
-            label: `run · ${status.totalRows ?? status.rowsProcessed} rows`,
+            rows: resultRows,
+            outputCount: resultOutputCount,
+            label: resultOutputCount !== undefined
+              ? `run · ${resultOutputCount} outputs`
+              : resultRows !== undefined
+                ? `run · ${resultRows} ${resultRows === 1 ? 'row' : 'rows'}`
+                : 'run · result',
             config: { ...node.data.config },
           }
           g.updateData(nodeId, { history: [...(node.data.history ?? []), version] })

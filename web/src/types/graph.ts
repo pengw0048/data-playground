@@ -59,7 +59,8 @@ export interface NodeConfig {
 }
 
 export interface LastRun {
-  rows: number
+  rows?: number
+  outputCount?: number
   ms: number
   placement: 'local' | 'distributed'
 }
@@ -68,6 +69,7 @@ export interface NodeVersion {
   id: string
   ts: number
   rows?: number
+  outputCount?: number
   label: string
   config: NodeConfig
 }
