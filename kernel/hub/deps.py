@@ -14,6 +14,7 @@ import importlib.util
 import logging
 import os
 import sys
+from collections.abc import Callable
 
 from hub.backends import CatalogProvider, NodeBuilder
 from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
@@ -140,8 +141,18 @@ class Registry:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
 
     def add_runner(self, runner) -> None:
-        # runner should satisfy hub.backends.ExecutionBackend; inserted first so it wins pick_runner
-        self.deps.runners.insert(0, runner)
+        # runner should satisfy hub.backends.ExecutionBackend; materialized in registration order after
+        # the built-in local runner exists, then inserted first so it wins pick_runner.
+        self.deps._runner_registrations.append((self._pack, lambda _deps: runner))
+
+    def add_runner_factory(self, factory) -> None:
+        """Register ``factory(deps) -> ExecutionBackend`` for composition after the local runner exists.
+
+        Catalog selection must finish before any runner captures it.  A backend that also delegates to
+        the built-in runner (for example dp_ray) therefore registers a factory instead of constructing
+        itself during plugin discovery.
+        """
+        self.deps._runner_registrations.append((self._pack, factory))
 
     def add_capability(self, cap) -> None:
         self.deps.capabilities.append(cap)
@@ -351,6 +362,7 @@ class Deps:
         # Plugins register before services are constructed.  Keep the collection available now so a
         # plugin backend can register itself, then append the built-ins after they bind the final catalog.
         self.runners: list = []
+        self._runner_registrations: list[tuple[str | None, Callable[[Deps], object]]] = []
         from hub.storage import make_storage
         self.storage = make_storage(workspace)
         # The catalog is shared by every user (by design — one workspace, not one kernel per session);
@@ -394,6 +406,8 @@ class Deps:
         self.runner.result_get = _result_get  # DB-backed content-addressed result reuse (cross-run/restart)
         self.runner.result_acquire = _result_acquire
         self.runner.result_put = _result_put
+        self.runners = [self.runner]
+        self._materialize_plugin_runners()
         # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileProcessRunner
@@ -411,7 +425,7 @@ class Deps:
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         sub.result_put = _result_put
-        self.runners.extend([self.runner, sub])
+        self.runners.append(sub)
         # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
         # cluster — pods are processes with configured capacities. Shows in the Compute view + is
         # selectable/placeable. Absent → default behavior unchanged. (k8s/Ray = plugins over the same API.)
@@ -455,6 +469,19 @@ class Deps:
             except Exception:  # noqa: BLE001
                 continue
         return self.default_adapter
+
+    def _materialize_plugin_runners(self) -> None:
+        """Construct registered plugin backends after catalog selection and the local base runner."""
+        for pack, factory in self._runner_registrations:
+            try:
+                self.runners.insert(0, factory(self))
+            except Exception as e:  # noqa: BLE001 — optional plugin failure remains non-fatal
+                name = pack or getattr(factory, "__module__", "plugin-runner")
+                print(f"[deps] plugin runner '{name}' failed: {e}")
+                entry = next((p for p in reversed(self.plugins)
+                              if p.get("name") == pack and "error" not in p), None)
+                if entry is not None:
+                    entry["error"] = f"{type(e).__name__}: {e}"
 
     def chosen_backend(self, uid: str | None = None) -> str:
         """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >

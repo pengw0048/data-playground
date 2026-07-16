@@ -5419,4 +5419,5 @@ def _collect_arrow(dataset, *, purpose: str = "Ray result"):
 
 def register(reg) -> None:
     # opt-in: added as an available backend, selected only when execution == 'ray-data' (never the default)
-    reg.add_runner(RayRunner(reg.deps))
+    # Construction is deferred until the final catalog and built-in local delegate both exist.
+    reg.add_runner_factory(lambda deps: RayRunner(deps))

@@ -7243,6 +7243,7 @@ def test_catalog_plugin_is_finalized_before_catalog_services(tmp_path, monkeypat
     """A catalog selected by a drop-in plugin is the one every later service observes."""
     import importlib
     import sys
+    import uuid
 
     import duckdb
 
@@ -7270,6 +7271,8 @@ def test_catalog_plugin_is_finalized_before_catalog_services(tmp_path, monkeypat
         "    reg.set_catalog(catalog)\n"
     )
     source = tmp_path / "source.parquet"
+    source_name = f"catalog_composition_source_{uuid.uuid4().hex}"
+    output_name = f"catalog_composition_output_{uuid.uuid4().hex}"
     duckdb.connect().execute(f"COPY (SELECT 1 AS value) TO '{source}' (FORMAT PARQUET)")
 
     try:
@@ -7282,9 +7285,10 @@ def test_catalog_plugin_is_finalized_before_catalog_services(tmp_path, monkeypat
         assert first.controller.deps.catalog is selected
 
         # Read and profile preflight resolve an alias through the selected provider.
-        selected.register_output(name="source", uri=str(source), parents=[])
+        selected.register_output(name=source_name, uri=str(source), parents=[])
         graph = Graph(**{"id": "catalog-composition", "version": 1, "nodes": [
-            N("source", "source", {"uri": "source"}), N("write", "write", {"name": "published"}),
+            N("source", "source", {"uri": source_name}),
+            N("write", "write", {"name": output_name}),
         ], "edges": [E("source", "write")]})
         graph_mod.resolve_source_refs(graph, first.catalog.resolve_ref)
         assert graph.nodes[0].data["config"]["uri"] == str(source)
@@ -7333,6 +7337,32 @@ def test_required_default_catalog_failure_aborts_composition(tmp_path, monkeypat
     monkeypatch.setattr(default_catalog, "register", lambda _reg: (_ for _ in ()).throw(RuntimeError("catalog boom")))
     with pytest.raises(RuntimeError, match="catalog boom"):
         Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
+
+
+def test_runner_plugin_constructs_after_catalog_and_local_runner(tmp_path):
+    """The bundled dp_ray plugin can bind both the selected catalog and its local delegate."""
+    import sys
+    from pathlib import Path
+
+    from hub.deps import Deps
+
+    plugin_name = "dp_ray"
+    plugin = tmp_path / "ws" / "plugins" / plugin_name
+    plugins_dir = str(plugin.parent)
+    plugin.parent.mkdir(parents=True)
+    source = Path(__file__).resolve().parents[3] / "examples" / "plugins" / plugin_name
+    plugin.symlink_to(source, target_is_directory=True)
+
+    try:
+        deps = Deps(str(tmp_path / "ws"), str(tmp_path / "data"), maintain_storage=False)
+        runner = next(r for r in deps.runners if getattr(r, "name", None) == "ray-data")
+        assert runner.base is deps.runner
+        assert runner.catalog is deps.catalog
+        assert not next(p for p in deps.plugins if p["name"] == plugin_name).get("error")
+    finally:
+        sys.modules.pop(plugin_name, None)
+        if plugins_dir in sys.path:
+            sys.path.remove(plugins_dir)
 
 
 def test_core_api_range_check(monkeypatch):

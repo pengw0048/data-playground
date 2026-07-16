@@ -129,6 +129,11 @@ the capability unless the backend uses the selected Cred rather than silently fa
 credentials. A remote backend also owns truthful cancellation, deadlines, resource limits, worker trust,
 and operational documentation for the shapes it claims.
 
+Plugin registration finishes before the built-in local runner is constructed. If a backend delegates to
+that runner, register `reg.add_runner_factory(factory)` instead; core calls `factory(deps)` after catalog
+selection and local-runner wiring are complete. Use `reg.add_runner(runner)` when construction needs only
+the composition-time objects already available during `register()`.
+
 Every public `RunStatus` uses the same named-output contract. `outputs` is a declaration-ordered array
 of `RunOutput` snapshots (`nodeId`, `portId`, `portLabel`, `wire`, `publicationKind`, `outcome`, and the
 committed publication fields); there are no singular `outputUri` or `outputTable` fields. An ordinary
