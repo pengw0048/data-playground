@@ -588,20 +588,20 @@ class InMemoryCatalog:
             name=name, uri=artifact_uri, strict_probe=True,
             _persist_table=False, _embed_table=False,
         )
+        parent_tokens = metadb.catalog_lineage_parent_tokens(parents)
+        lineage_doc = lineage.model_dump() if parent_tokens and lineage is not None else None
         try:
             published = metadb.catalog_publish_managed_local_file(
-                logical_uri, artifact_uri, name, table.model_dump(by_alias=True))
+                logical_uri, artifact_uri, name, table.model_dump(by_alias=True),
+                parents=parent_tokens, lineage=lineage_doc)
         except Exception:
             published = metadb.catalog_managed_local_file_publication_receipt(
-                logical_uri, artifact_uri, name)
+                logical_uri, artifact_uri, name,
+                parents=parent_tokens, lineage=lineage_doc)
             if published is None:
                 raise
         canonical = CatalogTable.model_validate(published["table"])
-        if parents and lineage is not None:
-            self.record_lineage(
-                name=canonical.name, uri=canonical.uri, version=canonical.version,
-                parents=parents, lineage=lineage)
-        for parent in parents or []:
+        for parent in parent_tokens:
             try:
                 metadb.catalog_bump_usage(parent)
             except Exception:  # noqa: BLE001 — popularity is optional after durable publication
