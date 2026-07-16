@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import uuid
 from types import SimpleNamespace
 
@@ -10,7 +9,6 @@ import pyarrow as pa
 import pytest
 
 from hub import db, metadb
-from hub.api_errors import APIError
 from hub.models import Graph
 from hub.plugins.adapters import LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
