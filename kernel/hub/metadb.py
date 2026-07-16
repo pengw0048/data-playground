@@ -2730,6 +2730,26 @@ def local_run_input_manifest(run_id: str) -> list[dict[str, str]] | None:
     return [dict(item) for item in parsed]
 
 
+def local_run_input_admission(run_id: str) -> dict | None:
+    """Return the immutable identity and manifest required by local execution transport."""
+    with session() as s:
+        row = s.get(RunInputAdmission, str(run_id))
+        if row is None:
+            return None
+        admission = {
+            "run_id": row.run_id,
+            "canvas_id": row.canvas_id,
+            "target_node_id": row.target_node_id,
+        }
+        try:
+            manifest = json.loads(row.manifest)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("persisted local run input manifest is invalid") from exc
+    if not isinstance(manifest, list):
+        raise RuntimeError("persisted local run input manifest is invalid")
+    return {**admission, "manifest": [dict(item) for item in manifest]}
+
+
 def claim_local_run_dispatch(*, run_id: str, uid: str, auth_canvas_id: str | None,
                              request_id: str | None) -> tuple[dict, bool]:
     """Claim one local admission before the runner can create a worker.

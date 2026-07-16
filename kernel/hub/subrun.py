@@ -122,6 +122,39 @@ def _parent_attested_source_uris(job: dict, graph) -> frozenset[str]:
     return frozenset(attested | attested_local)
 
 
+def _validate_admitted_input_manifest(job: dict, graph) -> None:
+    """Reject a malformed/stale exact-input transport before compilation or source scanning."""
+    from hub.local_run_inputs import LocalRunInputError, source_nodes, validate_manifest_graph
+
+    manifest = job.get("inputManifest")
+    private_revisions = any(
+        isinstance(node.data, dict)
+        and isinstance(node.data.get("config"), dict)
+        and node.data["config"].get("_input_revision_id") is not None
+        for node in source_nodes(graph, job.get("target"))
+    )
+    if manifest is None:
+        if private_revisions:
+            raise RuntimeError("isolated run is missing its admitted input manifest")
+        return
+    identity = job.get("inputManifestIdentity")
+    if (not isinstance(identity, dict)
+            or set(identity) != {"runId", "canvasId", "targetNodeId"}
+            or not isinstance(identity.get("runId"), str)
+            or not identity["runId"]
+            or not isinstance(identity.get("canvasId"), str)
+            or not identity["canvasId"]
+            or identity["runId"] != job.get("runId")
+            or identity["canvasId"] != str(graph.id)
+            or identity["targetNodeId"] != job.get("target")):
+        raise RuntimeError("isolated admitted input manifest identity is invalid")
+    try:
+        validate_manifest_graph(
+            graph, job.get("target"), manifest, require_bound_revisions=True)
+    except LocalRunInputError as exc:
+        raise RuntimeError("isolated admitted input manifest is invalid") from exc
+
+
 def _validate_local_source_locks(job: dict, storage) -> None:
     """Bind every parent-attested source URI to this namespace and its inherited lock inode."""
     raw = job.get("managedLocalSources")
@@ -319,6 +352,7 @@ def main() -> int:
             dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
         deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
         graph = Graph(**job["graph"])
+        _validate_admitted_input_manifest(job, graph)
         # The disposable child DB cannot prove lifecycle ownership. Accept managed source attempts only
         # when the durable parent attested the exact physical URI and is holding its renewable read lease.
         deps.runner.parent_attested_source_uris = _parent_attested_source_uris(job, graph)

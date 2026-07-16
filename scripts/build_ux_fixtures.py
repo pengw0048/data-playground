@@ -58,6 +58,14 @@ def _seed_starter_data(output: Path) -> None:
     from hub.seed import seed  # noqa: PLC0415 - script deliberately bootstraps the product builder
 
     seed(str(output))
+    # Full runs use the default kernel transport, which admits only provider-native exact revisions.
+    # Keep the starter schema and catalog name while making the golden full-result source reopenable.
+    import lance  # noqa: PLC0415 - available through the kernel runtime used by this script
+    import pyarrow.parquet as pq  # noqa: PLC0415 - available through the kernel runtime
+
+    events_parquet = output / "events.parquet"
+    lance.write_dataset(pq.read_table(events_parquet), str(output / "events.lance"))
+    events_parquet.unlink()
 
 
 def _build_temporal_multimodal(output: Path) -> None:

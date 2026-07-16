@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import os
 import time
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -3844,7 +3845,8 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
     from hub import metadb
     metadb.set_setting("backend", "local-subprocess", "global")
     try:
-        p = _seq_parquet(tmp_path, n=40)
+        p = _seq_lance(tmp_path, n=40)
+        _ensure_run_canvas("c")
         g = {"id": "c", "version": 1, "nodes": [
             N("src", "source", {"uri": p}),
             N("wr", "write", {"name": "subproc_out", "writeMode": "overwrite"}),
@@ -3882,7 +3884,8 @@ def test_subprocess_runner_enforces_named_schema_contract_without_hub_db_access(
     metadb.save_schema_contract("subprocess_value_contract", [{"name": "v", "type": "int"}])
     metadb.set_setting("backend", "local-subprocess", "global")
     try:
-        p = _seq_parquet(tmp_path, n=10)
+        p = _seq_lance(tmp_path, n=10)
+        _ensure_run_canvas("c")
         g = {"id": "c", "version": 1, "nodes": [
             N("src", "source", {"uri": p}),
             N("xf", "transform", {
@@ -4066,7 +4069,7 @@ def test_subprocess_run_is_recorded_in_history(tmp_path):
     before = len(metadb.list_runs(cid))
     metadb.set_setting("backend", "local-subprocess", "global")
     try:
-        p = _seq_parquet(tmp_path, n=30)
+        p = _seq_lance(tmp_path, n=30)
         g = {"id": cid, "version": 1, "nodes": [
             N("src", "source", {"uri": p}),
             N("wr", "write", {"filename": "hist_out.parquet", "writeMode": "overwrite"}),
@@ -4487,6 +4490,26 @@ def _seq_parquet(tmp_path, n=1000):
     return p
 
 
+def _seq_lance(tmp_path, n=1000):
+    import lance
+    import pyarrow as pa
+
+    p = str(tmp_path / f"seq-{uuid.uuid4().hex}.lance")
+    lance.write_dataset(pa.table({"v": list(range(n))}), p)
+    get_deps().catalog._add(
+        name=f"seq_{uuid.uuid4().hex}", uri=p, strict_probe=True)
+    return p
+
+
+def _ensure_run_canvas(canvas_id: str) -> None:
+    from hub import metadb
+
+    with metadb.session() as session:
+        if session.get(metadb.Canvas, canvas_id) is None:
+            session.add(metadb.Canvas(
+                id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name=canvas_id))
+
+
 def test_section_for_each_over_a_list(tmp_path):
     # for-each: run a filter per predicate in a list, concat the results (graph isn't fixed — a `for`)
     p = _seq_parquet(tmp_path)  # v = 0..999
@@ -4825,7 +4848,7 @@ def test_headless_timeout_stops_isolated_child_without_late_publish(tmp_path, ca
     from hub.deps import get_deps
 
     d = get_deps()
-    src = _seq_parquet(tmp_path, n=5)
+    src = _seq_lance(tmp_path, n=5)
     suffix = uuid.uuid4().hex
     output_name = f"cli_subprocess_timeout_{suffix}.parquet"
     table_name = output_name.removesuffix(".parquet")
@@ -6558,18 +6581,31 @@ def test_kernel_backend_runs_a_canvas_end_to_end():
     # path (atomic lease → spawn → token-authed loopback command channel → run → status via the DB).
     from hub import deps as dm, kernel_backend, metadb
     from hub import settings as sm
-    canvas_id = "cv_kernel_e2e"
+    canvas_id = f"cv_kernel_e2e_{uuid.uuid4().hex}"
     os.environ["DP_KERNEL_IDLE_TTL"] = "6"          # backstop: the detached kernel self-exits soon if idle
     old = sm.settings.execution
     sm.settings.execution = "kernel"
     dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)   # rebuild deps → registers KernelBackend
     try:
-        assert any(getattr(r, "name", "") == "kernel" for r in dm.get_deps().runners)
+        import lance
+        import pyarrow as pa
+
+        deps = dm.get_deps()
+        assert any(getattr(r, "name", "") == "kernel" for r in deps.runners)
+        source_uri = os.path.join(sm.settings.data_dir, f"kernel-e2e-{uuid.uuid4().hex}.lance")
+        lance.write_dataset(pa.table({"amount": [1, 2, 3]}), source_uri)
+        deps.catalog._add(
+            name=f"kernel_e2e_{uuid.uuid4().hex}", uri=source_uri, strict_probe=True)
+        with metadb.session() as session:
+            session.add(metadb.Canvas(id=canvas_id, owner_id="local", name="kernel e2e"))
         g = {"id": canvas_id, "version": 1, "nodes": [
-            N("src", "source", {"uri": _uri("events")}),
+            N("src", "source", {"uri": source_uri}),
             N("flt", "filter", {"predicate": "amount > 1"}),
         ], "edges": [E("src", "flt")]}
-        r = client.post("/api/run", json={"graph": g, "targetNodeId": "flt", "confirmed": True}).json()
+        r = client.post("/api/run", json={
+            "graph": g, "targetNodeId": "flt", "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        }).json()
         st = _poll(r["runId"], tries=400)
         assert st["status"] == "done", st.get("error")
         assert metadb.get_kernel(canvas_id) is not None   # a live kernel owned the run

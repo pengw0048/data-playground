@@ -30,6 +30,7 @@ class RunBody(BaseModel):
     placement: str = "local"
     request_id: str | None = None  # OPS-01: HTTP/WebSocket id that started this run
     attempt_id: str | None = None  # OPS-01: optional managed-object attempt correlation
+    input_manifest: list[dict[str, str]]
 
 
 class PreviewBody(BaseModel):
@@ -184,6 +185,35 @@ def _start_admitted_profile(
                 return retain_failure(graph, failed, persist_failure)
             persist_failure(graph, failed)
             return failed
+
+
+def _admitted_kernel_graph(body: RunBody, *, kernel_canvas: str, deps, metadata):
+    """Validate a kernel command against its durable admission and reopen exact Source bindings."""
+    from hub.local_run_inputs import LocalRunInputError, bind_manifest, validate_manifest, validate_manifest_graph
+    from hub.models import Graph
+
+    try:
+        admission = metadata.local_run_input_admission(body.run_id)
+    except Exception as exc:
+        raise LocalRunInputError("kernel run input admission is unavailable") from exc
+    if (admission is None or admission.get("run_id") != body.run_id
+            or admission.get("canvas_id") != kernel_canvas
+            or admission.get("target_node_id") != body.target):
+        raise LocalRunInputError("kernel run does not match its persisted input admission")
+    manifest = validate_manifest(body.input_manifest)
+    persisted = validate_manifest(admission.get("manifest"))
+    if manifest != persisted:
+        raise LocalRunInputError("kernel transport manifest does not match its persisted admission")
+    try:
+        graph = Graph(**body.graph)
+    except Exception as exc:
+        raise LocalRunInputError("kernel graph payload is malformed") from exc
+    if graph.id != kernel_canvas:
+        raise LocalRunInputError("kernel graph does not match its canvas")
+    validate_manifest_graph(graph, body.target, manifest, require_bound_revisions=False)
+    graph = bind_manifest(graph, body.target, manifest, deps.resolve_adapter)
+    validate_manifest_graph(graph, body.target, manifest, require_bound_revisions=True)
+    return graph, manifest
 
 
 def _dispatch_profile_job(
@@ -373,11 +403,22 @@ def main() -> None:
     def run(body: RunBody, x_dp_kernel_token: str = Header(None)):
         _auth(x_dp_kernel_token)
         last_activity[0] = time.monotonic()
-        graph = Graph(**body.graph)
+        from hub.local_run_inputs import LocalRunInputError
+        from hub.models import RunStatus
+        try:
+            graph, manifest = _admitted_kernel_graph(
+                body, kernel_canvas=canvas, deps=deps, metadata=metadb)
+        except LocalRunInputError as exc:
+            failed = metadb.fail_claimed_local_run_dispatch(
+                body.run_id, f"{type(exc).__name__}: {exc}")
+            return RunStatus(**failed).model_dump()
         _ensure_deps(graph)
         plan = compiler.compile_plan(graph, body.target, deps.registry, deps.node_specs, deps.node_ir)
-        st = run_runner.run(plan, graph, body.target, body.placement, run_id=body.run_id,
-                            request_id=body.request_id, attempt_id=body.attempt_id)
+        run_kwargs = {"run_id": body.run_id, "request_id": body.request_id,
+                      "attempt_id": body.attempt_id}
+        if _isolate:
+            run_kwargs["input_manifest"] = manifest
+        st = run_runner.run(plan, graph, body.target, body.placement, **run_kwargs)
         return st.model_dump()
 
     @app.post("/preview")

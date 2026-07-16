@@ -21,7 +21,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import auth, compiler, db, destinations, metadb, placement
+from hub import auth, compiler, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
@@ -120,37 +120,22 @@ def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list
     return manifest
 
 
-def _bind_local_run_manifest(graph, manifest: list[dict[str, str]], deps):
+def _bind_local_run_manifest(
+        graph, manifest: list[dict[str, str]], deps, target_node_id: str | None = None):
     """Reopen persisted exact bindings and attach them only to the dispatch copy of a graph."""
-    bound = graph.model_copy(deep=True)
-    nodes = {node.id: node for node in bound.nodes}
-    for item in manifest:
-        node = nodes.get(item["node_id"])
-        if node is None:
-            raise APIError(409, "local_run_input_manifest_does_not_match_graph",
-                           code=APIErrorCode.INVALID_REQUEST, retryable=False)
-        binding = metadb.catalog_revision_binding(item["dataset_id"])
-        if binding is None:
-            raise APIError(410, "local_run_input_revision_unavailable",
-                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
-        uri = str(binding["uri"])
-        adapter = deps.resolve_adapter(uri)
-        if (not isinstance(adapter, DatasetRevisionAdapter)
-                or str(getattr(adapter, "name", "") or "") != item["provider"]):
-            raise APIError(410, "local_run_input_revision_unavailable",
-                           code=APIErrorCode.RESOURCE_GONE, retryable=False)
-        try:
-            # Force provider retention validation before any worker thread/kernel dispatch.  Engine opens
-            # it again from the same exact id, which is the only execution read allowed for this Source.
-            with db.base_guard():
-                adapter.open_revision(uri, item["revision_id"])
-        except Exception as exc:
-            raise APIError(410, "local_run_input_revision_unavailable",
-                           code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
-        cfg = node.data.setdefault("config", {})
-        cfg["uri"] = uri
-        cfg["_input_revision_id"] = item["revision_id"]
-    return bound
+    from hub.local_run_inputs import LocalRunInputError, bind_manifest
+
+    try:
+        return bind_manifest(graph, target_node_id, manifest, deps.resolve_adapter)
+    except LocalRunInputError as exc:
+        unavailable = "unavailable" in str(exc)
+        raise APIError(
+            410 if unavailable else 409,
+            "local_run_input_revision_unavailable" if unavailable
+            else "local_run_input_manifest_does_not_match_graph",
+            code=APIErrorCode.RESOURCE_GONE if unavailable else APIErrorCode.INVALID_REQUEST,
+            retryable=False,
+        ) from exc
 _EXPORT_OPENAPI_CONTENT = {
     media_type.split(";", 1)[0]: {"schema": {"type": "string", "format": "binary"}}
     for media_type in sorted(set(_EXPORT_MEDIA_TYPES.values()))
@@ -1095,7 +1080,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if role not in _RUN_MUTATE_ROLES:
             raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
         auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
-    intent_sha256 = _local_run_intent_sha256(graph, target_node_id) if submission_id else None
+    # Capture caller intent before catalog references are resolved or private exact-revision bindings are
+    # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
+    # browser-supplied id remains stable across response-loss retries.
+    intent_sha256 = _local_run_intent_sha256(graph, target_node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
@@ -1125,12 +1113,23 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         AuditAction, AuditOutcome, emit_audit, get_request_id, invoke_backend_run,
     )
     request_id = get_request_id()
-    # The immutable-manifest contract belongs to the default in-process local owner only.  Other
-    # backends own their transport/admission contracts and are deliberately outside this issue.
-    local_admission = bool(submission_id and runner is deps.runner and not controller_regions)
+    # Admission is shared only by the built-in local transports. Optional/plugin backends and placed
+    # controller regions own separate contracts and remain outside this issue.
+    from hub.kernel_backend import KernelBackend
+    from hub.subprocess_runner import SubprocessRunner
+
+    transport_requires_admission = isinstance(runner, (KernelBackend, SubprocessRunner))
+    if transport_requires_admission and submission_id is None:
+        submission_id = str(uuid.uuid4())
+    local_admission = bool(
+        not controller_regions
+        and (transport_requires_admission or (submission_id and runner is deps.runner))
+    )
     dispatch_graph = graph
+    dispatch_manifest: list[dict[str, str]] | None = None
     prebound_local_run_id: str | None = None
     if local_admission:
+        assert submission_id is not None
         manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
         operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
         if operational_canvas is None:
@@ -1142,7 +1141,13 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         persisted = metadb.local_run_input_manifest(prebound_local_run_id)
         if persisted is None:
             raise RuntimeError("local run admission was not persisted")
-        dispatch_graph = _bind_local_run_manifest(graph, persisted, deps)
+        dispatch_manifest = persisted
+        dispatch_graph = _bind_local_run_manifest(graph, persisted, deps, target_node_id)
+        if isinstance(runner, KernelBackend):
+            # A newly spawned kernel runs boot recovery before serving. Start it only after admission and
+            # exact reopen, but before the queued dispatch claim exists; otherwise that boot recovery can
+            # correctly mistake the still-unstamped queued row for a dead prior-hub run.
+            runner._ensure_kernel(operational_canvas)
         claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
             run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
             request_id=request_id,
@@ -1220,7 +1225,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             try:
                 status = invoke_backend_run(
                     runner, plan, dispatch_graph, target_node_id, est.placement,
-                    run_id=prebound_local_run_id, request_id=request_id)
+                    run_id=prebound_local_run_id, request_id=request_id,
+                    input_manifest=dispatch_manifest)
             except Exception as exc:
                 if prebound_local_run_id is None:
                     raise
