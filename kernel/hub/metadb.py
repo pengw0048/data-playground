@@ -7294,16 +7294,10 @@ def _catalog_lineage_publication_semantic(lineage: dict) -> dict:
     }
 
 
-def _catalog_reserve_lineage_publication(
-        s, *, destination_uri: str, destination_version: str | None,
-        parent_tokens: list[str], lineage: dict) -> tuple[str, bool]:
-    """Reserve one complete caller request before resolving its mutable catalog projection.
-
-    The reservation deliberately binds raw, canonical request tokens rather than registration IDs or
-    whichever source versions happen to be current. Those resolved values belong to the immutable facts
-    created by the first apply. A later exact retry therefore remains a no-op after overwrite or
-    unregister, while changing the source set or any lineage metadata is still a key collision.
-    """
+def _catalog_lineage_publication_identity(
+        *, destination_uri: str, destination_version: str | None,
+        parent_tokens: list[str], lineage: dict) -> tuple[str, str]:
+    """Return the durable key and exact request fingerprint for one lineage publication."""
     destination_uri = _catalog_lineage_uri(
         destination_uri, field="destination URI")
     destination_version = _catalog_lineage_version(
@@ -7323,6 +7317,44 @@ def _catalog_reserve_lineage_publication(
     fingerprint = "lineage-publication:v2:sha256:" + hashlib.sha256(json.dumps(
         semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")).hexdigest()
+    return publication_key, fingerprint
+
+
+def _catalog_require_lineage_publication(
+        s, *, destination_uri: str, destination_version: str | None,
+        parent_tokens: list[str], lineage: dict) -> str:
+    """Validate that an existing output receipt belongs to this exact lineage request."""
+    publication_key, fingerprint = _catalog_lineage_publication_identity(
+        destination_uri=destination_uri,
+        destination_version=destination_version,
+        parent_tokens=parent_tokens,
+        lineage=lineage,
+    )
+    event = s.get(CatalogPublicationEvent, publication_key)
+    if (event is None or event.effect_type != "lineage"
+            or event.uri != str(destination_uri).rstrip("/")
+            or event.version != destination_version
+            or event.fingerprint != fingerprint):
+        raise RuntimeError(f"catalog publication key collision: {publication_key}")
+    return publication_key
+
+
+def _catalog_reserve_lineage_publication(
+        s, *, destination_uri: str, destination_version: str | None,
+        parent_tokens: list[str], lineage: dict) -> tuple[str, bool]:
+    """Reserve one complete caller request before resolving its mutable catalog projection.
+
+    The reservation deliberately binds raw, canonical request tokens rather than registration IDs or
+    whichever source versions happen to be current. Those resolved values belong to the immutable facts
+    created by the first apply. A later exact retry therefore remains a no-op after overwrite or
+    unregister, while changing the source set or any lineage metadata is still a key collision.
+    """
+    publication_key, fingerprint = _catalog_lineage_publication_identity(
+        destination_uri=destination_uri,
+        destination_version=destination_version,
+        parent_tokens=parent_tokens,
+        lineage=lineage,
+    )
     applied = _catalog_publication_event_once(
         s, publication_key, "lineage", destination_uri,
         destination_version, fingerprint)
@@ -8043,6 +8075,18 @@ def catalog_publish_managed_local_file(
         parent_snapshots: list[_CatalogLineageParentSnapshot] = []
         destination_version = _catalog_lineage_version(
             payload.get("version"), field="destination version")
+        receipt = _managed_local_file_publication_receipt_in_session(
+            s, logical_uri, artifact_uri, str(name))
+        if receipt is not None:
+            if canonical_lineage is not None:
+                _catalog_require_lineage_publication(
+                    s,
+                    destination_uri=artifact_uri,
+                    destination_version=destination_version,
+                    parent_tokens=parent_tokens,
+                    lineage=canonical_lineage,
+                )
+            return receipt
         if canonical_lineage is not None:
             lineage_publication_key, lineage_applied = _catalog_reserve_lineage_publication(
                 s,
@@ -8060,6 +8104,17 @@ def catalog_publish_managed_local_file(
         receipt = _managed_local_file_publication_receipt_in_session(
             s, logical_uri, artifact_uri, str(name))
         if receipt is not None:
+            if canonical_lineage is not None:
+                _catalog_require_lineage_publication(
+                    s,
+                    destination_uri=artifact_uri,
+                    destination_version=destination_version,
+                    parent_tokens=parent_tokens,
+                    lineage=canonical_lineage,
+                )
+                if lineage_applied:
+                    raise RuntimeError(
+                        "managed local publication receipt belongs to another lineage request")
             return receipt
         if canonical_lineage is not None and not lineage_applied:
             raise RuntimeError("managed local publication lineage reservation has no receipt")
@@ -8179,15 +8234,28 @@ def _managed_local_file_publication_receipt_in_session(
 
 
 def catalog_managed_local_file_publication_receipt(
-        logical_uri: str, artifact_uri: str, name: str) -> dict | None:
+        logical_uri: str, artifact_uri: str, name: str, *,
+        parents: list[str] | None = None, lineage: dict | None = None) -> dict | None:
     """Recover one exact committed local revision after an unknown transaction response."""
     logical_uri = str(logical_uri).rstrip("/")
     artifact_uri = _local_result_candidate(artifact_uri) or ""
     if not logical_uri or not artifact_uri:
         raise ValueError("managed local publication requires logical and exact artifact URIs")
     with session() as s:
-        return _managed_local_file_publication_receipt_in_session(
+        receipt = _managed_local_file_publication_receipt_in_session(
             s, logical_uri, artifact_uri, str(name))
+        parent_tokens = catalog_lineage_parent_tokens(parents)
+        canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
+        if receipt is not None and canonical_lineage is not None:
+            _catalog_require_lineage_publication(
+                s,
+                destination_uri=artifact_uri,
+                destination_version=_catalog_lineage_version(
+                    receipt["table"].get("version"), field="destination version"),
+                parent_tokens=parent_tokens,
+                lineage=canonical_lineage,
+            )
+        return receipt
 
 
 def catalog_managed_publication_receipt(uri: str) -> dict | None:

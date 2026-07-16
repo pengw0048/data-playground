@@ -192,3 +192,29 @@ def test_committed_publication_response_loss_recovers_exact_receipt(
     with metadb.session() as session:
         assert session.scalar(select(metadb.CatalogLineageFact)) is not None
         assert len(list(session.scalars(select(metadb.CatalogLineageFact)))) == 1
+
+
+def test_committed_publication_rejects_a_different_lineage_replay(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "managed.parquet")
+    source_uri = _register_source(catalog, tmp_path)
+    run_id = f"managed-local-lineage-mismatch-{uuid.uuid4().hex}"
+    artifact = storage.begin_result("lineage-mismatch", run_id)
+    pq.write_table(pa.table({"value": [9]}), artifact)
+    storage.commit_result(artifact, run_id)
+
+    published = catalog.publish_managed_local_file_output(
+        name="managed_local", logical_uri=logical_uri, artifact_uri=artifact,
+        parents=[source_uri], lineage=_lineage("managed-local-original-lineage"))
+    with pytest.raises(RuntimeError, match="catalog publication key collision"):
+        catalog.publish_managed_local_file_output(
+            name="managed_local", logical_uri=logical_uri, artifact_uri=artifact,
+            parents=[source_uri], lineage=_lineage("managed-local-different-lineage"))
+
+    assert storage.release_result(artifact, run_id) is True
+    assert published["table"].uri == artifact
+    with metadb.session() as session:
+        lineage_events = list(session.scalars(select(metadb.CatalogPublicationEvent).where(
+            metadb.CatalogPublicationEvent.effect_type == "lineage")))
+        assert len(lineage_events) == 1
+        assert len(list(session.scalars(select(metadb.CatalogLineageFact)))) == 1

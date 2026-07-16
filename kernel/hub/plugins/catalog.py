@@ -596,7 +596,8 @@ class InMemoryCatalog:
                 parents=parent_tokens, lineage=lineage_doc)
         except Exception:
             published = metadb.catalog_managed_local_file_publication_receipt(
-                logical_uri, artifact_uri, name)
+                logical_uri, artifact_uri, name,
+                parents=parent_tokens, lineage=lineage_doc)
             if published is None:
                 raise
         canonical = CatalogTable.model_validate(published["table"])
