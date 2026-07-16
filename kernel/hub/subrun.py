@@ -415,6 +415,8 @@ def main() -> int:
             s = deps.runner.status(rid)
             _atomic_write(status_file, s.model_dump())
             if s.status in ("done", "failed", "cancelled"):
+                if not deps.runner.wait_for_worker(rid, timeout=30.0):
+                    raise RuntimeError("local execution worker did not stop after terminal status")
                 return 0 if s.status == "done" else 1
             time.sleep(0.12)
     except Exception as e:  # noqa: BLE001

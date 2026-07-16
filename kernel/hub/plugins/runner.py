@@ -334,6 +334,7 @@ class LocalRunner:
         self._cache: dict[str, dict] = {}
         self._owned_result_uris: dict[str, set[str]] = {}
         self._owned_object_result_uris: dict[str, set[str]] = {}
+        self._worker_threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         # Injectable for deterministic commit-unknown tests; production uses bounded exponential sleeps.
         self.publication_retry_wait = time.sleep
@@ -493,7 +494,14 @@ class LocalRunner:
             self._terminal_publication_gates[run_id] = _TerminalPublicationGate()
             self._evict()
         self._emit(graph, status)  # persist 'queued' before the worker starts (pollable on any instance)
-        threading.Thread(target=self._execute_guarded, args=(run_id, plan, graph, target_node_id), daemon=True).start()
+        worker = threading.Thread(
+            target=self._execute_guarded,
+            args=(run_id, plan, graph, target_node_id),
+            daemon=True,
+        )
+        with self._lock:
+            self._worker_threads[run_id] = worker
+        worker.start()
         return self.status(run_id)
 
     def _execute_guarded(self, run_id: str, plan: CompilePlan, graph: Graph, target: str | None) -> None:
@@ -596,7 +604,9 @@ class LocalRunner:
         while len(self.runs) > _MAX_RUNS:
             victim = next((rid for rid in self.runs
                            if (published := self._published_statuses.get(rid)) is not None
-                           and published.status in _terminal), None)
+                           and published.status in _terminal
+                           and ((worker := self._worker_threads.get(rid)) is None
+                                or not worker.is_alive())), None)
             if victim is None:
                 break  # everything retained is still in-flight — exceed the cap rather than drop a live run
             self.runs.pop(victim, None)
@@ -604,6 +614,7 @@ class LocalRunner:
             self._cancel.pop(victim, None)
             self._terminal_publication_gates.pop(victim, None)
             self._scopes.pop(victim, None)
+            self._worker_threads.pop(victim, None)
         while len(self._cache) > _MAX_RUNS:
             self._cache.pop(next(iter(self._cache)), None)
 
@@ -1609,6 +1620,26 @@ class LocalRunner:
     def status(self, run_id: str) -> RunStatus:
         with self._lock:
             return self._published_statuses[run_id].model_copy(deep=True)
+
+    def wait_for_worker(self, run_id: str, timeout: float | None = None) -> bool:
+        """Join one run's worker after a terminal status has been observed.
+
+        The warm kernel normally retains daemon workers until they finish naturally. One-shot subprocess
+        children use this fence before interpreter exit so native DuckDB/Arrow cleanup cannot be cut off
+        after the terminal snapshot becomes visible but before the execution thread has unwound.
+        """
+        with self._lock:
+            self.runs[run_id]  # preserve the status/cancel KeyError contract for an unknown run
+            worker = self._worker_threads.get(run_id)
+        if worker is None:
+            return True  # direct synchronous execution has no worker thread to reap
+        worker.join(timeout)
+        if worker.is_alive():
+            return False
+        with self._lock:
+            if self._worker_threads.get(run_id) is worker:
+                self._worker_threads.pop(run_id, None)
+        return True
 
     def cancel(self, run_id: str) -> RunStatus:
         with self._lock:

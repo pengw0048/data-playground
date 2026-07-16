@@ -4,6 +4,7 @@ import contextlib
 import json
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -13,6 +14,31 @@ import pytest
 from sqlalchemy import select
 
 from hub import handoff, metadb
+
+
+def test_local_runner_wait_for_worker_joins_the_exact_terminal_thread():
+    from hub.plugins.runner import LocalRunner
+
+    release = threading.Event()
+    stopped = threading.Event()
+
+    def work():
+        release.wait()
+        stopped.set()
+
+    runner = object.__new__(LocalRunner)
+    runner._lock = threading.Lock()
+    runner.runs = {"run": object()}
+    runner._worker_threads = {}
+    worker = threading.Thread(target=work, daemon=True)
+    runner._worker_threads["run"] = worker
+    worker.start()
+
+    assert runner.wait_for_worker("run", timeout=0.01) is False
+    release.set()
+    assert runner.wait_for_worker("run", timeout=1.0) is True
+    assert stopped.is_set()
+    assert "run" not in runner._worker_threads
 
 
 def _wait_for_reaped_terminal(runner, run_id: str, timeout: float = 30.0):
