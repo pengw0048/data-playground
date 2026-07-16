@@ -214,6 +214,36 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
                    and "catalog_" in statement for statement in statements)
 
 
+def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    folder = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-unicode-page")
+    for name in ("A", "Z", "İ"):
+        metadb.workspace_create_container(folder["id"], f"workspace-{token}-{name}")
+
+    names: list[str] = []
+    cursor = None
+    with TestClient(app) as client:
+        while True:
+            response = client.get(f"/api/workspace/containers/{folder['id']}", params={
+                "limit": 1, **({"cursor": cursor} if cursor else {}),
+            })
+            assert response.status_code == 200
+            page = response.json()
+            names.extend(item["name"].removeprefix(f"workspace-{token}-")
+                         for item in page["items"])
+            cursor = page["nextCursor"]
+            if cursor is None:
+                break
+
+        invalid = client.get(f"/api/workspace/containers/{folder['id']}", params={
+            "cursor": metadb._workspace_cursor_encode(2**63, 0, "A", "invalid"),
+        })
+
+    assert names == ["A", "Z", "İ"]
+    assert invalid.status_code == 422
+
+
 def test_concurrent_container_cas_has_one_winner(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     container = metadb.workspace_create_container(

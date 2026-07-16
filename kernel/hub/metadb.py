@@ -2398,24 +2398,31 @@ def _workspace_cursor_decode(cursor: str | None) -> tuple[int, int, str, str] | 
         ordinal, rank, name, identity = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace cursor") from exc
-    if (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0
-            or rank not in (0, 1, 2) or not isinstance(name, str)
-            or not isinstance(identity, str)):
+    if (isinstance(ordinal, bool) or not isinstance(ordinal, int)
+            or ordinal < 0 or ordinal >= 2**63
+            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2)
+            or not isinstance(name, str) or not name
+            or not isinstance(identity, str) or not identity):
         raise ValueError("invalid Workspace cursor")
     return ordinal, rank, name, identity
+
+
+def _workspace_name_order(column):
+    """Use the same Unicode code-point ordering in SQLite, PostgreSQL, and Python."""
+    return column.collate("BINARY" if _is_sqlite_database() else "C")
 
 
 def _workspace_after(ordinal_column, name_column, id_column, rank: int, cursor):
     if cursor is None:
         return None
     ordinal, cursor_rank, name, identity = cursor
-    lowered = func.lower(name_column)
+    ordered_name = _workspace_name_order(name_column)
     return or_(
         ordinal_column > ordinal,
         and_(ordinal_column == ordinal, rank > cursor_rank),
         and_(ordinal_column == ordinal, rank == cursor_rank, or_(
-            lowered > name.lower(),
-            and_(lowered == name.lower(), id_column > identity),
+            ordered_name > name,
+            and_(ordered_name == name, id_column > identity),
         )),
     )
 
@@ -2466,7 +2473,11 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         containers = list(s.scalars(select(WorkspaceContainer).where(
             WorkspaceContainer.parent_id == container_id,
             *([container_after] if container_after is not None else []),
-        ).order_by(WorkspaceContainer.ordinal, func.lower(WorkspaceContainer.name), WorkspaceContainer.id)
+        ).order_by(
+            WorkspaceContainer.ordinal,
+            _workspace_name_order(WorkspaceContainer.name),
+            WorkspaceContainer.id,
+        )
           .limit(limit + 1)))
         visible_or_missing_canvas = or_(
             ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
@@ -2480,7 +2491,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
-            func.lower(WorkspacePlacement.name),
+            _workspace_name_order(WorkspacePlacement.name),
             WorkspacePlacement.id,
         ).limit(limit + 1)))
         dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
@@ -2489,7 +2500,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             *([dataset_after] if dataset_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
-            func.lower(WorkspacePlacement.name),
+            _workspace_name_order(WorkspacePlacement.name),
             WorkspacePlacement.id,
         ).limit(limit + 1)))
         placements = [*canvas_placements, *dataset_placements]
@@ -2501,11 +2512,11 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
 
         rows: list[tuple[tuple, dict]] = []
         for row in containers:
-            rows.append(((row.ordinal, 0, row.name.lower(), row.id), _workspace_container_resource(row)))
+            rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(row)))
         for row in placements:
             rank = 1 if row.target_kind == "canvas" else 2
             live = row.target_id in (live_canvases if row.target_kind == "canvas" else live_datasets)
-            rows.append(((row.ordinal, rank, row.name.lower(), row.id),
+            rows.append(((row.ordinal, rank, row.name, row.id),
                          _workspace_placement_resource(row, detached=not live)))
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
