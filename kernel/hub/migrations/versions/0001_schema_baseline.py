@@ -67,20 +67,59 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("catalog_key"),
     )
     op.create_table(
-        "catalog_edges",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("parent", sa.String(), nullable=False),
-        sa.Column("child", sa.String(), nullable=False),
-        sa.Column("column", sa.String(), nullable=True),
-        sa.Column("pipeline", sa.String(), nullable=True),
+        "catalog_lineage_facts",
+        sa.Column(
+            "id", sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+            autoincrement=True, nullable=False,
+        ),
+        sa.Column("fact_key", sa.String(length=512), nullable=False),
+        sa.Column("publication_key", sa.String(length=96), nullable=False),
+        sa.Column("fingerprint", sa.String(length=96), nullable=False),
+        sa.Column("source_key", sa.String(), nullable=False),
+        sa.Column("destination_key", sa.String(), nullable=False),
+        sa.Column("source_uri", sa.Text(), nullable=False),
+        sa.Column("destination_uri", sa.Text(), nullable=False),
+        sa.Column("source_key_hash", sa.String(length=64), nullable=False),
+        sa.Column("destination_key_hash", sa.String(length=64), nullable=False),
+        sa.Column("source_uri_hash", sa.String(length=64), nullable=False),
+        sa.Column("destination_uri_hash", sa.String(length=64), nullable=False),
+        sa.Column("source_version", sa.String(), nullable=True),
+        sa.Column("destination_version", sa.String(), nullable=True),
+        sa.Column("run_id", sa.String(), nullable=True),
+        sa.Column("attempt_id", sa.String(), nullable=True),
+        sa.Column("producer", sa.String(), nullable=True),
+        sa.Column("producer_version", sa.BigInteger(), nullable=True),
+        sa.Column("step_id", sa.String(), nullable=True),
+        sa.Column("provenance", sa.String(), nullable=False),
+        sa.Column("field_mappings_json", sa.Text(), server_default="[]", nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "provenance IN ('run', 'manual', 'imported')",
+            name="ck_catalog_lineage_fact_provenance",
+        ),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("parent", "child", name="uq_catalog_edge"),
+        sa.UniqueConstraint("fact_key", name="uq_catalog_lineage_fact_key"),
+        sqlite_autoincrement=True,
     )
     op.create_index(
-        op.f("ix_catalog_edges_child"), "catalog_edges", ["child"], unique=False
+        op.f("ix_catalog_lineage_facts_destination_key_hash"),
+        "catalog_lineage_facts", ["destination_key_hash"], unique=False,
     )
     op.create_index(
-        op.f("ix_catalog_edges_parent"), "catalog_edges", ["parent"], unique=False
+        op.f("ix_catalog_lineage_facts_destination_uri_hash"),
+        "catalog_lineage_facts", ["destination_uri_hash"], unique=False,
+    )
+    op.create_index(
+        "ix_catalog_lineage_facts_pair_hash", "catalog_lineage_facts",
+        ["source_key_hash", "destination_key_hash"], unique=False,
+    )
+    op.create_index(
+        op.f("ix_catalog_lineage_facts_publication_key"),
+        "catalog_lineage_facts", ["publication_key"], unique=False,
+    )
+    op.create_index(
+        op.f("ix_catalog_lineage_facts_source_uri_hash"),
+        "catalog_lineage_facts", ["source_uri_hash"], unique=False,
     )
     op.create_table(
         "catalog_embeddings",
@@ -94,6 +133,7 @@ def upgrade() -> None:
     op.create_table(
         "catalog_entries",
         sa.Column("uri", sa.String(), nullable=False),
+        sa.Column("registration_id", sa.String(length=32), nullable=False),
         sa.Column("name", sa.String(), nullable=False),
         sa.Column("doc", sa.Text(), nullable=False),
         sa.Column("tbl_id", sa.String(), nullable=True),
@@ -105,6 +145,7 @@ def upgrade() -> None:
         sa.Column("logical_id", sa.String(), nullable=True),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.PrimaryKeyConstraint("uri"),
+        sa.UniqueConstraint("registration_id"),
         sa.UniqueConstraint("logical_id"),
     )
     op.create_index(
@@ -922,9 +963,25 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_catalog_entries_folder"), table_name="catalog_entries")
     op.drop_table("catalog_entries")
     op.drop_table("catalog_embeddings")
-    op.drop_index(op.f("ix_catalog_edges_parent"), table_name="catalog_edges")
-    op.drop_index(op.f("ix_catalog_edges_child"), table_name="catalog_edges")
-    op.drop_table("catalog_edges")
+    op.drop_index(
+        "ix_catalog_lineage_facts_pair_hash", table_name="catalog_lineage_facts")
+    op.drop_index(
+        op.f("ix_catalog_lineage_facts_publication_key"),
+        table_name="catalog_lineage_facts",
+    )
+    op.drop_index(
+        op.f("ix_catalog_lineage_facts_source_uri_hash"),
+        table_name="catalog_lineage_facts",
+    )
+    op.drop_index(
+        op.f("ix_catalog_lineage_facts_destination_uri_hash"),
+        table_name="catalog_lineage_facts",
+    )
+    op.drop_index(
+        op.f("ix_catalog_lineage_facts_destination_key_hash"),
+        table_name="catalog_lineage_facts",
+    )
+    op.drop_table("catalog_lineage_facts")
     op.drop_table("catalog_declared_keys")
     op.drop_index("ix_catalog_columns_column", table_name="catalog_columns")
     op.drop_table("catalog_columns")

@@ -309,6 +309,8 @@ class SubprocessRunner:
         contracts: dict[str, dict] = {}
         managed = []
         from hub import graph as graph_mod
+        from hub import metadb
+        from hub.plugins.catalog import lineage_for_output
 
         for step in plan.steps:
             if step.kind != "write":
@@ -336,21 +338,23 @@ class SubprocessRunner:
                     spec, self.workspace, self.storage, self.resolve_adapter)
                 adapter = self.resolve_adapter(target_uri)
             targets[step.node_id] = target_uri
-            parents = graph_mod.all_upstream_publication_uris(graph, step.node_id)
+            parents = metadb.catalog_lineage_parent_tokens(
+                graph_mod.all_upstream_publication_uris(graph, step.node_id))
+            lineage = lineage_for_output(graph, run_id, step.node_id)
             contracts[step.node_id] = {
                 "logical_uri": target_uri,
                 "published_uri": expected_sink_uri(spec, target_uri, adapter),
-                "name": spec.name, "parents": parents,
+                "name": spec.name, "parents": parents, "lineage": lineage,
             }
             if adapter is not None and _is_core_managed_sink(spec, target_uri, adapter):
-                managed.append((step.node_id, target_uri, spec, parents))
+                managed.append((step.node_id, target_uri, spec, parents, lineage))
 
         from hub.plugins.catalog import core_managed_publisher, unmanaged_publication_supported
         if len(targets) > 1:
             raise RuntimeError(
                 "isolated subprocess runs support one sink until atomic multi-sink publication "
                 "is enabled")
-        managed_ids = {step_id for step_id, _uri, _spec, _parents in managed}
+        managed_ids = {step_id for step_id, _uri, _spec, _parents, _lineage in managed}
         if (any(step_id not in managed_ids for step_id in targets)
                 and not unmanaged_publication_supported(self.catalog)):
             raise RuntimeError(
@@ -362,7 +366,7 @@ class SubprocessRunner:
         attempts: dict[str, dict] = {}
         try:
             from hub.handoff import allocate_attempt, physical_attempt_uri
-            for step_id, logical_uri, spec, parents in managed:
+            for step_id, logical_uri, spec, parents, lineage in managed:
                 handle = allocate_attempt(
                     logical_uri=logical_uri, kind="sink", run_id=run_id,
                     allocation_key=f"subprocess-sink:{run_id}:{step_id}:{logical_uri}",
@@ -373,7 +377,7 @@ class SubprocessRunner:
                 )
                 attempts[step_id] = {
                     "uri": handle["uri"], "logical_uri": logical_uri, "name": spec.name,
-                    "parents": parents,
+                    "parents": parents, "lineage": lineage,
                 }
             return targets, attempts, contracts
         except Exception:
@@ -387,6 +391,15 @@ class SubprocessRunner:
         for item in sinks.values():
             _safe_abandon_attempt(
                 item["uri"], context="parent managed-sink")
+
+    @staticmethod
+    def _set_catalog_output_version(
+            status: RunStatus, output: RunOutput, version: str | None) -> None:
+        """Replace the child-reported catalog identity with the parent's exact receipt."""
+        status.outputs = [RunOutput.model_validate({
+            **output.model_dump(),
+            "version": version,
+        })]
 
     def _publish_object_sinks(self, sinks: dict[str, dict], status: RunStatus) -> None:
         if not sinks:
@@ -407,10 +420,18 @@ class SubprocessRunner:
             raise RuntimeError("managed object output has no core publisher")
         receipt = publish(
             name=item["name"], uri=item["uri"], version=None,
-            parents=item["parents"], pipeline="canvas")
-        if not isinstance(receipt, dict) or receipt.get("uri") != item["uri"]:
+            parents=item["parents"], pipeline="canvas", lineage=item["lineage"])
+        table = receipt.get("table") if isinstance(receipt, dict) else None
+        table_uri = table.get("uri") if isinstance(table, dict) else getattr(table, "uri", None)
+        table_name = table.get("name") if isinstance(table, dict) else getattr(table, "name", None)
+        table_version = (
+            table.get("version") if isinstance(table, dict) else getattr(table, "version", None)
+        )
+        if (not isinstance(receipt, dict) or receipt.get("uri") != item["uri"]
+                or table is None or table_uri != item["uri"] or table_name != item["name"]):
             raise RuntimeError(
                 f"core publisher returned an invalid receipt for sink '{step_id}'")
+        self._set_catalog_output_version(status, output, table_version)
 
     def run(self, plan: CompilePlan, graph: Graph, target_node_id: str | None,
             placement: Placement, run_id: str | None = None,
@@ -1151,9 +1172,15 @@ class SubprocessRunner:
                 publish_kwargs = {
                     "name": catalog_output.table, "uri": catalog_output.uri,
                     "parents": contract["parents"], "pipeline": "canvas",
+                    "lineage": contract["lineage"],
                 }
                 from hub.plugins.catalog import publish_unmanaged_output_attested
-                publish_unmanaged_output_attested(self.catalog, **publish_kwargs)
+                observed = publish_unmanaged_output_attested(self.catalog, **publish_kwargs)
+                observed_version = (
+                    observed.get("version") if isinstance(observed, dict)
+                    else getattr(observed, "version", None)
+                )
+                self._set_catalog_output_version(st, catalog_output, observed_version)
             except Exception:  # noqa: BLE001 — registration is part of terminal output publication
                 logging.getLogger("hub").exception(
                     "parent subprocess catalog registration failed")

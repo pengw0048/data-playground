@@ -1132,6 +1132,10 @@ class RunController:
         """Run the final (target) region over the reduced graph, waiting for it — on the base runner
         (default) or on the region's target backend (a placed final region), so writes commit normally."""
         subg = self._subgraph(graph, region, ref_uri)
+        # Keep the controller's user-visible run separate from the backend sub-run. Reusing ``run_id``
+        # as the backend RunState owner would let the child overwrite the controller's status; catalog
+        # publication consumes this private context instead.
+        subg._publication_run_id = run_id
         plan = compiler.compile_plan(subg, region.output_node, self.deps.registry, self.deps.node_specs, self.deps.node_ir)
         backend = self._backend_runner(region, uid)
         sub = backend.run(plan, subg, region.output_node, "local")
@@ -1184,6 +1188,15 @@ class RunController:
         subgraph = Graph(id="_region", version=1, nodes=nodes, edges=edges,
                          requirements=getattr(graph, "requirements", None) or [])
         subgraph._publication_source_uris = publication_sources
+        # Private publication context survives nested region cuts without entering the workload wire
+        # model. The original canvas remains the producer; ``_region`` is only an execution detail.
+        subgraph._publication_run_id = getattr(graph, "_publication_run_id", None)
+        subgraph._publication_attempt_id = getattr(graph, "_publication_attempt_id", None)
+        subgraph._publication_producer_id = (
+            getattr(graph, "_publication_producer_id", None) or graph.id)
+        producer_version = getattr(graph, "_publication_producer_version", None)
+        subgraph._publication_producer_version = (
+            graph.version if producer_version is None else producer_version)
         return subgraph
 
     # -- status / cancel (a logical run, keyed by the overall run_id) ------- #

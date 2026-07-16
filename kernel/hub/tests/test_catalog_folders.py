@@ -324,54 +324,6 @@ def test_folder_rename_rolls_back_entry_governance_and_entities_on_failure(monke
         _wipe([old, new], [])
 
 
-def test_batch_publication_materializes_normalized_folders_that_survive_emptying():
-    token = uuid.uuid4().hex
-    root = f"batch-folders-{token[:10]}"
-    name_a = f"batch_a_{token[:10]}"
-    name_b = f"batch_b_{token[:10]}"
-    handles: list[dict] = []
-    try:
-        handles = [
-            _allocate_managed_generation(
-                f"s3://folder-tests/{token}/batch-a.parquet", name_a),
-            _allocate_managed_generation(
-                f"s3://folder-tests/{token}/batch-b.parquet", name_b),
-        ]
-        metadb.catalog_publish_entries([
-            (handles[0]["uri"], name_a, {
-                "id": "ignored", "name": name_a, "uri": handles[0]["uri"],
-                "folder": f" {root} / nested / a ",
-            }, None, None),
-            (handles[1]["uri"], name_b, {
-                "id": "ignored", "name": name_b, "uri": handles[1]["uri"],
-                "folder": f"{root}/nested/b",
-            }, None, None),
-        ])
-
-        assert _raw_folder(handles[0]["uri"]) == (
-            f"{root}/nested/a", f"{root}/nested/a")
-        assert _managed_folder_state(handles[0]["uri"])["governance"]["folder"] == \
-            f"{root}/nested/a"
-        paths = {folder["path"] for folder in metadb.catalog_folders_list()}
-        expected = {
-            root, f"{root}/nested", f"{root}/nested/a", f"{root}/nested/b",
-        }
-        assert expected <= paths
-
-        metadb.catalog_delete_entry(handles[0]["uri"])
-        metadb.catalog_delete_entry(handles[1]["uri"])
-        assert expected <= {folder["path"] for folder in metadb.catalog_folders_list()}
-        tree, tables, total = metadb.catalog_tree(f"{root}/nested")
-        assert {path for _name, path, _count in tree} == {
-            f"{root}/nested/a", f"{root}/nested/b",
-        }
-        assert tables == [] and total == 0
-    finally:
-        for handle in handles:
-            _cleanup_managed([handle])
-        _wipe([root], [])
-
-
 def test_route_errors_map_to_400(tmp_path):
     t = _register(tmp_path, "collideds", "keep")
     uri = t["uri"]

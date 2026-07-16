@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import func, select, text
 
 from hub import handoff, metadb
-from hub.models import RunOutput, RunStatus
+from hub.models import LineagePublication, RunOutput, RunStatus
 from hub.process_scope import OwnedProcessScope
 from hub.run_outputs import require_single_run_output, sole_committed_document_output, sole_output
 
@@ -65,15 +65,75 @@ def _commit(handle: dict, *, version_id: str | None = None) -> list[dict]:
     return inventory
 
 
+def _lineage(
+        *, key: str | None = None, producer: str = "object-lifecycle-test",
+        mappings: list[dict] | None = None) -> dict:
+    return {
+        "idempotency_key": key or f"object-lifecycle-{uuid.uuid4().hex}",
+        "run_id": None,
+        "attempt_id": None,
+        "producer": producer,
+        "producer_version": 1,
+        "step_id": None,
+        "provenance": "manual",
+        "field_mappings": mappings or [],
+    }
+
+
+def _managed_namespace_aliases(logical_uri: str) -> dict[str, str]:
+    logical_id, catalog_key = metadb._catalog_managed_namespace_identity(
+        logical_uri, "tbl_lifecycle_test")
+    return {
+        "logical_uri": logical_uri,
+        "logical_id": logical_id,
+        "catalog_key": catalog_key,
+    }
+
+
+def _unmanaged_namespace_doc(uri: str, token: str, *, version: str = "v1") -> dict:
+    return {
+        "id": f"tbl_unmanaged_namespace_{token}",
+        "name": f"unmanaged-namespace-{token}",
+        "uri": uri,
+        "version": version,
+        "columns": [],
+        "tags": [],
+    }
+
+
+def _publish_unmanaged_namespace(
+        event_key: str, uri: str, token: str, *, version: str = "v1") -> bool:
+    return metadb.catalog_upsert_output_idempotent(
+        event_key, uri, f"unmanaged-namespace-{token}",
+        _unmanaged_namespace_doc(uri, token, version=version),
+        requested_version=version,
+        lineage=_lineage(key=event_key),
+    )
+
+
+def _lineage_publication_event_key(event_key: str) -> str:
+    return "lineage-publication:v1:sha256:" + hashlib.sha256(event_key.encode()).hexdigest()
+
+
+def _record_lineage(parent: str, child: str, *, producer: str = "object-lifecycle-test") -> int:
+    destination = metadb.catalog_get(child)
+    return metadb.catalog_record_lineage(
+        child, destination.get("version") if destination is not None else None, [parent],
+        _lineage(producer=producer),
+    )
+
+
 def _run_output(
         uri: str | None = None, *, rows: int | None = None,
         node_id: str = "source", port_id: str = "out", table: str | None = None,
-        outcome: str = "committed", publication_kind: str | None = None) -> RunOutput:
+        outcome: str = "committed", publication_kind: str | None = None,
+        version: str | None = None) -> RunOutput:
     kind = publication_kind or ("catalog" if table is not None else "result")
     return RunOutput(
         node_id=node_id, port_id=port_id, wire="dataset", publication_kind=kind,
         outcome=outcome, uri=uri,
-        table=table if outcome == "committed" else None, rows=rows,
+        table=table if outcome == "committed" else None,
+        version=version if outcome == "committed" else None, rows=rows,
     )
 
 
@@ -184,6 +244,135 @@ def test_usage_publication_bumps_popularity_without_touching_updated_at():
         metadb.catalog_delete_prefix("mem://usage-updated-at/")
 
 
+@pytest.mark.parametrize("alias_name", ["logical_uri", "logical_id", "catalog_key"])
+@pytest.mark.parametrize("tombstoned", [False, True], ids=["active", "unregistered"])
+def test_managed_logical_namespace_rejects_new_unmanaged_publication(
+        alias_name: str, tombstoned: bool):
+    token = uuid.uuid4().hex
+    logical = f"s3://lifecycle-tests/{token}/namespace.parquet"
+    handle = _handle("sink", logical=logical)
+    aliases = _managed_namespace_aliases(logical)
+    event_key = f"managed-namespace-{alias_name}-{token}"
+    try:
+        if tombstoned:
+            _commit(handle)
+            metadb.catalog_upsert_entry(handle["uri"], "managed-namespace", {
+                "id": "ignored", "name": "managed-namespace", "uri": handle["uri"],
+                "version": "managed-v1", "columns": [], "tags": [],
+            })
+            metadb.catalog_delete_entry(handle["uri"])
+
+        with pytest.raises(RuntimeError, match="reserved for a managed logical dataset"):
+            _publish_unmanaged_namespace(
+                event_key, aliases[alias_name], token)
+
+        with metadb.session() as session:
+            logical_row = session.get(
+                metadb.CatalogLogicalDataset, aliases["logical_id"])
+            assert logical_row is not None
+            assert logical_row.state == ("unregistered" if tombstoned else "active")
+            assert session.get(metadb.CatalogEntry, aliases[alias_name]) is None
+            assert session.get(metadb.CatalogPublicationEvent, event_key) is None
+            assert session.get(
+                metadb.CatalogPublicationEvent,
+                _lineage_publication_event_key(event_key)) is None
+    finally:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+@pytest.mark.parametrize("alias_name", ["logical_uri", "logical_id", "catalog_key"])
+def test_managed_allocation_rejects_existing_unmanaged_namespace_alias(alias_name: str):
+    token = uuid.uuid4().hex
+    logical = f"s3://lifecycle-tests/{token}/occupied.parquet"
+    aliases = _managed_namespace_aliases(logical)
+    alias = aliases[alias_name]
+    event_key = f"unmanaged-first-{alias_name}-{token}"
+    allocation_key = f"managed-after-unmanaged-{alias_name}-{token}"
+    assert _publish_unmanaged_namespace(event_key, alias, token) is True
+    try:
+        with pytest.raises(RuntimeError, match="occupied by an unmanaged catalog entry"):
+            _handle(
+                "sink", logical=logical,
+                run_id=f"managed-after-unmanaged-{token}",
+                allocation_key=allocation_key,
+            )
+        with metadb.session() as session:
+            assert session.get(
+                metadb.CatalogLogicalDataset, aliases["logical_id"]) is None
+            assert session.get(metadb.ObjectAttemptAllocation, allocation_key) is None
+            assert session.scalar(select(func.count()).select_from(
+                metadb.ObjectAttempt).where(
+                    metadb.ObjectAttempt.logical_uri == logical)) == 0
+            assert session.get(metadb.CatalogEntry, alias) is not None
+            assert session.get(metadb.CatalogPublicationEvent, event_key) is not None
+            assert session.get(
+                metadb.CatalogPublicationEvent,
+                _lineage_publication_event_key(event_key)) is not None
+    finally:
+        metadb.catalog_delete_entry(alias)
+
+
+def test_old_unmanaged_receipt_replays_after_managed_namespace_takeover():
+    token = uuid.uuid4().hex
+    logical = f"s3://lifecycle-tests/{token}/replay.parquet"
+    event_key = f"unmanaged-before-managed-{token}"
+    assert _publish_unmanaged_namespace(event_key, logical, token) is True
+    metadb.catalog_delete_entry(logical)
+
+    handle = _handle("sink", logical=logical)
+    try:
+        assert _publish_unmanaged_namespace(event_key, logical, token) is False
+        with pytest.raises(RuntimeError, match="publication key collision"):
+            metadb.catalog_upsert_output_idempotent(
+                event_key, logical, f"changed-unmanaged-namespace-{token}",
+                {
+                    **_unmanaged_namespace_doc(logical, token),
+                    "name": f"changed-unmanaged-namespace-{token}",
+                },
+                requested_version="v1",
+            )
+        with metadb.session() as session:
+            logical_id = _managed_namespace_aliases(logical)["logical_id"]
+            logical_row = session.get(metadb.CatalogLogicalDataset, logical_id)
+            pointer = session.get(
+                metadb.ObjectAttemptAllocation, handle["allocation_key"])
+            assert logical_row is not None and logical_row.current_uri is None
+            assert pointer is not None and pointer.attempt_uri == handle["uri"]
+            assert session.get(metadb.CatalogEntry, logical) is None
+    finally:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_compatibility_receipt_rejects_reserved_managed_namespace_but_replays_old_receipt():
+    token = uuid.uuid4().hex
+    logical = f"s3://lifecycle-tests/{token}/compat.parquet"
+    old_event = f"compat-before-managed-{token}"
+    doc = _unmanaged_namespace_doc(logical, token)
+    metadb.catalog_upsert_entry(logical, doc["name"], doc)
+    metadb.catalog_record_output_publication(old_event, logical, "v1")
+    metadb.catalog_delete_entry(logical)
+
+    handle = _handle("sink", logical=logical)
+    blocked_event = f"compat-after-managed-{token}"
+    try:
+        metadb.catalog_record_output_publication(old_event, logical, "v1")
+
+        # Simulate a legacy unmanaged projection that predates the namespace fence. It must never gain a
+        # new durable receipt after the managed logical identity has reserved this alias.
+        metadb.catalog_upsert_entry(logical, doc["name"], doc)
+        with pytest.raises(RuntimeError, match="reserved for a managed logical dataset"):
+            metadb.catalog_record_output_publication(blocked_event, logical, "v1")
+        with metadb.session() as session:
+            assert session.get(metadb.CatalogPublicationEvent, old_event) is not None
+            assert session.get(metadb.CatalogPublicationEvent, blocked_event) is None
+    finally:
+        with metadb.session() as session:
+            legacy = session.get(metadb.CatalogEntry, logical, with_for_update=True)
+            if legacy is not None:
+                session.delete(legacy)
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
 def test_postgres_concurrent_first_sink_publishers_reserve_one_logical_identity():
     if metadb.engine().dialect.name != "postgresql":
         pytest.skip("requires a real PostgreSQL metadata database")
@@ -227,6 +416,92 @@ def test_postgres_concurrent_first_sink_publishers_reserve_one_logical_identity(
         assert rows[0].next_publish_seq == 2
     for handle in handles:
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+@pytest.mark.parametrize("alias_name", ["logical_uri", "logical_id", "catalog_key"])
+def test_postgres_managed_allocation_and_unmanaged_publication_share_namespace_fence(
+        alias_name: str):
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+    token = uuid.uuid4().hex
+    logical = f"s3://lifecycle-tests/{token}/namespace-race.parquet"
+    aliases = _managed_namespace_aliases(logical)
+    alias = aliases[alias_name]
+    allocation_key = f"pg-namespace-race-{alias_name}-{token}"
+    event_key = f"pg-unmanaged-namespace-race-{alias_name}-{token}"
+    barrier = threading.Barrier(2)
+    handles: list[dict] = []
+    unmanaged_results: list[bool] = []
+    errors: list[tuple[str, BaseException]] = []
+
+    def allocate() -> None:
+        try:
+            barrier.wait(timeout=5)
+            handles.append(_handle(
+                "sink", logical=logical,
+                run_id=f"pg-managed-namespace-race-{token}",
+                allocation_key=allocation_key,
+            ))
+        except BaseException as exc:  # noqa: BLE001 - both race outcomes are asserted below
+            errors.append(("managed", exc))
+
+    def publish_unmanaged() -> None:
+        try:
+            barrier.wait(timeout=5)
+            unmanaged_results.append(_publish_unmanaged_namespace(
+                event_key, alias, token))
+        except BaseException as exc:  # noqa: BLE001 - both race outcomes are asserted below
+            errors.append(("unmanaged", exc))
+
+    threads = [threading.Thread(target=allocate), threading.Thread(target=publish_unmanaged)]
+    try:
+        with _postgres_lock_timeout(seconds=5):
+            with metadb.session() as blocker:
+                metadb._lock_catalog_namespace_tokens(blocker, [alias])
+                for thread in threads:
+                    thread.start()
+                time.sleep(0.1)
+                assert all(thread.is_alive() for thread in threads)
+            for thread in threads:
+                thread.join(timeout=10)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(errors) == 1
+        assert isinstance(errors[0][1], RuntimeError)
+
+        with metadb.session() as session:
+            logical_row = session.get(
+                metadb.CatalogLogicalDataset, aliases["logical_id"])
+            entry = session.get(metadb.CatalogEntry, alias)
+            event = session.get(metadb.CatalogPublicationEvent, event_key)
+            lineage_event = session.get(
+                metadb.CatalogPublicationEvent,
+                _lineage_publication_event_key(event_key))
+            pointer = session.get(metadb.ObjectAttemptAllocation, allocation_key)
+            if handles:
+                assert unmanaged_results == []
+                assert errors[0][0] == "unmanaged"
+                assert "reserved for a managed logical dataset" in str(errors[0][1])
+                assert logical_row is not None and pointer is not None
+                assert entry is None and event is None and lineage_event is None
+            else:
+                assert unmanaged_results == [True]
+                assert errors[0][0] == "managed"
+                assert "occupied by an unmanaged catalog entry" in str(errors[0][1])
+                assert logical_row is None and pointer is None
+                assert entry is not None and event is not None and lineage_event is not None
+                assert session.scalar(select(func.count()).select_from(
+                    metadb.ObjectAttempt).where(
+                        metadb.ObjectAttempt.logical_uri == logical)) == 0
+    finally:
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+        with metadb.session() as session:
+            legacy = session.get(metadb.CatalogEntry, alias, with_for_update=True)
+            if legacy is not None and legacy.logical_id is None:
+                session.delete(legacy)
+        for handle in handles:
+            metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_postgres_committed_allocation_retry_uses_publish_compatible_lock_order():
@@ -711,7 +986,7 @@ def test_postgres_unregister_serializes_governance_mutations():
         lambda uri: metadb.catalog_set_metadata(uri, "ghost", None, None, ["ghost"]),
         lambda uri: metadb.catalog_set_declared_key(uri, ["ghost"]),
         lambda uri: metadb.catalog_set_embedding(uri, "model", 1, b"ghost"),
-        lambda uri: metadb.catalog_add_edge("s3://external/ghost", uri, "ghost"),
+        lambda uri: _record_lineage("s3://external/ghost", uri, producer="ghost"),
         lambda uri: metadb.catalog_upsert_relationship("ghost", {
             "leftUri": uri, "leftColumns": ["ghost"],
             "rightUri": "s3://external/ghost", "rightColumns": ["ghost"],
@@ -764,8 +1039,8 @@ def test_postgres_unregister_serializes_governance_mutations():
         with metadb.session() as session:
             assert session.get(metadb.CatalogDeclaredKey, catalog_key) is None
             assert session.get(metadb.CatalogEmbedding, catalog_key) is None
-            assert not list(session.scalars(select(metadb.CatalogEdge).where(
-                metadb.CatalogEdge.child == catalog_key)))
+            assert not list(session.scalars(select(metadb.CatalogLineageFact).where(
+                metadb.CatalogLineageFact.destination_key == catalog_key)))
             assert not any(catalog_key in row.doc for row in
                            session.scalars(select(metadb.CatalogRelationship)))
         metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
@@ -911,7 +1186,8 @@ def test_postgres_parent_unregister_and_child_publish_do_not_leave_stable_lineag
             barrier.wait(timeout=3)
             metadb.catalog_upsert_entry(child["uri"], "pg-child", {
                 "id": "ignored", "name": "pg-child", "uri": child["uri"],
-            }, parents=[parent["uri"]], pipeline="pg-lineage")
+            }, parents=[parent["uri"]], pipeline="pg-lineage",
+                lineage=_lineage(producer="pg-lineage"))
         except BaseException as exc:  # noqa: BLE001 - asserted below
             errors.append(("publish", exc))
 
@@ -938,15 +1214,15 @@ def test_postgres_parent_unregister_and_child_publish_do_not_leave_stable_lineag
     _commit(replacement)
     metadb.catalog_upsert_entry(replacement["uri"], "pg-parent", {
         "id": "ignored", "name": "pg-parent", "uri": replacement["uri"]})
-    child_parents = {edge["parent"] for edge in metadb.catalog_edges()
+    child_parents = {edge["parent"] for edge in metadb.catalog_lineage_pairs()
                      if edge["child"] == child["uri"]}
     assert replacement["uri"] not in child_parents
     with metadb.session() as session:
         parent_attempt = session.get(metadb.ObjectAttempt, parent["uri"])
         parent_row = session.get(metadb.CatalogLogicalDataset, parent_attempt.logical_id)
-        assert not list(session.scalars(select(metadb.CatalogEdge).where(
-            metadb.CatalogEdge.parent == parent_row.catalog_key,
-            metadb.CatalogEdge.child == session.get(
+        assert not list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.source_key == parent_row.catalog_key,
+            metadb.CatalogLineageFact.destination_key == session.get(
                 metadb.CatalogLogicalDataset,
                 session.get(metadb.ObjectAttempt, child["uri"]).logical_id).catalog_key,
         )))
@@ -1229,7 +1505,8 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
         "folder": "gold/team", "owner": "data", "description": "curated contract",
         "tags": ["gold"], "columns": [{"name": "id", "type": "int64"}],
         "version": "v1",
-    }, parents=["s3://source/one"], pipeline="canvas-v1")
+    }, parents=["s3://source/one"], pipeline="canvas-v1",
+        lineage=_lineage(producer="canvas-v1"))
     stable_id = metadb.catalog_get(first["uri"])["id"]
     metadb.catalog_set_declared_key(first["uri"], ["id"])
     metadb.catalog_set_embedding(first["uri"], "model", 1, b"\x00\x00\x80?")
@@ -1244,7 +1521,8 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
         "id": "must-not-replace-stable-id", "name": "curated", "uri": second["uri"],
         "columns": [{"name": "id", "type": "int64"}, {"name": "v", "type": "string"}],
         "version": "v2",
-    }, parents=["s3://source/two"], pipeline="canvas-v2")
+    }, parents=["s3://source/two"], pipeline="canvas-v2",
+        lineage=_lineage(producer="canvas-v2"))
 
     current = metadb.catalog_get(stable_id)
     assert current["uri"] == second["uri"]
@@ -1254,9 +1532,16 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
     rels = metadb.catalog_relationships()
     assert any(second["uri"] in (r.get("leftUri"), r.get("rightUri")) for r in rels)
     assert all(first["uri"] not in (r.get("leftUri"), r.get("rightUri")) for r in rels)
-    edges = metadb.catalog_edges()
-    assert {e["parent"] for e in edges if e["child"] == second["uri"]} >= {
+    pairs = metadb.catalog_lineage_pairs()
+    assert {e["parent"] for e in pairs if e["child"] == second["uri"]} >= {
         "s3://source/one", "s3://source/two"}
+    with metadb.session() as session:
+        exact_facts = set(session.execute(select(
+            metadb.CatalogLineageFact.source_uri,
+            metadb.CatalogLineageFact.destination_uri,
+        )).all())
+    assert ("s3://source/one", first["uri"]) in exact_facts
+    assert ("s3://source/two", second["uri"]) in exact_facts
     assert metadb.catalog_embeddings_for("model") == [(second["uri"], b"\x00\x00\x80?")]
     with metadb.session() as session:
         logical_row = session.scalar(select(metadb.CatalogLogicalDataset).where(
@@ -1267,6 +1552,172 @@ def test_catalog_overwrite_keeps_stable_identity_and_governance():
         })
         assert ref.attempt_uri == second["uri"]
     assert _state(first["uri"]) == "superseded"
+    metadb.catalog_delete_entry(second["uri"])
+    metadb.quarantine_object_attempt(first["uri"], "test cleanup")
+    metadb.quarantine_object_attempt(second["uri"], "test cleanup")
+
+
+@pytest.mark.parametrize(
+    "alias_name", ["logical_uri", "logical_id", "catalog_key", "friendly_name"])
+def test_managed_self_overwrite_freezes_stable_alias_source_version(alias_name):
+    token = uuid.uuid4().hex
+    logical_uri = f"s3://lifecycle-tests/{token}/self-overwrite.parquet"
+    friendly_name = f"self-overwrite-{token}"
+    first = _handle("sink", logical=logical_uri)
+    second = _handle("sink", logical=logical_uri)
+    _commit(first)
+    metadb.catalog_upsert_entry(first["uri"], friendly_name, {
+        "id": "ignored", "name": friendly_name, "uri": first["uri"],
+        "version": "v1",
+    })
+    aliases = _managed_namespace_aliases(logical_uri)
+    aliases["friendly_name"] = friendly_name
+
+    _commit(second)
+    metadb.catalog_upsert_entry(second["uri"], friendly_name, {
+        "id": "ignored", "name": friendly_name, "uri": second["uri"],
+        "version": "v2",
+    }, parents=[aliases[alias_name]], lineage=_lineage(
+        key=f"managed-self-overwrite-{alias_name}-{uuid.uuid4().hex}"))
+
+    with metadb.session() as session:
+        facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.destination_uri == second["uri"])))
+    assert len(facts) == 1
+    assert (facts[0].source_key, facts[0].destination_key) == (
+        aliases["catalog_key"], aliases["catalog_key"])
+    assert (facts[0].source_uri, facts[0].destination_uri) == (
+        first["uri"], second["uri"])
+    assert (facts[0].source_version, facts[0].destination_version) == ("v1", "v2")
+
+    metadb.catalog_delete_entry(second["uri"])
+    metadb.quarantine_object_attempt(first["uri"], "test cleanup")
+    metadb.quarantine_object_attempt(second["uri"], "test cleanup")
+
+
+@pytest.mark.parametrize("alias_name", ["logical_uri", "catalog_key"])
+def test_managed_lineage_alias_projects_to_one_physical_graph_root(tmp_path, alias_name):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    token = uuid.uuid4().hex
+    parent_logical = f"s3://lifecycle-tests/{token}/parent.parquet"
+    child_logical = f"s3://lifecycle-tests/{token}/child.parquet"
+    parent = _handle("sink", logical=parent_logical)
+    child = _handle("sink", logical=child_logical)
+    _commit(parent)
+    metadb.catalog_upsert_entry(parent["uri"], "lineage-parent", {
+        "id": "ignored", "name": "lineage-parent", "uri": parent["uri"], "version": "v1",
+    })
+    parent_aliases = _managed_namespace_aliases(parent_logical)
+    _commit(child)
+    metadb.catalog_upsert_entry(child["uri"], "lineage-child", {
+        "id": "ignored", "name": "lineage-child", "uri": child["uri"], "version": "v1",
+    }, parents=[parent["uri"]], lineage=_lineage())
+    catalog = InMemoryCatalog(str(tmp_path), lambda _uri: None)
+
+    full = catalog.lineage(parent_aliases[alias_name], depth=2, max_nodes=10)
+    assert full.root_uri == parent["uri"]
+    assert {node.uri for node in full.nodes} == {parent["uri"], child["uri"]}
+    assert {(edge.parent, edge.child) for edge in full.edges} == {
+        (parent["uri"], child["uri"])}
+    capped = catalog.lineage(parent_aliases[alias_name], depth=2, max_nodes=1)
+    assert capped.root_uri == parent["uri"]
+    assert [node.uri for node in capped.nodes] == [parent["uri"]]
+    assert capped.edges == [] and capped.truncated is True
+
+    metadb.catalog_delete_entry(child["uri"])
+    metadb.catalog_delete_entry(parent["uri"])
+    metadb.quarantine_object_attempt(parent["uri"], "test cleanup")
+    metadb.quarantine_object_attempt(child["uri"], "test cleanup")
+
+
+def test_managed_lineage_graph_uses_one_projection_after_interleaved_overwrite(
+        tmp_path, monkeypatch):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    token = uuid.uuid4().hex
+    parent_logical = f"s3://lifecycle-tests/{token}/parent.parquet"
+    child_logical = f"s3://lifecycle-tests/{token}/child.parquet"
+    first = _handle("sink", logical=parent_logical)
+    second = _handle("sink", logical=parent_logical)
+    child = _handle("sink", logical=child_logical)
+    _commit(first)
+    metadb.catalog_upsert_entry(first["uri"], "lineage-parent", {
+        "id": "ignored", "name": "lineage-parent", "uri": first["uri"], "version": "v1",
+    })
+    parent_aliases = _managed_namespace_aliases(parent_logical)
+    _commit(child)
+    metadb.catalog_upsert_entry(child["uri"], "lineage-child", {
+        "id": "ignored", "name": "lineage-child", "uri": child["uri"], "version": "v1",
+    }, parents=[first["uri"]], lineage=_lineage())
+    _commit(second)
+    original_touching = metadb.catalog_lineage_key_pairs_touching
+    overwritten = False
+
+    def overwrite_before_first_hop(keys, limit):
+        nonlocal overwritten
+        if not overwritten:
+            overwritten = True
+            metadb.catalog_upsert_entry(second["uri"], "lineage-parent", {
+                "id": "ignored", "name": "lineage-parent",
+                "uri": second["uri"], "version": "v2",
+            })
+        return original_touching(keys, limit)
+
+    monkeypatch.setattr(
+        metadb, "catalog_lineage_key_pairs_touching", overwrite_before_first_hop)
+    graph = InMemoryCatalog(str(tmp_path), lambda _uri: None).lineage(
+        parent_aliases["logical_uri"], depth=2, max_nodes=10)
+
+    assert overwritten is True
+    assert graph.root_uri == second["uri"]
+    assert {node.uri for node in graph.nodes} == {second["uri"], child["uri"]}
+    assert [(edge.parent, edge.child, edge.fact_count) for edge in graph.edges] == [
+        (second["uri"], child["uri"], 1),
+    ]
+
+    metadb.catalog_delete_entry(child["uri"])
+    metadb.catalog_delete_entry(second["uri"])
+    for handle in (first, second, child):
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_postgres_lineage_projection_materializes_pointer_and_entry_together(
+        monkeypatch):
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("requires a real PostgreSQL metadata database")
+
+    token = uuid.uuid4().hex
+    logical_uri = f"s3://lifecycle-tests/{token}/projection.parquet"
+    first = _handle("sink", logical=logical_uri)
+    second = _handle("sink", logical=logical_uri)
+    _commit(first)
+    metadb.catalog_upsert_entry(first["uri"], "projection", {
+        "id": "ignored", "name": "projection", "uri": first["uri"], "version": "v1",
+    })
+    catalog_key = _managed_namespace_aliases(logical_uri)["catalog_key"]
+    _commit(second)
+    original_tags = metadb._tags_for
+    overwritten = False
+
+    def overwrite_after_joined_projection(session, uris):
+        nonlocal overwritten
+        if not overwritten:
+            overwritten = True
+            metadb.catalog_upsert_entry(second["uri"], "projection", {
+                "id": "ignored", "name": "projection",
+                "uri": second["uri"], "version": "v2",
+            })
+        return original_tags(session, uris)
+
+    monkeypatch.setattr(metadb, "_tags_for", overwrite_after_joined_projection)
+    projection, docs = metadb.catalog_lineage_project_keys([catalog_key])
+
+    assert overwritten is True
+    assert projection == {catalog_key: first["uri"]}
+    assert docs[first["uri"]]["version"] == "v1"
+    assert metadb.catalog_get(catalog_key)["uri"] == second["uri"]
+
     metadb.catalog_delete_entry(second["uri"])
     metadb.quarantine_object_attempt(first["uri"], "test cleanup")
     metadb.quarantine_object_attempt(second["uri"], "test cleanup")
@@ -1334,6 +1785,17 @@ def test_durable_usage_follows_logical_identity_across_aliases_and_generations(t
         with pytest.raises(RuntimeError, match="publication key collision"):
             metadb.catalog_bump_usage_once(second_event, [unmanaged_uri])
         assert metadb.catalog_get(unmanaged_uri)["usage"] == 0
+
+        metadb.catalog_delete_entry(second["uri"])
+        assert metadb.catalog_bump_usage_once(second_event, [logical_uri]) is False
+        with pytest.raises(RuntimeError, match="publication key collision"):
+            metadb.catalog_bump_usage_once(
+                second_event, [logical_uri, unmanaged_uri])
+        with pytest.raises(RuntimeError, match="catalog governance target is inactive"):
+            metadb.catalog_prepare_usage_publication(
+                f"run-after-unregister-{token}", f"usage-after-unregister-{token}",
+                [logical_uri],
+            )
     finally:
         if metadb.catalog_get(unmanaged_uri) is not None:
             metadb.catalog_delete_entry(unmanaged_uri)
@@ -1341,6 +1803,36 @@ def test_durable_usage_follows_logical_identity_across_aliases_and_generations(t
             metadb.catalog_delete_entry(logical_id)
         metadb.quarantine_object_attempt(first["uri"], "test cleanup")
         metadb.quarantine_object_attempt(second["uri"], "test cleanup")
+
+
+def test_durable_usage_inactive_replay_does_not_hide_active_catalog_corruption():
+    token = uuid.uuid4().hex
+    logical_uri = f"s3://lifecycle-tests/{token}/usage-corrupt.parquet"
+    handle = _handle("sink", logical=logical_uri)
+    _commit(handle)
+    metadb.catalog_upsert_entry(handle["uri"], "usage-corrupt", {
+        "id": "ignored", "name": "usage-corrupt", "uri": handle["uri"],
+        "version": "v1", "columns": [], "tags": [],
+    })
+    with metadb.session() as session:
+        attempt = session.get(metadb.ObjectAttempt, handle["uri"])
+        logical_id = attempt.logical_id
+        logical = session.get(metadb.CatalogLogicalDataset, logical_id)
+        assert logical.state == "active" and logical.current_uri == handle["uri"]
+        logical.current_uri = None
+
+    event_key = f"usage-corrupt-{token}"
+    try:
+        with pytest.raises(RuntimeError, match="catalog governance target is inactive"):
+            metadb.catalog_bump_usage_once(event_key, [logical_uri])
+        with metadb.session() as session:
+            assert session.get(metadb.CatalogPublicationEvent, event_key) is None
+    finally:
+        with metadb.session() as session:
+            logical = session.get(metadb.CatalogLogicalDataset, logical_id)
+            logical.current_uri = handle["uri"]
+        metadb.catalog_delete_entry(handle["uri"])
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_read_lease_wins_or_observes_explicit_gc_miss():
@@ -2109,7 +2601,7 @@ def test_publication_response_loss_converges_to_exact_receipt(monkeypatch, tmp_p
     assert receipt["generation"] == handle["generation"]
     assert calls == {"schema": 1, "count": 1, "fingerprint": 1}
     assert _state(handle["uri"]) == "published"
-    assert len([edge for edge in metadb.catalog_edges()
+    assert len([edge for edge in metadb.catalog_lineage_pairs()
                 if edge["child"] == handle["uri"]]) == 1
     metadb.catalog_delete_entry(handle["uri"])
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
@@ -2130,19 +2622,20 @@ def test_inactive_parent_stable_key_is_preserved_only_as_raw_historical_lineage(
     _commit(child)
     metadb.catalog_upsert_entry(child["uri"], "child", {
         "id": "ignored", "name": "child", "uri": child["uri"],
-    }, parents=[stable_id], pipeline="historical")
-    assert {edge["parent"] for edge in metadb.catalog_edges()
+    }, parents=[stable_id], pipeline="historical",
+        lineage=_lineage(producer="historical"))
+    assert {edge["parent"] for edge in metadb.catalog_lineage_pairs()
             if edge["child"] == child["uri"]} == {parent_logical}
 
     replacement = _handle("sink", logical=parent_logical)
     _commit(replacement)
     metadb.catalog_upsert_entry(replacement["uri"], "parent", {
         "id": "ignored", "name": "parent", "uri": replacement["uri"]})
-    assert replacement["uri"] not in {edge["parent"] for edge in metadb.catalog_edges()
+    assert replacement["uri"] not in {edge["parent"] for edge in metadb.catalog_lineage_pairs()
                                       if edge["child"] == child["uri"]}
     with metadb.session() as session:
-        assert not list(session.scalars(select(metadb.CatalogEdge).where(
-            metadb.CatalogEdge.parent == stable_id)))
+        assert not list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.source_key == stable_id)))
 
     metadb.catalog_delete_entry(child["uri"])
     metadb.catalog_delete_entry(replacement["uri"])
@@ -2169,9 +2662,10 @@ def test_old_parent_attempt_epoch_never_attaches_lineage_to_fresh_registration()
     _commit(child)
     metadb.catalog_upsert_entry(child["uri"], "epoch-child", {
         "id": "ignored", "name": "epoch-child", "uri": child["uri"],
-    }, parents=[old_parent["uri"]], pipeline="late-old-epoch")
+    }, parents=[old_parent["uri"]], pipeline="late-old-epoch",
+        lineage=_lineage(producer="late-old-epoch"))
 
-    child_parents = {edge["parent"] for edge in metadb.catalog_edges()
+    child_parents = {edge["parent"] for edge in metadb.catalog_lineage_pairs()
                      if edge["child"] == child["uri"]}
     assert child_parents == {old_parent["uri"]}
     assert fresh_parent["uri"] not in child_parents
@@ -2179,9 +2673,9 @@ def test_old_parent_attempt_epoch_never_attaches_lineage_to_fresh_registration()
         child_key = session.get(
             metadb.CatalogLogicalDataset,
             session.get(metadb.ObjectAttempt, child["uri"]).logical_id).catalog_key
-        assert not list(session.scalars(select(metadb.CatalogEdge).where(
-            metadb.CatalogEdge.parent == stable_id,
-            metadb.CatalogEdge.child == child_key,
+        assert not list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.source_key == stable_id,
+            metadb.CatalogLineageFact.destination_key == child_key,
         )))
 
     metadb.catalog_delete_entry(child["uri"])
@@ -2209,7 +2703,9 @@ def test_logical_governance_late_writes_and_unregister_epoch_are_linearizable():
     with pytest.raises(RuntimeError, match="stale for the current publication"):
         metadb.catalog_set_embedding(first["uri"], "model", 1, b"old")
     metadb.catalog_set_embedding(second["uri"], "model", 1, b"v")
-    metadb.catalog_add_edge("s3://external/source", first["uri"], "late")
+    with pytest.raises(RuntimeError, match="stale for the current publication"):
+        _record_lineage("s3://external/source", first["uri"], producer="late")
+    _record_lineage("s3://external/source", second["uri"], producer="current")
     metadb.catalog_upsert_relationship("ignored", {
         "leftUri": first["uri"], "leftColumns": ["id"],
         "rightUri": "s3://external/right", "rightColumns": ["id"],
@@ -2220,7 +2716,7 @@ def test_logical_governance_late_writes_and_unregister_epoch_are_linearizable():
         "gold", "late-owner", ["late"])
     assert metadb.catalog_declared_keys([second["uri"]])[second["uri"]] == ["id"]
     assert (second["uri"], b"v") in metadb.catalog_embeddings_for("model")
-    assert any(edge["child"] == second["uri"] for edge in metadb.catalog_edges())
+    assert any(edge["child"] == second["uri"] for edge in metadb.catalog_lineage_pairs())
     assert any((rel.get("leftUri") or rel.get("left_uri")) == second["uri"]
                for rel in metadb.catalog_relationships())
 
@@ -2228,14 +2724,14 @@ def test_logical_governance_late_writes_and_unregister_epoch_are_linearizable():
     metadb.catalog_delete_entry(first["uri"])
     assert metadb.catalog_get(stable_id) is None
     assert not any(edge["child"] in (first["uri"], second["uri"], stable_id)
-                   for edge in metadb.catalog_edges())
+                   for edge in metadb.catalog_lineage_pairs())
     assert not any(stable_id in (rel.get("leftUri"), rel.get("rightUri"))
                    for rel in metadb.catalog_relationships())
     stale_mutations = (
         lambda: metadb.catalog_set_metadata(first["uri"], "ghost", None, None, []),
         lambda: metadb.catalog_set_declared_key(first["uri"], ["ghost"]),
         lambda: metadb.catalog_set_embedding(second["uri"], "model", 1, b"ghost"),
-        lambda: metadb.catalog_add_edge("s3://external/ghost", first["uri"], "ghost"),
+        lambda: _record_lineage("s3://external/ghost", first["uri"], producer="ghost"),
         lambda: metadb.catalog_upsert_relationship("ghost", {
             "leftUri": first["uri"], "leftColumns": ["ghost"],
             "rightUri": "s3://external/ghost", "rightColumns": ["ghost"],
@@ -2266,7 +2762,8 @@ def test_logical_governance_late_writes_and_unregister_epoch_are_linearizable():
     assert metadb.catalog_get(stable_id)["uri"] == fresh["uri"]
     assert metadb.catalog_declared_keys([fresh["uri"]]) == {}
     assert not any(vec == b"ghost" for _uri, vec in metadb.catalog_embeddings_for("model"))
-    assert not any(edge["child"] == fresh["uri"] for edge in metadb.catalog_edges())
+    assert not any(edge["child"] == fresh["uri"]
+                   for edge in metadb.catalog_lineage_pairs())
     assert not any(fresh["uri"] in (
         rel.get("leftUri"), rel.get("left_uri"), rel.get("rightUri"), rel.get("right_uri"))
         for rel in metadb.catalog_relationships())
@@ -3068,7 +3565,7 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
                 metadb.ObjectAttemptRef.attempt_uri == published_uri,
             )) is not None
         assert any(edge["parent"] == str(source) and edge["child"] == published_uri
-                   for edge in metadb.catalog_edges())
+                   for edge in metadb.catalog_lineage_pairs())
         result_key = urlsplit(published_uri).path.lstrip("/").rstrip("/") \
             + "/part-00000.parquet"
         result_bytes = client.get_object(
@@ -3091,8 +3588,9 @@ def test_moto_subprocess_backends_publish_parent_owned_managed_sink(
 
 def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
         tmp_path, monkeypatch):
-    from hub.models import RunStatus
+    from hub.models import Graph, RunStatus
     from hub.plugins import catalog as catalog_mod
+    from hub.plugins.catalog import lineage_for_output
     from hub.subprocess_runner import SubprocessRunner
 
     attempt_uri = "s3://managed/results/daily.attempt-parent"
@@ -3103,25 +3601,37 @@ def test_subprocess_parent_attests_and_prepares_managed_sink_before_publish(
 
     def publish(**kwargs):
         events.append(("publish", kwargs))
-        return {"uri": kwargs["uri"]}
+        return {
+            "uri": kwargs["uri"],
+            "table": {
+                "uri": kwargs["uri"], "name": kwargs["name"],
+                "version": "v-parent-managed",
+            },
+        }
 
     monkeypatch.setattr(catalog_mod, "core_managed_publisher", lambda _catalog: publish)
     runner = SubprocessRunner(str(tmp_path), str(tmp_path), catalog=object())
+    lineage = lineage_for_output(Graph(id="canvas", version=1), "run", "write")
     sinks = {"write": {
         "uri": attempt_uri, "logical_uri": "s3://managed/results/daily.parquet",
         "name": "daily", "parents": ["s3://managed/source.parquet"],
+        "lineage": lineage,
     }}
-    runner._publish_object_sinks(sinks, RunStatus(
+    status = RunStatus(
         run_id="run", status="done", per_node=[], target_node_id="write",
         outputs=[_run_output(
-            attempt_uri, rows=1, node_id="write", table="daily")]))
+            attempt_uri, rows=1, node_id="write", table="daily",
+            version="v-child-untrusted")])
+    runner._publish_object_sinks(sinks, status)
     assert events == [
         ("prepare", attempt_uri),
         ("publish", {
             "name": "daily", "uri": attempt_uri, "version": None,
             "parents": ["s3://managed/source.parquet"], "pipeline": "canvas",
+            "lineage": lineage,
         }),
     ]
+    assert status.outputs[0].version == "v-parent-managed"
 
     with pytest.raises(RuntimeError, match="unexpected output binding"):
         runner._publish_object_sinks(sinks, RunStatus(
@@ -3296,7 +3806,7 @@ def test_core_strict_publication_ignores_post_commit_usage_failure(
     assert table.uri == output_uri
     assert metadb.catalog_get(output_uri)["uri"] == output_uri
     assert any(edge["parent"] == parent_uri and edge["child"] == output_uri
-               for edge in metadb.catalog_edges())
+               for edge in metadb.catalog_lineage_pairs())
     metadb.catalog_delete_entry(output_uri)
 
 
@@ -3555,6 +4065,7 @@ def test_subprocess_parent_catalog_failure_is_generic_and_clears_output(
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": str(tmp_path / "out.parquet"),
         "published_uri": str(tmp_path / "out.parquet"), "name": "out", "parents": [],
+        "lineage": LineagePublication.model_validate(_lineage()),
     }}
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir),
@@ -3619,6 +4130,7 @@ def test_subprocess_builtin_catalog_strict_publish_rejects_same_uri_persist_fail
     runner._sink_contracts["run"] = {"write": {
         "logical_uri": output_uri, "published_uri": output_uri,
         "name": "durable-readback", "parents": [],
+        "lineage": LineagePublication.model_validate(_lineage()),
     }}
     monkeypatch.setattr(
         metadb, "catalog_upsert_entry",
@@ -3773,7 +4285,8 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_r
         plan, graph, "run", claim_status)
     assert set(expected_parents) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [region_ref]
-    assert contracts["write"]["parents"] == expected_parents
+    assert contracts["write"]["parents"] == metadb.catalog_lineage_parent_tokens(
+        expected_parents)
     runner._sink_contracts["run"] = contracts
     runner.runs["run"] = RunStatus(
         run_id="run", status="running", per_node=[], target_node_id="write",
@@ -3785,7 +4298,8 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_r
     status_file.write_text(json.dumps(RunStatus(
         run_id="child", status="done", per_node=[], target_node_id="write",
         total_rows=1, outputs=[_run_output(
-            str(tmp_path / "derived.csv"), rows=1, node_id="write", table="derived")],
+            str(tmp_path / "derived.csv"), rows=1, node_id="write", table="derived",
+            version="v-child-untrusted")],
     ).model_dump()))
 
     class FinishedProcess:
@@ -3801,8 +4315,11 @@ def test_subprocess_parent_registers_unmanaged_sink_with_source_lineage_across_r
 
     runner._watch(
         "run", FinishedProcess(), str(status_file), str(job_dir), graph, "write")
-    assert runner.status("run").status == "done"
-    assert registered["parents"] == expected_parents
+    final = runner.status("run")
+    assert final.status == "done"
+    assert final.outputs[0].version == "v1"
+    assert registered["parents"] == metadb.catalog_lineage_parent_tokens(
+        expected_parents)
 
 
 def test_isolated_child_adapter_disagreement_never_writes_assigned_sink(tmp_path):
@@ -4649,7 +5166,7 @@ def test_local_unmanaged_sink_registers_all_join_sources_across_region_cut(tmp_p
         _CancelToken(), pre_publish=lambda **_kwargs: None)
     assert set(expected) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]
-    assert registered["parents"] == expected
+    assert registered["parents"] == metadb.catalog_lineage_parent_tokens(expected)
 
 
 def test_local_sink_catalog_detail_is_logged_but_status_is_generic(

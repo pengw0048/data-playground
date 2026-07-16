@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, and_, create_engine, exists, func, or_, select, update,
+    Text, UniqueConstraint, and_, create_engine, delete, exists, func, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -322,6 +322,8 @@ class CatalogEntry(Base):
     memory and filtering in Python (the old O(n)-per-read model that didn't scale past a few hundred)."""
     __tablename__ = "catalog_entries"
     uri: Mapped[str] = mapped_column(String, primary_key=True)
+    registration_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, unique=True, default=lambda: uuid.uuid4().hex)
     name: Mapped[str] = mapped_column(String, index=True)
     doc: Mapped[str] = mapped_column(Text)  # the full CatalogTable as JSON
     tbl_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)  # CatalogTable.id (stable browse id)
@@ -374,16 +376,48 @@ class CatalogEmbedding(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
-class CatalogEdge(Base):
-    """A lineage edge (parent uri → child uri), shared like CatalogEntry so lineage is cross-instance.
-    `column` records column-level provenance when known (which output column derived from the input)."""
-    __tablename__ = "catalog_edges"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    parent: Mapped[str] = mapped_column(String, index=True)
-    child: Mapped[str] = mapped_column(String, index=True)
-    column: Mapped[str | None] = mapped_column(String, nullable=True)
-    pipeline: Mapped[str | None] = mapped_column(String, nullable=True)
-    __table_args__ = (UniqueConstraint("parent", "child", name="uq_catalog_edge"),)
+class CatalogLineageFact(Base):
+    """One immutable publication fact; repeated dataset pairs remain distinct observations."""
+    __tablename__ = "catalog_lineage_facts"
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    fact_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    publication_key: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    fingerprint: Mapped[str] = mapped_column(String(96), nullable=False)
+    source_key: Mapped[str] = mapped_column(String, nullable=False)
+    destination_key: Mapped[str] = mapped_column(String, nullable=False)
+    source_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    destination_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    # PostgreSQL B-tree entries cannot hold the public 8192-character identity ceiling. Keep the
+    # original values authoritative/exportable and index fixed-width hashes; every lookup also checks
+    # the original value, so a theoretical digest collision cannot join or delete unrelated facts.
+    source_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    destination_key_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_uri_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    destination_uri_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    destination_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    attempt_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    producer: Mapped[str | None] = mapped_column(String, nullable=True)
+    producer_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    step_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    provenance: Mapped[str] = mapped_column(String, nullable=False)
+    field_mappings_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        UniqueConstraint("fact_key", name="uq_catalog_lineage_fact_key"),
+        CheckConstraint(
+            "provenance IN ('run', 'manual', 'imported')",
+            name="ck_catalog_lineage_fact_provenance",
+        ),
+        Index(
+            "ix_catalog_lineage_facts_pair_hash",
+            "source_key_hash", "destination_key_hash"),
+        {"sqlite_autoincrement": True},
+    )
 
 
 class CatalogPublicationEvent(Base):
@@ -5190,11 +5224,10 @@ def _put_lease(s, row: ObjectAttempt, lease_type: str, owner: str, ttl_seconds: 
 
 
 def _reserve_catalog_publication(s, logical_uri: str, catalog_key_base: str) -> tuple[str, int, int]:
-    logical_id = _catalog_logical_id(logical_uri)
+    logical_id, catalog_key = _catalog_managed_namespace_identity(
+        logical_uri, catalog_key_base)
     logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True)
     if logical is None:
-        base = str(catalog_key_base).strip() or logical_id
-        catalog_key = f"{base}_{hashlib.sha256(logical_uri.encode()).hexdigest()[:16]}"
         values = {
             "logical_id": logical_id, "catalog_key": catalog_key, "logical_uri": logical_uri,
             "current_uri": None, "current_publish_seq": 0, "next_publish_seq": 0,
@@ -5251,6 +5284,15 @@ def allocate_object_attempt(*, logical_uri: str, kind: str, run_id: str, allocat
                     or backend is not None):
                 raise RuntimeError(
                     "managed sink allocation requires a live unbound run preallocation")
+        managed_namespace = None
+        if kind == "sink":
+            managed_namespace = _catalog_managed_namespace_identity(
+                logical_uri, str(catalog_key_base))
+            _lock_catalog_namespace_tokens(
+                s, [logical_uri, *managed_namespace])
+            _assert_managed_catalog_namespace_available(
+                s, logical_uri=logical_uri,
+                logical_id=managed_namespace[0], catalog_key=managed_namespace[1])
         ident = _installation_identity(s)
         if expected_namespace is not None and ident.storage_namespace != expected_namespace:
             raise RuntimeError("storage namespace changed during provider ownership claim")
@@ -6310,6 +6352,61 @@ def _catalog_logical_id(logical_uri: str) -> str:
     return "logical_" + hashlib.sha256(str(logical_uri).rstrip("/").encode()).hexdigest()[:24]
 
 
+def _catalog_managed_namespace_identity(
+        logical_uri: str, catalog_key_base: str) -> tuple[str, str]:
+    """Return every derived stable identifier reserved by one managed logical target."""
+    logical_id = _catalog_logical_id(logical_uri)
+    base = str(catalog_key_base).strip() or logical_id
+    catalog_key = f"{base}_{hashlib.sha256(logical_uri.encode()).hexdigest()[:16]}"
+    return logical_id, catalog_key
+
+
+def _lock_catalog_namespace_tokens(s, tokens: list[str]) -> None:
+    """Serialize claims of managed logical aliases with durable unmanaged publication.
+
+    PostgreSQL row locks cannot protect an absent row in either namespace table, so both claim paths
+    take the same transaction advisory lock for every token they may create. SQLite already serializes
+    catalog writers through the installation-identity write fence.
+    """
+    canonical = sorted(set(str(token).rstrip("/") for token in tokens if token))
+    if s.get_bind().dialect.name == "sqlite":
+        _catalog_sqlite_write_fence(s)
+        return
+    if s.get_bind().dialect.name != "postgresql":
+        return
+    for token in canonical:
+        digest = hashlib.sha256(
+            f"catalog-namespace:v1\0{token}".encode("utf-8")).digest()
+        lock_id = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        s.execute(select(func.pg_advisory_xact_lock(lock_id)))
+
+
+def _assert_managed_catalog_namespace_available(
+        s, *, logical_uri: str, logical_id: str, catalog_key: str) -> None:
+    """Reject a managed allocation while an unmanaged projection owns a reserved alias."""
+    tokens = sorted({logical_uri, logical_id, catalog_key})
+    conflict = s.scalars(select(CatalogEntry).where(
+        CatalogEntry.uri.in_(tokens), CatalogEntry.logical_id.is_(None),
+    ).order_by(CatalogEntry.uri).with_for_update()
+        .execution_options(populate_existing=True)).first()
+    if conflict is not None:
+        raise RuntimeError(
+            "managed catalog namespace is occupied by an unmanaged catalog entry")
+
+
+def _assert_unmanaged_catalog_namespace_available(s, uri: str) -> None:
+    """Reject a first unmanaged apply for every active or tombstoned managed alias."""
+    conflict = s.scalars(select(CatalogLogicalDataset).where(or_(
+        CatalogLogicalDataset.logical_uri == uri,
+        CatalogLogicalDataset.catalog_key == uri,
+        CatalogLogicalDataset.logical_id == uri,
+    )).order_by(CatalogLogicalDataset.logical_id).with_for_update()
+        .execution_options(populate_existing=True)).first()
+    if conflict is not None:
+        raise RuntimeError(
+            "catalog namespace is reserved for a managed logical dataset")
+
+
 def _relationship_key(doc: dict) -> str:
     left_uri = doc.get("leftUri") or doc.get("left_uri")
     right_uri = doc.get("rightUri") or doc.get("right_uri")
@@ -6364,10 +6461,13 @@ def _catalog_key_to_uri(s, token: str) -> str:
 
 
 def _lock_catalog_mutation_targets(s, tokens: list[str], *,
-                                   exact_current_attempts: set[str] | None = None) -> list[dict]:
+                                   exact_current_attempts: set[str] | None = None,
+                                   allow_inactive: bool = False) -> list[dict]:
     """Resolve curation targets, lock managed logical rows in deterministic order, and fence stale
-    physical generations. Attempt identity is read before logical locks because its publication epoch
-    and sequence are immutable; governance paths do not need to lock the attempt row itself."""
+    physical generations. ``allow_inactive`` preserves only a managed tombstone's stable identity as an
+    unknown target; active rows with a missing current projection still fail as corruption. Attempt
+    identity is read before logical locks because its publication epoch and sequence are immutable;
+    governance paths do not need to lock the attempt row itself."""
     normalized = [str(token).rstrip("/") for token in tokens]
     exact = {str(token).rstrip("/") for token in (exact_current_attempts or set())}
     resolved: list[dict] = []
@@ -6413,19 +6513,28 @@ def _lock_catalog_mutation_targets(s, tokens: list[str], *,
     logical_rows = {row.logical_id: row for row in s.scalars(
         select(CatalogLogicalDataset).where(
             CatalogLogicalDataset.logical_id.in_(sorted(logical_ids)))
-        .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+        .order_by(CatalogLogicalDataset.logical_id).with_for_update()
+        .execution_options(populate_existing=True))} if logical_ids else {}
     managed_entry_uris = sorted({
         str(row.current_uri) for row in logical_rows.values() if row.current_uri
     })
     entry_uris = sorted(set(managed_entry_uris) | unmanaged_uris)
     entries = {row.uri: row for row in s.scalars(
         select(CatalogEntry).where(CatalogEntry.uri.in_(entry_uris))
-        .order_by(CatalogEntry.uri).with_for_update())} if entry_uris else {}
+        .order_by(CatalogEntry.uri).with_for_update()
+        .execution_options(populate_existing=True))} if entry_uris else {}
 
     for target in resolved:
         logical_id = target["logical_id"]
         if logical_id:
             logical = logical_rows.get(logical_id)
+            if (allow_inactive and logical is not None
+                    and logical.state == "unregistered" and not logical.current_uri):
+                target.update({
+                    "known": False, "catalog_key": logical.catalog_key,
+                    "current_uri": None, "logical": logical, "entry": None,
+                })
+                continue
             if (logical is None or logical.state != "active" or not logical.current_uri
                     or logical.current_uri not in entries):
                 raise RuntimeError("catalog governance target is inactive")
@@ -6461,50 +6570,497 @@ def _catalog_governance(doc: dict) -> dict:
         "id", "name", "folder", "owner", "description", "tags") if key in doc}
 
 
-def _catalog_apply_lineage_in_session(
-        s, child_key: str, parent_snapshots: list[tuple[str, str | None, int | None]],
-        locked_logicals: dict[str, CatalogLogicalDataset], pipeline: str | None) -> None:
-    """Apply frozen parent tokens without changing a managed child's current generation."""
-    for parent, parent_logical_id, parent_attempt_epoch in parent_snapshots:
-        parent_logical = locked_logicals.get(parent_logical_id) \
-            if parent_logical_id is not None else None
-        current_parent_attempt = s.execute(select(
-            ObjectAttempt.logical_id, ObjectAttempt.catalog_epoch,
-        ).where(ObjectAttempt.uri == parent)).one_or_none() \
-            if parent_attempt_epoch is not None else None
-        parent_attempt_is_current_epoch = (
-            parent_attempt_epoch is None or (
-                current_parent_attempt is not None
-                and current_parent_attempt.logical_id == parent_logical_id
-                and current_parent_attempt.catalog_epoch == parent_attempt_epoch
-                and parent_logical is not None
-                and parent_attempt_epoch == parent_logical.catalog_epoch
-            )
-        )
-        if (parent_logical is not None and parent_logical.state == "active"
-                and parent_logical.current_uri and parent_attempt_is_current_epoch):
-            parent_key = parent_logical.catalog_key
-        elif parent_logical is not None and parent == parent_logical.catalog_key:
-            # A stable key cannot remain on an edge after unregister: it would silently attach the
-            # historical edge to a future registration. Preserve only the raw logical URI instead.
-            parent_key = parent_logical.logical_uri
-        else:
-            parent_key = parent
-        if parent_key == child_key:
+_CATALOG_LINEAGE_FIELDS = {
+    "idempotency_key", "run_id", "attempt_id", "producer", "producer_version",
+    "step_id", "provenance", "field_mappings",
+}
+_CATALOG_LINEAGE_MAX_PARENTS = 5_000
+_CATALOG_LINEAGE_MAX_URI_LENGTH = 8_192
+_CATALOG_LINEAGE_MAX_VERSION_LENGTH = 512
+
+
+def _catalog_lineage_uri(value: object, *, field: str) -> str:
+    """Validate one URI/key before it can become durable lineage or a replay identity."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"catalog lineage {field} must be a non-empty canonical string")
+    canonical = value.rstrip("/")
+    if not canonical:
+        raise ValueError(f"catalog lineage {field} cannot contain only path separators")
+    if len(canonical) > _CATALOG_LINEAGE_MAX_URI_LENGTH:
+        raise ValueError(
+            f"catalog lineage {field} exceeds {_CATALOG_LINEAGE_MAX_URI_LENGTH} characters")
+    return canonical
+
+
+def catalog_lineage_uri(value: object) -> str:
+    """Validate one public lineage graph root using the persisted fact URI contract."""
+    return _catalog_lineage_uri(value, field="root URI")
+
+
+def _catalog_lineage_identity_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _catalog_lineage_version(value: object, *, field: str) -> str | None:
+    """Keep persisted versions inside the public LineageFact/RunOutput wire contract."""
+    if value is None:
+        return None
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value) > _CATALOG_LINEAGE_MAX_VERSION_LENGTH):
+        raise ValueError(
+            f"catalog lineage {field} must be a non-empty canonical string of at most "
+            f"{_CATALOG_LINEAGE_MAX_VERSION_LENGTH} characters")
+    return value
+
+
+def catalog_lineage_parent_tokens(parents: list[str] | None) -> list[str]:
+    """Return the one canonical source-token set shared by every publication path."""
+    if parents is None:
+        return []
+    if not isinstance(parents, list):
+        raise ValueError("catalog lineage parents must be a list")
+    if len(parents) > _CATALOG_LINEAGE_MAX_PARENTS:
+        raise ValueError(
+            f"catalog lineage parents exceed {_CATALOG_LINEAGE_MAX_PARENTS} entries")
+    return sorted({
+        _catalog_lineage_uri(parent, field="parent") for parent in parents
+    })
+
+
+def _catalog_lineage_canonical(lineage: dict | None, parent_count: int) -> dict | None:
+    """Validate the catalog-local wire shape and require its already-canonical representation."""
+    if lineage is None:
+        return None
+    if not isinstance(lineage, dict) or set(lineage) != _CATALOG_LINEAGE_FIELDS:
+        raise ValueError("catalog lineage has an invalid field set")
+    from hub.models import LineagePublication
+    canonical = LineagePublication.model_validate(lineage).model_dump()
+    if json.dumps(lineage, sort_keys=True, separators=(",", ":")) != json.dumps(
+            canonical, sort_keys=True, separators=(",", ":")):
+        raise ValueError("catalog lineage must use canonical field mapping order")
+    if (canonical["producer_version"] is not None
+            and canonical["producer_version"] > 2**53 - 1):
+        raise ValueError("catalog lineage producer version exceeds the JSON safe-integer range")
+    mappings_json = json.dumps(
+        canonical["field_mappings"], sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    if len(mappings_json.encode("utf-8")) > 64 * 1024:
+        raise ValueError("catalog lineage field mappings exceed 64 KiB")
+    if parent_count != 1 and canonical["field_mappings"]:
+        raise ValueError(
+            "catalog lineage field mappings require exactly one source per publication")
+    return {**canonical, "field_mappings_json": mappings_json}
+
+
+def _catalog_lineage_publication_semantic(lineage: dict) -> dict:
+    """Return only caller-supplied lineage fields, excluding the derived storage encoding."""
+    return {
+        key: lineage[key] for key in sorted(_CATALOG_LINEAGE_FIELDS)
+    }
+
+
+def _catalog_reserve_lineage_publication(
+        s, *, destination_uri: str, destination_version: str | None,
+        parent_tokens: list[str], lineage: dict) -> tuple[str, bool]:
+    """Reserve one complete caller request before resolving its mutable catalog projection.
+
+    The reservation deliberately binds raw, canonical request tokens rather than registration IDs or
+    whichever source versions happen to be current. Those resolved values belong to the immutable facts
+    created by the first apply. A later exact retry therefore remains a no-op after overwrite or
+    unregister, while changing the source set or any lineage metadata is still a key collision.
+    """
+    destination_uri = _catalog_lineage_uri(
+        destination_uri, field="destination URI")
+    destination_version = _catalog_lineage_version(
+        destination_version, field="destination version")
+    parent_tokens = catalog_lineage_parent_tokens(parent_tokens)
+    publication_key = "lineage-publication:v1:sha256:" + hashlib.sha256(
+        lineage["idempotency_key"].encode("utf-8")
+    ).hexdigest()
+    semantic = {
+        "schema_version": 2,
+        "idempotency_key": lineage["idempotency_key"],
+        "parents": parent_tokens,
+        "destination_uri": destination_uri,
+        "destination_version": destination_version,
+        "lineage": _catalog_lineage_publication_semantic(lineage),
+    }
+    fingerprint = "lineage-publication:v2:sha256:" + hashlib.sha256(json.dumps(
+        semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    applied = _catalog_publication_event_once(
+        s, publication_key, "lineage", destination_uri,
+        destination_version, fingerprint)
+    return publication_key, applied
+
+
+def _catalog_doc_version(doc: str | None) -> str | None:
+    try:
+        version = json.loads(doc or "{}").get("version")
+    except (AttributeError, TypeError, ValueError):
+        version = None
+    return _catalog_lineage_version(version, field="version")
+
+
+def _catalog_entry_version(entry: CatalogEntry | None) -> str | None:
+    return _catalog_doc_version(entry.doc) if entry is not None else None
+
+
+def _catalog_sqlite_write_fence(s) -> None:
+    """Acquire SQLite's single writer transaction before reading catalog publication identity.
+
+    SQLite ignores ``SELECT FOR UPDATE``. Without an early write, unregister or overwrite can commit
+    after source validation and before the fact insert. PostgreSQL keeps its finer row-lock ordering.
+    """
+    if s.get_bind().dialect.name != "sqlite":
+        return
+    result = s.execute(update(InstallationIdentity).where(
+        InstallationIdentity.id == _INSTALLATION_ID,
+    ).values(owner_token=InstallationIdentity.owner_token))
+    if result.rowcount != 1:
+        raise RuntimeError("catalog publication installation identity is missing")
+
+
+@dataclass(frozen=True)
+class _CatalogLineageParentSnapshot:
+    token: str
+    logical_id: str | None
+    attempt_epoch: int | None
+    entry_uri: str | None
+    entry_version: str | None
+    entry_registration_id: str | None
+    resolved_source_key: str | None = None
+    resolved_source_uri: str | None = None
+    logical_state: str | None = None
+    logical_current_uri: str | None = None
+    logical_catalog_epoch: int | None = None
+    logical_catalog_key: str | None = None
+    logical_uri: str | None = None
+
+
+def _catalog_lineage_logical_parent_snapshot(
+        s, token: str, logical: CatalogLogicalDataset) -> _CatalogLineageParentSnapshot:
+    """Resolve any managed alias against the same pre-mutation logical generation."""
+    if logical.state == "active" and logical.current_uri:
+        current = s.get(CatalogEntry, logical.current_uri)
+        source_key, source_uri = logical.catalog_key, logical.current_uri
+        entry_uri = logical.current_uri
+        entry_version = _catalog_entry_version(current)
+        entry_registration_id = current.registration_id if current is not None else None
+    else:
+        source_key = logical.logical_uri if token == logical.catalog_key else token
+        source_uri = source_key
+        entry_uri = entry_version = entry_registration_id = None
+    return _CatalogLineageParentSnapshot(
+        token, logical.logical_id, None,
+        entry_uri, entry_version, entry_registration_id,
+        resolved_source_key=source_key, resolved_source_uri=source_uri,
+        logical_state=logical.state, logical_current_uri=logical.current_uri,
+        logical_catalog_epoch=logical.catalog_epoch,
+        logical_catalog_key=logical.catalog_key, logical_uri=logical.logical_uri,
+    )
+
+
+def _catalog_lineage_parent_snapshot(s, token: str) -> _CatalogLineageParentSnapshot:
+    """Remember whether a source was a concrete catalog entry before taking mutation locks."""
+    attempt = s.get(ObjectAttempt, token)
+    if attempt is not None and attempt.logical_id:
+        return _CatalogLineageParentSnapshot(
+            token, attempt.logical_id, attempt.catalog_epoch, None, None, None)
+    logical = s.scalars(select(CatalogLogicalDataset).where(or_(
+        CatalogLogicalDataset.logical_id == token,
+        CatalogLogicalDataset.catalog_key == token,
+        CatalogLogicalDataset.logical_uri == token,
+        CatalogLogicalDataset.current_uri == token,
+    )).order_by(CatalogLogicalDataset.logical_id).limit(1)).first()
+    if logical is not None:
+        return _catalog_lineage_logical_parent_snapshot(s, token, logical)
+    entry = s.execute(select(
+        CatalogEntry.uri, CatalogEntry.logical_id, CatalogEntry.doc,
+        CatalogEntry.registration_id,
+    ).where(CatalogEntry.uri == token).limit(1)).first()
+    if entry is None:
+        entry = s.execute(select(
+            CatalogEntry.uri, CatalogEntry.logical_id, CatalogEntry.doc,
+            CatalogEntry.registration_id,
+        ).where(or_(
+            CatalogEntry.tbl_id == token, CatalogEntry.name == token,
+        )).order_by(CatalogEntry.uri).limit(1)).first()
+    if entry is None:
+        return _CatalogLineageParentSnapshot(token, None, None, None, None, None)
+    if entry.logical_id:
+        logical = s.get(CatalogLogicalDataset, entry.logical_id)
+        if logical is None:
+            raise RuntimeError("catalog lineage entry has no logical source identity")
+        return _catalog_lineage_logical_parent_snapshot(s, token, logical)
+    return _CatalogLineageParentSnapshot(
+        token, None, None, entry.uri, _catalog_doc_version(entry.doc), entry.registration_id)
+
+
+def _catalog_validate_lineage_parent_entries(
+        snapshots: list[_CatalogLineageParentSnapshot],
+        locked_entries: dict[str, CatalogEntry]) -> None:
+    """Fence unregister or overwrite that won after the initial identity snapshot."""
+    for snapshot in snapshots:
+        if snapshot.entry_uri is None:
             continue
-        edge = s.scalars(select(CatalogEdge).where(
-            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key).limit(1)).first()
-        if edge is None:
-            s.add(CatalogEdge(parent=parent_key, child=child_key, pipeline=pipeline))
+        entry = locked_entries.get(snapshot.entry_uri)
+        if (entry is None
+                or entry.registration_id != snapshot.entry_registration_id
+                or _catalog_entry_version(entry) != snapshot.entry_version):
+            raise RuntimeError("catalog lineage entry changed concurrently")
+
+
+def _catalog_validate_lineage_parent_logicals(
+        snapshots: list[_CatalogLineageParentSnapshot],
+        locked_logicals: dict[str, CatalogLogicalDataset]) -> None:
+    """Fence a stable alias against resolving through a different current generation."""
+    for snapshot in snapshots:
+        if snapshot.logical_state is None or snapshot.logical_id is None:
+            continue
+        logical = locked_logicals.get(snapshot.logical_id)
+        if (logical is None
+                or logical.state != snapshot.logical_state
+                or logical.current_uri != snapshot.logical_current_uri
+                or logical.catalog_epoch != snapshot.logical_catalog_epoch
+                or logical.catalog_key != snapshot.logical_catalog_key
+                or logical.logical_uri != snapshot.logical_uri):
+            raise RuntimeError("catalog lineage logical source changed concurrently")
+
+
+def _catalog_lineage_source_snapshot(
+        s, snapshot: _CatalogLineageParentSnapshot,
+        locked_logicals: dict[str, CatalogLogicalDataset],
+        locked_entries: dict[str, CatalogEntry]) -> dict:
+    """Freeze the source identity and exact physical generation used by this publication."""
+    parent = snapshot.token
+    if snapshot.resolved_source_uri is not None:
+        return {
+            "source_key": snapshot.resolved_source_key,
+            "source_uri": snapshot.resolved_source_uri,
+            "source_version": snapshot.entry_version,
+            "source_registration_id": snapshot.entry_registration_id,
+        }
+    if snapshot.entry_uri is not None:
+        return {
+            "source_key": snapshot.entry_uri,
+            "source_uri": snapshot.entry_uri,
+            "source_version": snapshot.entry_version,
+            "source_registration_id": snapshot.entry_registration_id,
+        }
+    parent_logical = locked_logicals.get(snapshot.logical_id) \
+        if snapshot.logical_id is not None else None
+    current_parent_attempt = s.execute(select(
+        ObjectAttempt.logical_id, ObjectAttempt.catalog_epoch,
+    ).where(ObjectAttempt.uri == parent)).one_or_none() \
+        if snapshot.attempt_epoch is not None else None
+    attempt_is_current_epoch = (
+        snapshot.attempt_epoch is None or (
+            current_parent_attempt is not None
+            and current_parent_attempt.logical_id == snapshot.logical_id
+            and current_parent_attempt.catalog_epoch == snapshot.attempt_epoch
+            and parent_logical is not None
+            and snapshot.attempt_epoch == parent_logical.catalog_epoch
+        )
+    )
+    if (parent_logical is not None and parent_logical.state == "active"
+            and parent_logical.current_uri and attempt_is_current_epoch):
+        source_key = parent_logical.catalog_key
+        source_uri = parent if snapshot.attempt_epoch is not None else parent_logical.current_uri
+    elif parent_logical is not None and parent == parent_logical.catalog_key:
+        # Never retain an inactive stable key: re-registering the logical URI must not inherit facts.
+        source_key = parent_logical.logical_uri
+        source_uri = parent_logical.logical_uri
+    else:
+        source_key = parent
+        source_uri = parent
+    entry = locked_entries.get(source_uri)
+    return {
+        "source_key": _catalog_lineage_uri(source_key, field="source key"),
+        "source_uri": _catalog_lineage_uri(source_uri, field="source URI"),
+        "source_version": _catalog_entry_version(entry),
+        "source_registration_id": entry.registration_id if entry is not None else None,
+    }
+
+
+def _catalog_insert_lineage_fact(
+        s, *, publication_key: str, source: dict, destination_key: str, destination_uri: str,
+        destination_version: str | None, lineage: dict) -> bool:
+    public_source = {
+        key: source[key] for key in ("source_key", "source_uri", "source_version")
+    }
+    fact_key = "lineage-fact:v1:sha256:" + hashlib.sha256(
+        (publication_key + "\0" + source["source_key"]).encode("utf-8")
+    ).hexdigest()
+    semantic = {
+        "schema_version": 1,
+        "fact_key": fact_key,
+        "publication_key": publication_key,
+        **public_source,
+        "destination_key": destination_key,
+        "destination_uri": destination_uri,
+        "destination_version": destination_version,
+        "run_id": lineage["run_id"],
+        "attempt_id": lineage["attempt_id"],
+        "producer": lineage["producer"],
+        "producer_version": lineage["producer_version"],
+        "step_id": lineage["step_id"],
+        "provenance": lineage["provenance"],
+        "field_mappings": lineage["field_mappings"],
+    }
+    # Last durable-boundary guard: no built-in publication path may create a fact that the public
+    # exporter cannot validate and paginate past. This also catches a long resolved catalog key/URI
+    # even when the caller supplied a short alias.
+    from hub.models import LineageFact
+    created_at = _now()
+    LineageFact.model_validate({
+        "id": "1",
+        **{key: value for key, value in semantic.items() if key != "schema_version"},
+        "created_at": created_at,
+    })
+    fingerprint = "lineage-fact:v1:sha256:" + hashlib.sha256(json.dumps(
+        semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    values = {
+        "fact_key": fact_key,
+        "publication_key": publication_key,
+        "fingerprint": fingerprint,
+        **public_source,
+        "destination_key": destination_key,
+        "destination_uri": destination_uri,
+        "source_key_hash": _catalog_lineage_identity_hash(source["source_key"]),
+        "destination_key_hash": _catalog_lineage_identity_hash(destination_key),
+        "source_uri_hash": _catalog_lineage_identity_hash(source["source_uri"]),
+        "destination_uri_hash": _catalog_lineage_identity_hash(destination_uri),
+        "destination_version": destination_version,
+        "run_id": lineage["run_id"],
+        "attempt_id": lineage["attempt_id"],
+        "producer": lineage["producer"],
+        "producer_version": lineage["producer_version"],
+        "step_id": lineage["step_id"],
+        "provenance": lineage["provenance"],
+        "field_mappings_json": lineage["field_mappings_json"],
+        "created_at": created_at,
+    }
+    dialect = s.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - the product supports SQLite and PostgreSQL metadata stores
+        raise RuntimeError(f"unsupported catalog lineage dialect: {dialect}")
+    inserted_id = s.scalar(dialect_insert(CatalogLineageFact).values(
+        **values,
+    ).on_conflict_do_nothing(
+        index_elements=[CatalogLineageFact.fact_key],
+    ).returning(CatalogLineageFact.id))
+    winner = s.scalars(select(CatalogLineageFact).where(
+        CatalogLineageFact.fact_key == fact_key).limit(1)).first()
+    if winner is None:  # pragma: no cover - defensive database contract check
+        raise RuntimeError("catalog lineage fact reservation failed")
+    persisted = {
+        key: getattr(winner, key) for key in values if key != "created_at"
+    }
+    expected = {key: value for key, value in values.items() if key != "created_at"}
+    if persisted != expected:
+        raise RuntimeError(
+            f"catalog lineage idempotency key collision: {lineage['idempotency_key']}")
+    return inserted_id is not None
+
+
+def _catalog_apply_lineage_in_session(
+        s, destination_key: str, destination_uri: str,
+        destination_version: str | None,
+        parent_snapshots: list[_CatalogLineageParentSnapshot],
+        locked_logicals: dict[str, CatalogLogicalDataset],
+        locked_entries: dict[str, CatalogEntry], lineage: dict | None,
+        publication_key: str | None) -> int:
+    """Insert immutable facts for the first reserved publication without moving a pointer."""
+    if publication_key is None:
+        return 0
+    if lineage is None:
+        raise ValueError("catalog publication with sources requires lineage identity")
+    sources: dict[str, dict] = {}
+    for snapshot in parent_snapshots:
+        source = _catalog_lineage_source_snapshot(
+            s, snapshot, locked_logicals, locked_entries)
+        prior = sources.get(source["source_key"])
+        if prior is not None and prior != source:
+            raise ValueError(
+                "catalog lineage publication names multiple versions of one source identity")
+        sources[source["source_key"]] = source
+    inserted = 0
+    for source_key in sorted(sources):
+        inserted += int(_catalog_insert_lineage_fact(
+            s, publication_key=publication_key, source=sources[source_key],
+            destination_key=destination_key,
+            destination_uri=destination_uri,
+            destination_version=destination_version, lineage=lineage))
+    return inserted
 
 
 def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
                                parents: list[str] | None = None,
-                               pipeline: str | None = None, *,
+                               pipeline: str | None = None,
+                               lineage: dict | None = None, *,
                                publication_event_key: str | None = None,
                                publication_fingerprint: str | None = None,
-                               backend_publication: dict | None = None) -> None:
+                               backend_publication: dict | None = None,
+                               lineage_replay_noop: bool = True,
+                               require_unmanaged: bool = False,
+                               requested_destination_version: str | None = None) -> bool:
+    if require_unmanaged:
+        _lock_catalog_namespace_tokens(s, [uri])
+    else:
+        _catalog_sqlite_write_fence(s)
+    parent_tokens = catalog_lineage_parent_tokens(parents)
+    canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
+    destination_version = (
+        _catalog_lineage_version(doc.get("version"), field="destination version")
+        if canonical_lineage is not None or publication_event_key else None
+    )
+    lineage_reservation_version = (
+        _catalog_lineage_version(
+            requested_destination_version, field="requested destination version")
+        if require_unmanaged else destination_version
+    )
+    lineage_publication_key = None
+    # Composite publications use one global reservation order on every backend and execution path:
+    # lineage header -> output receipt -> catalog/lifecycle projection mutation. This keeps managed and
+    # unmanaged callers from taking the two unique event keys in opposite orders under PostgreSQL.
+    if canonical_lineage is not None:
+        lineage_publication_key, lineage_applied = _catalog_reserve_lineage_publication(
+            s,
+            destination_uri=uri,
+            destination_version=lineage_reservation_version,
+            parent_tokens=parent_tokens,
+            lineage=canonical_lineage,
+        )
+        if not lineage_applied:
+            if lineage_replay_noop:
+                return False
+            lineage_publication_key = None
+    if publication_event_key:
+        if not publication_fingerprint:
+            raise RuntimeError("catalog publication requires an exact effect fingerprint")
+        applied = (
+            _catalog_unmanaged_output_event_once(
+                s, publication_event_key, uri, destination_version,
+                publication_fingerprint)
+            if require_unmanaged else _catalog_publication_event_once(
+                s, publication_event_key, "output", uri,
+                destination_version, publication_fingerprint)
+        )
+        if not applied:
+            return False
+    if require_unmanaged:
+        _assert_unmanaged_catalog_namespace_available(s, uri)
     attempt_identity = s.get(ObjectAttempt, uri)
+    if require_unmanaged and (
+            attempt_identity is not None or object_attempt_uri_shape(uri)):
+        raise RuntimeError(
+            "managed catalog output requires the core object-lifecycle publication receipt")
     if attempt_identity is None and object_attempt_uri_shape(uri):
         _validated_object_uri(uri, attempt=True)
         raise RuntimeError("attempt-shaped object URI has no lifecycle ownership row")
@@ -6513,15 +7069,10 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
     logical_id = None
     locked_entries: dict[str, CatalogEntry] = {}
     attempt = attempt_identity
-    parent_snapshots: list[tuple[str, str | None, int | None]] = []
-    for token in dict.fromkeys(str(parent).rstrip("/") for parent in (parents or [])):
-        parent_attempt = s.get(ObjectAttempt, token)
-        parent_snapshots.append((
-            token,
-            (parent_attempt.logical_id if parent_attempt is not None and parent_attempt.logical_id
-             else _catalog_token_logical_id(s, token)),
-            parent_attempt.catalog_epoch if parent_attempt is not None else None,
-        ))
+    parent_snapshots = [
+        _catalog_lineage_parent_snapshot(s, token)
+        for token in parent_tokens
+    ]
     if attempt_identity is not None:
         if attempt_identity.kind != "sink":
             raise RuntimeError("catalog cannot publish a region attempt")
@@ -6530,24 +7081,45 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
             raise RuntimeError("object sink attempt has no reserved logical publication identity")
         logical_id = attempt_identity.logical_id
     logical_ids = sorted(({logical_id} if logical_id is not None else set()) | {
-        parent_logical_id for _token, parent_logical_id, _epoch in parent_snapshots
-        if parent_logical_id is not None
+        snapshot.logical_id for snapshot in parent_snapshots
+        if snapshot.logical_id is not None
     })
     locked_logicals = {row.logical_id: row for row in s.scalars(
         select(CatalogLogicalDataset).where(
             CatalogLogicalDataset.logical_id.in_(logical_ids))
-        .order_by(CatalogLogicalDataset.logical_id).with_for_update())} if logical_ids else {}
+        .order_by(CatalogLogicalDataset.logical_id).with_for_update()
+        .execution_options(populate_existing=True))} if logical_ids else {}
+    _catalog_validate_lineage_parent_logicals(parent_snapshots, locked_logicals)
+    lineage_entry_uris: set[str] = set()
+    for snapshot in parent_snapshots:
+        if snapshot.entry_uri is not None:
+            lineage_entry_uris.add(snapshot.entry_uri)
+            continue
+        parent = snapshot.token
+        parent_logical = locked_logicals.get(snapshot.logical_id) \
+            if snapshot.logical_id is not None else None
+        if (parent_logical is not None and parent_logical.state == "active"
+                and parent_logical.current_uri
+                and (snapshot.attempt_epoch is None
+                     or snapshot.attempt_epoch == parent_logical.catalog_epoch)):
+            lineage_entry_uris.add(
+                parent if snapshot.attempt_epoch is not None else parent_logical.current_uri)
+        elif parent_logical is not None and parent == parent_logical.catalog_key:
+            lineage_entry_uris.add(parent_logical.logical_uri)
+        else:
+            lineage_entry_uris.add(parent)
     if attempt_identity is not None:
         logical = locked_logicals.get(logical_id)
         if logical is None:
             raise RuntimeError("object sink attempt logical publication identity is missing")
         old_uri = logical.current_uri
         attempt_uris = sorted({candidate for candidate in (
-            uri, old_uri, *(parent for parent, _logical_id, epoch in parent_snapshots
-                            if epoch is not None),
+            uri, old_uri, *(snapshot.token for snapshot in parent_snapshots
+                            if snapshot.attempt_epoch is not None),
         ) if candidate})
         locked_attempts = {row.uri: row for row in s.scalars(select(ObjectAttempt).where(
-            ObjectAttempt.uri.in_(attempt_uris)).order_by(ObjectAttempt.uri).with_for_update())}
+            ObjectAttempt.uri.in_(attempt_uris)).order_by(ObjectAttempt.uri).with_for_update()
+            .execution_options(populate_existing=True))}
         attempt = locked_attempts.get(uri)
         if attempt is None or (old_uri and old_uri not in locked_attempts):
             raise RuntimeError("catalog publication ownership changed concurrently")
@@ -6562,10 +7134,13 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         locked_refs = {(row.ref_type, row.ref_key): row for row in s.scalars(
             select(ObjectAttemptRef).where(or_(*ref_predicates))
             .order_by(ObjectAttemptRef.ref_type, ObjectAttemptRef.ref_key)
-            .with_for_update()
+            .with_for_update().execution_options(populate_existing=True)
         )}
+        entry_uris = sorted(set(attempt_uris) | lineage_entry_uris)
         locked_entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
-            CatalogEntry.uri.in_(attempt_uris)).order_by(CatalogEntry.uri).with_for_update())}
+            CatalogEntry.uri.in_(entry_uris)).order_by(CatalogEntry.uri).with_for_update()
+            .execution_options(populate_existing=True))}
+        _catalog_validate_lineage_parent_entries(parent_snapshots, locked_entries)
         if attempt.state not in ("committed", "published"):
             raise RuntimeError("object sink attempt lacks terminal proof or exact inventory")
         if (attempt.logical_id, attempt.catalog_epoch, attempt.publish_seq) != (
@@ -6574,11 +7149,6 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
             raise RuntimeError("catalog publication identity changed concurrently")
         if attempt.catalog_epoch != logical.catalog_epoch:
             raise RuntimeError("object sink attempt was fenced by catalog unregister")
-        if (publication_event_key and publication_fingerprint
-                and _catalog_output_event_receipt_in_session(
-                    s, publication_event_key, uri, str(doc.get("version")),
-                    publication_fingerprint) is not None):
-            return
         backend_refs = [ref for (ref_type, _ref_key), ref in locked_refs.items()
                         if ref_type == "backend_publication"]
         if backend_publication is not None:
@@ -6619,10 +7189,15 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
                 s.delete(prior)
             s.flush()
 
+    if logical is None:
+        entry_uris = sorted({uri, *lineage_entry_uris})
+        locked_entries = {row.uri: row for row in s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(entry_uris)).order_by(CatalogEntry.uri).with_for_update()
+            .execution_options(populate_existing=True))}
+        _catalog_validate_lineage_parent_entries(parent_snapshots, locked_entries)
     tbl_id, folder, owner, description, rows, tags, cols = _doc_org(doc)
     payload = json.dumps(doc, default=str)
-    entry = locked_entries.get(uri) if logical is not None else \
-        s.get(CatalogEntry, uri, with_for_update=True)
+    entry = locked_entries.get(uri)
     if entry is None:
         entry = CatalogEntry(
             uri=uri, name=name, doc=payload, tbl_id=tbl_id, folder=folder,
@@ -6636,6 +7211,7 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         entry.logical_id = logical_id
         if logical is not None:
             entry.usage = logical.usage
+    locked_entries[uri] = entry
     _sync_children(s, uri, tags, cols)
     s.flush()
 
@@ -6647,19 +7223,16 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         _replace_attempt_ref(s, "catalog", logical_id, uri, publish=True)
     child_key = logical.catalog_key if logical is not None else uri
     _catalog_apply_lineage_in_session(
-        s, child_key, parent_snapshots, locked_logicals, pipeline)
-    if publication_event_key:
-        if not publication_fingerprint:
-            raise RuntimeError("managed catalog publication requires an exact effect fingerprint")
-        _catalog_publication_event_once(
-            s, publication_event_key, "output", uri, doc.get("version"),
-            publication_fingerprint,
-        )
+        s, child_key, uri,
+        destination_version,
+        parent_snapshots, locked_logicals, locked_entries, canonical_lineage,
+        lineage_publication_key)
+    return True
 
 
 _MANAGED_CATALOG_PLAN_FIELDS = {
     "contract_version", "run_id", "step_id", "ref_key", "generation", "event_key",
-    "name", "uri", "version", "parents", "pipeline", "table_doc", "fingerprint",
+    "name", "uri", "version", "parents", "pipeline", "lineage", "table_doc", "fingerprint",
 }
 
 
@@ -6669,7 +7242,7 @@ def validate_managed_catalog_publication_plan(plan: dict) -> dict:
 
     if not isinstance(plan, dict) or set(plan) != _MANAGED_CATALOG_PLAN_FIELDS:
         raise ValueError("managed catalog publication plan has an invalid field set")
-    if plan.get("contract_version") != 1:
+    if plan.get("contract_version") != 2:
         raise ValueError("managed catalog publication plan has an unsupported version")
     for key in (
             "run_id", "step_id", "ref_key", "event_key", "name", "uri", "version",
@@ -6684,12 +7257,27 @@ def validate_managed_catalog_publication_plan(plan: dict) -> dict:
         raise ValueError("managed catalog publication plan has an invalid generation")
     uri = _validated_object_uri(plan["uri"], attempt=True)
     parents = plan.get("parents")
-    if (not isinstance(parents, list)
-            or any(not isinstance(parent, str) or not parent for parent in parents)
-            or parents != list(dict.fromkeys(parent.rstrip("/") for parent in parents))):
+    try:
+        canonical_parents = catalog_lineage_parent_tokens(parents)
+    except ValueError as exc:
+        raise ValueError("managed catalog publication plan has invalid parents") from exc
+    if parents != canonical_parents:
         raise ValueError("managed catalog publication plan has invalid parents")
     if plan.get("pipeline") is not None and not isinstance(plan["pipeline"], str):
         raise ValueError("managed catalog publication plan has an invalid pipeline")
+    canonical_lineage = _catalog_lineage_canonical(plan.get("lineage"), len(parents))
+    if parents and canonical_lineage is None:
+        raise ValueError("managed catalog publication with sources requires lineage identity")
+    if canonical_lineage is not None:
+        comparable = {key: value for key, value in canonical_lineage.items()
+                      if key != "field_mappings_json"}
+        if plan["lineage"] != comparable:
+            raise ValueError("managed catalog publication lineage is not canonical")
+        if comparable["idempotency_key"] != plan["event_key"]:
+            raise ValueError("managed catalog publication lineage identity changed after preflight")
+        if (comparable["provenance"] == "run"
+                and comparable["step_id"] != plan["step_id"]):
+            raise ValueError("managed catalog publication lineage step identity does not match")
     if not isinstance(plan.get("table_doc"), dict):
         raise ValueError("managed catalog publication plan has no exact table document")
     table = CatalogTable.model_validate(plan["table_doc"])
@@ -6698,7 +7286,7 @@ def validate_managed_catalog_publication_plan(plan: dict) -> dict:
             or table.version != plan["version"]):
         raise ValueError("managed catalog publication table document changed after preflight")
     unsigned = {key: value for key, value in plan.items() if key != "fingerprint"}
-    expected = "managed-output:v1:sha256:" + hashlib.sha256(json.dumps(
+    expected = "managed-output:v2:sha256:" + hashlib.sha256(json.dumps(
         unsigned, sort_keys=True, separators=(",", ":"), default=str,
     ).encode()).hexdigest()
     if plan["fingerprint"] != expected:
@@ -6718,7 +7306,7 @@ def managed_catalog_publication_identity(uri: str, run_id: str) -> dict:
 
 
 def _catalog_output_event_receipt_in_session(
-        s, event_key: str, uri: str, version: str,
+        s, event_key: str, uri: str, version: str | None,
         fingerprint: str) -> dict | None:
     event = s.get(CatalogPublicationEvent, str(event_key), with_for_update=True)
     if event is None:
@@ -6747,6 +7335,7 @@ def catalog_apply_managed_publication(plan: dict) -> dict:
         _catalog_upsert_in_session(
             s, validated["uri"], validated["name"], dict(validated["table_doc"]),
             parents=validated["parents"], pipeline=validated["pipeline"],
+            lineage=validated["lineage"],
             publication_event_key=validated["event_key"],
             publication_fingerprint=validated["fingerprint"],
             backend_publication={
@@ -6754,6 +7343,7 @@ def catalog_apply_managed_publication(plan: dict) -> dict:
                 "ref_key": validated["ref_key"],
                 "generation": validated["generation"],
             },
+            lineage_replay_noop=False,
         )
         receipt = _catalog_output_event_receipt_in_session(
             s, validated["event_key"], validated["uri"], validated["version"],
@@ -6766,38 +7356,28 @@ def catalog_apply_managed_publication(plan: dict) -> dict:
 
 def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
                          parents: list[str] | None = None,
-                         pipeline: str | None = None) -> None:
+                         pipeline: str | None = None,
+                         lineage: dict | None = None) -> bool:
     """Write-through a catalog entry (registered dataset / written output) to the shared DB, keyed by
     uri, so other instances + a restart see it. `doc` is the full CatalogTable model_dump; its folder /
     owner / description / row_count / tags / column-names are mirrored to indexed columns + join tables
     so browse/search/facet push down to the DB. `usage` (popularity) is owned by the column and NOT
     overwritten from the doc — it's bumped independently on reads."""
     with session() as s:
-        normalized = str(uri).rstrip("/")
+        normalized = (
+            _catalog_lineage_uri(uri, field="destination URI")
+            if lineage is not None else str(uri).rstrip("/")
+        )
         payload = dict(doc)
         payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
-        _catalog_upsert_in_session(
-            s, normalized, name, payload, parents=parents, pipeline=pipeline)
+        applied = _catalog_upsert_in_session(
+            s, normalized, name, payload, parents=parents, pipeline=pipeline,
+            lineage=lineage)
+        if not applied:
+            return False
         sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
         _materialize_folder(s, payload.get("folder") or "")  # a registered dataset's folder is first-class
-
-
-def catalog_publish_entries(entries: list[tuple[str, str, dict, list[str] | None, str | None]]) -> None:
-    """Reusable atomic publication primitive for a future successful multi-sink batch."""
-    with session() as s:
-        local_owners: list[tuple[str, dict]] = []
-        for uri, name, doc, parents, pipeline in entries:
-            normalized = str(uri).rstrip("/")
-            payload = dict(doc)
-            payload["folder"] = catalog_folder_normalize(payload.get("folder") or "")
-            _catalog_upsert_in_session(
-                s, normalized, name, payload,
-                parents=parents, pipeline=pipeline)
-            _materialize_folder(s, payload.get("folder") or "")
-            local_owners.append((normalized, payload))
-        for normalized, payload in local_owners:
-            sync_local_result_owner(
-                s, "catalog_entry", normalized, normalized, payload)
+        return True
 
 
 def catalog_managed_publication_receipt(uri: str) -> dict | None:
@@ -6874,9 +7454,9 @@ def _catalog_publication_event_once(
         version: str | None, fingerprint: str | None = None) -> bool:
     """Insert one exact catalog effect identity in the caller's transaction.
 
-    Catalog owner rows are locked before this helper is called. The savepoint contains only the unique
-    event insert, so a concurrent winner can be validated without rolling back the caller's catalog
-    locks or accidentally converting a later catalog mutation error into an idempotent replay.
+    The savepoint contains only the unique event insert, so a concurrent winner can be validated without
+    rolling back the caller's transaction or accidentally converting a later catalog mutation error into
+    an idempotent replay. Callers reserve before mutating catalog projections.
     """
     fingerprint = fingerprint or (
         "catalog-effect:v1:sha256:" + hashlib.sha256(json.dumps(
@@ -6911,6 +7491,159 @@ def _catalog_publication_event_once(
     return True
 
 
+def _catalog_unmanaged_output_event_once(
+        s, event_key: str, uri: str, version: str | None, fingerprint: str) -> bool:
+    """Reserve a first unmanaged apply; replay matching uses caller semantics, not a fresh probe.
+
+    ``version`` is the exact value discovered by the winning first probe and returned in its receipt.
+    A concurrent exact caller may observe different bytes at the mutable URI, but its request
+    fingerprint is still identical and must attest the winner without replacing that version.
+    """
+    version = _catalog_lineage_version(version, field="destination version")
+
+    def validate(event: CatalogPublicationEvent | None) -> None:
+        if (event is None or event.effect_type != "output" or event.uri != uri
+                or event.fingerprint != fingerprint):
+            raise RuntimeError(f"catalog publication key collision: {event_key}")
+        _catalog_lineage_version(
+            event.version, field="persisted destination version")
+
+    event = s.get(CatalogPublicationEvent, event_key, with_for_update=True)
+    if event is not None:
+        validate(event)
+        return False
+    try:
+        with s.begin_nested():
+            s.add(CatalogPublicationEvent(
+                event_key=event_key, effect_type="output", uri=uri,
+                version=version, fingerprint=fingerprint,
+            ))
+            s.flush()
+    except IntegrityError:
+        s.expire_all()
+        validate(s.get(CatalogPublicationEvent, event_key, populate_existing=True))
+        return False
+    return True
+
+
+def _canonical_unmanaged_output_request(
+        event_key: str, uri: str, name: str, requested_version: str | None, *,
+        parents: list[str] | None, pipeline: str | None,
+        lineage: dict | None) -> tuple[str, str | None, list[str], dict | None, str]:
+    """Fingerprint only stable caller semantics, never the mutable artifact at ``uri``."""
+    if not event_key:
+        raise ValueError("catalog publication event_key is required")
+    normalized = _catalog_lineage_uri(uri, field="destination URI")
+    if not isinstance(name, str) or not name or len(name) > 512:
+        raise ValueError("catalog publication name must be a non-empty string of at most 512 characters")
+    requested_version = _catalog_lineage_version(
+        requested_version, field="requested destination version")
+    if pipeline is not None and not isinstance(pipeline, str):
+        raise ValueError("catalog publication pipeline must be a string")
+    parent_tokens = catalog_lineage_parent_tokens(parents)
+    canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
+    if parent_tokens and canonical_lineage is None:
+        raise ValueError("catalog publication with sources requires lineage identity")
+    semantic = {
+        "schema_version": 2,
+        "name": name,
+        "uri": normalized,
+        "requested_version": requested_version,
+        "parents": parent_tokens,
+        "pipeline": pipeline,
+        "lineage": (
+            _catalog_lineage_publication_semantic(canonical_lineage)
+            if canonical_lineage is not None else None),
+    }
+    fingerprint = "unmanaged-output:v2:sha256:" + hashlib.sha256(json.dumps(
+        semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+    return normalized, requested_version, parent_tokens, canonical_lineage, fingerprint
+
+
+def catalog_unmanaged_output_publication_receipt(
+        event_key: str, uri: str, name: str, requested_version: str | None, *,
+        parents: list[str] | None = None, pipeline: str | None = None,
+        lineage: dict | None = None) -> dict | None:
+    """Return an exact prior receipt before probing a mutable or already-deleted artifact."""
+    normalized, _requested, _parents, _lineage, fingerprint = (
+        _canonical_unmanaged_output_request(
+            event_key, uri, name, requested_version,
+            parents=parents, pipeline=pipeline, lineage=lineage))
+    with session() as s:
+        event = s.get(CatalogPublicationEvent, event_key, with_for_update=True)
+        if event is None:
+            return None
+        if (event.effect_type != "output" or event.uri != normalized
+                or event.fingerprint != fingerprint):
+            raise RuntimeError(f"catalog publication key collision: {event_key}")
+        version = _catalog_lineage_version(
+            event.version, field="persisted destination version")
+        return {"uri": event.uri, "version": version, "fingerprint": event.fingerprint}
+
+
+def _canonical_unmanaged_output_publication(
+        event_key: str, uri: str, name: str, doc: dict, *,
+        requested_version: str | None, parents: list[str] | None,
+        pipeline: str | None, lineage: dict | None,
+        ) -> tuple[str, str | None, list[str], dict | None, dict, str]:
+    """Validate a first apply against its pre-probe caller request."""
+    (normalized, requested_version, parent_tokens,
+     canonical_lineage, fingerprint) = _canonical_unmanaged_output_request(
+        event_key, uri, name, requested_version,
+        parents=parents, pipeline=pipeline, lineage=lineage)
+
+    from hub.models import CatalogTable
+    table = CatalogTable.model_validate(doc)
+    if table.name != name or table.uri.rstrip("/") != normalized:
+        raise ValueError("catalog publication table document does not match its destination")
+    canonical_doc = table.model_dump(by_alias=True)
+    canonical_doc["uri"] = normalized
+    version = _catalog_lineage_version(
+        table.version, field="destination version")
+    if requested_version is not None and version != requested_version:
+        raise ValueError("catalog publication table version does not match its caller request")
+    return (
+        normalized, version, parent_tokens, canonical_lineage,
+        canonical_doc, fingerprint,
+    )
+
+
+def catalog_upsert_output_idempotent(
+        event_key: str, uri: str, name: str, doc: dict, *,
+        requested_version: str | None,
+        parents: list[str] | None = None, pipeline: str | None = None,
+        lineage: dict | None = None) -> bool:
+    """Atomically reserve and apply one complete unmanaged catalog output publication.
+
+    The output receipt, entry projection, child indexes, local ownership, and optional lineage header /
+    facts share one transaction. Exact retries return before consulting or mutating the current catalog
+    projection; changed retries collide before they can roll an entry back.
+    """
+    (normalized, version, parent_tokens, canonical_lineage,
+     canonical_doc, fingerprint) = _canonical_unmanaged_output_publication(
+        event_key, uri, name, doc, requested_version=requested_version,
+        parents=parents, pipeline=pipeline, lineage=lineage)
+    lineage_doc = (
+        _catalog_lineage_publication_semantic(canonical_lineage)
+        if canonical_lineage is not None else None)
+    with session() as s:
+        applied = _catalog_upsert_in_session(
+            s, normalized, str(name), dict(canonical_doc),
+            parents=parent_tokens, pipeline=pipeline, lineage=lineage_doc,
+            publication_event_key=event_key,
+            publication_fingerprint=fingerprint,
+            lineage_replay_noop=False,
+            require_unmanaged=True,
+            requested_destination_version=requested_version)
+        if not applied:
+            return False
+        sync_local_result_owner(
+            s, "catalog_entry", normalized, normalized, canonical_doc)
+        _materialize_folder(s, canonical_doc.get("folder") or "")
+        return True
+
+
 def _lock_exact_unmanaged_catalog_output(
         s, uri: str, version: str | None) -> CatalogEntry:
     """Lock and attest the exact unmanaged catalog row behind an output receipt."""
@@ -6935,9 +7668,9 @@ def _lock_exact_unmanaged_catalog_output(
 def catalog_record_output_publication(event_key: str, uri: str, version: str | None) -> None:
     """Persist a receipt only after the referenced catalog entry is durably readable.
 
-    The entry upsert and this receipt are separate retry-safe commits: a crash between them leaves an
-    unacknowledged entry that the next call re-upserts, while a crash after the receipt replays the same
-    event. Durable backends must not expose terminal success until this function returns.
+    This compatibility receipt API does not perform the entry upsert. It reserves the event first in its
+    transaction, so an exact replay stays successful after the catalog projection advances or is removed;
+    a first apply still has to attest the exact readable unmanaged row before the event can commit.
     """
     if not event_key:
         raise ValueError("catalog publication event_key is required")
@@ -6945,17 +7678,20 @@ def catalog_record_output_publication(event_key: str, uri: str, version: str | N
     if not normalized:
         raise ValueError("catalog publication uri is required")
     with session() as s:
+        _lock_catalog_namespace_tokens(s, [normalized])
+        if not _catalog_publication_event_once(
+                s, event_key, "output", normalized, version):
+            return
+        _assert_unmanaged_catalog_namespace_available(s, normalized)
         _lock_exact_unmanaged_catalog_output(s, normalized, version)
-        _catalog_publication_event_once(
-            s, event_key, "output", normalized, version)
 
 
 def _catalog_usage_effect(
         s, uris: list[str]) -> tuple[str, list[dict]]:
     """Resolve aliases to stable identities and return one canonical effect plus unique live targets."""
-    normalized = [str(value).rstrip("/") for value in uris if value]
-    normalized = list(dict.fromkeys(token for token in normalized if token))
-    targets = _lock_catalog_mutation_targets(s, normalized)
+    normalized = catalog_lineage_parent_tokens(uris)
+    targets = _lock_catalog_mutation_targets(
+        s, normalized, allow_inactive=True)
     identities: set[str] = set()
     unique_targets: dict[str, dict] = {}
     for target in targets:
@@ -7045,10 +7781,10 @@ def catalog_prepare_usage_publication(
     run_id, event_key = str(run_id), str(event_key)
     if not run_id or not event_key or not isinstance(parents, list):
         raise ValueError("catalog usage publication requires run, event key, and parent list")
+    parent_tokens = catalog_lineage_parent_tokens(parents)
     with session() as s:
-        targets = _lock_catalog_mutation_targets(s, [
-            str(parent).rstrip("/") for parent in parents if parent
-        ])
+        targets = _lock_catalog_mutation_targets(
+            s, parent_tokens, allow_inactive=False)
         identities = []
         for target in targets:
             logical = target["logical"]
@@ -7125,29 +7861,62 @@ def catalog_apply_usage_publication(plan: dict) -> bool:
         return True
 
 
-def catalog_add_edge(parent: str, child: str, pipeline: str | None = None,
-                     column: str | None = None) -> bool:
-    """Write-through a lineage edge; one row per (parent, child). `column` records column-level
-    provenance when known. Returns whether this call created the edge."""
-    if parent == child:
-        return False
+def catalog_record_lineage(
+        destination_uri: str, destination_version: str | None,
+        parents: list[str], lineage: dict) -> int:
+    """Record facts for an exact current destination without rewriting its catalog entry."""
+    destination_uri = _catalog_lineage_uri(
+        destination_uri, field="destination URI")
+    destination_version = _catalog_lineage_version(
+        destination_version, field="destination version")
+    parent_tokens = catalog_lineage_parent_tokens(parents)
+    canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
+    if canonical_lineage is None:  # pragma: no cover - public contract is intentionally non-null
+        raise ValueError("catalog lineage identity is required")
     with session() as s:
-        parent_target, child_target = _lock_catalog_mutation_targets(s, [parent, child])
-        if not child_target["known"]:
-            raise RuntimeError("catalog lineage child is not registered")
-        parent_key, child_key = parent_target["catalog_key"], child_target["catalog_key"]
-        if parent_key == child_key:
-            return False
-        edge = s.scalars(select(CatalogEdge).where(
-            CatalogEdge.parent == parent_key, CatalogEdge.child == child_key)).first()
-        if edge is None:
-            s.add(CatalogEdge(
-                parent=parent_key, child=child_key, pipeline=pipeline, column=column))
-            s.flush()
-            return True
-        if column and not edge.column:
-            edge.column = column
-        return False
+        _catalog_sqlite_write_fence(s)
+        publication_key, applied = _catalog_reserve_lineage_publication(
+            s,
+            destination_uri=destination_uri,
+            destination_version=destination_version,
+            parent_tokens=parent_tokens,
+            lineage=canonical_lineage,
+        )
+        if not applied:
+            return 0
+        target_snapshots = [
+            _catalog_lineage_parent_snapshot(s, token)
+            for token in [destination_uri, *parent_tokens]
+        ]
+        if (target_snapshots[0].logical_id is None
+                and target_snapshots[0].entry_uri is None):
+            raise RuntimeError("lineage destination is not the exact current catalog output")
+        targets = _lock_catalog_mutation_targets(
+            s, [destination_uri, *parent_tokens],
+            exact_current_attempts={destination_uri})
+        destination = targets[0]
+        if (not destination["known"]
+                or destination["current_uri"] != destination_uri):
+            raise RuntimeError("lineage destination is not the exact current catalog output")
+        observed_version = _catalog_entry_version(destination["entry"])
+        expected_version = destination_version
+        if observed_version != expected_version:
+            raise RuntimeError("lineage destination version is not exact")
+        parent_snapshots = target_snapshots[1:]
+        locked_logicals = {
+            target["logical"].logical_id: target["logical"]
+            for target in targets if target.get("logical") is not None
+        }
+        locked_entries = {
+            target["entry"].uri: target["entry"]
+            for target in targets if target.get("entry") is not None
+        }
+        _catalog_validate_lineage_parent_logicals(target_snapshots, locked_logicals)
+        _catalog_validate_lineage_parent_entries(target_snapshots, locked_entries)
+        return _catalog_apply_lineage_in_session(
+            s, destination["catalog_key"], destination_uri, observed_version,
+            parent_snapshots, locked_logicals, locked_entries, canonical_lineage,
+            publication_key)
 
 
 def _row_to_doc(r: "CatalogEntry", tags: list[str]) -> dict:
@@ -7584,15 +8353,27 @@ def catalog_entries() -> list[dict]:
 
 def _delete_catalog_children(s, uris: list[str]) -> None:
     """Remove EVERY row keyed to `uris` alongside the entries themselves — tags/columns/embeddings,
-    lineage edges (either endpoint), declared keys, and relationships. Otherwise a deleted table
+    lineage facts (either endpoint), declared keys, and relationships. Otherwise a deleted table
     haunts lineage/ER as a ghost node, and a NEW dataset re-registered at the same uri silently
     inherits the old declared key + parents."""
     for model in (CatalogTag, CatalogColumn):
         for r in s.scalars(select(model).where(model.uri.in_(uris))):
             s.delete(r)
-    for r in s.scalars(select(CatalogEdge).where(
-            or_(CatalogEdge.parent.in_(uris), CatalogEdge.child.in_(uris)))):
-        s.delete(r)
+    identity_hashes = [_catalog_lineage_identity_hash(uri) for uri in uris]
+    s.execute(delete(CatalogLineageFact).where(or_(
+        and_(
+            CatalogLineageFact.source_uri_hash.in_(identity_hashes),
+            CatalogLineageFact.source_uri.in_(uris)),
+        and_(
+            CatalogLineageFact.destination_uri_hash.in_(identity_hashes),
+            CatalogLineageFact.destination_uri.in_(uris)),
+        and_(
+            CatalogLineageFact.source_key_hash.in_(identity_hashes),
+            CatalogLineageFact.source_key.in_(uris)),
+        and_(
+            CatalogLineageFact.destination_key_hash.in_(identity_hashes),
+            CatalogLineageFact.destination_key.in_(uris)),
+    )))
     gone = set(uris)
     for r in s.scalars(select(CatalogRelationship)):
         try:
@@ -7609,9 +8390,17 @@ def _delete_catalog_governance(s, catalog_key: str) -> None:
         row = s.get(model, catalog_key)
         if row is not None:
             s.delete(row)
-    for edge in s.scalars(select(CatalogEdge).where(or_(
-            CatalogEdge.parent == catalog_key, CatalogEdge.child == catalog_key))):
-        s.delete(edge)
+    identity_hash = _catalog_lineage_identity_hash(catalog_key)
+    s.execute(delete(CatalogLineageFact).where(or_(
+        and_(CatalogLineageFact.source_key_hash == identity_hash,
+             CatalogLineageFact.source_key == catalog_key),
+        and_(CatalogLineageFact.destination_key_hash == identity_hash,
+             CatalogLineageFact.destination_key == catalog_key),
+        and_(CatalogLineageFact.source_uri_hash == identity_hash,
+             CatalogLineageFact.source_uri == catalog_key),
+        and_(CatalogLineageFact.destination_uri_hash == identity_hash,
+             CatalogLineageFact.destination_uri == catalog_key),
+    )))
     for relationship in s.scalars(select(CatalogRelationship)):
         try:
             doc = json.loads(relationship.doc)
@@ -7634,7 +8423,7 @@ def _catalog_logicals_have_backend_publication_refs(s, logical_ids: list[str]) -
 
 
 def catalog_delete_entry(uri: str) -> None:
-    """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/edges/
+    """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
     declared key/relationships)."""
     with session() as s:
         token = str(uri).rstrip("/")
@@ -7758,44 +8547,199 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
     return len(current_uris)
 
 
-def catalog_edges() -> list[dict]:
+def _catalog_lineage_pair_dicts(s, rows) -> list[dict]:
+    materialized = list(rows)
+    keys = sorted({key for source, destination, _count in materialized
+                   for key in (source, destination)})
+    logicals = {row.catalog_key: row.current_uri for row in s.scalars(select(
+        CatalogLogicalDataset,
+    ).where(
+        CatalogLogicalDataset.catalog_key.in_(keys),
+        CatalogLogicalDataset.state == "active",
+        CatalogLogicalDataset.current_uri.is_not(None),
+    ))} if keys else {}
+    return [{
+        "parent": logicals.get(source, source),
+        "child": logicals.get(destination, destination),
+        "fact_count": int(count),
+    } for source, destination, count in materialized]
+
+
+def _catalog_lineage_key_pair_dicts(rows) -> list[dict]:
+    return [{
+        "parent": source,
+        "child": destination,
+        "fact_count": int(count),
+    } for source, destination, count in rows]
+
+
+def _catalog_lineage_pair_rows(s, keys: list[str], bounded: int):
+    key_hashes = [_catalog_lineage_identity_hash(key) for key in keys]
+    return s.execute(select(
+        CatalogLineageFact.source_key,
+        CatalogLineageFact.destination_key,
+        func.count(CatalogLineageFact.id),
+    ).where(or_(
+        and_(CatalogLineageFact.source_key_hash.in_(key_hashes),
+             CatalogLineageFact.source_key.in_(keys)),
+        and_(CatalogLineageFact.destination_key_hash.in_(key_hashes),
+             CatalogLineageFact.destination_key.in_(keys)),
+    )).group_by(
+        CatalogLineageFact.source_key,
+        CatalogLineageFact.destination_key,
+    ).order_by(
+        CatalogLineageFact.source_key,
+        CatalogLineageFact.destination_key,
+    ).limit(bounded + 1)).all()
+
+
+def catalog_lineage_root_key(token: str) -> str:
+    """Resolve a graph root to its immutable catalog key, including friendly names and table IDs."""
+    normalized = catalog_lineage_uri(token)
     with session() as s:
-        return [{"parent": _catalog_key_to_uri(s, r.parent),
-                 "child": _catalog_key_to_uri(s, r.child),
-                 "column": r.column, "pipeline": r.pipeline}
-                for r in s.scalars(select(CatalogEdge))]
+        catalog_key = _catalog_token_to_key(s, normalized)
+        if catalog_key != normalized:
+            return catalog_key
+        entry = s.get(CatalogEntry, normalized)
+        if entry is None:
+            entry = s.scalars(select(CatalogEntry).where(
+                CatalogEntry.tbl_id == normalized).limit(1)).first()
+        if entry is None:
+            entry = s.scalars(select(CatalogEntry).where(
+                CatalogEntry.name == normalized).order_by(CatalogEntry.uri).limit(1)).first()
+        return _catalog_token_to_key(s, entry.uri) if entry is not None else normalized
 
 
-def catalog_edges_touching(uris: list[str], limit: int | None = None) -> list[dict]:
-    """Every edge with an endpoint in `uris` — the frontier expansion step of a bounded lineage BFS
-    (so lineage never loads the whole edge table). `limit` caps a pathologically-connected frontier
-    (a hub node with 100k children) so one expansion can't load unbounded rows; the caller treats a
-    full batch as truncation."""
+def catalog_lineage_key_pairs_touching(
+        keys: list[str], limit: int) -> tuple[list[dict], bool]:
+    """Return bounded aggregate pairs in immutable catalog-key space for graph traversal."""
+    canonical = list(dict.fromkeys(
+        _catalog_lineage_uri(key, field="catalog key") for key in keys))
+    if not canonical:
+        return [], False
+    bounded = max(1, int(limit))
+    with session() as s:
+        rows = _catalog_lineage_pair_rows(s, canonical, bounded)
+        truncated = len(rows) > bounded
+        return _catalog_lineage_key_pair_dicts(rows[:bounded]), truncated
+
+
+def catalog_lineage_project_keys(keys: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
+    """Project stable graph keys and display rows through one current catalog snapshot.
+
+    Traversal stays in immutable key space. Applying this one projection to the root, every edge,
+    and every node prevents a managed overwrite from mixing physical generations in one response.
+    """
+    canonical = list(dict.fromkeys(
+        _catalog_lineage_uri(key, field="catalog key") for key in keys))
+    if not canonical:
+        return {}, {}
+    with session() as s:
+        projection = {key: key for key in canonical}
+        managed_rows = list(s.execute(select(
+            CatalogLogicalDataset.catalog_key,
+            CatalogLogicalDataset.current_uri,
+            CatalogEntry,
+        ).outerjoin(
+            CatalogEntry, CatalogEntry.uri == CatalogLogicalDataset.current_uri,
+        ).where(
+                CatalogLogicalDataset.catalog_key.in_(canonical),
+                CatalogLogicalDataset.state == "active",
+                CatalogLogicalDataset.current_uri.is_not(None),
+        )))
+        managed_keys: set[str] = set()
+        managed_entries: list[CatalogEntry] = []
+        for catalog_key, current_uri, entry in managed_rows:
+            projection[catalog_key] = current_uri
+            managed_keys.add(catalog_key)
+            if entry is not None:
+                managed_entries.append(entry)
+        unmanaged_uris = [key for key in canonical if key not in managed_keys]
+        unmanaged_entries = list(s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(unmanaged_uris)))) if unmanaged_uris else []
+        rows = [*managed_entries, *unmanaged_entries]
+        tag_map = _tags_for(s, [row.uri for row in rows])
+        docs = {row.uri: _row_to_doc(row, tag_map.get(row.uri, [])) for row in rows}
+        return projection, docs
+
+
+def catalog_lineage_pairs() -> list[dict]:
+    """Aggregate the complete fact set for diagnostics and bounded backup fixtures."""
+    with session() as s:
+        rows = s.execute(select(
+            CatalogLineageFact.source_key,
+            CatalogLineageFact.destination_key,
+            func.count(CatalogLineageFact.id),
+        ).group_by(
+            CatalogLineageFact.source_key,
+            CatalogLineageFact.destination_key,
+        ).order_by(
+            CatalogLineageFact.source_key,
+            CatalogLineageFact.destination_key,
+        )).all()
+        return _catalog_lineage_pair_dicts(s, rows)
+
+
+def catalog_lineage_pairs_touching(
+        uris: list[str], limit: int) -> tuple[list[dict], bool]:
+    """Return a bounded page of aggregate pairs touching one graph frontier."""
     if not uris:
-        return []
+        return [], False
+    bounded = max(1, int(limit))
     with session() as s:
         keys = list(dict.fromkeys(_catalog_token_to_key(s, uri) for uri in uris))
-        stmt = select(CatalogEdge).where(
-            or_(CatalogEdge.parent.in_(keys), CatalogEdge.child.in_(keys)))
-        if limit is not None:
-            stmt = stmt.limit(limit)
-        rows = s.scalars(stmt)
-        return [{"parent": _catalog_key_to_uri(s, r.parent),
-                 "child": _catalog_key_to_uri(s, r.child),
-                 "column": r.column, "pipeline": r.pipeline} for r in rows]
+        rows = _catalog_lineage_pair_rows(s, keys, bounded)
+        truncated = len(rows) > bounded
+        return _catalog_lineage_pair_dicts(s, rows[:bounded]), truncated
 
 
-def catalog_edges_page(limit: int = 500, offset: int = 0) -> tuple[list[dict], int]:
-    """One page of the whole lineage edge set + the total count — the bulk-export surface an external
-    lineage store (e.g. an OpenLineage bridge plugin) syncs from."""
+def _catalog_lineage_fact_dict(row: CatalogLineageFact) -> dict:
+    created_at = row.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    else:
+        created_at = created_at.astimezone(datetime.timezone.utc)
+    try:
+        mappings = json.loads(row.field_mappings_json)
+    except (TypeError, ValueError) as e:  # pragma: no cover - persistent corruption guard
+        raise RuntimeError("catalog lineage field mappings are corrupt") from e
+    return {
+        "id": int(row.id),
+        "fact_key": row.fact_key,
+        "publication_key": row.publication_key,
+        "source_key": row.source_key,
+        "source_uri": row.source_uri,
+        "source_version": row.source_version,
+        "destination_key": row.destination_key,
+        "destination_uri": row.destination_uri,
+        "destination_version": row.destination_version,
+        "run_id": row.run_id,
+        "attempt_id": row.attempt_id,
+        "producer": row.producer,
+        "producer_version": row.producer_version,
+        "step_id": row.step_id,
+        "provenance": row.provenance,
+        "field_mappings": mappings,
+        "created_at": created_at,
+    }
+
+
+def catalog_lineage_facts_page(
+        limit: int = 100, after_id: int = 0,
+) -> tuple[list[dict], int | None, bool]:
+    """Export immutable facts using a monotonic BIGINT keyset cursor."""
+    if (isinstance(after_id, bool) or not isinstance(after_id, int)
+            or after_id < 0 or after_id >= 2**63):
+        raise ValueError("catalog lineage cursor must be a signed non-negative BIGINT")
+    bounded = max(1, min(int(limit), 500))
     with session() as s:
-        total = s.scalar(select(func.count()).select_from(CatalogEdge)) or 0
-        rows = s.scalars(select(CatalogEdge).order_by(CatalogEdge.id.asc())
-                         .limit(max(0, limit)).offset(max(0, offset)))
-        return ([{"parent": _catalog_key_to_uri(s, r.parent),
-                  "child": _catalog_key_to_uri(s, r.child),
-                  "column": r.column, "pipeline": r.pipeline}
-                 for r in rows], int(total))
+        rows = list(s.scalars(select(CatalogLineageFact).where(
+            CatalogLineageFact.id > after_id,
+        ).order_by(CatalogLineageFact.id.asc()).limit(bounded + 1)))
+        has_more = len(rows) > bounded
+        page = rows[:bounded]
+        next_after_id = int(page[-1].id) if has_more and page else None
+        return [_catalog_lineage_fact_dict(row) for row in page], next_after_id, has_more
 
 
 # -- semantic search (opt-in: only populated when an embedder is registered) ----------------------- #

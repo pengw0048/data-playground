@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 
 from hub import metadb
 from hub.models import (
@@ -34,7 +35,10 @@ from hub.models import (
     FolderNode,
     KeyInfo,
     LineageEdge,
+    LineageFact,
+    LineageFactsPage,
     LineageNode,
+    LineagePublication,
     LineageResult,
     Relationship,
 )
@@ -45,6 +49,59 @@ log = logging.getLogger("hub")
 # a client renders (and the payload) stays sane; `truncated` tells the UI there was more.
 DEFAULT_LINEAGE_DEPTH = 6
 DEFAULT_LINEAGE_MAX_NODES = 500
+
+
+def canonical_lineage_parent_tokens(parents: list[str] | None) -> list[str]:
+    """Expose the core lineage wire canonicalizer without giving runners metadata-table access."""
+    return metadb.catalog_lineage_parent_tokens(parents)
+
+
+def lineage_for_output(graph, backend_run_id: str, step_id: str, *,
+                       attempt_id: str | None = None,
+                       idempotency_key: str | None = None) -> LineagePublication:
+    """Resolve the catalog-only identity for one execution sink.
+
+    A placed final region keeps its own backend run for status/cancellation, while the graph's private
+    publication context preserves the researcher-visible outer run and original canvas producer.
+    """
+    logical_run = getattr(graph, "_publication_run_id", None) or str(backend_run_id)
+    producer = getattr(graph, "_publication_producer_id", None) or str(graph.id)
+    producer_version = getattr(graph, "_publication_producer_version", None)
+    if producer_version is None:
+        producer_version = int(graph.version)
+    execution_attempt = attempt_id or getattr(graph, "_publication_attempt_id", None)
+    if execution_attempt is None and logical_run != str(backend_run_id):
+        execution_attempt = str(backend_run_id)
+    if idempotency_key is None:
+        identity = json.dumps({
+            "run": logical_run,
+            "attempt": execution_attempt,
+            "producer": producer,
+            "producerVersion": producer_version,
+            "step": str(step_id),
+        }, sort_keys=True, separators=(",", ":"))
+        idempotency_key = "lineage-run:v1:sha256:" + hashlib.sha256(identity.encode()).hexdigest()
+    return LineagePublication(
+        idempotency_key=idempotency_key,
+        run_id=logical_run,
+        attempt_id=execution_attempt,
+        producer=producer,
+        producer_version=producer_version,
+        step_id=str(step_id),
+        provenance="run",
+    )
+
+
+def _manual_lineage(pipeline: str | None) -> LineagePublication:
+    # A manual register call has no caller-owned retry key. Treat each call as a distinct observation;
+    # durable/imported producers must supply their own stable LineagePublication identity.
+    return LineagePublication(
+        idempotency_key=f"lineage-manual:v1:{uuid.uuid4().hex}",
+        producer=pipeline,
+        provenance="manual",
+    )
+
+
 class InMemoryCatalog:
     """The default CatalogProvider. Named for history — it's now DB-backed (the DB is authoritative and
     cross-instance); there is no in-memory table map to go stale."""
@@ -105,9 +162,12 @@ class InMemoryCatalog:
     def _add(self, name: str, uri: str, version: str | None = None, meta: str | None = None,
              folder: str = "", tags: list[str] | None = None, owner: str | None = None,
              description: str | None = None, parents: list[str] | None = None,
-             pipeline: str | None = None, *, strict_probe: bool = False,
+             pipeline: str | None = None, lineage: LineagePublication | None = None, *,
+             strict_probe: bool = False,
              strict_persist: bool = False, _persist_table: bool = True,
-             _embed_table: bool = True) -> CatalogTable:
+             _embed_table: bool = True,
+             _publication_event_key: str | None = None,
+             _publication_requested_version: str | None = None) -> CatalogTable:
         import hashlib as _h
         # schema/count probe (may touch disk/network) OUTSIDE the lock so a slow adapter doesn't block
         # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
@@ -130,6 +190,7 @@ class InMemoryCatalog:
             sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
             version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
         tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
+        applied = True
         with self._lock:
             prior = metadb.catalog_get(uri)  # by uri (PK)
             if prior is None:
@@ -154,10 +215,12 @@ class InMemoryCatalog:
                 owner=owner, description=description,
             )
             if _persist_table:
-                self._persist(
-                    table, parents=parents, pipeline=pipeline,
-                    strict=strict_persist)
-        if _embed_table:
+                applied = self._persist(
+                    table, parents=parents, pipeline=pipeline, lineage=lineage,
+                    strict=strict_persist,
+                    publication_event_key=_publication_event_key,
+                    publication_requested_version=_publication_requested_version)
+        if _embed_table and applied:
             self._embed_one(table)  # best-effort semantic index (no-op without an embedder)
         return table
 
@@ -178,18 +241,37 @@ class InMemoryCatalog:
                     name, prior.get("version"), version, detail)
 
     def _persist(self, table: CatalogTable, *, parents: list[str] | None = None,
-                 pipeline: str | None = None, strict: bool = False) -> None:
+                 pipeline: str | None = None, lineage: LineagePublication | None = None,
+                 strict: bool = False,
+                 publication_event_key: str | None = None,
+                 publication_requested_version: str | None = None) -> bool:
+        parent_uris = metadb.catalog_lineage_parent_tokens(parents)
         try:
             from hub.handoff import prepare_attempt_commit
             prepare_attempt_commit(table.uri)
-            metadb.catalog_upsert_entry(
+            publication = lineage or (
+                _manual_lineage(pipeline) if parent_uris else None)
+            publication_doc = publication.model_dump() if publication is not None else None
+            if publication_event_key is not None:
+                return metadb.catalog_upsert_output_idempotent(
+                    publication_event_key,
+                    table.uri, table.name, table.model_dump(by_alias=True),
+                    requested_version=publication_requested_version,
+                    parents=parent_uris, pipeline=pipeline,
+                    lineage=publication_doc,
+                )
+            return metadb.catalog_upsert_entry(
                 table.uri, table.name, table.model_dump(by_alias=True),
-                parents=parents, pipeline=pipeline)
+                parents=parent_uris, pipeline=pipeline,
+                lineage=publication_doc)
         except Exception as e:  # noqa: BLE001
             from hub.handoff import is_attempt_uri
-            if strict or metadb.object_attempt_is_managed(table.uri) or is_attempt_uri(table.uri):
+            if (strict or parent_uris or lineage is not None
+                    or metadb.object_attempt_is_managed(table.uri)
+                    or is_attempt_uri(table.uri)):
                 raise
             log.warning("catalog persist failed for %s (%s: %s)", table.name, type(e).__name__, e)
+            return True
 
     # -- read-side overlay ------------------------------------------------- #
     def _overlay(self, t: CatalogTable, dmap: dict[str, list[str]] | None = None) -> CatalogTable:
@@ -256,8 +338,9 @@ class InMemoryCatalog:
         """The connected component around `uri`, expanded breadth-first from the DB one frontier at a
         time and CAPPED by `depth` + `max_nodes` (so a huge lineage graph can't blow up the payload).
         `truncated` is set when the cap stopped the walk before the component was exhausted."""
-        seen: set[str] = {uri}
-        frontier = [uri]
+        root_key = metadb.catalog_lineage_root_key(uri)
+        seen: set[str] = {root_key}
+        frontier = [root_key]
         edges: dict[tuple[str, str], LineageEdge] = {}
         truncated = False
         hops = 0
@@ -265,15 +348,15 @@ class InMemoryCatalog:
         edge_cap = max(2000, max_nodes * 4)
         while frontier and hops < max(1, depth):
             hops += 1
-            batch = metadb.catalog_edges_touching(frontier, limit=edge_cap)
-            if len(batch) >= edge_cap:
-                truncated = True
+            batch, pair_truncated = metadb.catalog_lineage_key_pairs_touching(
+                frontier, limit=edge_cap)
+            truncated = truncated or pair_truncated
             nxt: list[str] = []
             for e in batch:
                 key = (e["parent"], e["child"])
                 if key not in edges:
                     edges[key] = LineageEdge(parent=e["parent"], child=e["child"],
-                                             column=e.get("column"), pipeline=e.get("pipeline"))
+                                             fact_count=e["fact_count"])
                 for end in (e["parent"], e["child"]):
                     if end in seen:
                         continue
@@ -283,26 +366,58 @@ class InMemoryCatalog:
                     seen.add(end)
                     nxt.append(end)
             frontier = nxt
-        if frontier:  # depth budget ran out with more to explore
-            truncated = True
-        # keep only edges whose BOTH endpoints made it into the (capped) node set
-        kept = [e for e in edges.values() if e.parent in seen and e.child in seen]
-        names = metadb.catalog_get_many(list(seen))
+        if frontier and not truncated:
+            # Reaching the depth boundary is not itself truncation: a complete root->leaf graph at
+            # depth=1 fits. Probe one bounded frontier to include edges between already-visible nodes
+            # and learn whether an unseen endpoint exists.
+            probe, probe_truncated = metadb.catalog_lineage_key_pairs_touching(
+                frontier, limit=edge_cap)
+            truncated = probe_truncated
+            for item in probe:
+                key = (item["parent"], item["child"])
+                if item["parent"] in seen and item["child"] in seen:
+                    if key not in edges:
+                        edges[key] = LineageEdge(
+                            parent=item["parent"], child=item["child"],
+                            fact_count=item["fact_count"])
+                else:
+                    truncated = True
+        projection, names = metadb.catalog_lineage_project_keys(list(seen))
+        root_uri = projection.get(root_key, root_key)
+        # Keep only edges whose endpoints survived the cap, then apply one current projection to the
+        # root, nodes, and edges. Distinct stable pairs can converge on one visible pair, so aggregate
+        # once more after projection.
+        projected_counts: dict[tuple[str, str], int] = {}
+        for edge in edges.values():
+            if edge.parent not in seen or edge.child not in seen:
+                continue
+            pair = (
+                projection.get(edge.parent, edge.parent),
+                projection.get(edge.child, edge.child),
+            )
+            projected_counts[pair] = projected_counts.get(pair, 0) + edge.fact_count
+        kept = [
+            LineageEdge(parent=parent, child=child, fact_count=count)
+            for (parent, child), count in sorted(projected_counts.items())
+        ]
+        visible_uris = sorted({projection.get(key, key) for key in seen})
         nodes = [LineageNode(id=(names.get(u, {}).get("id") or u),
                              name=(names.get(u, {}).get("name") or u.split("/")[-1]), uri=u)
-                 for u in seen]
-        return LineageResult(nodes=nodes, edges=kept, truncated=truncated)
+                 for u in visible_uris]
+        return LineageResult(
+            root_uri=root_uri, nodes=nodes, edges=kept, truncated=truncated)
+
+    def lineage_facts_page(self, *, limit: int, after_id: int) -> LineageFactsPage:
+        """Export one bounded page from the same authoritative store as this provider's graph."""
+        rows, next_after_id, has_more = metadb.catalog_lineage_facts_page(
+            limit=limit, after_id=after_id)
+        return LineageFactsPage(
+            items=[LineageFact.model_validate({**row, "id": str(row["id"])}) for row in rows],
+            next_after_id=str(next_after_id) if next_after_id is not None else None,
+            has_more=has_more,
+        )
 
     # -- CatalogProvider: write-back -------------------------------------- #
-    def _add_edge(self, parent: str, child: str, pipeline: str | None,
-                  column: str | None = None) -> bool:
-        if parent == child:
-            return False
-        try:
-            return metadb.catalog_add_edge(parent, child, pipeline, column)
-        except Exception:  # noqa: BLE001
-            return False
-
     def register(self, table: CatalogTable, parents: list[str] | None = None,
                  pipeline: str | None = None) -> None:
         with self._lock:
@@ -311,28 +426,44 @@ class InMemoryCatalog:
 
     def register_output(self, name: str, uri: str, version: str | None = None,
                         parents: list[str] | None = None, pipeline: str | None = None,
+                        lineage: LineagePublication | None = None,
                         folder: str = "", tags: list[str] | None = None, owner: str | None = None,
                         description: str | None = None,
                         _bump_usage: bool = True, _require_durable: bool = False) -> CatalogTable:
         table = self._add(name=name, uri=uri, version=version, meta=pipeline, folder=folder,
                           tags=tags, owner=owner, description=description,
-                          parents=parents, pipeline=pipeline,
+                          parents=parents, pipeline=pipeline, lineage=lineage,
                           strict_probe=_require_durable,
                           strict_persist=_require_durable)
-        parent_uris = list(dict.fromkeys(parents or []))
+        parent_uris = metadb.catalog_lineage_parent_tokens(parents)
         if _bump_usage:
             # Local/legacy calls are one completed run each and retain their per-call popularity bump.
             for parent in parent_uris:
                 metadb.catalog_bump_usage(parent)
         return table
 
+    def record_lineage(self, *, name: str, uri: str, version: str | None,
+                       parents: list[str], lineage: LineagePublication) -> int:
+        """Record facts for a previously published, exact catalog output without rewriting it."""
+        observed = self.get_table(uri)
+        if (observed.uri != str(uri).rstrip("/") or observed.name != name
+                or observed.version != version):
+            raise RuntimeError("lineage destination is not the exact current catalog output")
+        return metadb.catalog_record_lineage(
+            destination_uri=observed.uri,
+            destination_version=observed.version,
+            parents=metadb.catalog_lineage_parent_tokens(parents),
+            lineage=lineage.model_dump(),
+        )
+
     def publish_output_strict(self, name: str, uri: str, version: str | None = None,
                               parents: list[str] | None = None,
-                              pipeline: str | None = None) -> CatalogTable:
+                              pipeline: str | None = None,
+                              lineage: LineagePublication | None = None) -> CatalogTable:
         """Durably publish a just-written unmanaged output or propagate the metadata transaction failure."""
         table = self._add(
             name=name, uri=uri, version=version, meta=pipeline,
-            parents=parents, pipeline=pipeline, strict_probe=True,
+            parents=parents, pipeline=pipeline, lineage=lineage, strict_probe=True,
             strict_persist=True)
         for parent in parents or []:
             try:
@@ -344,10 +475,19 @@ class InMemoryCatalog:
     def prepare_managed_output_publication(
             self, *, run_id: str, step_id: str, idempotency_key: str, name: str, uri: str,
             version: str | None = None, parents: list[str] | None = None,
-            pipeline: str | None = None) -> dict:
+            pipeline: str | None = None,
+            lineage: LineagePublication | None = None) -> dict:
         """Commit exact inventory and freeze schema/catalog metadata before effects can win."""
         if not run_id or not step_id or not idempotency_key:
             raise ValueError("managed publication run, step_id, and idempotency_key are required")
+        if parents and lineage is None:
+            raise ValueError("managed publication with sources requires lineage identity")
+        if lineage is not None and lineage.idempotency_key != idempotency_key:
+            raise ValueError("managed publication lineage identity does not match its effect")
+        if (lineage is not None and lineage.provenance == "run"
+                and lineage.step_id != step_id):
+            raise ValueError("managed publication lineage step does not match its effect")
+        parent_uris = metadb.catalog_lineage_parent_tokens(parents)
         from hub.handoff import managed_read_lease, prepare_attempt_commit
 
         prepare_attempt_commit(uri)
@@ -362,12 +502,12 @@ class InMemoryCatalog:
             guard.check()
             table = self._add(
                 name=name, uri=uri, version=version, meta=pipeline,
-                parents=parents, pipeline=pipeline, strict_probe=True,
+                parents=parents, pipeline=pipeline, lineage=lineage, strict_probe=True,
                 _persist_table=False, _embed_table=False,
             )
         identity = metadb.managed_catalog_publication_identity(uri, run_id)
         plan = {
-            "contract_version": 1,
+            "contract_version": 2,
             "run_id": str(run_id),
             "step_id": str(step_id),
             "ref_key": f"{run_id}:{step_id}",
@@ -376,31 +516,35 @@ class InMemoryCatalog:
             "name": str(name),
             "uri": str(uri).rstrip("/"),
             "version": table.version,
-            "parents": list(dict.fromkeys(str(parent).rstrip("/") for parent in (parents or []))),
+            "parents": parent_uris,
             "pipeline": pipeline,
+            "lineage": lineage.model_dump() if lineage is not None else None,
             "table_doc": table.model_dump(by_alias=True),
         }
         canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), default=str)
-        plan["fingerprint"] = "managed-output:v1:sha256:" + hashlib.sha256(
+        plan["fingerprint"] = "managed-output:v2:sha256:" + hashlib.sha256(
             canonical.encode()
         ).hexdigest()
         return plan
 
     def publish_managed_output(self, name: str, uri: str, version: str | None = None,
                                parents: list[str] | None = None,
-                               pipeline: str | None = None, *,
+                               pipeline: str | None = None,
+                               lineage: LineagePublication | None = None, *,
                                idempotency_key: str | None = None,
                                prepared_plan: dict | None = None) -> dict:
         """Core single-sink publication: inventory proof, catalog pointer, ref, and state commit."""
         if prepared_plan is not None:
+            parent_uris = metadb.catalog_lineage_parent_tokens(parents)
             if not idempotency_key or (
                     prepared_plan.get("event_key") != idempotency_key
                     or prepared_plan.get("name") != name
                     or prepared_plan.get("uri") != str(uri).rstrip("/")
                     or prepared_plan.get("version") != version
-                    or prepared_plan.get("parents") != list(dict.fromkeys(
-                        str(parent).rstrip("/") for parent in (parents or [])))
-                    or prepared_plan.get("pipeline") != pipeline):
+                    or prepared_plan.get("parents") != parent_uris
+                    or prepared_plan.get("pipeline") != pipeline
+                    or prepared_plan.get("lineage") != (
+                        lineage.model_dump() if lineage is not None else None)):
                 raise RuntimeError("managed publication arguments changed after effects staging")
             return metadb.catalog_apply_managed_publication(prepared_plan)
         existing = metadb.catalog_managed_publication_receipt(uri)
@@ -421,6 +565,7 @@ class InMemoryCatalog:
                 guard.check()
                 table = self._add(
                     name=name, uri=uri, version=version, parents=parents, pipeline=pipeline,
+                    lineage=lineage,
                     strict_probe=True)
         except Exception:
             receipt = metadb.catalog_managed_publication_receipt(uri)
@@ -438,17 +583,49 @@ class InMemoryCatalog:
     ) -> CatalogPublicationReceipt:
         """Durable-executor write projection keyed by one logical output effect.
 
-        Catalog entries/lineage remain URI-idempotent. The Jobs publisher records one separate aggregate
-        usage event after every output is registered, so a multi-sink run does not overcount parents.
+        The catalog entry remains the current URI projection; lineage is idempotent per publication and
+        source, so separate runs between the same datasets remain separate facts. The Jobs publisher
+        records one aggregate usage event after every output is registered, so a multi-sink run does not
+        overcount parents.
         """
         if not idempotency_key:
             raise ValueError("idempotency_key is required")
-        table = self.register_output(_bump_usage=False, _require_durable=True, **kwargs)
-        metadb.catalog_record_output_publication(
-            idempotency_key, table.uri, table.version
+        parents = metadb.catalog_lineage_parent_tokens(kwargs.get("parents"))
+        lineage = kwargs.get("lineage")
+        if parents and lineage is None:
+            raise ValueError("durable catalog publication with sources requires lineage identity")
+        if lineage is not None and lineage.idempotency_key != idempotency_key:
+            raise ValueError("durable catalog publication lineage identity does not match its effect")
+        requested_version = kwargs.get("version")
+        lineage_doc = lineage.model_dump() if lineage is not None else None
+        prior = metadb.catalog_unmanaged_output_publication_receipt(
+            idempotency_key,
+            kwargs.get("uri"), kwargs.get("name"), requested_version,
+            parents=parents, pipeline=kwargs.get("pipeline"), lineage=lineage_doc,
         )
+        if prior is not None:
+            return CatalogPublicationReceipt(
+                idempotency_key=idempotency_key,
+                uri=prior["uri"], version=prior["version"],
+            )
+        self._add(
+            meta=kwargs.get("pipeline"),
+            _publication_event_key=idempotency_key,
+            _publication_requested_version=requested_version,
+            strict_probe=True,
+            strict_persist=True,
+            **kwargs,
+        )
+        persisted = metadb.catalog_unmanaged_output_publication_receipt(
+            idempotency_key,
+            kwargs.get("uri"), kwargs.get("name"), requested_version,
+            parents=parents, pipeline=kwargs.get("pipeline"), lineage=lineage_doc,
+        )
+        if persisted is None:  # pragma: no cover - transaction contract guard
+            raise RuntimeError("catalog publication did not return a durable receipt")
         return CatalogPublicationReceipt(
-            idempotency_key=idempotency_key, uri=table.uri, version=table.version
+            idempotency_key=idempotency_key,
+            uri=persisted["uri"], version=persisted["version"],
         )
 
     def record_usage_idempotent(self, idempotency_key: str, parents: list[str]) -> bool:
@@ -734,12 +911,13 @@ def unmanaged_publication_supported(catalog) -> bool:
 def publish_unmanaged_output_attested(catalog, *, name: str, uri: str,
                                       version: str | None = None,
                                       parents: list[str] | None = None,
-                                      pipeline: str | None = None):
+                                      pipeline: str | None = None,
+                                      lineage: LineagePublication | None = None):
     """Publish an unmanaged output and require an exact uri/name/version receipt."""
     publish = core_unmanaged_publisher(catalog)
     kwargs = {
         "name": name, "uri": uri, "version": version,
-        "parents": parents, "pipeline": pipeline,
+        "parents": parents, "pipeline": pipeline, "lineage": lineage,
     }
     if publish is not None:
         receipt = observed = publish(**kwargs)
@@ -762,3 +940,41 @@ def publish_unmanaged_output_attested(catalog, *, name: str, uri: str,
     if expected[0] != uri or expected[1] != name or missing in expected or actual != expected:
         raise RuntimeError("catalog publication read-back did not match its receipt")
     return observed
+
+
+def record_cached_output_lineage(
+        catalog, *, name: str, uri: str, version: str,
+        parents: list[str], lineage: LineagePublication, pre_publish=None) -> bool:
+    """Validate one cached catalog pointer and atomically add this run's facts when supported.
+
+    A provider without a lineage-only recorder returns ``False`` so the runner recomputes and follows
+    its ordinary output-publication path. Storage or collision failures from a supported recorder are
+    not downgraded to cache misses.
+    """
+    from hub.backends import CatalogLineageRecorder
+    if not isinstance(catalog, CatalogLineageRecorder):
+        return False
+    try:
+        observed = catalog.get_table(uri)
+    except (KeyError, FileNotFoundError):
+        return False
+
+    def field(key: str):
+        return observed.get(key) if isinstance(observed, dict) else getattr(observed, key, None)
+
+    observed_uri = field("uri")
+    observed_name = field("name")
+    observed_version = field("version")
+    if (observed_uri != str(uri).rstrip("/") or observed_name != name
+            or observed_version != version):
+        return False
+    if pre_publish is not None:
+        pre_publish()
+    recorded = catalog.record_lineage(
+        name=name, uri=observed_uri, version=observed_version,
+        parents=parents, lineage=lineage,
+    )
+    if (isinstance(recorded, bool) or not isinstance(recorded, int)
+            or recorded < 0):
+        raise RuntimeError("catalog lineage recorder returned an invalid durable receipt")
+    return True

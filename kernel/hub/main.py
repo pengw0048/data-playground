@@ -6,7 +6,8 @@ per-user (signed session cookies when DP_AUTH_SECRET is set; an open X-DP-User d
 each user has their own canvases + workspace shares in a SQLite/Postgres metadata DB.
 
 It is also STATELESS-WEB-READY: the runtime coordination state that used to be process-local is now
-shared — metadata, run status (`run_states`), and the catalog (`catalog_entries`/`catalog_edges`)
+shared — metadata, run status (`run_states`), and the catalog (`catalog_entries`/
+`catalog_lineage_facts`)
 all live in the DB, and the data itself in object storage — so several web instances behind a load
 balancer converge (see README "Scaling out"). The per-instance pieces are collab (one in-memory room
 per canvas → route each canvas to a consistent instance) and execution (runs on the accepting

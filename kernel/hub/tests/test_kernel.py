@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from hub.deps import get_deps
 from hub.main import app
@@ -717,6 +718,8 @@ def test_dedup_and_metric():
 
 
 def test_run_write_and_lineage():
+    from hub import metadb
+
     g = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("images")}),
         N("flt", "filter", {"predicate": "is_valid = true"}),
@@ -729,6 +732,16 @@ def test_run_write_and_lineage():
     assert st["totalRows"] and st["totalRows"] < 500  # filtered out invalids
     lin = client.get("/api/catalog/lineage", params={"uri": _uri("images")}).json()
     assert any(e["child"].endswith("images_valid.parquet") for e in lin["edges"])
+    destination = _output_field(st, "uri", outcome="committed")
+    with metadb.session() as session:
+        facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.destination_uri == destination,
+            metadb.CatalogLineageFact.run_id == r["runId"],
+        )))
+    assert len(facts) == 1
+    assert facts[0].source_uri == _uri("images")
+    assert facts[0].attempt_id is None
+    assert (facts[0].producer, facts[0].producer_version, facts[0].step_id) == ("c", 1, "wr")
     assert st["progress"] == 1.0  # a finished run reports full progress
 
 
@@ -988,6 +1001,135 @@ def test_request_body_and_graph_complexity_limits(monkeypatch):
     # a small body still passes with the tiny cap in place (sanity: the cap isn't rejecting everything)
     monkeypatch.setattr(settings, "max_body_bytes", 64 * 1024**2)
     assert client.post("/api/graph/compile", json={"graph": {"id": "c", "version": 1, "nodes": [], "edges": []}}).status_code == 200
+
+
+def test_graph_and_lineage_wire_identities_use_lossless_integer_bounds():
+    from hub.models import (
+        MAX_SAFE_INTEGER, Graph, GraphNode, LineageFact, LineagePublication,
+    )
+
+    Graph(
+        id="g" * 512, version=MAX_SAFE_INTEGER,
+        nodes=[GraphNode(id="n" * 256, type="source")],
+    )
+    for invalid in (True, "1", 1.0, -1, MAX_SAFE_INTEGER + 1):
+        with pytest.raises(ValueError):
+            Graph(id="graph", version=invalid)
+    for invalid in ("", " graph", "graph ", "g" * 513):
+        with pytest.raises(ValueError):
+            Graph(id=invalid)
+    for invalid in ("", " node", "node ", "n" * 257):
+        with pytest.raises(ValueError):
+            GraphNode(id=invalid, type="source")
+
+    publication = {
+        "idempotency_key": "publication", "run_id": "run", "producer": "canvas",
+        "step_id": "write", "provenance": "run",
+    }
+    assert LineagePublication(
+        **publication, producer_version=MAX_SAFE_INTEGER,
+    ).producer_version == MAX_SAFE_INTEGER
+    for invalid in (True, "1", 1.0, -1, MAX_SAFE_INTEGER + 1):
+        with pytest.raises(ValueError):
+            LineagePublication(**publication, producer_version=invalid)
+    for field in ("idempotency_key", "run_id", "producer", "step_id"):
+        with pytest.raises(ValueError):
+            LineagePublication(**{**publication, field: f" {publication[field]}"})
+
+    fact = {
+        "id": "1", "fact_key": "fact", "publication_key": "publication",
+        "source_key": "source", "source_uri": "/data/source.parquet",
+        "destination_key": "destination", "destination_uri": "/data/output.parquet",
+        "run_id": "run", "producer": "canvas", "step_id": "write",
+        "provenance": "run",
+        "created_at": datetime.datetime.now(datetime.timezone.utc),
+    }
+    assert LineageFact(
+        **fact, producer_version=MAX_SAFE_INTEGER,
+    ).producer_version == MAX_SAFE_INTEGER
+    for invalid in (True, "1", 1.0, -1, MAX_SAFE_INTEGER + 1):
+        with pytest.raises(ValueError):
+            LineageFact(**fact, producer_version=invalid)
+    for field in ("fact_key", "source_key", "source_uri", "destination_uri", "run_id"):
+        with pytest.raises(ValueError):
+            LineageFact(**{**fact, field: f" {fact[field]}"})
+    for field in ("run_id", "attempt_id", "producer", "step_id"):
+        with pytest.raises(ValueError):
+            LineageFact(**{**fact, field: ""})
+    with pytest.raises(ValueError, match="include a timezone"):
+        LineageFact(**{
+            **fact, "created_at": datetime.datetime.now().replace(tzinfo=None),
+        })
+    with pytest.raises(ValueError, match="requires run, producer, and step"):
+        LineageFact(**{**fact, "run_id": None})
+    with pytest.raises(ValueError):
+        LineageFact(**{
+            **fact,
+            "field_mappings": [
+                {"source_field": f"source-{index}", "destination_field": "destination"}
+                for index in range(257)
+            ],
+        })
+
+
+def test_lineage_fact_page_cursor_and_size_contract_are_bounded():
+    from hub.models import LineageFact, LineageFactsPage
+
+    max_cursor = str(2**63 - 1)
+    fact = LineageFact(
+        id=max_cursor, fact_key="fact", publication_key="publication",
+        source_key="source", source_uri="/data/source.parquet",
+        destination_key="destination", destination_uri="/data/output.parquet",
+        provenance="manual", created_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    page = LineageFactsPage(items=[fact], next_after_id=max_cursor, has_more=True)
+    assert page.next_after_id == max_cursor and page.has_more is True
+
+    for invalid in ("0", "01", "-1", str(2**63), 1):
+        with pytest.raises(ValueError):
+            LineageFactsPage(next_after_id=invalid, has_more=True)
+    with pytest.raises(ValueError, match="continuation state"):
+        LineageFactsPage(has_more=True)
+    with pytest.raises(ValueError, match="continuation state"):
+        LineageFactsPage(next_after_id="1", has_more=False)
+    assert len(LineageFactsPage(items=[fact] * 500).items) == 500
+    with pytest.raises(ValueError):
+        LineageFactsPage(items=[fact] * 501)
+
+
+def test_run_output_catalog_version_is_exact_before_cache_admission():
+    from hub.models import RunOutput, RunStatus
+    from hub.run_outputs import outputs_cache_document
+
+    fields = {
+        "node_id": "write", "port_id": "out", "wire": "dataset",
+        "publication_kind": "catalog", "outcome": "committed",
+        "uri": "/data/output.parquet", "table": "output", "rows": 3,
+    }
+    exact = RunOutput(**fields, version="v-exact")
+    status = RunStatus(
+        run_id="run-exact", status="done", target_node_id="write", outputs=[exact],
+    )
+    assert outputs_cache_document(status) == {"outputs": [exact.model_dump()]}
+
+    missing = RunOutput(**fields)
+    with pytest.raises(RuntimeError, match="exact catalog versions"):
+        outputs_cache_document(RunStatus(
+            run_id="run-missing-version", status="done", target_node_id="write",
+            outputs=[missing],
+        ))
+    for invalid in ("", " v1", "v1 ", "v" * 513):
+        with pytest.raises(ValueError):
+            RunOutput(**fields, version=invalid)
+    with pytest.raises(ValueError, match="non-catalog"):
+        RunOutput(**{
+            **fields, "publication_kind": "result", "table": None, "version": "v1",
+        })
+    with pytest.raises(ValueError, match="non-committed"):
+        RunOutput(**{
+            **fields, "outcome": "pending", "uri": None, "table": None,
+            "version": "v1", "rows": None,
+        })
 
 
 def test_upload_same_name_does_not_clobber():
@@ -2303,11 +2445,223 @@ def test_catalog_output_receipt_attests_exact_unmanaged_version(tmp_path):
         with metadb.session() as session:
             assert session.get(metadb.CatalogPublicationEvent, wrong_version_key) is None
 
+        metadb.catalog_upsert_entry(uri, "receipt", {
+            "id": f"tbl_receipt_{token}", "name": "receipt", "uri": uri,
+            "version": "v2", "columns": [], "tags": [],
+        })
+        metadb.catalog_record_output_publication(event_key, uri, "v1")
+        assert metadb.catalog_get(uri)["version"] == "v2"
+
         with pytest.raises(RuntimeError, match="publication key collision"):
             metadb.catalog_record_output_publication(event_key, other_uri, "v1")
     finally:
         metadb.catalog_delete_entry(uri)
         metadb.catalog_delete_entry(other_uri)
+
+
+def test_unmanaged_output_replay_is_atomic_and_projection_independent(tmp_path, monkeypatch):
+    import duckdb
+
+    from hub import metadb
+    from hub.deps import Deps
+    from hub.models import LineagePublication
+
+    token = os.urandom(8).hex()
+    output = str(tmp_path / f"unmanaged-replay-{token}.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS id, 'value' AS label) TO '{output}' (FORMAT PARQUET)")
+    catalog = Deps(str(tmp_path / "ws"), str(tmp_path / "data")).catalog
+    embedded: list[str | None] = []
+    monkeypatch.setattr(catalog, "_embed_one", lambda table: embedded.append(table.version))
+
+    def publication(key: str) -> LineagePublication:
+        return LineagePublication(
+            idempotency_key=key,
+            run_id=f"run-{key}",
+            producer="unmanaged-replay-test",
+            producer_version=1,
+            step_id="write",
+            provenance="run",
+        )
+
+    first_key = f"unmanaged-v1-{token}"
+    first = publication(first_key)
+    catalog.register_output_idempotent(
+        first_key, name="unmanaged-replay", uri=output, version="v1",
+        parents=[], pipeline="canvas", lineage=first)
+    assert embedded == ["v1"]
+
+    metadb.catalog_set_metadata(
+        output, folder="curated/research", tags=["robotics"],
+        owner="research", description="kept across output retries")
+    with metadb.session() as session:
+        curated_entry = session.get(metadb.CatalogEntry, output)
+        assert curated_entry is not None
+        curated_updated_at = curated_entry.updated_at
+        curated_children = (
+            list(session.scalars(select(metadb.CatalogTag.tag).where(
+                metadb.CatalogTag.uri == output).order_by(metadb.CatalogTag.tag))),
+            list(session.scalars(select(metadb.CatalogColumn.column).where(
+                metadb.CatalogColumn.uri == output).order_by(metadb.CatalogColumn.column))),
+        )
+
+    # The URI is mutable. Advancing its physical bytes must not make an old exact retry probe the
+    # replacement artifact or rewrite the projection frozen by the first publication.
+    os.unlink(output)
+    duckdb.connect().execute(
+        f"COPY (SELECT 2 AS id, 'replacement' AS label, 3.5 AS score) "
+        f"TO '{output}' (FORMAT PARQUET)")
+    # The current governance projection is not part of the output effect identity. An exact retry
+    # attests the old receipt before any entry/children mutation and does not re-embed.
+    replay = catalog.register_output_idempotent(
+        first_key, name="unmanaged-replay", uri=output, version="v1",
+        parents=[], pipeline="canvas", lineage=first)
+    assert (replay.uri, replay.version) == (output, "v1")
+    current = metadb.catalog_get(output)
+    assert (current["version"], current["folder"], current["tags"], current["owner"]) == (
+        "v1", "curated/research", ["robotics"], "research")
+    with metadb.session() as session:
+        replayed_entry = session.get(metadb.CatalogEntry, output)
+        assert replayed_entry is not None
+        assert replayed_entry.updated_at == curated_updated_at
+        assert (
+            list(session.scalars(select(metadb.CatalogTag.tag).where(
+                metadb.CatalogTag.uri == output).order_by(metadb.CatalogTag.tag))),
+            list(session.scalars(select(metadb.CatalogColumn.column).where(
+                metadb.CatalogColumn.uri == output).order_by(metadb.CatalogColumn.column))),
+        ) == curated_children
+    assert embedded == ["v1"]
+
+    with pytest.raises(RuntimeError, match="publication key collision"):
+        catalog.register_output_idempotent(
+            first_key, name="unmanaged-replay", uri=output, version="changed-v1",
+            parents=[], pipeline="canvas", lineage=first)
+    with pytest.raises(RuntimeError, match="publication key collision"):
+        catalog.register_output_idempotent(
+            first_key, name="changed-name", uri=output, version="v1",
+            parents=[], pipeline="canvas", lineage=first)
+    after_collision = metadb.catalog_get(output)
+    assert (after_collision["name"], after_collision["version"],
+            after_collision["folder"], after_collision["tags"]) == (
+        "unmanaged-replay", "v1", "curated/research", ["robotics"])
+    with metadb.session() as session:
+        unchanged_entry = session.get(metadb.CatalogEntry, output)
+        assert unchanged_entry is not None
+        assert unchanged_entry.updated_at == curated_updated_at
+        assert (
+            list(session.scalars(select(metadb.CatalogTag.tag).where(
+                metadb.CatalogTag.uri == output).order_by(metadb.CatalogTag.tag))),
+            list(session.scalars(select(metadb.CatalogColumn.column).where(
+                metadb.CatalogColumn.uri == output).order_by(metadb.CatalogColumn.column))),
+        ) == curated_children
+    assert embedded == ["v1"]
+
+    second_key = f"unmanaged-v2-{token}"
+    catalog.register_output_idempotent(
+        second_key, name="unmanaged-replay", uri=output, version="v2",
+        parents=[], pipeline="canvas", lineage=publication(second_key))
+    os.unlink(output)
+    deleted_replay = catalog.register_output_idempotent(
+        first_key, name="unmanaged-replay", uri=output, version="v1",
+        parents=[], pipeline="canvas", lineage=first)
+    assert (deleted_replay.uri, deleted_replay.version) == (output, "v1")
+    assert metadb.catalog_get(output)["version"] == "v2"
+    assert embedded == ["v1", "v2"]
+
+    # A changed request using the old key still collides from caller-owned semantics before touching
+    # the now-missing artifact.
+    with pytest.raises(RuntimeError, match="publication key collision"):
+        catalog.register_output_idempotent(
+            first_key, name="unmanaged-replay", uri=output, version="changed-v1",
+            parents=[], pipeline="canvas", lineage=first)
+
+    metadb.catalog_delete_entry(output)
+    tombstone_replay = catalog.register_output_idempotent(
+        first_key, name="unmanaged-replay", uri=output, version="v1",
+        parents=[], pipeline="canvas", lineage=first)
+    assert (tombstone_replay.uri, tombstone_replay.version) == (output, "v1")
+    assert metadb.catalog_get(output) is None
+    assert embedded == ["v1", "v2"]
+
+
+def test_concurrent_unmanaged_publishers_return_the_winning_observed_version(
+        tmp_path, monkeypatch):
+    import concurrent.futures
+    import threading
+    import uuid
+
+    from sqlalchemy import delete
+
+    from hub import metadb
+    from hub.models import ColumnSchema, LineagePublication
+    from hub.plugins.catalog import InMemoryCatalog
+
+    token = uuid.uuid4().hex
+    uri = f"mem://unmanaged-race/{token}"
+    event_key = f"unmanaged-race-{token}"
+    probes_ready = threading.Barrier(2)
+
+    class Adapter:
+        def __init__(self, marker: str):
+            self.marker = marker
+
+        def schema(self, _uri: str) -> list[ColumnSchema]:
+            probes_ready.wait(timeout=5)
+            return [ColumnSchema(name=self.marker, type="INTEGER")]
+
+        @staticmethod
+        def count(_uri: str) -> int:
+            return 1
+
+        def fingerprint(self, _uri: str) -> str:
+            return self.marker
+
+    adapters = [Adapter("winner-a"), Adapter("winner-b")]
+    catalogs = [
+        InMemoryCatalog(str(tmp_path), lambda _uri, adapter=adapter: adapter)
+        for adapter in adapters
+    ]
+    embedded: list[str | None] = []
+    for catalog in catalogs:
+        monkeypatch.setattr(catalog, "_embed_one", lambda table: embedded.append(table.version))
+    lineage = LineagePublication(
+        idempotency_key=event_key,
+        run_id=f"run-{token}",
+        producer="unmanaged-race-test",
+        producer_version=1,
+        step_id="write",
+        provenance="run",
+    )
+
+    def publish(catalog: InMemoryCatalog):
+        return catalog.register_output_idempotent(
+            event_key, name="unmanaged-race", uri=uri,
+            parents=[], pipeline="canvas", lineage=lineage,
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            receipts = [future.result(timeout=10) for future in (
+                pool.submit(publish, catalogs[0]),
+                pool.submit(publish, catalogs[1]),
+            )]
+        with metadb.session() as session:
+            event = session.get(metadb.CatalogPublicationEvent, event_key)
+            assert event is not None
+            persisted_version = event.version
+        assert persisted_version is not None
+        assert {(receipt.uri, receipt.version) for receipt in receipts} == {
+            (uri, persisted_version)}
+        assert metadb.catalog_get(uri)["version"] == persisted_version
+        assert embedded == [persisted_version]
+    finally:
+        metadb.catalog_delete_entry(uri)
+        with metadb.session() as session:
+            session.execute(delete(metadb.CatalogPublicationEvent).where(
+                metadb.CatalogPublicationEvent.event_key == event_key))
+            session.execute(delete(metadb.CatalogPublicationEvent).where(
+                metadb.CatalogPublicationEvent.effect_type == "lineage",
+                metadb.CatalogPublicationEvent.uri == uri))
 
 
 def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_path, monkeypatch):
@@ -2316,34 +2670,63 @@ def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_pa
     from hub import metadb
     from hub.backends import DurableCatalogPublisher
     from hub.deps import Deps
+    from hub.models import LineagePublication
 
     d = Deps(str(tmp_path / "ws"), str(tmp_path / "data"))
     assert isinstance(d.catalog, DurableCatalogPublisher)
     source = str(tmp_path / "source.parquet")
     output = str(tmp_path / "output.parquet")
     output_two = str(tmp_path / "output-two.parquet")
+    event = lambda suffix: f"catalog-usage-{os.urandom(8).hex()}-{suffix}"  # noqa: E731
+    missing_key = event("missing-lineage")
+    attempt_a_one = event("attempt-a-write-one")
+    attempt_a_two = event("attempt-a-write-two")
+    attempt_a_usage = event("attempt-a-usage")
+    attempt_b_write = event("attempt-b-write")
+    attempt_b_usage = event("attempt-b-usage")
+    attempt_c_usage = event("attempt-c-usage")
     duckdb.connect().execute(f"COPY (SELECT 1 AS id) TO '{source}' (FORMAT PARQUET)")
     duckdb.connect().execute(f"COPY (SELECT 2 AS id) TO '{output}' (FORMAT PARQUET)")
     duckdb.connect().execute(f"COPY (SELECT 3 AS id) TO '{output_two}' (FORMAT PARQUET)")
     d.catalog.register_output(name="source", uri=source, parents=[])
 
+    def publication(key: str, run_id: str, step_id: str) -> LineagePublication:
+        return LineagePublication(
+            idempotency_key=key, run_id=run_id, producer="durable-catalog-test",
+            producer_version=1, step_id=step_id, provenance="run",
+        )
+
+    with pytest.raises(ValueError, match="requires lineage identity"):
+        d.catalog.register_output_idempotent(
+            missing_key, name="output", uri=output,
+            parents=[source], pipeline="canvas",
+        )
+    assert metadb.catalog_get(output) is None
+
     receipt = d.catalog.register_output_idempotent(
-        "attempt-a:write-one", name="output", uri=output, parents=[source], pipeline="canvas"
+        attempt_a_one, name="output", uri=output, parents=[source], pipeline="canvas",
+        lineage=publication(attempt_a_one, "attempt-a", "write-one"),
     )
-    assert receipt.idempotency_key == "attempt-a:write-one" and receipt.uri == output
+    assert receipt.idempotency_key == attempt_a_one and receipt.uri == output
     d.catalog.register_output_idempotent(
-        "attempt-a:write-two", name="output-two", uri=output_two, parents=[source], pipeline="canvas"
+        attempt_a_two, name="output-two", uri=output_two,
+        parents=[source], pipeline="canvas",
+        lineage=publication(attempt_a_two, "attempt-a", "write-two"),
     )
     assert metadb.catalog_get(source)["usage"] == 0, "output count is not run popularity"
-    d.catalog.record_usage_idempotent("attempt-a", [source, source])
-    d.catalog.record_usage_idempotent("attempt-a", [source])
+    d.catalog.record_usage_idempotent(attempt_a_usage, [source, source])
+    d.catalog.record_usage_idempotent(attempt_a_usage, [source])
     assert metadb.catalog_get(source)["usage"] == 1, "one multi-sink run counts its parent once"
 
     d.catalog.register_output_idempotent(
-        "attempt-b:write", name="output", uri=output, parents=[source], pipeline="canvas"
+        attempt_b_write, name="output", uri=output, parents=[source], pipeline="canvas",
+        lineage=publication(attempt_b_write, "attempt-b", "write"),
     )
-    d.catalog.record_usage_idempotent("attempt-b", [source])
+    d.catalog.record_usage_idempotent(attempt_b_usage, [source])
     assert metadb.catalog_get(source)["usage"] == 2, "two real runs sharing one lineage edge count twice"
+    pairs = {(row["parent"], row["child"]): row["fact_count"]
+             for row in metadb.catalog_lineage_pairs() if row["parent"] == source}
+    assert pairs == {(source, output): 2, (source, output_two): 1}
 
     original = metadb.catalog_bump_usage_once
     crashed = False
@@ -2358,8 +2741,8 @@ def test_catalog_usage_counts_runs_and_deduplicates_one_publication_event(tmp_pa
 
     monkeypatch.setattr(metadb, "catalog_bump_usage_once", _commit_then_crash)
     with pytest.raises(ConnectionError, match="after usage commit"):
-        d.catalog.record_usage_idempotent("attempt-c", [source])
-    d.catalog.record_usage_idempotent("attempt-c", [source])
+        d.catalog.record_usage_idempotent(attempt_c_usage, [source])
+    d.catalog.record_usage_idempotent(attempt_c_usage, [source])
     assert metadb.catalog_get(source)["usage"] == 3
 
     d.catalog.register_output(name="output", uri=output, parents=[source], pipeline="canvas")
@@ -3177,6 +3560,15 @@ def test_subprocess_runner_executes_in_isolation(tmp_path):
             params={"uris": _output_field(st, "uri", outcome="committed")},
         ).json()["items"]
         assert any(t["name"] == "subproc_out" for t in tables)
+        destination = _output_field(st, "uri", outcome="committed")
+        with metadb.session() as session:
+            facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+                metadb.CatalogLineageFact.destination_uri == destination,
+                metadb.CatalogLineageFact.run_id == r["runId"],
+            )))
+        assert len(facts) == 1
+        assert facts[0].source_uri == p and facts[0].attempt_id is None
+        assert (facts[0].producer, facts[0].producer_version, facts[0].step_id) == ("c", 1, "wr")
     finally:
         metadb.set_setting("backend", "", "global")  # restore the default in-process runner
 
@@ -3248,6 +3640,11 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
     runner = SubprocessRunner(
         str(tmp_path / "workspace"), str(tmp_path), catalog=BlockingCatalog())
     run_id = "run_catalog_gate"
+    graph = Graph.model_validate({
+        "id": "c", "version": 1,
+        "nodes": [N("write", "write", {"name": "result"})], "edges": [],
+    })
+    from hub.plugins.catalog import lineage_for_output
     runner.runs[run_id] = RunStatus(
         run_id=run_id, status="running", target_node_id="write", per_node=[],
         outputs=[RunOutput(
@@ -3259,6 +3656,7 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
         "logical_uri": str(tmp_path / "result.parquet"),
         "published_uri": str(tmp_path / "result.parquet"),
         "name": "result", "parents": [],
+        "lineage": lineage_for_output(graph, run_id, "write"),
     }}
     status_file = tmp_path / "status.json"
     status_file.write_text(json.dumps(RunStatus(
@@ -3272,10 +3670,6 @@ def test_subprocess_terminal_status_waits_for_parent_catalog_registration(tmp_pa
             uri=str(tmp_path / "result.parquet"), table="result",
         )],
     ).model_dump()))
-    graph = Graph.model_validate({
-        "id": "c", "version": 1,
-        "nodes": [N("write", "write", {"name": "result"})], "edges": [],
-    })
     runner._emit(graph, runner.runs[run_id])
 
     watcher = threading.Thread(target=runner._watch, args=(
@@ -7571,14 +7965,35 @@ def test_completed_run_result_is_db_cached(tmp_path):
     p = _seq_parquet(tmp_path)
     gd = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "a2cache"})],
           "edges": [E("src", "wr")]}
-    st = _poll(client.post("/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}).json()["runId"])
-    assert st["status"] == "done"
+    first = _poll(client.post(
+        "/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}
+    ).json()["runId"])
+    assert first["status"] == "done"
+    first_output = _sole_output(first, outcome="committed")
+    assert first_output["version"]
     phash = get_deps().runner._plan_hash(Graph(**gd), "wr")
     c = metadb.get_result(phash)
     cached_output = sole_committed_document_output(c)
     assert cached_output and cached_output.uri and cached_output.table  # persisted to the shared DB
+    assert cached_output.version == first_output["version"]
     fresh_output = sole_committed_document_output(get_deps().runner._cache_get(phash))
     assert fresh_output and fresh_output.table == cached_output.table  # a fresh instance reads the same pointer
+
+    second = _poll(client.post(
+        "/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}
+    ).json()["runId"])
+    assert second["status"] == "done"
+    second_output = _sole_output(second, outcome="committed")
+    assert (second_output["uri"], second_output["version"]) == (
+        first_output["uri"], first_output["version"])
+
+    with metadb.session() as session:
+        facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.destination_uri == first_output["uri"],
+            metadb.CatalogLineageFact.run_id.in_([first["runId"], second["runId"]]),
+        ).order_by(metadb.CatalogLineageFact.id)))
+    assert [fact.run_id for fact in facts] == [first["runId"], second["runId"]]
+    assert all(fact.destination_version == first_output["version"] for fact in facts)
 
 
 def test_plan_cacheable_opt_out():
@@ -7740,6 +8155,16 @@ def test_run_controller_executes_checkpointed_regions(tmp_path):
     edges = get_deps().catalog.lineage(table.uri).edges
     assert any(edge.parent == p and edge.child == table.uri for edge in edges)
     assert not any(edge.child == table.uri and "/regions/" in edge.parent for edge in edges)
+    from hub import metadb
+    with metadb.session() as session:
+        facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.destination_uri == table.uri,
+            metadb.CatalogLineageFact.run_id == st["runId"],
+        )))
+    assert len(facts) == 1
+    assert facts[0].source_uri == p
+    assert facts[0].attempt_id and facts[0].attempt_id != st["runId"]
+    assert (facts[0].producer, facts[0].producer_version, facts[0].step_id) == ("c", 1, "wr")
 
 
 def test_default_region_runs_isolated_when_kernel_is_selected():
@@ -11283,7 +11708,7 @@ def test_ray_rejects_any_multiple_write_sinks_before_allocation(tmp_path, monkey
 
 def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage_across_region_cut(
         tmp_path):
-    from hub import graph as graph_mod
+    from hub import graph as graph_mod, metadb
     from hub.deps import Deps
     from hub.models import Graph, ResourceSpec
     from hub.planner import Region
@@ -11329,14 +11754,19 @@ def test_ray_unmanaged_publication_attests_external_catalog_and_all_join_lineage
     )
     graph = runner.deps.controller._subgraph(
         graph, region, {"transform": str(tmp_path / "region-ref.parquet")})
+    graph._publication_run_id = "outer-run"
     runner._register_outputs(graph, {"outputs": [{
         "step_id": "write", "name": "joined", "uri": output,
         "logical_uri": output,
-    }]}, expected_targets={"write": output}, expected_attempts={})
+    }]}, expected_targets={"write": output}, expected_attempts={},
+        backend_run_id="ray-subrun")
 
     assert set(expected) == {source_a, source_b}
     assert graph_mod.execution_source_uris(graph, "write") == [str(tmp_path / "region-ref.parquet")]
-    assert registered["parents"] == expected
+    assert registered["parents"] == metadb.catalog_lineage_parent_tokens(expected)
+    assert registered["lineage"].run_id == "outer-run"
+    assert registered["lineage"].attempt_id == "ray-subrun"
+    assert registered["lineage"].producer == "ray-lineage"
     assert readbacks == [output]
 
 
@@ -11826,7 +12256,7 @@ def test_ray_popen_supervisor_erases_sensitive_workdir_and_closes_log(
         per_node=[PerNodeStatus(node_id="target", status="queued")],
     )
     runner.runs[run_id] = status
-    runner._register_outputs = lambda _graph, result: catalog_calls.append(
+    runner._register_outputs = lambda _graph, result, **_kwargs: catalog_calls.append(
         (result, any(path.exists() for path in workdirs))
     )
     runner._cancel[run_id] = threading.Event()
@@ -12103,7 +12533,7 @@ def test_ray_clean_done_receipt_wins_late_cancel_and_nonzero_done_stays_private(
     monkeypatch.setattr(subprocess, "Popen", DoneProcess)
     monkeypatch.setattr(
         runner, "_register_outputs",
-        lambda _graph, result: registered.append(result),
+        lambda _graph, result, **_kwargs: registered.append(result),
     )
     run_id = "ray-late-cancel"
     graph = Graph(id="ray-late-cancel", version=1, nodes=[], edges=[])
@@ -12358,10 +12788,12 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
         ],
     }
     registered = []
-    monkeypatch.setattr(
-        runner, "_register_outputs",
-        lambda got_graph, got_result, **kwargs: registered.append((got_graph, got_result, kwargs)),
-    )
+
+    def register_outputs(got_graph, got_result, **kwargs):
+        registered.append((got_graph, got_result, kwargs))
+        return {"first": "v-first", "second": "v-second"}
+
+    monkeypatch.setattr(runner, "_register_outputs", register_outputs)
     status = RunStatus(
         run_id="run", status="running", target_node_id="second",
         outputs=[RunOutput(
@@ -12377,12 +12809,46 @@ def test_ray_popen_done_result_keeps_expected_output_binding_and_registration(tm
 
     assert registered == [(graph, result, {
         "expected_targets": expected_targets, "expected_attempts": expected_attempts,
+        "backend_run_id": "run",
     })]
     assert status.status == "done" and status.progress == 1.0
     output = sole_output(status, committed=True)
     assert output is not None
     assert output.uri == result["output_uri"] and output.table == "second"
+    assert output.version == "v-second"
     assert status.rows_processed == status.total_rows == 5
+
+
+def test_ray_popen_managed_publication_reads_version_from_nested_table(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from hub.deps import Deps
+    from hub.models import Graph
+    from hub.plugins import catalog as catalog_plugin
+
+    runner = _load_dp_ray().RayRunner(
+        Deps(str(tmp_path / "workspace"), str(tmp_path / "data")))
+    graph = Graph(**{
+        "id": "ray-managed-version", "version": 1,
+        "nodes": [_ray_node("write", "write", {"filename": "out.parquet"})],
+        "edges": [],
+    })
+    physical_uri = "s3://shared/out.attempt-run"
+
+    def publish(**kwargs):
+        return {
+            "uri": kwargs["uri"], "generation": 1,
+            "table": SimpleNamespace(
+                uri=kwargs["uri"], name=kwargs["name"], version="v-managed-exact"),
+        }
+
+    monkeypatch.setattr(catalog_plugin, "core_managed_publisher", lambda _catalog: publish)
+    versions = runner._register_outputs(graph, {"outputs": [{
+        "step_id": "write", "name": "out", "uri": physical_uri,
+        "logical_uri": "s3://shared/out.parquet",
+    }]})
+
+    assert versions == {"write": "v-managed-exact"}
 
 
 def test_ray_hive_native_plan_matches_adapter_schema_and_fails_closed_on_unproved_layouts(

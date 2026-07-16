@@ -125,8 +125,39 @@ export interface Relationship {
 }
 
 export interface LineageNode { id: string; name: string; uri: string; kind: string }
-export interface LineageEdge { parent: string; child: string; column?: string | null; pipeline?: string | null }
-export interface LineageResult { nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
+export interface LineageEdge { parent: string; child: string; factCount: number }
+export interface LineageResult { rootUri: string; nodes: LineageNode[]; edges: LineageEdge[]; truncated?: boolean }
+
+export interface LineageFieldMapping {
+  sourceField: string
+  destinationField: string
+}
+
+export interface LineageFact {
+  id: string
+  factKey: string
+  publicationKey: string
+  sourceKey: string
+  sourceUri: string
+  sourceVersion: string | null
+  destinationKey: string
+  destinationUri: string
+  destinationVersion: string | null
+  runId: string | null
+  attemptId: string | null
+  producer: string | null
+  producerVersion: number | null
+  stepId: string | null
+  provenance: 'run' | 'manual' | 'imported'
+  fieldMappings: LineageFieldMapping[]
+  createdAt: string
+}
+
+export interface LineageFactsPage {
+  items: LineageFact[]
+  nextAfterId: string | null
+  hasMore: boolean
+}
 
 export interface SampleResult {
   columns: ColumnSchema[]
@@ -220,6 +251,7 @@ export interface RunOutput {
   outcome: RunOutputOutcome
   uri?: string | null
   table?: string | null
+  version?: string | null
   rows?: number | null
   error?: string | null
 }

@@ -108,7 +108,7 @@ def _selected_output(status: RunStatus, port_id: str | None) -> tuple[int, RunOu
 
 def committed_output_snapshot(
         status: RunStatus, *, uri: str, rows: int, table: str | None = None,
-        port_id: str | None = None) -> RunOutput:
+        version: str | None = None, port_id: str | None = None) -> RunOutput:
     """Build and validate a committed snapshot without making it public."""
     _index, expected = _selected_output(status, port_id)
     return RunOutput(
@@ -120,6 +120,7 @@ def committed_output_snapshot(
         outcome="committed",
         uri=uri,
         table=table,
+        version=version,
         rows=rows,
     )
 
@@ -132,10 +133,10 @@ def preflight_output_table(status: RunStatus, table: str) -> None:
 
 def commit_output(
         status: RunStatus, *, uri: str, rows: int, table: str | None = None,
-        port_id: str | None = None) -> RunOutput:
+        version: str | None = None, port_id: str | None = None) -> RunOutput:
     index, _expected = _selected_output(status, port_id)
     committed = committed_output_snapshot(
-        status, uri=uri, rows=rows, table=table, port_id=port_id)
+        status, uri=uri, rows=rows, table=table, version=version, port_id=port_id)
     status.outputs[index] = committed
     return committed
 
@@ -200,9 +201,11 @@ def discard_unpublished_outputs(
 def outputs_cache_document(status: RunStatus) -> dict:
     if not status.outputs or any(
             output.outcome != "committed" or output.rows is None
+            or (output.publication_kind == "catalog" and output.version is None)
             for output in status.outputs):
         raise RuntimeError(
-            "only a complete committed output set with known row counts can enter the result cache")
+            "only a complete committed output set with known row counts and exact catalog versions "
+            "can enter the result cache")
     return {"outputs": [output.model_dump() for output in status.outputs]}
 
 

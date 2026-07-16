@@ -89,15 +89,21 @@ produces an attempt ID; the complete envelope produces a second SHA-256 binding.
 environment excludes known secrets, but the hub cannot prove that arbitrary plugin configuration is
 secret-free; artifact and metadata-store access controls remain mandatory.
 
-Durable Jobs currently supports contract version 3 only. That version freezes each sink's writer mode,
-logical URI, and physical attempt URI before submission. Earlier experimental versions were never
-released and are intentionally not replayed: an unsupported version is quarantined and stopped rather
-than submitted under semantics that cannot satisfy the current ownership contract.
+Durable Jobs currently supports contract version 4 only. That version freezes catalog publication
+identity and each sink's canonical, bounded source-parent set alongside its writer mode, logical URI,
+and physical attempt URI before submission. The parent map is keyed by the exact sink-target set; each
+list is bounded, sorted, unique, and contains only non-empty canonical URIs. A source-free generator may
+legitimately freeze an empty list. This also preserves the original sources of a controller-created
+region cut: rebuilding the public graph from the artifact may expose only its temporary materialization,
+so catalog publication never recomputes lineage parents from that reconstructed graph.
+Earlier experimental versions were never released and are intentionally not replayed: an unsupported
+version is quarantined and stopped rather than submitted under semantics that cannot satisfy the current
+ownership contract.
 
 A release must bump the contract version for any incompatible envelope or result change. The current
 implementation has no mixed-version decoder, so that release requires draining active Jobs runs before
 upgrading the hubs and Ray image. Rolling hub replacement is supported only when no metadata migration is
-required, every process uses the same exact Alembic head, every replacement keeps the v3 reader, and the
+required, every process uses the same exact Alembic head, every replacement keeps the v4 reader, and the
 image asserted by each active run's `code_ref` remains available. For any schema or contract change,
 stop new submissions, drain active Jobs, stop all metadata writers, run the one-shot migration, and then
 upgrade the hubs and Ray image.
@@ -184,33 +190,40 @@ API keys are never sent to the driver.
    CAS, while an `effects_started` winner replays only the frozen idempotent SQL plan.
 7. `effects_started` is a write-ahead catalog barrier. A replacement supervisor replays only the prepared
    SQL plan: it does not reread Ray state, job/result artifacts, manifests, or output schemas. Catalog
-   pointer, lineage, attempt state, and an exact event receipt commit together; run-level usage has a
-   separate stable-identity receipt. A later overwrite or unregister waits for the temporary publication
-   reference. If it committed before this plan reached the barrier, the stale publication fails with an
-   explicit conflict instead of reporting `done` without a readable catalog projection.
+   pointer, lineage, attempt state, and exact output and lineage publication receipts commit together;
+   run-level usage has a separate stable-identity receipt. A later overwrite or unregister waits for the
+   temporary publication reference. If it committed before this plan reached the barrier, the stale
+   publication fails with an explicit conflict instead of reporting `done` without a readable catalog
+   projection.
 8. After every required receipt exists, one database transaction CAS-publishes the backend result, public
    terminal `RunState`, and run-history row. It transfers output ownership to the retained run state before
    releasing temporary publication and source references; if bounded detail retention prunes that state,
    the exact attempt becomes eligible for the normal supersession/GC policy while the compact run-ID fence
    still prevents resurrection. Telemetry is best-effort only after that terminal barrier.
 
-Jobs v3 managed outputs currently require the built-in DB-backed catalog. A graph with a write sink rejects
+Jobs v4 managed outputs currently require the built-in DB-backed catalog. A graph with a write sink rejects
 an external catalog before object allocation or Ray submission, even if that provider implements the older
-`DurableCatalogPublisher` capability. That interface can acknowledge an at-least-once write, but it cannot freeze a pre-probed plan,
-participate in the core object-attempt barrier, or replay exact output/lineage/usage receipts without
-rereading mutable artifacts. A future external integration needs an explicit prepared-plan protocol with
-those semantics; accepting the older interface here would fail only after remote execution had already
-completed.
+`DurableCatalogPublisher` capability. That interface can acknowledge an at-least-once write, but it cannot
+freeze a pre-probed plan, participate in the core object-attempt barrier, or replay exact
+output/lineage/usage receipts without rereading mutable artifacts. A future external integration needs an
+explicit prepared-plan protocol with those semantics; accepting the older interface here would fail only
+after remote execution had already completed.
 
-Output publication keys are per sink, while one separate run-level usage event aggregates every distinct
-parent for the run. Parent aliases are resolved to stable logical or exact-URI identities before the
-write-ahead barrier: a generation replacement receives the usage on its logical dataset, while an
-unregister becomes an idempotent no-op and never resurrects the dataset. Two real runs therefore increment
-popularity twice, while a crash/retry does not increment it again; permanent lineage-edge existence is not
-a run-usage event. The current Jobs v3
-backend admits at most one write sink and rejects a multi-sink graph before allocation. The catalog
-publisher primitive can represent multiple outputs, but it does not provide a cross-dataset transaction,
-so the reference Jobs backend will not expose that shape until atomic batch publication exists.
+Output publication keys are per sink, and the same stable effect identity reserves that sink's complete
+lineage publication. Every per-source fact from the sink shares one exported `publicationKey`. An exact
+supervisor replay is a no-op, while a changed source set, exact source/destination identity, execution
+identity, provenance, or mappings is a collision rather than a partial retry. The receipt remains as a
+tombstone after unregister, so delayed recovery cannot resurrect removed evidence.
+
+One separate run-level usage event aggregates every distinct parent for the run. Parent aliases are
+resolved to stable logical or exact-URI identities before the write-ahead barrier: a generation
+replacement receives the usage on its logical dataset, while an unregister becomes an idempotent no-op
+and never resurrects the dataset. Two real runs therefore increment popularity twice, while a crash/retry
+does not increment it again; each run's immutable lineage facts are separate from the run-usage event.
+The current Jobs v4 backend admits at most one write sink and rejects a multi-sink graph before
+allocation. The catalog publisher primitive can represent multiple outputs, but it does not provide a
+cross-dataset transaction, so the reference Jobs backend will not expose that shape until atomic batch
+publication exists.
 
 Terminal `RunState` and backend-detail rows share the normal bounded retention policy. Pruning happens in
 the same terminal publication transaction and leaves `run_records` history intact. A separate compact,

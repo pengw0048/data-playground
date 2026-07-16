@@ -6,10 +6,12 @@ snake_case in Python. These shapes ARE the contract.
 
 from __future__ import annotations
 
+import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import (
-    UUID4, BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator,
+    UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
+    model_validator,
 )
 from pydantic.alias_generators import to_camel
 
@@ -21,6 +23,7 @@ Placement = Literal["local", "distributed"]
 DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
+MAX_SAFE_INTEGER = 2**53 - 1
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
     str,
@@ -173,11 +176,137 @@ class LineageNode(Wire):
 class LineageEdge(Wire):
     parent: str
     child: str
-    column: str | None = None
-    pipeline: str | None = None
+    fact_count: int = Field(ge=1)
+
+
+class LineageFieldMapping(Wire):
+    source_field: str = Field(min_length=1, max_length=512)
+    destination_field: str = Field(min_length=1, max_length=512)
+
+
+class LineagePublication(Wire):
+    """Catalog-local provenance supplied when one output becomes visible.
+
+    This is deliberately narrower than an execution request: it contains only the immutable identity
+    needed to create one fact per source in the catalog transaction. ``attempt_id`` remains null when a
+    backend has no execution attempt distinct from the logical run.
+    """
+
+    idempotency_key: str = Field(min_length=1, max_length=2048)
+    run_id: str | None = Field(default=None, min_length=1, max_length=512)
+    attempt_id: str | None = Field(default=None, min_length=1, max_length=512)
+    producer: str | None = Field(default=None, min_length=1, max_length=512)
+    producer_version: int | None = Field(default=None, ge=0, le=MAX_SAFE_INTEGER)
+    step_id: str | None = Field(default=None, min_length=1, max_length=512)
+    provenance: Literal["run", "manual", "imported"]
+    field_mappings: list[LineageFieldMapping] = Field(default_factory=list, max_length=256)
+
+    @field_validator("producer_version", mode="before")
+    @classmethod
+    def validate_producer_version(cls, value):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("lineage producer version must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "LineagePublication":
+        for field_name in ("idempotency_key", "run_id", "attempt_id", "producer", "step_id"):
+            value = getattr(self, field_name)
+            if value is not None and (not value or value != value.strip()):
+                raise ValueError(
+                    f"lineage {field_name} cannot be blank or contain surrounding whitespace")
+        if self.attempt_id is not None and self.run_id is None:
+            raise ValueError("lineage attempt requires a run identity")
+        if self.producer_version is not None and self.producer is None:
+            raise ValueError("lineage producer version requires a producer identity")
+        if self.provenance == "run" and not (
+                self.run_id and self.producer and self.step_id):
+            raise ValueError("run lineage requires run, producer, and step identities")
+        self.field_mappings = [
+            LineageFieldMapping(source_field=source, destination_field=destination)
+            for source, destination in sorted({
+                (mapping.source_field, mapping.destination_field)
+                for mapping in self.field_mappings
+            })
+        ]
+        return self
+
+
+def _lineage_fact_cursor(value: str) -> str:
+    if int(value) >= 2**63:
+        raise ValueError("lineage fact cursor exceeds the signed BIGINT range")
+    return value
+
+
+LineageFactCursor = Annotated[
+    str,
+    Field(min_length=1, max_length=19, pattern=r"^[1-9][0-9]*$"),
+    AfterValidator(_lineage_fact_cursor),
+]
+
+
+class LineageFact(Wire):
+    id: LineageFactCursor
+    fact_key: str = Field(min_length=1, max_length=512)
+    publication_key: str = Field(min_length=1, max_length=96)
+    source_key: str = Field(min_length=1, max_length=8192)
+    source_uri: str = Field(min_length=1, max_length=8192)
+    source_version: str | None = Field(default=None, min_length=1, max_length=512)
+    destination_key: str = Field(min_length=1, max_length=8192)
+    destination_uri: str = Field(min_length=1, max_length=8192)
+    destination_version: str | None = Field(default=None, min_length=1, max_length=512)
+    run_id: str | None = Field(default=None, min_length=1, max_length=512)
+    attempt_id: str | None = Field(default=None, min_length=1, max_length=512)
+    producer: str | None = Field(default=None, min_length=1, max_length=512)
+    producer_version: int | None = Field(default=None, ge=0, le=MAX_SAFE_INTEGER)
+    step_id: str | None = Field(default=None, min_length=1, max_length=512)
+    provenance: Literal["run", "manual", "imported"]
+    field_mappings: list[LineageFieldMapping] = Field(default_factory=list, max_length=256)
+    created_at: datetime.datetime
+
+    @field_validator("producer_version", mode="before")
+    @classmethod
+    def validate_producer_version(cls, value):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("lineage producer version must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "LineageFact":
+        for field_name in (
+                "fact_key", "publication_key", "source_key", "source_uri",
+                "source_version", "destination_key", "destination_uri",
+                "destination_version", "run_id", "attempt_id", "producer", "step_id"):
+            value = getattr(self, field_name)
+            if value is not None and value != value.strip():
+                raise ValueError(
+                    f"lineage fact {field_name} cannot contain surrounding whitespace")
+        if self.attempt_id is not None and self.run_id is None:
+            raise ValueError("lineage fact attempt requires a run identity")
+        if self.producer_version is not None and self.producer is None:
+            raise ValueError("lineage fact producer version requires a producer identity")
+        if self.provenance == "run" and not (
+                self.run_id and self.producer and self.step_id):
+            raise ValueError("run lineage fact requires run, producer, and step identities")
+        if self.created_at.utcoffset() is None:
+            raise ValueError("lineage fact creation time must include a timezone")
+        return self
+
+
+class LineageFactsPage(Wire):
+    items: list[LineageFact] = Field(default_factory=list, max_length=500)
+    next_after_id: LineageFactCursor | None = None
+    has_more: bool = False
+
+    @model_validator(mode="after")
+    def validate_cursor_state(self) -> "LineageFactsPage":
+        if self.has_more != (self.next_after_id is not None):
+            raise ValueError("lineage fact page continuation state is inconsistent")
+        return self
 
 
 class LineageResult(Wire):
+    root_uri: str = Field(min_length=1, max_length=8192)
     nodes: list[LineageNode] = []
     edges: list[LineageEdge] = []
     truncated: bool = False  # the connected component was larger than max_nodes / deeper than depth
@@ -546,6 +675,10 @@ class RunOutput(Wire):
     outcome: Literal["pending", "committed", "failed", "skipped", "cancelled"]
     uri: str | None = Field(default=None, max_length=8192)
     table: str | None = Field(default=None, max_length=512)
+    version: str | None = Field(
+        default=None, min_length=1, max_length=512,
+        exclude_if=lambda value: value is None,
+    )
     rows: int | None = Field(default=None, ge=0)
     error: str | None = Field(default=None, max_length=4096)
 
@@ -553,6 +686,8 @@ class RunOutput(Wire):
     def _publication_shape(self) -> "RunOutput":
         if self.port_id != self.port_id.strip():
             raise ValueError("run output portId cannot contain surrounding whitespace")
+        if self.version is not None and self.version != self.version.strip():
+            raise ValueError("run output catalog version cannot contain surrounding whitespace")
         if self.outcome == "committed":
             if not self.uri:
                 raise ValueError("a committed run output requires a URI")
@@ -560,8 +695,11 @@ class RunOutput(Wire):
                 raise ValueError("a committed catalog output requires a table identity")
             if self.publication_kind == "result" and self.table is not None:
                 raise ValueError("a non-catalog run output cannot carry a table identity")
-        elif self.uri is not None or self.table is not None:
-            raise ValueError("a non-committed run output cannot expose a URI or table identity")
+            if self.publication_kind == "result" and self.version is not None:
+                raise ValueError("a non-catalog run output cannot carry a catalog version")
+        elif self.uri is not None or self.table is not None or self.version is not None:
+            raise ValueError(
+                "a non-committed run output cannot expose a URI, table, or catalog version")
         return self
 
 
@@ -798,6 +936,13 @@ class GraphNode(Wire):
     data: dict[str, Any] = {}
     parent_id: str | None = None  # visual containment: this node lives inside a section (its parent)
 
+    @field_validator("id")
+    @classmethod
+    def _canonical_node_id(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("graph node id cannot contain surrounding whitespace")
+        return value
+
     @field_validator("data")
     @classmethod
     def _cap_embedded_code(cls, v):
@@ -825,14 +970,32 @@ class GraphEdge(Wire):
 
 
 class Graph(Wire):
-    id: str = "canvas"
-    version: int = 1
+    id: str = Field(default="canvas", min_length=1, max_length=512)
+    version: int = Field(default=1, ge=0, le=MAX_SAFE_INTEGER)
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them
     # Parent-owned provenance for synthetic region ref-sources. PrivateAttr keeps this control-plane
     # metadata out of the client wire model, workload serialization, and user-controlled node data.
     _publication_source_uris: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
+    _publication_run_id: str | None = PrivateAttr(default=None)
+    _publication_attempt_id: str | None = PrivateAttr(default=None)
+    _publication_producer_id: str | None = PrivateAttr(default=None)
+    _publication_producer_version: int | None = PrivateAttr(default=None)
+
+    @field_validator("id")
+    @classmethod
+    def _canonical_graph_id(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("graph id cannot contain surrounding whitespace")
+        return value
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _strict_graph_version(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("graph version must be an integer")
+        return value
 
 
 # --------------------------------------------------------------------------- #

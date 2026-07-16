@@ -826,6 +826,8 @@
           },
           "id": {
             "default": "canvas",
+            "maxLength": 512,
+            "minLength": 1,
             "title": "Id",
             "type": "string"
           },
@@ -848,6 +850,8 @@
           },
           "version": {
             "default": 1,
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
             "title": "Version",
             "type": "integer"
           }
@@ -1278,38 +1282,250 @@
             "title": "Child",
             "type": "string"
           },
-          "column": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Column"
+          "factCount": {
+            "minimum": 1.0,
+            "title": "Factcount",
+            "type": "integer"
           },
           "parent": {
             "title": "Parent",
             "type": "string"
-          },
-          "pipeline": {
+          }
+        },
+        "required": [
+          "parent",
+          "child",
+          "factCount"
+        ],
+        "title": "LineageEdge",
+        "type": "object"
+      },
+      "LineageFact": {
+        "properties": {
+          "attemptId": {
             "anyOf": [
               {
+                "maxLength": 512,
+                "minLength": 1,
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Pipeline"
+            "title": "Attemptid"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "destinationKey": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Destinationkey",
+            "type": "string"
+          },
+          "destinationUri": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Destinationuri",
+            "type": "string"
+          },
+          "destinationVersion": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destinationversion"
+          },
+          "factKey": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Factkey",
+            "type": "string"
+          },
+          "fieldMappings": {
+            "items": {
+              "$ref": "#/components/schemas/LineageFieldMapping"
+            },
+            "maxItems": 256,
+            "title": "Fieldmappings",
+            "type": "array"
+          },
+          "id": {
+            "maxLength": 19,
+            "minLength": 1,
+            "pattern": "^[1-9][0-9]*$",
+            "title": "Id",
+            "type": "string"
+          },
+          "producer": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producer"
+          },
+          "producerVersion": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producerversion"
+          },
+          "provenance": {
+            "enum": [
+              "run",
+              "manual",
+              "imported"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "publicationKey": {
+            "maxLength": 96,
+            "minLength": 1,
+            "title": "Publicationkey",
+            "type": "string"
+          },
+          "runId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runid"
+          },
+          "sourceKey": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Sourcekey",
+            "type": "string"
+          },
+          "sourceUri": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Sourceuri",
+            "type": "string"
+          },
+          "sourceVersion": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceversion"
+          },
+          "stepId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepid"
           }
         },
         "required": [
-          "parent",
-          "child"
+          "id",
+          "factKey",
+          "publicationKey",
+          "sourceKey",
+          "sourceUri",
+          "destinationKey",
+          "destinationUri",
+          "provenance",
+          "createdAt"
         ],
-        "title": "LineageEdge",
+        "title": "LineageFact",
+        "type": "object"
+      },
+      "LineageFactsPage": {
+        "properties": {
+          "hasMore": {
+            "default": false,
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LineageFact"
+            },
+            "maxItems": 500,
+            "title": "Items",
+            "type": "array"
+          },
+          "nextAfterId": {
+            "anyOf": [
+              {
+                "maxLength": 19,
+                "minLength": 1,
+                "pattern": "^[1-9][0-9]*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextafterid"
+          }
+        },
+        "title": "LineageFactsPage",
+        "type": "object"
+      },
+      "LineageFieldMapping": {
+        "properties": {
+          "destinationField": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Destinationfield",
+            "type": "string"
+          },
+          "sourceField": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourcefield",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sourceField",
+          "destinationField"
+        ],
+        "title": "LineageFieldMapping",
         "type": "object"
       },
       "LineageNode": {
@@ -1358,12 +1574,21 @@
             "title": "Nodes",
             "type": "array"
           },
+          "rootUri": {
+            "maxLength": 8192,
+            "minLength": 1,
+            "title": "Rooturi",
+            "type": "string"
+          },
           "truncated": {
             "default": false,
             "title": "Truncated",
             "type": "boolean"
           }
         },
+        "required": [
+          "rootUri"
+        ],
         "title": "LineageResult",
         "type": "object"
       },
@@ -2561,6 +2786,19 @@
               }
             ],
             "title": "Uri"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
           },
           "wire": {
             "enum": [
@@ -5012,103 +5250,6 @@
         "summary": "Get Canvas Versions"
       }
     },
-    "/api/catalog/edges": {
-      "get": {
-        "description": "A page of the WHOLE lineage edge set (`X-Total-Count` rides in a header) — the bulk-export\nsurface an external lineage store syncs from. Edges are URI-keyed `{parent, child, column,\npipeline}`, so a bridge plugin can map them onto OpenLineage-style datasets 1:1.",
-        "operationId": "lineage_edges_api_catalog_edges_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "default": 500,
-              "title": "Limit",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "offset",
-            "required": false,
-            "schema": {
-              "default": 0,
-              "title": "Offset",
-              "type": "integer"
-            }
-          },
-          {
-            "in": "header",
-            "name": "x-dp-user",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "X-Dp-User"
-            }
-          },
-          {
-            "in": "cookie",
-            "name": "dp_session",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Dp Session"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/LineageEdge"
-                  },
-                  "title": "Response Lineage Edges Api Catalog Edges Get",
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/APIErrorResponse"
-                }
-              }
-            },
-            "description": "Request validation failed."
-          },
-          "default": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/APIErrorResponse"
-                }
-              }
-            },
-            "description": "API error with a stable code and retry classification."
-          }
-        },
-        "summary": "Lineage Edges"
-      }
-    },
     "/api/catalog/facets": {
       "get": {
         "description": "Distinct folder / tag / owner values + counts over the active filter set — powers the facet rail\n(each value is a one-click, counted filter). Computed with the SAME filters as the list, so the\ncounts always describe what a click would show. `semanticAvailable` rides along so the UI knows\nwhether a search-by-meaning mode exists (an embedder plugin is installed).",
@@ -5687,6 +5828,7 @@
             "name": "uri",
             "required": true,
             "schema": {
+              "maxLength": 8192,
               "title": "Uri",
               "type": "string"
             }
@@ -5777,6 +5919,102 @@
           }
         },
         "summary": "Lineage"
+      }
+    },
+    "/api/catalog/lineage/facts": {
+      "get": {
+        "description": "Export immutable provenance facts with a deletion-safe, monotonic keyset cursor.",
+        "operationId": "lineage_facts_api_catalog_lineage_facts_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "afterId",
+            "required": false,
+            "schema": {
+              "default": "0",
+              "pattern": "^(0|[1-9][0-9]{0,18})$",
+              "title": "Afterid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageFactsPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Lineage Facts"
       }
     },
     "/api/catalog/register": {

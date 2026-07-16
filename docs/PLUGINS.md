@@ -134,17 +134,19 @@ of `RunOutput` snapshots (`nodeId`, `portId`, `portLabel`, `wire`, `publicationK
 committed publication fields); there are no singular `outputUri` or `outputTable` fields. An ordinary
 run exposes its expected output as `pending` in the first observable status, and every terminal status
 settles it as `committed`, `failed`, `cancelled`, or `skipped`. A successful targeted run must contain a
-complete committed output set. `totalRows` projects the row count only for a single committed output;
-multi-output cardinality remains on each `RunOutput`. Profile jobs are inspection jobs: they set
-`jobType="profile"`, keep `outputs=[]` and `totalRows=null`, and report their row count only in
-`profile.rowCount`.
+complete committed output set. `version` is the exact catalog revision attested at publication; it is
+allowed only on a committed catalog output, never on a pending/non-committed or non-catalog result.
+Catalog outputs without an attested version remain valid status records but cannot enter the result
+cache. `totalRows` projects the row count only for a single committed output; multi-output cardinality
+remains on each `RunOutput`. Profile jobs are inspection jobs: they set `jobType="profile"`, keep
+`outputs=[]` and `totalRows=null`, and report their row count only in `profile.rowCount`.
 
 The in-process `LocalRunner` can materialize and own every declared target output. Other execution
 backends must opt in with `supports_named_multi_output_runs() -> True` only when execution, terminal
 publication, cache ownership, restart recovery, cancellation, and cleanup all preserve the exact set.
 A missing, false, or broken probe fails closed before run identity, worker, job, or artifact allocation;
 it must never choose the first port as a fallback. Full runs with multiple independent write sinks remain
-unsupported on every backend. The private Ray Jobs v3 result artifact still contains `output_uri`,
+unsupported on every backend. The private Ray Jobs v4 result artifact still contains `output_uri`,
 `output_table`, and step-level `outputs` for its versioned worker/supervisor protocol; those keys are not
 plugin SPI and must be translated into public `RunOutput` values only after publication is attested.
 
@@ -168,10 +170,66 @@ Every discovery implementation must push its filters and finite window into the 
 a miss. `reg.set_catalog` validates the complete protocol during registration and rejects an incomplete
 provider with the missing method names. A read-only external catalog can subclass `InMemoryCatalog` and
 override the reads (`dp_sql_catalog` overrides `get_table`, `list_page`, `facets`, `browse`, and `search`
-so SQL rows appear on every read surface). A catalog that fully replaces the built-in without
-subclassing will not automatically receive run-completion
-`register_output` write-backs (runners keep the catalog they were built with), so either subclass
-`InMemoryCatalog` or forward `register_output` to your store.
+so SQL rows appear on every read surface).
+
+`lineage` returns a `LineageResult` whose `root_uri` is the canonical identity used by every returned
+node and edge. A provider that accepts aliases must resolve the requested alias into this field; clients
+use it to identify the root and do not guess from names or provider-specific identifiers.
+
+`reg.set_catalog` selects the provider used by catalog routes and later dependency lookups; it does not
+rebind runners that have already been constructed. Those runners keep their runner-bound catalog
+publication authority for output write-backs, cache validation, and cache-reuse lineage. A fully
+replacing workspace provider can therefore serve catalog reads without receiving execution write-backs,
+and adding or forwarding `register_output` on that replacement does not by itself close the gap. Sharing
+the built-in metadata side store (for example, by inheriting the built-in lineage methods) keeps those
+surfaces consistent today. Automatic single-authority rebinding is tracked in issue #166.
+
+Immutable fact export and cache-reuse recording are optional, runtime-checkable protocols rather than
+members of the required `CatalogProvider` contract:
+
+- `CatalogLineageFactExporter.lineage_facts_page(limit=, after_id=)` returns a bounded, monotonic
+  `LineageFactsPage`. `/catalog/lineage/facts` delegates to the selected provider and returns `501` if
+  this capability is absent; core never reads its own metadata side store behind another provider. The
+  route rejects pages larger than the requested limit, IDs that do not advance beyond `after_id`, IDs
+  that are not strictly increasing, and inconsistent or non-progressing `hasMore` / `nextAfterId`
+  continuations with `502`.
+- `CatalogLineageRecorder.record_lineage(name=, uri=, version=, parents=, lineage=)` atomically records
+  facts for a previously published exact output and returns the non-negative number inserted (`0` for
+  an exact replay).
+
+Fact export is a sequence of bounded page snapshots, not a CDC stream or a transactionally frozen
+multi-page snapshot. Unregister deletes every touching fact and the export has no deletion feed. A
+consumer that mirrors facts must periodically scan from the beginning and reconcile its complete view;
+retaining only the last cursor will miss deletions.
+
+All lineage methods exposed by a catalog plugin must agree on authority. An `InMemoryCatalog` subclass
+may serve discovery rows externally while deliberately retaining its inherited core-metadata lineage
+graph, exporter, and recorder as one side store. If it moves any lineage surface elsewhere, it must
+override the other inherited lineage methods too (or omit the optional ones); otherwise it would combine
+an external graph with local facts. A fully replacing provider may omit either optional capability and
+receive the fail-closed behavior above.
+
+When a runner writes back an output, it passes a `LineagePublication` to its runner-bound catalog. The
+idempotency key reserves the complete output publication, and all per-source facts share the resulting
+`publicationKey`. The reservation fingerprint binds the raw parent tokens after canonicalization but
+before catalog resolution, the caller's explicit destination URI and version, and the canonical lineage
+identity (execution identity, provenance, and mappings). Reusing the key with any changed caller request
+is a collision and rolls back. The first apply's facts retain the source and destination projections
+resolved at that commit, with versions when available; those mutable projections are not part of replay
+matching. An exact replay therefore remains a no-op after a projection changes or is unregistered and
+does not restore deleted facts. Empty-source publications reserve the same complete header. The durable
+reservation remains after unregister as a retry tombstone, so old work cannot recreate removed evidence.
+Because the current `field_mappings` shape (`fieldMappings` on the wire) does not identify a source
+dataset, non-empty
+mappings require exactly one source; multi-source mappings fail closed instead of being inferred or
+duplicated.
+
+The built-in local result cache considers a catalog output reusable only when its cached `RunOutput`
+contains an exact `version`, the artifact still exists, and the runner-bound catalog reads back the same
+URI, name, and version. It then uses that authority's `CatalogLineageRecorder` to attach the current
+run's provenance before reporting a hit. An absent recorder or a stale read-back becomes a cache miss
+and recomputation; a provider that advertises the recorder but returns an absent, boolean, negative, or
+otherwise malformed durable receipt fails the run instead of hiding incomplete lineage.
 
 `reg.set_managed_object_provider(factory)` sets lifecycle operations for managed object attempts.
 `factory(uri) -> ManagedObjectProvider`. The provider must set `complete_inventory=True` and
@@ -203,7 +261,7 @@ Built-in `local` / `s3` / `gs` go through the same registry.
 finished run with `canvas_id`, `run_id`, `request_id`, `job_type`, `status`, `rows`, `ms`, `error`,
 declaration-ordered `outputs`, `placement`, and `per_node` (`[{node_id, label, status, rows, ms}]`).
 Each output snapshots `node_id`, `port_id`, its declared label/wire, publication kind, outcome, and only
-after commit its URI/table/row count. Core ships no exporter. A sink that
+after commit its URI/table/catalog version/row count. Core ships no exporter. A sink that
 raises is caught and logged, never failing the run. Delivery is best-effort and asynchronous through a
 finite per-sink queue; overload drops the newest event with a rate-limited warning. It stays alongside
 the typed `MetricEvent` / `AuditEvent` sinks below — see [`OBSERVABILITY.md`](OBSERVABILITY.md) and
@@ -221,13 +279,27 @@ A catalog used by an at-least-once durable runner also implements the runtime-ch
 parents. The output method must return a matching `CatalogPublicationReceipt` only after the provider can
 durably read the registered reference; returning `None` or an optimistic in-memory object blocks terminal
 publication. A provider that does not need popularity can make the usage call a durable idempotent no-op.
+The built-in implementation commits the output receipt, catalog entry and child indexes, local ownership,
+and lineage header/facts in one transaction. Its effect fingerprint covers only caller-known, stable
+request semantics: name, URI, the caller-requested version (when supplied), canonical raw parent tokens,
+pipeline, and canonical lineage identity. The winning first apply probes the artifact and persists its
+exact table projection and resulting version in the receipt, but those mutable observed bytes are not
+re-probed to match an exact retry. Mutable catalog governance such as folder, tags, owner, and description
+is excluded as well. An exact retry after the artifact advances or disappears, or after catalog curation
+or unregister, is therefore a side-effect-free receipt replay, not a projection rollback or resurrection.
+Core also reserves every managed logical dataset's logical URI, logical ID, and stable catalog key for
+that identity, including after unregister. A first unmanaged publication at any reserved alias fails in
+the same transaction as its receipt; an exact receipt created before a later managed reservation remains
+replayable but cannot recreate its old projection. External publishers should enforce an equivalent
+single-owner namespace rule if they combine managed and unmanaged datasets.
 
 That capability alone does not opt an external catalog into managed-output publication for the bundled Ray
-Jobs v3 backend. Jobs v3 freezes a pre-probed catalog plan in SQL and coordinates it with core
+Jobs v4 backend. Jobs v4 freezes a pre-probed catalog plan in SQL and coordinates it with core
 object-attempt references, lineage, usage, and terminal publication. A graph with a write sink therefore
-requires the built-in DB-backed catalog and fails before allocation or remote submission when another
-catalog is installed. Supporting an external provider here needs a future prepared-plan/replay protocol,
-not just the two idempotent methods above.
+requires the Ray runner's publication authority to be the built-in DB-backed catalog and fails before
+allocation or remote submission when that runner was constructed with another catalog. Supporting an
+external provider here needs a future prepared-plan/replay protocol, not just the two idempotent methods
+above.
 
 Adapters `insert(0)` so a plugin claims a URI before the built-in DuckDB adapter. Runners are picked by
 `pick_runner` (Settings → Execution, else the first that `can_run`). Built-ins go through these same

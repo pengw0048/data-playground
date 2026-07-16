@@ -9,8 +9,12 @@ they can't leak into the rest of the suite.
 from __future__ import annotations
 
 
+import datetime
+import uuid
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete, or_, select
 
 from hub import metadb
 from hub.deps import get_deps
@@ -23,13 +27,55 @@ _SCALE = "mem://scale/"
 _SEM = "mem://sem/"
 
 
-def _doc(name, uri, *, folder="", tags=None, owner=None, description=None, rows=0, cols=None):
+@pytest.fixture(autouse=True)
+def _remove_scale_publication_tombstones():
+    """Keep this module's permanent retry fences out of persistent test databases."""
+    yield
+    with metadb.session() as session:
+        session.execute(delete(metadb.CatalogPublicationEvent).where(
+            metadb.CatalogPublicationEvent.effect_type == "lineage",
+            or_(
+                metadb.CatalogPublicationEvent.uri.like(f"{_SCALE}%"),
+                metadb.CatalogPublicationEvent.uri.like(f"{_SEM}%"),
+            ),
+        ))
+
+
+def _doc(
+        name, uri, *, folder="", tags=None, owner=None, description=None,
+        rows=0, cols=None, version=None):
     """A catalog_bulk_seed entry: {uri, name, doc} where doc is the full CatalogTable-shaped dict."""
-    return {"uri": uri, "name": name, "doc": {
+    doc = {
         "id": f"tbl_{name}", "name": name, "uri": uri, "folder": folder, "tags": tags or [],
         "owner": owner, "description": description, "rowCount": rows,
         "columns": [{"name": c, "type": "VARCHAR"} for c in (cols or [])],
-    }}
+    }
+    if version is not None:
+        doc["version"] = str(version)
+    return {"uri": uri, "name": name, "doc": doc}
+
+
+def _lineage(
+        *, key=None, run_id=None, attempt_id=None, producer=None,
+        producer_version=None, step_id=None, provenance="manual", mappings=None):
+    return {
+        "idempotency_key": key or f"catalog-scale-{uuid.uuid4().hex}",
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "producer": producer,
+        "producer_version": producer_version,
+        "step_id": step_id,
+        "provenance": provenance,
+        "field_mappings": mappings or [],
+    }
+
+
+def _record_lineage(parent, child, *, lineage=None):
+    destination = metadb.catalog_get(child)
+    assert destination is not None
+    return metadb.catalog_record_lineage(
+        destination["uri"], destination.get("version"), [parent],
+        lineage or _lineage())
 
 
 @pytest.fixture
@@ -153,7 +199,7 @@ def test_bounded_lineage_depth_and_maxnodes():
     try:
         metadb.catalog_bulk_seed([_doc(f"chain_{i}", u) for i, u in enumerate(uris)])
         for a, b in zip(uris, uris[1:]):
-            metadb.catalog_add_edge(a, b, pipeline="p")
+            _record_lineage(a, b)
         deep = client.get("/api/catalog/lineage", params={"uri": uris[0], "depth": 20, "maxNodes": 5000}).json()
         assert len(deep["nodes"]) == 12 and deep["truncated"] is False
         shallow = client.get("/api/catalog/lineage", params={"uri": uris[0], "depth": 2}).json()
@@ -299,13 +345,13 @@ def test_set_metadata_partial_and_clear(scale_catalog):
     assert cleared["tags"] == ["keep"], "tags were absent from the body, so they survive"
 
 
-def test_unregister_cleans_edges_keys_relationships():
+def test_unregister_cleans_facts_keys_relationships_without_reregister_inheritance():
     """A deleted table must not haunt lineage/ER as a ghost node, and a NEW dataset re-registered at
     the same uri must not inherit the old declared key or parents."""
     a, b = f"{_SCALE}orph/a", f"{_SCALE}orph/b"
     try:
         metadb.catalog_bulk_seed([_doc("orph_a", a, cols=["id"]), _doc("orph_b", b, cols=["id"])])
-        metadb.catalog_add_edge(a, b, pipeline="p")
+        _record_lineage(a, b)
         metadb.catalog_set_declared_key(b, ["id"])
         client.post("/api/catalog/relationships", json={
             "leftUri": a, "leftColumns": ["id"], "rightUri": b, "rightColumns": ["id"],
@@ -316,6 +362,19 @@ def test_unregister_cleans_edges_keys_relationships():
         assert metadb.catalog_declared_keys([b]) == {}
         assert all(b not in (r["leftUri"], r["rightUri"])
                    for r in client.get("/api/catalog/relationships").json())
+        with metadb.session() as session:
+            assert session.scalar(select(metadb.CatalogLineageFact).where(
+                (metadb.CatalogLineageFact.source_uri == b)
+                | (metadb.CatalogLineageFact.destination_uri == b)
+                | (metadb.CatalogLineageFact.source_key == b)
+                | (metadb.CatalogLineageFact.destination_key == b)
+            )) is None
+
+        assert metadb.catalog_bulk_seed([_doc("orph_b_fresh", b, cols=["id"])]) == 1
+        fresh = client.get("/api/catalog/lineage", params={"uri": b}).json()
+        assert fresh["edges"] == []
+        assert all(b not in (row["parent"], row["child"])
+                   for row in metadb.catalog_lineage_pairs())
     finally:
         metadb.catalog_delete_prefix(_SCALE)
 
@@ -331,20 +390,326 @@ def test_browse_tree_truncation_flag():
         metadb.catalog_delete_prefix(_SCALE)
 
 
-def test_lineage_edges_export_page():
-    uris = [f"{_SCALE}exp/{i}" for i in range(4)]
+def test_legacy_lineage_edges_export_is_removed():
+    assert client.get("/api/catalog/edges").status_code == 404
+
+
+@pytest.mark.parametrize("after_id", ["", "-1", "01", "abc", str(2**63)])
+def test_lineage_facts_reject_invalid_or_overflow_cursor(after_id):
+    response = client.get("/api/catalog/lineage/facts", params={"afterId": after_id})
+    assert response.status_code == 422
+
+
+def test_lineage_facts_wire_contract_preserves_bigint_ids(monkeypatch):
+    fact_id = 2**53 + 1
+    created_at = datetime.datetime(2026, 7, 16, 8, 30, tzinfo=datetime.UTC)
+    row = {
+        "id": fact_id,
+        "fact_key": "lineage:v1:test-fact",
+        "publication_key": "lineage-publication:v1:test-publication",
+        "source_key": "tbl_raw_orders",
+        "source_uri": "s3://warehouse/raw/orders.lance",
+        "source_version": "17",
+        "destination_key": "tbl_curated_orders",
+        "destination_uri": "s3://warehouse/curated/orders.lance",
+        "destination_version": "23",
+        "run_id": "run-123",
+        "attempt_id": "attempt-2",
+        "producer": "canvas-orders",
+        "producer_version": 7,
+        "step_id": "write-orders",
+        "provenance": "run",
+        "field_mappings": [{
+            "source_field": "raw_order_id",
+            "destination_field": "order_id",
+        }],
+        "created_at": created_at,
+    }
+    monkeypatch.setattr(
+        metadb,
+        "catalog_lineage_facts_page",
+        lambda *, limit, after_id: ([row], fact_id, True),
+    )
+
+    response = client.get(
+        "/api/catalog/lineage/facts", params={"limit": 1, "afterId": "0"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [{
+            "id": str(fact_id),
+            "factKey": "lineage:v1:test-fact",
+            "publicationKey": "lineage-publication:v1:test-publication",
+            "sourceKey": "tbl_raw_orders",
+            "sourceUri": "s3://warehouse/raw/orders.lance",
+            "sourceVersion": "17",
+            "destinationKey": "tbl_curated_orders",
+            "destinationUri": "s3://warehouse/curated/orders.lance",
+            "destinationVersion": "23",
+            "runId": "run-123",
+            "attemptId": "attempt-2",
+            "producer": "canvas-orders",
+            "producerVersion": 7,
+            "stepId": "write-orders",
+            "provenance": "run",
+            "fieldMappings": [{
+                "sourceField": "raw_order_id",
+                "destinationField": "order_id",
+            }],
+            "createdAt": "2026-07-16T08:30:00Z",
+        }],
+        "nextAfterId": str(fact_id),
+        "hasMore": True,
+    }
+
+
+def test_lineage_facts_export_uses_provider_capability_or_fails_explicitly(monkeypatch):
+    from hub.models import LineageFact, LineageFactsPage
+
+    calls = []
+    fact = LineageFact(
+        id="11", fact_key="fact-11", publication_key="publication-11",
+        source_key="source", source_uri="mem://source",
+        destination_key="destination", destination_uri="mem://destination",
+        provenance="manual", created_at=datetime.datetime.now(datetime.UTC),
+    )
+
+    class Exporter:
+        def lineage_facts_page(self, *, limit, after_id):
+            calls.append((limit, after_id))
+            return LineageFactsPage(items=[fact], next_after_id="11", has_more=True)
+
+    def local_side_store_must_not_run(**_kwargs):
+        raise AssertionError("external catalog export fell back to the built-in side-store")
+
+    deps = get_deps()
+    monkeypatch.setattr(metadb, "catalog_lineage_facts_page", local_side_store_must_not_run)
+    monkeypatch.setattr(deps, "catalog", Exporter())
+    response = client.get(
+        "/api/catalog/lineage/facts", params={"limit": 7, "afterId": "9"})
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [fact.model_dump(by_alias=True, mode="json")],
+        "nextAfterId": "11", "hasMore": True,
+    }
+    assert calls == [(7, 9)]
+
+    monkeypatch.setattr(deps, "catalog", object())
+    unsupported = client.get("/api/catalog/lineage/facts")
+    assert unsupported.status_code == 501
+    assert unsupported.json() == {
+        "detail": "catalog provider does not support lineage fact export",
+        "code": "not_implemented",
+        "retryable": False,
+    }
+
+
+def test_lineage_fact_export_rejects_provider_cursor_contract_violations(monkeypatch):
+    def fact(fact_id: int) -> dict:
+        return {
+            "id": str(fact_id), "factKey": f"fact-{fact_id}",
+            "publicationKey": f"publication-{fact_id}",
+            "sourceKey": "source", "sourceUri": "mem://source",
+            "destinationKey": "destination", "destinationUri": "mem://destination",
+            "provenance": "manual", "createdAt": "2026-07-16T08:30:00Z",
+        }
+
+    cases = [
+        ({"items": [], "nextAfterId": "11", "hasMore": True}, 1),
+        ({"items": [fact(9)], "nextAfterId": "9", "hasMore": True}, 1),
+        ({"items": [fact(11), fact(10)], "nextAfterId": "10", "hasMore": True}, 2),
+        ({"items": [fact(11)], "nextAfterId": "12", "hasMore": True}, 1),
+        ({"items": [fact(11), fact(12)], "nextAfterId": "12", "hasMore": True}, 1),
+    ]
+    deps = get_deps()
+    for page, limit in cases:
+        class Exporter:
+            @staticmethod
+            def lineage_facts_page(*, limit: int, after_id: int):
+                assert after_id == 9
+                return page
+
+        monkeypatch.setattr(deps, "catalog", Exporter())
+        response = client.get(
+            "/api/catalog/lineage/facts",
+            params={"limit": limit, "afterId": "9"},
+        )
+        assert response.status_code == 502
+        assert response.json()["detail"] == \
+            "catalog provider returned an invalid lineage fact page"
+
+
+def test_lineage_facts_export_uses_real_keyset_pagination():
+    uris = [f"{_SCALE}facts/{i}" for i in range(4)]
+    run_id = f"run-facts-export-{uuid.uuid4().hex}"
     try:
-        metadb.catalog_bulk_seed([_doc(f"exp_{i}", u) for i, u in enumerate(uris)])
-        for a, b in zip(uris, uris[1:]):
-            metadb.catalog_add_edge(a, b, pipeline="exp")
-        r = client.get("/api/catalog/edges", params={"limit": 2, "offset": 0})
-        assert r.status_code == 200 and len(r.json()) == 2
-        assert int(r.headers["X-Total-Count"]) >= 3
-        page2 = client.get("/api/catalog/edges", params={"limit": 2, "offset": 2}).json()
-        assert {(e["parent"], e["child"]) for e in r.json()}.isdisjoint(
-            {(e["parent"], e["child"]) for e in page2})
+        metadb.catalog_bulk_seed([
+            _doc(f"facts_{i}", uri, version=10 + i)
+            for i, uri in enumerate(uris)
+        ])
+        for i, (source, destination) in enumerate(zip(uris, uris[1:])):
+            assert _record_lineage(
+                source,
+                destination,
+                lineage=_lineage(
+                    key=f"facts-export-{uuid.uuid4().hex}",
+                    run_id=run_id,
+                    attempt_id=f"attempt-{i}",
+                    producer="canvas-facts-export",
+                    producer_version=7,
+                    step_id=f"write-{i}",
+                    provenance="run",
+                    mappings=[{
+                        "source_field": "raw_id",
+                        "destination_field": "id",
+                    }],
+                ),
+            ) == 1
+        with metadb.session() as session:
+            ids = list(session.scalars(select(metadb.CatalogLineageFact.id).where(
+                metadb.CatalogLineageFact.run_id == run_id,
+            ).order_by(metadb.CatalogLineageFact.id)))
+        assert len(ids) == 3
+        assert ids == sorted(ids) and all(isinstance(value, int) for value in ids)
+
+        first = client.get(
+            "/api/catalog/lineage/facts",
+            params={"limit": 2, "afterId": str(ids[0] - 1)},
+        )
+        assert first.status_code == 200
+        first_page = first.json()
+        assert [item["id"] for item in first_page["items"]] == [str(ids[0]), str(ids[1])]
+        assert first_page["nextAfterId"] == str(ids[1])
+        assert first_page["hasMore"] is True
+        first_fact = dict(first_page["items"][0])
+        fact_key = first_fact.pop("factKey")
+        publication_key = first_fact.pop("publicationKey")
+        created_at = first_fact.pop("createdAt")
+        assert first_fact == {
+            "id": str(ids[0]),
+            "sourceKey": uris[0],
+            "sourceUri": uris[0],
+            "sourceVersion": "10",
+            "destinationKey": uris[1],
+            "destinationUri": uris[1],
+            "destinationVersion": "11",
+            "runId": run_id,
+            "attemptId": "attempt-0",
+            "producer": "canvas-facts-export",
+            "producerVersion": 7,
+            "stepId": "write-0",
+            "provenance": "run",
+            "fieldMappings": [{"sourceField": "raw_id", "destinationField": "id"}],
+        }
+        assert fact_key.startswith("lineage-fact:v1:sha256:")
+        assert publication_key.startswith("lineage-publication:v1:sha256:")
+        assert created_at.endswith("Z")
+
+        # Deleting a row before the keyset cursor must not shift or duplicate the next page.
+        with metadb.session() as session:
+            obsolete = session.get(metadb.CatalogLineageFact, ids[0])
+            assert obsolete is not None
+            session.delete(obsolete)
+
+        second = client.get(
+            "/api/catalog/lineage/facts",
+            params={"limit": 2, "afterId": first_page["nextAfterId"]},
+        )
+        assert second.status_code == 200
+        second_page = second.json()
+        assert [item["id"] for item in second_page["items"]] == [str(ids[2])]
+        assert second_page["nextAfterId"] is None
+        assert second_page["hasMore"] is False
     finally:
         metadb.catalog_delete_prefix(_SCALE)
+
+
+def test_lineage_pair_limit_counts_pairs_and_graph_aggregates_facts():
+    root = f"{_SCALE}aggregate/root"
+    children = [f"{_SCALE}aggregate/child-{i}" for i in range(2)]
+    try:
+        metadb.catalog_bulk_seed([
+            _doc("aggregate_root", root),
+            *[_doc(f"aggregate_child_{i}", uri) for i, uri in enumerate(children)],
+        ])
+        for _ in range(4):
+            _record_lineage(root, children[0])
+        _record_lineage(root, children[1])
+
+        one_pair, truncated = metadb.catalog_lineage_pairs_touching([root], limit=1)
+        assert len(one_pair) == 1 and truncated is True
+        two_pairs, truncated = metadb.catalog_lineage_pairs_touching([root], limit=2)
+        assert truncated is False
+        assert {(row["child"], row["fact_count"]) for row in two_pairs} == {
+            (children[0], 4),
+            (children[1], 1),
+        }
+
+        graph = client.get("/api/catalog/lineage", params={"uri": root}).json()
+        assert {(edge["child"], edge["factCount"]) for edge in graph["edges"]} == {
+            (children[0], 4),
+            (children[1], 1),
+        }
+        assert graph["truncated"] is False
+        _record_lineage(children[0], children[1])
+        complete_at_boundary = client.get(
+            "/api/catalog/lineage",
+            params={"uri": root, "depth": 1, "maxNodes": 10},
+        ).json()
+        assert {(edge["parent"], edge["child"]) for edge in complete_at_boundary["edges"]} == {
+            (root, children[0]),
+            (root, children[1]),
+            (children[0], children[1]),
+        }
+        assert complete_at_boundary["truncated"] is False
+
+        grandchild = f"{_SCALE}aggregate/grandchild"
+        metadb.catalog_bulk_seed([_doc("aggregate_grandchild", grandchild)])
+        _record_lineage(children[0], grandchild)
+        deeper_than_boundary = client.get(
+            "/api/catalog/lineage",
+            params={"uri": root, "depth": 1, "maxNodes": 10},
+        ).json()
+        assert deeper_than_boundary["truncated"] is True
+    finally:
+        metadb.catalog_delete_prefix(_SCALE)
+
+
+def test_lineage_graph_reports_fact_count_and_pair_truncation(monkeypatch):
+    root = f"{_SCALE}lineage-root"
+    child = f"{_SCALE}lineage-child"
+
+    def touching(frontier, *, limit):
+        assert frontier == [root]
+        assert limit >= 1
+        return ([{
+            "parent": root,
+            "child": child,
+            "fact_count": 4,
+        }], True)
+
+    monkeypatch.setattr(metadb, "catalog_lineage_key_pairs_touching", touching)
+
+    response = client.get(
+        "/api/catalog/lineage",
+        params={"uri": root, "depth": 1, "maxNodes": 10},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["edges"] == [{
+        "parent": root,
+        "child": child,
+        "factCount": 4,
+    }]
+    assert response.json()["truncated"] is True
+
+
+@pytest.mark.parametrize("uri", ["/", "x" * 8_193])
+def test_lineage_rejects_invalid_root_uri_at_the_request_boundary(uri):
+    response = client.get("/api/catalog/lineage", params={"uri": uri})
+
+    assert response.status_code == 422
+    assert response.json().get("detail")
 
 
 def test_facets_advertise_semantic_availability():

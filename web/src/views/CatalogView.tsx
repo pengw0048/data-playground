@@ -783,7 +783,11 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     catch (e) { pushToast(errorMessage(e), 'error') }
     finally { setDeleting(false) }
   }
-  const openLinked = async (ref: string) => {
+  const openLinked = async (ref: string | undefined) => {
+    if (!ref) {
+      pushToast("Couldn't open linked dataset: lineage node has no catalog identity", 'error')
+      return
+    }
     try { onOpenTable(await api.table(ref)) }
     catch (e) { pushToast(`Couldn't open linked dataset: ${errorMessage(e)}`, 'error') }
   }
@@ -799,9 +803,11 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
     } catch (e) { pushToast(errorMessage(e), 'error') }
     finally { setBusy(false) }
   }
-  const parents = (lin?.edges ?? []).filter((e) => e.child === table.uri)
-  const children = (lin?.edges ?? []).filter((e) => e.parent === table.uri)
-  const nameOf = (u: string) => lin?.nodes.find((n) => n.uri === u)?.name ?? u.split('/').slice(-1)[0]
+  const lineageRoot = lin?.rootUri ?? table.uri
+  const parents = (lin?.edges ?? []).filter((e) => e.child === lineageRoot)
+  const children = (lin?.edges ?? []).filter((e) => e.parent === lineageRoot)
+  const lineageNode = (u: string) => lin?.nodes.find((n) => n.uri === u)
+  const nameOf = (u: string) => lineageNode(u)?.name ?? u.split('/').slice(-1)[0]
 
   const declaredPk = table.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
   const togglePk = async (col: string) => {
@@ -917,9 +923,15 @@ function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, 
             ) : null}
             {lin ? <>
               <LineageMini label="Parents" empty="no upstream datasets" onOpen={openLinked}
-                rows={parents.map((e) => ({ name: nameOf(e.parent), sub: e.pipeline ?? undefined, uri: e.parent }))} />
+                rows={parents.map((e) => ({
+                  name: nameOf(e.parent), factCount: e.factCount,
+                  uri: e.parent, catalogId: lineageNode(e.parent)?.id,
+                }))} />
               <LineageMini label="Children" empty="no downstream datasets" onOpen={openLinked}
-                rows={children.map((e) => ({ name: nameOf(e.child), sub: e.pipeline ?? undefined, uri: e.child }))} />
+                rows={children.map((e) => ({
+                  name: nameOf(e.child), factCount: e.factCount,
+                  uri: e.child, catalogId: lineageNode(e.child)?.id,
+                }))} />
             </> : null}
           </section>
 
@@ -1043,16 +1055,18 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
 }
 
 function LineageMini({ label, empty, rows, onOpen }: {
-  label: string; empty: string; rows: { name: string; sub?: string; uri: string }[]; onOpen: (uri: string) => void
+  label: string; empty: string
+  rows: { name: string; factCount: number; uri: string; catalogId?: string }[]
+  onOpen: (catalogId: string | undefined) => void
 }) {
   return (
     <div className="mb-1.5">
       <div className="text-[9.5px] font-bold uppercase tracking-wide text-muted-foreground">{label}</div>
       {rows.length
         ? rows.map((r, i) => (
-            <button key={i} onClick={() => onOpen(r.uri)} title={r.uri}
+            <button key={i} onClick={() => onOpen(r.catalogId)} title={r.uri}
               className="flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[12px] text-foreground hover:bg-accent hover:underline">
-              <Icon name="arrow" size={11} /> {r.name}{r.sub && <span className="text-[10px] text-muted-foreground">· {r.sub}</span>}
+              <Icon name="arrow" size={11} /> {r.name}<span className="text-[10px] text-muted-foreground">· {r.factCount} {r.factCount === 1 ? 'fact' : 'facts'}</span>
             </button>
           ))
         : <div className="py-0.5 text-[11px] text-muted-foreground">{empty}</div>}

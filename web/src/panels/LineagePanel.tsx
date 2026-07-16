@@ -12,29 +12,41 @@ export function LineagePanel({ nodeId }: { nodeId: string }) {
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!uri) { setErr('this node has no registered dataset yet — run it first'); return }
-    api.lineage(uri, 6, 200).then(setLin).catch((e) => setErr(e.message))
+    let current = true
+    setLin(null)
+    setErr(null)
+    if (!uri) {
+      setErr('this node has no registered dataset yet — run it first')
+      return () => { current = false }
+    }
+    api.lineage(uri, 6, 200).then((next) => {
+      if (current) setLin(next)
+    }).catch((e) => {
+      if (current) setErr(e instanceof Error ? e.message : String(e))
+    })
+    return () => { current = false }
   }, [uri])
 
   if (err) return <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>{err}</div>
   if (!lin) return <div style={{ padding: 16, fontSize: 12, color: color.text3 }}>tracing lineage…</div>
 
-  const parents = lin.edges.filter((e) => e.child === uri)
-  const children = lin.edges.filter((e) => e.parent === uri)
+  const rootUri = lin.rootUri
+  const parents = lin.edges.filter((e) => e.child === rootUri)
+  const children = lin.edges.filter((e) => e.parent === rootUri)
   const name = (u: string) => lin.nodes.find((n) => n.uri === u)?.name ?? u.split('/').slice(-1)[0]
 
   return (
     <div style={{ padding: 14, fontSize: 12.5 }}>
       <Section label="Parents" empty="no upstream datasets">
-        {parents.map((e, i) => <Row key={i} name={name(e.parent)} sub={e.pipeline ?? undefined} up />)}
+        {parents.map((e, i) => <Row key={i} name={name(e.parent)} factCount={e.factCount} up />)}
       </Section>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 2px' }}>
         <span style={{ width: 8, height: 8, borderRadius: '50%', background: color.focus }} />
-        <span style={{ fontWeight: 600 }}>{name(uri!)}</span>
+        <span style={{ fontWeight: 600 }}>{name(rootUri)}</span>
         <span style={{ fontSize: 10.5, color: color.text3 }}>this node</span>
       </div>
       <Section label="Children" empty="no downstream datasets yet">
-        {children.map((e, i) => <Row key={i} name={name(e.child)} sub={e.pipeline ?? undefined} />)}
+        {children.map((e, i) => <Row key={i} name={name(e.child)} factCount={e.factCount} />)}
       </Section>
     </div>
   )
@@ -50,12 +62,12 @@ function Section({ label, empty, children }: { label: string; empty: string; chi
   )
 }
 
-function Row({ name, sub, up }: { name: string; sub?: string; up?: boolean }) {
+function Row({ name, factCount, up }: { name: string; factCount: number; up?: boolean }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 2px', color: color.text2 }}>
       <span style={{ color: color.text3 }}><Icon name={up ? 'chevronRight' : 'arrow'} size={12} /></span>
       <span style={{ fontWeight: 600, color: color.ink }}>{name}</span>
-      {sub && <span style={{ fontSize: 10, color: color.text3 }}>· {sub}</span>}
+      <span style={{ fontSize: 10, color: color.text3 }}>· {factCount} {factCount === 1 ? 'fact' : 'facts'}</span>
     </div>
   )
 }

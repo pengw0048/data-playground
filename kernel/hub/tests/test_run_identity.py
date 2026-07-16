@@ -373,7 +373,7 @@ def test_finish_accepts_matching_terminal_fence_after_status_detail_is_pruned(mo
         "attempt_id": ref["attempt_id"], "submission_id": ref["submission_id"],
         "envelope_sha256": envelope_sha256, "status": "done", "rows": 0,
         "error": None,
-        # Private Ray v3 artifact fields are mapped once into the public RunOutput above.
+        # Private Ray v4 artifact fields are mapped once into the public RunOutput above.
         "output_uri": f"{ref['result_uri']}.parquet",
         "output_table": None,
         "outputs": [],

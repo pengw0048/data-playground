@@ -17,7 +17,8 @@ import duckdb
 
 from hub.models import (
     CatalogBrowse, CatalogPage, CatalogPublicationReceipt, CatalogQuery, CatalogTable, ColumnSchema,
-    CompilePlan, Facets, Graph, GraphNode, LineageResult, Placement, Relationship, RunEstimate, RunStatus,
+    CompilePlan, Facets, Graph, GraphNode, LineageFactsPage, LineagePublication, LineageResult,
+    Placement, Relationship, RunEstimate, RunStatus,
 )
 
 # The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
@@ -341,6 +342,7 @@ class CatalogProvider(Protocol):
     def register(self, table: CatalogTable, parents: "list[str] | None" = None, pipeline: str = "canvas") -> None: ...
     def register_output(self, name: str, uri: str, version: "str | None" = None,
                         parents: "list[str] | None" = None, pipeline: "str | None" = "canvas",
+                        lineage: "LineagePublication | None" = None,
                         folder: str = "", tags: "list[str] | None" = None, owner: "str | None" = None,
                         description: "str | None" = None) -> CatalogTable: ...
     def set_metadata(self, uri: str, *, folder: "str | None" = None, tags: "list[str] | None" = None,
@@ -349,6 +351,27 @@ class CatalogProvider(Protocol):
     def set_declared_key(self, uri: str, columns: "list[str] | None") -> None: ...
     def add_relationship(self, rel: Relationship) -> None: ...
     def remove_relationship(self, rel: Relationship) -> None: ...
+
+
+@runtime_checkable
+class CatalogLineageFactExporter(Protocol):
+    """Optional bounded evidence export for catalogs that retain immutable lineage facts.
+
+    A provider that owns an external catalog must serve facts from that same authority. The HTTP route
+    returns 501 when this capability is absent; it never falls back to the built-in metadata side-store.
+    """
+
+    def lineage_facts_page(self, *, limit: int, after_id: int) -> LineageFactsPage: ...
+
+
+@runtime_checkable
+class CatalogLineageRecorder(Protocol):
+    """Optional exact-output capability required before a catalog cache hit can be reused."""
+
+    def record_lineage(
+        self, *, name: str, uri: str, version: str | None,
+        parents: list[str], lineage: LineagePublication,
+    ) -> int: ...
 
 
 @runtime_checkable

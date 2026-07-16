@@ -237,7 +237,7 @@ Current status versus what production ownership still needs:
   workload/driver memory; native connectors are preferable
 - Whole-graph Parquet overwrite data path — implemented; use shared object storage for remote
   clusters and tune the built-in deletion grace to the workload
-- Durable whole-graph Jobs lifecycle — implemented for the documented v3 contract: persisted
+- Durable whole-graph Jobs lifecycle — implemented for the documented v4 contract: persisted
   attempt/submission/control routing, restart reconciliation, durable acknowledged cancel, exact
   artifact fencing, and atomic terminal SQL publication; this does not extend to the multi-region parent
 - Atomic region publication — implemented; distributed and local-fallback handoffs use immutable

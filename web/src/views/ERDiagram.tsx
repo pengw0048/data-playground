@@ -111,6 +111,9 @@ export function ERDiagram() {
   const [tables, setTables] = useState<CatalogTable[]>([])
   const [total, setTotal] = useState(0)
   const [linEdges, setLinEdges] = useState<LineageEdge[]>([])
+  const [lineageFocus, setLineageFocus] = useState<{
+    requested: string; canonical: string
+  } | null>(null)
   const [rels, setRels] = useState<Relationship[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -142,29 +145,32 @@ export function ERDiagram() {
   useEffect(() => { setTables([]); setTotal(0); setLinEdges([]) }, [focus, folder, mode, hops])
 
   // recompute the visible entity set whenever the query (focus / hops / mode / folder / rels) changes
-  const focusName = tables.find((t) => t.uri === focus)?.name ?? focus?.split('/').slice(-1)[0]
+  const visibleFocus = mode === 'lineage' && lineageFocus?.requested === focus
+    ? lineageFocus.canonical : focus
+  const focusName = tables.find((t) => t.uri === visibleFocus)?.name ?? visibleFocus?.split('/').slice(-1)[0]
   useEffect(() => {
     const s = ++dataReq.current
     setLoading(true); setError(null)
     ;(async () => {
       try {
-        if (focus) {
+        if (visibleFocus) {
           if (mode === 'lineage') {
-            const lin = await api.lineage(focus, hops, ER_CAP)
+            const lin = await api.lineage(visibleFocus, hops, ER_CAP)
             const uris = [...new Set(lin.nodes.map((n) => n.uri))]
             const page = uris.length ? await api.tablesPage({ uris, limit: ER_CAP }) : { items: [], total: 0, hasMore: false }
             if (s !== dataReq.current) return
             setTables(page.items); setTotal(page.items.length); setLinEdges(lin.edges)
+            setLineageFocus({ requested: focus ?? visibleFocus, canonical: lin.rootUri })
           } else {
-            const uris = joinNeighbourhood(focus, rels, hops)
+            const uris = joinNeighbourhood(visibleFocus, rels, hops)
             const page = await api.tablesPage({ uris, limit: ER_CAP })
             if (s !== dataReq.current) return
-            setTables(page.items); setTotal(page.items.length); setLinEdges([])
+            setTables(page.items); setTotal(page.items.length); setLinEdges([]); setLineageFocus(null)
           }
         } else {
           const page = await api.tablesPage({ folder: folder || undefined, limit: ER_CAP, sort: 'usage', order: 'desc' })
           if (s !== dataReq.current) return
-          setTables(page.items); setTotal(page.total); setLinEdges([])
+          setTables(page.items); setTotal(page.total); setLinEdges([]); setLineageFocus(null)
         }
       } catch (e) {
         if (s === dataReq.current) setError(errorMessage(e))
@@ -173,7 +179,7 @@ export function ERDiagram() {
       }
     })()
     return () => { dataReq.current += 1 }
-  }, [focus, hops, mode, folder, rels, reloadKey])
+  }, [focus, visibleFocus, hops, mode, folder, rels, reloadKey])
 
   const refresh = useCallback(() => setReloadKey((k) => k + 1), [])
 
@@ -189,8 +195,8 @@ export function ERDiagram() {
   const nodes: Node[] = useMemo(() => visible.map((t, i) => ({
     id: t.id, type: 'entity',
     position: positions[t.id] ?? { x: (i % 3) * 300, y: Math.floor(i / 3) * 300 },
-    data: { table: t, pk: pkOf(t), focused: t.uri === focus, onFocus: () => setFocus(t.uri) } satisfies EntityData,
-  })), [visible, positions, focus])
+    data: { table: t, pk: pkOf(t), focused: t.uri === visibleFocus, onFocus: () => setFocus(t.uri) } satisfies EntityData,
+  })), [visible, positions, visibleFocus])
 
   const edges: Edge[] = useMemo(() => {
     const out: Edge[] = []

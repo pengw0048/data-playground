@@ -150,6 +150,8 @@ _GPU_BATCH_ROWS_DEFAULT = 4096
 _GPU_BATCH_ROWS_MAX = 65536
 _JOB_CONTRACT_VERSION = RAY_JOB_CONTRACT_VERSION
 _JOB_RESULT_FIELDS = RAY_JOB_RESULT_FIELDS
+_JOB_LINEAGE_PARENT_MAX_COUNT = 5_000
+_JOB_LINEAGE_PARENT_URI_MAX_LENGTH = 8_192
 
 
 class ArtifactContractError(RuntimeError):
@@ -1449,6 +1451,17 @@ class RayRunner:
             managed.add(uri)
         return sorted(managed)
 
+    @staticmethod
+    def _publication_lineage_parents(graph, step_ids) -> dict[str, list[str]]:
+        """Canonicalize every sink's provenance before allocation or driver dispatch."""
+        from hub import metadb
+
+        return {
+            step_id: metadb.catalog_lineage_parent_tokens(
+                g.all_upstream_publication_uris(graph, step_id))
+            for step_id in sorted(step_ids)
+        }
+
     def _make_jobs_artifacts(self, run_id: str, graph, target, *, sink_targets=None,
                              sink_contracts=None, source_attempts=None,
                              materialize_uri=None, requires=None) -> tuple[dict, dict]:
@@ -1465,6 +1478,26 @@ class RayRunner:
                 "Ray Jobs requires a durable run owner before artifact allocation"
             )
         graph_doc = prepare_workload_graph(graph)
+        publication_targets = {} if sink_targets is None else sink_targets
+        lineage_parents = self._publication_lineage_parents(
+            graph, publication_targets)
+        publication_context = {
+            "run_id": getattr(graph, "_publication_run_id", None) or run_id,
+            "producer": getattr(graph, "_publication_producer_id", None) or graph.id,
+            "producer_version": (
+                getattr(graph, "_publication_producer_version", None)
+                if getattr(graph, "_publication_producer_version", None) is not None
+                else graph.version
+            ),
+            # A region cut replaces original sources with temporary materializations in ``graph_doc``.
+            # Freeze the controller-owned parent set before serialization so restart reconstruction
+            # cannot publish those execution-only refs as catalog lineage.
+            "lineage_parents": lineage_parents,
+        }
+        self._validated_publication_context({
+            "publication_context": publication_context,
+            "sink_targets": sink_targets,
+        })
         semantic_env = build_workload_semantic_env()
         semantic_env.update({
             "DP_RAY_JOB_MODE": "1",
@@ -1480,6 +1513,7 @@ class RayRunner:
         canonical = {
             "contract_version": _JOB_CONTRACT_VERSION,
             "run_id": run_id,
+            "publication_context": publication_context,
             "graph": graph_doc,
             "target": target,
             "source_attempts": source_attempts or [],
@@ -1522,6 +1556,67 @@ class RayRunner:
     @staticmethod
     def _ref_model(ref: dict) -> RunBackendRef:
         return RunBackendRef.model_validate(ref)
+
+    @staticmethod
+    def _validated_publication_context(job: dict) -> dict:
+        """Validate catalog provenance frozen into this hash-bound Jobs attempt."""
+        context = job.get("publication_context")
+        fields = {"run_id", "producer", "producer_version", "lineage_parents"}
+        if not isinstance(context, dict) or set(context) != fields:
+            raise ArtifactContractError("Ray job publication context is incomplete")
+        if any(not isinstance(context.get(key), str) or not context[key].strip()
+               or context[key] != context[key].strip() or len(context[key]) > 512
+               for key in ("run_id", "producer")):
+            raise ArtifactContractError("Ray job publication context has an invalid identity")
+        version = context.get("producer_version")
+        if (isinstance(version, bool) or not isinstance(version, int)
+                or version < 0 or version > 2**53 - 1):
+            raise ArtifactContractError("Ray job publication context has an invalid producer version")
+        raw_targets = job.get("sink_targets")
+        targets = {} if raw_targets is None else raw_targets
+        parents_by_sink = context.get("lineage_parents")
+        if (not isinstance(targets, dict) or not isinstance(parents_by_sink, dict)
+                or set(parents_by_sink) != set(targets)
+                or any(not isinstance(step_id, str) or not step_id.strip()
+                       or step_id != step_id.strip() or len(step_id) > 256
+                       for step_id in parents_by_sink)):
+            raise ArtifactContractError(
+                "Ray job publication context does not match its sink target set"
+            )
+        for step_id, parents in parents_by_sink.items():
+            if (not isinstance(parents, list)
+                    or len(parents) > _JOB_LINEAGE_PARENT_MAX_COUNT):
+                raise ArtifactContractError(
+                    f"Ray job publication context has invalid parents for sink '{step_id}'"
+                )
+            canonical: list[str] = []
+            for uri in parents:
+                if (not isinstance(uri, str) or not uri.strip()
+                        or len(uri) > _JOB_LINEAGE_PARENT_URI_MAX_LENGTH
+                        or uri != uri.strip()):
+                    raise ArtifactContractError(
+                        f"Ray job publication context has invalid parents for sink '{step_id}'"
+                    )
+                canonical_uri = uri.rstrip("/")
+                if not canonical_uri or uri != canonical_uri:
+                    raise ArtifactContractError(
+                        f"Ray job publication context has invalid parents for sink '{step_id}'"
+                    )
+                canonical.append(canonical_uri)
+            if parents != sorted(set(canonical)):
+                raise ArtifactContractError(
+                    f"Ray job publication context has non-canonical parents for sink '{step_id}'"
+                )
+        return context
+
+    @staticmethod
+    def _restore_publication_context(job: dict, graph):
+        context = RayRunner._validated_publication_context(job)
+        graph._publication_run_id = context["run_id"]
+        graph._publication_attempt_id = None
+        graph._publication_producer_id = context["producer"]
+        graph._publication_producer_version = context["producer_version"]
+        return graph
 
     @staticmethod
     def _validated_sink_contracts(job: dict) -> dict[str, dict[str, str]]:
@@ -1671,6 +1766,7 @@ class RayRunner:
             raise ArtifactContractError("Ray job artifact semantic environment hash does not match")
         if _jobs_submission_id(status.run_id, attempt_id) != ref.submission_id:
             raise ArtifactContractError("Ray job artifact submission_id is not deterministic")
+        self._validated_publication_context(job)
         self._validated_source_attempts(job)
         self._validated_sink_contracts(job)
 
@@ -2778,6 +2874,7 @@ class RayRunner:
                 source_attempts = self._jobs_source_attempts(graph, target_node_id)
             else:
                 sink_targets = self._resolve_sink_targets(ir)
+            self._publication_lineage_parents(graph, sink_targets)
         except Exception as exc:  # noqa: BLE001 — resolve/adapter uncertainty ⇒ local or explicit failure
             if self.jobs_address:
                 raise
@@ -2917,13 +3014,17 @@ class RayRunner:
             return snapshot.model_copy(deep=True) if snapshot is not None else None
 
     def _register_outputs(self, graph, result, job: dict | None = None, *,
-                          expected_targets=None, expected_attempts=None) -> None:
+                          expected_targets=None, expected_attempts=None,
+                          backend_run_id: str | None = None) -> dict[str, str | None]:
         """Publish driver-written outputs through the hub-owned catalog/control plane."""
         from hub.plugins.adapters import is_object_uri
         from hub.plugins.catalog import (
+            canonical_lineage_parent_tokens,
             core_managed_publisher,
+            lineage_for_output,
             publish_unmanaged_output_attested,
         )
+        from hub.plugins.runner import _catalog_publication_version
         durable_catalog = self.catalog if job and isinstance(
             self.catalog, DurableCatalogPublisher
         ) else None
@@ -2934,6 +3035,9 @@ class RayRunner:
                 "Ray Jobs requires the DurableCatalogPublisher capability: "
                 "register_output_idempotent(...) and record_usage_idempotent(idempotency_key, parents)"
             )
+        if job and "run_id" in job:
+            self._restore_publication_context(job, graph)
+            backend_run_id = str(job["run_id"])
         nodes = {node.id: node for node in graph.nodes}
         outputs = result.get("outputs") or []
         if expected_targets is not None:
@@ -2965,11 +3069,30 @@ class RayRunner:
                         f"ray driver returned an unexpected physical URI for sink '{step_id}'")
 
         run_parents: list[str] = []
+        published_versions: dict[str, str | None] = {}
+        frozen_parents = (
+            self._validated_publication_context(job)["lineage_parents"]
+            if job else None
+        )
         for output in outputs:
             step_id, name, uri = output["step_id"], output["name"], output["uri"]
             logical_uri = output.get("logical_uri")
-            parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
+            parents = (
+                list(frozen_parents[step_id]) if frozen_parents is not None
+                else canonical_lineage_parent_tokens(
+                    g.all_upstream_publication_uris(graph, step_id))
+            )
             run_parents.extend(parents)
+            lineage = None
+            if backend_run_id:
+                lineage_kwargs = {}
+                if job:
+                    event_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
+                    lineage_kwargs = {
+                        "attempt_id": job["attempt_id"], "idempotency_key": event_key,
+                    }
+                lineage = lineage_for_output(
+                    graph, backend_run_id, step_id, **lineage_kwargs)
             managed_attempt = bool(logical_uri and is_object_uri(uri) and is_attempt_uri(uri))
             if managed_attempt:
                 publish = core_managed_publisher(self.catalog)
@@ -2977,7 +3100,8 @@ class RayRunner:
                     raise RuntimeError("managed object output has no core publisher")
                 try:
                     receipt = publish(
-                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas")
+                        name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
+                        lineage=lineage)
                 except Exception as exc:
                     logging.getLogger(__name__).exception(
                         "Ray managed sink publication failed for step %s", step_id)
@@ -2987,11 +3111,13 @@ class RayRunner:
                 if not isinstance(receipt, dict) or receipt.get("uri") != uri:
                     raise RuntimeError(
                         f"core publisher returned an invalid receipt for sink '{step_id}'")
+                published_versions[step_id] = _catalog_publication_version(receipt)
             elif register_once is not None:
                 idempotency_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
                 raw_receipt = register_once(
                     idempotency_key=idempotency_key,
                     name=name, uri=uri, version=None, parents=parents, pipeline="canvas",
+                    lineage=lineage,
                 )
                 try:
                     receipt = CatalogPublicationReceipt.model_validate(raw_receipt)
@@ -3003,15 +3129,21 @@ class RayRunner:
                     raise RuntimeError(
                         "durable catalog publisher returned a receipt for a different output effect"
                     )
+                published_versions[step_id] = receipt.version
             else:
-                publish_unmanaged_output_attested(
+                observed = publish_unmanaged_output_attested(
                     self.catalog, name=name, uri=uri, version=None,
-                    parents=parents, pipeline="canvas")
+                    parents=parents, pipeline="canvas", lineage=lineage)
+                published_versions[step_id] = (
+                    observed.get("version") if isinstance(observed, dict)
+                    else getattr(observed, "version", None)
+                )
         if usage_once and (result.get("outputs") or []):
             usage_once(
                 idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}",
                 parents=list(dict.fromkeys(run_parents)),
             )
+        return published_versions
 
     @staticmethod
     def _listed_job_status(jobs, submission_id: str) -> str | None:
@@ -3314,10 +3446,11 @@ class RayRunner:
         return True
 
     @staticmethod
-    def _apply_public_result(status: RunStatus, result: dict) -> None:
-        """Map the private Ray v3 artifact into the public RunOutput collection.
+    def _apply_public_result(
+            status: RunStatus, result: dict, *, catalog_version: str | None = None) -> None:
+        """Map the private Ray v4 artifact into the public RunOutput collection.
 
-        The artifact's ``output_uri``/``output_table`` keys intentionally remain private version-3
+        The artifact's ``output_uri``/``output_table`` keys intentionally remain private version-4
         fields. They never leak as top-level RunStatus fields.
         """
         status.rows_processed = int(result.get("rows") or 0)
@@ -3333,7 +3466,7 @@ class RayRunner:
                 raise RuntimeError("successful Ray result has no published output URI")
             committed = commit_output(
                 status, uri=str(uri), table=result.get("output_table"),
-                rows=status.rows_processed)
+                version=catalog_version, rows=status.rows_processed)
             status.total_rows = committed.rows
             return
         settle_uncommitted_outputs(
@@ -3358,8 +3491,10 @@ class RayRunner:
             self, job: dict, graph, result: dict) -> tuple[list[dict], dict | None]:
         """Preflight object/schema reads and freeze every managed SQL effect before the barrier."""
         from hub import metadb
-        from hub.plugins.catalog import core_managed_publication_planner
+        from hub.plugins.catalog import core_managed_publication_planner, lineage_for_output
 
+        self._restore_publication_context(job, graph)
+        frozen_parents = self._validated_publication_context(job)["lineage_parents"]
         outputs = sorted(result.get("outputs") or [], key=lambda item: item["step_id"])
         if not outputs:
             return [], None
@@ -3377,13 +3512,25 @@ class RayRunner:
             spec = SinkSpec.from_config(node.data.get("config") or {}, node.data.get("title"))
             if output["name"] != spec.name:
                 raise RuntimeError(f"Ray driver returned an unexpected name for sink '{step_id}'")
-            parents = list(dict.fromkeys(g.all_upstream_publication_uris(graph, step_id)))
+            try:
+                parents = list(frozen_parents[step_id])
+            except KeyError as e:
+                raise ArtifactContractError(
+                    f"Ray job publication context has no parents for sink '{step_id}'"
+                ) from e
             run_parents.extend(parents)
+            event_key = f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}"
+            lineage = lineage_for_output(
+                graph, job["run_id"], step_id,
+                attempt_id=job["attempt_id"], idempotency_key=event_key,
+            )
+            # The managed plan remains owned by the backend/storage run. The independent lineage
+            # payload carries a controller's outer logical run when they differ.
             plans.append(planner(
                 run_id=job["run_id"], step_id=step_id,
-                idempotency_key=f"{_JOBS_BACKEND}:{job['attempt_id']}:{step_id}",
+                idempotency_key=event_key,
                 name=output["name"], uri=output["uri"], version=None,
-                parents=parents, pipeline="canvas",
+                parents=parents, pipeline="canvas", lineage=lineage,
             ))
         usage = None
         if plans:
@@ -3392,6 +3539,24 @@ class RayRunner:
                 list(dict.fromkeys(run_parents)),
             )
         return plans, usage
+
+    @staticmethod
+    def _apply_staged_catalog_version(status: RunStatus, plans: list[dict]) -> None:
+        """Bind the public output to the exact version frozen in its staged catalog effect."""
+        output = sole_output(status, committed=True)
+        if output is None or output.publication_kind != "catalog":
+            raise RuntimeError("Ray Jobs staged a catalog effect without one committed output")
+        matches = [plan for plan in plans if plan.get("step_id") == output.node_id]
+        if (len(matches) != 1 or matches[0].get("uri") != output.uri
+                or matches[0].get("name") != output.table):
+            raise RuntimeError("Ray Jobs staged catalog effect does not match its public output")
+        if output.rows is None:
+            raise RuntimeError("Ray Jobs committed output has no row count")
+        commit_output(
+            status, uri=output.uri, table=output.table,
+            version=matches[0].get("version"), rows=output.rows,
+            port_id=output.port_id,
+        )
 
     def _apply_job_publication_effects(self, effects: dict) -> None:
         """Replay only frozen SQL effects; no artifact, manifest, schema, or Ray reads are allowed."""
@@ -3421,7 +3586,8 @@ class RayRunner:
         if not isinstance(job, dict) or canonical_json(job) != payload:
             return None
         self._validate_job_artifact_integrity(ref, candidate, job)
-        return Graph.model_validate(job["graph"])
+        return self._restore_publication_context(
+            job, Graph.model_validate(job["graph"]))
 
     def _publish_job_result(self, job: dict, graph, target, status: RunStatus, result: dict, *,
                             artifact_error: bool = False) -> None:
@@ -3504,6 +3670,8 @@ class RayRunner:
                             catalog_effects, usage_effect = \
                                 self._prepare_job_publication_effects(
                                     job, graph, validated_result)
+                            if catalog_effects:
+                                self._apply_staged_catalog_version(candidate, catalog_effects)
                         stage = metadb.begin_backend_publication_effects(
                             status.run_id, ref.attempt_id, owner, candidate.model_dump(),
                             validated_result, sink_attempts,
@@ -4834,15 +5002,19 @@ class RayRunner:
             and (expected_targets is not None or bool(result.get("outputs")))
         )
         shared_error = None
+        published_versions: dict[str, str | None] = {}
         if should_publish:
             try:
                 if expected_targets is None and expected_attempts is None:
-                    self._register_outputs(graph, result)
+                    published_versions = self._register_outputs(
+                        graph, result, backend_run_id=status.run_id)
                 else:
-                    self._register_outputs(
+                    published_versions = self._register_outputs(
                         graph, result, expected_targets=expected_targets,
                         expected_attempts=expected_attempts,
+                        backend_run_id=status.run_id,
                     )
+                published_versions = published_versions or {}
             except Exception as exc:  # noqa: BLE001 — local parity: catalog commit failure fails the run
                 logging.getLogger(__name__).exception("Ray output publication failed")
                 shared_error = self._stable_exception(
@@ -4855,7 +5027,10 @@ class RayRunner:
         # Local Popen driver shares the hub's host and trust boundary, so its failure text is surfaced
         # verbatim; only cross-boundary Jobs results are reduced to a stable code by _apply_job_result.
         status.error = shared_error or (str(result["error"]) if result.get("error") else None)
-        self._apply_public_result(status, result)
+        self._apply_public_result(
+            status, result,
+            catalog_version=published_versions.get(status.target_node_id),
+        )
         if status.status == "done":
             status.progress = 1.0
 

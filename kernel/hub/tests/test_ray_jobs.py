@@ -205,7 +205,8 @@ class CountingCatalog:
             metadb.catalog_upsert_entry(kwargs["uri"], kwargs["name"], {
                 "id": kwargs["name"], "name": kwargs["name"], "uri": kwargs["uri"],
                 "version": kwargs.get("version"), "columns": [], "tags": [],
-            })
+            }, lineage=(kwargs["lineage"].model_dump()
+                        if kwargs.get("lineage") is not None else None))
             metadb.catalog_record_output_publication(
                 idempotency_key, kwargs["uri"], kwargs.get("version")
             )
@@ -259,6 +260,8 @@ class PersistingManagedCatalog(CountingCatalog):
                 "version": kwargs.get("version"), "columns": [], "tags": [],
             },
             parents=kwargs.get("parents"), pipeline=kwargs.get("pipeline"),
+            lineage=(kwargs["lineage"].model_dump()
+                     if kwargs.get("lineage") is not None else None),
         )
         with self.lock:
             if uri not in self.managed_uris:
@@ -404,6 +407,318 @@ def _runner(jobs_config, client=None, store=None, recover=False, catalog=None):
         deps, jobs_client_factory=client, artifact_store=store, recover=recover
     )
     return module, deps, runner, client, store
+
+
+def test_ray_jobs_hash_binds_catalog_publication_context(jobs_config):
+    module, _deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    graph._publication_run_id = "outer-run"
+    graph._publication_producer_id = "original-canvas"
+    graph._publication_producer_version = 9
+    sink_targets = {"write": "s3://shared/outputs/jobs_out.parquet"}
+    physical_uri = module._attempt_handoff_uri(
+        sink_targets["write"],
+        "backend-subrun",
+        scope="write",
+        namespace="publication-context-test",
+        generation=1,
+        attempt_id="publication-context-test",
+    )
+    sink_contracts = {"write": {
+        "name": "jobs_out",
+        "logical_uri": sink_targets["write"],
+        "physical_uri": physical_uri,
+        "writer": "worker-direct-parquet",
+    }}
+
+    ref, job = runner._make_jobs_artifacts(
+        "backend-subrun", graph, "write",
+        sink_targets=sink_targets, sink_contracts=sink_contracts,
+    )
+
+    assert job["contract_version"] == 4
+    assert job["publication_context"] == {
+        "run_id": "outer-run",
+        "producer": "original-canvas",
+        "producer_version": 9,
+        "lineage_parents": {"write": ["s3://shared/input.parquet"]},
+    }
+    restored = runner._restore_publication_context(
+        job, Graph.model_validate(job["graph"]))
+    from hub.plugins.catalog import lineage_for_output
+    publication = lineage_for_output(
+        restored, job["run_id"], "write",
+        attempt_id=job["attempt_id"], idempotency_key="ray-jobs:effect:write",
+    )
+    assert publication.run_id == "outer-run"
+    assert publication.attempt_id == job["attempt_id"]
+    assert publication.producer == "original-canvas"
+    assert publication.producer_version == 9
+
+    changed = graph.model_copy(deep=True)
+    changed._publication_producer_version = 10
+    changed_ref, changed_job = runner._make_jobs_artifacts(
+        "backend-subrun", changed, "write",
+        sink_targets=sink_targets, sink_contracts=sink_contracts,
+    )
+    assert changed_job["publication_context"]["producer_version"] == 10
+    assert changed_ref["attempt_id"] != ref["attempt_id"]
+
+    changed_parents = graph.model_copy(deep=True)
+    changed_parents._publication_source_uris = {
+        "src": ("s3://shared/original-before-region-cut.parquet",),
+    }
+    parent_ref, parent_job = runner._make_jobs_artifacts(
+        "backend-subrun", changed_parents, "write",
+        sink_targets=sink_targets, sink_contracts=sink_contracts,
+    )
+    assert parent_job["publication_context"]["lineage_parents"] == {
+        "write": ["s3://shared/original-before-region-cut.parquet"],
+    }
+    assert parent_ref["attempt_id"] != ref["attempt_id"]
+
+    malformed = dict(job, publication_context={"run_id": "outer-run"})
+    with pytest.raises(module.ArtifactContractError, match="publication context"):
+        runner._validated_publication_context(malformed)
+
+    max_safe_context = {
+        "run_id": "outer-run", "producer": "original-canvas",
+        "producer_version": 2**53 - 1,
+        "lineage_parents": {},
+    }
+    assert runner._validated_publication_context({
+        "publication_context": max_safe_context,
+    }) == max_safe_context
+    invalid_contexts = [
+        {**max_safe_context, "run_id": " outer-run"},
+        {**max_safe_context, "run_id": "outer-run "},
+        {**max_safe_context, "producer": " original-canvas"},
+        {**max_safe_context, "producer": "original-canvas "},
+        {**max_safe_context, "producer_version": True},
+        {**max_safe_context, "producer_version": "9"},
+        {**max_safe_context, "producer_version": -1},
+        {**max_safe_context, "producer_version": 2**53},
+    ]
+    for invalid_context in invalid_contexts:
+        with pytest.raises(module.ArtifactContractError, match="publication context"):
+            runner._validated_publication_context({
+                "publication_context": invalid_context,
+            })
+
+    base_context = job["publication_context"]
+    invalid_parent_maps = [
+        {},
+        {"other": ["s3://shared/input.parquet"]},
+        {"write": ["s3://shared/input.parquet/"]},
+        {"write": ["s3://shared/input.parquet", "s3://shared/input.parquet"]},
+        {"write": ["s3://shared/z.parquet", "s3://shared/a.parquet"]},
+        {"write": [" "]},
+        {"write": ["s3://shared/input.parquet "]},
+        {"write": ["///"]},
+        {"write": ["x" * 8193]},
+        {"write": [f"s3://shared/{index}.parquet" for index in range(5001)]},
+    ]
+    for invalid_parents in invalid_parent_maps:
+        with pytest.raises(module.ArtifactContractError, match="publication context"):
+            runner._validated_publication_context({
+                "publication_context": {
+                    **base_context,
+                    "lineage_parents": invalid_parents,
+                },
+                "sink_targets": sink_targets,
+            })
+
+    for invalid_step_id in (" write", "write ", "x" * 257):
+        with pytest.raises(module.ArtifactContractError, match="publication context"):
+            runner._validated_publication_context({
+                "publication_context": {
+                    **base_context,
+                    "lineage_parents": {
+                        invalid_step_id: ["s3://shared/input.parquet"],
+                    },
+                },
+                "sink_targets": {invalid_step_id: sink_targets["write"]},
+            })
+
+    source_free = Graph.model_validate({
+        "id": "source-free-generator",
+        "version": 1,
+        "nodes": [{
+            "id": "write",
+            "type": "write",
+            "position": {"x": 0, "y": 0},
+            "data": {"config": {"filename": "jobs_out.parquet"}},
+        }],
+        "edges": [],
+    })
+    source_free_ref, source_free_job = runner._make_jobs_artifacts(
+        "source-free-backend",
+        source_free,
+        "write",
+        sink_targets=sink_targets,
+        sink_contracts=sink_contracts,
+    )
+    assert source_free_job["publication_context"]["lineage_parents"] == {"write": []}
+    assert runner._validated_publication_context(source_free_job) == (
+        source_free_job["publication_context"]
+    )
+    assert module._job_attempt_id(source_free_job) == source_free_ref["attempt_id"]
+    assert Graph.model_validate(source_free_job["graph"]).id == "source-free-generator"
+
+
+def test_ray_rejects_invalid_lineage_parent_before_sink_allocation(jobs_config):
+    _module, _deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph(source="s" * 8_193)
+
+    with pytest.raises(ValueError, match="exceeds 8192 characters"):
+        runner._publication_lineage_parents(
+            graph, {"write": "s3://shared/outputs/jobs_out.parquet"})
+
+
+def test_ray_jobs_managed_plan_keeps_outer_lineage_independent_from_backend_run(
+        jobs_config, monkeypatch):
+    _module, deps, runner, _client, _store = _runner(jobs_config)
+    graph = _graph()
+    outer_run = f"outer-{uuid.uuid4().hex}"
+    backend_run = f"backend-{uuid.uuid4().hex}"
+    graph._publication_run_id = outer_run
+    graph._publication_producer_id = "controller-owned-canvas"
+    graph._publication_producer_version = 17
+    plan = compile_plan(
+        graph, "write", deps.registry, deps.node_specs, deps.node_ir)
+    runner._ensure_jobs_supervisor = lambda _run_id: None
+
+    status = runner.run(
+        plan, graph, "write", "distributed", run_id=backend_run)
+    assert status.backend_ref is not None
+    captured = {}
+    begin_effects = metadb.begin_backend_publication_effects
+
+    def capture_effects(*args, **kwargs):
+        captured["catalog_effects"] = kwargs.get("catalog_effects")
+        return begin_effects(*args, **kwargs)
+
+    monkeypatch.setattr(metadb, "begin_backend_publication_effects", capture_effects)
+    _publish_test_backend_done(runner, graph, status)
+
+    final = runner.status(backend_run)
+    assert final.status == "done"
+    assert captured["catalog_effects"] is not None
+    assert len(captured["catalog_effects"]) == 1
+    managed_plan = captured["catalog_effects"][0]
+    assert managed_plan["run_id"] == backend_run
+    assert managed_plan["lineage"]["run_id"] == outer_run
+    assert managed_plan["lineage"]["attempt_id"] == status.backend_ref.attempt_id
+    assert final.outputs[0].version == managed_plan["version"]
+
+    with metadb.session() as session:
+        facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.run_id == outer_run)))
+    assert len(facts) == 1
+    assert facts[0].attempt_id == status.backend_ref.attempt_id
+    assert facts[0].producer == "controller-owned-canvas"
+    assert facts[0].producer_version == 17
+
+
+def test_region_cut_lineage_parents_survive_job_artifact_reconstruction(
+        jobs_config, monkeypatch):
+    from hub import graph as graph_ops
+    from hub.planner import Region
+    from hub.plugins import catalog as catalog_plugin
+
+    module, deps, runner, _client, _store = _runner(jobs_config)
+    original_source = f"s3://shared/original-{uuid.uuid4().hex}.parquet"
+    materialized_region = f"s3://shared/region-{uuid.uuid4().hex}.parquet"
+    original = _graph(name="region_out", source=original_source)
+    final_region = Region(
+        id="final",
+        node_ids={"write"},
+        output_node="write",
+        backend="ray-data",
+        worker=None,
+        requires=ResourceSpec(),
+        cut_inputs=[("map", None, "write", None)],
+    )
+    subgraph = deps.controller._subgraph(
+        original, final_region, {"map": materialized_region}
+    )
+    assert graph_ops.all_upstream_publication_uris(subgraph, "write") == [original_source]
+
+    backend_run = f"backend-region-{uuid.uuid4().hex}"
+    logical_uri = f"s3://shared/outputs/region-{uuid.uuid4().hex}.parquet"
+    physical_uri = module._attempt_handoff_uri(
+        logical_uri,
+        backend_run,
+        scope="write",
+        namespace="lineage-test",
+        generation=1,
+        attempt_id=uuid.uuid4().hex,
+    )
+    assert module.is_attempt_uri(physical_uri)
+    sink_targets = {"write": logical_uri}
+    sink_contracts = {"write": {
+        "name": "region_out",
+        "logical_uri": logical_uri,
+        "physical_uri": physical_uri,
+        "writer": "worker-direct-parquet",
+    }}
+    _ref, job = runner._make_jobs_artifacts(
+        backend_run,
+        subgraph,
+        "write",
+        sink_targets=sink_targets,
+        sink_contracts=sink_contracts,
+    )
+    assert job["publication_context"]["lineage_parents"] == {
+        "write": [original_source],
+    }
+
+    rebuilt = Graph.model_validate(job["graph"])
+    assert graph_ops.all_upstream_publication_uris(rebuilt, "write") == [materialized_region]
+
+    prepared: list[dict] = []
+
+    def fake_planner(**kwargs):
+        prepared.append(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(
+        catalog_plugin,
+        "core_managed_publication_planner",
+        lambda _catalog: fake_planner,
+    )
+    monkeypatch.setattr(
+        metadb,
+        "catalog_prepare_usage_publication",
+        lambda run_id, event_key, parents: {
+            "run_id": run_id,
+            "event_key": event_key,
+            "parents": parents,
+        },
+    )
+    result = {"outputs": [{
+        "step_id": "write",
+        "name": "region_out",
+        "uri": physical_uri,
+        "logical_uri": logical_uri,
+    }]}
+    plans, usage = runner._prepare_job_publication_effects(job, rebuilt, result)
+    assert plans == prepared
+    assert prepared[0]["parents"] == [original_source]
+    assert prepared[0]["lineage"].producer == original.id
+    assert usage["parents"] == [original_source]
+
+    catalog = CountingCatalog()
+    runner.catalog = catalog
+    unmanaged_uri = f"s3://shared/published-{uuid.uuid4().hex}.parquet"
+    runner._register_outputs(rebuilt, {"outputs": [{
+        "step_id": "write",
+        "name": "region_out",
+        "uri": unmanaged_uri,
+    }]}, job)
+    assert catalog.calls[0]["parents"] == [original_source]
+    assert catalog.calls[0]["lineage"].producer == original.id
+    assert catalog.usage_calls[0]["parents"] == [original_source]
 
 
 def _wait(runner, run_id: str, terminal=True, timeout=10.0):
@@ -951,7 +1266,7 @@ def test_ray_jobs_preallocated_run_id_uses_full_uuid_entropy(jobs_config):
     assert prefix == "run" and len(value) == 32 and int(value, 16) >= 0
 
 
-def test_v3_result_validation_uses_frozen_sink_contract_after_adapter_drift(jobs_config):
+def test_v4_result_validation_uses_frozen_sink_contract_after_adapter_drift(jobs_config):
     _module, deps, runner, client, store = _runner(jobs_config)
     graph = _graph()
     plan = compile_plan(graph, "write", deps.registry, deps.node_specs, deps.node_ir)
@@ -1102,7 +1417,7 @@ def test_negative_effect_stage_requires_exact_sinks_and_durable_derive_authority
     })
     tampered_candidate = candidate.model_dump()
     tampered_candidate["outputs"][0]["uri"] = "s3://private/remote-output"
-    with pytest.raises(ValueError, match="cannot expose a URI or table identity"):
+    with pytest.raises(ValueError, match="cannot expose a URI, table, or catalog version"):
         metadb.begin_backend_publication_effects(
             status.run_id, ref.attempt_id, owner, tampered_candidate,
             None, {"write": sink_uri}, catalog_effects=[], usage_effect=None,
@@ -2913,14 +3228,34 @@ def test_ray_jobs_multi_sink_usage_is_one_event_per_run(jobs_config):
         {"step_id": "write-b", "name": "b", "uri": "s3://shared/b.parquet"},
     ]}
 
-    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
-    runner._register_outputs(graph, result, {"attempt_id": "attempt-multi"})
+    job = {
+        "run_id": "run-multi",
+        "attempt_id": "attempt-multi",
+        "sink_targets": {
+            "write-a": "s3://shared/a.parquet",
+            "write-b": "s3://shared/b.parquet",
+        },
+        "publication_context": {
+            "run_id": "outer-multi",
+            "producer": "original-multi-canvas",
+            "producer_version": 3,
+            "lineage_parents": {
+                "write-a": [left_source, right_source],
+                "write-b": [left_source, right_source],
+            },
+        },
+    }
+    runner._register_outputs(graph, result, job)
+    runner._register_outputs(graph, result, job)
 
     assert len(catalog.calls) == 2, "each output remains independently idempotent"
     assert len(catalog.usage_calls) == 1
     assert catalog.usage_calls[0]["idempotency_key"] == "ray-jobs:attempt-multi"
     assert set(catalog.usage_calls[0]["parents"]) == {left_source, right_source}
     assert all(set(call["parents"]) == {left_source, right_source} for call in catalog.calls)
+    assert all(call["lineage"].run_id == "outer-multi" for call in catalog.calls)
+    assert all(call["lineage"].attempt_id == "attempt-multi" for call in catalog.calls)
+    assert all(call["lineage"].producer == "original-multi-canvas" for call in catalog.calls)
 
 
 def test_ray_jobs_failure_never_shares_rotated_credentials_or_remote_text(
