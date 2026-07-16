@@ -20,7 +20,6 @@ from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, Wo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
 from hub.plugins.capabilities import BUILTIN_CAPABILITIES
-from hub.plugins.catalog import InMemoryCatalog
 from hub.plugins.processors import InMemoryProcessorRegistry
 from hub.plugins.runner import LocalRunner
 from hub.settings import settings
@@ -349,6 +348,9 @@ class Deps:
         self.managed_object_provider = None
         self.plugins: list[dict] = []
         self._manifests: dict[str, dict] = {}
+        # Plugins register before services are constructed.  Keep the collection available now so a
+        # plugin backend can register itself, then append the built-ins after they bind the final catalog.
+        self.runners: list = []
         from hub.storage import make_storage
         self.storage = make_storage(workspace)
         # The catalog is shared by every user (by design — one workspace, not one kernel per session);
@@ -360,8 +362,11 @@ class Deps:
         # later can still replace it (set_catalog). See _load_bundled.
         self.catalog = None  # set by the bundled default-catalog plugin immediately below
         self._load_bundled()
-        if self.catalog is None:  # defensive: a catalog must always exist (clone-it-and-it-works)
-            self.catalog = InMemoryCatalog(data_dir, self.resolve_adapter)
+        if self.catalog is None:
+            raise RuntimeError("bundled default-catalog plugin did not install a catalog")
+        # Catalog selection is a composition-time decision.  Do not construct a runner, profile
+        # supervisor, or run controller until every plugin has had its one registration opportunity.
+        self._load_plugins()
         # recover/clean any temp siblings an interrupted append/compaction left behind BEFORE re-cataloging,
         # so a crash can't surface a half-written staging file as a dataset or leave a compacting one absent.
         if maintain_storage:
@@ -406,7 +411,7 @@ class Deps:
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         sub.result_put = _result_put
-        self.runners = [self.runner, sub]
+        self.runners.extend([self.runner, sub])
         # opt-in reference multi-worker pool (DP_POOL_WORKERS): capability-based placement without a
         # cluster — pods are processes with configured capacities. Shows in the Compute view + is
         # selectable/placeable. Absent → default behavior unchanged. (k8s/Ray = plugins over the same API.)
@@ -441,7 +446,6 @@ class Deps:
         self.controller.on_complete = _on_complete
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
-        self._load_plugins()
 
     def resolve_adapter(self, uri: str):
         for a in self.adapters:
@@ -491,16 +495,14 @@ class Deps:
         """Register the first-party DEFAULTS through the public plugin seam, BEFORE any external plugin.
         Today that's the default catalog: the built-in installs itself via reg.set_catalog exactly like a
         third-party catalog would, so it's the first implementation through the seam — not a privileged
-        core instantiation — and a plugin loaded later can still replace it. Kept minimal + never fatal:
-        a bundled default that fails to register falls back to the defensive path in __init__."""
+        core instantiation — and a plugin loaded later can still replace it. This required plugin must
+        install a catalog; startup cannot continue with an ambiguous composition root."""
         reg = Registry(self)
         from hub.plugins import default_catalog
         reg._pack = "default-catalog"
         try:
             default_catalog.register(reg)
             self.plugins.append({"name": "default-catalog", "source": "builtin"})
-        except Exception as e:  # noqa: BLE001
-            print(f"[deps] bundled default-catalog failed to register: {e}")
         finally:
             reg._pack = None
 

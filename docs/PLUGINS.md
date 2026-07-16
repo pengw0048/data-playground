@@ -176,13 +176,12 @@ so SQL rows appear on every read surface).
 node and edge. A provider that accepts aliases must resolve the requested alias into this field; clients
 use it to identify the root and do not guess from names or provider-specific identifiers.
 
-`reg.set_catalog` selects the provider used by catalog routes and later dependency lookups; it does not
-rebind runners that have already been constructed. Those runners keep their runner-bound catalog
-publication authority for output write-backs, cache validation, and cache-reuse lineage. A fully
-replacing workspace provider can therefore serve catalog reads without receiving execution write-backs,
-and adding or forwarding `register_output` on that replacement does not by itself close the gap. Sharing
-the built-in metadata side store (for example, by inheriting the built-in lineage methods) keeps those
-surfaces consistent today. Automatic single-authority rebinding is tracked in issue #166.
+`reg.set_catalog` selects the one catalog provider for the application instance. The kernel completes all
+plugin registration before constructing catalog-dependent runners, profile supervision, and run control,
+so catalog reads and execution publication use that same object. Registration happens once at startup;
+calling `set_catalog` later is not a hot-swap mechanism. A fully replacing provider must therefore
+implement its write-back contract as well as its reads; subclassing `InMemoryCatalog` remains a practical
+way to retain the built-in lineage and publication behavior.
 
 Immutable fact export and cache-reuse recording are optional, runtime-checkable protocols rather than
 members of the required `CatalogProvider` contract:
