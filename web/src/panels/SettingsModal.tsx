@@ -49,6 +49,8 @@ type SaveFailure = {
   message: string
 }
 
+type ActionNotice = { kind: 'success' | 'error'; message: string }
+
 type ConflictRecovery = {
   submitted: SettingChange[]
   serverChanged: SettingChange[]
@@ -182,6 +184,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [creds, setCreds] = useState<Cred[]>([])
   const [credForm, setCredForm] = useState<CredForm>(emptyCredForm('object_store'))
   const [newUser, setNewUser] = useState({ name: '', password: '' })
+  const [credentialSaving, setCredentialSaving] = useState(false)
+  const [credentialDeletingId, setCredentialDeletingId] = useState<string | null>(null)
+  const [credentialNotice, setCredentialNotice] = useState<ActionNotice | null>(null)
+  const [memberAdding, setMemberAdding] = useState(false)
+  const [memberNotice, setMemberNotice] = useState<ActionNotice | null>(null)
+  const [kernelRestarting, setKernelRestarting] = useState(false)
+  const [kernelNotice, setKernelNotice] = useState<ActionNotice | null>(null)
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [pcfg, setPcfg] = useState<PluginEdits>({})  // pack → edited { key: value }, null = use environment/default
   const [active, setActive] = useState('agent')
@@ -194,13 +203,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
   const addUser = async () => {
     const name = newUser.name.trim()
-    if (!name) return
+    if (!name || memberAdding) return
+    setMemberAdding(true)
+    setMemberNotice(null)
     try {
       await api.createUser(name, newUser.password || undefined)
       setNewUser({ name: '', password: '' })
       await refreshUsers()
+      setMemberNotice({ kind: 'success', message: `Added ${name}. This applied immediately; staged Settings are unchanged.` })
       pushToast(`Added ${name}`, 'success')
-    } catch (e) { pushToast((e as Error).message, 'error') }
+    } catch (e) {
+      const message = `Could not add ${name}: ${errorMessage(e)}`
+      setMemberNotice({ kind: 'error', message })
+      pushToast(message, 'error')
+    } finally { setMemberAdding(false) }
   }
 
   useEffect(() => {
@@ -387,25 +403,66 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const editCred = (c: Cred) => setCredForm({ id: c.id, name: c.name, kind: c.kind, fields: { ...c.fields } })
   const saveCred = async () => {
     const name = credForm.name.trim()
-    if (!name) return
+    if (!name || credentialSaving || credentialDeletingId) return
     // Send only non-empty reference fields; a blank field is omitted (keeps refs, never writes plaintext).
     const fields = Object.fromEntries(Object.entries(credForm.fields).filter(([, v]) => v.trim() !== ''))
+    const isEdit = Boolean(credForm.id)
+    setCredentialSaving(true)
+    setCredentialNotice(null)
     try {
       const body = { name, kind: credForm.kind, fields }
       const saved = credForm.id ? await api.updateCred(credForm.id, body) : await api.createCred(body)
       setCreds((prev) => credForm.id ? prev.map((c) => c.id === saved.id ? saved : c) : [...prev, saved])
       setCredForm(emptyCredForm(credForm.kind))
+      const message = `${isEdit ? 'Saved' : 'Added'} credential ${name}. This applied immediately; staged Settings are unchanged.`
+      setCredentialNotice({ kind: 'success', message })
       pushToast(`Saved credential ${name}`, 'success')
-    } catch (e) { pushToast((e as Error).message, 'error') }
+    } catch (e) {
+      const message = `Could not save credential ${name}: ${errorMessage(e)}`
+      setCredentialNotice({ kind: 'error', message })
+      pushToast(message, 'error')
+    } finally { setCredentialSaving(false) }
   }
   const removeCred = async (c: Cred) => {
+    if (credentialDeletingId || credentialSaving) return
+    const destinationUsesCredential = dests.some((destination) => destination.credId === c.id)
+      || (dest.backend !== 'local' && dest.credId === c.id)
+    if (g.defaultObjectStoreCredId === c.id || g.agentCredId === c.id || destinationUsesCredential) {
+      const message = `Credential ${c.name} is selected in Settings. Select a different credential (or None) and Save before removing it.`
+      setCredentialNotice({ kind: 'error', message })
+      pushToast(message, 'error')
+      return
+    }
+    setCredentialDeletingId(c.id)
+    setCredentialNotice(null)
     try {
       await api.deleteCred(c.id)
       setCreds((prev) => prev.filter((x) => x.id !== c.id))
-      if (g.defaultObjectStoreCredId === c.id) setG((prev) => ({ ...prev, defaultObjectStoreCredId: '' }))
-      if (g.agentCredId === c.id) setG((prev) => ({ ...prev, agentCredId: '' }))
+      if (credForm.id === c.id) setCredForm(emptyCredForm(credForm.kind))
+      setCredentialNotice({ kind: 'success', message: `Removed credential ${c.name}. This applied immediately; staged Settings are unchanged.` })
       pushToast(`Removed credential ${c.name}`, 'success')
-    } catch (e) { pushToast((e as Error).message, 'error') }
+    } catch (e) {
+      const message = `Could not remove credential ${c.name}: ${errorMessage(e)}`
+      setCredentialNotice({ kind: 'error', message })
+      pushToast(message, 'error')
+    } finally { setCredentialDeletingId(null) }
+  }
+  const restartKernel = async () => {
+    if (kernelRestarting) return
+    setKernelRestarting(true)
+    setKernelNotice(null)
+    try {
+      const result = await api.restartKernel(canvasId)
+      const message = result.restarted
+        ? 'Kernel restart requested. This applied immediately; staged Settings are unchanged.'
+        : 'No live kernel to restart. The next run starts fresh; staged Settings are unchanged.'
+      setKernelNotice({ kind: 'success', message })
+      pushToast(result.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
+    } catch (e) {
+      const message = `Could not restart kernel: ${errorMessage(e)}`
+      setKernelNotice({ kind: 'error', message })
+      pushToast(message, 'error')
+    } finally { setKernelRestarting(false) }
   }
   const go = (id: string) => setActive(id)  // master-detail: the nav switches the visible pane
   const runners = kernelInfo?.runners ?? ['local-out-of-core']
@@ -540,15 +597,13 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <div className="-mt-1 text-[10.5px] text-muted-foreground">Your preference for your own runs — falls back to the workspace default.</div>
                   {((u.backend && u.backend !== INHERIT ? String(u.backend) : (g.backend ? String(g.backend) : runners[0])) === 'kernel') && (
                     <div className="mt-2 flex items-center gap-2">
-                      <Button variant="outline" size="sm" onClick={async () => {
-                        try {
-                          const r = await api.restartKernel(canvasId)
-                          pushToast(r.restarted ? 'Kernel restarting…' : 'No live kernel — a fresh one starts on the next run', 'success')
-                        } catch (e) { pushToast((e as Error).message, 'error') }  // a failed restart is an error, not success
-                      }}>Restart kernel</Button>
-                      <span className="text-[10.5px] text-muted-foreground">Clears this canvas's warm kernel (a wedged transform / stale state); the next run starts fresh.</span>
+                      <Button variant="outline" size="sm" onClick={restartKernel} disabled={kernelRestarting}>{kernelRestarting ? 'Restarting…' : 'Restart kernel'}</Button>
+                      <span className="text-[10.5px] text-muted-foreground">Applies immediately; it does not save staged Settings. Clears this canvas's warm kernel; the next run starts fresh.</span>
                     </div>
                   )}
+                  {kernelNotice && <div role={kernelNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', kernelNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+                    {kernelNotice.message}
+                  </div>}
 
                   <div className="mb-1.5 mt-4 text-[11.5px] font-semibold text-foreground">Compute</div>
                   <div className="mb-2 text-[10.5px] text-muted-foreground">Backends and the workers (pods / processes) they offer, with capacity. A pod/Ray backend plugin adds its own here.</div>
@@ -626,6 +681,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
                     Named credentials a destination or the agent references. Fields store references (`env:VAR` / `file:/path`), never the secret bytes.
                   </p>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Credential changes apply immediately; they do not wait for Save or change other staged Settings.</div>
                   <div className="mb-3 flex flex-col gap-1">
                     {creds.map((c) => (
                       <div key={c.id} className="flex items-center gap-2 text-xs text-foreground">
@@ -635,12 +691,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         {c.kind === 'object_store' && g.defaultObjectStoreCredId === c.id && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">default</Badge>}
                         <span className="flex-1" />
                         {c.kind === 'object_store' && g.defaultObjectStoreCredId !== c.id && (
-                          <button onClick={() => setG((prev) => ({ ...prev, defaultObjectStoreCredId: c.id }))}
+                          <button onClick={() => setG((prev) => ({ ...prev, defaultObjectStoreCredId: c.id }))} disabled={credentialSaving || Boolean(credentialDeletingId)}
                             className="text-[10.5px] text-muted-foreground transition-colors hover:text-foreground">Make default</button>
                         )}
-                        <button onClick={() => editCred(c)} aria-label={`Edit credential ${c.name}`}
+                        <button onClick={() => editCred(c)} disabled={credentialSaving || Boolean(credentialDeletingId)} aria-label={`Edit credential ${c.name}`}
                           className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="rename" size={12} /></button>
-                        <button onClick={() => removeCred(c)} aria-label={`Remove credential ${c.name}`}
+                        <button onClick={() => removeCred(c)} disabled={credentialSaving || Boolean(credentialDeletingId)} aria-label={`Remove credential ${c.name}`}
                           className="grid place-items-center text-muted-foreground transition-colors hover:text-foreground"><Icon name="close" size={12} /></button>
                       </div>
                     ))}
@@ -672,9 +728,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     )}
                     <div className="mt-1.5 text-[10.5px] text-muted-foreground">References only (`env:VAR` / `file:/path`). A blank field is left unchanged; leave all blank to use the environment.</div>
                     <div className="mt-2 flex gap-1.5">
-                      <Button onClick={saveCred} disabled={!credForm.name.trim()} className="shrink-0">{credForm.id ? 'Save credential' : 'Add credential'}</Button>
-                      {credForm.id && <Button variant="outline" onClick={() => setCredForm(emptyCredForm(credForm.kind))} className="shrink-0">Cancel</Button>}
+                      <Button onClick={saveCred} disabled={!credForm.name.trim() || credentialSaving || Boolean(credentialDeletingId)} className="shrink-0">{credentialSaving ? 'Saving credential…' : credForm.id ? 'Save credential' : 'Add credential'}</Button>
+                      {credForm.id && <Button variant="outline" onClick={() => setCredForm(emptyCredForm(credForm.kind))} disabled={credentialSaving} className="shrink-0">Cancel</Button>}
                     </div>
+                    {credentialNotice && <div role={credentialNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', credentialNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+                      {credentialNotice.message}
+                    </div>}
                   </div>
                 </Section>}
 
@@ -753,6 +812,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                       ? ' Set an initial password below; each member can then rotate their own from the account menu.'
                       : ' Sign-in is off (no DP_AUTH_SECRET), so passwords are unused until you enable auth — anyone with the URL is trusted.'}
                   </p>
+                  <div className="mb-2 text-[10.5px] text-muted-foreground">Adding a member applies immediately; it does not wait for Save or change other staged Settings.</div>
                   <div className="mb-2.5 flex flex-col gap-1">
                     {users.map((usr) => (
                       <div key={usr.id} className="flex items-center gap-2 text-xs text-foreground">
@@ -767,8 +827,11 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                     <Input type="password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
                       onKeyDown={(e) => { if (e.key === 'Enter') addUser() }}
                       placeholder={authEnabled ? 'Initial password (optional)' : 'Password (unused until auth is on)'} className="min-w-0 flex-1" />
-                    <Button onClick={addUser} disabled={!newUser.name.trim()} className="shrink-0">Add member</Button>
+                    <Button onClick={addUser} disabled={!newUser.name.trim() || memberAdding} className="shrink-0">{memberAdding ? 'Adding member…' : 'Add member'}</Button>
                   </div>
+                  {memberNotice && <div role={memberNotice.kind === 'error' ? 'alert' : 'status'} className={cn('mt-2 text-[10.5px]', memberNotice.kind === 'error' ? 'text-destructive' : 'text-green-600')}>
+                    {memberNotice.message}
+                  </div>}
                 </Section>}
               </div>
             )}
