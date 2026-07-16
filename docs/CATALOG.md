@@ -65,9 +65,11 @@ Key endpoints under `/api`:
   for adapters that support it. `datasetId`, `revisionId`, and the cursor are opaque; retention remains
   provider-owned.
 - `GET /catalog/tables/{id}/revisions/resolve?asOf=` — resolves latest or an RFC 3339 instant to one
-  immutable native version. `GET /catalog/revisions/{datasetId}/{revisionId}` verifies that persisted
-  registration/version binding exactly. Missing, compacted, unregistered, or unsupported revisions
-  return a stable unavailable result and never fall back to current head.
+  immutable native version. `GET /catalog/revisions/{datasetId}/{revisionId}` returns bounded schema,
+  row/file/byte facts, a retained parent when known, and a fixed 100-row preview from that exact
+  version. Producer operation is `null` when the provider does not record it. Missing, compacted,
+  unregistered, or unsupported revisions return a stable unavailable result and never fall back to
+  current head.
 - `POST /data/sample` — bounded dataset rows plus explicit `completeness`, `rowLimit`,
   `limitReason`, and `limitScope` metadata. `limitScope=result-window` identifies the 2,000-row
   interactive artifact window; graph previews use `each-source` instead because their source budget
