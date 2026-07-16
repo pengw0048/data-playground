@@ -98,7 +98,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
-      profileJobs: {},
+      profileJobs: {}, agentLog: [],
     })
   })
 
@@ -116,6 +116,14 @@ describe('graph store — core authority ops', () => {
     // a SECOND apply replaces (does not append) — proves it's safe to import onto a fresh file only
     useStore.getState().applyAgentGraph({ nodes: [NODE('z')], edges: [] })
     expect(useStore.getState().doc.nodes.map((n) => n.id)).toEqual(['z'])
+  })
+
+  it('clears display-only agent requests when switching canvases', () => {
+    useStore.setState({ agentLog: [{ role: 'user', text: 'previous canvas request' }] })
+
+    useStore.getState().loadDoc({ id: 'other', version: 1, name: 'other', nodes: [], edges: [] }, 'owner')
+
+    expect(useStore.getState().agentLog).toEqual([])
   })
 
   it('undo restores the pre-apply doc', () => {

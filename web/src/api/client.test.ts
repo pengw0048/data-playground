@@ -30,6 +30,19 @@ describe('toGraph wire serialization', () => {
   it('drops note/code annotation nodes (no build step)', () => {
     expect(toGraph(doc).nodes.map((n) => n.id)).toEqual(['a', 'j'])
   })
+
+  it('sends an Agent request with only the current prompt and current graph payload', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      available: true, graph: { nodes: [], edges: [] }, summary: 'Done.', transcript: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await api.agentAct(doc, 'build a current filter')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/agent', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ outcome: 'build a current filter', graph: toGraph(doc) }),
+    }))
+  })
 })
 
 describe('run-scoped result access', () => {
