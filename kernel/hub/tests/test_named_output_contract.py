@@ -121,6 +121,93 @@ def test_committed_run_output_retains_explicit_sample_evidence(tmp_path):
     assert committed.sample_provenance.returned_rows == 4
 
 
+def test_explicit_sample_provenance_requires_one_dominating_sample():
+    class Adapter:
+        def fingerprint(self, uri): return f"revision:{uri}"
+        def metadata_count(self, _uri): return 12
+
+    def node(node_id: str, kind: str, config: dict | None = None, **data) -> GraphNode:
+        return GraphNode(id=node_id, type=kind, data={"config": config or {}, **data})
+
+    def edge(source: str, target: str) -> GraphEdge:
+        return GraphEdge(id=f"{source}-{target}", source=source, target=target)
+
+    resolve = lambda _uri: Adapter()
+
+    two_sampled_branches = Graph(
+        id="two-sampled-branches",
+        nodes=[
+            node("left-source", "source", {"uri": "sample://left"}),
+            node("left-sample", "sample", {"n": 4, "seed": 7}),
+            node("right-source", "source", {"uri": "sample://right"}),
+            node("right-sample", "sample", {"n": 8, "seed": 9}),
+            node("join", "join"),
+        ],
+        edges=[
+            edge("left-source", "left-sample"), edge("left-sample", "join"),
+            edge("right-source", "right-sample"), edge("right-sample", "join"),
+        ],
+    )
+    assert explicit_sample_provenance(two_sampled_branches, "join", resolve, returned_rows=3) is None
+
+    sampled_and_unsampled = Graph(
+        id="sampled-and-unsampled",
+        nodes=[
+            node("sampled-source", "source", {"uri": "sample://sampled"}),
+            node("sample", "sample", {"n": 4, "seed": 7}),
+            node("plain-source", "source", {"uri": "sample://plain"}),
+            node("join", "join"),
+        ],
+        edges=[
+            edge("sampled-source", "sample"), edge("sample", "join"),
+            edge("plain-source", "join"),
+        ],
+    )
+    assert explicit_sample_provenance(sampled_and_unsampled, "join", resolve, returned_rows=3) is None
+
+    dominating_sample = Graph(
+        id="dominating-sample",
+        nodes=[
+            node("source", "source", {"uri": "sample://source"}),
+            node("sample", "sample", {"n": 4, "seed": 7}),
+            node("filter", "filter"),
+            node("target", "select"),
+        ],
+        edges=[
+            edge("source", "sample"), edge("sample", "filter"), edge("filter", "target"),
+        ],
+    )
+    provenance = explicit_sample_provenance(dominating_sample, "target", resolve, returned_rows=3)
+    assert provenance is not None and provenance.seed == 7 and provenance.requested_rows == 4
+
+    sequential_samples = Graph(
+        id="sequential-samples",
+        nodes=[
+            node("source", "source", {"uri": "sample://source"}),
+            node("first", "sample", {"n": 8, "seed": 5}),
+            node("second", "sample", {"n": 4, "seed": 7}),
+            node("target", "filter"),
+        ],
+        edges=[
+            edge("source", "first"), edge("first", "second"), edge("second", "target"),
+        ],
+    )
+    provenance = explicit_sample_provenance(sequential_samples, "target", resolve, returned_rows=3)
+    assert provenance is not None and provenance.seed == 7 and provenance.requested_rows == 4
+
+    for state in ("disabled", "bypassed"):
+        inactive_sample = Graph(
+            id=f"{state}-sample",
+            nodes=[
+                node("source", "source", {"uri": "sample://source"}),
+                node("sample", "sample", {"n": 4, "seed": 7}, **{state: True}),
+                node("target", "filter"),
+            ],
+            edges=[edge("source", "sample"), edge("sample", "target")],
+        )
+        assert explicit_sample_provenance(inactive_sample, "target", resolve, returned_rows=3) is None
+
+
 @pytest.mark.parametrize("surface", ["estimate", "start"])
 def test_full_run_surfaces_reject_unsupported_selected_backend_before_work(
         surface, tmp_path, monkeypatch):
