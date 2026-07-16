@@ -1,0 +1,41 @@
+{
+  "fixtures": {
+    "fault_injection": {
+      "purpose": "Deterministic route/browser injection; never requires a private service or credential.",
+      "scenarios": [
+        "slow",
+        "unavailable",
+        "permission_denied",
+        "stale_reference",
+        "partial_failure",
+        "recovery"
+      ]
+    },
+    "medium_catalog": {
+      "datasets": 120,
+      "purpose": "Catalog paging, search, folders, and more-than-100-result behavior."
+    },
+    "relationship_dense": {
+      "datasets": 24,
+      "purpose": "Dense join and lineage rendering with bounded result disclosure."
+    },
+    "small_happy_path": {
+      "datasets": [
+        "events",
+        "movies",
+        "images"
+      ],
+      "purpose": "Three related starter datasets for discovery, preview, transform, and export."
+    },
+    "temporal_multimodal": {
+      "datasets": [
+        "episodes",
+        "frames",
+        "audio_windows"
+      ],
+      "purpose": "Synchronized event, image-pointer, and audio-window workflows."
+    }
+  },
+  "profile": "full",
+  "version": 1
+}
