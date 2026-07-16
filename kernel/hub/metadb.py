@@ -218,7 +218,10 @@ class RunInputAdmission(Base):
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     manifest: Mapped[str] = mapped_column(Text, nullable=False)
-    dispatched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # This is a write-ahead claim, committed with the initial queued RunState before calling the
+    # in-process runner. It intentionally means "may have been dispatched", not "the call returned".
+    dispatched_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (
         UniqueConstraint("creator_id", "canvas_id", "submission_id", name="uq_run_input_admission_submission"),
@@ -2673,15 +2676,48 @@ def local_run_input_manifest(run_id: str) -> list[dict[str, str]] | None:
     return [dict(item) for item in parsed]
 
 
-def mark_local_run_dispatched(run_id: str) -> bool:
+def claim_local_run_dispatch(*, run_id: str, uid: str, auth_canvas_id: str | None,
+                             request_id: str | None) -> tuple[dict, bool]:
+    """Claim one local admission before the runner can create a worker.
+
+    The admission claim and its pollable queued status share one transaction. Once that transaction
+    commits, a caller cannot distinguish a failure before ``runner.run`` from a lost response after it,
+    so retries must adopt rather than dispatch a second worker.
+    """
+    from hub.models import RunStatus
+
     with session() as s:
+        admission_hint = s.execute(select(RunInputAdmission.canvas_id).where(
+            RunInputAdmission.run_id == str(run_id)
+        )).scalar_one_or_none()
+        if admission_hint is None:
+            raise RuntimeError("local run admission was not persisted")
+        _lock_authorized_run_canvas(s, admission_hint)
         row = s.get(RunInputAdmission, str(run_id), with_for_update=True)
         if row is None:
-            return False
-        if row.dispatched_at is None:
+            raise RuntimeError("local run admission was deleted before dispatch")
+        state = s.get(RunState, str(run_id), with_for_update=True)
+        if row.dispatched_at is not None:
+            if state is None:
+                raise RuntimeError("claimed local run has no durable status")
+            return json.loads(state.doc), False
+        if state is not None:
+            # A prior process may have created the runner state just before this write-ahead boundary.
+            # Treat it as possibly dispatched: repeating a local worker is never safe.
             row.dispatched_at = _db_now(s)
-            return True
-        return False
+            return json.loads(state.doc), False
+        queued = RunStatus(
+            run_id=str(run_id), status="queued", target_node_id=row.target_node_id,
+            request_id=request_id,
+        ).model_dump()
+        s.add(RunState(
+            run_id=str(run_id), canvas_id=row.canvas_id, status="queued",
+            doc=json.dumps(queued, default=str), created_by=str(uid),
+            auth_canvas_id=str(auth_canvas_id) if auth_canvas_id is not None else None,
+            request_id=request_id,
+        ))
+        row.dispatched_at = _db_now(s)
+        return queued, True
 
 
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,

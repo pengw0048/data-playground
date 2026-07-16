@@ -1111,10 +1111,12 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if persisted is None:
             raise RuntimeError("local run admission was not persisted")
         dispatch_graph = _bind_local_run_manifest(graph, persisted, deps)
-        # A duplicate/retry adopts its exact run state and never dispatches a second worker.
-        existing = metadb.get_run_state(prebound_local_run_id)
-        if existing is not None and existing.get("status") != "queued":
-            return RunStatus(**existing), deps.runner
+        claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
+            run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
+            request_id=request_id,
+        )
+        if not should_dispatch:
+            return RunStatus(**claimed_status), deps.runner
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
@@ -1188,8 +1190,6 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 run_id=prebound_local_run_id, request_id=request_id)
             if prebound_local_run_id is not None and status.run_id != prebound_local_run_id:
                 raise RuntimeError("local execution backend did not preserve its admitted run id")
-            if prebound_local_run_id is not None:
-                metadb.mark_local_run_dispatched(prebound_local_run_id)
         owner = runner
     if request_id and not status.request_id:
         status.request_id = request_id
