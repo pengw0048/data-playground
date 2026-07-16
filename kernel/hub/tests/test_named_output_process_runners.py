@@ -830,21 +830,98 @@ def test_subprocess_local_multi_output_commits_in_declaration_order(tmp_path):
         runner._terminate_all()
 
 
-def test_subprocess_local_second_port_commit_failure_retains_first_publication(
-        tmp_path, monkeypatch):
+def test_pool_runner_reuses_worker_for_named_outputs_and_persists_history(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     from hub import compiler, metadb
+    from hub.metadb import Canvas, session
+    from hub.pool_runner import PoolRunner
+
+    metadb.migrate_db()
+    canvas_id = "pool-named-output-history"
+    with session() as database:
+        if database.get(Canvas, canvas_id) is None:
+            database.add(Canvas(
+                id=canvas_id, owner_id=metadb.DEFAULT_USER_ID, name="pool", version=1,
+                doc="{}", visibility="private"))
+    source = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"value": [1, 2, 3]}), source)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = PoolRunner(
+        str(workspace), str(tmp_path / "data"), [{"name": "worker", "cpu": 2}],
+        node_specs=NODE_SPECS,
+    )
+    runner.on_status = lambda _graph, status: metadb.save_run_state(
+        status.run_id, status.model_dump(), canvas_id=canvas_id)
+    runner.on_complete = lambda graph, target, status: metadb.record_run(
+        canvas_id=graph.id, target_node_id=status.target_node_id or target,
+        job_type=status.job_type, status=status.status, rows=status.total_rows, ms=status.ms,
+        error=status.error, outputs=[output.model_dump() for output in status.outputs],
+        run_id=status.run_id)
+    graph = Graph(**{"id": canvas_id, "nodes": [
+        {"id": "source", "type": "source", "data": {
+            "title": "source", "config": {"uri": str(source)}}},
+        {"id": "branches", "type": "section", "data": {"title": "branches", "config": {
+            "script": "emit('first', inputs['in'])\nemit('second', inputs['in'])\n",
+            "outputs": ["first", "second"], "params": {}, "maxRuns": 10}}},
+    ], "edges": [{"id": "source-to-branches", "source": "source", "target": "branches"}]})
+    plan = compiler.compile_plan(graph, "branches")
+
+    def wait_for_terminal(status):
+        deadline = time.monotonic() + 15
+        while (runner.status(status.run_id).status not in ("done", "failed", "cancelled")
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        return runner.status(status.run_id)
+
+    def wait_for_worker_release():
+        deadline = time.monotonic() + 5
+        while runner.workers()[0].state != "idle" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert runner.workers()[0].state == "idle"
+
+    try:
+        first = wait_for_terminal(runner.run(plan, graph, "branches", "local"))
+        assert first.status == "done", first.error
+        assert [(output.port_id, output.rows) for output in first.outputs] == [
+            ("first", 3), ("second", 3)]
+        wait_for_worker_release()
+
+        second = wait_for_terminal(runner.run(plan, graph, "branches", "local"))
+        assert second.status == "done", second.error
+        wait_for_worker_release()
+        history = {row["runId"]: row for row in metadb.list_runs(canvas_id)}
+        assert history[first.run_id]["outputs"] == [
+            output.model_dump() for output in first.outputs]
+        assert history[second.run_id]["outputs"] == [
+            output.model_dump() for output in second.outputs]
+    finally:
+        runner._terminate_all()
+
+
+@pytest.mark.parametrize("runner_kind", ["subprocess", "pool"])
+def test_isolated_local_second_port_commit_failure_retains_first_publication(
+        tmp_path, monkeypatch, runner_kind):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import compiler, metadb
+    from hub.pool_runner import PoolRunner
 
     metadb.migrate_db()
     source = tmp_path / "input.parquet"
     pq.write_table(pa.table({"value": [1, 2, 3]}), source)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    runner = SubprocessRunner(
-        str(workspace), str(tmp_path / "data"), node_specs=NODE_SPECS,
-    )
+    runner = (
+        PoolRunner(
+            str(workspace), str(tmp_path / "data"), [{"name": "worker", "cpu": 2}],
+            node_specs=NODE_SPECS,
+        ) if runner_kind == "pool" else SubprocessRunner(
+            str(workspace), str(tmp_path / "data"), node_specs=NODE_SPECS,
+        ))
     runner.on_status = lambda _graph, status: metadb.save_run_state(
         status.run_id, status.model_dump())
     graph = Graph(**{"id": "partial-receipt", "nodes": [
@@ -881,5 +958,10 @@ def test_subprocess_local_second_port_commit_failure_retains_first_publication(
         durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
         assert [(output.port_id, output.outcome) for output in durable.outputs] == [
             ("first", "committed"), ("second", "failed")]
+        if runner_kind == "pool":
+            deadline = time.monotonic() + 5
+            while runner.workers()[0].state != "idle" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert runner.workers()[0].state == "idle"
     finally:
         runner._terminate_all()
