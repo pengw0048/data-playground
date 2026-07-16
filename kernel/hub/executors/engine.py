@@ -495,8 +495,9 @@ class BuildEngine:
         names = _dedupe_names(tbl.column_names)
         if names != tbl.column_names:
             tbl = tbl.rename_columns(names)
-        cols = tag_columns([ColumnSchema(name=n, type=display_type(str(t)))
-                            for n, t in zip(tbl.column_names, tbl.schema.types)])
+        cols = tag_columns([ColumnSchema(
+            name=n, type=display_type(str(t)), physical_type=str(t), provenance="inferred")
+            for n, t in zip(tbl.column_names, tbl.schema.types)])
         return _table_to_rows(tbl), cols
 
     # -- inputs ------------------------------------------------------------ #

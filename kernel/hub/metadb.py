@@ -31,6 +31,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
+from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
 from hub.settings import settings
 
 DEFAULT_USER_ID = "local"
@@ -4221,13 +4222,23 @@ def run_stalled(run_id: str, threshold_s: float) -> bool:
         return (now - observed_at).total_seconds() > threshold_s
 
 
+def _stored_schema_columns(columns: list[dict]) -> list[dict]:
+    """Validate and retain the complete current schema model in contract storage."""
+    stored: list[dict] = []
+    for raw in columns:
+        field = ColumnSchema.model_validate(raw)
+        # Direct callers create a named contract, so omitted provenance means a declaration.
+        if "provenance" not in field.model_fields_set:
+            field = field.model_copy(update={"provenance": "declared"})
+        stored.append(field.model_dump(by_alias=True))
+    return stored
+
+
 def save_schema_contract(name: str, columns: list[dict]) -> int:
-    """Save a named schema contract as a NEW version (max existing + 1). `columns` = [{name, type}, ...].
-    Returns the new version number. The max+1 read-then-insert isn't atomic, so a concurrent save of the
-    SAME name can collide on the (name, version) PK — retry a few times (each recomputes the next version)."""
+    """Save a named schema contract as a new version without dropping field evidence."""
     from sqlalchemy import func
     from sqlalchemy.exc import IntegrityError
-    doc = json.dumps([{"name": c["name"], "type": c.get("type", "")} for c in columns])
+    doc = json.dumps(_stored_schema_columns(columns))
     for _ in range(5):
         try:
             with session() as s:
@@ -4265,16 +4276,121 @@ def schema_contract_versions(name: str) -> list[int]:
         return sorted(v for (v,) in s.query(SchemaContract.version).filter(SchemaContract.name == name).all())
 
 
-def diff_columns(a: list[dict], b: list[dict]) -> dict:
-    """Structural diff of two column lists (contract vs contract, or contract vs actual). Reports columns
-    added / removed / whose type changed, going a → b (b is the newer / actual)."""
-    am = {c["name"]: str(c.get("type", "")) for c in a}
-    bm = {c["name"]: str(c.get("type", "")) for c in b}
-    added = [n for n in bm if n not in am]
-    removed = [n for n in am if n not in bm]
-    changed = [{"name": n, "from": am[n], "to": bm[n]} for n in am if n in bm and am[n] != bm[n]]
-    return {"added": added, "removed": removed, "changed": changed,
-            "match": not (added or removed or changed)}
+_NUMERIC_TYPE_RANK = {
+    "tinyint": 0, "int8": 0,
+    "smallint": 1, "int16": 1,
+    "int": 2, "integer": 2, "int32": 2,
+    "bigint": 3, "int64": 3,
+    "float": 4, "real": 4, "float32": 4,
+    "double": 5, "float64": 5,
+}
+
+
+def _type_change_status(before: str, after: str) -> tuple[str, str]:
+    before, after = before.strip().lower(), after.strip().lower()
+    if not before or not after:
+        return "unknown", "logical type is unknown"
+    if before == after:
+        return "compatible", "logical type is unchanged"
+    old_rank, new_rank = _NUMERIC_TYPE_RANK.get(before), _NUMERIC_TYPE_RANK.get(after)
+    if old_rank is not None and new_rank is not None:
+        if new_rank > old_rank:
+            return "compatible", f"logical type widens from {before} to {after}"
+        return "breaking", f"logical type narrows from {before} to {after}"
+    return "breaking", f"logical type changes from {before} to {after}"
+
+
+def _matched_field_status(before: ColumnSchema, after: ColumnSchema) -> tuple[str, str]:
+    type_status, reason = _type_change_status(before.type, after.type)
+    if type_status == "breaking":
+        return type_status, reason
+    if before.nullable is None or after.nullable is None:
+        return "unknown", reason + "; nullability is not proven on both versions"
+    if before.nullable and not after.nullable:
+        return "breaking", reason + "; field became non-nullable"
+    if not before.nullable and after.nullable:
+        return "compatible", reason + "; field became nullable"
+    return type_status, reason
+
+
+def _addition_status(field: ColumnSchema) -> tuple[str, str]:
+    if field.nullable is True:
+        return "compatible", "nullable field was added"
+    if field.nullable is False and field.has_default is True:
+        return "compatible", "non-nullable field was added with a default"
+    if field.nullable is False and field.has_default is False:
+        return "breaking", "non-nullable field was added without a default"
+    return "unknown", "added field has unknown nullability or default evidence"
+
+
+def _overall_status(fields: list[SchemaFieldCompatibility]) -> str:
+    statuses = {field.status for field in fields}
+    if "breaking" in statuses:
+        return "breaking"
+    if "unknown" in statuses:
+        return "unknown"
+    return "compatible"
+
+
+def diff_columns(a: list[dict], b: list[dict]) -> SchemaCompatibility:
+    """Evaluate a schema transition without inferring identity the evidence does not provide."""
+    before = [ColumnSchema.model_validate(field) for field in a]
+    after = [ColumnSchema.model_validate(field) for field in b]
+    before_ids = {field.field_id for field in before if field.field_id}
+    after_ids = {field.field_id for field in after if field.field_id}
+    duplicate_ids = {
+        field_id for field_id in before_ids | after_ids
+        if sum(field.field_id == field_id for field in before) > 1
+        or sum(field.field_id == field_id for field in after) > 1
+    }
+    if duplicate_ids:
+        fields = [SchemaFieldCompatibility(
+            kind="changed", status="unknown", field_id=field_id,
+            reason="stable field identity is duplicated and cannot prove a match")
+            for field_id in sorted(duplicate_ids)]
+        return SchemaCompatibility(status="unknown", fields=fields)
+
+    by_id = {field.field_id: field for field in after if field.field_id}
+    by_name = {field.name: field for field in after}
+    matched_after: set[int] = set()
+    fields: list[SchemaFieldCompatibility] = []
+
+    for old in before:
+        new = None
+        matched_by_id = False
+        if old.field_id and old.field_id in by_id:
+            new, matched_by_id = by_id[old.field_id], True
+        elif old.name in by_name:
+            new = by_name[old.name]
+            if old.field_id or new.field_id:
+                fields.append(SchemaFieldCompatibility(
+                    kind="changed", status="unknown", old_name=old.name, new_name=new.name,
+                    field_id=old.field_id or new.field_id,
+                    reason="field identity is missing or changed, so the name match is not proven stable"))
+                matched_after.add(id(new))
+                continue
+        if new is None:
+            if old.field_id and len(after_ids) == len(after):
+                status, reason = "breaking", "stable field identity is absent from the newer complete schema"
+            else:
+                status, reason = "unknown", "field is absent by name; no stable identity proves removal versus rename"
+            fields.append(SchemaFieldCompatibility(
+                kind="removed", status=status, old_name=old.name, field_id=old.field_id, reason=reason))
+            continue
+        matched_after.add(id(new))
+        status, reason = _matched_field_status(old, new)
+        fields.append(SchemaFieldCompatibility(
+            kind="renamed" if matched_by_id and old.name != new.name else "unchanged" if old.name == new.name else "changed",
+            status=status, reason=(f"renamed from {old.name}; " if matched_by_id and old.name != new.name else "") + reason,
+            field_id=old.field_id if matched_by_id else None, old_name=old.name, new_name=new.name))
+
+    for new in after:
+        if id(new) in matched_after:
+            continue
+        status, reason = _addition_status(new)
+        fields.append(SchemaFieldCompatibility(
+            kind="added", status=status, new_name=new.name, field_id=new.field_id, reason=reason))
+    return SchemaCompatibility(status=_overall_status(fields), fields=fields)
 
 
 _RESULT_CACHE_MAX = 1000  # persistent equivalent of the old in-process _MAX_RUNS cache cap

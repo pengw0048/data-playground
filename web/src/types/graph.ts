@@ -114,7 +114,12 @@ export interface CanvasDoc {
 }
 
 export interface ColumnSchema {
+  fieldId?: string | null
   name: string
-  type: string
+  type: string // logical type
+  physicalType?: string | null
+  nullable?: boolean | null
+  hasDefault?: boolean | null
+  provenance?: 'inferred' | 'declared' | 'provider'
   capabilities: string[]
 }

@@ -73,10 +73,39 @@ class CredUpsert(Wire):
 # --------------------------------------------------------------------------- #
 # Schema / catalog
 # --------------------------------------------------------------------------- #
+SchemaProvenance = Literal["inferred", "declared", "provider"]
+SchemaCompatibilityStatus = Literal["compatible", "breaking", "unknown"]
+
+
 class ColumnSchema(Wire):
+    """One current schema-field model.
+
+    ``type`` is the logical type used by execution and the UI.  Adapters may also
+    report their source physical type, but must leave facts they cannot prove as
+    ``None`` rather than guessing.
+    """
+    field_id: str | None = Field(default=None, description="Stable source-supplied field identity, when available.")
     name: str
-    type: str
+    type: str = Field(description="Logical field type.")
+    physical_type: str | None = Field(default=None, description="Source physical type, when available.")
+    nullable: bool | None = Field(default=None, description="Whether the field accepts null values; null means unknown.")
+    has_default: bool | None = Field(default=None, description="Whether a non-null field has a source default; null means unknown.")
+    provenance: SchemaProvenance = Field(default="inferred", description="Evidence source for this field metadata.")
     capabilities: list[str] = []
+
+
+class SchemaFieldCompatibility(Wire):
+    kind: Literal["unchanged", "renamed", "added", "removed", "changed"]
+    status: SchemaCompatibilityStatus
+    reason: str
+    field_id: str | None = None
+    old_name: str | None = None
+    new_name: str | None = None
+
+
+class SchemaCompatibility(Wire):
+    status: SchemaCompatibilityStatus
+    fields: list[SchemaFieldCompatibility] = []
 
 
 class KeyInfo(Wire):

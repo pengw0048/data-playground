@@ -46,6 +46,7 @@ from hub.models import (
     PipelineImport,
     ProcessorDescriptor,
     Relationship,
+    SchemaCompatibility,
     SampleRequest,
     SampleResult,
 )
@@ -126,14 +127,20 @@ def save_schema(req: SaveSchemaRequest) -> dict:
     """Save a named contract as a NEW version (drift is a diff between versions, never an overwrite)."""
     if not req.name.strip():
         raise HTTPException(400, "a schema contract needs a name")
-    cols = [{"name": c.name, "type": c.type} for c in req.columns]
+    cols = []
+    for field in req.columns:
+        # A manually submitted field is a declaration. Inferred preview fields keep
+        # their explicit provenance when the UI saves them as a named contract.
+        if "provenance" not in field.model_fields_set:
+            field = field.model_copy(update={"provenance": "declared"})
+        cols.append(field.model_dump(by_alias=True))
     version = metadb.save_schema_contract(req.name.strip(), cols)
     return {"name": req.name.strip(), "version": version, "columns": cols}
 
 
-@router.get("/schemas/diff")
-def diff_schemas(name: str = Query(...), a: int = Query(...), b: int = Query(...)) -> dict:
-    """Structural diff of two versions of a named contract (which fields were added / removed / retyped)."""
+@router.get("/schemas/diff", response_model=SchemaCompatibility)
+def diff_schemas(name: str = Query(...), a: int = Query(...), b: int = Query(...)) -> SchemaCompatibility:
+    """Compatibility result with per-field reasons for two versions of a named contract."""
     ca, cb = metadb.get_schema_contract(name, a), metadb.get_schema_contract(name, b)
     if ca is None or cb is None:
         raise HTTPException(404, "unknown contract name or version")

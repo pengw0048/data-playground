@@ -320,7 +320,9 @@ def test_workload_graph_inlines_named_schema_contract_without_mutating_source():
 
     payload = prepare_workload_graph(graph)
 
-    assert payload["nodes"][0]["data"]["config"]["outputSchema"] == [{"name": "v", "type": "int"}]
+    schema = payload["nodes"][0]["data"]["config"]["outputSchema"]
+    assert schema[0]["name"] == "v" and schema[0]["type"] == "int"
+    assert schema[0]["provenance"] == "declared" and schema[0]["nullable"] is None
     assert graph.nodes[0].data["config"]["outputSchema"] == {"ref": "isolated_worker_contract"}
 
 

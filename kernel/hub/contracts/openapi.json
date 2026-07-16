@@ -501,6 +501,7 @@
         "type": "object"
       },
       "ColumnSchema": {
+        "description": "One current schema-field model.\n\n``type`` is the logical type used by execution and the UI.  Adapters may also\nreport their source physical type, but must leave facts they cannot prove as\n``None`` rather than guessing.",
         "properties": {
           "capabilities": {
             "default": [],
@@ -510,11 +511,71 @@
             "title": "Capabilities",
             "type": "array"
           },
+          "fieldId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable source-supplied field identity, when available.",
+            "title": "Fieldid"
+          },
+          "hasDefault": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether a non-null field has a source default; null means unknown.",
+            "title": "Hasdefault"
+          },
           "name": {
             "title": "Name",
             "type": "string"
           },
+          "nullable": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the field accepts null values; null means unknown.",
+            "title": "Nullable"
+          },
+          "physicalType": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Source physical type, when available.",
+            "title": "Physicaltype"
+          },
+          "provenance": {
+            "default": "inferred",
+            "description": "Evidence source for this field metadata.",
+            "enum": [
+              "inferred",
+              "declared",
+              "provider"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
           "type": {
+            "description": "Logical field type.",
             "title": "Type",
             "type": "string"
           }
@@ -3276,6 +3337,100 @@
           "columns"
         ],
         "title": "SaveSchemaRequest",
+        "type": "object"
+      },
+      "SchemaCompatibility": {
+        "properties": {
+          "fields": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SchemaFieldCompatibility"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "compatible",
+              "breaking",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SchemaCompatibility",
+        "type": "object"
+      },
+      "SchemaFieldCompatibility": {
+        "properties": {
+          "fieldId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fieldid"
+          },
+          "kind": {
+            "enum": [
+              "unchanged",
+              "renamed",
+              "added",
+              "removed",
+              "changed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "newName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Newname"
+          },
+          "oldName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldname"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "compatible",
+              "breaking",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "status",
+          "reason"
+        ],
+        "title": "SchemaFieldCompatibility",
         "type": "object"
       },
       "SettingBody": {
@@ -10408,7 +10563,7 @@
     },
     "/api/schemas/diff": {
       "get": {
-        "description": "Structural diff of two versions of a named contract (which fields were added / removed / retyped).",
+        "description": "Compatibility result with per-field reasons for two versions of a named contract.",
         "operationId": "diff_schemas_api_schemas_diff_get",
         "parameters": [
           {
@@ -10476,9 +10631,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Diff Schemas Api Schemas Diff Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/SchemaCompatibility"
                 }
               }
             },
