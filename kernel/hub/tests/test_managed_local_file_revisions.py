@@ -96,8 +96,11 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
     assert page.items[0].revision_id == second["revision_id"]
     assert page.items[0].retention_owner == "core"
     exact = catalog_routes.open_dataset_revision(second["dataset_id"], first["revision_id"])
-    assert exact.selector == "exact" and exact.revision_id == first["revision_id"]
+    assert exact.revision_id == first["revision_id"]
     assert exact.retention_owner == "core"
+    assert exact.parent_revision_id is None
+    assert exact.summary.row_count == 1 and exact.summary.data_file_count == 1
+    assert exact.preview.rows == [{"value": 1}]
 
     with metadb.session() as session:
         refs = list(session.scalars(select(metadb.LocalResultReference).where(

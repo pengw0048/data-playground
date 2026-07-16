@@ -9063,6 +9063,34 @@ def managed_local_file_revision_open(uri: str, revision_id: str) -> str:
         return row.artifact_uri
 
 
+def managed_local_file_revision_detail(uri: str, revision_id: str) -> dict:
+    """Return persisted facts for one exact retained local revision and its immediate parent."""
+    from hub.models import CatalogTable
+
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        row = s.get(ManagedLocalFileRevision, str(revision_id))
+        if row is None or row.logical_id != entry.logical_id:
+            raise KeyError(revision_id)
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            raise KeyError(revision_id)
+        parent = s.scalars(select(ManagedLocalFileRevision).where(
+            ManagedLocalFileRevision.logical_id == row.logical_id,
+            ManagedLocalFileRevision.publish_seq < row.publish_seq,
+        ).order_by(ManagedLocalFileRevision.publish_seq.desc()).limit(1)).first()
+        table = CatalogTable.model_validate(json.loads(row.table_doc))
+        return {
+            "revision_id": row.revision_id,
+            "committed_at": row.committed_at,
+            "parent_revision_id": parent.revision_id if parent is not None else None,
+            "artifact_uri": row.artifact_uri,
+            "table": table,
+        }
+
+
 def catalog_get_many(uris: list[str]) -> dict[str, dict]:
     """{uri: doc} for a batch of uris — used to name lineage-graph nodes in one round-trip."""
     if not uris:

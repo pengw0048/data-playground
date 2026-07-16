@@ -800,6 +800,39 @@ class ManagedLocalFileRevisionAdapter:
         except (KeyError, OSError, duckdb.Error) as exc:
             raise RevisionUnavailable("revision_unavailable") from exc
 
+    def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
+        """Read bounded facts and preview from one exact immutable local Parquet artifact."""
+        from hub import metadb
+
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            detail = metadb.managed_local_file_revision_detail(uri, revision_id)
+            artifact_uri = detail["artifact_uri"]
+            parquet = pq.ParquetFile(artifact_uri)
+            bounded = max(1, min(int(preview_limit), 100))
+            batch = next(parquet.iter_batches(batch_size=bounded + 1), None)
+            preview = (pa.Table.from_batches([batch]) if batch is not None
+                       else pa.Table.from_batches([], schema=parquet.schema_arrow))
+            table = detail["table"]
+            return {
+                "revision_id": detail["revision_id"],
+                "committed_at": detail["committed_at"],
+                "parent_revision_id": detail["parent_revision_id"],
+                "producer_operation": "overwrite",
+                "columns": table.columns,
+                "row_count": parquet.metadata.num_rows,
+                "data_file_count": 1,
+                "total_bytes": os.path.getsize(artifact_uri),
+                "fragment_count": None,
+                "preview_table": preview,
+            }
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
+
 
 def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAdapter | None:
     """Select the ledger-backed provider only for the exact current managed local head."""
@@ -956,6 +989,53 @@ class LanceAdapter:
         except Exception as exc:
             raise RevisionUnavailable("revision_unavailable") from exc
         return db.conn().from_arrow(dataset.scanner().to_reader())
+
+    def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
+        """Read bounded, exact-version facts without consulting the mutable current head."""
+        try:
+            import pyarrow as pa
+
+            exact_id = self._revision_id(revision_id)
+            dataset = self._dataset(uri, version=int(exact_id))
+            dataset.schema  # Force a retained-version check before exposing any facts.
+            versions = list(self._dataset(uri).versions())
+            entry = next((item for item in versions
+                          if self._revision_id(item.get("version")) == exact_id), None)
+            if entry is None:
+                raise RevisionUnavailable("revision_unavailable")
+            metadata = entry.get("metadata") or {}
+            parent_id = str(int(exact_id) - 1) if int(exact_id) > 1 else None
+            parent = (parent_id if parent_id is not None and any(
+                self._revision_id(item.get("version")) == parent_id for item in versions) else None)
+
+            def metadata_int(name: str) -> int | None:
+                value = metadata.get(name)
+                try:
+                    return int(value) if value is not None and int(value) >= 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            bounded = max(1, min(int(preview_limit), 100))
+            reader = dataset.scanner(limit=bounded + 1).to_reader()
+            table = pa.Table.from_batches(list(reader), schema=reader.schema)
+            empty = pa.Table.from_batches([], schema=dataset.schema)
+            return {
+                "revision_id": exact_id,
+                "committed_at": entry.get("timestamp"),
+                "parent_revision_id": parent,
+                # Lance's version metadata does not identify the producing job/operation.
+                "producer_operation": None,
+                "columns": relation_columns(db.conn().from_arrow(empty)),
+                "row_count": int(dataset.count_rows()),
+                "data_file_count": metadata_int("total_data_files"),
+                "total_bytes": metadata_int("total_files_size"),
+                "fragment_count": metadata_int("total_fragments"),
+                "preview_table": table,
+            }
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise RevisionUnavailable("revision_unavailable") from exc
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:

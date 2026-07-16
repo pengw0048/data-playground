@@ -809,6 +809,82 @@
         "title": "DatasetRevision",
         "type": "object"
       },
+      "DatasetRevisionDetail": {
+        "description": "Inspectable facts and a bounded preview for one retained exact revision.",
+        "properties": {
+          "committedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committedat"
+          },
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "parentRevisionId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parentrevisionid"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/DatasetRevisionPreview"
+          },
+          "producerOperation": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Produceroperation"
+          },
+          "retentionOwner": {
+            "default": "provider",
+            "enum": [
+              "provider",
+              "core"
+            ],
+            "title": "Retentionowner",
+            "type": "string"
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/DatasetRevisionSummary"
+          }
+        },
+        "required": [
+          "datasetId",
+          "revisionId",
+          "summary",
+          "preview"
+        ],
+        "title": "DatasetRevisionDetail",
+        "type": "object"
+      },
       "DatasetRevisionPage": {
         "properties": {
           "hasMore": {
@@ -838,6 +914,42 @@
           }
         },
         "title": "DatasetRevisionPage",
+        "type": "object"
+      },
+      "DatasetRevisionPreview": {
+        "description": "A fixed, exact-revision preview window; it is never a read of current head.",
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "hasMore": {
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "rowLimit": {
+            "const": 100,
+            "default": 100,
+            "title": "Rowlimit",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 100,
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "hasMore"
+        ],
+        "title": "DatasetRevisionPreview",
         "type": "object"
       },
       "DatasetRevisionResolution": {
@@ -892,6 +1004,61 @@
           "selector"
         ],
         "title": "DatasetRevisionResolution",
+        "type": "object"
+      },
+      "DatasetRevisionSummary": {
+        "description": "Bounded provider facts for one exact revision; absent facts are not inferred.",
+        "properties": {
+          "dataFileCount": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datafilecount"
+          },
+          "fragmentCount": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fragmentcount"
+          },
+          "rowCount": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rowcount"
+          },
+          "totalBytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Totalbytes"
+          }
+        },
+        "title": "DatasetRevisionSummary",
         "type": "object"
       },
       "DeclareKeyRequest": {
@@ -6839,7 +7006,7 @@
     },
     "/api/catalog/revisions/{dataset_id}/{revision_id}": {
       "get": {
-        "description": "Verify one persisted dataset/revision binding exactly; unavailable never means current head.",
+        "description": "Return bounded facts and preview for one exact revision; never fall back to current head.",
         "operationId": "open_dataset_revision_api_catalog_revisions__dataset_id___revision_id__get",
         "parameters": [
           {
@@ -6898,7 +7065,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DatasetRevisionResolution"
+                  "$ref": "#/components/schemas/DatasetRevisionDetail"
                 }
               }
             },

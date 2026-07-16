@@ -52,8 +52,84 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
     opened = client.get(f"/api/catalog/revisions/{dataset_id}/{exact}")
     assert opened.status_code == 200, opened.text
-    assert opened.json()["selector"] == "exact"
+    detail = opened.json()
+    assert detail["revisionId"] == exact
+    assert detail["parentRevisionId"] is None
+    assert detail["producerOperation"] is None
+    assert detail["summary"]["rowCount"] == 1
+    assert detail["preview"]["columns"][0]["name"] == "value"
+    assert detail["preview"]["rows"] == [{"value": 1}]
+    assert detail["preview"]["hasMore"] is False
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
+
+
+def test_lance_exact_revision_detail_is_bounded_and_keeps_parent_after_head_moves(tmp_path):
+    lance = pytest.importorskip("lance")
+    name = f"revision-detail-{uuid.uuid4().hex}"
+    uri = str(tmp_path / f"{name}.lance")
+    lance.write_dataset(pa.table({"value": list(range(101))}), uri)
+    lance.write_dataset(pa.table({"value": [101]}), uri, mode="append")
+    registered = client.post("/api/catalog/register", json={"uri": uri, "name": name})
+    assert registered.status_code == 200, registered.text
+    history = client.get(f"/api/catalog/tables/{registered.json()['id']}/revisions?limit=1")
+    assert history.status_code == 200, history.text
+    current = history.json()["items"][0]
+
+    lance.write_dataset(pa.table({"value": [102]}), uri, mode="append")
+    response = client.get(f"/api/catalog/revisions/{current['datasetId']}/{current['revisionId']}")
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    assert detail["parentRevisionId"] is not None
+    assert detail["summary"]["rowCount"] == 102
+    assert detail["summary"]["dataFileCount"] is not None
+    assert detail["summary"]["totalBytes"] is not None
+    assert detail["summary"]["fragmentCount"] is not None
+    assert len(detail["preview"]["rows"]) == 100
+    assert detail["preview"]["hasMore"] is True
+    assert detail["preview"]["rows"][0] == {"value": 0}
+
+
+def test_lance_exact_revision_detail_preserves_schema_for_empty_revision(tmp_path):
+    lance = pytest.importorskip("lance")
+    name = f"empty-revision-{uuid.uuid4().hex}"
+    uri = str(tmp_path / f"{name}.lance")
+    lance.write_dataset(pa.table({"value": pa.array([], type=pa.int64())}), uri)
+    registered = client.post("/api/catalog/register", json={"uri": uri, "name": name})
+    assert registered.status_code == 200, registered.text
+    history = client.get(f"/api/catalog/tables/{registered.json()['id']}/revisions")
+    revision = history.json()["items"][0]
+
+    response = client.get(f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    assert detail["summary"]["rowCount"] == 0
+    assert detail["preview"]["columns"][0]["name"] == "value"
+    assert detail["preview"]["rows"] == []
+    assert detail["preview"]["hasMore"] is False
+
+
+def test_lance_exact_revision_detail_does_not_invent_parent_across_retention_gap(tmp_path):
+    lance = pytest.importorskip("lance")
+    name = f"revision-gap-{uuid.uuid4().hex}"
+    uri = str(tmp_path / f"{name}.lance")
+    for value in range(3):
+        lance.write_dataset(pa.table({"value": [value]}), uri,
+                            mode="create" if value == 0 else "append")
+    dataset = lance.dataset(uri)
+    dataset.tags.create("keep-first", 1)
+    dataset.cleanup_old_versions(
+        older_than=datetime.timedelta(0), retain_versions=1,
+        error_if_tagged_old_versions=False)
+    assert [entry["version"] for entry in dataset.versions()] == [1, 3]
+
+    registered = client.post("/api/catalog/register", json={"uri": uri, "name": name})
+    assert registered.status_code == 200, registered.text
+    revision = client.get(
+        f"/api/catalog/tables/{registered.json()['id']}/revisions").json()["items"][0]
+    response = client.get(
+        f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["parentRevisionId"] is None
 
 
 def test_unregistered_lance_binding_never_retargets_same_path(tmp_path):
