@@ -920,14 +920,14 @@ class LanceAdapter:
             dataset = self._dataset(uri, version=int(exact_id))
             dataset.schema  # Force a retained-version check before exposing any facts.
             versions = list(self._dataset(uri).versions())
-            index = next((i for i, item in enumerate(versions)
+            entry = next((item for item in versions
                           if self._revision_id(item.get("version")) == exact_id), None)
-            if index is None:
+            if entry is None:
                 raise RevisionUnavailable("revision_unavailable")
-            entry = versions[index]
             metadata = entry.get("metadata") or {}
-            parent = (self._revision_id(versions[index - 1].get("version"))
-                      if index > 0 else None)
+            parent_id = str(int(exact_id) - 1) if int(exact_id) > 1 else None
+            parent = (parent_id if parent_id is not None and any(
+                self._revision_id(item.get("version")) == parent_id for item in versions) else None)
 
             def metadata_int(name: str) -> int | None:
                 value = metadata.get(name)
@@ -940,12 +940,12 @@ class LanceAdapter:
             reader = dataset.scanner(limit=bounded + 1).to_reader()
             table = pa.Table.from_batches(list(reader), schema=reader.schema)
             empty = pa.Table.from_batches([], schema=dataset.schema)
-            operation = metadata.get("operation")
             return {
                 "revision_id": exact_id,
                 "committed_at": entry.get("timestamp"),
                 "parent_revision_id": parent,
-                "producer_operation": operation if isinstance(operation, str) else None,
+                # Lance's version metadata does not identify the producing job/operation.
+                "producer_operation": None,
                 "columns": relation_columns(db.conn().from_arrow(empty)),
                 "row_count": int(dataset.count_rows()),
                 "data_file_count": metadata_int("total_data_files"),

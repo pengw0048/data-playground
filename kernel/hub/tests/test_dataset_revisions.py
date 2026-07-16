@@ -108,6 +108,30 @@ def test_lance_exact_revision_detail_preserves_schema_for_empty_revision(tmp_pat
     assert detail["preview"]["hasMore"] is False
 
 
+def test_lance_exact_revision_detail_does_not_invent_parent_across_retention_gap(tmp_path):
+    lance = pytest.importorskip("lance")
+    name = f"revision-gap-{uuid.uuid4().hex}"
+    uri = str(tmp_path / f"{name}.lance")
+    for value in range(3):
+        lance.write_dataset(pa.table({"value": [value]}), uri,
+                            mode="create" if value == 0 else "append")
+    dataset = lance.dataset(uri)
+    dataset.tags.create("keep-first", 1)
+    dataset.cleanup_old_versions(
+        older_than=datetime.timedelta(0), retain_versions=1,
+        error_if_tagged_old_versions=False)
+    assert [entry["version"] for entry in dataset.versions()] == [1, 3]
+
+    registered = client.post("/api/catalog/register", json={"uri": uri, "name": name})
+    assert registered.status_code == 200, registered.text
+    revision = client.get(
+        f"/api/catalog/tables/{registered.json()['id']}/revisions").json()["items"][0]
+    response = client.get(
+        f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
+    assert response.status_code == 200, response.text
+    assert response.json()["parentRevisionId"] is None
+
+
 def test_unregistered_lance_binding_never_retargets_same_path(tmp_path):
     uri, table = _register_lance(tmp_path)
     history = client.get(f"/api/catalog/tables/{table['id']}/revisions")
