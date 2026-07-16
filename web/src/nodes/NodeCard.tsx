@@ -14,7 +14,7 @@ import { cn } from '@/lib/utils'
 import { Port } from './Port'
 import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
-import { useSchemaWarnings } from './fields'
+import { useInputColumns, useSchemaWarnings } from './fields'
 import {
   useStore, nodeRunnable, isDisabled, roleCanEdit, type PanelKind,
 } from '../store/graph'
@@ -74,7 +74,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const off = disabled || offDownstream  // dimmed either way; only self-disabled shows the badge
   const hasCode = KINDS_WITH_CODE.has(kind)
   const busy = runState === 'running' || runState === 'estimating'
-  const invalid = node ? nodeInvalidReason(node) : null   // e.g. "order by is required"
+  const inputColumns = useInputColumns(id)
+  const invalid = node ? nodeInvalidReason(node, inputColumns) : null   // e.g. "order by is required"
   const warnings = useSchemaWarnings(id)   // soft cue: config references a column not in the input
   const sizeEst = useStore((s) => s.sizes[id])   // conservative pre-run size estimate (card hint)
   // the action shelf is revealed on hover / sole-selection / while running, so a resting card is clean

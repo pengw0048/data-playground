@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { getSpec, portMulti } from './registry'
-import { registerGenericNodes } from './generic'
+import { nodeInvalidReason, registerGenericNodes } from './generic'
 
 describe('generic node registration', () => {
   it('preserves a plugin multi-input descriptor for canvas connection validation', () => {
@@ -25,5 +25,19 @@ describe('generic node registration', () => {
       previewable: false,
       requires: { gpu: 1, labels: { engine: 'plugin-gpu' } },
     })
+  })
+
+  it('keeps a columns parameter structured and rejects lossy shapes', () => {
+    registerGenericNodes([{
+      kind: 'plugin-structured-columns-contract', title: 'Plugin columns', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
+      params: [{ name: 'columns', type: 'columns', required: true }], canBypass: false, previewable: true, blurb: '',
+    }])
+    const node = (columns: unknown) => ({ type: 'plugin-structured-columns-contract', data: { config: { columns } } })
+
+    expect(nodeInvalidReason(node('id,event'))).toContain('ordered list')
+    expect(nodeInvalidReason(node(['missing']), [{ name: 'id' }])).toContain('unavailable column')
+    expect(nodeInvalidReason(node(['missing']), [])).toBeNull()
+    expect(nodeInvalidReason(node(['event', 'id']), [{ name: 'id' }, { name: 'event' }])).toBeNull()
   })
 })

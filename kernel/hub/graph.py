@@ -318,12 +318,41 @@ def validation_error(
     structural = structural_errors(graph, node_specs, target_node_id)
     if structural:
         return "invalid graph: " + "; ".join(structural[:5]), True
+    parameter = parameter_errors(graph, node_specs)
+    if parameter:
+        return "invalid graph: " + "; ".join(parameter[:5]), True
     incompatible = type_errors(graph, node_specs)
     if incompatible:
         return "incompatible connection: " + "; ".join(incompatible[:5]), True
     if not is_acyclic(graph):
         return "graph has a cycle — control flow must be encapsulated (§5.7)", False
     return None
+
+
+def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
+    """Validate descriptor-defined structured config without inventing plugin semantics.
+
+    ``columns`` is the one existing structured parameter type. It is an ordered list of field
+    names, never a comma-delimited convenience string; individual plugins remain responsible for
+    deciding which known fields they support.
+    """
+    errors: list[str] = []
+    for node in graph.nodes:
+        spec = node_specs.get(node.type)
+        if spec is None:
+            continue
+        config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        if not isinstance(config, dict):
+            continue
+        for param in getattr(spec, "params", []):
+            if getattr(param, "type", None) != "columns" or param.name not in config:
+                continue
+            value = config[param.name]
+            if (not isinstance(value, list)
+                    or any(not isinstance(column, str) or not column.strip() for column in value)):
+                errors.append(
+                    f"node '{node.id}' parameter '{param.name}' must be an ordered list of column names")
+    return errors
 
 
 def _ports(node: GraphNode, spec, side: str) -> list[tuple[str, str, bool]]:
