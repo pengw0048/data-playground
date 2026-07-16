@@ -35,6 +35,7 @@ from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibili
 from hub.settings import settings
 
 DEFAULT_USER_ID = "local"
+LOCAL_WORKSPACE_ROOT_ID = "workspace-local-root"
 
 
 def _uid() -> str:
@@ -83,6 +84,43 @@ class CanvasShare(Base):
     __table_args__ = (
         UniqueConstraint("canvas_id", "user_id", name="uq_share"),
         CheckConstraint("role IN ('editor', 'viewer')", name="ck_share_role"),
+    )
+
+
+class WorkspaceContainer(Base):
+    """A local overlay node.  Its ID, rather than its display path, is its identity."""
+    __tablename__ = "workspace_containers"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    parent_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("workspace_containers.id"), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
+    is_root: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    __table_args__ = (
+        UniqueConstraint("parent_id", "name", name="uq_workspace_container_parent_name"),
+        CheckConstraint("ordinal >= 0", name="ck_workspace_container_ordinal"),
+        CheckConstraint("version >= 1", name="ck_workspace_container_version"),
+        CheckConstraint("is_root = false OR parent_id IS NULL", name="ck_workspace_container_root"),
+    )
+
+
+class WorkspacePlacement(Base):
+    """Canonical local placement of one canvas or registered built-in dataset."""
+    __tablename__ = "workspace_placements"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    container_id: Mapped[str] = mapped_column(
+        String, ForeignKey("workspace_containers.id"), nullable=False, index=True)
+    target_kind: Mapped[str] = mapped_column(String, nullable=False)
+    target_id: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String)
+    ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
+    __table_args__ = (
+        UniqueConstraint("target_kind", "target_id", name="uq_workspace_placement_target"),
+        CheckConstraint("target_kind IN ('canvas', 'dataset')", name="ck_workspace_placement_kind"),
+        CheckConstraint("ordinal >= 0", name="ck_workspace_placement_ordinal"),
+        CheckConstraint("version >= 1", name="ck_workspace_placement_version"),
     )
 
 
@@ -2095,6 +2133,187 @@ def list_canvases_for(uid: str) -> list[dict]:
         for c in s.scalars(select(Canvas).where(Canvas.visibility == "workspace_view", Canvas.owner_id != uid)):
             out.setdefault(c.id, _canvas_row(c, _effective_canvas_role(c, uid), True))
         return sorted(out.values(), key=lambda r: r["updatedAt"] or "", reverse=True)
+
+
+class WorkspaceVersionConflict(RuntimeError):
+    """A Workspace edit was based on a stale container or placement version."""
+
+
+class WorkspaceNameConflict(ValueError):
+    """A sibling container already owns the requested display name."""
+
+
+def _workspace_name(name: str) -> str:
+    normalized = str(name).strip()
+    if not normalized:
+        raise ValueError("workspace name must not be blank")
+    if "\x00" in normalized:
+        raise ValueError("workspace name must not contain NUL")
+    return normalized
+
+
+def _workspace_ordinal(ordinal: int) -> int:
+    if isinstance(ordinal, bool) or int(ordinal) != ordinal or ordinal < 0:
+        raise ValueError("workspace ordinal must be a non-negative integer")
+    return int(ordinal)
+
+
+def local_workspace_root() -> dict:
+    """Return the persisted, installation-local root identity from the fresh schema baseline."""
+    with session() as s:
+        root = s.get(WorkspaceContainer, LOCAL_WORKSPACE_ROOT_ID)
+        if root is None or not root.is_root:
+            raise RuntimeError("local Workspace root is missing from the metadata baseline")
+        return _workspace_container_doc(root)
+
+
+def _workspace_container_doc(row: WorkspaceContainer) -> dict:
+    return {"id": row.id, "parentId": row.parent_id, "name": row.name,
+            "ordinal": row.ordinal, "version": row.version, "isRoot": row.is_root}
+
+
+def _workspace_placement_doc(row: WorkspacePlacement) -> dict:
+    return {"id": row.id, "containerId": row.container_id, "targetKind": row.target_kind,
+            "targetId": row.target_id, "name": row.name, "ordinal": row.ordinal,
+            "version": row.version}
+
+
+def _workspace_container_locked(s, container_id: str) -> WorkspaceContainer:
+    row = s.get(WorkspaceContainer, container_id, with_for_update=True)
+    if row is None:
+        raise KeyError(f"workspace container '{container_id}' not found")
+    return row
+
+
+def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -> dict:
+    """Create one local overlay container beneath a stable parent identity."""
+    name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
+    with session() as s:
+        _workspace_container_locked(s, parent_id)
+        if s.scalar(select(WorkspaceContainer.id).where(
+                WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name)) is not None:
+            raise WorkspaceNameConflict(f"workspace container '{name}' already exists under its parent")
+        row = WorkspaceContainer(parent_id=parent_id, name=name, ordinal=ordinal)
+        s.add(row)
+        s.flush()
+        return _workspace_container_doc(row)
+
+
+def _workspace_parent_is_descendant(s, candidate_parent_id: str, container_id: str) -> bool:
+    current_id: str | None = candidate_parent_id
+    while current_id is not None:
+        if current_id == container_id:
+            return True
+        current = s.get(WorkspaceContainer, current_id, with_for_update=True)
+        if current is None:
+            raise KeyError(f"workspace container '{candidate_parent_id}' not found")
+        current_id = current.parent_id
+    return False
+
+
+def workspace_update_container(container_id: str, *, expected_version: int, name: str | None = None,
+                               parent_id: str | None = None, ordinal: int | None = None) -> dict:
+    """CAS-update a container's display/navigation fields without changing its opaque identity."""
+    with session() as s:
+        row = _workspace_container_locked(s, container_id)
+        if row.is_root:
+            raise ValueError("the local Workspace root cannot be edited")
+        if row.version != expected_version:
+            raise WorkspaceVersionConflict(
+                f"workspace container '{container_id}' is at version {row.version}")
+        target_parent = parent_id if parent_id is not None else row.parent_id
+        if target_parent is None:
+            raise ValueError("an overlay container requires a parent")
+        if _workspace_parent_is_descendant(s, target_parent, container_id):
+            raise ValueError("a workspace container cannot become its own descendant")
+        target_name = _workspace_name(name) if name is not None else row.name
+        target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
+        sibling = s.scalar(select(WorkspaceContainer.id).where(
+            WorkspaceContainer.parent_id == target_parent,
+            WorkspaceContainer.name == target_name,
+            WorkspaceContainer.id != container_id,
+        ))
+        if sibling is not None:
+            raise WorkspaceNameConflict(f"workspace container '{target_name}' already exists under its parent")
+        row.parent_id, row.name, row.ordinal = target_parent, target_name, target_ordinal
+        row.version += 1
+        s.flush()
+        return _workspace_container_doc(row)
+
+
+def workspace_delete_container(container_id: str, *, expected_version: int) -> None:
+    """Delete an empty overlay container; callers must explicitly move its children first."""
+    with session() as s:
+        row = _workspace_container_locked(s, container_id)
+        if row.is_root:
+            raise ValueError("the local Workspace root cannot be deleted")
+        if row.version != expected_version:
+            raise WorkspaceVersionConflict(
+                f"workspace container '{container_id}' is at version {row.version}")
+        if s.scalar(select(WorkspaceContainer.id).where(
+                WorkspaceContainer.parent_id == container_id).limit(1)) is not None:
+            raise ValueError("cannot delete a workspace container with child containers")
+        if s.scalar(select(WorkspacePlacement.id).where(
+                WorkspacePlacement.container_id == container_id).limit(1)) is not None:
+            raise ValueError("cannot delete a workspace container with placements")
+        s.delete(row)
+
+
+def workspace_builtin_dataset_identity(uri: str) -> str:
+    """Resolve a registered built-in dataset to its stable registration identity, never its path."""
+    with session() as s:
+        entry = s.get(CatalogEntry, uri)
+        if entry is None:
+            raise KeyError(f"registered dataset '{uri}' not found")
+        return entry.registration_id
+
+
+def workspace_create_placement(container_id: str, *, target_kind: str, target_id: str,
+                               name: str, ordinal: int = 0) -> dict:
+    """Create the sole canonical local placement for a canvas or registered dataset identity."""
+    if target_kind not in {"canvas", "dataset"}:
+        raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
+    name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
+    with session() as s:
+        _workspace_container_locked(s, container_id)
+        if target_kind == "canvas":
+            if s.get(Canvas, target_id) is None:
+                raise KeyError(f"canvas '{target_id}' not found")
+        elif s.scalar(select(CatalogEntry.uri).where(
+                CatalogEntry.registration_id == target_id).limit(1)) is None:
+            raise KeyError(f"registered dataset identity '{target_id}' not found")
+        if s.scalar(select(WorkspacePlacement.id).where(
+                WorkspacePlacement.target_kind == target_kind,
+                WorkspacePlacement.target_id == target_id)) is not None:
+            raise ValueError("workspace target already has a canonical placement")
+        row = WorkspacePlacement(container_id=container_id, target_kind=target_kind,
+                                 target_id=target_id, name=name, ordinal=ordinal)
+        s.add(row)
+        s.flush()
+        return _workspace_placement_doc(row)
+
+
+def workspace_update_placement(placement_id: str, *, expected_version: int,
+                               container_id: str | None = None, name: str | None = None,
+                               ordinal: int | None = None) -> dict:
+    """CAS-update only a placement's local presentation; target identity is intentionally immutable."""
+    with session() as s:
+        row = s.get(WorkspacePlacement, placement_id, with_for_update=True)
+        if row is None:
+            raise KeyError(f"workspace placement '{placement_id}' not found")
+        if row.version != expected_version:
+            raise WorkspaceVersionConflict(
+                f"workspace placement '{placement_id}' is at version {row.version}")
+        if container_id is not None:
+            _workspace_container_locked(s, container_id)
+            row.container_id = container_id
+        if name is not None:
+            row.name = _workspace_name(name)
+        if ordinal is not None:
+            row.ordinal = _workspace_ordinal(ordinal)
+        row.version += 1
+        s.flush()
+        return _workspace_placement_doc(row)
 
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
