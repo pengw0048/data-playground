@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, Facets,
+  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionDetail, DatasetRevisionPage, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunOutput, RunStatus, SampleResult,
   WorkspaceBrowsePage, WorkspaceResourceResolution,
@@ -211,6 +211,15 @@ export const api = {
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
   tableByRegistration: (id: string) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}?registration=true`),
+  datasetRevisions: (tableId: string, options?: { limit?: number; cursor?: string }) => {
+    const query = new URLSearchParams()
+    if (options?.limit != null) query.set('limit', String(options.limit))
+    if (options?.cursor) query.set('cursor', options.cursor)
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return req<DatasetRevisionPage>(`/catalog/tables/${encodeURIComponent(tableId)}/revisions${suffix}`)
+  },
+  datasetRevision: (datasetId: string, revisionId: string) =>
+    req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>

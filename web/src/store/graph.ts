@@ -1866,7 +1866,11 @@ export const useStore = create<Store>((set, get) => ({
       if (!opened) {
         if (fallback) await get().openFile(fallback)
         else await get().newFile()
-        if (route.view !== 'canvas') get().setView(route.view)
+        // A Workspace dataset/container deep link carries more identity than the top-level view.
+        // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
+        // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
+        if (route.view === 'workspace') get().setWorkspaceResource(route.workspaceResourceId ?? null)
+        else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {
       // offline / no kernel: fall back to the local cached doc so work survives a refresh

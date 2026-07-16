@@ -5,6 +5,7 @@ import { color, radius } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
+import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
 
 // The Tables catalog — built to browse thousands of datasets. Nothing is loaded up front: a left
@@ -872,6 +873,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <span>· {table.version ?? 'v1'}</span>
             {table.usage ? <span>· used {table.usage}×</span> : null}
           </div>
+
+          <DatasetRevisionHistory key={table.id} table={table} />
 
           {/* organization editor */}
           <section className="flex flex-col gap-2 rounded-lg border border-border p-3">

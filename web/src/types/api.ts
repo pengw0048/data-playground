@@ -70,6 +70,54 @@ export interface CatalogTable {
   metadataRevision?: string | null
 }
 
+export interface DatasetRevision {
+  datasetId: string
+  revisionId: string
+  committedAt?: string | null
+  retentionOwner: 'provider' | 'core'
+}
+
+export interface DatasetRevisionPage {
+  items: DatasetRevision[]
+  nextCursor?: string | null
+  hasMore: boolean
+}
+
+export interface DatasetRevisionSummary {
+  rowCount?: number | null
+  dataFileCount?: number | null
+  totalBytes?: number | null
+  fragmentCount?: number | null
+}
+
+export interface DatasetRevisionPreview {
+  columns: ColumnSchema[]
+  rows: Record<string, unknown>[]
+  hasMore: boolean
+  rowLimit: 100
+}
+
+export interface DatasetRevisionDetail extends DatasetRevision {
+  parentRevisionId?: string | null
+  producerOperation?: string | null
+  summary: DatasetRevisionSummary
+  preview: DatasetRevisionPreview
+}
+
+export type SchemaCompatibilityStatus = 'compatible' | 'breaking' | 'unknown'
+export interface SchemaFieldCompatibility {
+  kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'
+  status: SchemaCompatibilityStatus
+  reason: string
+  fieldId?: string | null
+  oldName?: string | null
+  newName?: string | null
+}
+export interface SchemaCompatibility {
+  status: SchemaCompatibilityStatus
+  fields: SchemaFieldCompatibility[]
+}
+
 // filter/sort/paginate params for the catalog browse query (mirrors CatalogQuery on the server)
 export interface CatalogQueryParams {
   q?: string
