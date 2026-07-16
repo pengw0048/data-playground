@@ -174,6 +174,34 @@ class DatasetRevisionResolution(Wire):
     selector: Literal["latest", "as_of", "exact"]
 
 
+class DatasetRevisionSummary(Wire):
+    """Bounded provider facts for one exact revision; absent facts are not inferred."""
+    row_count: int | None = Field(default=None, ge=0)
+    data_file_count: int | None = Field(default=None, ge=0)
+    total_bytes: int | None = Field(default=None, ge=0)
+    fragment_count: int | None = Field(default=None, ge=0)
+
+
+class DatasetRevisionPreview(Wire):
+    """A fixed, exact-revision preview window; it is never a read of current head."""
+    columns: list[ColumnSchema] = Field(default_factory=list)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    has_more: bool
+    row_limit: Literal[100] = 100
+
+
+class DatasetRevisionDetail(Wire):
+    """Inspectable facts and a bounded preview for one retained exact revision."""
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+    committed_at: datetime.datetime | None = None
+    retention_owner: Literal["provider"] = "provider"
+    parent_revision_id: str | None = Field(default=None, max_length=256)
+    producer_operation: str | None = Field(default=None, max_length=128)
+    summary: DatasetRevisionSummary
+    preview: DatasetRevisionPreview
+
+
 class CatalogPublicationReceipt(Wire):
     """Durable acknowledgement returned by an idempotent catalog output publication."""
     idempotency_key: str

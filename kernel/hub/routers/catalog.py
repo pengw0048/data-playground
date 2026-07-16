@@ -41,9 +41,12 @@ from hub.models import (
     CatalogQuery,
     CatalogTable,
     ColumnSchema,
+    DatasetRevisionDetail,
     DatasetRevision,
     DatasetRevisionPage,
+    DatasetRevisionPreview,
     DatasetRevisionResolution,
+    DatasetRevisionSummary,
     Facets,
     ImportRequest,
     JoinSuggestion,
@@ -80,6 +83,7 @@ router = APIRouter()
 # bounded prefix; keep that prefix under a fixed server-owned budget regardless of caller-controlled
 # `offset`/`k`. A larger browse belongs in a durable run, not an interactive request.
 DATA_SAMPLE_PREVIEW_ROW_BUDGET = 2_000
+DATASET_REVISION_PREVIEW_ROWS = 100
 
 @router.get("/kernel", response_model=KernelInfo)
 def kernel_info() -> KernelInfo:
@@ -363,21 +367,32 @@ def resolve_dataset_revision(table_id: str,
                                      selector="as_of" if as_of is not None else "latest")
 
 
-@router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionResolution)
-def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionResolution:
-    """Verify one persisted dataset/revision binding exactly; unavailable never means current head."""
+@router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionDetail)
+def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionDetail:
+    """Return bounded facts and preview for one exact revision; never fall back to current head."""
     binding = metadb.catalog_revision_binding(dataset_id)
     if binding is None:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
         with db.base_guard():
-            _revision_adapter(binding["uri"]).open_revision(binding["uri"], revision_id)
+            raw = _revision_adapter(binding["uri"]).revision_detail(
+                binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    return DatasetRevisionResolution(dataset_id=binding["dataset_id"], revision_id=revision_id,
-                                     selector="exact")
+    table = raw["preview_table"]
+    preview_rows = _table_to_rows(table.slice(0, DATASET_REVISION_PREVIEW_ROWS))
+    return DatasetRevisionDetail(
+        dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
+        committed_at=raw.get("committed_at"), parent_revision_id=raw.get("parent_revision_id"),
+        producer_operation=raw.get("producer_operation"),
+        summary=DatasetRevisionSummary(
+            row_count=raw.get("row_count"), data_file_count=raw.get("data_file_count"),
+            total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),
+        preview=DatasetRevisionPreview(columns=raw["columns"], rows=preview_rows,
+                                       has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
+    )
 
 
 @router.put("/catalog/tables/{table_id}/metadata", response_model=CatalogTable)
