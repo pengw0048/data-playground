@@ -5,6 +5,8 @@ The top-level canvas graph must be acyclic (control flow is encapsulated).
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 
 from hub.models import Graph, GraphEdge, GraphNode, Position
@@ -330,11 +332,11 @@ def validation_error(
 
 
 def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
-    """Validate descriptor-defined structured config without inventing plugin semantics.
+    """Validate descriptor-defined typed config without inventing plugin semantics.
 
-    ``columns`` is the one existing structured parameter type. It is an ordered list of field
-    names, never a comma-delimited convenience string; individual plugins remain responsible for
-    deciding which known fields they support.
+    ``columns`` is an ordered list of field names, never a comma-delimited convenience string.
+    Numeric descriptors accept only their declared JSON number shape; individual plugins remain
+    responsible for semantic bounds such as positive-only values.
     """
     errors: list[str] = []
     for node in graph.nodes:
@@ -345,14 +347,32 @@ def parameter_errors(graph: Graph, node_specs: dict) -> list[str]:
         if not isinstance(config, dict):
             continue
         for param in getattr(spec, "params", []):
-            if getattr(param, "type", None) != "columns" or param.name not in config:
+            param_type = getattr(param, "type", None)
+            if param.name not in config or config[param.name] is None:
+                if (param_type in ("int", "float") and getattr(param, "required", False)
+                        and getattr(param, "default", None) is None):
+                    errors.append(f"node '{node.id}' parameter '{param.name}' is required")
                 continue
             value = config[param.name]
-            if (not isinstance(value, list)
+            if param_type == "int" and (type(value) is not int or not -(2**53 - 1) <= value <= 2**53 - 1):
+                errors.append(
+                    f"node '{node.id}' parameter '{param.name}' must be a complete safe integer")
+            elif param_type == "float" and not _finite_json_number(value):
+                errors.append(f"node '{node.id}' parameter '{param.name}' must be a finite number")
+            elif param_type == "columns" and (not isinstance(value, list)
                     or any(not isinstance(column, str) or not column.strip() for column in value)):
                 errors.append(
                     f"node '{node.id}' parameter '{param.name}' must be an ordered list of column names")
     return errors
+
+
+def _finite_json_number(value) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _ports(node: GraphNode, spec, side: str) -> list[tuple[str, str, bool]]:

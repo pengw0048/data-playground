@@ -1,7 +1,6 @@
 // Generic node rendering: any node the frontend doesn't have a hand-built
 // card for — including plugin nodes — is rendered from its /api/nodes schema. A plugin that
 // registers a typed node therefore appears in the canvas, typed and wired, with NO frontend code.
-import { useEffect, useState } from 'react'
 import { register, getSpec, type NodeComponentProps } from './registry'
 import { NodeCard } from './NodeCard'
 import { useStore } from '../store/graph'
@@ -9,7 +8,7 @@ import { Field, MiniInput, MiniSelect } from '../ui/controls'
 import { ColumnListPicker, useInputColumns } from './fields'
 import { CodeSnippet } from '../ui/CodeSnippet'
 import { color } from '../theme/tokens'
-import type { BackendNodeSpec } from '../api/client'
+import type { BackendNodeSpec, BackendParam } from '../api/client'
 import type { WireType } from '../theme/tokens'
 
 let backendSpecs: Record<string, BackendNodeSpec> = {}
@@ -23,11 +22,30 @@ export function getBackendSpec(kind: string): BackendNodeSpec | undefined {
  * disabled Run affordance + its reason, from the backend param schema (works for any kind/plugin). */
 export function nodeInvalidReason(
   node: { type: string; data: { config: Record<string, unknown> } }, inputColumns?: { name: string }[],
+  numericDrafts?: Record<string, string>,
 ): string | null {
   const spec = backendSpecs[node.type]
   if (!spec) return null
   for (const p of spec.params) {
+    if (p.showWhen && !p.showWhen.in.includes(String(node.data.config[p.showWhen.param] ?? ''))) continue
     const v = node.data.config[p.name]
+    if (p.type === 'int' || p.type === 'float') {
+      const draft = numericDrafts?.[p.name]
+      if (draft !== undefined) {
+        const reason = numericParamReason(p, draft)
+        if (reason) return reason
+        continue
+      }
+      const effective = v ?? p.default
+      if (effective == null) {
+        if (p.required) return `${p.label ?? p.name} is required`
+        continue
+      }
+      const valid = typeof effective === 'number'
+        && (p.type === 'int' ? Number.isSafeInteger(effective) : Number.isFinite(effective))
+      if (!valid) return numericTypeReason(p)
+      continue
+    }
     if (p.required) {
       if (v == null || String(v).trim() === '') return `${p.label ?? p.name} is required`
     }
@@ -45,11 +63,31 @@ export function nodeInvalidReason(
   return null
 }
 
+/** Invalid in-progress numeric text only. Used by autosave so an unrelated doc edit cannot flush it. */
+export function numericDraftInvalidReason(
+  node: { type: string; data: { config: Record<string, unknown> } }, numericDrafts?: Record<string, string>,
+): string | null {
+  if (!numericDrafts) return null
+  const spec = backendSpecs[node.type]
+  if (!spec) return null
+  for (const p of spec.params) {
+    if (p.type !== 'int' && p.type !== 'float') continue
+    if (p.showWhen && !p.showWhen.in.includes(String(node.data.config[p.showWhen.param] ?? ''))) continue
+    const draft = numericDrafts[p.name]
+    if (draft === undefined) continue
+    const reason = numericParamReason(p, draft)
+    if (reason) return reason
+  }
+  return null
+}
+
 /** Editable form fields for a node's non-code params (from the backend schema). Reused by the
  * generic node card and the Inspector so param editing stays in one place. */
 export function NodeParamFields({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
+  const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
+  const setNumericDraft = useStore((s) => s.setNumericParamDraft)
   const columns = useInputColumns(nodeId)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   // hide a conditional param whose showWhen dependency isn't met (e.g. batchFormat only for map_batches)
@@ -74,7 +112,9 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
                 {val ? 'true' : 'false'}
               </button>
             ) : p.type === 'int' || p.type === 'float' ? (
-              <NumberField value={val} isInt={p.type === 'int'} onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
+              <NumberField param={p} value={val} draft={numericDrafts?.[p.name]}
+                onDraft={(text) => setNumericDraft(nodeId, p.name, text)}
+                onCommit={(n) => updateConfig(nodeId, { [p.name]: n })} />
             ) : (
               <MiniInput value={String(val)} onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
             )}
@@ -85,23 +125,66 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
   )
 }
 
-// A numeric field that keeps its own text (so you can type "0.", "-", or clear it) and commits only
-// valid parsed numbers — a fully-controlled value={String(n)} reverts partial input mid-keystroke.
-function NumberField({ value, isInt, onCommit }: { value: unknown; isInt: boolean; onCommit: (n: number) => void }) {
-  const [text, setText] = useState(value == null ? '' : String(value))
-  useEffect(() => {
-    // resync only on an EXTERNAL change (e.g. a different node selected), not our own commit
-    const cur = isInt ? parseInt(text, 10) : parseFloat(text)
-    if (cur !== value) setText(value == null ? '' : String(value))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value])
+export type NumericParamParse = { kind: 'empty' } | { kind: 'invalid' } | { kind: 'valid'; value: number }
+
+/** Parse the complete field text. Prefixes such as `12abc` and non-finite values never coerce. */
+export function parseNumericParam(text: string, type: 'int' | 'float'): NumericParamParse {
+  const canonical = text.trim()
+  if (!canonical) return { kind: 'empty' }
+  const grammar = type === 'int'
+    ? /^[+-]?\d+$/
+    : /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/
+  if (!grammar.test(canonical)) return { kind: 'invalid' }
+  const value = Number(canonical)
+  const valid = type === 'int' ? Number.isSafeInteger(value) : Number.isFinite(value)
+  return valid ? { kind: 'valid', value } : { kind: 'invalid' }
+}
+
+function numericTypeReason(param: BackendParam): string {
+  return `${param.label ?? param.name} must be a ${param.type === 'int' ? 'complete safe integer' : 'finite number'}`
+}
+
+function numericParamReason(param: BackendParam, text: string): string | null {
+  const parsed = parseNumericParam(text, param.type as 'int' | 'float')
+  if (parsed.kind === 'empty') {
+    return param.required && param.default == null ? `${param.label ?? param.name} is required` : null
+  }
+  return parsed.kind === 'invalid' ? numericTypeReason(param) : null
+}
+
+// Numeric edits stay outside the canvas document until blur. Invalid text is therefore retained for
+// correction without entering autosave/collaboration or becoming executable configuration.
+function NumberField({ param, value, draft, onDraft, onCommit }: {
+  param: BackendParam; value: unknown; draft?: string
+  onDraft: (text: string | undefined) => void; onCommit: (n: number | undefined) => void
+}) {
+  const text = draft ?? (value == null ? '' : String(value))
+  const reason = draft !== undefined
+    ? numericParamReason(param, draft)
+    : value != null && (typeof value !== 'number'
+      || (param.type === 'int' ? !Number.isSafeInteger(value) : !Number.isFinite(value)))
+      ? numericTypeReason(param)
+      : null
+  const clearHint = param.default != null
+    ? `Clear to use the declared default (${String(param.default)}).`
+    : !param.required ? 'Clear to leave this value unset.' : null
   return (
-    <MiniInput mono value={text} onChange={(v) => {
-      setText(v)
-      if (v.trim() === '') return
-      const n = isInt ? parseInt(v, 10) : parseFloat(v)
-      if (!Number.isNaN(n)) onCommit(n)
-    }} />
+    <>
+      <MiniInput mono value={text} onChange={(v) => onDraft(v)} onBlur={() => {
+        if (draft === undefined) return
+        const parsed = parseNumericParam(draft, param.type as 'int' | 'float')
+        if (parsed.kind === 'valid') {
+          onCommit(parsed.value)
+          onDraft(undefined)
+        } else if (parsed.kind === 'empty' && (param.default != null || !param.required)) {
+          onCommit(param.default == null ? undefined : Number(param.default))
+          onDraft(undefined)
+        }
+      }} />
+      {reason
+        ? <div role="alert" className="text-[10.5px] text-destructive">{reason}.</div>
+        : clearHint && <div className="text-[10.5px] text-muted-foreground">{clearHint}</div>}
+    </>
   )
 }
 
