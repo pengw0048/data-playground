@@ -168,6 +168,25 @@ describe('durable full results', () => {
     expect(await screen.findByText('survived')).toBeInTheDocument()
   })
 
+  it('shows persisted sample evidence beside a retained result', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'sample-history', runId: 'sample-run', status: 'done', targetNodeId: 'target', rows: 4,
+      outputs: [{
+        ...committedOutput('/outputs/sample.parquet', 4),
+        sampleProvenance: {
+          strategy: 'reservoir', seed: 7, requestedRows: 4, scannedRows: 12,
+          returnedRows: 4, totalRows: 12, identity: 'a'.repeat(64), limitations: ['deterministic'],
+        },
+      }],
+    }])
+
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    expect(await screen.findByText(/Deterministic reservoir sample/)).toBeInTheDocument()
+    expect(screen.getByText(/seed 7/)).toBeInTheDocument()
+    expect(screen.getByText(/requested 4/)).toBeInTheDocument()
+  })
+
   it('pages beyond the first 50 materialized rows', async () => {
     const downloads: string[] = []
     Object.defineProperty(URL, 'createObjectURL', {

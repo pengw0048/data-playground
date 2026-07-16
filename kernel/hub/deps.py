@@ -229,6 +229,7 @@ def _persist_run(deps, graph, target, status) -> None:
                       job_type=status.job_type, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
                       outputs=[output.model_dump() for output in status.outputs], per_node=per_node,
+                      profile=status.profile.model_dump() if status.profile else None,
                       run_id=status.run_id, request_id=request_id)
     _emit_telemetry(deps, graph, persisted_target, status, per_node, request_id=request_id)
     labels = finished_run_metric_labels(status.status, status.placement)

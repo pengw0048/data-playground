@@ -2600,6 +2600,16 @@
             "title": "Rowcount",
             "type": "integer"
           },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "sampled": {
             "default": true,
             "description": "Whether statistics were computed from a bounded sample instead of all rows.",
@@ -3057,6 +3067,16 @@
             ],
             "title": "Pernode"
           },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "requestId": {
             "anyOf": [
               {
@@ -3189,6 +3209,16 @@
               }
             ],
             "title": "Rows"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "table": {
             "anyOf": [

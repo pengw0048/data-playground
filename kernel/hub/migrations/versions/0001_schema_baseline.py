@@ -909,6 +909,7 @@ def upgrade() -> None:
         sa.Column("ms", sa.Integer(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
         sa.Column("outputs", sa.Text(), server_default="[]", nullable=False),
+        sa.Column("profile", sa.Text(), nullable=True),
         sa.Column("per_node", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.ForeignKeyConstraint(

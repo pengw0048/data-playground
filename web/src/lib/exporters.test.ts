@@ -134,6 +134,25 @@ describe('node sample export freshness', () => {
     expect(await blobs[0].text()).toContain('fresh visible right')
   })
 
+  it('writes sample provenance as an adjacent export sidecar', async () => {
+    apiMocks.preview.mockResolvedValueOnce({
+      ...result('sampled'),
+      sampleProvenance: {
+        strategy: 'reservoir', seed: 42, requestedRows: 10, scannedRows: 100,
+        returnedRows: 1, totalRows: 100, datasetIdentity: 'events.parquet',
+        datasetRevision: 'revision', identity: 'a'.repeat(64), limitations: ['deterministic'],
+      },
+    })
+
+    await exportNode('target')
+
+    expect(downloads).toEqual([
+      'target-preview-sample.json', 'target-preview-sample.csv',
+      'target-preview-sample.provenance.json',
+    ])
+    expect(await blobs[2].text()).toContain('reservoir')
+  })
+
   it('requires a visible named output before exporting a multi-output node', async () => {
     const doc = pipeline()
     doc.nodes[1].type = 'section'

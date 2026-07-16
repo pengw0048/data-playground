@@ -145,6 +145,8 @@ class RunRecord(Base):
     # Declaration-ordered RunOutput snapshots.  The pre-1.0 baseline stores the collection directly;
     # there are no singular compatibility columns or migration shims.
     outputs: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default="[]")
+    # Full-profile jobs have no outputs; retain their bounded ProfileResult separately for history.
+    profile: Mapped[str | None] = mapped_column(Text, nullable=True)
     per_node: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON: durable per-node breakdown
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (
@@ -2578,6 +2580,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        job_type: str, status: str,
                        rows: int | None = None, ms: int | None = None, error: str | None = None,
                        outputs: list[dict] | None = None, per_node: list[dict] | None = None,
+                       profile: dict | None = None,
                        run_id: str | None = None,
                        request_id: str | None = None) -> bool:
     """Session-scoped history upsert shared by normal completion and backend publication."""
@@ -2596,6 +2599,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         "ms": ms,
         "error": error,
         "outputs": outputs if outputs is not None else [],
+        "profile": profile,
         "per_node": per_node,
     })
     output_docs = [output.model_dump() for output in history.outputs]
@@ -2619,6 +2623,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         history.target_node_id, history.job_type, history.status)
     rec.rows, rec.ms, rec.error = history.rows, history.ms, history.error
     rec.outputs = output_payload
+    rec.profile = json.dumps(history.profile.model_dump(), default=str) if history.profile else None
     rec.per_node = (json.dumps(
         [item.model_dump() for item in history.per_node], default=str)
         if history.per_node else None)
@@ -2643,6 +2648,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
 def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str, status: str,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                outputs: list[dict] | None = None, per_node: list[dict] | None = None,
+               profile: dict | None = None,
                run_id: str | None = None,
                request_id: str | None = None) -> bool:
     """Persist a finished run under its canvas. No-op (returns False) without a real canvas — an ad-hoc
@@ -2656,7 +2662,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
         return _upsert_run_record(
             s, canvas_id=canvas_id, target_node_id=target_node_id,
             job_type=job_type, status=status,
-            rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node,
+            rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node, profile=profile,
             run_id=run_id, request_id=request_id,
         )
 
@@ -2785,6 +2791,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "targetNodeId": r.target_node_id, "jobType": r.job_type, "rows": r.rows,
                  "ms": r.ms, "error": r.error,
                  "outputs": json.loads(r.outputs),
+                 "profile": json.loads(r.profile) if r.profile else None,
                  "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
 

@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { FullResult } from './DataPanel'
+import { SampleProvenanceSummary } from './DataPanel'
 import type { RunOutput } from '../types/api'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
@@ -65,6 +66,11 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                       outputs={r.outputs} openKey={resultOpen}
                       onToggle={(key) => setResultOpen(resultOpen === key ? null : key)} />
                   )}
+                  {r.profile?.sampleProvenance && (
+                    <div className="border-t border-border bg-muted/20 px-4 py-2">
+                      <SampleProvenanceSummary provenance={r.profile.sampleProvenance} />
+                    </div>
+                  )}
                 </div>
               )
             })}
@@ -120,6 +126,7 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
+            {output.sampleProvenance && <div className="px-4 pb-2"><SampleProvenanceSummary provenance={output.sampleProvenance} /></div>}
             {openKey === key && readable && (
               <div className="border-t border-border">
                 <FullResult uri={output.uri!}
