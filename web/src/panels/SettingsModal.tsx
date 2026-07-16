@@ -1,5 +1,11 @@
-import { useEffect, useState } from 'react'
-import { api, type Cred, type CredKind } from '../api/client'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  api,
+  type Cred,
+  type CredKind,
+  type SettingChange,
+  type SettingsSnapshot,
+} from '../api/client'
 import type { PluginInfo, ResourceSpec } from '../types/api'
 import { useStore } from '../store/graph'
 import { Icon, type IconName } from '../ui/Icon'
@@ -40,11 +46,61 @@ const emptyCredForm = (kind: CredKind): CredForm => ({ id: null, name: '', kind,
 
 type SaveFailure = {
   message: string
-  completed: number
-  total: number
 }
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
+
+const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right)
+
+function stagedSettings(
+  baseline: SettingsSnapshot | null,
+  global: Record<string, unknown>,
+  user: Record<string, unknown>,
+  pluginEdits: Record<string, Record<string, string>>,
+  plugins: PluginInfo[],
+  canGlobal: boolean,
+): SettingChange[] {
+  if (!baseline) return []
+  const changes: SettingChange[] = []
+  if (canGlobal) {
+    const candidates: [string, unknown, unknown][] = [
+      ['agentModel', String(global.agentModel ?? ''), String(baseline.global.agentModel ?? '')],
+      ['agentBaseUrl', String(global.agentBaseUrl ?? ''), String(baseline.global.agentBaseUrl ?? '')],
+      ['agentCredId', global.agentCredId === NO_CRED ? '' : String(global.agentCredId ?? ''), String(baseline.global.agentCredId ?? '')],
+      ['defaultObjectStoreCredId', global.defaultObjectStoreCredId === NO_CRED ? '' : String(global.defaultObjectStoreCredId ?? ''), String(baseline.global.defaultObjectStoreCredId ?? '')],
+      [
+        'agentDataPolicy',
+        {
+          level: String(global.agentDataPolicyLevel || 'metadata-only'),
+          endpointIsLocal: Boolean(global.agentDataPolicyEndpointIsLocal),
+        },
+        {
+          level: String((baseline.global.agentDataPolicy as { level?: string } | undefined)?.level || 'metadata-only'),
+          endpointIsLocal: Boolean((baseline.global.agentDataPolicy as { endpointIsLocal?: boolean } | undefined)?.endpointIsLocal),
+        },
+      ],
+      ['destinations', Array.isArray(global.destinations) ? global.destinations : [], Array.isArray(baseline.global.destinations) ? baseline.global.destinations : []],
+    ]
+    for (const [key, value, original] of candidates) {
+      if (!sameJson(value, original)) changes.push({ scope: 'global', key, value })
+    }
+    for (const [pack, fields] of Object.entries(pluginEdits)) {
+      const schema = plugins.find((plugin) => plugin.name === pack)?.config ?? []
+      for (const [key, value] of Object.entries(fields)) {
+        if (schema.find((field) => field.key === key)?.secret && !value) continue
+        const settingKey = `plugin.${pack}.${key}`
+        if (!sameJson(value, baseline.global[settingKey] ?? '')) {
+          changes.push({ scope: 'global', key: settingKey, value })
+        }
+      }
+    }
+  }
+  const backend = user.backend === INHERIT ? '' : String(user.backend ?? '')
+  if (backend !== String(baseline.user.backend ?? '')) {
+    changes.push({ scope: 'user', key: 'backend', value: backend })
+  }
+  return changes
+}
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {
   const kernelInfo = useStore((s) => s.kernelInfo)
@@ -59,6 +115,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [loadAttempt, setLoadAttempt] = useState(0)
+  const [baseline, setBaseline] = useState<SettingsSnapshot | null>(null)
   const [saving, setSaving] = useState(false)
   const [saveFailure, setSaveFailure] = useState<SaveFailure | null>(null)
   const [savedMsg, setSavedMsg] = useState('')
@@ -108,8 +165,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
       global.agentDataPolicyEndpointIsLocal = Boolean(policy?.endpointIsLocal)
       setG(global)
       setU(nextSettings.user)
+      setBaseline(nextSettings)
       setPlugins(nextPlugins)
       setCreds(nextCreds)
+      setPcfg({})
       setLoading(false)
     }).catch((error) => {
       if (cancelled) return
@@ -123,9 +182,9 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     if (!canGlobal && active !== 'execution') setActive('execution')
   }, [active, canGlobal])
 
-  // a plugin config field's currently-shown value: the user's edit, else the stored (non-secret) value
-  const pval = (pack: string, key: string, stored: unknown) =>
-    pcfg[pack]?.[key] ?? (stored == null ? '' : String(stored))
+  // The revisioned Settings snapshot is the save baseline; /plugins contributes field schema only.
+  const pval = (pack: string, key: string) =>
+    pcfg[pack]?.[key] ?? String(g[`plugin.${pack}.${key}`] ?? '')
   const setPval = (pack: string, key: string, v: string) =>
     setPcfg((prev) => ({ ...prev, [pack]: { ...(prev[pack] ?? {}), [key]: v } }))
   const configurable = plugins.filter((p) => (p.config?.length ?? 0) > 0)
@@ -136,53 +195,32 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const objectStoreCreds = creds.filter((c) => c.kind === 'object_store')
   const agentCreds = creds.filter((c) => c.kind === 'agent')
   const credName = (id?: string | null) => creds.find((c) => c.id === id)?.name
+  const changes = useMemo(
+    () => stagedSettings(baseline, g, u, pcfg, plugins, canGlobal),
+    [baseline, canGlobal, g, pcfg, plugins, u],
+  )
   const save = async () => {
-    if (loading || loadError || saving) return
-    const updates: { scope: 'global' | 'user'; key: string; value: unknown }[] = []
-    // Only admins may write global settings. Non-admins see just their per-user runner preference,
-    // so the request list mirrors exactly what the UI says they can change.
-    if (canGlobal) {
-      for (const key of ['agentModel', 'agentBaseUrl']) {
-        updates.push({ scope: 'global', key, value: g[key] ?? '' })
-      }
-      // The agent's key and object-store credentials are Cred entities now (managed in the Credentials
-      // pane); settings only reference them by id.
-      updates.push({ scope: 'global', key: 'agentCredId', value: g.agentCredId === NO_CRED ? '' : (g.agentCredId ?? '') })
-      updates.push({ scope: 'global', key: 'defaultObjectStoreCredId', value: g.defaultObjectStoreCredId === NO_CRED ? '' : (g.defaultObjectStoreCredId ?? '') })
-      updates.push({
-        scope: 'global',
-        key: 'agentDataPolicy',
-        value: {
-          level: String(g.agentDataPolicyLevel || 'metadata-only'),
-          endpointIsLocal: Boolean(g.agentDataPolicyEndpointIsLocal),
-        },
-      })
-      updates.push({ scope: 'global', key: 'destinations', value: dests })
-      for (const [pack, fields] of Object.entries(pcfg)) {
-        const schema = plugins.find((p) => p.name === pack)?.config ?? []
-        for (const [key, value] of Object.entries(fields)) {
-          if (schema.find((f) => f.key === key)?.secret && !value) continue
-          updates.push({ scope: 'global', key: `plugin.${pack}.${key}`, value })
-        }
-      }
-    }
-    updates.push({ scope: 'user', key: 'backend', value: u.backend === INHERIT ? '' : (u.backend ?? '') })
+    if (loading || loadError || saving || !baseline || changes.length === 0) return
+    const submitted = changes
 
     setSaving(true)
     setSavedMsg('')
     setSaveFailure(null)
-    let completed = 0
     try {
-      for (const update of updates) {
-        await api.putSetting(update.scope, update.key, update.value)
-        completed += 1
-      }
+      const result = await api.putSettingsBatch(baseline.revision, submitted)
+      setBaseline((current) => {
+        if (!current) return current
+        const next = { global: { ...current.global }, user: { ...current.user }, revision: { ...current.revision } }
+        const touched = new Set(submitted.map((change) => change.scope))
+        for (const change of submitted) next[change.scope][change.key] = change.value
+        if (touched.has('global')) next.revision.global = result.revision.global
+        if (touched.has('user')) next.revision.user = result.revision.user
+        return next
+      })
       setSavedMsg('Saved'); setTimeout(() => setSavedMsg(''), 1400)
     } catch (e) {
-      const failed = updates[completed]
-      const target = failed ? `${failed.scope} setting "${failed.key}"` : 'settings'
-      const message = `Could not save ${target}: ${errorMessage(e)}`
-      setSaveFailure({ message, completed, total: updates.length })
+      const message = `Settings were not saved: ${errorMessage(e)}`
+      setSaveFailure({ message })
       pushToast(message, 'error')
     } finally {
       setSaving(false)
@@ -231,8 +269,10 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <span className="flex items-center text-muted-foreground"><Icon name="settings" size={15} /></span>
           <DialogTitle className="text-[15px] font-bold">Settings</DialogTitle>
           <span className="flex-1" />
-          <span className="text-[11.5px] text-green-600">{savedMsg}</span>
-          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving}>{saving ? 'Saving…' : 'Save'}</Button>
+          <span role="status" aria-live="polite" className={cn('text-[11.5px]', changes.length ? 'text-amber-700 dark:text-amber-300' : 'text-green-600')}>
+            {changes.length ? `${changes.length} unsaved change${changes.length === 1 ? '' : 's'}` : savedMsg}
+          </span>
+          <Button size="sm" onClick={save} disabled={loading || Boolean(loadError) || saving || changes.length === 0}>{saving ? 'Saving…' : 'Save'}</Button>
         </div>
         <DialogDescription className="sr-only">Application and workspace settings: the agent model, execution backend, and output destinations.</DialogDescription>
 
@@ -240,11 +280,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           <div role="alert" className="flex items-center gap-3 border-b border-destructive/30 bg-destructive/5 px-[18px] py-2 text-[11.5px] text-destructive">
             <div className="min-w-0 flex-1">
               <div>{saveFailure.message}</div>
-              <div className="mt-0.5 text-[10.5px]">
-                {saveFailure.completed > 0
-                  ? `${saveFailure.completed} of ${saveFailure.total} updates completed before the failure. Server settings may be partially updated; your edits remain here.`
-                  : 'No update was confirmed. Your edits remain here.'}
-              </div>
+              <div className="mt-0.5 text-[10.5px]">The save was not confirmed. Settings are never partially committed; your edits remain here.</div>
             </div>
             <Button variant="outline" size="sm" onClick={save} disabled={saving}>Retry save</Button>
           </div>
@@ -496,22 +532,20 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                         <Icon name="settings" size={12} /> {p.name}
                       </div>
                       {p.config!.map((f) => {
-                        const isSet = p.config_set?.includes(f.key)
-                        const storedRef = f.secret
-                          ? (g[`plugin.${p.name}.${f.key}`] ?? p.config_values?.[f.key])
-                          : p.config_values?.[f.key]
+                        const storedRef = g[`plugin.${p.name}.${f.key}`]
+                        const isSet = storedRef != null && storedRef !== ''
                         const ph = f.placeholder ?? (f.secret
                           ? (isSet ? String(storedRef ?? 'env:VAR or file:/path') : 'env:VAR or file:/path')
                           : (f.default != null ? String(f.default) : ''))
                         return (
                           <Field key={f.key} label={f.label}>
                             {f.type === 'select' && f.options ? (
-                              <Select value={pval(p.name, f.key, p.config_values?.[f.key])} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                              <Select value={pval(p.name, f.key)} onValueChange={(v) => setPval(p.name, f.key, v)}>
                                 <SelectTrigger aria-label={f.label}><SelectValue placeholder={ph} /></SelectTrigger>
                                 <SelectContent>{f.options.map((o) => <SelectItem key={o} value={o}>{o}</SelectItem>)}</SelectContent>
                               </Select>
                             ) : f.type === 'bool' ? (
-                              <Select value={pval(p.name, f.key, p.config_values?.[f.key]) || 'false'} onValueChange={(v) => setPval(p.name, f.key, v)}>
+                              <Select value={pval(p.name, f.key) || 'false'} onValueChange={(v) => setPval(p.name, f.key, v)}>
                                 <SelectTrigger aria-label={f.label}><SelectValue /></SelectTrigger>
                                 <SelectContent><SelectItem value="true">true</SelectItem><SelectItem value="false">false</SelectItem></SelectContent>
                               </Select>
@@ -520,7 +554,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                                 type={f.type === 'int' || f.type === 'float' ? 'number' : 'text'}
                                 value={f.secret
                                   ? (pcfg[p.name]?.[f.key] ?? (storedRef == null ? '' : String(storedRef)))
-                                  : pval(p.name, f.key, p.config_values?.[f.key])}
+                                  : pval(p.name, f.key)}
                                 placeholder={ph}
                                 aria-label={f.label}
                                 onChange={(e) => setPval(p.name, f.key, e.target.value)}

@@ -69,3 +69,24 @@ describe('run-scoped result access', () => {
     )
   })
 })
+
+describe('settings batch client', () => {
+  it('sends the expected revision and dirty changes in one request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      ok: true, revision: { global: 4, user: 7 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await api.putSettingsBatch(
+      { global: 3, user: 7 },
+      [{ scope: 'global', key: 'agentModel', value: 'openai/gpt-5' }],
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/settings/batch', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({
+        expectedRevision: { global: 3, user: 7 },
+        changes: [{ scope: 'global', key: 'agentModel', value: 'openai/gpt-5' }],
+      }),
+    }))
+  })
+})
