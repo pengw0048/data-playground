@@ -71,9 +71,13 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     assert ready_service.returncode == 0, ready_service.stderr
 
     with metadb.engine().connect() as connection:
-        command.downgrade(metadb._alembic_cfg(connection), "-1")
+        command.downgrade(metadb._alembic_cfg(connection), "0002_managed_file_revs")
+    with metadb.engine().begin() as connection:
+        connection.execute(text("DROP TABLE workspace_placements"))
+        connection.execute(text("DROP TABLE workspace_containers"))
+        connection.execute(text("ALTER TABLE run_records DROP COLUMN profile"))
     behind = metadb._current_schema_heads()
-    assert behind == ("0001_schema_baseline",)
+    assert behind == ("0002_managed_file_revs",)
 
     service = subprocess.run(
         [sys.executable, "-c", "from hub import metadb; metadb.init_db()"],
@@ -83,7 +87,7 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     assert "metadata schema is not at required Alembic head" in (service.stderr + service.stdout)
     assert metadb._current_schema_heads() == behind
 
-    # The explicit migration command upgrades the supported prior baseline without service startup
+    # The explicit migration command repairs the supported historical schema without service startup
     # silently mutating a behind production schema.
     restore = subprocess.run(
         [sys.executable, "-m", "hub.cli", "migrate", "--workspace", str(tmp_path)],
@@ -91,3 +95,13 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
     )
     assert restore.returncode == 0, restore.stderr
     assert metadb.schema_at_head() is True
+    with metadb.engine().connect() as connection:
+        assert "profile" in {
+            column["name"] for column in metadb.Base.metadata.tables["run_records"].columns
+        }
+        assert "profile" in {
+            column["name"] for column in connection.dialect.get_columns(connection, "run_records")
+        }
+        assert connection.execute(text("""
+            SELECT id FROM workspace_containers WHERE id = 'workspace-local-root'
+        """)).scalar_one() == "workspace-local-root"
