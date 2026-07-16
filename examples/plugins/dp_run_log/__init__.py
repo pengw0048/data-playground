@@ -18,10 +18,13 @@ file. Default: `run-telemetry.jsonl` in the process working directory.
 from __future__ import annotations
 
 import json
+import os
 
 
 def register(reg) -> None:
-    path = reg.config("path", "run-telemetry.jsonl")
+    # Entry-point packages do not carry a drop-in manifest into the workspace loader, so retain the
+    # documented environment fallback when this reference plugin is installed from its wheel.
+    path = reg.config("path", os.environ.get("DP_RUN_LOG", "run-telemetry.jsonl"))
 
     def sink(record: dict) -> None:
         with open(path, "a", encoding="utf-8") as f:

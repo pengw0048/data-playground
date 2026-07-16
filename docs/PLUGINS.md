@@ -350,10 +350,33 @@ The example has a test that loads it via drop-in discovery and runs its node
 (`test_example_plugin_loads_and_runs` in `kernel/hub/tests/test_kernel.py`). `GET /api/plugins` lists
 loaded packs (with any load error). `GET /api/nodes` shows the schema the SPA renders.
 
-An out-of-tree package should run the same contract tests against its declared core API range and add
-provider-independent fakes for failure, cancellation, credential-selection, and bounded-work behavior.
-Live integration tests then validate the intended provider or cluster; they do not replace deterministic
-contract tests.
+For an installed telemetry plugin, build the core candidate and plugin wheel, install both into a clean
+environment, then run the conformance kit that ships in the core wheel. It discovers the plugin only from
+its `dataplay.plugins` entry point, checks activation, delivers one finished-run telemetry record, and
+stops sink workers before exit. Its failures are stage-labelled (`activation`, `capability`, or `cleanup`)
+and intentionally do not echo loader details or configured paths.
+
+```bash
+(
+  cd kernel
+  uv build --wheel
+)
+(
+  cd examples/plugins/dp_run_log
+  uv build --wheel
+)
+uv venv /tmp/dp-plugin-conformance
+uv pip install --python /tmp/dp-plugin-conformance/bin/python \
+  kernel/dist/data_playground-*.whl \
+  examples/plugins/dp_run_log/dist/dp_run_log-*.whl
+/tmp/dp-plugin-conformance/bin/python -m hub.plugin_conformance dp-run-log \
+  --workspace /tmp/dp-plugin-workspace \
+  --telemetry-log /tmp/dp-plugin-workspace/run-telemetry.jsonl
+```
+
+Private or third-party plugins can reuse `python -m hub.plugin_conformance` for the telemetry capability
+and add their own capability-specific tests. Live integration tests then validate the intended provider or
+cluster; they do not replace deterministic contract tests.
 
 ## Reference plugins
 
