@@ -344,6 +344,9 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }:
   const total = data.rowCount ?? null
   const sourceCapped = data.limitScope === 'each-source' || data.limitReason === 'preview-scan'
   const provenance = data.sampleProvenance
+  const provenanceCounts = provenance
+    ? `Requested ${provenance.requestedRows.toLocaleString()} rows · scanned ${provenance.scannedRows?.toLocaleString() ?? 'unknown'} · returned ${provenance.returnedRows.toLocaleString()} · total ${provenance.totalRows?.toLocaleString() ?? 'unknown'}.`
+    : null
   const resultCapped = data.limitScope === 'result-window'
     || data.limitReason === 'interactive-row-budget'
     || (data.completeness === 'capped' && !sourceCapped)
@@ -375,10 +378,10 @@ function DataScopeBanner({ data, offset, unit, scope, allowNextAttempt = true }:
         </div>
       )}
       {provenance && (
-        <div className="mt-1 text-muted-foreground">
-          {provenance.strategy === 'reservoir'
-            ? <>Seed {provenance.seed} · input revision {provenance.datasetRevision ?? 'unknown'} · deterministic membership.</>
-            : <>Prefix preview · input revision {provenance.datasetRevision ?? 'unknown'} · not representative or random.</>}
+        <div className="mt-1 space-y-0.5 text-muted-foreground">
+          <div>{provenance.strategy === 'reservoir' ? `Reservoir sample · seed ${provenance.seed}.` : 'Prefix preview.'} {provenanceCounts}</div>
+          <div className="break-all">Input {provenance.datasetIdentity ?? 'unknown'} · revision {provenance.datasetRevision ?? 'unknown'}.</div>
+          {provenance.limitations.map((limitation) => <div key={limitation}>{limitation}</div>)}
         </div>
       )}
       {resultCapped && (

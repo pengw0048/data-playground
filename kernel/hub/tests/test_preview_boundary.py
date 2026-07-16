@@ -12,6 +12,7 @@ from hub import db
 from hub.backends import DatasetAdapter, DatasetPreviewAdapter
 from hub.estimate import estimate_sizes
 from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.executors.preview import _reservoir_preview_allowed
 from hub.models import ColumnProfile, Graph, ProfileResult, SampleRequest, SampleResult
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 
@@ -173,6 +174,20 @@ def test_remote_ipc_source_preview_refuses_before_opening_the_object_store(monke
         _engine(graph, adapter).relation("source")
 
     assert opened == []
+
+
+def test_reservoir_preview_does_not_turn_a_remote_duckdb_source_into_a_full_scan() -> None:
+    graph = Graph.model_validate({
+        "id": "remote-reservoir-preview", "version": 1,
+        "nodes": [
+            _node("source", "source", {"uri": "s3://bucket/data.parquet"}),
+            _node("sample", "sample", {"n": 100, "seed": 42}),
+        ],
+        "edges": [_edge("source", "sample")],
+    })
+    adapter = type("RemoteDuckDBAdapter", (), {"name": "duckdb"})()
+
+    assert not _reservoir_preview_allowed(graph, "sample", lambda _uri: adapter)
 
 
 @pytest.mark.parametrize(

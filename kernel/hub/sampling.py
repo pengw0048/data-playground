@@ -7,6 +7,7 @@ import json
 
 from hub import graph as graph_ops
 from hub.models import Graph, SampleProvenance
+from hub.plan_key import plan_hash
 
 
 def provenance_for_graph(
@@ -38,6 +39,11 @@ def provenance_for_graph(
         "requestedRows": requested_rows,
         "datasetIdentity": dataset_identity,
         "datasetRevision": dataset_revision,
+        # Bind the evidence to the complete execution cone, not only the physical source. A filter,
+        # join, or other upstream edit changes the sampled population even when the source revision and
+        # seed stay fixed. Reuse the runtime's canonical plan identity so provenance and cached results
+        # invalidate on the same execution-relevant edits.
+        "planHash": plan_hash(graph, target_node_id, resolve_adapter),
     }, sort_keys=True, separators=(",", ":"))
     return SampleProvenance(
         strategy=strategy, seed=seed, requested_rows=requested_rows,

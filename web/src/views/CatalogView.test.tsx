@@ -206,7 +206,9 @@ describe('CatalogView request and mutation truth', () => {
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
-    expect(await screen.findByText(/Prefix preview.*input revision revision-1.*not representative or random/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Prefix preview.*Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
+    expect(screen.getByText(`Input ${TABLE.uri} · revision revision-1.`)).toBeInTheDocument()
+    expect(screen.getByText('This is a prefix preview, not representative or random.')).toBeInTheDocument()
   })
 
   it('does not infer an empty dataset from an empty bounded preview batch', async () => {

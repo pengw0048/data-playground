@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 
-from hub import db, graph as g
+from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.models import Graph, SampleResult
 from hub.sampling import provenance_for_graph
@@ -35,6 +35,9 @@ def _reservoir_preview_allowed(graph: Graph, node_id: str, resolve_adapter) -> b
     target = nodes.get(node_id)
     if target is None or target.type != "sample":
         return False
+    target_data = target.data if isinstance(target.data, dict) else {}
+    if target_data.get("bypassed") or target_data.get("disabled"):
+        return False
     sources = [node for node in nodes.values() if node.type == "source"]
     if not sources:
         return False
@@ -42,7 +45,8 @@ def _reservoir_preview_allowed(graph: Graph, node_id: str, resolve_adapter) -> b
         config = source.data.get("config", {}) if isinstance(source.data, dict) else {}
         uri = config.get("uri") if isinstance(config, dict) else None
         try:
-            if not uri or getattr(resolve_adapter(uri), "name", None) not in _LOCAL_SAMPLE_ADAPTERS:
+            if (not uri or paths.local_path(uri) is None
+                    or getattr(resolve_adapter(uri), "name", None) not in _LOCAL_SAMPLE_ADAPTERS):
                 return False
         except Exception:
             return False

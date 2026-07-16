@@ -1566,6 +1566,31 @@ def test_sample_node_preview_is_deterministic_and_provenance_bearing(tmp_path):
     changed_revision = client.post("/api/run/preview", json={"graph": g, "nodeId": "sm", "k": 200}).json()
     assert changed_revision["sampleProvenance"]["identity"] != changed_seed["sampleProvenance"]["identity"]
 
+    filtered = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": p}),
+        N("f", "filter", {"predicate": "id >= 15000"}),
+        N("sm", "sample", {"n": 200, "seed": 2}),
+    ], "edges": [E("s", "f"), E("f", "sm")]}
+    first_filter = client.post(
+        "/api/run/preview", json={"graph": filtered, "nodeId": "sm", "k": 200},
+    ).json()
+    filtered["nodes"][1]["data"]["config"]["predicate"] = "id >= 19000"
+    changed_filter = client.post(
+        "/api/run/preview", json={"graph": filtered, "nodeId": "sm", "k": 200},
+    ).json()
+    assert changed_filter["sampleProvenance"]["identity"] != first_filter["sampleProvenance"]["identity"]
+
+    bypassed = {"id": "c", "version": 1, "nodes": [
+        N("s", "source", {"uri": p}),
+        N("sm", "sample", {"n": 200, "seed": 2}),
+    ], "edges": [E("s", "sm")]}
+    bypassed["nodes"][1]["data"]["bypassed"] = True
+    bypassed_result = client.post(
+        "/api/run/preview", json={"graph": bypassed, "nodeId": "sm", "k": 200},
+    ).json()
+    assert bypassed_result["sampleProvenance"]["strategy"] == "prefix"
+    assert bypassed_result["rowLimit"] == 2_000
+
 
 def test_sample_seed_and_size_survive_canvas_save_reload():
     canvas_id = "sample-provenance-save-reload"
