@@ -58,6 +58,21 @@ class Registry:
     def __init__(self, deps: "Deps"):
         self.deps = deps
         self._pack: str | None = None  # the pack currently registering — set by the loader for reg.config
+        self._entry: dict | None = None
+
+    def _activate(self, capability: str, placement: str, *, replace: bool = False) -> None:
+        """Record only capabilities that actually entered this ``Deps`` instance's dispatch state."""
+        if self._entry is not None:
+            self.deps._activate_plugin_capability(
+                self._entry, capability, placement, replace=replace)
+
+    def _conflict(self, summary: str) -> None:
+        if self._entry is not None:
+            self.deps._record_plugin_problem(self._entry, summary, conflict=True)
+
+    def _problem(self, summary: str) -> None:
+        if self._entry is not None:
+            self.deps._record_plugin_problem(self._entry, summary)
 
     def config(self, key: str, default=None):
         """Read a config value for the CURRENTLY-registering pack. Precedence: a UI-set value (metadb
@@ -94,7 +109,15 @@ class Registry:
         that calls this during ``register(reg)`` — core never imports a vendor client.
         """
         from hub.secrets import register_resolver
-        register_resolver(scheme, resolver)
+        try:
+            register_resolver(scheme, resolver)
+        except Exception as e:
+            if "already registered" in str(e):
+                self._conflict(f"Secret resolver '{scheme}' conflicts with an existing resolver.")
+            else:
+                self._problem(f"Secret resolver '{scheme}' is invalid; use a URI-style scheme name.")
+            raise
+        self._activate(f"secret-resolver:{scheme.lower()}", "application")
 
     def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact
@@ -107,15 +130,18 @@ class Registry:
         # corrupt the /api/nodes contract and leave the original's build() as dead code
         if spec.kind in self.deps.builtin_kinds:
             print(f"[deps] plugin node '{spec.kind}' collides with a built-in kind — refused")
+            self._conflict(f"Node '{spec.kind}' conflicts with a built-in node.")
             return
         if spec.kind in self.deps.node_specs:
             print(f"[deps] plugin node '{spec.kind}' already registered by another plugin — refused")
+            self._conflict(f"Node '{spec.kind}' conflicts with another plugin.")
             return
         self.deps.node_specs[spec.kind] = spec
         if build is not None:
             self.deps.node_builders[spec.kind] = build
         if ir is not None:
             self.deps.node_ir[spec.kind] = ir
+        self._activate(f"node:{spec.kind}", "execution")
 
     def add_telemetry_sink(self, sink) -> None:
         """Register a callback invoked once per FINISHED run with a normalized telemetry record (a dict:
@@ -125,25 +151,31 @@ class Registry:
         if callable(sink):
             from hub.observability import register_sink_delivery
             self.deps.telemetry_sinks.append(register_sink_delivery(sink, kind="telemetry"))
+            self._activate("telemetry-sink", "application")
 
     def add_metric_sink(self, sink) -> None:
         """Register a MetricEvent consumer (OPS-01). See docs/OBSERVABILITY.md. Isolation matches
         add_telemetry_sink — delivery never waits on plugin I/O in a request or run path."""
         from hub.observability import add_metric_sink
         add_metric_sink(sink)
+        if callable(sink):
+            self._activate("metric-sink", "application")
 
     def add_audit_sink(self, sink) -> None:
         """Register an AuditEvent consumer (OPS-01). See docs/OBSERVABILITY.md."""
         from hub.observability import add_audit_sink
         add_audit_sink(sink)
+        if callable(sink):
+            self._activate("audit-sink", "application")
 
     def add_adapter(self, adapter) -> None:
         self.deps.adapters.insert(0, adapter)  # plugins claim uris before defaults
+        self._activate(f"adapter:{getattr(adapter, 'name', adapter.__class__.__name__)}", "execution")
 
     def add_runner(self, runner) -> None:
         # runner should satisfy hub.backends.ExecutionBackend; materialized in registration order after
         # the built-in local runner exists, then inserted first so it wins pick_runner.
-        self.deps._runner_registrations.append((self._pack, lambda _deps: runner))
+        self.deps._runner_registrations.append((self._entry, self._pack, lambda _deps: runner))
 
     def add_runner_factory(self, factory) -> None:
         """Register ``factory(deps) -> ExecutionBackend`` for composition after the local runner exists.
@@ -152,7 +184,7 @@ class Registry:
         the built-in runner (for example dp_ray) therefore registers a factory instead of constructing
         itself during plugin discovery.
         """
-        self.deps._runner_registrations.append((self._pack, factory))
+        self.deps._runner_registrations.append((self._entry, self._pack, factory))
 
     def add_capability(self, cap) -> None:
         self.deps.capabilities.append(cap)
@@ -160,9 +192,11 @@ class Registry:
         if callable(detect):
             from hub.plugins import capabilities as caps
             caps.register_detector(getattr(cap, "id", ""), detect)
+        self._activate(f"column-capability:{getattr(cap, 'id', cap.__class__.__name__)}", "execution")
 
     def add_processor(self, proc) -> None:
         self.deps.registry.register(proc)
+        self._activate(f"processor:{proc.id}", "execution")
 
     def set_catalog(self, catalog) -> None:
         if not isinstance(catalog, CatalogProvider):
@@ -178,12 +212,14 @@ class Registry:
             detail = f"; missing methods: {', '.join(missing)}" if missing else ""
             raise TypeError(f"catalog provider does not satisfy CatalogProvider{detail}")
         self.deps.catalog = catalog
+        self._activate("catalog", "application", replace=True)
 
     def set_managed_object_provider(self, provider) -> None:
         """Install the proof-capable exact-object lifecycle provider for managed storage."""
         from hub.handoff import set_runtime_managed_object_provider
         self.deps.managed_object_provider = provider
         set_runtime_managed_object_provider(provider)
+        self._activate("managed-object-lifecycle", "application", replace=True)
 
     def add_embedder(self, fn, model: str = "custom") -> None:
         """Register a text embedder — `fn(list[str]) -> list[list[float]]` — to power the catalog's
@@ -194,11 +230,13 @@ class Registry:
         setter = getattr(self.deps.catalog, "set_embedder", None)
         if callable(setter):
             setter(fn, model)
+            self._activate("embedder", "application", replace=True)
 
     def set_importer(self, importer) -> None:
         # a pipeline importer (§5.6/§7.5). Without one, deps.importer stays the NullImporter → the
         # /pipelines/import endpoint reports 'not configured' (501), not a broken 500.
         self.deps.importer = importer
+        self._activate("pipeline-importer", "application", replace=True)
 
     def add_destination(self, backend) -> None:
         # a save/open-dialog "place" backend (a storage/warehouse browser+writer). Should satisfy
@@ -207,6 +245,7 @@ class Registry:
         # same registry — this seam just lets register(reg) add one instead of a module-level call.
         from hub import destinations
         destinations.register_backend(backend)
+        self._activate(f"destination:{backend.kind}", "application", replace=True)
 
 
 def _persist_run(deps, graph, target, status) -> None:
@@ -360,11 +399,16 @@ class Deps:
         self.telemetry_sinks: list = []
         self.managed_object_provider = None
         self.plugins: list[dict] = []
+        # Status is instance-owned: constructing a second app/kernel must not reuse the first one's
+        # discoveries, failures, or effective capability ownership.
+        self._plugin_capability_owners: dict[str, dict] = {}
         self._manifests: dict[str, dict] = {}
         # Plugins register before services are constructed.  Keep the collection available now so a
         # plugin backend can register itself, then append the built-ins after they bind the final catalog.
         self.runners: list = []
-        self._runner_registrations: list[tuple[str | None, Callable[[Deps], object]]] = []
+        self._runner_registrations: list[
+            tuple[dict | None, str | None, Callable[[Deps], object]]
+        ] = []
         from hub.storage import make_storage
         self.storage = make_storage(workspace)
         # The catalog is shared by every user (by design — one workspace, not one kernel per session);
@@ -463,6 +507,83 @@ class Deps:
         self.run_index: dict[str, object] = {}  # run_id -> the runner that owns it
         self.run_owner: dict[str, str] = {}  # run_id -> creator uid, to authorize ad-hoc (no-canvas) runs
 
+    def _new_plugin_status(
+        self,
+        name: str,
+        source: str,
+        *,
+        package: str | None = None,
+        version: str | None = None,
+        config: list[dict] | None = None,
+        required: bool = False,
+    ) -> dict:
+        entry: dict = {
+            "name": name,
+            "package": package or name,
+            "source": source,
+            "state": "inactive",
+            "required": required,
+            "failure_impact": "startup-blocking" if required else "optional-degradation",
+            "effective_capabilities": [],
+            "process_placement": [],
+            "_placements": {},
+            "_problems": [],
+            "_conflict": False,
+        }
+        if version:
+            entry["version"] = version
+        if config:
+            entry["config"] = config
+        self.plugins.append(entry)
+        return entry
+
+    def _refresh_plugin_status(self, entry: dict) -> None:
+        capabilities = entry.get("effective_capabilities", [])
+        problems = entry.get("_problems", [])
+        if entry.get("_conflict"):
+            state = "conflict"
+        elif problems:
+            state = "degraded" if capabilities else "failed"
+        else:
+            state = "active" if capabilities else "inactive"
+        entry["state"] = state
+        placements = entry.get("_placements", {})
+        entry["process_placement"] = sorted(set(placements.values()))
+        if problems:
+            entry["failure_summary"] = problems[-1]
+            # Preserve the pre-existing API field while ensuring only the sanitized summary is exposed.
+            entry["error"] = problems[-1]
+        else:
+            entry.pop("failure_summary", None)
+            entry.pop("error", None)
+
+    def _record_plugin_problem(self, entry: dict, summary: str, *, conflict: bool = False) -> None:
+        entry.setdefault("_problems", []).append(summary)
+        if conflict:
+            entry["_conflict"] = True
+        self._refresh_plugin_status(entry)
+
+    def _activate_plugin_capability(
+        self,
+        entry: dict,
+        capability: str,
+        placement: str,
+        *,
+        replace: bool = False,
+    ) -> None:
+        previous = self._plugin_capability_owners.get(capability)
+        if replace and previous is not None and previous is not entry:
+            if capability in previous.get("effective_capabilities", []):
+                previous["effective_capabilities"].remove(capability)
+            previous.get("_placements", {}).pop(capability, None)
+            self._refresh_plugin_status(previous)
+        self._plugin_capability_owners[capability] = entry
+        if capability not in entry["effective_capabilities"]:
+            entry["effective_capabilities"].append(capability)
+            entry["effective_capabilities"].sort()
+        entry["_placements"][capability] = placement
+        self._refresh_plugin_status(entry)
+
     def resolve_adapter(self, uri: str):
         for a in self.adapters:
             try:
@@ -474,16 +595,22 @@ class Deps:
 
     def _materialize_plugin_runners(self) -> None:
         """Construct registered plugin backends after catalog selection and the local base runner."""
-        for pack, factory in self._runner_registrations:
+        for entry, pack, factory in self._runner_registrations:
             try:
-                self.runners.insert(0, factory(self))
+                runner = factory(self)
+                self.runners.insert(0, runner)
+                if entry is not None:
+                    name = getattr(runner, "name", pack or runner.__class__.__name__)
+                    self._activate_plugin_capability(
+                        entry, f"runner:{name}", f"backend:{name}")
             except Exception as e:  # noqa: BLE001 — optional plugin failure remains non-fatal
                 name = pack or getattr(factory, "__module__", "plugin-runner")
                 print(f"[deps] plugin runner '{name}' failed: {e}")
-                entry = next((p for p in reversed(self.plugins)
-                              if p.get("name") == pack and "error" not in p), None)
                 if entry is not None:
-                    entry["error"] = f"{type(e).__name__}: {e}"
+                    self._record_plugin_problem(
+                        entry,
+                        f"Runner activation failed ({type(e).__name__}); check plugin configuration and server logs.",
+                    )
 
     def chosen_backend(self, uid: str | None = None) -> str:
         """The selected execution backend NAME: per-user preference > workspace default > DP_EXECUTION >
@@ -529,11 +656,20 @@ class Deps:
         reg = Registry(self)
         from hub.plugins import default_catalog
         reg._pack = "default-catalog"
+        entry = self._new_plugin_status(
+            "default-catalog", "builtin", package="data-playground", required=True)
+        reg._entry = entry
         try:
             default_catalog.register(reg)
-            self.plugins.append({"name": "default-catalog", "source": "builtin"})
+        except Exception as e:
+            self._record_plugin_problem(
+                entry,
+                f"Required plugin activation failed ({type(e).__name__}); startup cannot continue.",
+            )
+            raise
         finally:
             reg._pack = None
+            reg._entry = None
 
     def _load_plugins(self) -> None:
         reg = Registry(self)
@@ -546,27 +682,36 @@ class Deps:
                 pack = os.path.join(plugins_dir, name)
                 if os.path.isdir(pack) and os.path.exists(os.path.join(pack, "__init__.py")):
                     if self._read_manifest(pack, name):  # skip a pack with a missing/bad/incompatible manifest
-                        self._register_module(name, reg)
+                        self._register_module(name, reg, source="drop-in")
         # 2) configured modules (DP_PLUGINS) + installed entry points
         for mod in settings.plugin_modules:
             self._register_module(mod, reg)
         try:
             from importlib.metadata import entry_points
             for ep in entry_points(group="dataplay.plugins"):
+                package = getattr(getattr(ep, "dist", None), "name", None) or ep.name
+                version = getattr(getattr(ep, "dist", None), "version", None)
+                entry = self._new_plugin_status(
+                    ep.name, "entry_point", package=package, version=version)
                 try:
                     fn = ep.load()
                     mod = sys.modules.get(getattr(fn, "__module__", "") or "")
                     err = _core_api_error(getattr(mod, "MIN_CORE_API", getattr(mod, "min_core_api", None))) if mod else None
                     if err:  # entry-point plugin declares an unsupported core → skip before register (OSS-01)
-                        self.plugins.append({"name": ep.name, "source": "entry_point", "error": err})
+                        self._record_plugin_problem(entry, err)
                         continue
                     reg._pack = ep.name
+                    reg._entry = entry
                     fn(reg)
-                    self.plugins.append({"name": ep.name, "source": "entry_point"})
                 except Exception as e:  # noqa: BLE001
                     print(f"[deps] entry-point plugin '{ep.name}' failed: {e}")
+                    self._record_plugin_problem(
+                        entry,
+                        f"Plugin import or registration failed ({type(e).__name__}); check compatibility, configuration, and server logs.",
+                    )
                 finally:
                     reg._pack = None
+                    reg._entry = None
         except Exception:  # noqa: BLE001
             pass
 
@@ -584,20 +729,36 @@ class Deps:
                 man = tomllib.load(f)
             missing = [k for k in ("name", "version") if k not in man]
             if missing:
-                self.plugins.append({"name": name, "source": "drop-in", "error": f"dataplay.toml missing: {', '.join(missing)}"})
+                entry = self._new_plugin_status(name, "drop-in")
+                self._record_plugin_problem(
+                    entry, f"Manifest is missing required fields: {', '.join(missing)}.")
                 return False
             err = _core_api_error(man.get("min_core_api"))
             if err:
-                self.plugins.append({"name": name, "source": "drop-in", "error": err})
+                entry = self._new_plugin_status(
+                    name, "drop-in", package=str(man["name"]), version=str(man["version"]))
+                self._record_plugin_problem(entry, err)
                 return False
             man["config"] = _normalize_config(man.get("config"))  # [[config]] → clean UI-field list (may be [])
             self._manifests[name] = man
             return True
         except Exception as e:  # noqa: BLE001
-            self.plugins.append({"name": name, "source": "drop-in", "error": f"bad dataplay.toml: {e}"})
+            entry = self._new_plugin_status(name, "drop-in")
+            self._record_plugin_problem(
+                entry,
+                f"Manifest is invalid ({type(e).__name__}); fix dataplay.toml and restart.",
+            )
             return False
 
-    def _register_module(self, mod: str, reg: Registry) -> None:
+    def _register_module(self, mod: str, reg: Registry, *, source: str = "module") -> None:
+        manifest = self._manifests.get(mod, {})
+        entry = self._new_plugin_status(
+            mod,
+            source,
+            package=str(manifest.get("name") or mod),
+            version=str(manifest["version"]) if manifest.get("version") is not None else None,
+            config=manifest.get("config") or None,
+        )
         try:
             m = importlib.import_module(mod)
             # a DP_PLUGINS module (pip package, no dataplay.toml) declares compat via a module attribute;
@@ -605,23 +766,23 @@ class Deps:
             # Harmless no-op for a drop-in pack (already manifest-gated; sets no such attr).
             err = _core_api_error(getattr(m, "MIN_CORE_API", getattr(m, "min_core_api", None)))
             if err:
-                self.plugins.append({"name": mod, "source": "module", "error": err})
+                self._record_plugin_problem(entry, err)
                 return
             reg._pack = mod  # so reg.config() resolves plugin.<mod>.<key> for THIS pack
+            reg._entry = entry
             if hasattr(m, "register"):
                 m.register(reg)
-            entry = {"name": mod, "source": "module", **({"version": self._manifests.get(mod, {}).get("version")} if mod in self._manifests else {})}
-            schema = self._manifests.get(mod, {}).get("config")  # dataplay.toml [[config]] → UI-configurable fields
-            if schema:
-                entry["config"] = schema
-            self.plugins.append(entry)
         except Exception as e:  # noqa: BLE001
             import traceback
             print(f"[deps] failed to load plugin '{mod}': {e}")
-            self.plugins.append({"name": mod, "source": "module", "error": f"{type(e).__name__}: {e}",
-                                 "traceback": traceback.format_exc().splitlines()[-3:]})
+            traceback.print_exc()
+            self._record_plugin_problem(
+                entry,
+                f"Plugin import or registration failed ({type(e).__name__}); check compatibility, configuration, and server logs.",
+            )
         finally:
             reg._pack = None
+            reg._entry = None
 
     def _place(self, requires):
         """First (backend_name, worker_id) across the registered backends that satisfies `requires`,

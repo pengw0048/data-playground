@@ -2446,6 +2446,146 @@
         "title": "PlanStep",
         "type": "object"
       },
+      "PluginStatus": {
+        "description": "Bounded operator-facing status; implementation exceptions and tracebacks are intentionally absent.",
+        "properties": {
+          "config": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config"
+          },
+          "config_set": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Set"
+          },
+          "config_values": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Values"
+          },
+          "effective_capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Effective Capabilities",
+            "type": "array"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "failure_impact": {
+            "enum": [
+              "startup-blocking",
+              "optional-degradation"
+            ],
+            "title": "Failure Impact",
+            "type": "string"
+          },
+          "failure_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Summary"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "package": {
+            "title": "Package",
+            "type": "string"
+          },
+          "process_placement": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Process Placement",
+            "type": "array"
+          },
+          "required": {
+            "title": "Required",
+            "type": "boolean"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "inactive",
+              "degraded",
+              "conflict",
+              "failed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "name",
+          "package",
+          "source",
+          "state",
+          "required",
+          "failure_impact",
+          "effective_capabilities",
+          "process_placement"
+        ],
+        "title": "PluginStatus",
+        "type": "object"
+      },
       "Position": {
         "properties": {
           "x": {
@@ -10784,8 +10924,7 @@
               "application/json": {
                 "schema": {
                   "items": {
-                    "additionalProperties": true,
-                    "type": "object"
+                    "$ref": "#/components/schemas/PluginStatus"
                   },
                   "title": "Response List Plugins Api Plugins Get",
                   "type": "array"

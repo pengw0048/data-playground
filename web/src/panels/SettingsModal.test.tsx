@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const PACK = {
@@ -523,6 +523,41 @@ describe('SettingsModal — plugin config form', () => {
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('Plugins request failed: HTTP 500: plugin registry unavailable')
     expect(screen.queryByText('No plugins loaded.')).toBeNull()
+  })
+
+  it('shows healthy, inactive, degraded, conflict, and failed plugin lifecycle states truthfully', async () => {
+    plugins.mockResolvedValue([
+      { name: 'healthy', package: 'dp-healthy', source: 'entry_point', version: '1.2.0', state: 'active',
+        effective_capabilities: ['node:clean'], process_placement: ['execution'] },
+      { name: 'idle', source: 'drop-in', state: 'inactive', effective_capabilities: [], process_placement: [] },
+      { name: 'partial', source: 'module', state: 'degraded', effective_capabilities: ['node:usable'],
+        process_placement: ['execution'], failure_summary: 'Runner activation failed (RuntimeError); check server logs.',
+        failure_impact: 'optional-degradation' },
+      { name: 'collision', source: 'drop-in', state: 'conflict', effective_capabilities: [], process_placement: [],
+        failure_summary: "Node 'source' conflicts with a built-in node.", failure_impact: 'optional-degradation' },
+      { name: 'broken', source: 'entry_point', state: 'failed', effective_capabilities: [], process_placement: [],
+        failure_summary: 'Plugin registration failed (ValueError); check server logs.', failure_impact: 'optional-degradation' },
+    ])
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    expect(within(screen.getByTestId('plugin-status-healthy')).getByText('active')).toBeVisible()
+    expect(within(screen.getByTestId('plugin-status-healthy')).getByText('node:clean')).toBeVisible()
+    expect(screen.getByTestId('plugin-status-healthy')).toHaveTextContent('Placement: execution')
+    expect(within(screen.getByTestId('plugin-status-idle')).getByText('inactive')).toBeVisible()
+    expect(screen.getByTestId('plugin-status-idle')).toHaveTextContent('No effective capabilities.')
+    expect(within(screen.getByTestId('plugin-status-partial')).getByText('degraded')).toBeVisible()
+    expect(screen.getByTestId('plugin-status-partial')).toHaveTextContent('The application continues without the unavailable capability.')
+    expect(within(screen.getByTestId('plugin-status-collision')).getByText('conflict')).toBeVisible()
+    expect(within(screen.getByTestId('plugin-status-broken')).getByText('failed')).toBeVisible()
+  })
+
+  it('shows the empty discovery state without implying a load failure', async () => {
+    plugins.mockResolvedValue([])
+    render(<SettingsModal onClose={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Plugins' }))
+    expect(screen.getByText('No plugins discovered.')).toBeVisible()
   })
 
   it('hides admin-only controls and saves only the user runner for a non-admin', async () => {
