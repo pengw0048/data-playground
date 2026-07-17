@@ -588,8 +588,35 @@ class BuildEngine:
             # CSV parse overrides (delimiter/header), already normalized + nested under 'options' by the
             # resolver — passed only when set, so an adapter whose scan() predates the kwarg keeps working
             extra = {"options": cfg["options"]} if cfg.get("options") else {}
+            adapter = self.resolve_adapter(uri)
+            dataset_ref = cfg.get("datasetRef")
+            if isinstance(dataset_ref, dict):
+                # A persisted Source pin is path-independent. Re-resolve the current catalog binding
+                # before every interactive read so unregister/re-register at the same URI cannot
+                # retarget an old reference to a numerically identical Lance version.
+                from hub import metadb
+                binding = metadb.catalog_revision_binding_for_uri(uri)
+                if (binding is None
+                        or str(binding.get("dataset_id") or "") != str(dataset_ref.get("datasetId") or "")
+                        or getattr(adapter, "name", None) != "lance"):
+                    raise NotPreviewable(node, "selected pinned revision is unavailable; choose another revision or follow latest")
+                open_revision = getattr(adapter, "open_revision", None)
+                if not callable(open_revision):
+                    raise NotPreviewable(node, "selected pinned revision is unavailable; choose another revision or follow latest")
+                try:
+                    exact = open_revision(uri, str(dataset_ref.get("revisionId") or ""))
+                    if self.schema_only:
+                        return exact.limit(0)
+                    # Keep the existing interactive preview work bound. Exact open fixes identity; it
+                    # must not accidentally turn a downstream preview into an unbounded source scan.
+                    if self.sample_k is not None and not self.full and not self.reservoir_preview:
+                        return exact.limit(self.sample_k)
+                    return exact
+                except Exception as exc:
+                    raise NotPreviewable(
+                        node, "selected pinned revision is unavailable; choose another revision or follow latest") from exc
             if self.schema_only:
-                return self.resolve_adapter(uri).scan(uri, limit=0, **extra)  # metadata only — never materialize
+                return adapter.scan(uri, limit=0, **extra)  # metadata only — never materialize
             if self.pushdown and node.id != self._output_node:
                 cols, pred = self._source_pushdown(node)  # prune at the source for adapters that can
                 if cols:
@@ -598,7 +625,6 @@ class BuildEngine:
                 # adapter-declared index bound, preview caps the source first and filters that prefix.
                 if pred and self.full:
                     extra["predicate"] = pred
-            adapter = self.resolve_adapter(uri)
             # Full-run admission may bind a source to one provider-native revision.  This is an
             # internal execution capability, never a client-configurable source option: opening the
             # exact revision is deliberately preferred to scanning the mutable provider head.

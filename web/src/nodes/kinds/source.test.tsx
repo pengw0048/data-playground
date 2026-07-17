@@ -5,7 +5,7 @@ import { ReactFlowProvider } from '@xyflow/react'
 // importing the store triggers autosave side-effects → stub the api client
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), destinations: vi.fn(), browseDestination: vi.fn(),
-  registerFile: vi.fn(), mkdirDestination: vi.fn(),
+  registerFile: vi.fn(), mkdirDestination: vi.fn(), datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
 }))
 vi.mock('../../api/client', () => ({ api: mocks }))
 
@@ -24,6 +24,11 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.destinations.mockResolvedValue({ destinations: [{ id: 'local', name: 'Workspace', backend: 'local', root: '/data' }], backends: ['local'] })
     mocks.browseDestination.mockResolvedValue({ path: '', entries: [{ name: 'new.csv', kind: 'file', uri: 'file:///data/new.csv' }], writable: true })
     mocks.mkdirDestination.mockResolvedValue({ ok: true })
+    mocks.datasetRevisions.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: 'dataset-1', revisionId: '1', retentionOwner: 'provider', summary: { rowCount: 1 },
+      preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
+    })
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
       kernelUp: true,
@@ -110,5 +115,44 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     await waitFor(() => expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ uri: 'file:///data/new.csv', tableId: 't2' }))
     expect(useStore.getState().doc.nodes[0].data.title).toBe('new')
     expect(screen.queryByText(/Couldn't open file/i)).toBeNull()
+  })
+
+  it('pins one bounded Lance revision and invalidates downstream state', async () => {
+    const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
+      title: 'orders', status: 'latest', config: { uri: '/data/orders.lance', tableId: 't1' },
+    } }
+    const target = { id: 'out', type: 'write', position: { x: 100, y: 0 }, data: {
+      title: 'output', status: 'latest', config: {},
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.lance' }],
+      doc: { id: 'c', name: 'test', version: 1, nodes: [source, target], edges: [{ id: 'e', source: 's1', target: 'out' }] } } as any)
+    mocks.datasetRevisions.mockResolvedValue({ items: [
+      { datasetId: 'dataset-1', revisionId: '2', committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' },
+      { datasetId: 'dataset-1', revisionId: '1', committedAt: '2026-07-15T12:00:00Z', retentionOwner: 'provider' },
+    ], nextCursor: null, hasMore: false })
+    render1(source.data)
+
+    fireEvent.click(await screen.findByRole('button', { name: /Pin exact revision/i }))
+    fireEvent.click(screen.getAllByRole('button').find((button) => button.textContent?.startsWith('1'))!)
+
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({ datasetId: 'dataset-1', revisionId: '1' })
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
+    expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
+  })
+
+  it('preserves an unavailable pinned selection with a recoverable explanation', async () => {
+    const selected = { datasetId: 'dataset-1', revisionId: 'missing' }
+    const data = { title: 'orders', status: 'stale', config: {
+      uri: '/data/orders.lance', tableId: 't1', datasetRef: selected,
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.lance' }],
+      doc: { id: 'c', name: 'test', version: 1, nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
+    mocks.datasetRevision.mockRejectedValueOnce(new Error('HTTP 410: dataset_revision_unavailable'))
+    render1(data)
+
+    expect(await screen.findByText(/Pinned revision missing is unavailable.*Selection preserved/i)).toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
 })

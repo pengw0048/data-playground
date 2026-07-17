@@ -16,10 +16,16 @@ export interface PortSpec {
   multi?: boolean // an input port that accepts MANY incoming edges (e.g. union stacks N inputs)
 }
 
+export interface DatasetRef {
+  datasetId: string
+  revisionId: string
+}
+
 export interface NodeConfig {
   // source
   uri?: string
   tableId?: string
+  datasetRef?: DatasetRef
   // sample
   n?: number
   seed?: number

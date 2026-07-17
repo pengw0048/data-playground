@@ -153,6 +153,14 @@ class DatasetRevision(Wire):
     retention_owner: Literal["provider", "core"] = "provider"
 
 
+class DatasetRef(Wire):
+    """Opaque, path-independent identity for one exact retained dataset revision."""
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+
+
 class DatasetRevisionPage(Wire):
     items: list[DatasetRevision] = Field(default_factory=list, max_length=100)
     next_cursor: str | None = Field(default=None, max_length=256)
@@ -1126,6 +1134,8 @@ class GraphNode(Wire):
                     val = cfg.get(key)
                     if isinstance(val, str) and len(val) > MAX_CODE_LEN:
                         raise ValueError(f"node {key} exceeds the {MAX_CODE_LEN}-char limit")
+                if "datasetRef" in cfg:
+                    DatasetRef.model_validate(cfg["datasetRef"])
         return v
 
 

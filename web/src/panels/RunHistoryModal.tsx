@@ -61,6 +61,16 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
+                  {r.inputManifest && r.inputManifest.length > 0 && (
+                    <div aria-label={`Resolved inputs for run ${r.id}`} className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
+                      <div className="font-semibold text-foreground">Resolved exact inputs</div>
+                      {r.inputManifest.map((input) => (
+                        <div key={input.nodeId} className="mt-0.5 break-all">
+                          {input.nodeId} · dataset {input.datasetId} · revision {input.revisionId} · {input.provider}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
                       outputs={r.outputs} openKey={resultOpen}

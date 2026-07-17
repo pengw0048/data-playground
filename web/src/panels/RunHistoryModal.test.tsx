@@ -145,6 +145,20 @@ describe('durable full results', () => {
     expect(document.querySelector('iframe')?.getAttribute('src')).toBe('/api/run/full-result-export')
   })
 
+  it('shows the exact resolved input manifest retained with a run', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'pinned-history', runId: 'pinned-run', status: 'done', targetNodeId: 'target', rows: 1,
+      inputManifest: [{ nodeId: 'source', datasetId: 'dataset-opaque', revisionId: '7',
+        provider: 'lance', resolvedAt: '2026-07-16T12:00:00Z' }],
+      outputs: [committedOutput('/outputs/pinned.parquet', 1)],
+    }])
+
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    expect(await screen.findByText('Resolved exact inputs')).toBeInTheDocument()
+    expect(screen.getByText(/source · dataset dataset-opaque · revision 7 · lance/)).toBeInTheDocument()
+  })
+
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {
     apiMock.listRuns.mockResolvedValue([{
       id: 'partial-history', runId: 'partial-run', status: 'failed', targetNodeId: 'target', rows: null,

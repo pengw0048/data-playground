@@ -73,6 +73,33 @@ def test_manifest_is_ordered_secret_free_and_reopens_the_original_lance_head(tmp
         assert LanceAdapter().open_revision(cfg["uri"], cfg["_input_revision_id"]).fetchall() == [(1,)]
 
 
+def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri = str(tmp_path / "pinned-input.lance")
+    lance.write_dataset(pa.table({"value": [1]}), uri)
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: LanceAdapter())
+    table = catalog._add(name="pinned-input", uri=uri, strict_probe=True)
+    binding = metadb.catalog_revision_binding_for_uri(uri)
+    assert binding is not None
+    selected = LanceAdapter().resolve_revision(uri)["revision_id"]
+    lance.write_dataset(pa.table({"value": [2]}), uri, mode="append")
+    graph = _graph(uri)
+    graph.nodes[0].data["config"] |= {
+        "tableId": table.id,
+        "datasetRef": {"datasetId": binding["dataset_id"], "revisionId": selected},
+    }
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: LanceAdapter())
+
+    manifest = runs._resolve_local_run_manifest(graph, "source", deps)
+
+    assert manifest[0]["dataset_id"] == binding["dataset_id"]
+    assert manifest[0]["revision_id"] == selected
+    bound = runs._bind_local_run_manifest(graph, manifest, deps, "source")
+    dispatch_config = bound.nodes[0].data["config"]
+    assert dispatch_config["_input_revision_id"] == selected
+    assert LanceAdapter().open_revision(uri, dispatch_config["_input_revision_id"]).fetchall() == [(1,)]
+
+
 def test_same_submission_adopts_its_original_manifest_after_the_lance_head_moves(tmp_path):
     lance = pytest.importorskip("lance")
     uri = str(tmp_path / "retry.lance")

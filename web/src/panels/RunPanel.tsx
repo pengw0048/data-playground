@@ -5,6 +5,7 @@ import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { RunOutput } from '../types/api'
+import type { CanvasDoc, DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -12,6 +13,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const doc = useStore((s) => s.doc)
 
   useEffect(() => {
     if (!run || run.phase === 'idle') estimate(nodeId)
@@ -21,6 +23,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
   const st = run?.status
+  const pinnedInputs = pinnedSourceInputs(doc, nodeId)
 
   return (
     <div className="p-3.5">
@@ -37,6 +40,16 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </span>
           </div>
           {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
+          {pinnedInputs.length > 0 && (
+            <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+              <div className="font-semibold text-foreground">Pinned exact inputs for this run</div>
+              {pinnedInputs.map((input) => (
+                <div key={input.nodeId} className="mt-0.5 break-all">
+                  {input.title} · dataset {input.ref.datasetId} · revision {input.ref.revisionId}
+                </div>
+              ))}
+            </div>
+          )}
           {phase === 'confirm' ? (
             <div className="mt-3.5 flex gap-2">
               <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">Run</Button>
@@ -106,6 +119,31 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       )}
     </div>
   )
+}
+
+function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: string; title: string; ref: DatasetRef }[] {
+  const byId = new Map(doc.nodes.map((node) => [node.id, node]))
+  const incoming = new Map<string, string[]>()
+  const children = new Map<string, string[]>()
+  for (const edge of doc.edges) incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source])
+  for (const node of doc.nodes) {
+    if (node.parentId) children.set(node.parentId, [...(children.get(node.parentId) ?? []), node.id])
+  }
+  const selected = new Set<string>()
+  const pending = byId.has(targetNodeId) ? [targetNodeId] : []
+  while (pending.length) {
+    const current = pending.pop()!
+    if (selected.has(current)) continue
+    selected.add(current)
+    pending.push(...(incoming.get(current) ?? []))
+    if (byId.get(current)?.type === 'section') pending.push(...(children.get(current) ?? []))
+  }
+  return doc.nodes.flatMap((node) => {
+    const ref = node.data.config.datasetRef
+    return selected.has(node.id) && node.type === 'source' && ref
+      ? [{ nodeId: node.id, title: node.data.title, ref }]
+      : []
+  })
 }
 
 function RunOutputs({ outputs }: { outputs: RunOutput[] }) {

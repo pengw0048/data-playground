@@ -25,12 +25,17 @@ def provenance_for_graph(
         config = sources[0].data.get("config", {}) if isinstance(sources[0].data, dict) else {}
         uri = config.get("uri") if isinstance(config, dict) else None
         if isinstance(uri, str) and uri:
-            dataset_identity = uri
-            try:
-                revision = resolve_adapter(uri).fingerprint(uri)
-                dataset_revision = revision if revision and revision != "unknown" else None
-            except Exception:  # source identity is best-effort evidence, never a preview failure
-                pass
+            dataset_ref = config.get("datasetRef")
+            if isinstance(dataset_ref, dict):
+                dataset_identity = str(dataset_ref.get("datasetId") or "") or None
+                dataset_revision = str(dataset_ref.get("revisionId") or "") or None
+            else:
+                dataset_identity = uri
+                try:
+                    revision = resolve_adapter(uri).fingerprint(uri)
+                    dataset_revision = revision if revision and revision != "unknown" else None
+                except Exception:  # source identity is best-effort evidence, never a preview failure
+                    pass
     elif len(sources) != 1:
         notes.append("Dataset identity/revision is unavailable because this result has multiple sources.")
 

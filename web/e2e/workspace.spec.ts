@@ -85,3 +85,63 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByRole('dialog', { name: dataset.name })).toBeVisible()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
 })
+
+test('pins a Source revision, persists it across reload, and keeps the control in the supported viewport @ux-smoke', async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 768 })
+  const canvasId = `source-pin-${Date.now()}`
+  const table = {
+    id: 'pin-table', name: 'Pinned Lance source', uri: '/mock/pinned-source.lance',
+    rowCount: 2, version: 'v2', columns: [{ name: 'value', type: 'bigint', capabilities: [] }],
+  }
+  const created = await page.request.post('/api/canvas', { data: {
+    id: canvasId, name: 'Source pin viewport', version: 1,
+    nodes: [{ id: 'source', type: 'source', position: { x: 80, y: 80 }, data: {
+      title: 'Pinned source', status: 'draft', config: { uri: table.uri, tableId: table.id },
+    } }], edges: [],
+  } })
+  expect(created.ok()).toBe(true)
+
+  await page.route('**/api/catalog/tables?*', async (route) => {
+    await route.fulfill({ json: { items: [table], total: 1, offset: 0, limit: 50, hasMore: false } })
+  })
+  await page.route('**/api/catalog/tables/pin-table/revisions*', async (route) => {
+    await route.fulfill({ json: { items: [
+      { datasetId: 'opaque-dataset', revisionId: '2', committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' },
+      { datasetId: 'opaque-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z', retentionOwner: 'provider' },
+    ], nextCursor: null, hasMore: false } })
+  })
+  await page.route('**/api/catalog/revisions/opaque-dataset/1', async (route) => {
+    await route.fulfill({ json: {
+      datasetId: 'opaque-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z',
+      retentionOwner: 'provider', parentRevisionId: null, producerOperation: 'create',
+      summary: { rowCount: 1, dataFileCount: 1, totalBytes: 8, fragmentCount: 1 },
+      preview: { columns: table.columns, rows: [{ value: 1 }], hasMore: false, rowLimit: 100 },
+    } })
+  })
+
+  try {
+    await page.goto(`/#/canvas/${canvasId}`)
+    const node = page.locator('.react-flow__node', { hasText: 'Pinned source' })
+    await expect(node).toBeVisible()
+    await page.getByRole('button', { name: 'Pin exact revision' }).click()
+    await page.getByText('1', { exact: true }).click()
+    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    await expect.poll(async () => {
+      const response = await page.request.get(`/api/canvas/${canvasId}`)
+      return (await response.json()).nodes[0].data.config.datasetRef
+    }).toEqual({ datasetId: 'opaque-dataset', revisionId: '1' })
+
+    await page.reload()
+    const control = page.getByRole('button', { name: 'Change pinned revision 1' })
+    await expect(control).toBeVisible()
+    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    const box = await control.boundingBox()
+    expect(box).not.toBeNull()
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.y).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(1024)
+    expect(box!.y + box!.height).toBeLessThanOrEqual(768)
+  } finally {
+    await page.request.delete(`/api/canvas/${canvasId}`)
+  }
+})
