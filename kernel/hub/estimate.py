@@ -146,7 +146,7 @@ _COUNT_CACHE: dict[tuple[str, str], int] = {}
 _COUNT_CACHE_MAX = 256
 
 
-def _counted(resolve_adapter, uri: str) -> int | None:
+def _counted(resolve_adapter, uri: str, revision_id: str | None = None) -> int | None:
     """Read an exact metadata-only count when the adapter explicitly provides that capability.
 
     Preflight must never call the ordinary `count`, which may parse/scan an entire CSV, JSON, remote
@@ -154,17 +154,28 @@ def _counted(resolve_adapter, uri: str) -> int | None:
     """
     try:
         adapter = resolve_adapter(uri)
-        metadata_count = getattr(adapter, "metadata_count", None)
-        if not callable(metadata_count):
-            return None
-        fp = adapter.fingerprint(uri)
+        if revision_id is not None:
+            revision_detail = getattr(adapter, "revision_detail", None)
+            if not callable(revision_detail):
+                return None
+            identity = f"revision:{revision_id}"
+        else:
+            metadata_count = getattr(adapter, "metadata_count", None)
+            if not callable(metadata_count):
+                return None
+            identity = str(adapter.fingerprint(uri))
     except Exception:  # noqa: BLE001 — unknown metadata is safer than a fallback scan
         return None
-    key = (uri, fp)
+    key = (uri, identity)
     if key in _COUNT_CACHE:
         return _COUNT_CACHE[key]
     try:
-        n = metadata_count(uri)
+        if revision_id is not None:
+            detail = revision_detail(uri, revision_id, preview_limit=1)
+            value = detail.get("row_count") if isinstance(detail, dict) else None
+            n = int(value) if value is not None and int(value) >= 0 else None
+        else:
+            n = metadata_count(uri)
     except Exception:  # noqa: BLE001 — uncountable source → unknown, not a fabricated number
         return None
     if n is not None:
@@ -263,7 +274,12 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
             continue
 
         if t == "source":
-            n = _counted(resolve_adapter, uri) if uri else None
+            config = resolve_config(node)
+            revision_id = config.get("_input_revision_id")
+            n = _counted(
+                resolve_adapter, uri,
+                str(revision_id) if isinstance(revision_id, str) and revision_id else None,
+            ) if uri else None
             out[nid] = _sized(n, "exact" if n is not None else "unknown", w)
             continue
 

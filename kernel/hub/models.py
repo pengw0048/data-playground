@@ -727,6 +727,9 @@ class ProfileResult(Wire):
     # Present only when the profile was measured from a bounded preview or an explicit Sample node.
     # A complete profile over an unsampled graph must not acquire sample evidence by implication.
     sample_provenance: SampleProvenance | None = None
+    # Exact Source revisions measured by this profile. The established local-run manifest shape is
+    # reused verbatim so preview, run, and profile recovery have one durable input identity contract.
+    input_manifest: list[dict[str, str]] | None = None
     not_previewable: bool = False
     error: bool = False
     reason: str | None = None
@@ -803,12 +806,14 @@ class ProfileEstimate(RunEstimate):
     """Whole-profile preflight plus the server-minted identity required by submission."""
     target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileIdentity(Wire):
     """Current server identity for recovery without re-running the size estimate."""
     target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class PerNodeStatus(Wire):
@@ -1225,6 +1230,7 @@ class ImportRequest(Wire):
 class CompileRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class PreviewRequest(Wire):
@@ -1267,6 +1273,7 @@ class ProfileEstimateRequest(Wire):
     graph: Graph
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileIdentityRequest(Wire):
@@ -1274,6 +1281,7 @@ class ProfileIdentityRequest(Wire):
     graph: Graph
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileJobRequest(Wire):
@@ -1289,6 +1297,7 @@ class ProfileJobRequest(Wire):
     plan_digest: PlanDigest
     submission_id: UUID4
     confirmed: bool = False
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class EstimateRequest(Wire):
