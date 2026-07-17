@@ -1665,6 +1665,27 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
+    if (managed_write and effective_write_intent is not None
+            and effective_write_intent.mode in ("create", "replace")):
+        # This one consumer transfers ownership to a durable Task before any worker dispatch. Append,
+        # provider-neutral, placed, kernel, subprocess, and Ray paths deliberately retain their current
+        # lifecycle. The stable local submission id also remains the Write provenance identity.
+        operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
+        if operational_canvas is None or not metadb.canvas_exists(operational_canvas):
+            raise HTTPException(409, "durable managed-local writes require a saved canvas")
+        assert submission_id is not None
+        manifest = (input_manifest if input_manifest is not None
+                    else _resolve_local_run_manifest(graph, target_node_id, deps))
+        task, _created = metadb.submit_durable_local_write_task(
+            uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+            target_node_id=str(target_node_id),
+            graph_doc=graph.model_dump(by_alias=True, mode="json"),
+            input_manifest=manifest,
+            write_intent=effective_write_intent.model_dump(by_alias=True, mode="json"),
+        )
+        from hub.durable_tasks import dispatch
+        dispatch(task["id"], deps)
+        return RunStatus.model_validate(task["status_doc"]), None
     if controller_regions is None:
         controller_regions = deps.controller.plan_for_run(
             graph, target_node_id, sizes=sizes)
@@ -1855,6 +1876,10 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
         return True
     if not uid:
         return False
+    task_auth = metadb.durable_task_auth(run_id)
+    if task_auth is not None:
+        creator, canvas_id = task_auth
+        return creator == uid or metadb.canvas_role(canvas_id, uid) is not None
     creator, auth_canvas = metadb.run_auth(run_id)
     if creator is not None:
         if creator == uid:
@@ -1889,6 +1914,11 @@ def _run_mutate_access(run_id: str, uid: str | None) -> bool:
         return True
     if not uid:
         return False
+    task_auth = metadb.durable_task_auth(run_id)
+    if task_auth is not None:
+        creator, canvas_id = task_auth
+        return (creator == uid and metadb.canvas_role(canvas_id, uid) is not None) \
+            or metadb.canvas_role(canvas_id, uid) in _RUN_MUTATE_ROLES
     creator, auth_canvas = metadb.run_auth(run_id)
     if creator is not None:
         if auth_canvas:
@@ -2350,10 +2380,12 @@ def _status_or_lost(run_id: str) -> RunStatus:
     instance ran it); (2) the shared DB (run_states) — so ANOTHER stateless web instance, or this one
     after a restart, can still answer; (3) a synthetic terminal status. Returning terminal instead of a
     404 lets the client resolve the node cleanly instead of exhausting its retries and stranding it."""
+    task = metadb.durable_task(run_id, include_admission=False)
+    if task is not None:
+        return RunStatus.model_validate(task["status_doc"])
     try:
         return _runner_for(run_id).status(run_id)
     except KeyError:
-        from hub import metadb
         persisted = metadb.get_run_state(run_id)
         if persisted is not None:
             return RunStatus(**persisted)
@@ -2374,7 +2406,8 @@ except ValueError:
 def run_status(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     _require_run_read_access(run_id, uid)  # status carries row counts, paths in errors, output names
     st = _status_or_lost(run_id)
-    if st.status in ("queued", "running") and metadb.run_stalled(run_id, _STALL_S):
+    if (metadb.durable_task_auth(run_id) is None
+            and st.status in ("queued", "running") and metadb.run_stalled(run_id, _STALL_S)):
         st = st.model_copy(update={"stalled": True})  # copy — don't mutate the runner's live object
     return st
 
@@ -2384,6 +2417,12 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     from hub.observability import AuditAction, AuditOutcome, emit_audit, get_request_id
     _require_run_mutate_access(run_id, uid)  # only owner/editor may disrupt a shared canvas run
     deps = get_deps()
+    if metadb.durable_task_auth(run_id) is not None:
+        from hub.durable_tasks import request_cancel
+        task = request_cancel(run_id)
+        if task is None:  # ownership was checked above; deletion can race only as a not-found outcome
+            raise HTTPException(404, f"run '{run_id}' not found")
+        return RunStatus.model_validate(task["status_doc"])
     owner = _runner_for(run_id, fallback=False)
     if owner is not None:
         status = owner.cancel(run_id)  # this instance ran it → cancel in-process
@@ -2434,3 +2473,26 @@ def run_cancel(run_id: str, uid: str = Depends(current_user)) -> RunStatus:
     if persisted is not None:
         return RunStatus(**persisted)
     raise HTTPException(404, f"run '{run_id}' not found")
+
+
+class DurableTaskRetryRequest(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    action_id: uuid.UUID
+
+
+@router.post("/run/{run_id}/retry", response_model=RunStatus)
+def run_retry(
+        run_id: str, req: DurableTaskRetryRequest,
+        uid: str = Depends(current_user)) -> RunStatus:
+    """Explicitly create the next bounded attempt for the one durable local Write task."""
+    _require_run_mutate_access(run_id, uid)
+    if metadb.durable_task_auth(run_id) is None:
+        raise HTTPException(409, "only durable managed-local write tasks support retry")
+    from hub.durable_tasks import retry
+    try:
+        task = retry(run_id, str(req.action_id), get_deps())
+    except KeyError as exc:
+        raise HTTPException(404, f"run '{run_id}' not found") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return RunStatus.model_validate(task["status_doc"])

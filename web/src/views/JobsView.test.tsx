@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const mocks = vi.hoisted(() => ({ workspaceJobs: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  workspaceJobs: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(),
+}))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
 
@@ -20,6 +22,8 @@ describe('JobsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.workspaceJobs.mockResolvedValue({ items: [job()], hasMore: false, nextCursor: null })
+    mocks.cancelRun.mockResolvedValue(undefined)
+    mocks.retryRun.mockResolvedValue(undefined)
     useStore.setState({ view: 'jobs', jobsQuery: '', toasts: [] } as never)
   })
 
@@ -91,5 +95,43 @@ describe('JobsView', () => {
 
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('output=write-1%3Aout'))
     expect(screen.getByTestId('full-result')).toBeVisible()
+  })
+
+  it('shows exact durable task state and requests cancellation from Jobs', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'task-1', taskId: 'task-1', status: 'running', error: null,
+      inputManifest: [{ node_id: 'source', dataset_id: 'dataset-1', revision_id: 'revision-7', provider: 'lance', resolved_at: '2026-07-16T12:00:00Z' }],
+      taskAttempts: [{ id: 'attempt-1', attemptNumber: 1, status: 'running', progress: 0.5, error: null, startedAt: '2026-07-16T12:00:00Z', completedAt: null }],
+      cancelRequested: false, canRetry: false,
+      writeIntent: { mode: 'replace', destination: { name: 'durable', logicalUri: 'managed://durable', provider: 'managed-local-file' }, expectedHead: { revisionId: 'head-6' } },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open run task-1 in Alpha research', expanded: false,
+    }))
+
+    expect(screen.getByText(/dataset-1@revision-7/)).toBeVisible()
+    expect(screen.getByText(/#1 running/)).toBeVisible()
+    expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
+    await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
+  })
+
+  it('reuses one retry action id after an ambiguous request failure', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'task-2', taskId: 'task-2', status: 'failed', canRetry: true,
+      taskAttempts: [{ id: 'attempt-1', attemptNumber: 1, status: 'failed', progress: null, error: 'worker lost', startedAt: null, completedAt: '2026-07-16T12:01:00Z' }],
+    })], hasMore: false, nextCursor: null })
+    mocks.retryRun.mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce(undefined)
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open run task-2 in Alpha research', expanded: false,
+    }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
+    expect(await screen.findByText(/Job action failed: response lost/)).toBeVisible()
+    const actionId = mocks.retryRun.mock.calls[0][1]
+    fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
+    await waitFor(() => expect(mocks.retryRun).toHaveBeenCalledTimes(2))
+    expect(mocks.retryRun.mock.calls[1]).toEqual(['task-2', actionId])
   })
 })

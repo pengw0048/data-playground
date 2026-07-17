@@ -1315,6 +1315,16 @@ class RunHistoryRecord(Wire):
         return self
 
 
+class DurableTaskAttemptView(Wire):
+    id: str
+    attempt_number: int = Field(ge=1)
+    status: Literal["queued", "running", "done", "failed", "cancelled", "fenced"]
+    progress: float | None = Field(default=None, ge=0, le=1)
+    error: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
 class WorkspaceRunRecord(Wire):
     """One visible run in the workspace-wide, read-only Jobs projection."""
 
@@ -1339,6 +1349,12 @@ class WorkspaceRunRecord(Wire):
     backend: str
     placement: Placement
     attempt: str
+    task_id: str | None = None
+    task_attempts: list[DurableTaskAttemptView] = Field(default_factory=list, max_length=16)
+    cancel_requested: bool = False
+    can_retry: bool = False
+    write_intent: WriteIntent | None = None
+    output_receipt: WriteReceipt | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":

@@ -1186,6 +1186,99 @@
         "title": "DriverStep",
         "type": "object"
       },
+      "DurableTaskAttemptView": {
+        "properties": {
+          "attemptNumber": {
+            "minimum": 1.0,
+            "title": "Attemptnumber",
+            "type": "integer"
+          },
+          "completedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completedat"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startedat"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed",
+              "cancelled",
+              "fenced"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "attemptNumber",
+          "status"
+        ],
+        "title": "DurableTaskAttemptView",
+        "type": "object"
+      },
+      "DurableTaskRetryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "actionId": {
+            "format": "uuid",
+            "title": "Actionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "actionId"
+        ],
+        "title": "DurableTaskRetryRequest",
+        "type": "object"
+      },
       "EstimateRequest": {
         "properties": {
           "graph": {
@@ -5398,6 +5491,16 @@
             "title": "Backend",
             "type": "string"
           },
+          "canRetry": {
+            "default": false,
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "cancelRequested": {
+            "default": false,
+            "title": "Cancelrequested",
+            "type": "boolean"
+          },
           "canvasId": {
             "title": "Canvasid",
             "type": "string"
@@ -5479,6 +5582,16 @@
               }
             ],
             "title": "Nodelabel"
+          },
+          "outputReceipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "outputs": {
             "items": {
@@ -5588,6 +5701,35 @@
               }
             ],
             "title": "Targetportid"
+          },
+          "taskAttempts": {
+            "items": {
+              "$ref": "#/components/schemas/DurableTaskAttemptView"
+            },
+            "maxItems": 16,
+            "title": "Taskattempts",
+            "type": "array"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "writeIntent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -13798,6 +13940,98 @@
           }
         },
         "summary": "Preflight Run Result Export"
+      }
+    },
+    "/api/run/{run_id}/retry": {
+      "post": {
+        "description": "Explicitly create the next bounded attempt for the one durable local Write task.",
+        "operationId": "run_retry_api_run__run_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DurableTaskRetryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Run Retry"
       }
     },
     "/api/run/{run_id}/sample": {

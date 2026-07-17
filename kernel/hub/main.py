@@ -266,6 +266,11 @@ async def _lifespan(_app):
             _object_attempt_reaper_stop = stop
             _object_attempt_reaper_thread = object_thread
             _local_result_reaper_thread = local_thread
+            # Reclaim only expired/queued managed-local durable tasks. SQL leases elect one owner;
+            # this lifespan hook is a recovery trigger, not a scheduler or an in-memory source of truth.
+            from hub.deps import get_deps
+            from hub.durable_tasks import recover as recover_durable_tasks
+            recover_durable_tasks(get_deps())
         _reaper_lifespan_users += 1
     try:
         yield
