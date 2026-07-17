@@ -41,6 +41,8 @@ from hub.models import (
     LineagePublication,
     LineageResult,
     Relationship,
+    WriteIntent,
+    WriteReceipt,
 )
 
 log = logging.getLogger("hub")
@@ -608,6 +610,39 @@ class InMemoryCatalog:
                 log.warning("catalog usage bump failed after local revision publication", exc_info=True)
         self._embed_one(canonical)
         return {**published, "table": canonical}
+
+    def publish_managed_local_write(
+            self, intent: WriteIntent, artifact_uri: str, *, total_bytes: int) -> WriteReceipt:
+        """Publish one admitted local create/replace and return its exact durable receipt."""
+        frozen = WriteIntent.model_validate(intent)
+        table = self._add(
+            name=frozen.destination.name,
+            uri=artifact_uri,
+            strict_probe=True,
+            _persist_table=False,
+            _embed_table=False,
+        )
+        provenance = frozen.provenance.publication
+        try:
+            published = metadb.catalog_publish_managed_local_file(
+                frozen.destination.logical_uri,
+                artifact_uri,
+                frozen.destination.name,
+                table.model_dump(by_alias=True),
+                parents=frozen.provenance.parents,
+                lineage=provenance.model_dump(),
+                write_intent=frozen.model_dump(by_alias=True, mode="json"),
+                total_bytes=total_bytes,
+            )
+        except Exception:
+            published = metadb.catalog_managed_local_write_receipt(
+                frozen.model_dump(by_alias=True, mode="json"))
+            if published is None:
+                raise
+        receipt = WriteReceipt.model_validate(published)
+        if receipt.publication.artifact_uri == artifact_uri:
+            self._embed_one(table)
+        return receipt
 
     def register_output_idempotent(
         self, idempotency_key: str, **kwargs

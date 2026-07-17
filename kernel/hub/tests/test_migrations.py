@@ -54,14 +54,15 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0006_typed_local_writes", "0005_profile_output_ports"),
         ("0005_profile_output_ports", "0004_local_run_input_admissions"),
         ("0004_local_run_input_admissions", "0003_repair_historical_metadata"),
         ("0003_repair_historical_metadata", "0002_managed_file_revs"),
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0005_profile_output_ports"]
-    assert metadb.expected_schema_head() == "0005_profile_output_ports"
+    assert scripts.get_heads() == ["0006_typed_local_writes"]
+    assert metadb.expected_schema_head() == "0006_typed_local_writes"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -79,6 +80,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0005_profile_output_ports.py": (
             "af30394298fed43a53a7be86f23256d63a4d97217d0fceb1718d77c81d351547"
+        ),
+        "0006_typed_local_writes.py": (
+            "132a4a8ff77a5a48ad45538beaded4480b45b7bf4006fe504e02e1481845507c"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

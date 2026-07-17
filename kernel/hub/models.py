@@ -378,6 +378,141 @@ class LineagePublication(Wire):
         return self
 
 
+class WriteDestination(Wire):
+    """Stable logical identity of one managed write destination."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    logical_uri: str = Field(min_length=1, max_length=4096)
+    name: str = Field(min_length=1, max_length=512)
+    dataset_id: str | None = Field(default=None, min_length=1, max_length=128)
+    provider: Literal["managed-local-file"] = "managed-local-file"
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "WriteDestination":
+        for field_name in ("logical_uri", "name", "dataset_id"):
+            value = getattr(self, field_name)
+            if value is not None and value != value.strip():
+                raise ValueError(
+                    f"write destination {field_name} cannot contain surrounding whitespace")
+        self.logical_uri = self.logical_uri.rstrip("/")
+        if not self.logical_uri:
+            raise ValueError("write destination logical_uri cannot be blank")
+        return self
+
+
+class WritePartitionExpectation(Wire):
+    """One bounded partition field requested by a write intent."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    field: str = Field(min_length=1, max_length=512)
+
+    @field_validator("field")
+    @classmethod
+    def validate_field(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("write partition field cannot contain surrounding whitespace")
+        return value
+
+
+class WriteProvenance(Wire):
+    """Frozen producer evidence and the ordered source identities used by one write."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    publication: LineagePublication
+    parents: list[str] = Field(default_factory=list, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_parents(self) -> "WriteProvenance":
+        canonical: list[str] = []
+        seen: set[str] = set()
+        for parent in self.parents:
+            token = str(parent).rstrip("/")
+            if not token or token != str(parent):
+                raise ValueError("write provenance parents must be canonical non-empty identities")
+            if token in seen:
+                raise ValueError("write provenance parents must be unique")
+            seen.add(token)
+            canonical.append(token)
+        self.parents = sorted(canonical)
+        return self
+
+
+class WriteIntent(Wire):
+    """Frozen pre-1.0 contract for one local create or compare-and-swap replace."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    destination: WriteDestination
+    mode: Literal["create", "replace"]
+    expected_schema: list[ColumnSchema] = Field(default_factory=list, max_length=1024)
+    expected_head: ExactDatasetRef | None = None
+    idempotency_key: str = Field(min_length=1, max_length=2048)
+    partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
+    provenance: WriteProvenance
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> "WriteIntent":
+        if self.idempotency_key != self.idempotency_key.strip():
+            raise ValueError("write idempotency_key cannot contain surrounding whitespace")
+        names = [column.name for column in self.expected_schema]
+        if any(not name or name != name.strip() for name in names):
+            raise ValueError("write expected schema field names must be canonical")
+        if len(names) != len(set(names)):
+            raise ValueError("write expected schema field names must be unique")
+        partition_fields = [item.field for item in self.partitions]
+        if len(partition_fields) != len(set(partition_fields)):
+            raise ValueError("write partition fields must be unique")
+        if any(field not in set(names) for field in partition_fields):
+            raise ValueError("write partition fields must exist in the expected schema")
+        if self.provenance.publication.idempotency_key != self.idempotency_key:
+            raise ValueError("write provenance identity must match the write idempotency key")
+        if self.mode == "create":
+            if self.destination.dataset_id is not None or self.expected_head is not None:
+                raise ValueError("create write cannot claim an existing dataset or expected head")
+        else:
+            if self.destination.dataset_id is None or self.expected_head is None:
+                raise ValueError("replace write requires destination dataset and expected head")
+            if self.expected_head.dataset_id != self.destination.dataset_id:
+                raise ValueError("replace expected head must belong to the destination dataset")
+        return self
+
+
+class WritePublicationIdentity(Wire):
+    """Durable provider-side identity of one local managed-file publication."""
+
+    provider: Literal["managed-local-file"] = "managed-local-file"
+    logical_uri: str
+    artifact_uri: str
+    publish_sequence: int = Field(ge=1, le=MAX_SAFE_INTEGER)
+    idempotency_key: str
+    catalog_version: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class WriteReceipt(Wire):
+    """Durable evidence for one exact revision-producing write."""
+
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+    parent_head: ExactDatasetRef | None = None
+    head: DatasetRevision
+    rows: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    bytes: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    schema_facts: list[ColumnSchema] = Field(
+        default_factory=list, max_length=1024, alias="schema")
+    partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
+    publication: WritePublicationIdentity
+    provenance: WriteProvenance
+    durable: Literal[True] = True
+
+    @property
+    def schema(self) -> list[ColumnSchema]:
+        """Expose the natural Python spelling while keeping Pydantic's legacy method unshadowed."""
+        return self.schema_facts
+
+
 def _lineage_fact_cursor(value: str) -> str:
     if int(value) >= 2**63:
         raise ValueError("lineage fact cursor exceeds the signed BIGINT range")
