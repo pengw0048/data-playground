@@ -202,7 +202,8 @@ def test_two_lance_appends_admitted_from_one_head_have_one_cas_winner(lance_dest
     assert LanceAdapter()._dataset(table.uri).count_rows() == 2
     with metadb.session() as session:
         assert len(list(session.scalars(select(
-            metadb.ManagedLocalLanceWriteReceipt)))) == 1
+            metadb.ManagedLocalLanceWriteReceipt).where(
+                metadb.ManagedLocalLanceWriteReceipt.dataset_id == binding["dataset_id"])))) == 1
 
 
 def test_lance_append_response_loss_replays_without_duplicate_version(
