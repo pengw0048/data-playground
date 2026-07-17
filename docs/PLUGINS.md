@@ -451,13 +451,36 @@ Private or third-party plugins can reuse `python -m hub.plugin_conformance` for 
 and add their own capability-specific tests. Live integration tests then validate the intended provider or
 cluster; they do not replace deterministic contract tests.
 
+### External-wait adapter contract
+
+An optional external-wait plugin imports the immutable DTOs and `ExternalWaitAdapter` protocol from
+`hub.external_wait`, then calls `reg.add_external_wait_adapter(adapter)`. Provider kinds are normalized
+lowercase slugs and are unique per application instance; duplicate registrations fail closed. Requests,
+handles, checkpoints, outcomes, diagnostics, retry hints, and download evidence are bounded and non-secret.
+Core supplies the stable submit idempotency key and the isolated download target.
+
+Build the core candidate and the deterministic fixture wheel, install only those candidates into a clean
+environment, and run the packaged contract check:
+
+```bash
+python -m hub.external_wait_conformance dp-external-wait-fixture \
+  --provider-kind fixture-local
+```
+
+The command clears ambient `DP_*` routing, discovers the adapter only through its `dataplay.plugins`
+entry point, and checks response-loss replay, monotonic polling, terminal replay, cancellation, download
+evidence, malformed returns, and instance isolation. Its failure output contains only a stage and canonical
+error code. The fixture is an offline conformance dependency, not a default provider or product feature.
+
 ## Reference plugins
 
-`examples/plugins/` ships twelve working plugins. Each has a test in
+`examples/plugins/` ships thirteen working plugins. Each has a test in
 `kernel/hub/tests/test_kernel.py` you can copy:
 
 - [`dp_example`](../examples/plugins/dp_example/) — `add_node`: `redact` compute node (mask a PII
   column)
+- [`dp_external_wait_fixture`](../examples/plugins/dp_external_wait_fixture/) — deterministic installed-
+  wheel fixture for the public external-wait adapter contract (not installed by default).
 - [`dp_sql_catalog`](../examples/plugins/dp_sql_catalog/) — `set_catalog`: SQL-backed
   `CatalogProvider` subclassing `InMemoryCatalog` and overriding reads.
   `DP_SQL_CATALOG_URL` / `DP_SQL_CATALOG_TABLE`. Uses `sqlalchemy` (core dep).

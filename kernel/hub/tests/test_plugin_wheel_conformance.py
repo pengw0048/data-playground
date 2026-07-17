@@ -104,6 +104,64 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
     assert secret not in stale_failure.stdout + stale_failure.stderr
 
 
+def test_external_wait_fixture_wheel_passes_sanitized_conformance(tmp_path):
+    repo = Path(__file__).resolve().parents[3]
+    kernel = repo / "kernel"
+    plugin = repo / "examples" / "plugins" / "dp_external_wait_fixture"
+    uv = shutil.which("uv")
+    assert uv is not None, "the supported wheel conformance path requires uv"
+
+    core_dist = tmp_path / "core-dist"
+    plugin_dist = tmp_path / "plugin-dist"
+    assert _run([uv, "build", "--wheel", "--out-dir", str(core_dist)], cwd=kernel).returncode == 0
+    assert _run([uv, "build", "--wheel", "--out-dir", str(plugin_dist)], cwd=plugin).returncode == 0
+    core_wheel, = core_dist.glob("data_playground-*.whl")
+    plugin_wheel, = plugin_dist.glob("dp_external_wait_fixture-*.whl")
+
+    venv = tmp_path / "venv"
+    assert _run([uv, "venv", str(venv)], cwd=tmp_path).returncode == 0
+    python = venv / "bin" / "python"
+    installed = _run(
+        [uv, "pip", "install", "--python", str(python), str(core_wheel), str(plugin_wheel)],
+        cwd=tmp_path,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    clean_env = os.environ.copy()
+    for key in tuple(clean_env):
+        if key == "PYTHONPATH" or key.startswith("DP_"):
+            clean_env.pop(key)
+    decoy = tmp_path / "decoy"
+    env = clean_env | {
+        "DP_WORKSPACE": str(decoy),
+        "DP_DATA_DIR": str(decoy / "data"),
+        "DP_DATABASE_URL": f"sqlite:///{decoy / 'metadata.db'}",
+        "DP_PLUGINS": "module-that-must-not-load",
+        "DP_EXECUTION": "provider-that-must-not-load",
+    }
+    command = [
+        str(python), "-m", "hub.external_wait_conformance", "dp-external-wait-fixture",
+        "--provider-kind", "fixture-local",
+    ]
+    checked = _run(command, cwd=tmp_path, env=env)
+    assert checked.returncode == 0, checked.stdout + checked.stderr
+    assert checked.stdout.strip() == "external-wait conformance passed"
+    assert checked.stderr == ""
+    assert not decoy.exists()
+    assert "external-wait-secret-sentinel" not in checked.stdout + checked.stderr
+    assert "/private/configured/path" not in checked.stdout + checked.stderr
+
+    secret = "requested-plugin-secret-sentinel"
+    rejected = _run(
+        [str(python), "-m", "hub.external_wait_conformance", secret,
+         "--provider-kind", "fixture-local"],
+        cwd=tmp_path, env=clean_env,
+    )
+    assert rejected.returncode == 1
+    assert rejected.stderr.strip() == "activation: entry_point_inactive"
+    assert secret not in rejected.stdout + rejected.stderr
+
+
 def test_installed_descriptor_fixture_certifies_backend_api_and_execution(tmp_path):
     repo = Path(__file__).resolve().parents[3]
     kernel = repo / "kernel"

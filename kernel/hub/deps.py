@@ -249,6 +249,26 @@ class Registry:
         destinations.register_backend(backend)
         self._activate(f"destination:{backend.kind}", "application", replace=True)
 
+    def add_external_wait_adapter(self, adapter) -> None:
+        """Register one provider-neutral external-wait adapter on this application instance."""
+        from hub.external_wait import ExternalWaitAdapter, normalize_provider_kind
+        try:
+            kind = normalize_provider_kind(getattr(adapter, "provider_kind", None))
+            valid = isinstance(adapter, ExternalWaitAdapter) and all(
+                callable(getattr(adapter, method, None))
+                for method in ("submit", "status", "cancel", "download"))
+        except Exception:  # noqa: BLE001 — plugin values never enter public status
+            kind = None
+            valid = False
+        if kind is None or not valid:
+            self._problem("External-wait adapter registration is invalid.")
+            return
+        if kind in self.deps.external_wait_adapters:
+            self._conflict(f"External-wait provider kind '{kind}' conflicts with another plugin.")
+            return
+        self.deps.external_wait_adapters[kind] = adapter
+        self._activate(f"external-wait:{kind}", "application")
+
 
 def _persist_run(deps, graph, target, status) -> None:
     """Runner on_complete hook (bound to the owning deps): keep a finished run with its canvas
@@ -400,6 +420,7 @@ class Deps:
         # Registered delivery handles for reg.add_telemetry_sink callbacks (OTel/exporters stay plugins).
         self.telemetry_sinks: list = []
         self.managed_object_provider = None
+        self.external_wait_adapters: dict[str, object] = {}
         self.plugins: list[dict] = []
         # Status is instance-owned: constructing a second app/kernel must not reuse the first one's
         # discoveries, failures, or effective capability ownership.
@@ -594,6 +615,14 @@ class Deps:
             except Exception:  # noqa: BLE001
                 continue
         return self.default_adapter
+
+    def _external_wait_adapter(self, provider_kind: object):
+        """Internal lookup reserved for the later durable Task consumer."""
+        from hub.external_wait import normalize_provider_kind
+        try:
+            return self.external_wait_adapters.get(normalize_provider_kind(provider_kind))
+        except ValueError:
+            return None
 
     def _materialize_plugin_runners(self) -> None:
         """Construct registered plugin backends after catalog selection and the local base runner."""
