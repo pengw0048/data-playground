@@ -201,6 +201,20 @@ def write_managed_local_lance_append(
     if expected is None:  # guarded by WriteIntent
         raise ValueError("managed local Lance append requires an expected head")
     expected_version = int(adapter._revision_id(expected.revision_id))
+    import lance
+
+    backend_version = str(getattr(lance, "__version__", "unknown"))
+
+    def persist_recovered(receipt: WriteReceipt) -> WriteReceipt:
+        saved = metadb.catalog_publish_managed_local_lance_write(
+            frozen_doc, lambda: receipt.model_dump(by_alias=True, mode="json"))
+        return WriteReceipt.model_validate(saved)
+
+    # A process can die after Lance commits expected+1 but before the SQL receipt is durable. Every retry
+    # must reconcile the exact native transaction evidence before treating the advanced head as stale.
+    recovered = _lance_append_receipt(frozen, adapter, backend_version)
+    if recovered is not None:
+        return persist_recovered(recovered)
     observed = adapter.resolve_revision(frozen.destination.logical_uri)
     if observed["revision_id"] != str(expected_version):
         raise metadb.ManagedLocalWriteConflict("append expected head is stale")
@@ -227,14 +241,8 @@ def write_managed_local_lance_append(
         raise ModuleNotFoundError(
             "Lance support is not installed — run: uv pip install -e 'kernel[lance]'") from exc
 
-    backend_version = str(getattr(lance, "__version__", "unknown"))
     fragment = None
     transaction_file = None
-
-    def persist_recovered(receipt: WriteReceipt) -> WriteReceipt:
-        saved = metadb.catalog_publish_managed_local_lance_write(
-            frozen_doc, lambda: receipt.model_dump(by_alias=True, mode="json"))
-        return WriteReceipt.model_validate(saved)
 
     def publish() -> dict[str, object]:
         nonlocal fragment, transaction_file

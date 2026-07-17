@@ -80,6 +80,13 @@ def _is_core_managed_local_file_sink(spec, uri: str, adapter, storage) -> bool:
     return is_core_managed_local_file_sink(spec, uri, adapter, storage)
 
 
+def _is_core_managed_local_lance_append_sink(spec, uri: str, adapter) -> bool:
+    """The one existing local Lance append shape owned by the typed CAS publisher."""
+    from hub.sinks import is_core_managed_local_lance_append_sink
+
+    return is_core_managed_local_lance_append_sink(spec, uri, adapter)
+
+
 # Existing isolated-object transport imports this private predicate; keep its object-only meaning.
 _is_core_managed_sink = _is_core_managed_object_sink
 
@@ -280,7 +287,7 @@ class LocalRunner:
 
     @staticmethod
     def supports_managed_local_write_intents() -> bool:
-        return True  # this process owns the typed local create/replace publication boundary
+        return True  # this process owns typed local create/replace and Lance append publication
 
     def supports_named_multi_output_runs(self) -> bool:
         return True
@@ -1475,12 +1482,16 @@ class LocalRunner:
         # The parent-owned isolated transport has its own output contract; this issue deliberately
         # covers only the default in-process local writer.
         from hub.plugins.catalog import InMemoryCatalog
-        managed_local = (
+        managed_local_file = (
             _is_core_managed_local_file_sink(spec, logical_uri, logical_adapter, self.storage)
             and not parent_contract and type(self.catalog) is InMemoryCatalog
         )
+        managed_local_lance = (
+            _is_core_managed_local_lance_append_sink(spec, logical_uri, logical_adapter)
+            and not parent_contract and type(self.catalog) is InMemoryCatalog
+        )
         admitted = cfg.get("_admittedWriteIntent")
-        if admitted is not None and not managed_local:
+        if admitted is not None and not (managed_local_file or managed_local_lance):
             raise RuntimeError(
                 "managed local write admission reached an incompatible execution sink")
         parent_assigned_attempt = self.forced_sink_attempts.get(node.id)
@@ -1530,7 +1541,54 @@ class LocalRunner:
                 if not parent_owned:
                     discard_attempt(attempt_uri)
                 raise
-        elif managed_local:
+        elif managed_local_lance and admitted is not None:
+            import pyarrow as pa
+
+            from hub.local_writes import write_managed_local_lance_append
+            from hub.models import WriteIntent
+            from hub.plugins.adapters import relation_columns
+
+            if lineage is None:  # parent-owned transports are excluded by admission
+                raise RuntimeError("managed local Lance append requires local provenance identity")
+            intent = WriteIntent.model_validate(admitted)
+            if (intent.mode != "append"
+                    or intent.destination.provider != "managed-local-lance"
+                    or intent.destination.logical_uri != logical_uri
+                    or intent.expected_schema != relation_columns(parent_rel)
+                    or intent.provenance.publication != lineage
+                    or intent.provenance.parents != parent_uris
+                    or intent.partitions):
+                raise RuntimeError(
+                    "managed local Lance admission does not match the executing graph")
+            source = parent_rel.to_arrow_reader(1 << 16)
+
+            def cancellable_batches():
+                while True:
+                    if cancel.is_set():
+                        raise RuntimeError("run cancelled before output commit")
+                    try:
+                        yield source.read_next_batch()
+                    except StopIteration:
+                        return
+
+            reader = pa.RecordBatchReader.from_batches(source.schema, cancellable_batches())
+            receipt = write_managed_local_lance_append(
+                intent=intent,
+                data=reader,
+                before_publish=(None if pre_publish is None
+                                else lambda: pre_publish(check_cancel=True)),
+            )
+            committed_snapshot = committed_output_snapshot(
+                status,
+                uri=receipt.publication.artifact_uri,
+                table=spec.name,
+                version=receipt.publication.catalog_version,
+                rows=receipt.rows,
+                write_receipt=receipt,
+            )
+            status.outputs = [committed_snapshot]
+            return receipt.rows
+        elif managed_local_file:
             from hub.local_writes import write_managed_local_file
             from hub.models import ExactDatasetRef, WriteDestination, WriteIntent, WriteProvenance
             from hub.plugins.adapters import relation_columns
@@ -1627,17 +1685,17 @@ class LocalRunner:
                 # An unmanaged adapter's successful return is already an externally visible mutation;
                 # publication wins from that point. Immutable managed attempts can still let cancel win
                 # before their pointer is published.
-                pre_publish(check_cancel=managed_object or managed_local)
+                pre_publish(check_cancel=managed_object or managed_local_file)
         except Exception:
             if managed_object and not parent_owned:
                 _safe_abandon_attempt(attempt_uri)
-            elif managed_local:
+            elif managed_local_file:
                 _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
             raise
         if not (managed_object and parent_contract):
             if managed_object:
                 publish = managed_publisher
-            elif managed_local:
+            elif managed_local_file:
                 publish = lambda **kwargs: managed_publisher(  # noqa: E731
                     name=committed.name, logical_uri=logical_uri, artifact_uri=committed.uri,
                     parents=kwargs.get("parents"), pipeline=kwargs.get("pipeline"),
@@ -1654,7 +1712,7 @@ class LocalRunner:
                 logging.getLogger("hub").exception("sink publication failed")
                 if managed_object and not parent_owned:
                     _safe_abandon_attempt(attempt_uri)
-                elif managed_local:
+                elif managed_local_file:
                     _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
                 raise RuntimeError("sink publication failed") from exc
             published_version = _catalog_publication_version(published)
@@ -1662,7 +1720,7 @@ class LocalRunner:
                 committed_snapshot = committed_output_snapshot(
                     status, uri=committed.uri, table=committed.name,
                     version=published_version, rows=committed.rows)
-        if managed_local and not self.storage.release_result(attempt_uri, status.run_id):
+        if managed_local_file and not self.storage.release_result(attempt_uri, status.run_id):
             raise RuntimeError("managed local revision publication is missing its durable owner")
         status.outputs = [committed_snapshot]
         return committed.rows

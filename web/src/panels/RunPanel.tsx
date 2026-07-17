@@ -234,6 +234,7 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
                 {' · '}dataset {output.writeReceipt.datasetId}
                 {' · '}{output.writeReceipt.bytes.toLocaleString()} bytes
                 {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
+                {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
               </div>
             )}
             {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}

@@ -190,7 +190,8 @@ def _write_admission_for_graph(
     """Resolve one metadata-only Write card contract without allocating an artifact."""
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
-        SinkSpec, is_core_managed_local_file_sink, preflight_sink,
+        SinkSpec, is_core_managed_local_file_sink,
+        is_core_managed_local_lance_append_sink, preflight_sink,
     )
 
     node = next((candidate for candidate in graph.nodes if candidate.id == node_id), None)
@@ -202,10 +203,15 @@ def _write_admission_for_graph(
     logical_uri = preflight_sink(
         spec, deps.workspace, deps.storage, deps.resolve_adapter)
     adapter = deps.resolve_adapter(logical_uri)
-    managed = (
+    managed_file = (
         is_core_managed_local_file_sink(spec, logical_uri, adapter, deps.storage)
         and type(deps.catalog) is InMemoryCatalog
     )
+    lance_candidate = (
+        is_core_managed_local_lance_append_sink(spec, logical_uri, adapter)
+        and type(deps.catalog) is InMemoryCatalog
+    )
+    managed = managed_file or lance_candidate
     pick_runner = getattr(deps, "pick_runner", None)
     if managed and callable(pick_runner):
         plan = compiler.compile_plan(
@@ -215,6 +221,24 @@ def _write_admission_for_graph(
         # retain their provider-neutral sink contract and must not be labelled create/replace.
         runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
+        controller = getattr(deps, "controller", None)
+        plan_for_run = getattr(controller, "plan_for_run", None)
+        if managed and callable(plan_for_run):
+            _rows, _byts, sizes = _cone_size(graph, node_id, deps)
+            try:
+                managed = not bool(plan_for_run(graph, node_id, sizes=sizes))
+            except Exception:
+                managed = False
+    lance_binding = None
+    lance_table = None
+    if managed and lance_candidate:
+        lance_binding = metadb.catalog_revision_binding_for_uri(logical_uri)
+        if lance_binding is not None:
+            try:
+                lance_table = deps.catalog.get_table(logical_uri)
+            except KeyError:
+                lance_binding = None
+        managed = lance_binding is not None and lance_table is not None
     partitions = [WritePartitionExpectation(field=field.strip()) for field in
                   spec.partition_by.split(",") if field.strip()]
     provider_name = str(getattr(adapter, "name", "") or "provider-neutral")
@@ -245,8 +269,9 @@ def _write_admission_for_graph(
             node_id=node_id,
             managed=True,
             destination=logical_uri,
-            mode="replace" if supplied and supplied.mode == "replace" else "create",
-            provider="managed-local-file",
+            mode=("append" if lance_candidate
+                  else "replace" if supplied and supplied.mode == "replace" else "create"),
+            provider=("managed-local-lance" if lance_candidate else "managed-local-file"),
             partitions=partitions,
             blocker=("input schema is not available from bounded metadata; "
                      "declare the upstream output schema before running"),
@@ -257,6 +282,106 @@ def _write_admission_for_graph(
     lineage = lineage_for_output(graph, run_id, node_id)
     parents = metadb.catalog_lineage_parent_tokens(
         graph_mod.all_upstream_publication_uris(graph, node_id))
+    provenance = WriteProvenance(publication=lineage, parents=parents)
+    normalized_schema = [ColumnSchema.model_validate(column) for column in schema]
+    if lance_candidate:
+        if lance_binding is None or lance_table is None:  # narrowed above; keeps typing explicit
+            raise RuntimeError("managed local Lance admission lost its catalog binding")
+        if supplied is not None and (
+                supplied.mode != "append"
+                or supplied.destination.provider != "managed-local-lance"
+                or supplied.destination.logical_uri != logical_uri
+                or supplied.destination.dataset_id != str(lance_binding["dataset_id"])
+                or supplied.destination.name != lance_table.name
+                or supplied.expected_schema != normalized_schema
+                or supplied.idempotency_key != lineage.idempotency_key
+                or supplied.provenance != provenance
+                or supplied.partitions):
+            raise HTTPException(409, "write admission does not match the submitted graph")
+        intent = supplied
+        if intent is not None:
+            try:
+                recovered = metadb.catalog_admit_managed_local_lance_write(
+                    intent.model_dump(by_alias=True, mode="json"))
+            except metadb.ManagedLocalWriteConflict as exc:
+                raise HTTPException(
+                    409, "write admission is stale; re-admit the current destination head and retry"
+                ) from exc
+            if recovered is not None:
+                receipt = WriteReceipt.model_validate(recovered)
+                return WriteAdmission(
+                    node_id=node_id, managed=True, destination=logical_uri,
+                    mode="append", provider="managed-local-lance",
+                    expected_schema=intent.expected_schema, expected_head=intent.expected_head,
+                    intent=intent, recovered_receipt=receipt,
+                )
+        try:
+            resolved = adapter.resolve_revision(logical_uri)
+            revision_id = str(resolved["revision_id"])
+            destination_detail = adapter.revision_detail(
+                logical_uri, revision_id, preview_limit=1)
+            destination_schema = [
+                ColumnSchema.model_validate(column)
+                for column in destination_detail["columns"]
+            ]
+        except Exception as exc:
+            if supplied is not None:
+                raise HTTPException(
+                    409, "write admission cannot reopen the frozen Lance destination head"
+                ) from exc
+            return WriteAdmission(
+                node_id=node_id, managed=True, destination=logical_uri,
+                mode="append", provider="managed-local-lance",
+                expected_schema=normalized_schema,
+                blocker="the existing Lance destination head is not available",
+            )
+        if intent is not None:
+            expected = intent.expected_head
+            if (expected is None or expected.revision_id != revision_id
+                    or expected.dataset_id != str(lance_binding["dataset_id"])):
+                raise HTTPException(
+                    409, "write admission is stale; re-admit the current destination head and retry")
+        if destination_schema != normalized_schema:
+            return WriteAdmission(
+                node_id=node_id, managed=True, destination=logical_uri,
+                mode="append", provider="managed-local-lance",
+                expected_schema=normalized_schema,
+                expected_head=ExactDatasetRef(
+                    kind="exact", dataset_id=str(lance_binding["dataset_id"]),
+                    revision_id=revision_id),
+                blocker="input schema is incompatible with the existing Lance destination",
+            )
+        intent = intent or WriteIntent(
+            destination=WriteDestination(
+                logical_uri=logical_uri,
+                name=lance_table.name,
+                dataset_id=str(lance_binding["dataset_id"]),
+                provider="managed-local-lance",
+            ),
+            mode="append",
+            expected_schema=normalized_schema,
+            expected_head=ExactDatasetRef(
+                kind="exact", dataset_id=str(lance_binding["dataset_id"]),
+                revision_id=revision_id),
+            idempotency_key=lineage.idempotency_key,
+            provenance=provenance,
+        )
+        try:
+            recovered = metadb.catalog_admit_managed_local_lance_write(
+                intent.model_dump(by_alias=True, mode="json"))
+        except metadb.ManagedLocalWriteConflict as exc:
+            raise HTTPException(
+                409, "write admission is stale; re-admit the current destination head and retry"
+            ) from exc
+        return WriteAdmission(
+            node_id=node_id, managed=True, destination=logical_uri,
+            mode="append", provider="managed-local-lance",
+            expected_schema=intent.expected_schema, expected_head=intent.expected_head,
+            intent=intent,
+            recovered_receipt=(WriteReceipt.model_validate(recovered)
+                               if recovered is not None else None),
+        )
+
     head = metadb.catalog_managed_local_write_head(logical_uri)
     replacing = bool(
         head is not None and head.get("state") == "active" and head.get("revision_id"))
@@ -272,20 +397,20 @@ def _write_admission_for_graph(
             dataset_id=(str(head["dataset_id"]) if replacing else None),
         ),
         mode=("replace" if replacing else "create"),
-        expected_schema=schema,
+        expected_schema=normalized_schema,
         expected_head=expected_head,
         idempotency_key=lineage.idempotency_key,
         partitions=partitions,
-        provenance=WriteProvenance(publication=lineage, parents=parents),
+        provenance=provenance,
     )
     if supplied is not None and (
             intent.destination.logical_uri != logical_uri
             or intent.destination.name != spec.name
-            or intent.expected_schema != [ColumnSchema.model_validate(column) for column in schema]):
+            or intent.expected_schema != normalized_schema):
         raise HTTPException(409, "write admission does not match the submitted graph")
     if supplied is not None and (
             intent.idempotency_key != lineage.idempotency_key
-            or intent.provenance != WriteProvenance(publication=lineage, parents=parents)
+            or intent.provenance != provenance
             or intent.partitions != partitions):
         raise HTTPException(409, "write admission does not match the submitted graph")
     try:
@@ -1529,9 +1654,14 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
+    managed_write = bool(write_admission is not None and write_admission.managed)
     controller_regions = (_controller_regions_for_run(
-        deps, graph, target_node_id, output_target, sizes, multi_output=True)
-        if multi_output else None)
+        deps, graph, target_node_id, output_target, sizes, multi_output=multi_output)
+        if multi_output or managed_write else None)
+    if managed_write and controller_regions:
+        raise HTTPException(
+            409, "the selected execution owner cannot consume the managed-local write admission; "
+            "discard it and retry with an in-process local plan")
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)

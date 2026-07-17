@@ -462,6 +462,29 @@ describe('durable full results', () => {
     expect(downloads).toContain('target-out-published-dataset-page-1-1.csv')
   })
 
+  it('reloads the durable Lance append receipt from persisted run history', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'lance-write-history', runId: 'lance-write-run', status: 'done',
+      targetNodeId: 'write', rows: 3, outputs: [{
+        ...committedOutput('/outputs/existing.lance', 3), publicationKind: 'catalog' as const,
+        table: 'existing', writeReceipt: {
+          datasetId: 'dataset-lance', revisionId: '8', rows: 3, bytes: 1024,
+          parentHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
+          publication: { backendVersion: '8.0.0' },
+        },
+      }],
+    }])
+
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    const receipt = await screen.findByLabelText('Write receipt for run lance-write-history')
+    expect(receipt).toHaveTextContent(/durable revision 8/i)
+    expect(receipt).toHaveTextContent(/dataset dataset-lance/i)
+    expect(receipt).toHaveTextContent(/parent 7/i)
+    expect(receipt).toHaveTextContent(/backend 8\.0\.0/i)
+    expect(receipt).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+  })
+
   it('offers sample/full switching for previewable nodes after a full run', async () => {
     apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{

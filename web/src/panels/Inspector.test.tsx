@@ -163,6 +163,34 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/512 bytes/i)
     expect(screen.queryByText(/^overwrite$/i)).not.toBeInTheDocument()
   })
+
+  it('shows the frozen Lance parent and backend version without a physical path', () => {
+    selectNode('write', undefined)
+    useStore.setState({
+      runs: { node: {
+        phase: 'done',
+        writeAdmission: {
+          nodeId: 'node', managed: true, destination: '/outputs/existing.lance',
+          mode: 'append', provider: 'managed-local-lance', expectedSchema: cols,
+          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
+        },
+        status: { outputs: [{ writeReceipt: {
+          datasetId: 'dataset-lance', revisionId: '8', rows: 12, bytes: 1024,
+          parentHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
+          publication: { backendVersion: '8.0.0' },
+        } }] },
+      } },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/append.*managed-local-lance/i)
+    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/expected revision 7/i)
+    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/durable revision 8/i)
+    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/parent revision 7/i)
+    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/backend 8\.0\.0/i)
+    expect(screen.getByLabelText('Write receipt')).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+  })
 })
 
 describe('PortRow — port schema badge', () => {

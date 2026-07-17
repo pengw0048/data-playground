@@ -132,6 +132,20 @@ def is_core_managed_local_file_sink(spec: SinkSpec, uri: str, adapter, storage) 
     )
 
 
+def is_core_managed_local_lance_append_sink(spec: SinkSpec, uri: str, adapter) -> bool:
+    """Whether this sink has the narrow local Lance append shape certified by core."""
+    from hub.paths import checked_local_path
+
+    return (
+        spec.mode == "append"
+        and not spec.partition_by
+        and spec.extension.lower() == ".lance"
+        and checked_local_path(uri) is not None
+        and adapter.__class__.__module__ == "hub.plugins.adapters"
+        and adapter.__class__.__name__ == "LanceAdapter"
+    )
+
+
 def commit_sink(spec: SinkSpec, relation, workspace: str, storage, resolve_adapter,
                 target_uri: str | None = None, write_adapter=None) -> SinkCommit:
     """Write a relation through the selected adapter using the normalized sink contract."""

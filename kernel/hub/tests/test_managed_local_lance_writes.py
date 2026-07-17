@@ -229,6 +229,42 @@ def test_lance_append_response_loss_replays_without_duplicate_version(
         {"value": 1}, {"value": 2}]
 
 
+def test_lance_append_restart_recovers_commit_before_sql_receipt(
+        lance_destination, monkeypatch):
+    _lance, _catalog, table, binding = lance_destination
+    intent = _intent(table, binding, "commit-before-receipt")
+    publish = metadb.catalog_publish_managed_local_lance_write
+
+    def commit_then_crash(value, commit):
+        commit()
+        raise SystemExit("process died before the SQL receipt committed")
+
+    monkeypatch.setattr(
+        metadb, "catalog_publish_managed_local_lance_write", commit_then_crash)
+    with pytest.raises(SystemExit, match="before the SQL receipt"):
+        write_managed_local_lance_append(
+            intent=intent, data=pa.table({"value": [2]}))
+
+    intent_doc = intent.model_dump(by_alias=True, mode="json")
+    assert LanceAdapter()._dataset(table.uri).version == 2
+    assert metadb.catalog_managed_local_lance_write_receipt(intent_doc) is None
+
+    if metadb._engine is not None:
+        metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
+    metadb.init_db()
+    monkeypatch.setattr(metadb, "catalog_publish_managed_local_lance_write", publish)
+    recovered = write_managed_local_lance_append(
+        intent=intent, data=pa.table({"value": [999]}))
+
+    assert recovered.revision_id == "2"
+    assert metadb.catalog_managed_local_lance_write_receipt(intent_doc) == recovered.model_dump(
+        by_alias=True, mode="json")
+    assert LanceAdapter()._dataset(table.uri).version == 2
+    assert LanceAdapter()._dataset(table.uri).to_table().to_pylist() == [
+        {"value": 1}, {"value": 2}]
+
+
 def test_lance_append_precommit_failure_cleans_fragment_and_preserves_head(
         lance_destination):
     _lance, _catalog, table, binding = lance_destination

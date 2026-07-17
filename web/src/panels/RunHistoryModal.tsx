@@ -261,6 +261,14 @@ function HistoryOutputs({ historyId, runId, outputs, openKey, onToggle }: {
               )}
             </div>
             {output.error && <div className="dp-mono px-4 pb-2 text-[10.5px] text-destructive">{output.error}</div>}
+            {output.writeReceipt && (
+              <div aria-label={`Write receipt for run ${historyId}`} className="px-4 pb-2 text-[10.5px] text-muted-foreground">
+                <span className="font-semibold text-foreground">durable revision {output.writeReceipt.revisionId}</span>
+                {' · '}dataset {output.writeReceipt.datasetId}
+                {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
+                {output.writeReceipt.publication.backendVersion ? ` · backend ${output.writeReceipt.publication.backendVersion}` : ''}
+              </div>
+            )}
             {output.sampleProvenance && <div className="px-4 pb-2"><SampleProvenanceSummary provenance={output.sampleProvenance} /></div>}
             {openKey === key && readable && (
               <div className="border-t border-border">

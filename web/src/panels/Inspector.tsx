@@ -394,6 +394,8 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
           <div className="font-semibold text-foreground">durable revision {receipt.revisionId}</div>
           <div className="dp-mono mt-0.5 break-all">dataset {receipt.datasetId}</div>
           <div className="mt-0.5">{receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
+          {receipt.parentHead && <div className="dp-mono mt-0.5">parent revision {receipt.parentHead.revisionId}</div>}
+          {receipt.publication?.backendVersion && <div className="mt-0.5">backend {receipt.publication.backendVersion}</div>}
         </div>
       )}
       {dlg && (
