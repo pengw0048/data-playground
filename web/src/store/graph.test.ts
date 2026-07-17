@@ -406,6 +406,97 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
   })
 
+  it('invalidates downstream state when refresh replaces the dataset at the same revision id', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    source.data.status = 'latest'
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'value > 0' }
+    target.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    const oldManifest = [{
+      node_id: 'source', dataset_id: 'dataset-a', revision_id: '1', provider: 'lance', resolved_at: 'before',
+    }]
+    const replacementManifest = [{
+      ...oldManifest[0], dataset_id: 'dataset-b', resolved_at: 'after',
+    }]
+    useStore.setState({ doc, previews: {}, previewBindings: {}, runs: {
+      target: { phase: 'drift', inputDrift: { drifted: true, sources: [] }, driftInputManifest: oldManifest },
+    } })
+    apiMocks.preview
+      .mockResolvedValueOnce({ ...previewResult('old'), inputManifest: oldManifest })
+      .mockResolvedValueOnce({ ...previewResult('replacement'), inputManifest: replacementManifest })
+
+    await useStore.getState().runPreview('target')
+    await useStore.getState().refreshPreviewInputs('target')
+
+    expect(useStore.getState().previewBindings.target.inputManifest).toEqual(replacementManifest)
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+    expect(useStore.getState().runs.target).toMatchObject({ phase: 'idle', estimate: undefined })
+  })
+
+  it('drops an unavailable retained binding after an explicit successful unversioned refresh', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    source.data.status = 'latest'
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'value > 0' }
+    target.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    const retainedManifest = [{
+      node_id: 'source', dataset_id: 'removed-dataset', revision_id: '1', provider: 'lance', resolved_at: 'before',
+    }]
+    useStore.setState({ doc, previews: {}, previewBindings: {}, runs: {} })
+    apiMocks.preview
+      .mockResolvedValueOnce({ ...previewResult('old'), inputManifest: retainedManifest })
+      .mockResolvedValueOnce(previewResult('unversioned latest'))
+
+    await useStore.getState().runPreview('target')
+    await useStore.getState().refreshPreviewInputs('target')
+
+    expect(useStore.getState().previewBindings.target).toBeUndefined()
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+  })
+
+  it('does not accept a drift decision after the preview binding became stale', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'value > 0' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    const manifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'lance', resolved_at: 'before',
+    }]
+    useStore.setState({ doc, previews: {}, previewBindings: {}, runs: {} })
+    apiMocks.preview.mockResolvedValueOnce({ ...previewResult('old'), inputManifest: manifest })
+    apiMocks.inputDrift.mockResolvedValueOnce({
+      drifted: true,
+      sources: [{
+        nodeId: 'source', datasetId: 'dataset', previewRevisionId: '1', latestRevisionId: '2',
+        oldRevisionReadable: true,
+      }],
+    })
+
+    await useStore.getState().runPreview('target')
+    await useStore.getState().requestRun('target')
+    useStore.getState().updateConfig('source', { uri: '/data/other.lance' })
+    await useStore.getState().run('target', false, true)
+
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'failed', error: 'Preview inputs changed; preview again before running.',
+    })
+  })
+
   it('records named output count instead of rowsProcessed as result cardinality', async () => {
     const target = NODE('target')
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [target], edges: [] }

@@ -339,6 +339,21 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId) ? retained : undefined
 }
 
+function sameInputManifest(
+  left: RunInputManifestItem[] | undefined,
+  right: RunInputManifestItem[] | undefined,
+): boolean {
+  if (!left || !right || left.length !== right.length) return false
+  return left.every((item, index) => {
+    const other = right[index]
+    return item.node_id === other.node_id
+      && item.dataset_id === other.dataset_id
+      && item.revision_id === other.revision_id
+      && item.provider === other.provider
+      && item.resolved_at === other.resolved_at
+  })
+}
+
 // Schema hints and editor completions must follow the same reuse rule as the data panel. The
 // consumer of this map additionally matches its source handle, so a current preview for one named
 // output cannot supply columns for a sibling port.
@@ -354,6 +369,7 @@ interface RunState {
   phase: 'idle' | 'estimating' | 'estimated' | 'confirm' | 'drift' | 'running' | 'done' | 'failed'
   error?: string
   inputDrift?: InputDrift
+  driftInputManifest?: RunInputManifestItem[]
 }
 
 export interface ProfileJobState {
@@ -1480,11 +1496,20 @@ export const useStore = create<Store>((set, get) => ({
         canvasId: doc.id, nodeId: id, portId, planIdentity,
         inputManifest: result.inputManifest,
       } : undefined
+      const clearRetainedBinding = refreshLatest && !binding && !result.error && !result.notPreviewable
       set((s) => ({
         previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, result, offset } },
-        previewBindings: binding ? { ...s.previewBindings, [id]: binding } : s.previewBindings,
+        previewBindings: (() => {
+          if (binding) return { ...s.previewBindings, [id]: binding }
+          if (!clearRetainedBinding) return s.previewBindings
+          const retained = { ...s.previewBindings }
+          delete retained[id]
+          return retained
+        })(),
       }))
-      if (binding) writePreviewBindings(get().currentUser?.id, doc.id, get().previewBindings)
+      if (binding || clearRetainedBinding) {
+        writePreviewBindings(get().currentUser?.id, doc.id, get().previewBindings)
+      }
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({
@@ -1503,10 +1528,18 @@ export const useStore = create<Store>((set, get) => ({
     const previous = currentPreviewBinding(get(), id)
     if (!previous) return
     await get().runPreview(id, 0, previous.portId, true)
+    const refreshed = get().previews[id]
+    if (!refreshed || !previewIsCurrent(refreshed, get().doc, id, previous.portId)
+        || refreshed.loading || refreshed.error || !refreshed.result
+        || refreshed.result.error || refreshed.result.notPreviewable) return
     const next = currentPreviewBinding(get(), id)
-    if (!next || next === previous || next.inputManifest === previous.inputManifest) return
-    const before = new Map(previous.inputManifest.map((item) => [item.node_id, item.revision_id]))
-    const changedSources = next.inputManifest.filter((item) => before.get(item.node_id) !== item.revision_id)
+    if (next && sameInputManifest(next.inputManifest, previous.inputManifest)) return
+    const before = new Map(previous.inputManifest.map((item) => [item.node_id, item]))
+    const changedSources = next ? next.inputManifest.filter((item) => {
+      const prior = before.get(item.node_id)
+      return !prior || prior.dataset_id !== item.dataset_id
+        || prior.revision_id !== item.revision_id || prior.provider !== item.provider
+    }) : previous.inputManifest
     if (!changedSources.length) return
     set((s) => {
       const stale = new Set<string>()
@@ -1518,7 +1551,10 @@ export const useStore = create<Store>((set, get) => ({
         doc: { ...s.doc, nodes: s.doc.nodes.map((node) => stale.has(node.id) && node.data.status !== 'draft'
           ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
           : node) },
-        runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimated', inputDrift: undefined, error: undefined } },
+        runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), phase: 'idle', estimate: undefined,
+          inputDrift: undefined, driftInputManifest: undefined, error: undefined,
+        } },
       }
     })
     get().pushToast(`Refreshed ${changedSources.length} preview input${changedSources.length === 1 ? '' : 's'} to latest`, 'success')
@@ -1581,7 +1617,10 @@ export const useStore = create<Store>((set, get) => ({
         const inputDrift = await api.inputDrift(doc, id, binding.inputManifest)
         if (inputDrift.drifted) {
           set((s) => ({
-            runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'drift', inputDrift, error: undefined } },
+            runs: { ...s.runs, [id]: {
+              ...(s.runs[id] ?? {}), phase: 'drift', inputDrift,
+              driftInputManifest: binding.inputManifest, error: undefined,
+            } },
             openPanels: { [id]: 'run' },
           }))
           return
@@ -1596,8 +1635,21 @@ export const useStore = create<Store>((set, get) => ({
         return
       }
     }
+    if (acceptPreviewDrift && (!binding
+        || !sameInputManifest(binding.inputManifest, get().runs[id]?.driftInputManifest))) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'failed', estimate: undefined,
+        inputDrift: undefined, driftInputManifest: undefined,
+        error: 'Preview inputs changed; preview again before running.',
+      } } }))
+      get().pushToast('Preview inputs changed; preview again before running.', 'info')
+      return
+    }
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running', error: undefined } } }))
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'running', inputDrift: undefined,
+      driftInputManifest: undefined, error: undefined,
+    } } }))
     get().updateData(id, { status: 'running' })
     try {
       const submissionId = globalThis.crypto.randomUUID()
