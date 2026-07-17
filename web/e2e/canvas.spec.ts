@@ -1120,6 +1120,138 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('an existing local Lance destination certifies append, stale conflict, retry, and history recovery', async ({ page }) => {
+    test.setTimeout(60_000)
+    const settings = await page.request.get('/api/settings')
+    const previousBackend = (await settings.json()).global?.backend ?? ''
+    await page.request.put('/api/settings', { data: {
+      scope: 'global', key: 'backend', value: 'local-out-of-core',
+    } })
+    try {
+      await fresh(page)
+      await addWorkspaceDatasetToCurrentCanvas(page, 'events')
+      await page.locator('.react-flow__node .react-flow__handle-right').first().click()
+      await page.locator('.dp-panel').getByText('write', { exact: true }).click()
+      const inspector = page.getByTestId('inspector')
+      const filename = `issue401-${Date.now()}.lance`
+      await inspector.getByRole('button', { name: /Change destination/ }).click()
+      const dialog = page.locator('.dp-modal-overlay')
+      await dialog.locator('input').fill(filename)
+      await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+
+      // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
+      // destination for the typed append journey below.
+      await expect(inspector.getByLabel('Write admission')).toContainText('overwrite · provider-neutral')
+      let fixtureRunId: string | undefined
+      page.on('response', async (response) => {
+        if (!response.url().endsWith('/api/run') || response.request().method() !== 'POST') return
+        const body = await response.json().catch(() => null)
+        if (body?.runId) fixtureRunId = body.runId
+      })
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      await expect.poll(async () => {
+        if (!fixtureRunId) return 'starting'
+        const response = await page.request.get(`/api/run/${fixtureRunId}`)
+        const status = await response.json()
+        if (status.status === 'failed') throw new Error(status.error)
+        return status.status
+      }, { timeout: 20_000 }).toBe('done')
+
+      let captured: { graph: unknown; nodeId: string } | undefined
+      await page.route('**/api/run/write-admission', async (route) => {
+        const request = route.request().postDataJSON() as { graph: unknown; nodeId: string }
+        const response = await route.fetch()
+        const body = await response.json()
+        if (body.provider === 'managed-local-lance' && body.intent) {
+          captured = { graph: request.graph, nodeId: request.nodeId }
+        }
+        await route.fulfill({ response, json: body })
+      })
+      await page.getByRole('combobox', { name: 'mode' }).selectOption('append')
+      const appendAdmission = inspector.getByLabel('Write admission')
+      await expect(appendAdmission).toContainText('append · managed-local-lance')
+      await expect(appendAdmission).toContainText('expected revision 1')
+      await expect.poll(() => captured).toBeTruthy()
+
+      // Hold the UI request only after it contains its frozen intent. A competing admission from the
+      // same head wins, then the original request resumes with the now-stale intent.
+      let injectedStaleWinner = false
+      await page.route('**/api/run', async (route) => {
+        if (injectedStaleWinner) {
+          await route.continue()
+          return
+        }
+        injectedStaleWinner = true
+        const competingSubmission = globalThis.crypto.randomUUID()
+        const competingAdmissionResponse = await page.request.post('/api/run/write-admission', { data: {
+          graph: captured!.graph, nodeId: captured!.nodeId, submissionId: competingSubmission,
+        } })
+        expect(competingAdmissionResponse.ok()).toBeTruthy()
+        const competingAdmission = await competingAdmissionResponse.json()
+        const competingRunResponse = await page.request.post('/api/run', { data: {
+          graph: captured!.graph, targetNodeId: captured!.nodeId, confirmed: true,
+          submissionId: competingSubmission, writeIntent: competingAdmission.intent,
+        } })
+        expect(competingRunResponse.ok()).toBeTruthy()
+        const competingRun = await competingRunResponse.json()
+        await expect.poll(async () => {
+          const response = await page.request.get(`/api/run/${competingRun.runId}`)
+          return (await response.json()).status
+        }, { timeout: 20_000 }).toBe('done')
+        await route.continue()
+      })
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      await expect(page.getByText(/write admission is stale/i).last()).toBeVisible({ timeout: 15_000 })
+      await page.unroute('**/api/run')
+
+      // Re-admission gets the new head. Lose every automatic POST response, then retry explicitly;
+      // all requests must retain one submission identity and recover the original exact receipt.
+      await page.route('**/api/run/estimate', async (route) => {
+        const response = await route.fetch()
+        const estimate = await response.json()
+        await route.fulfill({ response, json: { ...estimate, needsConfirm: true } })
+      })
+      const submissionIds: string[] = []
+      await page.route('**/api/run', async (route) => {
+        const request = route.request().postDataJSON() as { submissionId: string }
+        submissionIds.push(request.submissionId)
+        const response = await route.fetch()
+        if (submissionIds.length <= 3) {
+          await route.abort('connectionfailed')
+          return
+        }
+        await route.fulfill({ response })
+      })
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      const runPanel = page.getByTestId('panel-run')
+      await expect(runPanel.getByText('HEADS UP')).toBeVisible()
+      await runPanel.getByRole('button', { name: 'Run', exact: true }).click()
+      await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
+      await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
+
+      const receipt = inspector.getByLabel('Write receipt')
+      await expect(receipt).toContainText('durable revision 3', { timeout: 20_000 })
+      await expect(receipt).toContainText('parent revision 2')
+      await expect(receipt).toContainText(/backend \d/)
+      expect(submissionIds).toHaveLength(4)
+      expect(new Set(submissionIds).size).toBe(1)
+
+      await page.reload()
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Run history', { exact: true }).click()
+      const historyReceipt = page.getByLabel(/Write receipt for run/).first()
+      await expect(historyReceipt).toContainText('durable revision 3')
+      await expect(historyReceipt).toContainText('parent 2')
+      await expect(historyReceipt).toContainText(/backend \d/)
+      await expect(historyReceipt).not.toContainText('/outputs/')
+    } finally {
+      await page.unrouteAll({ behavior: 'wait' })
+      await page.request.put('/api/settings', { data: {
+        scope: 'global', key: 'backend', value: previousBackend,
+      } })
+    }
+  })
+
   test('the source node can browse files (open dialog)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source')

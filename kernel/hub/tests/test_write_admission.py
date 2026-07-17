@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from hub import metadb
 from hub.models import Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
-from hub.plugins.adapters import DuckDBAdapter
+from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.plugins.processors import InMemoryProcessorRegistry
 from hub.routers.runs import _write_admission_for_graph
@@ -73,6 +73,48 @@ def contract(tmp_path):
     )
     try:
         yield deps, graph
+    finally:
+        storage.close()
+
+
+@pytest.fixture
+def lance_contract(tmp_path):
+    lance = pytest.importorskip("lance")
+    source = tmp_path / "source.parquet"
+    pq.write_table(pa.table({"value": [2, 3]}), source)
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    destination = storage.output_uri("existing", ".lance")
+    lance.write_dataset(pa.table({"value": [1]}), destination)
+    duckdb_adapter = DuckDBAdapter()
+    lance_adapter = LanceAdapter()
+
+    def resolve_adapter(uri):
+        return lance_adapter if str(uri).lower().rstrip("/").endswith(".lance") else duckdb_adapter
+
+    catalog = InMemoryCatalog(str(tmp_path / "data"), resolve_adapter)
+    table = catalog._add(name="existing", uri=destination, strict_probe=True)
+    graph = Graph.model_validate({
+        "id": "lance-write-admission-canvas",
+        "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "data": {"config": {"uri": str(source)}}},
+            {"id": "write", "type": "write", "data": {"title": "existing", "config": {
+                "filename": "existing.lance", "writeMode": "append",
+            }}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+    runner_capability = SimpleNamespace(supports_managed_local_write_intents=lambda: True)
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage, catalog=catalog,
+        resolve_adapter=resolve_adapter,
+        registry=InMemoryProcessorRegistry(), node_builders={},
+        node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
+        node_ir={}, runners=[], runner=runner_capability,
+        pick_runner=lambda _plan, _uid: runner_capability,
+    )
+    try:
+        yield lance, deps, graph, table
     finally:
         storage.close()
 
@@ -285,3 +327,135 @@ def test_local_runner_consumes_frozen_intent_and_publishes_receipt(
     assert second.revision_id != first.revision_id
     assert replaced.outputs[0].uri == second.publication.artifact_uri
     assert replaced.outputs[0].version == second.publication.catalog_version
+
+
+def test_lance_append_admission_freezes_registered_exact_head_without_allocation(
+        lance_contract):
+    _lance, deps, graph, table = lance_contract
+    before = {
+        path: set(os.listdir(os.path.join(table.uri, path)))
+        for path in ("data", "_transactions")
+    }
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "81111111-1111-4111-8111-111111111111")
+
+    assert admission.managed is True
+    assert admission.mode == "append"
+    assert admission.provider == "managed-local-lance"
+    assert admission.expected_head is not None
+    assert admission.expected_head.revision_id == "1"
+    assert admission.intent is not None
+    assert admission.intent.destination.logical_uri == table.uri
+    assert admission.intent.destination.dataset_id == admission.expected_head.dataset_id
+    assert [(column.name, column.type) for column in admission.expected_schema] == [("value", "int")]
+    assert before == {
+        path: set(os.listdir(os.path.join(table.uri, path)))
+        for path in ("data", "_transactions")
+    }
+
+
+def test_lance_append_admission_blocks_incompatible_schema_before_publication(
+        lance_contract):
+    _lance, deps, graph, table = lance_contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    incompatible = os.path.join(deps.workspace, "incompatible.parquet")
+    pq.write_table(pa.table({"other": [2]}), incompatible)
+    source.data["config"]["uri"] = incompatible
+    before = set(os.listdir(os.path.join(table.uri, "data")))
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "82222222-2222-4222-8222-222222222222")
+
+    assert admission.managed is True
+    assert admission.intent is None
+    assert admission.expected_head is not None
+    assert admission.blocker == "input schema is incompatible with the existing Lance destination"
+    assert set(os.listdir(os.path.join(table.uri, "data"))) == before
+
+
+def test_lance_append_admission_rejects_stale_head_and_one_of_two_admissions(
+        lance_contract):
+    lance, deps, graph, table = lance_contract
+    stale = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "83333333-3333-4333-8333-333333333333")
+    competing = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "84444444-4444-4444-8444-444444444444")
+    assert stale.expected_head == competing.expected_head
+    lance.write_dataset(pa.table({"value": [9]}), table.uri, mode="append")
+    before_version = LanceAdapter().resolve_revision(table.uri)["revision_id"]
+
+    with pytest.raises(HTTPException, match="stale") as exc:
+        _write_admission_for_graph(
+            deps, graph, "write", "researcher",
+            "83333333-3333-4333-8333-333333333333", supplied=stale.intent)
+
+    assert exc.value.status_code == 409
+    assert LanceAdapter().resolve_revision(table.uri)["revision_id"] == before_version
+
+
+def test_lance_append_requires_registration_and_in_process_runner(lance_contract):
+    _lance, deps, graph, _table = lance_contract
+    unsupported = object()
+    deps.pick_runner = lambda _plan, _uid: unsupported
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "85555555-5555-4555-8555-555555555555")
+    assert admission.managed is False
+    assert admission.mode == "append"
+    assert admission.intent is None
+
+    deps.pick_runner = lambda _plan, _uid: deps.runner
+    write = next(node for node in graph.nodes if node.id == "write")
+    write.data["config"]["filename"] = "missing.lance"
+    missing = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "86666666-6666-4666-8666-666666666666")
+    assert missing.managed is False
+    assert missing.mode == "append"
+    assert missing.intent is None
+
+
+def test_local_runner_consumes_lance_append_intent_and_recovers_exact_receipt(
+        lance_contract):
+    from hub.compiler import compile_plan
+    from hub.plugins.runner import LocalRunner
+
+    lance, deps, base_graph, table = lance_contract
+    node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, deps.catalog, deps.workspace,
+        node_specs=node_specs, storage=deps.storage)
+    submission = "87777777-7777-4777-8777-777777777777"
+    graph = base_graph.model_copy(deep=True)
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+    assert admission.intent is not None
+    _inject_write_intent(graph, "write", admission.intent)
+    run_id = metadb.local_run_submission_id("researcher", graph.id, submission)
+    started = runner.run(
+        compile_plan(graph, "write", deps.registry, node_specs),
+        graph, "write", "local", run_id=run_id)
+    for _ in range(400):
+        status = runner.status(started.run_id)
+        if status.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("managed local Lance append did not finish")
+
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None
+    assert receipt.parent_head == admission.expected_head
+    assert receipt.revision_id == "2"
+    assert receipt.publication.provider == "managed-local-lance"
+    assert receipt.publication.backend_version == lance.__version__
+    assert LanceAdapter().open_revision(table.uri, receipt.revision_id).fetchall() == [
+        (1,), (2,), (3,)]
+
+    recovered = _write_admission_for_graph(
+        deps, base_graph.model_copy(deep=True), "write", "researcher", submission,
+        supplied=admission.intent)
+    assert recovered.recovered_receipt == receipt
+    lance.write_dataset(pa.table({"value": [99]}), table.uri, mode="append")
+    assert LanceAdapter().open_revision(table.uri, receipt.revision_id).fetchall() == [
+        (1,), (2,), (3,)]

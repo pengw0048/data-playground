@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
@@ -28,8 +29,8 @@ function Write({ id, data }: NodeComponentProps) {
         </Field>
         <Field label="mode" style={{ flex: 1 }}>
           <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[
-            { value: 'overwrite', label: admission?.managed ? 'create / replace (auto)' : 'overwrite' },
-            { value: 'append', label: 'append' },
+            { value: 'overwrite', label: admission?.provider === 'managed-local-file' ? 'create / replace (auto)' : 'overwrite' },
+            { value: 'append', label: admission?.provider === 'managed-local-lance' ? 'append (exact head)' : 'append' },
           ]} />
         </Field>
       </div>
@@ -51,4 +52,3 @@ register(
   },
   Write,
 )
-import { useEffect } from 'react'
