@@ -1491,6 +1491,22 @@ async def _broadcast_external_edit(canvas_id: str) -> None:
         _release_collab_room_lock(canvas_id, lock)
 
 
+@asynccontextmanager
+async def _idle_collab_room_edit(canvas_id: str):
+    """Hold the room admission boundary while one out-of-band document edit commits.
+
+    Checking the room and then releasing its lock before the metadata write leaves a window where a
+    new editor can join with the old document and later overwrite the committed edit.  Keeping this
+    lock across the off-loop write makes the empty-room decision and mutation one local boundary.
+    """
+    lock = _retain_collab_room_lock(canvas_id)
+    try:
+        async with lock:
+            yield not bool(_collab_rooms.get(canvas_id))
+    finally:
+        _release_collab_room_lock(canvas_id, lock)
+
+
 # --- MCP over HTTP: the SAME server as `dataplay mcp` (stdio), but served IN-PROCESS by the web app.
 # So a user's own Claude Code can drive this workspace via `claude mcp add --transport http <url>/mcp`
 # and every tool runs on the app's real deps / runner / auth — no separate engine, no behavior drift,

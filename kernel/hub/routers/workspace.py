@@ -376,6 +376,36 @@ def whoami(uid: str = Depends(current_user)) -> dict:
         return {"id": u.id, "name": u.name, "email": u.email, "capabilities": caps}
 
 
+class WorkspaceCreateCanvasBody(_StrictAuthBody):
+    container_id: str
+    expected_container_version: int = Field(ge=1)
+    name: str = "untitled"
+    dataset_id: str | None = None
+
+
+class WorkspaceAddDatasetBody(_StrictAuthBody):
+    dataset_id: str
+    expected_canvas_version: int = Field(ge=1)
+
+
+class WorkspaceMoveCanvasBody(_StrictAuthBody):
+    container_id: str
+    expected_container_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+
+
+def _workspace_action_error(exc: Exception) -> None:
+    if isinstance(exc, KeyError):
+        raise HTTPException(404, str(exc)) from exc
+    if isinstance(exc, PermissionError):
+        raise HTTPException(403, str(exc)) from exc
+    if isinstance(exc, metadb.WorkspaceVersionConflict):
+        raise HTTPException(409, str(exc)) from exc
+    if isinstance(exc, ValueError):
+        raise HTTPException(422, str(exc)) from exc
+    raise exc
+
+
 @router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
 def browse_workspace_container(container_id: str, limit: int = 50, cursor: str | None = None,
                                uid: str = Depends(current_user)) -> dict:
@@ -395,6 +425,57 @@ def resolve_workspace_resource(resource_id: str, uid: str = Depends(current_user
         return metadb.workspace_resolve(resource_id, uid=uid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/workspace/canvases")
+def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
+                            uid: str = Depends(current_user)) -> dict:
+    """Create at one exact local destination; an optional dataset is resolved by stable identity."""
+    try:
+        return metadb.workspace_create_canvas_action(
+            uid=uid, container_id=body.container_id,
+            expected_container_version=body.expected_container_version,
+            name=body.name, dataset_id=body.dataset_id)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.post("/workspace/canvases/{canvas_id}/datasets")
+async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddDatasetBody,
+                                          uid: str = Depends(current_user)) -> dict:
+    """Add one exact local dataset to one explicitly named editable canvas."""
+    from hub.main import _broadcast_external_edit, _idle_collab_room_edit
+    async with _idle_collab_room_edit(canvas_id) as idle:
+        if not idle:
+            raise HTTPException(
+                409,
+                "target canvas is currently open; close active editors and retry so their unsaved work is not replaced",
+            )
+        try:
+            result = await run_in_threadpool(
+                metadb.workspace_add_dataset_action,
+                uid=uid, canvas_id=canvas_id,
+                expected_canvas_version=body.expected_canvas_version,
+                dataset_id=body.dataset_id)
+        except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+            _workspace_action_error(exc)
+    # This is an out-of-band document edit, like MCP. Nudge any currently open collab room to refetch
+    # the committed snapshot so a stale tab cannot later autosave over the appended source.
+    await _broadcast_external_edit(canvas_id)
+    return result
+
+
+@router.put("/workspace/placements/{placement_id}/canvas")
+def move_workspace_canvas(placement_id: str, body: WorkspaceMoveCanvasBody,
+                          uid: str = Depends(current_user)) -> dict:
+    """Move only local canvas placement with placement and destination CAS preconditions."""
+    try:
+        return metadb.workspace_move_canvas_action(
+            uid=uid, placement_id=placement_id, expected_version=body.expected_version,
+            container_id=body.container_id,
+            expected_container_version=body.expected_container_version)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
 
 
 @router.get("/canvas")

@@ -4,7 +4,8 @@ import type {
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionDetail, DatasetRevisionPage, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
-  WorkspaceBrowsePage, WorkspaceResourceResolution,
+  WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
+  WorkspaceMoveCanvasResult, WorkspaceResourceResolution,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -198,6 +199,18 @@ export const api = {
   },
   workspaceResource: (resourceId: string) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`),
+  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetId?: string }) =>
+    req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  workspaceAddDataset: (canvasId: string, body: { datasetId: string; expectedCanvasVersion: number }) =>
+    req<WorkspaceAddDatasetResult>(`/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`, {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  workspaceMoveCanvas: (placementId: string, body: { containerId: string; expectedContainerVersion: number; expectedVersion: number }) =>
+    req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
+      method: 'PUT', body: JSON.stringify(body),
+    }),
   // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
   catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
   createFolder: (path: string) =>
