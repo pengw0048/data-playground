@@ -3846,6 +3846,54 @@ def local_result_run_state_receipt(
                 and artifact.writer_run_id is None
                 and artifact.writer_token is None
                 for artifact in artifacts.values()))
+
+
+def object_result_run_state_receipt(
+        uris: list[str], run_id: str, expected_doc: dict) -> bool:
+    """Prove an exact multi-port object-result RunState publication committed.
+
+    A failed database response is commit-unknown. This receipt binds the byte-for-byte terminal
+    document to its complete semantic port reference set and exact published attempt generations.
+    """
+    if not isinstance(expected_doc, dict):
+        raise ValueError("object result receipt requires a status document")
+    expected = dict(expected_doc)
+    if str(expected.get("status")) not in ("done", "failed"):
+        return False
+    expected_payload = json.dumps(expected, default=str)
+    supplied = [str(uri).strip().rstrip("/") for uri in uris]
+    if (not supplied or any(not object_attempt_uri_shape(uri) for uri in supplied)
+            or len(set(supplied)) != len(supplied)):
+        return False
+    expected_refs = {
+        slot: uri for slot, uri in _result_doc_refs(expected).items()
+        if object_attempt_uri_shape(uri)
+    }
+    if set(expected_refs.values()) != set(supplied):
+        return False
+    with session() as s:
+        state = s.get(RunState, str(run_id), with_for_update=True)
+        if (state is None or state.status != str(expected.get("status"))
+                or state.doc != expected_payload):
+            return False
+        refs = list(s.scalars(select(ObjectAttemptRef).where(
+            ObjectAttemptRef.ref_type == "run_state",
+            ObjectAttemptRef.ref_key == str(run_id),
+        ).order_by(ObjectAttemptRef.ref_slot)))
+        if {ref.ref_slot: ref.attempt_uri for ref in refs} != expected_refs:
+            return False
+        attempts = {attempt.uri: attempt for attempt in s.scalars(select(ObjectAttempt).where(
+            ObjectAttempt.uri.in_(sorted(supplied))).order_by(ObjectAttempt.uri))}
+        return bool(
+            set(attempts) == set(supplied)
+            and all(
+                attempt.state == "published" and attempt.run_id == str(run_id)
+                for attempt in attempts.values())
+            and all(
+                attempts[ref.attempt_uri].generation == ref.generation
+                for ref in refs))
+
+
 def get_run_state(run_id: str) -> dict | None:
     """The last-persisted RunStatus dict for a run, or None if unknown to this instance's DB."""
     with session() as s:

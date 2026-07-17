@@ -301,10 +301,16 @@ def main() -> int:
             deps.runner.forced_results = forced_results
         from hub.plugins.adapters import is_object_uri
         forced_object = bool(
-            forced_results and len(forced_results) == 1
-            and isinstance(forced_results[0], dict)
-            and isinstance(forced_results[0].get("uri"), str)
-            and is_object_uri(forced_results[0].get("uri")))
+            forced_results and all(
+                isinstance(result, dict)
+                and isinstance(result.get("uri"), str)
+                and is_object_uri(result["uri"])
+                for result in forced_results))
+        if (forced_results and not forced_object
+                and any(isinstance(result, dict)
+                        and is_object_uri(str(result.get("uri") or ""))
+                        for result in forced_results)):
+            raise RuntimeError("isolated forced result contract cannot mix local and object URIs")
         identity = job.get("resultNamespaceIdentity")
         if forced_results is None:
             identity = None
@@ -319,6 +325,7 @@ def main() -> int:
         else:
             deps.runner.forced_result_namespace_identity = tuple(identity)
         seen_forced: set[tuple[str, str]] = set()
+        seen_forced_uris: set[str] = set()
         for result in forced_results or []:
             if not isinstance(result, dict):
                 raise RuntimeError("isolated forced result contract is malformed")
@@ -326,12 +333,19 @@ def main() -> int:
             if (not isinstance(node_id, str) or not isinstance(port_id, str)
                     or not isinstance(uri, str)
                     or (not forced_object and not deps.storage.is_managed_result_uri(uri))
-                    or (node_id, port_id) in seen_forced):
+                    or (node_id, port_id) in seen_forced
+                    or uri in seen_forced_uris):
                 raise RuntimeError("isolated forced result contract is malformed")
             seen_forced.add((node_id, port_id))
+            seen_forced_uris.add(uri)
             fd = result.get("lockFd")
             if forced_object and (fd is not None or result.get("lockToken") is not None):
                 raise RuntimeError("object result contract cannot carry a local writer lock")
+            if forced_object:
+                from hub.handoff import is_attempt_uri
+                if not is_attempt_uri(uri):
+                    raise RuntimeError(
+                        "object result contract must bind every port to an exact managed attempt")
             if (not forced_object and getattr(deps.storage, "lock_supported", False)
                     and fd is None):
                 raise RuntimeError("local result writer lock was not inherited")
