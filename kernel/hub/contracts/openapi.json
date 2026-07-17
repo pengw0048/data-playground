@@ -4243,6 +4243,26 @@
         "title": "WorkerInfo",
         "type": "object"
       },
+      "WorkspaceAddDatasetBody": {
+        "additionalProperties": false,
+        "properties": {
+          "datasetId": {
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "expectedCanvasVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcanvasversion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "datasetId",
+          "expectedCanvasVersion"
+        ],
+        "title": "WorkspaceAddDatasetBody",
+        "type": "object"
+      },
       "WorkspaceBrowsePage": {
         "properties": {
           "completeness": {
@@ -4286,6 +4306,68 @@
           "container"
         ],
         "title": "WorkspaceBrowsePage",
+        "type": "object"
+      },
+      "WorkspaceCreateCanvasBody": {
+        "additionalProperties": false,
+        "properties": {
+          "containerId": {
+            "title": "Containerid",
+            "type": "string"
+          },
+          "datasetId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datasetid"
+          },
+          "expectedContainerVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcontainerversion",
+            "type": "integer"
+          },
+          "name": {
+            "default": "untitled",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "containerId",
+          "expectedContainerVersion"
+        ],
+        "title": "WorkspaceCreateCanvasBody",
+        "type": "object"
+      },
+      "WorkspaceMoveCanvasBody": {
+        "additionalProperties": false,
+        "properties": {
+          "containerId": {
+            "title": "Containerid",
+            "type": "string"
+          },
+          "expectedContainerVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcontainerversion",
+            "type": "integer"
+          },
+          "expectedVersion": {
+            "minimum": 1.0,
+            "title": "Expectedversion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "containerId",
+          "expectedContainerVersion",
+          "expectedVersion"
+        ],
+        "title": "WorkspaceMoveCanvasBody",
         "type": "object"
       },
       "WorkspaceResource": {
@@ -12237,6 +12319,185 @@
         "summary": "Version"
       }
     },
+    "/api/workspace/canvases": {
+      "post": {
+        "description": "Create at one exact local destination; an optional dataset is resolved by stable identity.",
+        "operationId": "create_workspace_canvas_api_workspace_canvases_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCreateCanvasBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Workspace Canvas Api Workspace Canvases Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Create Workspace Canvas"
+      }
+    },
+    "/api/workspace/canvases/{canvas_id}/datasets": {
+      "post": {
+        "description": "Add one exact local dataset to one explicitly named editable canvas.",
+        "operationId": "add_workspace_dataset_to_canvas_api_workspace_canvases__canvas_id__datasets_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceAddDatasetBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Workspace Dataset To Canvas Api Workspace Canvases  Canvas Id  Datasets Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Add Workspace Dataset To Canvas"
+      }
+    },
     "/api/workspace/containers/{container_id}": {
       "get": {
         "description": "One bounded, mixed local Workspace page; this route never invokes provider mutation APIs.",
@@ -12343,6 +12604,100 @@
           }
         },
         "summary": "Browse Workspace Container"
+      }
+    },
+    "/api/workspace/placements/{placement_id}/canvas": {
+      "put": {
+        "description": "Move only local canvas placement with placement and destination CAS preconditions.",
+        "operationId": "move_workspace_canvas_api_workspace_placements__placement_id__canvas_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "placement_id",
+            "required": true,
+            "schema": {
+              "title": "Placement Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceMoveCanvasBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Move Workspace Canvas Api Workspace Placements  Placement Id  Canvas Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Move Workspace Canvas"
       }
     },
     "/api/workspace/resources/{resource_id}": {

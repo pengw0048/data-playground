@@ -243,6 +243,199 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
                    and "catalog_" in statement for statement in statements)
 
 
+def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_names(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-actions")
+    created_ids: list[str] = []
+    statements: list[str] = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement.lower())
+
+    engine = metadb.engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        with TestClient(app) as client:
+            for _ in range(2):
+                response = client.post("/api/workspace/canvases", json={
+                    "containerId": folder["id"],
+                    "expectedContainerVersion": folder["version"],
+                    "name": "Duplicate exploration",
+                    "datasetId": workspace_scope["dataset_id"],
+                })
+                assert response.status_code == 200, response.text
+                created_ids.append(response.json()["id"])
+            assert len(set(created_ids)) == 2
+
+            with metadb.session() as session:
+                for canvas_id in created_ids:
+                    canvas = session.get(metadb.Canvas, canvas_id)
+                    placement = session.scalar(select(metadb.WorkspacePlacement).where(
+                        metadb.WorkspacePlacement.target_kind == "canvas",
+                        metadb.WorkspacePlacement.target_id == canvas_id,
+                    ))
+                    doc = json.loads(canvas.doc)
+                    assert placement.container_id == folder["id"]
+                    assert placement.name == "Duplicate exploration"
+                    assert doc["nodes"][0]["data"]["config"] == {
+                        "uri": workspace_scope["uri"],
+                        "tableId": f"tbl_{token}",
+                    }
+
+            renamed = metadb.workspace_update_container(
+                folder["id"], expected_version=folder["version"],
+                name=f"workspace-{token}-actions-renamed")
+            stale = client.post("/api/workspace/canvases", json={
+                "containerId": folder["id"],
+                "expectedContainerVersion": folder["version"],
+                "name": "Must not exist",
+            })
+            assert stale.status_code == 409
+            assert "expected version" in stale.json()["detail"]
+
+            missing = client.post("/api/workspace/canvases", json={
+                "containerId": folder["id"],
+                "expectedContainerVersion": renamed["version"],
+                "name": "Must not exist",
+                "datasetId": "missing-stable-dataset",
+            })
+            assert missing.status_code == 404
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspacePlacement).where(
+                metadb.WorkspacePlacement.target_id.in_(created_ids)))
+            session.execute(delete(metadb.Canvas).where(metadb.Canvas.id.in_(created_ids)))
+
+    assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
+                   and "catalog_" in statement for statement in statements)
+
+
+def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, monkeypatch):
+    canvas_id = workspace_scope["canvas_id"]
+    broadcasts: list[str] = []
+    active_room = False
+
+    async def record_external_edit(changed_canvas_id: str) -> None:
+        broadcasts.append(changed_canvas_id)
+
+    async def room_has_peers(_canvas_id: str) -> bool:
+        return active_room
+
+    monkeypatch.setattr("hub.main._broadcast_external_edit", record_external_edit)
+    monkeypatch.setattr("hub.main._collab_room_has_peers", room_has_peers)
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id)
+        original_node = {
+            "id": "write-existing", "type": "write", "position": {"x": 160, "y": 160},
+            "data": {"title": "Durable output", "status": "draft", "config": {
+                "destinationId": "local", "destinationPath": "kept/path", "name": "kept.parquet",
+            }},
+        }
+        original_doc = {
+            "id": canvas_id, "name": "Original canvas", "version": 7,
+            "nodes": [original_node], "edges": [], "requirements": ["polars==1.42.1"],
+        }
+        canvas.doc = json.dumps(original_doc)
+
+    with TestClient(app) as client:
+        active_room = True
+        concurrent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+        })
+        assert concurrent.status_code == 409
+        assert "currently open" in concurrent.json()["detail"]
+        active_room = False
+
+        added = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+        })
+        assert added.status_code == 200, added.text
+        assert added.json()["version"] == 8
+
+        stale = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+        })
+        assert stale.status_code == 409
+
+        missing = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetId": "missing-stable-dataset", "expectedCanvasVersion": 8,
+        })
+        assert missing.status_code == 404
+
+    assert broadcasts == [canvas_id]
+
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id)
+        doc = json.loads(canvas.doc)
+        assert canvas.version == doc["version"] == 8
+        assert doc["requirements"] == original_doc["requirements"]
+        assert doc["nodes"][0] == original_node
+        assert len(doc["nodes"]) == 2
+        assert doc["nodes"][1]["data"]["config"]["uri"] == workspace_scope["uri"]
+        snapshots = list(session.scalars(select(metadb.CanvasVersion).where(
+            metadb.CanvasVersion.canvas_id == canvas_id)))
+        assert any(snapshot.label == "before Workspace dataset add" for snapshot in snapshots)
+    metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_workspace_move_and_undo_change_only_canvas_placement(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    canvas_id = workspace_scope["canvas_id"]
+    root = metadb.local_workspace_root()
+    source = metadb.workspace_create_container(root["id"], f"workspace-{token}-move-source")
+    destination = metadb.workspace_create_container(root["id"], f"workspace-{token}-move-destination")
+    placement = metadb.workspace_create_placement(
+        source["id"], target_kind="canvas", target_id=canvas_id,
+        name=f"workspace-{token}-movable")
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id)
+        canvas.visibility = "workspace"
+        before = (canvas.doc, canvas.version, canvas.visibility, canvas.owner_id)
+
+    with TestClient(app) as client:
+        moved = client.put(f"/api/workspace/placements/{placement['id']}/canvas", json={
+            "containerId": destination["id"],
+            "expectedContainerVersion": destination["version"],
+            "expectedVersion": placement["version"],
+        })
+        assert moved.status_code == 200, moved.text
+        move_doc = moved.json()
+        assert move_doc["resource"]["parentId"] == f"container:{destination['id']}"
+        assert move_doc["previousContainer"]["id"] == f"container:{source['id']}"
+
+        stale = client.put(f"/api/workspace/placements/{placement['id']}/canvas", json={
+            "containerId": source["id"], "expectedContainerVersion": source["version"],
+            "expectedVersion": placement["version"],
+        })
+        assert stale.status_code == 409
+
+        undone = client.put(f"/api/workspace/placements/{placement['id']}/canvas", json={
+            "containerId": source["id"], "expectedContainerVersion": source["version"],
+            "expectedVersion": move_doc["resource"]["version"],
+        })
+        assert undone.status_code == 200, undone.text
+        assert undone.json()["resource"]["parentId"] == f"container:{source['id']}"
+
+        destination_next = metadb.workspace_update_container(
+            destination["id"], expected_version=destination["version"],
+            name=f"workspace-{token}-move-destination-renamed")
+        stale_target = client.put(f"/api/workspace/placements/{placement['id']}/canvas", json={
+            "containerId": destination["id"],
+            "expectedContainerVersion": destination["version"],
+            "expectedVersion": undone.json()["resource"]["version"],
+        })
+        assert stale_target.status_code == 409
+        assert destination_next["version"] == destination["version"] + 1
+
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id)
+        current = session.get(metadb.WorkspacePlacement, placement["id"])
+        assert (canvas.doc, canvas.version, canvas.visibility, canvas.owner_id) == before
+        assert current.container_id == source["id"]
+
+
 def test_workspace_api_unicode_keyset_has_no_duplicates_or_loss(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     folder = metadb.workspace_create_container(

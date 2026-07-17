@@ -1491,6 +1491,16 @@ async def _broadcast_external_edit(canvas_id: str) -> None:
         _release_collab_room_lock(canvas_id, lock)
 
 
+async def _collab_room_has_peers(canvas_id: str) -> bool:
+    """Return whether this process currently has an open editor/viewer for one canvas."""
+    lock = _retain_collab_room_lock(canvas_id)
+    try:
+        async with lock:
+            return bool(_collab_rooms.get(canvas_id))
+    finally:
+        _release_collab_room_lock(canvas_id, lock)
+
+
 # --- MCP over HTTP: the SAME server as `dataplay mcp` (stdio), but served IN-PROCESS by the web app.
 # So a user's own Claude Code can drive this workspace via `claude mcp add --transport http <url>/mcp`
 # and every tool runs on the app's real deps / runner / auth — no separate engine, no behavior drift,

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { workspaceResource } from './support/workspace'
 
 test.describe('local Workspace golden journey @ux-smoke', () => {
   test('shows normal canvas and catalog lifecycles through stable Workspace navigation', async ({ page }) => {
@@ -28,6 +29,53 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     await page.goBack()
     await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
     await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
+  })
+
+  test('creates, explores, and adds by exact local targets across reload', async ({ page }) => {
+    const catalog = await page.request.get('/api/catalog/tables?limit=1')
+    expect(catalog.ok()).toBe(true)
+    const dataset = (await catalog.json()).items[0] as { id: string; name: string }
+    const suffix = Date.now()
+    const emptyName = `Workspace exact target ${suffix}`
+    const exploreName = `Workspace exploration ${suffix}`
+    let emptyCanvasId = ''
+    let exploreCanvasId = ''
+
+    try {
+      await page.goto('/#/workspace')
+      await page.getByRole('button', { name: 'New canvas here' }).click()
+      await page.getByLabel('Canvas name').fill(emptyName)
+      await page.getByRole('button', { name: 'Create canvas' }).click()
+      await expect(page).toHaveURL(/#\/canvas\//)
+      emptyCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Back to Workspace').click()
+      await (await workspaceResource(page, 'dataset', dataset.name)).click()
+      await page.getByTestId('detail-use').click()
+      await page.getByLabel('New canvas name').fill(exploreName)
+      await page.getByRole('button', { name: 'Create and open' }).click()
+      await expect(page).toHaveURL(/#\/canvas\//)
+      exploreCanvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+      await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
+
+      await page.reload()
+      await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Back to Workspace').click()
+      await (await workspaceResource(page, 'dataset', dataset.name)).click()
+      await page.getByTestId('detail-use').click()
+      await page.getByRole('button', { name: /^Add to canvas/ }).click()
+      await page.getByLabel('Target canvas').selectOption({ label: `${emptyName} · ${emptyCanvasId}` })
+      await page.getByRole('button', { name: 'Add and open' }).click()
+      await expect(page).toHaveURL(new RegExp(`/#/canvas/${emptyCanvasId}$`))
+      await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
+      await page.reload()
+      await expect(page.locator('.react-flow__node', { hasText: dataset.name })).toBeVisible()
+    } finally {
+      if (emptyCanvasId) await page.request.delete(`/api/canvas/${emptyCanvasId}`)
+      if (exploreCanvasId) await page.request.delete(`/api/canvas/${exploreCanvasId}`)
+    }
   })
 })
 

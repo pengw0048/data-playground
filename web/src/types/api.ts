@@ -165,6 +165,23 @@ export interface WorkspaceResourceResolution {
   resource: WorkspaceResource
   ancestors: WorkspaceResource[]
 }
+export interface WorkspaceCreateCanvasResult {
+  ok: boolean
+  id: string
+  created: boolean
+  resource: WorkspaceResource
+}
+export interface WorkspaceAddDatasetResult {
+  ok: boolean
+  id: string
+  version: number
+}
+export interface WorkspaceMoveCanvasResult {
+  ok: boolean
+  resource: WorkspaceResource
+  previousContainer: WorkspaceResource
+  container: WorkspaceResource
+}
 export interface CatalogMetadata { folder?: string; tags?: string[]; owner?: string | null; description?: string | null; name?: string | null }
 export interface CatalogEdit { expectedRevision: string; folder: string; tags: string[]; owner: string | null; description: string | null; name?: string | null; declaredKey: string[] }
 export interface RegisterRequest { uri: string; name?: string; folder?: string; tags?: string[]; owner?: string; description?: string }

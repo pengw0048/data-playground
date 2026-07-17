@@ -2455,6 +2455,145 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
         return _workspace_placement_doc(row)
 
 
+def _workspace_container_at_version(s, container_id: str,
+                                    expected_version: int) -> WorkspaceContainer:
+    row = _workspace_container_locked(s, container_id)
+    if row.version != expected_version:
+        _workspace_version_conflict("container", container_id, expected_version)
+    return row
+
+
+def _workspace_canvas_role_in_session(s, canvas: Canvas, uid: str) -> str | None:
+    explicit_role = s.scalar(select(CanvasShare.role).where(
+        CanvasShare.canvas_id == canvas.id, CanvasShare.user_id == uid))
+    return _effective_canvas_role(canvas, uid, explicit_role)
+
+
+def _workspace_dataset_source_in_session(s, dataset_id: str) -> tuple[CatalogEntry, dict]:
+    entry = s.scalar(select(CatalogEntry).where(
+        CatalogEntry.registration_id == dataset_id).limit(1).with_for_update())
+    if entry is None:
+        raise KeyError(f"registered dataset identity '{dataset_id}' not found")
+    try:
+        catalog_doc = json.loads(entry.doc)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"registered dataset identity '{dataset_id}' has invalid metadata") from exc
+    return entry, {
+        "id": f"source-{_uid()}",
+        "type": "source",
+        "position": {"x": 160, "y": 160},
+        "data": {
+            "title": entry.name or "dataset",
+            "status": "draft",
+            "config": {"uri": entry.uri, "tableId": catalog_doc.get("id") or entry.tbl_id},
+        },
+    }
+
+
+def workspace_create_canvas_action(*, uid: str, container_id: str,
+                                   expected_container_version: int, name: str,
+                                   dataset_id: str | None = None) -> dict:
+    """Atomically create one canvas at an exact local container, optionally with one dataset source."""
+    canvas_name = _workspace_name(name)
+    with _workspace_write_session() as s:
+        container = _workspace_container_at_version(s, container_id, expected_container_version)
+        source = None
+        if dataset_id is not None:
+            _entry, source = _workspace_dataset_source_in_session(s, dataset_id)
+        canvas_id = _uid()
+        doc = {
+            "id": canvas_id, "name": canvas_name, "version": 1,
+            "nodes": [source] if source is not None else [], "edges": [],
+        }
+        canvas = Canvas(
+            id=canvas_id, owner_id=uid, name=canvas_name, version=1, doc=json.dumps(doc))
+        placement = WorkspacePlacement(
+            container_id=container.id, target_kind="canvas", target_id=canvas_id,
+            name=canvas_name, ordinal=0, version=1)
+        s.add_all([canvas, placement])
+        s.flush()
+        sync_local_result_owner(s, "canvas", canvas_id, doc)
+        return {
+            "ok": True, "id": canvas_id, "created": True,
+            "resource": _workspace_placement_resource(placement, detached=False),
+        }
+
+
+def workspace_add_dataset_action(*, uid: str, canvas_id: str,
+                                 expected_canvas_version: int, dataset_id: str) -> dict:
+    """Append one source resolved from an exact registration identity without a provider write."""
+    with _workspace_write_session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            raise KeyError(f"canvas '{canvas_id}' not found")
+        if _workspace_canvas_role_in_session(s, canvas, uid) not in ("owner", "editor"):
+            raise PermissionError("you don't have edit access to this canvas")
+        if canvas.version != expected_canvas_version:
+            raise WorkspaceVersionConflict(
+                f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
+        _entry, source = _workspace_dataset_source_in_session(s, dataset_id)
+        try:
+            doc = json.loads(canvas.doc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"canvas '{canvas_id}' has invalid content") from exc
+        nodes = doc.get("nodes")
+        if not isinstance(nodes, list):
+            raise ValueError(f"canvas '{canvas_id}' has invalid content")
+        occupied = {(node.get("position", {}).get("x"), node.get("position", {}).get("y"))
+                    for node in nodes if isinstance(node, dict)}
+        x, y = 160, 160
+        while (x, y) in occupied:
+            x += 60
+            y += 40
+        source["position"] = {"x": x, "y": y}
+        _snapshot_canvas_in_session(
+            s, canvas, canvas.doc, canvas.version, author_id=uid,
+            label="before Workspace dataset add")
+        nodes.append(source)
+        canvas.version += 1
+        doc["version"] = canvas.version
+        canvas.doc = json.dumps(doc)
+        sync_local_result_owner(s, "canvas", canvas_id, doc)
+        return {"ok": True, "id": canvas_id, "version": canvas.version, "doc": doc}
+
+
+def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_version: int,
+                                 container_id: str, expected_container_version: int) -> dict:
+    """CAS-move only a canvas's local placement and return enough facts for a truthful undo."""
+    with _workspace_write_session() as s:
+        placement = _workspace_placement_locked(s, placement_id)
+        if placement.target_kind != "canvas":
+            raise ValueError("only canvas placements can be moved by this action")
+        canvas = s.get(Canvas, placement.target_id, with_for_update=True)
+        if canvas is None:
+            raise KeyError(f"canvas '{placement.target_id}' not found")
+        if _workspace_canvas_role_in_session(s, canvas, uid) not in ("owner", "editor"):
+            raise PermissionError("you don't have edit access to this canvas")
+        if placement.version != expected_version:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        destination = _workspace_container_at_version(
+            s, container_id, expected_container_version)
+        previous = _workspace_container_locked(s, placement.container_id)
+        if previous.id == destination.id:
+            raise ValueError("canvas is already in that Workspace container")
+        changed = s.execute(update(WorkspacePlacement).where(
+            WorkspacePlacement.id == placement_id,
+            WorkspacePlacement.version == expected_version,
+        ).values(
+            container_id=destination.id,
+            version=WorkspacePlacement.version + 1,
+        ).execution_options(synchronize_session=False))
+        if changed.rowcount != 1:
+            _workspace_version_conflict("placement", placement_id, expected_version)
+        s.refresh(placement)
+        return {
+            "ok": True,
+            "resource": _workspace_placement_resource(placement, detached=False),
+            "previousContainer": _workspace_container_resource(previous),
+            "container": _workspace_container_resource(destination),
+        }
+
+
 def workspace_delete_placement(placement_id: str, *, expected_version: int) -> None:
     """CAS-delete a canonical placement without deleting or rewriting its target."""
     with _workspace_write_session() as s:
