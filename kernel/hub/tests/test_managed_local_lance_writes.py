@@ -188,8 +188,8 @@ def test_two_lance_appends_admitted_from_one_head_have_one_cas_winner(lance_dest
             errors.append(exc)
 
     threads = [
-        threading.Thread(target=append, args=("concurrent-a", 2)),
-        threading.Thread(target=append, args=("concurrent-b", 3)),
+        threading.Thread(target=append, args=("lance-concurrent-a", 2)),
+        threading.Thread(target=append, args=("lance-concurrent-b", 3)),
     ]
     for thread in threads:
         thread.start()
