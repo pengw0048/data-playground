@@ -47,6 +47,7 @@ class ProfileJobBody(BaseModel):
     admission_token: str = Field(min_length=20, max_length=200)
     graph: dict
     node_id: str
+    port_id: str = Field(min_length=1, max_length=128)
     plan_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     request_id: str | None = None
 
@@ -147,7 +148,7 @@ def _cancel_with_profile_admission(
 
 
 def _start_admitted_profile(
-        *, profile_runner, graph, node_id: str, plan_digest: str, run_id: str,
+        *, profile_runner, graph, node_id: str, port_id: str, plan_digest: str, run_id: str,
         request_id: str | None, profile_attempt_order: int, persist_failure) -> object:
     """Register/spawn an admitted profile or terminalize a proven pre-spawn failure.
 
@@ -159,7 +160,7 @@ def _start_admitted_profile(
 
     try:
         return profile_runner.run(
-            graph, node_id, plan_digest=plan_digest,
+            graph, node_id, port_id=port_id, plan_digest=plan_digest,
             profile_attempt_order=profile_attempt_order, run_id=run_id,
             request_id=request_id,
         )
@@ -172,7 +173,8 @@ def _start_admitted_profile(
                     "profile supervisor lost ownership of a possibly live child") from exc
             failed = RunStatus(
                 run_id=run_id, status="failed", job_type="profile",
-                target_node_id=node_id, plan_digest=plan_digest,
+                target_node_id=node_id, target_port_id=port_id,
+                plan_digest=plan_digest,
                 profile_attempt_order=profile_attempt_order, request_id=request_id,
                 per_node=[PerNodeStatus(
                     node_id=node_id, status="failed", label="Full profile",
@@ -229,6 +231,7 @@ def _dispatch_profile_job(
         won, durable = metadata.consume_profile_run_preallocation(
             body.run_id, body.admission_token, canvas_id=kernel_canvas, kernel_id=kernel_id,
             target_node_id=body.node_id, plan_digest=body.plan_digest,
+            target_port_id=body.port_id,
         )
         if not won:
             return RunStatus(**durable)
@@ -238,6 +241,7 @@ def _dispatch_profile_job(
             raise RuntimeError("profile admission is missing its attempt order")
         return _start_admitted_profile(
             profile_runner=profile_runner, graph=graph, node_id=body.node_id,
+            port_id=body.port_id,
             plan_digest=body.plan_digest, run_id=body.run_id,
             request_id=body.request_id,
             profile_attempt_order=profile_attempt_order,

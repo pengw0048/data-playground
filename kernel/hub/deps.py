@@ -226,6 +226,7 @@ def _persist_run(deps, graph, target, status) -> None:
     request_id = getattr(status, "request_id", None) or get_request_id()
     persisted_target = status.target_node_id or target
     metadb.record_run(canvas_id=getattr(graph, "id", None), target_node_id=persisted_target,
+                      target_port_id=status.target_port_id,
                       job_type=status.job_type, status=status.status,
                       rows=status.total_rows, ms=status.ms, error=status.error,
                       outputs=[output.model_dump() for output in status.outputs], per_node=per_node,

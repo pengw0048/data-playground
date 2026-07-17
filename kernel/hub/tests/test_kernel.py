@@ -7698,7 +7698,7 @@ def test_catalog_plugin_is_finalized_before_catalog_services(tmp_path, monkeypat
         ], "edges": [E("source", "write")]})
         graph_mod.resolve_source_refs(graph, first.catalog.resolve_ref)
         assert graph.nodes[0].data["config"]["uri"] == str(source)
-        assert _profile_plan_digest(graph, "source", first)
+        assert _profile_plan_digest(graph, "source", "out", first)
 
         # A real write reaches the same object through the runner's publication path.
         seen_publication_catalogs = []

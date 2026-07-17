@@ -44,7 +44,7 @@ vi.mock('../api/client', () => ({
 }))
 
 import {
-  currentPreviews, previewPlanIdentity, profilePlanIdentity, useStore,
+  currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
@@ -84,9 +84,12 @@ describe('graph store — core authority ops', () => {
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
     })
     apiMocks.profileEstimate.mockReset().mockResolvedValue({
-      rows: 10, bytes: 100, placement: 'local', needsConfirm: false, planDigest: 'a'.repeat(64),
+      rows: 10, bytes: 100, placement: 'local', needsConfirm: false,
+      targetPortId: 'out', planDigest: 'a'.repeat(64),
     })
-    apiMocks.profileIdentity.mockReset().mockResolvedValue({ planDigest: 'a'.repeat(64) })
+    apiMocks.profileIdentity.mockReset().mockResolvedValue({
+      targetPortId: 'out', planDigest: 'a'.repeat(64),
+    })
     apiMocks.fullProfile.mockReset()
     apiMocks.runStatus.mockReset()
     apiMocks.cancelRun.mockReset().mockImplementation(async (runId: string) => ({
@@ -473,6 +476,7 @@ describe('graph store — core authority ops', () => {
     useStore.getState().updateConfig('other-target', { predicate: 'score > 10' })
     finish({
       runId: 'profile-unrelated-edit', status: 'running', jobType: 'profile', targetNodeId: 'target',
+      targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, ms: 10, placement: 'local', perNode: [],
     })
@@ -501,7 +505,7 @@ describe('graph store — core authority ops', () => {
     const pending = useStore.getState().startFullProfile('source')
     await submittedJob
     useStore.getState().updateConfig('source', { uri: 'new-events.parquet' })
-    resolveJob({ runId: 'profile-old', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+    resolveJob({ runId: 'profile-old', status: 'queued', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [] })
     await pending
@@ -560,7 +564,8 @@ describe('graph store — core authority ops', () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     useStore.setState({ doc })
     apiMocks.profileEstimate.mockResolvedValueOnce({
-      rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
+      rows: null, bytes: null, placement: 'local', needsConfirm: true,
+      targetPortId: 'out', planDigest: 'a'.repeat(64),
     })
 
     await useStore.getState().prepareFullProfile('source')
@@ -571,15 +576,48 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.fullProfile).not.toHaveBeenCalled()
 
     apiMocks.fullProfile.mockResolvedValueOnce({
-      runId: 'profile-confirmed', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-confirmed', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
     await useStore.getState().startFullProfile('source')
 
     expect(apiMocks.fullProfile).toHaveBeenCalledWith(
-      doc, 'source', useStore.getState().profileJobs.source.planDigest, expect.any(String), true,
+      doc, 'source', 'out', useStore.getState().profileJobs.source.planDigest,
+      expect.any(String), true,
     )
+  })
+
+  it('keeps sibling named-output profile identities and results separate', async () => {
+    const section = NODE('branches', 'section')
+    section.data.config = { outputs: ['left', 'right'] }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [section], edges: [],
+    }
+    useStore.setState({ doc })
+    apiMocks.profileEstimate.mockImplementation(async (_doc, _nodeId, portId) => ({
+      rows: 1, bytes: 10, placement: 'local', needsConfirm: false,
+      targetPortId: portId, planDigest: portId === 'left' ? '1'.repeat(64) : '2'.repeat(64),
+    }))
+    apiMocks.fullProfile.mockImplementation(async (_doc, _nodeId, portId, planDigest) => ({
+      runId: `profile-${portId}`, status: 'done', jobType: 'profile',
+      targetNodeId: 'branches', targetPortId: portId, planDigest, profileAttemptOrder: 1,
+      rowsProcessed: 1, ms: 1, placement: 'local', perNode: [],
+      profile: { columns: [], rowCount: 1, sampled: false, targetPortId: portId },
+    }))
+
+    await useStore.getState().prepareFullProfile('branches', 'left')
+    await useStore.getState().prepareFullProfile('branches', 'right')
+    await useStore.getState().startFullProfile('branches', 'left')
+    await useStore.getState().startFullProfile('branches', 'right')
+
+    const jobs = useStore.getState().profileJobs
+    expect(jobs[profileJobKey('branches', 'left')].status).toMatchObject({
+      runId: 'profile-left', targetPortId: 'left', planDigest: '1'.repeat(64),
+    })
+    expect(jobs[profileJobKey('branches', 'right')].status).toMatchObject({
+      runId: 'profile-right', targetPortId: 'right', planDigest: '2'.repeat(64),
+    })
   })
 
   it('surfaces unsupported destination credentials from run preflight without starting', async () => {
@@ -605,7 +643,7 @@ describe('graph store — core authority ops', () => {
       .mockRejectedValueOnce(new Error('network response lost'))
       .mockRejectedValueOnce(new KernelError(503, 'hub restarting'))
       .mockResolvedValueOnce({
-        runId: 'profile-adopted', status: 'done', jobType: 'profile', targetNodeId: 'source',
+        runId: 'profile-adopted', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
         planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
         rowsProcessed: 10, ms: 10, placement: 'local', perNode: [],
         profile: { columns: [], rowCount: 10, sampled: false },
@@ -614,7 +652,7 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().startFullProfile('source')
 
     expect(apiMocks.fullProfile).toHaveBeenCalledTimes(3)
-    const submissionIds = apiMocks.fullProfile.mock.calls.map((call) => call[3])
+    const submissionIds = apiMocks.fullProfile.mock.calls.map((call) => call[4])
     expect(new Set(submissionIds).size).toBe(1)
     expect(submissionIds[0]).toMatch(/^[0-9a-f-]{36}$/i)
     expect(useStore.getState().profileJobs.source).toMatchObject({
@@ -649,7 +687,7 @@ describe('graph store — core authority ops', () => {
     const submissionId = useStore.getState().profileJobs.source.submissionId
     expect(useStore.getState().profileJobs.source.submissionUnresolved).toBe(true)
     apiMocks.fullProfile.mockReset().mockResolvedValueOnce({
-      runId: 'profile-reconciled-later', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-reconciled-later', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
@@ -657,7 +695,9 @@ describe('graph store — core authority ops', () => {
 
     await useStore.getState().startFullProfile('source')
 
-    expect(apiMocks.fullProfile).toHaveBeenCalledWith(doc, 'source', 'a'.repeat(64), submissionId, true)
+    expect(apiMocks.fullProfile).toHaveBeenCalledWith(
+      doc, 'source', 'out', 'a'.repeat(64), submissionId, true,
+    )
     expect(useStore.getState().profileJobs.source.status?.runId).toBe('profile-reconciled-later')
   })
 
@@ -676,7 +716,7 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.cancelRun).not.toHaveBeenCalled()
 
     finishSubmission({
-      runId: 'profile-cancel-after-adopt', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-after-adopt', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
@@ -702,7 +742,7 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(1))
     await useStore.getState().cancelFullProfile('source')
     finishSubmission({
-      runId: 'profile-cancel-response-lost', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-response-lost', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
@@ -729,7 +769,7 @@ describe('graph store — core authority ops', () => {
     } } }))
 
     finishSubmission({
-      runId: 'superseded-submission-run', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'superseded-submission-run', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
@@ -756,8 +796,8 @@ describe('graph store — core authority ops', () => {
     useStore.getState().updateConfig('source', { uri: 'new-source.parquet' })
     await firstSubmission
     await vi.waitFor(() => expect(apiMocks.fullProfile).toHaveBeenCalledTimes(4))
-    const oldSubmissionId = apiMocks.fullProfile.mock.calls[0][3]
-    expect(apiMocks.fullProfile.mock.calls.slice(0, 4).every((call) => call[3] === oldSubmissionId)).toBe(true)
+    const oldSubmissionId = apiMocks.fullProfile.mock.calls[0][4]
+    expect(apiMocks.fullProfile.mock.calls.slice(0, 4).every((call) => call[4] === oldSubmissionId)).toBe(true)
 
     // The user can move on to the new graph. Orphan reconciliation owns the old captured doc/key and
     // must not write through this newer preflight when its response finally arrives.
@@ -765,7 +805,7 @@ describe('graph store — core authority ops', () => {
     const newGeneration = useStore.getState().profileJobs.source.requestGeneration
     expect(useStore.getState().profileJobs.source.phase).toBe('preflight')
     finishOrphan({
-      runId: 'old-orphaned-scan', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'old-orphaned-scan', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     })
@@ -818,7 +858,7 @@ describe('graph store — core authority ops', () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const planDigest = 'a'.repeat(64)
     const running = {
-      runId: 'removed-node-profile', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'removed-node-profile', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
       placement: 'local', perNode: [],
     }
@@ -861,7 +901,7 @@ describe('graph store — core authority ops', () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const planDigest = 'a'.repeat(64)
     const running = {
-      runId: 'alice-detached-profile', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'alice-detached-profile', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
       placement: 'local', perNode: [],
     }
@@ -891,7 +931,7 @@ describe('graph store — core authority ops', () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const planDigest = 'a'.repeat(64)
     const running = {
-      runId: 'detached-profile-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'detached-profile-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, ms: 10,
       placement: 'local', perNode: [],
     }
@@ -950,7 +990,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-race', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-race', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -985,7 +1025,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-active-200', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-active-200', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1024,7 +1064,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-transient-error', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-transient-error', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1052,7 +1092,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-status-transient', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-status-transient', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1081,7 +1121,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-terminal-race', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-terminal-race', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1119,7 +1159,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-unverified', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-unverified', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
     }
@@ -1155,7 +1195,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-compact-terminal', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-compact-terminal', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1187,7 +1227,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-role-revoked', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1208,7 +1248,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ doc })
     await useStore.getState().prepareFullProfile('source')
     const running = {
-      runId: 'profile-cancel-unknown', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-cancel-unknown', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1252,7 +1292,7 @@ describe('graph store — core authority ops', () => {
     const planDigest = useStore.getState().profileJobs.source.planDigest
     useStore.setState({ profileJobs: {} })
     apiMocks.profileJobs.mockResolvedValueOnce([{
-      runId: 'finished-away', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'finished-away', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 4, sampled: false },
     }])
@@ -1263,7 +1303,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source?.phase).toBe('done')
 
     apiMocks.profileJobs.mockResolvedValueOnce([{
-      runId: 'stale-plan', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'stale-plan', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: '0'.repeat(64), profileAttemptOrder: 2, rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 4, sampled: false },
     }])
@@ -1284,14 +1324,14 @@ describe('graph store — core authority ops', () => {
     async (_label, staleStatus, staleFirst) => {
       const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
       const currentAttempt = {
-        runId: 'current-plan-order-1', status: 'done', jobType: 'profile', targetNodeId: 'source',
+        runId: 'current-plan-order-1', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
         planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
         rowsProcessed: 4, totalRows: 4, ms: 10, placement: 'local', perNode: [],
         profile: { columns: [], rowCount: 4, sampled: false },
       }
       const staleAttempt = {
         runId: `stale-plan-order-2-${staleStatus}-${staleFirst ? 'first' : 'last'}`,
-        status: staleStatus, jobType: 'profile', targetNodeId: 'source',
+        status: staleStatus, jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
         planDigest: 'b'.repeat(64), profileAttemptOrder: 2,
         rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       }
@@ -1318,7 +1358,7 @@ describe('graph store — core authority ops', () => {
   it('ignores a stale active recovery for viewers without issuing cancellation mutations', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const stale = {
-      runId: 'viewer-stale-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'viewer-stale-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'b'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1335,7 +1375,7 @@ describe('graph store — core authority ops', () => {
   it('recovers and read-only polls a current active profile for viewers', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const active = {
-      runId: 'viewer-current-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'viewer-current-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1355,7 +1395,7 @@ describe('graph store — core authority ops', () => {
   it('describes provisional viewer recovery without promising cancellation', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const active = {
-      runId: 'viewer-verifying-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'viewer-verifying-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }
@@ -1373,7 +1413,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source.error).toBeUndefined()
     expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(active.runId)
 
-    finishIdentity({ planDigest: active.planDigest })
+    finishIdentity({ targetPortId: 'out', planDigest: active.planDigest })
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
       phase: 'running', identityVerified: true, canCancel: false,
       status: { runId: active.runId },
@@ -1386,7 +1426,7 @@ describe('graph store — core authority ops', () => {
   ] as const)('keeps a recovered terminal result in non-error verification for %s', async (role, canCancel) => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const terminal = {
-      runId: `terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: `terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
@@ -1405,7 +1445,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source.error).toBeUndefined()
     expect(apiMocks.cancelRun).not.toHaveBeenCalledWith(terminal.runId)
 
-    finishIdentity({ planDigest: terminal.planDigest })
+    finishIdentity({ targetPortId: 'out', planDigest: terminal.planDigest })
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
       phase: 'done', identityVerified: true, canCancel,
       status: { runId: terminal.runId, profile: { rowCount: 10 } },
@@ -1418,7 +1458,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishRecovery = resolve }))
     useStore.getState().loadDoc(current, 'owner')
     const done = {
-      runId: 'alice-complete-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'alice-complete-profile', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
@@ -1444,7 +1484,7 @@ describe('graph store — core authority ops', () => {
   it('keeps a recovered active run cancellable while identity retry is pending, then verifies it', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const recovered = {
-      runId: 'identity-retry-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'identity-retry-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 2,
       rowsProcessed: 2, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 2, sampled: false },
@@ -1475,7 +1515,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source.status?.totalRows).toBeUndefined()
     expect(useStore.getState().profileJobs.source.error).toBeUndefined()
 
-    finishIdentity({ planDigest: 'a'.repeat(64) })
+    finishIdentity({ targetPortId: 'out', planDigest: 'a'.repeat(64) })
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
       phase: 'running', identityVerified: true,
       status: { runId: recovered.runId, profile: { rowCount: 2 } },
@@ -1485,7 +1525,7 @@ describe('graph store — core authority ops', () => {
   it('fails closed after persistent identity failure while retaining exact cancellation identity', async () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const recovered = {
-      runId: 'identity-failed-active', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      runId: 'identity-failed-active', status: 'queued', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 4,
       rowsProcessed: 0, totalRows: 10, ms: 0, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 999, sampled: false },
@@ -1538,7 +1578,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ profileJobs: {} })
     apiMocks.profileJobs.mockRejectedValueOnce(new Error('transient latest-profile lookup failure'))
     apiMocks.activeRuns.mockResolvedValueOnce([{
-      runId: 'active-fallback', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'active-fallback', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }])
     let finishStatus!: (status: any) => void
@@ -1551,7 +1591,7 @@ describe('graph store — core authority ops', () => {
     ).toBe('active-fallback'))
     expect(useStore.getState().profileJobs.source?.phase).toBe('running')
     finishStatus({
-      runId: 'active-fallback', status: 'cancelled', jobType: 'profile', targetNodeId: 'source',
+      runId: 'active-fallback', status: 'cancelled', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     })
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('cancelled'))
@@ -1561,7 +1601,7 @@ describe('graph store — core authority ops', () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const planDigest = 'a'.repeat(64)
     const base = {
-      runId: 'poll-monotonic', jobType: 'profile', targetNodeId: 'source',
+      runId: 'poll-monotonic', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 2, rowsProcessed: 1, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }
@@ -1587,12 +1627,12 @@ describe('graph store — core authority ops', () => {
     const planDigest = 'a'.repeat(64)
     apiMocks.profileJobs.mockRejectedValueOnce(new Error('projection unavailable'))
     apiMocks.activeRuns.mockResolvedValueOnce([{
-      runId: 'poll-identity', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'poll-identity', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 3, rowsProcessed: 1, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }])
     apiMocks.runStatus.mockResolvedValueOnce({
-      runId: 'poll-identity', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'poll-identity', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest: '0'.repeat(64), profileAttemptOrder: 3, rowsProcessed: 10, totalRows: 10,
       ms: 20, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
@@ -1609,7 +1649,7 @@ describe('graph store — core authority ops', () => {
     const current = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     const planDigest = 'a'.repeat(64)
     const running = {
-      runId: 'profile-pruned-detail', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'profile-pruned-detail', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 7, rowsProcessed: 3, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }
@@ -1646,7 +1686,7 @@ describe('graph store — core authority ops', () => {
     let finishActive!: (statuses: any[]) => void
     apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
     apiMocks.profileJobs.mockResolvedValueOnce([{
-      runId: 'projection-first', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'projection-first', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
@@ -1670,7 +1710,7 @@ describe('graph store — core authority ops', () => {
     useStore.getState().loadDoc(current, 'owner')
     await vi.waitFor(() => expect(apiMocks.profileJobs).toHaveBeenCalled())
     finishActive([{
-      runId: 'active-after-empty', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'active-after-empty', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 3, rowsProcessed: 1, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }])
@@ -1686,7 +1726,7 @@ describe('graph store — core authority ops', () => {
     let finishActive!: (statuses: any[]) => void
     apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
     apiMocks.profileJobs.mockResolvedValueOnce([{
-      runId: 'old-projection', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'old-projection', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 4, rowsProcessed: 10, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
@@ -1698,7 +1738,7 @@ describe('graph store — core authority ops', () => {
       useStore.getState().profileJobs.source?.status?.runId,
     ).toBe('old-projection'))
     finishActive([{
-      runId: 'new-active-retry', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'new-active-retry', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 5, rowsProcessed: 1, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }])
@@ -1714,7 +1754,7 @@ describe('graph store — core authority ops', () => {
     let finishProjection!: (statuses: any[]) => void
     apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishProjection = resolve }))
     apiMocks.activeRuns.mockResolvedValueOnce([{
-      runId: 'same-attempt', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'same-attempt', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 6, rowsProcessed: 1, totalRows: 10,
       ms: 10, placement: 'local', perNode: [],
     }])
@@ -1723,7 +1763,7 @@ describe('graph store — core authority ops', () => {
     useStore.getState().loadDoc(current, 'owner')
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source?.phase).toBe('running'))
     finishProjection([{
-      runId: 'same-attempt', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+      runId: 'same-attempt', status: 'queued', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 6, rowsProcessed: 0,
       ms: 0, placement: 'local', perNode: [],
     }])
@@ -1742,7 +1782,7 @@ describe('graph store — core authority ops', () => {
     let finishProjection!: (statuses: any[]) => void
     apiMocks.profileJobs.mockImplementationOnce(() => new Promise((resolve) => { finishProjection = resolve }))
     apiMocks.activeRuns.mockResolvedValueOnce([{
-      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 1, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     }])
     let finishStatus!: (status: any) => void
@@ -1754,7 +1794,7 @@ describe('graph store — core authority ops', () => {
       useStore.getState().profileJobs.source?.status?.runId,
     ).toBe('provisional-active'))
     finishProjection([{
-      runId: 'authoritative-terminal', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'authoritative-terminal', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10, ms: 20, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
@@ -1762,7 +1802,7 @@ describe('graph store — core authority ops', () => {
       useStore.getState().profileJobs.source?.status?.runId,
     ).toBe('authoritative-terminal'))
     finishStatus({
-      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source',
+      runId: 'provisional-active', status: 'running', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 2, totalRows: 10, ms: 20, placement: 'local', perNode: [],
     })
     await vi.waitFor(() => expect(apiMocks.cancelRun).toHaveBeenCalledWith('provisional-active'))
@@ -1784,7 +1824,7 @@ describe('graph store — core authority ops', () => {
     useStore.getState().loadDoc(current, 'owner')
     useStore.getState().loadDoc(current, 'owner')
     finishNew([{
-      runId: 'newer-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'newer-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },
     }])
@@ -1792,7 +1832,7 @@ describe('graph store — core authority ops', () => {
       useStore.getState().profileJobs.source?.status?.runId,
     ).toBe('newer-reattach'))
     finishOld([{
-      runId: 'older-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'older-reattach', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 5, totalRows: 5, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 5, sampled: false },
     }])
@@ -1813,7 +1853,7 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().prepareFullProfile('source')
     const submission = useStore.getState().startFullProfile('source')
     finishRecovery([{
-      runId: 'old-recovered-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'old-recovered-profile', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 5, totalRows: 5,
       ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 5, sampled: false },
@@ -1824,7 +1864,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().profileJobs.source?.status).toBeUndefined()
 
     finishSubmission({
-      runId: 'new-user-profile', status: 'done', jobType: 'profile', targetNodeId: 'source',
+      runId: 'new-user-profile', status: 'done', jobType: 'profile', targetNodeId: 'source', targetPortId: 'out',
       planDigest, profileAttemptOrder: 2, rowsProcessed: 10, totalRows: 10,
       ms: 20, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false },

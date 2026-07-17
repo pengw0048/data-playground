@@ -307,12 +307,13 @@ def test_profile_job_submit_and_recovery_use_read_vs_mutate_roles(authed, monkey
     dispatched: list[str] = []
 
     class Owner:
-        def profile_job(self, _graph_doc, node_id, plan_digest, *, run_id, admission_token,
+        def profile_job(self, _graph_doc, node_id, port_id, plan_digest, *, run_id, admission_token,
                         request_id=None):
             won, queued = metadb.consume_profile_run_preallocation(
-                run_id, admission_token, canvas_id="authz_canvas",
-                kernel_id="authz-profile-kernel", target_node_id=node_id,
-                plan_digest=plan_digest,
+                    run_id, admission_token, canvas_id="authz_canvas",
+                    kernel_id="authz-profile-kernel", target_node_id=node_id,
+                    target_port_id=port_id,
+                    plan_digest=plan_digest,
             )
             assert won
             dispatched.append(run_id)

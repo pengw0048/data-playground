@@ -431,7 +431,7 @@ def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
     return estimate.model_copy(update=updates)
 
 
-def _profile_plan_digest(graph, node_id: str, deps) -> str:
+def _profile_plan_digest(graph, node_id: str, port_id: str, deps) -> str:
     import uuid
     from hub.profile_identity import profile_plan_digest
     from hub.storage import source_read_scope
@@ -439,7 +439,7 @@ def _profile_plan_digest(graph, node_id: str, deps) -> str:
     with source_read_scope(
             deps.storage, graph_mod.execution_source_uris(graph, node_id),
             owner=f"profile-identity:{uuid.uuid4().hex}"):
-        return profile_plan_digest(graph, node_id, deps.resolve_adapter)
+        return profile_plan_digest(graph, node_id, port_id, deps.resolve_adapter)
 
 
 @router.post("/run/profile-estimate", response_model=ProfileEstimate)
@@ -453,7 +453,7 @@ def estimate_full_profile(req: ProfileEstimateRequest,
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
-    _require_single_backend_output(req.graph, req.node_id, deps)
+    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
     # Pin one managed-source generation across both observations. Their internal scopes remain useful
     # in direct-call paths, while this outer lease prevents size and digest from describing two different
@@ -462,8 +462,9 @@ def estimate_full_profile(req: ProfileEstimateRequest,
             deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
             owner=f"profile-preflight:{uuid.uuid4().hex}"):
         estimate = _profile_job_estimate(req.graph, req.node_id, deps)
-        digest = _profile_plan_digest(req.graph, req.node_id, deps)
-    return ProfileEstimate(**estimate.model_dump(), plan_digest=digest)
+        digest = _profile_plan_digest(req.graph, req.node_id, port_id, deps)
+    return ProfileEstimate(
+        **estimate.model_dump(), target_port_id=port_id, plan_digest=digest)
 
 
 @router.post("/run/profile-identity", response_model=ProfileIdentity)
@@ -474,9 +475,12 @@ def current_profile_identity(req: ProfileIdentityRequest,
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
-    _require_single_backend_output(req.graph, req.node_id, deps)
+    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
-    return ProfileIdentity(plan_digest=_profile_plan_digest(req.graph, req.node_id, deps))
+    return ProfileIdentity(
+        target_port_id=port_id,
+        plan_digest=_profile_plan_digest(req.graph, req.node_id, port_id, deps),
+    )
 
 
 def _require_full_profile_containment(graph, node_id: str, deps) -> None:
@@ -548,10 +552,11 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
         deps = get_deps()
         operational_canvas = str(getattr(req.graph, "id", None) or "canvas")
         submission_id = str(req.submission_id)
+        port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
         try:
             existing = metadb.lookup_profile_submission(
                 submission_id, uid, auth_canvas, operational_canvas,
-                req.node_id, req.plan_digest,
+                req.node_id, port_id, req.plan_digest,
             )
         except metadb.ProfileSubmissionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -565,10 +570,8 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
         else:
             graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
             _reject_invalid(req.graph, deps, req.node_id)
-            # Port identity is not part of the durable full-profile state machine until #266. New
-            # dispatches reject before source acquisition or run-id allocation. Immutable replay above
-            # deliberately adopts its stored terminal result without revalidating a changed graph.
-            _require_single_backend_output(req.graph, req.node_id, deps)
+            # Port selection is validated before source acquisition or run-id allocation. Immutable
+            # replay above adopts only the exact stored node/port/digest identity.
             _require_full_profile_containment(req.graph, req.node_id, deps)
 
             # Keep managed inputs pinned from identity minting until the kernel-side process runner has
@@ -577,7 +580,8 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
             with source_read_scope(
                     deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
                     owner=f"profile-submit:{uuid.uuid4().hex}"):
-                authoritative_digest = _profile_plan_digest(req.graph, req.node_id, deps)
+                authoritative_digest = _profile_plan_digest(
+                    req.graph, req.node_id, port_id, deps)
                 if req.plan_digest != authoritative_digest:
                     if existing is None or not existing.should_dispatch:
                         raise HTTPException(
@@ -586,6 +590,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                     outcome, settled = metadb.settle_profile_submission_failure(
                         existing.run_id, existing.admission_token, uid, auth_canvas,
                         canvas_id=operational_canvas, target_node_id=req.node_id,
+                        target_port_id=port_id,
                         plan_digest=req.plan_digest,
                         attempt_order=existing.attempt_order,
                         reason="profile source changed before kernel admission",
@@ -606,7 +611,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                     try:
                         reservation = metadb.preallocate_or_adopt_profile_run_owner(
                             submission_id, uid, auth_canvas, operational_canvas,
-                            req.node_id, authoritative_digest, request_id=request_id,
+                            req.node_id, port_id, authoritative_digest, request_id=request_id,
                         )
                     except metadb.ProfileSubmissionConflict as exc:
                         raise HTTPException(409, str(exc)) from exc
@@ -643,6 +648,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                                         run_id, preallocation_token, uid, auth_canvas,
                                         canvas_id=operational_canvas,
                                         target_node_id=req.node_id,
+                                        target_port_id=port_id,
                                         plan_digest=authoritative_digest,
                                         attempt_order=attempt_order,
                                     )
@@ -667,13 +673,14 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                             else:
                                 try:
                                     returned = owner.profile_job(
-                                        req.graph, req.node_id, authoritative_digest,
+                                        req.graph, req.node_id, port_id, authoritative_digest,
                                         run_id=run_id, admission_token=preallocation_token,
                                         request_id=request_id,
                                     )
                                     if (returned.run_id != run_id
                                             or returned.job_type != "profile"
                                             or returned.target_node_id != req.node_id
+                                            or returned.target_port_id != port_id
                                             or returned.plan_digest != authoritative_digest
                                             or returned.profile_attempt_order != attempt_order):
                                         raise RuntimeError(
@@ -690,6 +697,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                                         run_id, uid, auth_canvas,
                                         canvas_id=operational_canvas,
                                         target_node_id=req.node_id,
+                                        target_port_id=port_id,
                                         plan_digest=authoritative_digest,
                                         attempt_order=attempt_order,
                                     )
