@@ -32,6 +32,7 @@ from hub.deps import get_deps
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
+from hub.plugins.adapters import revision_adapter_for_uri
 from hub.run_outputs import (
     UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
     require_single_run_output,
@@ -59,6 +60,7 @@ from hub.models import (
     RunOutput,
     RunStatus,
     SampleResult,
+    dataset_ref_identity,
 )
 
 router = APIRouter()
@@ -104,17 +106,16 @@ def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         uri = str(cfg.get("uri") or "")
         binding = metadb.catalog_revision_binding_for_uri(uri)
-        adapter = deps.resolve_adapter(uri)
+        adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
         if binding is None or not isinstance(adapter, DatasetRevisionAdapter):
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         dataset_ref = cfg.get("datasetRef")
         try:
             if isinstance(dataset_ref, dict):
-                if (getattr(adapter, "name", None) != "lance"
-                        or str(binding["dataset_id"]) != str(dataset_ref.get("datasetId") or "")):
-                    raise ValueError("pinned dataset identity does not match the current registration")
-                revision_id = str(dataset_ref.get("revisionId") or "")
+                dataset_id, revision_id = dataset_ref_identity(dataset_ref)
+                if str(binding["dataset_id"]) != dataset_id:
+                    raise ValueError("selected dataset identity does not match the current registration")
                 with db.base_guard():
                     adapter.open_revision(uri, revision_id)
             else:
@@ -213,7 +214,7 @@ def _input_drift(
         compatibility = None
         binding = metadb.catalog_revision_binding(item["dataset_id"])
         if binding is not None:
-            adapter = deps.resolve_adapter(str(binding["uri"]))
+            adapter = revision_adapter_for_uri(str(binding["uri"]), deps.resolve_adapter)
             if isinstance(adapter, DatasetRevisionAdapter):
                 try:
                     with db.base_guard():
@@ -467,7 +468,7 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
         if req.input_manifest is not None or pinned:
             return SampleResult(
                 not_previewable=True,
-                reason=("selected pinned revision is unavailable" if pinned
+                reason=("selected revision is unavailable" if pinned
                         else "retained preview input revision is unavailable; refresh to latest"),
             )
         # Preview-only paths for unversioned/ad-hoc adapters retain their existing bounded behavior.

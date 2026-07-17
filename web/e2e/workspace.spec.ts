@@ -158,6 +158,9 @@ test('pins a Source revision, persists it across reload, and keeps the control i
       { datasetId: 'opaque-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z', retentionOwner: 'provider' },
     ], nextCursor: null, hasMore: false } })
   })
+  await page.route('**/api/catalog/tables/pin-table/revisions/capabilities', async (route) => {
+    await route.fulfill({ json: { selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null } })
+  })
   await page.route('**/api/catalog/revisions/opaque-dataset/1', async (route) => {
     await route.fulfill({ json: {
       datasetId: 'opaque-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z',
@@ -177,7 +180,7 @@ test('pins a Source revision, persists it across reload, and keeps the control i
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${canvasId}`)
       return (await response.json()).nodes[0].data.config.datasetRef
-    }).toEqual({ datasetId: 'opaque-dataset', revisionId: '1' })
+    }).toEqual({ kind: 'exact', datasetId: 'opaque-dataset', revisionId: '1' })
 
     await page.reload()
     const control = page.getByRole('button', { name: 'Change pinned revision 1' })

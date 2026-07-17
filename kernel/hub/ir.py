@@ -168,10 +168,8 @@ def resolve_config(node: GraphNode) -> dict:
         c = {"uri": cfg.get("uri")}
         dataset_ref = cfg.get("datasetRef")
         if isinstance(dataset_ref, dict):
-            c["datasetRef"] = {
-                "datasetId": dataset_ref.get("datasetId"),
-                "revisionId": dataset_ref.get("revisionId"),
-            }
+            # Keep the strict intent variant and its one-time exact resolution evidence together.
+            c["datasetRef"] = dataset_ref
         # Hub-only local-run admission evidence.  It is written only onto the private dispatch copy
         # after source resolution; accepting it here lets the default engine open that exact revision
         # without exposing a client-side Source configuration surface.

@@ -10,8 +10,8 @@ import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import (
-    UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
-    model_validator,
+    UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter,
+    field_validator, model_validator,
 )
 from pydantic.alias_generators import to_camel
 
@@ -153,10 +153,11 @@ class DatasetRevision(Wire):
     retention_owner: Literal["provider", "core"] = "provider"
 
 
-class DatasetRef(Wire):
+class ExactDatasetRef(Wire):
     """Opaque, path-independent identity for one exact retained dataset revision."""
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
+    kind: Literal["exact"]
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
 
@@ -180,6 +181,47 @@ class DatasetRevisionResolution(Wire):
     committed_at: datetime.datetime | None = None
     retention_owner: Literal["provider", "core"] = "provider"
     selector: Literal["latest", "as_of", "exact"]
+
+
+class AsOfDatasetRef(Wire):
+    """As-of intent plus the immutable provider evidence selected exactly once."""
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["as_of"]
+    as_of: datetime.datetime
+    resolved: DatasetRevisionResolution
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> "AsOfDatasetRef":
+        if self.as_of.tzinfo is None or self.as_of.utcoffset() is None:
+            raise ValueError("as-of DatasetRef requires an explicit timezone")
+        if self.resolved.selector != "as_of":
+            raise ValueError("as-of DatasetRef requires as-of resolution evidence")
+        committed_at = self.resolved.committed_at
+        if committed_at is None or committed_at.tzinfo is None or committed_at.utcoffset() is None:
+            raise ValueError("as-of DatasetRef requires timezone-aware provider ordering evidence")
+        if committed_at > self.as_of:
+            raise ValueError("as-of DatasetRef resolution is after the requested instant")
+        return self
+
+
+DatasetRef = Annotated[ExactDatasetRef | AsOfDatasetRef, Field(discriminator="kind")]
+_DATASET_REF_ADAPTER = TypeAdapter(DatasetRef)
+
+
+def dataset_ref_identity(value: object) -> tuple[str, str]:
+    """Return the exact identity carried by either strict DatasetRef variant."""
+    ref = _DATASET_REF_ADAPTER.validate_python(value)
+    if isinstance(ref, AsOfDatasetRef):
+        return ref.resolved.dataset_id, ref.resolved.revision_id
+    return ref.dataset_id, ref.revision_id
+
+
+class DatasetRevisionCapabilities(Wire):
+    """Provider-advertised revision selectors and their portable ordering contract."""
+    selectors: list[Literal["exact", "latest", "as_of"]]
+    as_of_ordering: Literal["latest_committed_at_at_or_before"] | None = None
+    timezone: Literal["UTC"] | None = None
 
 
 class DatasetRevisionSummary(Wire):
@@ -1186,7 +1228,7 @@ class GraphNode(Wire):
                     if isinstance(val, str) and len(val) > MAX_CODE_LEN:
                         raise ValueError(f"node {key} exceeds the {MAX_CODE_LEN}-char limit")
                 if "datasetRef" in cfg:
-                    DatasetRef.model_validate(cfg["datasetRef"])
+                    _DATASET_REF_ADAPTER.validate_python(cfg["datasetRef"])
         return v
 
 

@@ -26,8 +26,8 @@ from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, RevisionUnavailable, is_object_uri, managed_local_file_revision_adapter,
-    path_of, relation_columns,
+    BoundedPreviewUnsupported, RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri,
+    path_of, relation_columns, revision_adapter_for_uri,
 )
 from hub.plugins.importer import ImporterNotConfigured
 from hub.sampling import provenance_for_dataset
@@ -43,6 +43,7 @@ from hub.models import (
     CatalogTable,
     ColumnSchema,
     DatasetRevisionDetail,
+    DatasetRevisionCapabilities,
     DatasetRevision,
     DatasetRevisionPage,
     DatasetRevisionPreview,
@@ -321,9 +322,7 @@ def get_table(table_id: str, registration: bool = False) -> CatalogTable:
 
 
 def _revision_adapter(uri: str) -> DatasetRevisionAdapter:
-    if managed := managed_local_file_revision_adapter(uri):
-        return managed
-    adapter = get_deps().resolve_adapter(uri)
+    adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
     if not isinstance(adapter, DatasetRevisionAdapter):
         raise APIError(501, "dataset_revision_history_unavailable",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
@@ -343,6 +342,22 @@ def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> Da
     return DatasetRevision(dataset_id=dataset_id, revision_id=str(raw["revision_id"]),
                            committed_at=raw.get("committed_at"),
                            retention_owner=getattr(adapter, "retention_owner", "provider"))
+
+
+def _revision_capabilities(adapter: DatasetRevisionAdapter) -> DatasetRevisionCapabilities:
+    advertised = set(getattr(adapter, "revision_selectors", ()))
+    selectors = [selector for selector in ("exact", "latest", "as_of")
+                 if selector in advertised]
+    ordering = getattr(adapter, "revision_as_of_ordering", None)
+    timezone = getattr(adapter, "revision_timezone", None)
+    if ordering != "latest_committed_at_at_or_before" or timezone != "UTC":
+        selectors = [selector for selector in selectors if selector != "as_of"]
+        ordering = None
+        timezone = None
+    return DatasetRevisionCapabilities(
+        selectors=selectors, as_of_ordering=ordering if "as_of" in selectors else None,
+        timezone=timezone if "as_of" in selectors else None,
+    )
 
 
 @router.get("/catalog/tables/{table_id}/revisions", response_model=DatasetRevisionPage)
@@ -366,18 +381,52 @@ def resolve_dataset_revision(table_id: str,
                              as_of: datetime.datetime | None = Query(None, alias="asOf")) -> DatasetRevisionResolution:
     """Resolve latest or an as-of instant to immutable provider evidence without opening head later."""
     table, binding = _revision_binding_for_table(table_id)
+    adapter = _revision_adapter(table.uri)
+    if as_of is not None:
+        capabilities = _revision_capabilities(adapter)
+        if "as_of" not in capabilities.selectors:
+            raise APIError(501, "dataset_revision_as_of_unavailable",
+                           code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            raise APIError(422, "dataset_revision_as_of_timezone_required",
+                           code=APIErrorCode.VALIDATION_ERROR, retryable=False)
+        as_of = as_of.astimezone(datetime.timezone.utc)
     try:
-        adapter = _revision_adapter(table.uri)
         raw = adapter.resolve_revision(table.uri, as_of=as_of)
+    except RevisionResolutionAmbiguous:
+        raise APIError(409, "dataset_revision_resolution_ambiguous",
+                       code=APIErrorCode.CONFLICT, retryable=False)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    committed_at = raw.get("committed_at")
+    if as_of is not None:
+        if isinstance(committed_at, str):
+            try:
+                committed_at = datetime.datetime.fromisoformat(committed_at.replace("Z", "+00:00"))
+            except ValueError:
+                committed_at = None
+        if isinstance(committed_at, datetime.datetime) and (
+                committed_at.tzinfo is None or committed_at.utcoffset() is None):
+            committed_at = committed_at.replace(tzinfo=datetime.timezone.utc)
+        if (not isinstance(committed_at, datetime.datetime)
+                or committed_at.astimezone(datetime.timezone.utc) > as_of):
+            raise APIError(409, "dataset_revision_resolution_ambiguous",
+                           code=APIErrorCode.CONFLICT, retryable=False)
     return DatasetRevisionResolution(dataset_id=binding["dataset_id"],
                                      revision_id=str(raw["revision_id"]),
-                                     committed_at=raw.get("committed_at"),
+                                     committed_at=committed_at,
                                      retention_owner=getattr(
                                          adapter, "retention_owner", "provider"),
                                      selector="as_of" if as_of is not None else "latest")
+
+
+@router.get("/catalog/tables/{table_id}/revisions/capabilities",
+            response_model=DatasetRevisionCapabilities)
+def dataset_revision_capabilities(table_id: str) -> DatasetRevisionCapabilities:
+    """Expose only provider-declared revision selectors and portable ordering semantics."""
+    table, _binding = _revision_binding_for_table(table_id)
+    return _revision_capabilities(_revision_adapter(table.uri))
 
 
 @router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionDetail)

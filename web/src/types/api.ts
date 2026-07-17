@@ -83,6 +83,16 @@ export interface DatasetRevisionPage {
   hasMore: boolean
 }
 
+export interface DatasetRevisionResolution extends DatasetRevision {
+  selector: 'latest' | 'as_of' | 'exact'
+}
+
+export interface DatasetRevisionCapabilities {
+  selectors: Array<'exact' | 'latest' | 'as_of'>
+  asOfOrdering?: 'latest_committed_at_at_or_before' | null
+  timezone?: 'UTC' | null
+}
+
 export interface DatasetRevisionSummary {
   rowCount?: number | null
   dataFileCount?: number | null

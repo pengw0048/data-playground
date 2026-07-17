@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from hub import db, graph as graph_mod, metadb
 from hub.backends import DatasetRevisionAdapter
+from hub.models import dataset_ref_identity
+from hub.plugins.adapters import revision_adapter_for_uri
 
 _MANIFEST_FIELDS = {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
 
@@ -60,11 +62,15 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
         source_uri = str(config.get("uri") or "") if isinstance(config, dict) else ""
         source_binding = metadb.catalog_revision_binding_for_uri(source_uri)
         dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
+        try:
+            selected_identity = (dataset_ref_identity(dataset_ref)
+                                 if isinstance(dataset_ref, dict) else None)
+        except ValueError as exc:
+            raise LocalRunInputError("local run input manifest does not match the graph") from exc
         if (source_binding is None
                 or str(source_binding["dataset_id"]) != item["dataset_id"]
-                or (isinstance(dataset_ref, dict) and (
-                    str(dataset_ref.get("datasetId") or "") != item["dataset_id"]
-                    or str(dataset_ref.get("revisionId") or "") != item["revision_id"]))):
+                or (selected_identity is not None and selected_identity != (
+                    item["dataset_id"], item["revision_id"]))):
             raise LocalRunInputError("local run input manifest does not match the graph")
         try:
             binding = metadb.catalog_revision_binding(item["dataset_id"])
@@ -74,7 +80,7 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             raise LocalRunInputError("local run input revision is unavailable")
         uri = str(binding["uri"])
         try:
-            adapter = resolve_adapter(uri)
+            adapter = revision_adapter_for_uri(uri, resolve_adapter)
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         if (not isinstance(adapter, DatasetRevisionAdapter)

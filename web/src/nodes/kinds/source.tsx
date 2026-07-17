@@ -7,7 +7,7 @@ import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api, KernelError } from '../../api/client'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
-import type { DatasetRef } from '../../types/graph'
+import { datasetRefIdentity, type DatasetRef } from '../../types/graph'
 
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
@@ -195,6 +195,11 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const [historyError, setHistoryError] = useState('')
   const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
   const [detailState, setDetailState] = useState<'idle' | 'checking' | 'available' | 'unavailable'>('idle')
+  const [capabilitiesChecking, setCapabilitiesChecking] = useState(true)
+  const [asOfAvailable, setAsOfAvailable] = useState(false)
+  const [asOfLocal, setAsOfLocal] = useState('')
+  const [asOfResolving, setAsOfResolving] = useState(false)
+  const [asOfError, setAsOfError] = useState('')
 
   // #279 deliberately owns only the built-in Lance journey. Other exact-revision providers keep
   // their Catalog history UI but do not gain a Source configuration surface here.
@@ -203,22 +208,36 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     const generation = ++historyGeneration.current
     let live = true
     setOpen(false); setRevisions([]); setCursor(null); setHasMore(false); setHistoryError('')
-    if (!lance) { setAvailability('unavailable'); return () => { live = false } }
-    setAvailability('checking')
-    api.datasetRevisions(table.id, { limit: 20 }).then((page) => {
+    setAsOfError(''); setAsOfAvailable(false); setAsOfResolving(false); setCapabilitiesChecking(true)
+    api.datasetRevisionCapabilities(table.id).then((capabilities) => {
       if (!live || generation !== historyGeneration.current) return
-      setRevisions(page.items)
-      setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
-      setAvailability('available')
-    }).catch((error) => {
-      if (!live || generation !== historyGeneration.current) return
-      if (error instanceof KernelError && (error.status === 410 || error.status === 501)) {
-        setAvailability('unavailable')
-      } else {
-        setHistoryError(error instanceof Error ? error.message : String(error))
-        setAvailability('error')
-      }
+      setAsOfAvailable(capabilities.selectors.includes('as_of')
+        && capabilities.asOfOrdering === 'latest_committed_at_at_or_before'
+        && capabilities.timezone === 'UTC')
+    }).catch(() => {
+      if (live && generation === historyGeneration.current) setAsOfAvailable(false)
+    }).finally(() => {
+      if (live && generation === historyGeneration.current) setCapabilitiesChecking(false)
     })
+    if (lance) {
+      setAvailability('checking')
+      api.datasetRevisions(table.id, { limit: 20 }).then((page) => {
+        if (!live || generation !== historyGeneration.current) return
+        setRevisions(page.items)
+        setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+        setAvailability('available')
+      }).catch((error) => {
+        if (!live || generation !== historyGeneration.current) return
+        if (error instanceof KernelError && (error.status === 410 || error.status === 501)) {
+          setAvailability('unavailable')
+        } else {
+          setHistoryError(error instanceof Error ? error.message : String(error))
+          setAvailability('error')
+        }
+      })
+    } else {
+      setAvailability('unavailable')
+    }
     return () => { live = false }
   }, [table.id, table.uri, lance, request])
 
@@ -226,15 +245,46 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     let live = true
     setDetail(null)
     if (!selected) { setDetailState('idle'); return () => { live = false } }
+    const exact = datasetRefIdentity(selected)
     setDetailState('checking')
-    api.datasetRevision(selected.datasetId, selected.revisionId).then((next) => {
+    api.datasetRevision(exact.datasetId, exact.revisionId).then((next) => {
       if (!live) return
       setDetail(next); setDetailState('available')
     }).catch(() => {
       if (live) setDetailState('unavailable')
     })
     return () => { live = false }
-  }, [selected?.datasetId, selected?.revisionId])
+  }, [selected])
+
+  const resolveAsOf = async () => {
+    const requested = new Date(`${asOfLocal}Z`)
+    if (!asOfLocal || Number.isNaN(requested.getTime())) {
+      setAsOfError('Choose a valid UTC date and time.'); return
+    }
+    const generation = historyGeneration.current
+    const asOf = requested.toISOString()
+    setAsOfResolving(true); setAsOfError('')
+    try {
+      const resolved = await api.resolveDatasetRevision(table.id, asOf)
+      if (generation !== historyGeneration.current) return
+      if (resolved.selector !== 'as_of' || !resolved.committedAt) {
+        throw new Error('Provider returned ambiguous ordering evidence.')
+      }
+      onChange({ kind: 'as_of', asOf, resolved: { ...resolved, selector: 'as_of' } })
+      setOpen(false)
+    } catch (error) {
+      if (generation !== historyGeneration.current) return
+      if (error instanceof KernelError && error.status === 410) {
+        setAsOfError('No retained revision exists at or before that instant.')
+      } else if (error instanceof KernelError && error.status === 409) {
+        setAsOfError('The provider could not prove one exact revision for that instant.')
+      } else {
+        setAsOfError(error instanceof Error ? error.message : String(error))
+      }
+    } finally {
+      if (generation === historyGeneration.current) setAsOfResolving(false)
+    }
+  }
 
   const loadMore = async () => {
     if (!cursor || loadingMore) return
@@ -255,18 +305,24 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     }
   }
 
-  const controlLabel = availability === 'checking' ? 'Checking revision history…'
-    : availability === 'unavailable' ? 'Revision pinning unavailable'
-      : selected ? `Change pinned revision ${selected.revisionId}` : 'Pin exact revision'
+  const selectedExact = selected ? datasetRefIdentity(selected) : null
+  const controlAvailable = availability === 'available' || asOfAvailable
+  const checking = availability === 'checking' || capabilitiesChecking
+  const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
+    : !controlAvailable ? 'Revision selection unavailable'
+      : selected?.kind === 'as_of' ? `As of ${new Date(selected.asOf).toLocaleString()} → ${selectedExact?.revisionId}`
+        : selectedExact ? `Change pinned revision ${selectedExact.revisionId}`
+          : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
+            : asOfAvailable ? 'Choose revision as of a time' : 'Pin exact revision'
 
   return (
     <div className="mt-1.5" data-testid={`source-revision-${nodeId}`}>
-      <button ref={anchorRef} type="button" disabled={!canEdit || availability !== 'available'}
+      <button ref={anchorRef} type="button" disabled={!canEdit || !controlAvailable}
         title={controlLabel} onClick={(event) => { event.stopPropagation(); setOpen((value) => !value) }}
         className="flex w-full items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-left text-[10px] text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60">
         <Icon name="clock" size={11} />
         <span className="min-w-0 flex-1 truncate">{controlLabel}</span>
-        {availability === 'available' && <Icon name="chevronDown" size={10} />}
+        {controlAvailable && <Icon name="chevronDown" size={10} />}
       </button>
       {availability === 'error' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
@@ -274,33 +330,33 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           <button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button>
         </div>
       )}
-      {selected && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Resolving pinned revision {selected.revisionId}…</div>}
+      {selectedExact && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Opening selected revision {selectedExact.revisionId}…</div>}
       {selected && detailState === 'available' && detail && (
         <div className="mt-1 break-all text-[9.5px] text-muted-foreground">
-          Pinned exact revision {detail.revisionId} · {detail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows
+          {selected.kind === 'as_of' ? `As-of intent ${new Date(selected.asOf).toLocaleString()} resolved once to` : 'Pinned exact'} revision {detail.revisionId} · {detail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows
         </div>
       )}
-      {selected && detailState === 'unavailable' && (
+      {selectedExact && detailState === 'unavailable' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Pinned revision {selected.revisionId} is unavailable. Selection preserved; choose another revision or{' '}
+          Selected revision {selectedExact.revisionId} is unavailable. Selection preserved; choose another revision or{' '}
           <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow latest</button>.
         </div>
       )}
-      <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={280} maxHeight={300}>
-        <div className="px-2 py-1 text-[10px] text-muted-foreground">Select one retained Lance revision. The Source will never retarget it to latest.</div>
+      <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
+        <div className="px-2 py-1 text-[10px] text-muted-foreground">Persist one exact provider revision. The Source will never retarget it to latest.</div>
         {selected && (
           <button type="button" onClick={() => { onChange(undefined); setOpen(false) }}
             className="w-full rounded-md px-2 py-1.5 text-left text-[11px] font-semibold text-primary hover:bg-accent">
             Follow latest instead
           </button>
         )}
-        {revisions.length === 0 && <div className="px-2 py-2 text-[11px] text-muted-foreground">No retained revisions.</div>}
+        {availability === 'available' && revisions.length === 0 && <div className="px-2 py-2 text-[11px] text-muted-foreground">No retained revisions.</div>}
         {revisions.map((revision, index) => {
-          const active = selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
+          const active = selectedExact?.datasetId === revision.datasetId && selectedExact.revisionId === revision.revisionId
           return (
             <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
               aria-pressed={active} onClick={() => {
-                onChange({ datasetId: revision.datasetId, revisionId: revision.revisionId }); setOpen(false)
+                onChange({ kind: 'exact', datasetId: revision.datasetId, revisionId: revision.revisionId }); setOpen(false)
               }} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`}>
               <span className="dp-mono min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground">{revision.revisionId}</span>
               {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest retained</span>}
@@ -314,6 +370,21 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
             {loadingMore ? 'Loading…' : historyError ? 'Retry loading more' : 'Load more retained revisions'}
           </button>
         )}
+        {asOfAvailable && <div className="mt-1 border-t border-border px-2 pt-2">
+          <div className="text-[10.5px] font-semibold text-foreground">Resolve as of a timestamp</div>
+          <div className="mt-0.5 text-[9.5px] text-muted-foreground">
+            Select the latest provider commit at or before this UTC instant (inclusive). The saved intent remains UTC.
+          </div>
+          <div className="mt-1.5 flex gap-1">
+            <input type="datetime-local" step={1} value={asOfLocal} onChange={(event) => setAsOfLocal(event.target.value)}
+              aria-label="As-of UTC date and time" className="min-w-0 flex-1 rounded border border-border bg-card px-1.5 py-1 text-[10.5px]" />
+            <button type="button" disabled={!asOfLocal || asOfResolving} onClick={() => void resolveAsOf()}
+              className="rounded bg-primary px-2 py-1 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">
+              {asOfResolving ? 'Resolving…' : 'Resolve once'}
+            </button>
+          </div>
+          {asOfError && <div role="alert" className="mt-1 text-[9.5px] text-destructive">{asOfError}</div>}
+        </div>}
       </Popover>
     </div>
   )
