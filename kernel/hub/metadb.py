@@ -7810,6 +7810,11 @@ def reserve_linear_checkpoint_candidate(
             lock_protected=lock_token is not None, state="writing",
             writer_run_id=task.id, writer_token=writer_token, created_at=now)
         s.add(artifact)
+        # DurableCheckpoint has scalar foreign-key fields rather than an ORM relationship, so
+        # SQLAlchemy cannot infer that this insert must precede the candidate binding update.
+        # PostgreSQL enforces the FK immediately; establish the artifact authority first while
+        # retaining both writes in this transaction.
+        s.flush()
         checkpoint.phase = "reserved"
         checkpoint.candidate_uri = uri
         checkpoint.candidate_generation = generation
