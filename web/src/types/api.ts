@@ -163,17 +163,31 @@ export interface WorkspaceResource {
   placementId?: string | null
   version?: number | null
   detached: boolean
+  source: 'local' | 'provider'
+  mountId?: string | null
+  provider?: string | null
+  resourceId?: string | null
+}
+export interface WorkspaceSourceStatus {
+  id: string
+  kind: 'local' | 'provider' | 'configuration'
+  completeness: 'complete' | 'page' | 'pending' | 'partial' | 'unavailable' | 'unsupported'
+  mountId?: string | null
+  provider?: string | null
+  error?: string | null
 }
 export interface WorkspaceBrowsePage {
-  container: WorkspaceResource
+  container: WorkspaceResource | null
   items: WorkspaceResource[]
   nextCursor?: string | null
   hasMore: boolean
-  completeness: 'complete' | 'page'
+  completeness: 'complete' | 'page' | 'partial'
+  sources: WorkspaceSourceStatus[]
 }
 export interface WorkspaceResourceResolution {
-  resource: WorkspaceResource
+  resource: WorkspaceResource | null
   ancestors: WorkspaceResource[]
+  source: WorkspaceSourceStatus
 }
 export interface WorkspaceCreateCanvasResult {
   ok: boolean

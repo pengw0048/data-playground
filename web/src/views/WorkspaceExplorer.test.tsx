@@ -25,6 +25,9 @@ const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const,
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
 const DATASET = { id: 'dataset:dataset-1', kind: 'dataset' as const, name: 'observations', parentId: FOLDER.id, placementId: 'dataset-placement', version: 1, detached: false }
 const CANVAS = { id: 'canvas:canvas-1', kind: 'canvas' as const, name: 'Analysis', parentId: ROOT.id, placementId: 'canvas-placement', version: 3, detached: false }
+const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder' }
+const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset' }
+const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mountId: 'warehouse', provider: 'fixture', completeness: 'complete' as const, error: null }
 
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
@@ -33,8 +36,8 @@ describe('WorkspaceExplorer', () => {
     store.files = []
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
-    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER] })
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
+    mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
   })
   afterEach(() => cleanup())
@@ -173,5 +176,89 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByText('Research')).toBeInTheDocument()
     fireEvent.click(screen.getByText('Retry load more'))
     expect(await screen.findByText('observations')).toBeInTheDocument()
+  })
+
+  it('labels duplicate external names by mount and opens the exact stable identity', async () => {
+    const duplicate = { ...EXTERNAL_DATASET, id: 'dataset:external.other-dataset', mountId: 'archive', resourceId: 'same-provider-id' }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [EXTERNAL_DATASET, duplicate], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [
+        { id: 'local', kind: 'local', completeness: 'complete' },
+        PROVIDER_COMPLETE,
+        { ...PROVIDER_COMPLETE, id: 'mount:archive', mountId: 'archive' },
+      ],
+    })
+    render(<WorkspaceExplorer />)
+
+    const archive = await screen.findByRole('button', { name: 'Open dataset observations from Mount archive · fixture' })
+    expect(screen.getByRole('button', { name: 'Open dataset observations from Mount warehouse · fixture' })).toBeVisible()
+    fireEvent.click(archive)
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(duplicate.id)
+  })
+
+  it('keeps local content visible and reports an offline mount as partial', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'partial',
+      sources: [
+        { id: 'local', kind: 'local', completeness: 'complete' },
+        { id: 'mount:warehouse', kind: 'provider', mountId: 'warehouse', provider: 'fixture', completeness: 'unavailable', error: 'deadline exceeded' },
+      ],
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('Research')).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Some sources are incomplete')
+    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Mount warehouse · fixture · unavailable — deadline exceeded')
+  })
+
+  it('opens external dataset detail without catalog lookup or provider writes', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Read-only mount warehouse · fixture')
+    expect(detail).toHaveTextContent('Create, move, delete, and dataset-use actions are unavailable')
+    expect(screen.getByRole('button', { name: 'New canvas here' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'New canvas here' })).toHaveAttribute('title', 'Read-only external mounts do not support creating canvases')
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    expect(mocks.workspaceAddDataset).not.toHaveBeenCalled()
+    expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('preserves an external selection and ancestors when its refresh becomes unavailable', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource
+      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT], source: { ...PROVIDER_COMPLETE, completeness: 'partial', error: 'ancestor read interrupted' } })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('dialog', { name: 'observations' })).toBeVisible()
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Remote')
+    fireEvent.click(screen.getByTestId('workspace-reload'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('ancestor read interrupted')
+    expect(screen.getByRole('dialog', { name: 'observations' })).toBeVisible()
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Remote')
+    expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('external.mount-folder', { limit: 50, cursor: undefined })
+  })
+
+  it('allows an initially unavailable external deep link to retry instead of loading forever', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: null, ancestors: [],
+      source: { ...PROVIDER_COMPLETE, completeness: 'unavailable', error: 'provider offline' },
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('provider offline')
+    expect(screen.queryByText('Loading Workspace…')).not.toBeInTheDocument()
+    expect(screen.getByText('This Workspace location is unavailable.')).toBeVisible()
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).toBeEnabled()
+    fireEvent.click(retry)
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
   })
 })
