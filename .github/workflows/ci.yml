@@ -163,11 +163,14 @@ jobs:
           hub/tests/test_backend_source_pins.py
           hub/tests/test_catalog_folders.py
           hub/tests/test_lineage_facts.py
-          hub/tests/test_managed_local_file_revisions.py
           hub/tests/test_settings_batches.py
           hub/tests/test_run_identity.py
           hub/tests/test_object_lifecycle.py
           hub/tests/test_workspace_storage.py
+      - name: Verify typed local write contracts on PostgreSQL
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_managed_local_file_revisions.py -k typed_local
       - name: Verify durable Ray Jobs lifecycle on PostgreSQL
         # The PostgreSQL-gated Ray Jobs races skip on SQLite, so kernel-tests never runs them; select
         # them here by name so a regression cannot pass CI while every check stays green.
