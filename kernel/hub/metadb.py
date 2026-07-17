@@ -422,9 +422,13 @@ class DurableCheckpoint(Base):
             "(phase IN ('reserved','committed') AND candidate_uri IS NOT NULL)",
             name="ck_durable_checkpoint_phase_binding"),
         CheckConstraint(
-            "(phase <> 'committed' AND committed_rows IS NULL AND committed_bytes IS NULL "
+            # pending: no evidence and no inode. reserved: no committed evidence, but materialized
+            # candidate_dev/ino may already be bound before the fenced commit (#450).
+            "(phase = 'pending' AND committed_rows IS NULL AND committed_bytes IS NULL "
             "AND content_sha256 IS NULL AND schema_sha256 IS NULL AND committed_at IS NULL "
             "AND candidate_dev IS NULL AND candidate_ino IS NULL) OR "
+            "(phase = 'reserved' AND committed_rows IS NULL AND committed_bytes IS NULL "
+            "AND content_sha256 IS NULL AND schema_sha256 IS NULL AND committed_at IS NULL) OR "
             "(phase = 'committed' AND committed_rows IS NOT NULL AND committed_bytes IS NOT NULL "
             "AND content_sha256 IS NOT NULL AND schema_sha256 IS NOT NULL "
             "AND committed_at IS NOT NULL "
@@ -7982,6 +7986,11 @@ def commit_linear_checkpoint(
                 or existing["writer_token"] != writer_token
                 or existing["lock_token"] != lock_token):
             raise RuntimeError("checkpoint commit does not match the reserved candidate")
+        # When materialization identity was bound before commit (#450), the held-FD evidence must
+        # name the exact same inode — a path swap cannot establish a different committed identity.
+        if existing["dev"] is not None or existing["ino"] is not None:
+            if (existing["dev"], existing["ino"]) != (dev, ino):
+                raise RuntimeError("checkpoint commit disagrees with materialized identity")
         artifact = s.get(LocalResultArtifact, existing["uri"], with_for_update=True)
         if (artifact is None or artifact.state != "writing"
                 or artifact.committed_at is not None
@@ -8010,6 +8019,54 @@ def commit_linear_checkpoint(
         checkpoint.updated_at = now
         s.flush()
         return _linear_checkpoint_committed_doc(s, task, checkpoint)
+
+
+def bind_linear_checkpoint_materialization(
+        *, task_id: str, attempt_id: str, owner_token: str,
+        uri: str, dev: int, ino: int) -> dict:
+    """Persist the exact materialized inode for a reserved candidate before commit or crash.
+
+    Identity is proven from a held descriptor at materialize/seal time. Reattach and commit refuse
+    any later path swap that disagrees with this binding (#450).
+    """
+    task_id, attempt_id, owner_token = str(task_id), str(attempt_id), str(owner_token)
+    uri = str(uri)
+    if (not isinstance(dev, int) or isinstance(dev, bool) or dev < 0
+            or not isinstance(ino, int) or isinstance(ino, bool) or ino < 0):
+        raise ValueError("checkpoint materialization identity is not canonical")
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        latest = _linear_checkpoint_latest_attempt(s, task_id)
+        if (task is None or checkpoint is None or latest is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        if checkpoint.phase == "committed":
+            committed = _linear_checkpoint_committed_doc(s, task, checkpoint)
+            if (committed["dev"], committed["ino"]) != (dev, ino) or committed["uri"] != uri:
+                raise RuntimeError("materialization binding disagrees with committed identity")
+            return committed
+        now = _durable_task_db_now(s)
+        lease = latest.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task.status != "running" or latest.id != attempt_id
+                or latest.status != "running" or latest.owner_token != owner_token
+                or lease is None or lease <= now):
+            raise RuntimeError("checkpoint materialization owner is stale or fenced")
+        candidate = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        if candidate is None or candidate["uri"] != uri or candidate["attempt_id"] != attempt_id:
+            raise RuntimeError("checkpoint materialization does not match the reserved candidate")
+        if candidate["dev"] is not None or candidate["ino"] is not None:
+            if (candidate["dev"], candidate["ino"]) != (dev, ino):
+                raise RuntimeError("checkpoint materialization identity changed")
+            return candidate
+        checkpoint.candidate_dev = int(dev)
+        checkpoint.candidate_ino = int(ino)
+        checkpoint.updated_at = now
+        s.flush()
+        return _linear_checkpoint_candidate_doc(s, task, checkpoint)
 
 
 def reconcile_linear_checkpoint(task_id: str) -> dict | None:
@@ -8404,6 +8461,18 @@ def release_local_result_read(uri: str, namespace_id: str, reader_id: str) -> No
             s.delete(ref)
 
 
+def _uri_bound_as_checkpoint_candidate(s, uri: str) -> bool:
+    """A durable_checkpoints.candidate_uri binding is a live reclaim reference (#449)."""
+    return s.scalar(select(DurableCheckpoint.task_id).where(
+        DurableCheckpoint.candidate_uri == uri).limit(1)) is not None
+
+
+def _checkpoint_candidate_uri_exists():
+    """SQL EXISTS correlating a local-result URI to a live checkpoint candidate binding."""
+    return select(DurableCheckpoint.candidate_uri).where(
+        DurableCheckpoint.candidate_uri == LocalResultArtifact.uri).exists()
+
+
 def local_result_lock_candidates(
         namespace_id: str, *, limit: int = 50) -> list[tuple[str, str, str]]:
     """Bounded, rotating set of process-owned artifacts needing death reconciliation."""
@@ -8415,11 +8484,14 @@ def local_result_lock_candidates(
     ).exists()
     with session() as s:
         registry = _lock_local_result_registry(s)
+        # Never clear the writer fence of a live checkpoint candidate: reclaim would then delete the
+        # exact file #426 must reattach after crash (#449).
         predicates = (
             LocalResultArtifact.namespace_id == namespace_id,
             LocalResultArtifact.lock_protected.is_(True),
             LocalResultArtifact.state.in_(("writing", "ready")),
             or_(LocalResultArtifact.writer_run_id.is_not(None), lease_exists),
+            ~_checkpoint_candidate_uri_exists(),
         )
         cursor = registry.lock_cursor_uri
         rows = list(s.scalars(select(LocalResultArtifact).where(
@@ -8441,6 +8513,9 @@ def reconcile_dead_local_result(uri: str, namespace_id: str, lock_name: str) -> 
         row = s.get(LocalResultArtifact, uri, with_for_update=True)
         if (row is None or row.namespace_id != namespace_id
                 or row.lock_name != lock_name or row.state == "deleting"):
+            return
+        # Defense in depth for #449: a candidate binding is not proof the writer died.
+        if _uri_bound_as_checkpoint_candidate(s, uri):
             return
         row.writer_run_id = row.writer_token = None
         for ref in s.scalars(select(LocalResultReference).where(
@@ -8497,16 +8572,21 @@ def claim_local_result_reclaims(
         remaining = limit - len(claimed)
         no_reference = ~select(LocalResultReference.uri).where(
             LocalResultReference.uri == LocalResultArtifact.uri).exists()
+        # A durable_checkpoints.candidate_uri binding is a reclaim reference even with no
+        # LocalResultReference row yet (uncommitted reserved candidates, #449).
+        no_checkpoint = ~_checkpoint_candidate_uri_exists()
         rows = list(s.scalars(select(LocalResultArtifact).where(
             LocalResultArtifact.namespace_id == namespace_id,
             LocalResultArtifact.lock_protected.is_(True),
             LocalResultArtifact.state.in_(("writing", "ready")),
-            LocalResultArtifact.writer_run_id.is_(None), no_reference,
+            LocalResultArtifact.writer_run_id.is_(None), no_reference, no_checkpoint,
         ).order_by(LocalResultArtifact.created_at, LocalResultArtifact.uri)
           .limit(remaining).with_for_update()))
         for row in rows:
             if s.scalar(select(LocalResultReference.uri).where(
                     LocalResultReference.uri == row.uri).limit(1)) is not None:
+                continue
+            if _uri_bound_as_checkpoint_candidate(s, row.uri):
                 continue
             row.state = "deleting"
             row.writer_run_id = row.writer_token = None
@@ -8590,6 +8670,8 @@ def delete_local_result(uri: str, namespace_id: str, delete_token: str, delete_f
         if s.scalar(select(LocalResultReference.uri).where(
                 LocalResultReference.uri == uri).limit(1)) is not None:
             raise RuntimeError("cannot delete a referenced local result")
+        if _uri_bound_as_checkpoint_candidate(s, uri):
+            raise RuntimeError("cannot delete a checkpoint-bound local result")
         delete_file()
         s.delete(row)
         return True
