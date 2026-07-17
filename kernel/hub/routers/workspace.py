@@ -8,10 +8,11 @@ secure-default boundary.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 from typing import Callable, Hashable, Literal, TypeVar
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,6 +25,7 @@ from hub.models import (
     CredUpsert,
     RunHistoryRecord,
     RunStatus,
+    WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceResourceResolution,
     WorkspaceSearchPage,
@@ -669,6 +671,37 @@ def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunHis
     if metadb.canvas_role(canvas_id, uid) is None:  # same authz as the other canvas endpoints
         raise HTTPException(404, "not found")
     return [RunHistoryRecord.model_validate(record) for record in metadb.list_runs(canvas_id)]
+
+
+@router.get("/jobs", response_model=WorkspaceRunPage)
+def workspace_jobs(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=4096),
+        status: Literal["queued", "running", "done", "failed", "cancelled"] | None = None,
+        canvas_id: str | None = Query(default=None, max_length=512),
+        node_id: str | None = Query(default=None, max_length=256),
+        run_id: str | None = Query(default=None, max_length=512),
+        backend: str | None = Query(default=None, max_length=256),
+        after: datetime.datetime | None = None,
+        before: datetime.datetime | None = None,
+        q: str | None = Query(default=None, max_length=256),
+        uid: str = Depends(current_user)) -> WorkspaceRunPage:
+    """Bounded read-only history across every canvas the caller can currently access."""
+    if after is not None and (after.tzinfo is None or after.utcoffset() is None):
+        raise HTTPException(422, "after must include a timezone")
+    if before is not None and (before.tzinfo is None or before.utcoffset() is None):
+        raise HTTPException(422, "before must include a timezone")
+    if after is not None and before is not None and after > before:
+        raise HTTPException(422, "after must not be later than before")
+    try:
+        page = metadb.list_workspace_runs(
+            uid, limit=limit, cursor=cursor, status=status,
+            canvas_id=canvas_id, node_id=node_id, run_id=run_id, backend=backend,
+            recorded_after=after, recorded_before=before, text=q,
+        )
+        return WorkspaceRunPage.model_validate(page)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @router.get("/canvas/{canvas_id}/active-runs", response_model=list[RunStatus])

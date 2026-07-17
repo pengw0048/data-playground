@@ -24,4 +24,15 @@ describe('Workspace routes', () => {
     window.location.hash = '#/tables'
     expect(parseHash()).toEqual({ view: 'workspace' })
   })
+
+  it('round-trips Jobs filters and run/artifact deep-link identity', () => {
+    const query = new URLSearchParams({ status: 'failed', canvas: 'canvas-1', run: 'run-1', output: 'write:out' }).toString()
+    window.location.hash = routeHash('jobs', undefined, undefined, undefined, query)
+    expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: query })
+  })
+
+  it('round-trips a canvas node deep link', () => {
+    window.location.hash = routeHash('canvas', 'canvas-1', undefined, undefined, undefined, 'write-1')
+    expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'canvas-1', nodeId: 'write-1' })
+  })
 })

@@ -2165,6 +2165,19 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().past).toHaveLength(0)
   })
 
+  it('preserves a valid node selection when reopening the same canvas', async () => {
+    const doc = { id: 'shared', version: 2, name: 'shared', nodes: [NODE('a')], edges: [] }
+    useStore.setState({ doc: { ...doc, version: 1 }, selectedId: 'a', selectedIds: ['a'] })
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: 'shared', name: 'shared', version: 2, role: 'owner' },
+    ])
+
+    expect(await useStore.getState().openFile('shared')).toBe(true)
+
+    expect(useStore.getState().selectedId).toBe('a')
+  })
+
   it('lets only the latest overlapping file-open navigation install a document', async () => {
     let finishA!: (doc: ReturnType<typeof emptyTestDoc>) => void
     const a = new Promise<ReturnType<typeof emptyTestDoc>>((resolve) => { finishA = resolve })
