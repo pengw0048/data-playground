@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url'
 import { MIN_VIEWPORT } from '../support/min-viewport'
 import { backToWorkspace, workspaceResource } from './support/workspace'
 
+const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
+
 // Smoke that every core desktop surface remains visible, unclipped, and operable at the declared
 // minimum viewport (docs/BROWSER_SUPPORT.md ↔ web/support/min-viewport.ts).
 
@@ -70,9 +72,12 @@ test.describe('minimum viewport support', () => {
     expect(doc).toContain('web/support/min-viewport.ts')
   })
 
-  test('core surfaces stay visible and operable at the declared minimum', async ({ page }) => {
+  test('core surfaces stay visible and operable at the tested desktop viewport', async ({ page }, testInfo) => {
     const vp = page.viewportSize()
-    expect(vp, 'Playwright project must pin MIN_VIEWPORT').toEqual(MIN_VIEWPORT)
+    const expectedViewport = testInfo.project.name === 'chromium-reference-viewport'
+      ? REFERENCE_VIEWPORT
+      : MIN_VIEWPORT
+    expect(vp, 'Playwright project must pin an exercised desktop viewport').toEqual(expectedViewport)
 
     await goToWorkspaceShell(page)
 
@@ -94,6 +99,14 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await page.keyboard.press('Escape')
     await expect(settings).toHaveCount(0)
+
+    // Browse and inspect a dataset without the detail drawer hiding its close/use actions.
+    await (await workspaceResource(page, 'dataset', process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events')).click()
+    const detail = page.getByRole('dialog', { name: process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events' })
+    await expectFullyInViewport(page, detail, 'dataset detail')
+    await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
+    await expectFullyInViewport(page, detail.getByRole('button', { name: 'Close' }), 'dataset detail close')
+    await detail.getByRole('button', { name: 'Close' }).click()
 
     // Canvas with at least one node, inspector, data panel, run controls.
     await openCanvasWithSource(page)
@@ -127,9 +140,94 @@ test.describe('minimum viewport support', () => {
     await runPanel.getByTitle('Close').click()
     await expect(runPanel).toHaveCount(0)
 
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Run history', { exact: true }).click()
+    const runHistory = page.getByRole('dialog').filter({ has: page.getByRole('heading', { name: 'Run history' }) })
+    await expectFullyInViewport(page, runHistory, 'run history')
+    await runHistory.getByRole('button', { name: 'Close' }).click()
+
     // Settings from the canvas app menu as well.
     await page.getByTestId('app-menu').click()
     await page.getByText('Settings', { exact: true }).click()
     await expectFullyInViewport(page, page.getByTestId('settings-modal'), 'settings modal (canvas)')
+  })
+
+  test('panel choices persist and the canvas tracks the real remaining viewport', async ({ page }) => {
+    await goToWorkspaceShell(page)
+    const rail = page.getByTestId('workspace-rail')
+    expect((await boxOf(rail)).width).toBeCloseTo(232, 0)
+    await page.getByTestId('rail-collapse').click()
+    await expect(page.getByRole('button', { name: 'Expand navigation' })).toBeVisible()
+    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+    await page.reload()
+    await expect(page.getByRole('button', { name: 'Expand navigation' })).toBeVisible()
+    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+
+    await openCanvasWithSource(page)
+    const inspector = page.getByTestId('inspector')
+    expect((await boxOf(inspector)).width).toBeCloseTo(300, 0)
+    await page.getByTestId('inspector-collapse').click()
+    await expect(page.getByRole('button', { name: 'Expand Inspector' })).toBeVisible()
+    expect((await boxOf(inspector)).width).toBeCloseTo(44, 0)
+
+    const flowBox = await boxOf(page.locator('.react-flow'))
+    const inspectorBox = await boxOf(inspector)
+    expect(flowBox.x + flowBox.width).toBeCloseTo(inspectorBox.x, 0)
+
+    await page.reload()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Expand Inspector' })).toBeVisible()
+    expect((await boxOf(inspector)).width).toBeCloseTo(44, 0)
+    await page.getByTestId('inspector-collapse').click()
+    await expect(page.getByRole('button', { name: 'Collapse Inspector' })).toBeVisible()
+
+    // React Flow's Fit View control operates inside the flexed canvas, whose right edge is the
+    // current Inspector edge. The fitted node must remain inside that real region.
+    await page.locator('.react-flow__controls-fitview').click()
+    const fittedFlow = await boxOf(page.locator('.react-flow'))
+    const fittedNode = await boxOf(page.locator('.react-flow__node').first())
+    expect(fittedNode.x).toBeGreaterThanOrEqual(fittedFlow.x)
+    expect(fittedNode.x + fittedNode.width).toBeLessThanOrEqual(fittedFlow.x + fittedFlow.width)
+
+    // An already-open floating panel must be re-anchored after the Inspector changes width.
+    const node = page.locator('.react-flow__node').first()
+    await node.getByText('DATASET', { exact: true }).click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const dataPanel = page.getByTestId('panel-data')
+    await expect(dataPanel).toBeVisible()
+    await page.getByTestId('inspector-collapse').click()
+    await page.getByTestId('inspector-collapse').click()
+    await expect.poll(async () => {
+      const expandedInspector = await boxOf(inspector)
+      const repositionedPanel = await boxOf(dataPanel)
+      return repositionedPanel.x + repositionedPanel.width - expandedInspector.x
+    }).toBeLessThanOrEqual(0)
+  })
+
+  test('1024px browse and inspect stays navigable with compact chrome', async ({ page }) => {
+    await page.setViewportSize({ width: 1024, height: 720 })
+    await goToWorkspaceShell(page)
+
+    const rail = page.getByTestId('workspace-rail')
+    expect((await boxOf(rail)).width).toBeCloseTo(64, 0)
+    const main = page.getByRole('main')
+    expect((await boxOf(main)).width).toBeGreaterThan(900)
+    for (const id of ['rail-workspace', 'rail-transforms', 'rail-settings'] as const) {
+      await expectFullyInViewport(page, page.getByTestId(id), id)
+    }
+
+    const tableName = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
+    await (await workspaceResource(page, 'dataset', tableName)).click()
+    const detail = page.getByRole('dialog', { name: tableName })
+    await expectFullyInViewport(page, detail, '1024px dataset detail')
+    await expectFullyInViewport(page, detail.getByTestId('detail-use'), '1024px dataset use action')
+    await detail.getByRole('button', { name: 'Close' }).click()
+
+    await page.getByTestId('rail-collapse').click()
+    await expect(page.getByRole('button', { name: 'Collapse navigation' })).toBeVisible()
+    await page.reload()
+    await expect(page.getByRole('button', { name: 'Collapse navigation' })).toBeVisible()
+    await page.getByTestId('rail-settings').click()
+    await expectFullyInViewport(page, page.getByTestId('settings-modal'), '1024px settings')
   })
 })
