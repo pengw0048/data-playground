@@ -334,12 +334,10 @@ def test_checkpoint_constraints_pair_candidate_and_inode_state():
         with metadb.session() as session:
             row = session.get(metadb.DurableCheckpoint, task_id)
             row.candidate_dev, row.candidate_ino = -1, 2
-    with metadb.session() as session:
-        row = session.get(metadb.DurableCheckpoint, task_id)
-        row.candidate_dev, row.candidate_ino = 1, 2
-    with pytest.raises(RuntimeError, match="partial candidate"):
-        metadb.linear_checkpoint_admission(task_id)
-    with metadb.session() as session:
-        row = session.get(metadb.DurableCheckpoint, task_id)
-        row.candidate_dev = row.candidate_ino = None
+    # A pending checkpoint cannot carry committed device/inode identity: that is committed-only
+    # evidence, and a non-committed row must not hold half of it (0013 committed-evidence guard).
+    with pytest.raises(IntegrityError):
+        with metadb.session() as session:
+            row = session.get(metadb.DurableCheckpoint, task_id)
+            row.candidate_dev, row.candidate_ino = 1, 2
     assert metadb.linear_checkpoint_admission(task_id)["phase"] == "pending"

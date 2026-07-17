@@ -183,3 +183,106 @@ def test_postgres_linear_checkpoint_db_time_fencing_and_reservation_race(tmp_pat
         for error in errors
     )
     assert metadb.linear_checkpoint_candidate(admission["task_id"]) == winners[0]
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
+def test_postgres_linear_checkpoint_commit_is_single_owner_and_db_time_fenced(tmp_path):
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import linear_checkpoint as lc
+    from hub.storage import LocalStorage
+
+    suffix = uuid.uuid4().hex
+    uid, canvas_id, submission = f"cc-user-{suffix}", f"cc-canvas-{suffix}", str(uuid.uuid4())
+    task_id = metadb.local_run_submission_id(uid, canvas_id, submission)
+    key = f"write:{task_id}"
+    graph = {"id": canvas_id, "version": 1, "nodes": [
+        {"id": "checkpoint", "type": "write", "data": {
+            "title": "checkpoint", "config": {"filename": "checkpoint.parquet"}}},
+        {"id": "final", "type": "write", "data": {
+            "title": "final", "config": {"filename": "final.parquet"}}},
+    ], "edges": []}
+    intent = {
+        "destination": {"logicalUri": f"/tmp/{suffix}/final.parquet", "name": "final",
+                        "provider": "managed-local-file"},
+        "mode": "create", "expectedSchema": [], "idempotencyKey": key,
+        "partitions": [], "provenance": {"publication": {
+            "idempotencyKey": key, "runId": task_id, "producer": canvas_id,
+            "producerVersion": 1, "stepId": "final", "provenance": "run",
+            "fieldMappings": []}, "parents": []}}
+    with metadb.session() as session:
+        session.add(metadb.User(id=uid, name="Postgres checkpoint committer"))
+        session.flush()
+        session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Checkpoint", doc="{}"))
+    admission, _ = metadb.submit_linear_checkpoint_task(
+        uid=uid, canvas_id=canvas_id, submission_id=submission,
+        final_target_node_id="final", checkpoint_id=f"cc:{suffix}",
+        checkpoint_node_id="checkpoint", output_port_id="out",
+        task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
+        input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
+        graph_doc=graph, input_manifest=[], write_intent=intent)
+
+    store = LocalStorage(str(tmp_path / "outputs"))
+    claim = metadb.claim_linear_checkpoint_task(admission["task_id"], "current-owner")
+    attempt_id = claim["attempts"][-1]["id"]
+    candidate = metadb.reserve_linear_checkpoint_candidate(
+        task_id=admission["task_id"], attempt_id=attempt_id, owner_token="current-owner",
+        namespace_id=store.namespace_id, storage_root=store.result_root,
+        writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+
+    sink = io.BytesIO()
+    pq.write_table(pa.table({"id": pa.array([1, 2, 3], pa.int64())}), sink)
+    content = sink.getvalue()
+    writer = store.materialize_checkpoint(candidate)
+    writer.write(content)
+    writer.seal()
+    proof = store.open_checkpoint_proof(candidate["uri"], writer.lock_fileno())
+    evidence = proof.evidence
+
+    def commit(owner_token):
+        return metadb.commit_linear_checkpoint(
+            task_id=admission["task_id"], attempt_id=attempt_id, owner_token=owner_token,
+            namespace_id=candidate["namespace_id"], writer_token=candidate["writer_token"],
+            lock_token=candidate["lock_token"], generation=candidate["generation"],
+            rows=evidence["rows"], size_bytes=evidence["bytes"],
+            content_sha256=evidence["content_sha256"], schema_sha256=evidence["schema_sha256"],
+            dev=evidence["dev"], ino=evidence["ino"])
+
+    # DB-time fencing: an expired lease cannot record the commit.
+    with metadb.session() as session:
+        session.get(metadb.DurableTaskAttempt, attempt_id).lease_until = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
+    with pytest.raises(RuntimeError, match="stale or fenced"):
+        commit("current-owner")
+    with metadb.session() as session:
+        session.get(metadb.DurableTaskAttempt, attempt_id).lease_until = (
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60))
+
+    # Duplicate concurrent commits install exactly one owner and return identical evidence.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(commit, "current-owner") for _ in range(8)]
+    docs = [future.result() for future in futures]
+    proof.recheck()
+    proof.close()
+    writer.release()
+
+    assert all(doc == docs[0] for doc in docs)
+    assert docs[0]["phase"] == "committed"
+    with metadb.session() as session:
+        from sqlalchemy import func, select
+
+        owners = session.scalars(select(metadb.LocalResultReference.owner_kind).where(
+            metadb.LocalResultReference.uri == candidate["uri"])).all()
+        assert owners == [metadb._LINEAR_CHECKPOINT_OWNER_KIND]
+        assert session.scalar(select(func.count()).select_from(metadb.LocalResultArtifact).where(
+            metadb.LocalResultArtifact.uri == candidate["uri"],
+            metadb.LocalResultArtifact.state == "ready")) == 1
+    guard, reopened = lc.reopen_checkpoint(LocalStorage(str(tmp_path / "outputs")),
+                                           admission["task_id"])
+    try:
+        assert reopened.content_sha256 == evidence["content_sha256"]
+    finally:
+        guard.close()

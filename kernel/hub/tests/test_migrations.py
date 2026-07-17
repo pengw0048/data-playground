@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0013_linear_checkpoint_commit", "0012_linear_checkpoint_admission"),
         ("0012_linear_checkpoint_admission", "0011_external_wait_publication"),
         ("0011_external_wait_publication", "0010_durable_external_waits"),
         ("0010_durable_external_waits", "0009_durable_local_write_tasks"),
@@ -67,8 +68,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0012_linear_checkpoint_admission"]
-    assert metadb.expected_schema_head() == "0012_linear_checkpoint_admission"
+    assert scripts.get_heads() == ["0013_linear_checkpoint_commit"]
+    assert metadb.expected_schema_head() == "0013_linear_checkpoint_commit"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -107,6 +108,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0012_linear_checkpoint_admission.py": (
             "83237f57a39bdb92aa52d660aea9d7c4dddfc4bf7636ff18523b3fcec418214f"
+        ),
+        "0013_linear_checkpoint_commit.py": (
+            "628fda9d102d6ad024054139552ad9d83123081694bb967443843e8aad19aea4"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
