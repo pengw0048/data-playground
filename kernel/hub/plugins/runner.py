@@ -75,16 +75,9 @@ def _is_core_managed_object_sink(spec, uri: str, adapter) -> bool:
 
 def _is_core_managed_local_file_sink(spec, uri: str, adapter, storage) -> bool:
     """The default local overwrite shape published through the local revision ledger."""
-    from hub.plugins.adapters import is_object_uri
+    from hub.sinks import is_core_managed_local_file_sink
 
-    return (
-        not is_object_uri(uri) and spec.mode == "overwrite"
-        and not spec.partition_by
-        and spec.extension.lower() in (".parquet", ".pq")
-        and adapter.__class__.__module__ == "hub.plugins.adapters"
-        and callable(getattr(storage, "begin_result", None))
-        and callable(getattr(storage, "commit_result", None))
-    )
+    return is_core_managed_local_file_sink(spec, uri, adapter, storage)
 
 
 # Existing isolated-object transport imports this private predicate; keep its object-only meaning.
@@ -1433,7 +1426,8 @@ class LocalRunner:
         # no-op. append is NOT idempotent (it must add a part every run), so it never uses the cache.
         cached_output = sole_committed_document_output(cached)
         cached_binding = status.model_copy(deep=True)
-        if (spec.mode != "append" and cached_output is not None and cached_output.table
+        if (cfg.get("_admittedWriteIntent") is None
+                and spec.mode != "append" and cached_output is not None and cached_output.table
                 and cached_output.version is not None
                 and self._output_exists(str(cached_output.uri))
                 and apply_cached_output(cached_binding, cached) is not None):
@@ -1535,30 +1529,43 @@ class LocalRunner:
 
             if lineage is None:  # parent-owned transports are excluded by managed_local admission
                 raise RuntimeError("managed local-file write requires local provenance identity")
-            head = metadb.catalog_managed_local_write_head(logical_uri)
-            replacing = bool(
-                head is not None and head.get("state") == "active"
-                and head.get("revision_id"))
-            expected_head = (ExactDatasetRef(
-                kind="exact",
-                dataset_id=str(head["dataset_id"]),
-                revision_id=str(head["revision_id"]),
-            ) if replacing else None)
-            intent = WriteIntent(
-                destination=WriteDestination(
-                    logical_uri=logical_uri,
-                    name=spec.name,
-                    dataset_id=(str(head["dataset_id"]) if replacing else None),
-                ),
-                mode=("replace" if replacing else "create"),
-                expected_schema=relation_columns(parent_rel),
-                expected_head=expected_head,
-                idempotency_key=lineage.idempotency_key,
-                provenance=WriteProvenance(
-                    publication=lineage,
-                    parents=parent_uris,
-                ),
-            )
+            admitted = cfg.get("_admittedWriteIntent")
+            if admitted is None:
+                # Direct runner callers do not cross the HTTP admission seam. Keep that low-level API
+                # usable while every product run supplies the frozen intent below.
+                head = metadb.catalog_managed_local_write_head(logical_uri)
+                replacing = bool(
+                    head is not None and head.get("state") == "active"
+                    and head.get("revision_id"))
+                expected_head = (ExactDatasetRef(
+                    kind="exact",
+                    dataset_id=str(head["dataset_id"]),
+                    revision_id=str(head["revision_id"]),
+                ) if replacing else None)
+                intent = WriteIntent(
+                    destination=WriteDestination(
+                        logical_uri=logical_uri,
+                        name=spec.name,
+                        dataset_id=(str(head["dataset_id"]) if replacing else None),
+                    ),
+                    mode=("replace" if replacing else "create"),
+                    expected_schema=relation_columns(parent_rel),
+                    expected_head=expected_head,
+                    idempotency_key=lineage.idempotency_key,
+                    provenance=WriteProvenance(
+                        publication=lineage,
+                        parents=parent_uris,
+                    ),
+                )
+            else:
+                intent = WriteIntent.model_validate(admitted)
+                if (intent.destination.logical_uri != logical_uri
+                        or intent.destination.name != spec.name
+                        or intent.expected_schema != relation_columns(parent_rel)
+                        or intent.provenance.publication != lineage
+                        or intent.provenance.parents != parent_uris):
+                    raise RuntimeError(
+                        "managed local write admission does not match the executing graph")
             def write_candidate(candidate_uri: str) -> None:
                 committed_output_snapshot(
                     status, uri=candidate_uri, table=spec.name, rows=0)
@@ -1582,6 +1589,7 @@ class LocalRunner:
                 table=spec.name,
                 version=receipt.publication.catalog_version,
                 rows=receipt.rows,
+                write_receipt=receipt,
             )
             status.outputs = [committed_snapshot]
             return receipt.rows

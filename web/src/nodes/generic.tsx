@@ -83,7 +83,7 @@ export function numericDraftInvalidReason(
 
 /** Editable form fields for a node's non-code params (from the backend schema). Reused by the
  * generic node card and the Inspector so param editing stays in one place. */
-export function NodeParamFields({ nodeId }: { nodeId: string }) {
+export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; omitNames?: string[] }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
@@ -93,7 +93,9 @@ export function NodeParamFields({ nodeId }: { nodeId: string }) {
   // hide a conditional param whose showWhen dependency isn't met (e.g. batchFormat only for map_batches)
   const visible = (p: { showWhen?: { param: string; in: string[] } }) =>
     !p.showWhen || p.showWhen.in.includes(String(cfg[p.showWhen.param] ?? ''))
-  const editable = (backendSpecs[node?.type ?? '']?.params ?? []).filter((p) => p.type !== 'code' && visible(p))
+  const omitted = new Set(omitNames)
+  const editable = (backendSpecs[node?.type ?? '']?.params ?? []).filter(
+    (p) => p.type !== 'code' && visible(p) && !omitted.has(p.name))
   if (editable.length === 0) return null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>

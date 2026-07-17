@@ -414,6 +414,47 @@ export interface RunOutput {
   rows?: number | null
   error?: string | null
   sampleProvenance?: SampleProvenance | null
+  writeReceipt?: WriteReceipt | null
+}
+
+export interface WriteIntent {
+  destination: { logicalUri: string; name: string; datasetId?: string | null; provider: 'managed-local-file' }
+  mode: 'create' | 'replace'
+  expectedSchema: { name: string; type: string; capabilities?: string[] }[]
+  expectedHead?: { kind: 'exact'; datasetId: string; revisionId: string } | null
+  idempotencyKey: string
+  partitions: { field: string }[]
+  provenance: {
+    publication: { idempotencyKey: string; runId?: string | null; attemptId?: string | null; producer?: string | null; producerVersion?: number | null; stepId?: string | null; provenance: string }
+    parents: string[]
+  }
+}
+
+export interface WriteReceipt {
+  datasetId: string
+  revisionId: string
+  parentHead?: { kind: 'exact'; datasetId: string; revisionId: string } | null
+  head: { datasetId: string; revisionId: string; committedAt?: string | null; retentionOwner: string }
+  rows: number
+  bytes: number
+  schema: { name: string; type: string; capabilities?: string[] }[]
+  partitions: { field: string }[]
+  publication: { provider: string; logicalUri: string; artifactUri: string; publishSequence: number; idempotencyKey: string; catalogVersion?: string | null; backendVersion?: string | null }
+  durable: true
+}
+
+export interface WriteAdmission {
+  nodeId: string
+  managed: boolean
+  destination: string
+  mode: 'create' | 'replace' | 'overwrite' | 'append'
+  provider: string
+  expectedSchema: { name: string; type: string; capabilities?: string[] }[]
+  partitions: { field: string }[]
+  expectedHead?: { kind: 'exact'; datasetId: string; revisionId: string } | null
+  intent?: WriteIntent | null
+  recoveredReceipt?: WriteReceipt | null
+  blocker?: string | null
 }
 
 export interface RunInputManifestItem {

@@ -182,7 +182,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       {/* properties (reused generic param editor) */}
       <EditOnly enabled={canEdit}>
         <Section title="Properties">
-          <NodeParamFields nodeId={nodeId} />
+          <NodeParamFields nodeId={nodeId} omitNames={kind === 'write' ? ['writeMode'] : []} />
           {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
             <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
           )}
@@ -361,6 +361,9 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
   const destPath = String(cfg.destPath ?? '')
+  const admission = useStore((s) => s.runs[nodeId]?.writeAdmission)
+  const receipt = useStore((s) => s.runs[nodeId]?.status?.outputs
+    .find((output) => output.writeReceipt)?.writeReceipt)
   return (
     <Section title="Output">
       <div className="text-[11.5px] text-muted-foreground">
@@ -372,6 +375,27 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
       <div className="mt-2">
         <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
       </div>
+      {admission && (
+        <div aria-label="Write admission" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+          <div className="font-semibold text-foreground">
+            {admission.managed ? `${admission.mode} · ${admission.provider}` : `${admission.mode} · provider-neutral`}
+          </div>
+          <div className="dp-mono mt-0.5 break-all">{admission.destination}</div>
+          <div className="mt-0.5">
+            {admission.expectedSchema.length} schema field{admission.expectedSchema.length === 1 ? '' : 's'}
+            {admission.partitions.length ? ` · partitions ${admission.partitions.map((item) => item.field).join(', ')}` : ' · unpartitioned'}
+          </div>
+          {admission.expectedHead && <div className="dp-mono mt-0.5 break-all">expected revision {admission.expectedHead.revisionId}</div>}
+          {admission.blocker && <div className="mt-1 text-destructive">{admission.blocker}</div>}
+        </div>
+      )}
+      {receipt && (
+        <div aria-label="Write receipt" className="mt-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+          <div className="font-semibold text-foreground">durable revision {receipt.revisionId}</div>
+          <div className="dp-mono mt-0.5 break-all">dataset {receipt.datasetId}</div>
+          <div className="mt-0.5">{receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
+        </div>
+      )}
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />

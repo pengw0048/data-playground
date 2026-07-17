@@ -948,6 +948,25 @@
         "title": "DatasetRevisionDetail",
         "type": "object"
       },
+      "DatasetRevisionLastKnown": {
+        "description": "Bounded non-sensitive display evidence saved with an exact Source selection.",
+        "properties": {
+          "committedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committedat"
+          }
+        },
+        "title": "DatasetRevisionLastKnown",
+        "type": "object"
+      },
       "DatasetRevisionPage": {
         "properties": {
           "hasMore": {
@@ -1205,6 +1224,46 @@
           "graph"
         ],
         "title": "EstimateRequest",
+        "type": "object"
+      },
+      "ExactDatasetRef": {
+        "additionalProperties": false,
+        "description": "Opaque, path-independent identity for one exact retained dataset revision.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "exact",
+            "title": "Kind",
+            "type": "string"
+          },
+          "lastKnown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DatasetRevisionLastKnown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "datasetId",
+          "revisionId"
+        ],
+        "title": "ExactDatasetRef",
         "type": "object"
       },
       "FacetValue": {
@@ -2169,6 +2228,105 @@
           "uri"
         ],
         "title": "LineageNode",
+        "type": "object"
+      },
+      "LineagePublication": {
+        "description": "Catalog-local provenance supplied when one output becomes visible.\n\nThis is deliberately narrower than an execution request: it contains only the immutable identity\nneeded to create one fact per source in the catalog transaction. ``attempt_id`` remains null when a\nbackend has no execution attempt distinct from the logical run.",
+        "properties": {
+          "attemptId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attemptid"
+          },
+          "fieldMappings": {
+            "items": {
+              "$ref": "#/components/schemas/LineageFieldMapping"
+            },
+            "maxItems": 256,
+            "title": "Fieldmappings",
+            "type": "array"
+          },
+          "idempotencyKey": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Idempotencykey",
+            "type": "string"
+          },
+          "producer": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producer"
+          },
+          "producerVersion": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Producerversion"
+          },
+          "provenance": {
+            "enum": [
+              "run",
+              "manual",
+              "imported"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "runId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runid"
+          },
+          "stepId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stepid"
+          }
+        },
+        "required": [
+          "idempotencyKey",
+          "provenance"
+        ],
+        "title": "LineagePublication",
         "type": "object"
       },
       "LineageResult": {
@@ -3811,6 +3969,16 @@
             ],
             "title": "Wire",
             "type": "string"
+          },
+          "writeReceipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3910,6 +4078,16 @@
               }
             ],
             "title": "Targetnodeid"
+          },
+          "writeIntent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -5685,6 +5863,436 @@
           "completeness"
         ],
         "title": "WorkspaceSourceStatus",
+        "type": "object"
+      },
+      "WriteAdmission": {
+        "properties": {
+          "blocker": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blocker"
+          },
+          "destination": {
+            "title": "Destination",
+            "type": "string"
+          },
+          "expectedHead": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expectedSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 1024,
+            "title": "Expectedschema",
+            "type": "array"
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "managed": {
+            "title": "Managed",
+            "type": "boolean"
+          },
+          "mode": {
+            "enum": [
+              "create",
+              "replace",
+              "overwrite",
+              "append"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "partitions": {
+            "items": {
+              "$ref": "#/components/schemas/WritePartitionExpectation"
+            },
+            "maxItems": 32,
+            "title": "Partitions",
+            "type": "array"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "recoveredReceipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "nodeId",
+          "managed",
+          "destination",
+          "mode",
+          "provider"
+        ],
+        "title": "WriteAdmission",
+        "type": "object"
+      },
+      "WriteAdmissionRequest": {
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "submissionId": {
+            "format": "uuid4",
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph",
+          "nodeId",
+          "submissionId"
+        ],
+        "title": "WriteAdmissionRequest",
+        "type": "object"
+      },
+      "WriteDestination": {
+        "additionalProperties": false,
+        "description": "Stable logical identity of one managed write destination.",
+        "properties": {
+          "datasetId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Datasetid"
+          },
+          "logicalUri": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Logicaluri",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "default": "managed-local-file",
+            "enum": [
+              "managed-local-file",
+              "managed-local-lance"
+            ],
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "logicalUri",
+          "name"
+        ],
+        "title": "WriteDestination",
+        "type": "object"
+      },
+      "WriteIntent": {
+        "additionalProperties": false,
+        "description": "Frozen pre-1.0 contract for one managed local create, replace, or Lance append.",
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/WriteDestination"
+          },
+          "expectedHead": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expectedSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 1024,
+            "title": "Expectedschema",
+            "type": "array"
+          },
+          "idempotencyKey": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Idempotencykey",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "create",
+              "replace",
+              "append"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "partitions": {
+            "items": {
+              "$ref": "#/components/schemas/WritePartitionExpectation"
+            },
+            "maxItems": 32,
+            "title": "Partitions",
+            "type": "array"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/WriteProvenance"
+          }
+        },
+        "required": [
+          "destination",
+          "mode",
+          "idempotencyKey",
+          "provenance"
+        ],
+        "title": "WriteIntent",
+        "type": "object"
+      },
+      "WritePartitionExpectation": {
+        "additionalProperties": false,
+        "description": "One bounded partition field requested by a write intent.",
+        "properties": {
+          "field": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Field",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field"
+        ],
+        "title": "WritePartitionExpectation",
+        "type": "object"
+      },
+      "WriteProvenance": {
+        "additionalProperties": false,
+        "description": "Frozen producer evidence and the ordered source identities used by one write.",
+        "properties": {
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Parents",
+            "type": "array"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/LineagePublication"
+          }
+        },
+        "required": [
+          "publication"
+        ],
+        "title": "WriteProvenance",
+        "type": "object"
+      },
+      "WritePublicationIdentity": {
+        "description": "Durable provider-side identity of one managed local publication.",
+        "properties": {
+          "artifactUri": {
+            "title": "Artifacturi",
+            "type": "string"
+          },
+          "backendVersion": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backendversion"
+          },
+          "catalogVersion": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Catalogversion"
+          },
+          "idempotencyKey": {
+            "title": "Idempotencykey",
+            "type": "string"
+          },
+          "logicalUri": {
+            "title": "Logicaluri",
+            "type": "string"
+          },
+          "provider": {
+            "default": "managed-local-file",
+            "enum": [
+              "managed-local-file",
+              "managed-local-lance"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "publishSequence": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Publishsequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "logicalUri",
+          "artifactUri",
+          "publishSequence",
+          "idempotencyKey"
+        ],
+        "title": "WritePublicationIdentity",
+        "type": "object"
+      },
+      "WriteReceipt": {
+        "description": "Durable evidence for one exact revision-producing write.",
+        "properties": {
+          "bytes": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Bytes",
+            "type": "integer"
+          },
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "durable": {
+            "const": true,
+            "default": true,
+            "title": "Durable",
+            "type": "boolean"
+          },
+          "head": {
+            "$ref": "#/components/schemas/DatasetRevision"
+          },
+          "parentHead": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "partitions": {
+            "items": {
+              "$ref": "#/components/schemas/WritePartitionExpectation"
+            },
+            "maxItems": 32,
+            "title": "Partitions",
+            "type": "array"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/WriteProvenance"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/WritePublicationIdentity"
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "rows": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Rows",
+            "type": "integer"
+          },
+          "schema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 1024,
+            "title": "Schema",
+            "type": "array"
+          }
+        },
+        "required": [
+          "datasetId",
+          "revisionId",
+          "head",
+          "rows",
+          "bytes",
+          "publication",
+          "provenance"
+        ],
+        "title": "WriteReceipt",
         "type": "object"
       }
     }
@@ -12577,6 +13185,89 @@
           }
         },
         "summary": "Run Full Profile"
+      }
+    },
+    "/api/run/write-admission": {
+      "post": {
+        "description": "Certify one default-local Write card without creating or mutating an artifact.",
+        "operationId": "write_admission_api_run_write_admission_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteAdmissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteAdmission"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Write Admission"
       }
     },
     "/api/run/{run_id}": {

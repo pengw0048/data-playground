@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteIntent,
   WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
@@ -346,6 +346,14 @@ export const api = {
       method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
     }),
 
+  writeAdmission: (doc: CanvasDoc, nodeId: string, submissionId: string,
+    inputManifest?: RunInputManifestItem[]) =>
+    req<WriteAdmission>('/run/write-admission', {
+      method: 'POST', body: JSON.stringify({
+        graph: toGraph(doc), nodeId, submissionId, inputManifest,
+      }),
+    }),
+
   inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[]) =>
     req<InputDrift>('/run/input-drift', {
       method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
@@ -364,14 +372,14 @@ export const api = {
     }),
 
   run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string,
-    inputManifest?: RunInputManifestItem[]) => {
+    inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId, inputManifest }),
+          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error
