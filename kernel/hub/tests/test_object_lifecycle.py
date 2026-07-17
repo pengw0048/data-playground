@@ -2961,15 +2961,20 @@ def test_app_lifespan_starts_and_stops_background_reapers():
 
     object_before = len(live_reapers("dp-object-attempt-reaper"))
     local_before = len(live_reapers("dp-local-result-reaper"))
+    durable_before = len(live_reapers("dp-durable-task-recovery"))
     with TestClient(main.app):
         assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
         assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+        assert len(live_reapers("dp-durable-task-recovery")) == durable_before + 1
         assert main._object_attempt_reaper_thread is not None
         assert main._local_result_reaper_thread is not None
+        assert main._durable_task_recovery_thread is not None
     assert len(live_reapers("dp-object-attempt-reaper")) == object_before
     assert len(live_reapers("dp-local-result-reaper")) == local_before
+    assert len(live_reapers("dp-durable-task-recovery")) == durable_before
     assert main._object_attempt_reaper_thread is None
     assert main._local_result_reaper_thread is None
+    assert main._durable_task_recovery_thread is None
 
 
 def test_overlapping_app_lifespans_share_background_reapers_until_last_exit():
@@ -2982,26 +2987,36 @@ def test_overlapping_app_lifespans_share_background_reapers_until_last_exit():
 
     object_before = len(live_reapers("dp-object-attempt-reaper"))
     local_before = len(live_reapers("dp-local-result-reaper"))
+    durable_before = len(live_reapers("dp-durable-task-recovery"))
     with TestClient(main.app):
         object_thread = main._object_attempt_reaper_thread
         local_thread = main._local_result_reaper_thread
+        durable_thread = main._durable_task_recovery_thread
         assert object_thread is not None
         assert local_thread is not None
+        assert durable_thread is not None
         assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
         assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+        assert len(live_reapers("dp-durable-task-recovery")) == durable_before + 1
         with TestClient(main.app):
             assert main._object_attempt_reaper_thread is object_thread
             assert main._local_result_reaper_thread is local_thread
+            assert main._durable_task_recovery_thread is durable_thread
             assert len(live_reapers("dp-object-attempt-reaper")) == object_before + 1
             assert len(live_reapers("dp-local-result-reaper")) == local_before + 1
+            assert len(live_reapers("dp-durable-task-recovery")) == durable_before + 1
         assert main._object_attempt_reaper_thread is object_thread
         assert main._local_result_reaper_thread is local_thread
+        assert main._durable_task_recovery_thread is durable_thread
         assert object_thread.is_alive()
         assert local_thread.is_alive()
+        assert durable_thread.is_alive()
     assert len(live_reapers("dp-object-attempt-reaper")) == object_before
     assert len(live_reapers("dp-local-result-reaper")) == local_before
+    assert len(live_reapers("dp-durable-task-recovery")) == durable_before
     assert main._object_attempt_reaper_thread is None
     assert main._local_result_reaper_thread is None
+    assert main._durable_task_recovery_thread is None
 
 
 @pytest.mark.parametrize("versioning_enabled", [False, True], ids=["unversioned", "versioned"])

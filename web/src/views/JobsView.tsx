@@ -54,8 +54,11 @@ export function JobsView() {
   const [error, setError] = useState('')
   const [loadMoreError, setLoadMoreError] = useState('')
   const [loadedMore, setLoadedMore] = useState(false)
+  const [actionError, setActionError] = useState('')
+  const [acting, setActing] = useState('')
   const request = useRef(0)
   const deepLinkRequest = useRef('')
+  const retryActions = useRef(new Map<string, string>())
 
   const load = useCallback(async (nextCursor?: string, refresh = false) => {
     const sequence = ++request.current
@@ -116,6 +119,22 @@ export function JobsView() {
   const selected = items.find((item) => jobKey(item) === params.get('run'))
   const selectedOutput = selected?.outputs.find((output) =>
     outputKey(output.nodeId, output.portId) === params.get('output'))
+  const act = async (item: WorkspaceJobDto, action: 'cancel' | 'retry') => {
+    const runId = item.runId ?? item.id
+    setActing(`${runId}:${action}`); setActionError('')
+    try {
+      if (action === 'cancel') await api.cancelRun(runId)
+      else {
+        const actionId = retryActions.current.get(runId) ?? globalThis.crypto.randomUUID()
+        retryActions.current.set(runId, actionId)
+        await api.retryRun(runId, actionId)
+        retryActions.current.delete(runId)
+      }
+      await load(undefined, true)
+    } catch (caught) {
+      setActionError(caught instanceof Error ? caught.message : String(caught))
+    } finally { setActing('') }
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -144,6 +163,7 @@ export function JobsView() {
       </section>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
+        {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
         {loading && <div className="p-5 text-[12.5px] text-muted-foreground">Loading Jobs…</div>}
         {!loading && error && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-[12.5px] text-destructive">Couldn’t load Jobs: {error} <button className="ml-2 font-semibold underline" onClick={() => void load()}>Retry</button></div>}
         {!loading && !error && items.length === 0 && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">No runs match these filters.</div>}
@@ -151,7 +171,7 @@ export function JobsView() {
           <div className="grid grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
             <span>State</span><span>Canvas / node</span><span>Attempt / output</span><span>Backend</span><span>Timing</span><span>Recorded</span>
           </div>
-          {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} />)}
+          {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} />)}
         </div>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
         {hasMore && !loadMoreError && <Button variant="outline" className="mt-3 w-full" disabled={loadingMore || !cursor} onClick={() => cursor && void load(cursor)}>{loadingMore ? 'Loading…' : 'Load more'}</Button>}
@@ -173,7 +193,7 @@ function Filter({ label, name, value, onChange, placeholder }: { label: string; 
   return <label className="grid gap-1 text-[10.5px] text-muted-foreground">{label}<input aria-label={`Filter jobs by ${label.toLowerCase()}`} value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onBlur={() => onChange(name, draft.trim())} onKeyDown={(event) => { if (event.key === 'Enter') onChange(name, draft.trim()) }} className="h-8 min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
 }
 
-function JobRow({ item, expanded, onSelect, onOutput, selectedOutput }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null }) {
+function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const rows = item.rows ?? item.profile?.rowCount ?? null
@@ -189,12 +209,20 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput }: { item: 
       <span className="text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
-      <div className="grid gap-1"><div><strong>Run:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>Attempt:</strong> <span className="font-mono">{item.attempt}</span></div>{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
+      <div className="grid gap-1"><div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>Attempt:</strong> <span className="font-mono">{item.attempt}</span></div>{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
       <div className="flex flex-wrap content-start gap-2">
         <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>
         {item.targetNodeId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
+        {item.taskId && (item.status === 'queued' || item.status === 'running') && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
+        {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>Retry task</Button>}
       </div>
+      {item.taskId && <div className="grid gap-2 sm:col-span-2">
+        <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
+        {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
+        {item.taskAttempts?.length ? <div><strong>Attempts:</strong> {item.taskAttempts.map((attempt) => `#${attempt.attemptNumber} ${attempt.status}`).join(' · ')}</div> : null}
+        {item.outputReceipt && <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{item.outputReceipt.datasetId}</span> · revision <span className="font-mono">{item.outputReceipt.revisionId}</span> · {item.outputReceipt.rows.toLocaleString()} rows · {item.outputReceipt.bytes.toLocaleString()} bytes</div>}
+      </div>}
     </div>}
   </article>
 }

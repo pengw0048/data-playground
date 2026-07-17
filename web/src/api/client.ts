@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteIntent,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteIntent, WriteReceipt,
   WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
@@ -402,6 +402,9 @@ export const api = {
   kernelState: (canvasId: string) => req<CanvasKernelStatus>(`/canvas/${encodeURIComponent(canvasId)}/kernel`),
   restartKernel: (canvasId: string) => req<{ ok: boolean; restarted: boolean }>(`/canvas/${encodeURIComponent(canvasId)}/kernel/restart`, { method: 'POST' }),
   cancelRun: (runId: string) => req<RunStatus>(`/run/${runId}/cancel`, { method: 'POST' }),
+  retryRun: (runId: string, actionId: string) => req<RunStatus>(`/run/${runId}/retry`, {
+    method: 'POST', body: JSON.stringify({ actionId }),
+  }),
 
   agentStatus: () => req<AgentStatus>('/agent'),
   agentAct: (doc: CanvasDoc, outcome: string) =>
@@ -489,7 +492,8 @@ export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
-export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string }
+export interface DurableTaskAttemptDto { id: string; attemptNumber: number; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'fenced'; progress?: number | null; error?: string | null; startedAt?: string | null; completedAt?: string | null }
+export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }

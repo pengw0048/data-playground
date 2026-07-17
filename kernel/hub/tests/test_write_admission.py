@@ -210,6 +210,24 @@ def test_write_submission_identity_ignores_only_operational_node_status(contract
         retried, "write", write_intent=admission.intent) != initial
 
 
+def test_durable_submission_mismatch_is_a_bounded_conflict(contract, monkeypatch):
+    _deps, graph = contract
+
+    def conflict(*_args, **_kwargs):
+        raise metadb.DurableTaskSubmissionConflict(
+            "durable task submission does not match its frozen admission")
+
+    monkeypatch.setattr(run_routes, "start_run", conflict)
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write", "confirmed": True,
+    })
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == \
+        "durable task submission does not match its frozen admission"
+
+
 def test_external_destination_keeps_provider_neutral_mode(contract):
     deps, graph = contract
     write = next(node for node in graph.nodes if node.id == "write")

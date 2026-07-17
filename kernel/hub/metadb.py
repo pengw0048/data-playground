@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
+    BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
     Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
@@ -272,6 +272,67 @@ class RunInputAdmission(Base):
     )
 
 
+class DurableTask(Base):
+    """One bounded, restart-safe managed-local create/replace operation."""
+    __tablename__ = "durable_tasks"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False, index=True)
+    submission_id: Mapped[str] = mapped_column(String, nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    backend_kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="local", server_default="local")
+    graph_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    input_manifest: Mapped[str] = mapped_column(Text, nullable=False)
+    write_intent: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="queued", server_default="queued", index=True)
+    status_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    progress: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3, server_default="3")
+    output_receipt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
+        CheckConstraint("backend_kind = 'local'", name="ck_durable_task_backend"),
+        CheckConstraint("status IN ('queued','running','done','failed','cancelled')", name="ck_durable_task_status"),
+        CheckConstraint("retry_count >= 0 AND max_attempts >= 1 AND retry_count < max_attempts", name="ck_durable_task_retry_bounds"),
+    )
+
+
+class DurableTaskAttempt(Base):
+    """One leased execution owner for a durable task."""
+    __tablename__ = "durable_task_attempts"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    task_id: Mapped[str] = mapped_column(String, ForeignKey("durable_tasks.id"), nullable=False, index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    retry_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="queued", server_default="queued")
+    owner_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    progress: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cancel_requested_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    output_receipt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        UniqueConstraint("task_id", "attempt_number", name="uq_durable_task_attempt_number"),
+        UniqueConstraint("task_id", "retry_request_id", name="uq_durable_task_retry_request"),
+        CheckConstraint("attempt_number >= 1", name="ck_durable_task_attempt_number"),
+        CheckConstraint("status IN ('queued','running','done','failed','cancelled','fenced')", name="ck_durable_task_attempt_status"),
+    )
+
+
 class ProfileJobLatest(Base):
     """Canvas-scoped latest retry for one node/plan, independent of global RunState retention.
 
@@ -385,6 +446,10 @@ class TerminalRunIdError(RuntimeError):
 
 class ProfileSubmissionConflict(RuntimeError):
     """A submission id is already permanently bound to a different profile identity."""
+
+
+class DurableTaskSubmissionConflict(RuntimeError):
+    """A durable task submission id is bound to a different semantic admission."""
 
 
 @dataclass(frozen=True)
@@ -3239,6 +3304,389 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
 _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
+_DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
+_DURABLE_TASK_LEASE_SECONDS = 15
+
+
+def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> str:
+    # Preserve the existing write-admission lineage identity. The durable task replaces the old local
+    # dispatch owner for this exact submission; it must not mint a second publication idempotency key.
+    return local_run_submission_id(uid, canvas_id, submission_id)
+
+
+def _task_status_doc(task_id: str, target_node_id: str, status: str = "queued") -> dict:
+    from hub.models import RunStatus
+    return RunStatus(
+        run_id=str(task_id), status=status, target_node_id=str(target_node_id),
+    ).model_dump()
+
+
+def _durable_task_db_now(s) -> datetime.datetime:
+    value = _db_now(s)
+    return (value.replace(tzinfo=datetime.timezone.utc)
+            if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+
+
+def submit_durable_local_write_task(
+        *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
+        intent_sha256: str, graph_doc: dict, input_manifest: list[dict[str, str]],
+        write_intent: dict) -> tuple[dict, bool]:
+    """Persist a task and its first attempt atomically, adopting an identical replay."""
+    from hub.models import Graph, WriteIntent
+
+    uid, canvas_id, target_node_id = str(uid), str(canvas_id), str(target_node_id)
+    intent_sha256 = str(intent_sha256).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", intent_sha256):
+        raise ValueError("durable task requires a SHA-256 semantic admission identity")
+    graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
+    intent = WriteIntent.model_validate(write_intent)
+    if intent.mode not in ("create", "replace"):
+        raise ValueError("durable local tasks support only create or replace writes")
+    if not isinstance(input_manifest, list):
+        raise ValueError("durable task input manifest must be a list")
+    graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
+    manifest_payload = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
+    intent_payload = json.dumps(
+        intent.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":"))
+    if any(len(payload.encode()) > _DURABLE_TASK_DOC_MAX_BYTES
+           for payload in (graph_payload, manifest_payload, intent_payload)):
+        raise ValueError("durable task immutable admission exceeds the bounded limit")
+    task_id = durable_task_submission_id(uid, canvas_id, submission_id)
+    now = _now()
+    status_doc = json.dumps(_task_status_doc(task_id, target_node_id), default=str)
+    with session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            raise RuntimeError("durable task canvas does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+                updated_at=Canvas.updated_at))
+        existing = s.get(DurableTask, task_id, with_for_update=True)
+        if existing is not None:
+            if (existing.owner_id != uid or existing.canvas_id != canvas_id
+                    or existing.submission_id != str(submission_id).lower()
+                    or existing.target_node_id != target_node_id
+                    or existing.intent_sha256 != intent_sha256):
+                raise DurableTaskSubmissionConflict(
+                    "durable task submission does not match its frozen admission")
+            return _durable_task_doc(s, existing), False
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=canvas_id,
+            submission_id=str(submission_id).lower(), intent_sha256=intent_sha256,
+            target_node_id=target_node_id,
+            backend_kind="local", graph_doc=graph_payload,
+            input_manifest=manifest_payload, write_intent=intent_payload,
+            status="queued", status_doc=status_doc, created_at=now, updated_at=now,
+        )
+        s.add(task)
+        s.add(DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            status="queued", created_at=now,
+        ))
+        s.flush()
+        return _durable_task_doc(s, task), True
+
+
+def _durable_task_doc(s, task: DurableTask, *, include_admission: bool = True) -> dict:
+    attempts = list(s.scalars(select(DurableTaskAttempt).where(
+        DurableTaskAttempt.task_id == task.id,
+    ).order_by(DurableTaskAttempt.attempt_number)))
+    doc = {
+        "id": task.id, "owner_id": task.owner_id, "canvas_id": task.canvas_id,
+        "submission_id": task.submission_id, "target_node_id": task.target_node_id,
+        "backend_kind": task.backend_kind, "status": task.status,
+        "status_doc": json.loads(task.status_doc), "progress": task.progress,
+        "cancel_requested": task.cancel_requested, "retry_count": task.retry_count,
+        "max_attempts": task.max_attempts,
+        "output_receipt": json.loads(task.output_receipt) if task.output_receipt else None,
+        "error": task.error,
+        "created_at": task.created_at, "updated_at": task.updated_at,
+        "completed_at": task.completed_at,
+        "attempts": [{
+            "id": item.id, "attempt_number": item.attempt_number,
+            "status": item.status, "owner_token": item.owner_token,
+            "lease_until": item.lease_until, "heartbeat_at": item.heartbeat_at,
+            "progress": item.progress, "error": item.error,
+            "started_at": item.started_at, "completed_at": item.completed_at,
+            "output_receipt": json.loads(item.output_receipt) if item.output_receipt else None,
+        } for item in attempts],
+    }
+    if include_admission:
+        doc.update({
+            "graph_doc": json.loads(task.graph_doc),
+            "input_manifest": json.loads(task.input_manifest),
+            "write_intent": json.loads(task.write_intent),
+        })
+    return doc
+
+
+def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None:
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        return (_durable_task_doc(s, task, include_admission=include_admission)
+                if task is not None else None)
+
+
+def durable_task_auth(task_id: str) -> tuple[str, str] | None:
+    with session() as s:
+        row = s.execute(select(DurableTask.owner_id, DurableTask.canvas_id).where(
+            DurableTask.id == str(task_id))).one_or_none()
+        return tuple(row) if row is not None else None
+
+
+def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
+    """Lock one Task before making an ownership/action decision on SQLite or Postgres."""
+    task_id = str(task_id)
+    if s.get_bind().dialect.name == "sqlite":
+        # SQLite ignores SELECT ... FOR UPDATE. The canvas is a stable parent row for the lifetime of
+        # its Task; acquire the single writer lock before reading Task/action replay state.
+        canvas_id = s.scalar(select(DurableTask.canvas_id).where(DurableTask.id == task_id))
+        if canvas_id is None:
+            return None
+        locked = s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+            updated_at=Canvas.updated_at))
+        if locked.rowcount != 1:
+            return None
+    return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
+
+
+def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim queued work or fence one expired owner and create the next bounded attempt."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        if task is None or task.status in _TERMINAL_RUN:
+            return None
+        now = _durable_task_db_now(s)
+        attempt = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task.id,
+        ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+        if attempt is None:
+            raise RuntimeError("durable task has no attempt")
+        lease = attempt.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if attempt.status == "running" and lease is not None and lease > now:
+            return None
+        if attempt.status == "running":
+            attempt.status = "fenced"
+            attempt.error = "attempt owner lease expired"
+            attempt.completed_at = now
+            if attempt.attempt_number >= task.max_attempts:
+                task.status = "failed"
+                task.error = "durable task exhausted recovery attempts"
+                task.completed_at = now
+                failed = _task_status_doc(task.id, task.target_node_id, "failed")
+                failed["error"] = task.error
+                task.status_doc = json.dumps(failed, default=str)
+                return None
+            task.retry_count = attempt.attempt_number
+            attempt = DurableTaskAttempt(
+                id=uuid.uuid4().hex, task_id=task.id,
+                attempt_number=attempt.attempt_number + 1, status="queued", created_at=now)
+            s.add(attempt)
+            s.flush()
+        if task.cancel_requested:
+            attempt.status = "cancelled"
+            attempt.cancel_requested_at = now
+            attempt.completed_at = now
+            task.status = "cancelled"
+            task.completed_at = now
+            task.status_doc = json.dumps(
+                _task_status_doc(task.id, task.target_node_id, "cancelled"), default=str)
+            return None
+        attempt.status = "running"
+        attempt.owner_token = str(owner_token)
+        attempt.started_at = attempt.started_at or now
+        attempt.heartbeat_at = now
+        attempt.lease_until = now + datetime.timedelta(seconds=_DURABLE_TASK_LEASE_SECONDS)
+        task.status = "running"
+        task.error = None
+        task.updated_at = now
+        return _durable_task_doc(s, task)
+
+
+def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
+    with session() as s:
+        now = _durable_task_db_now(s)
+        task = s.get(DurableTask, str(task_id))
+        attempt = s.get(DurableTaskAttempt, str(attempt_id))
+        if task is None or attempt is None:
+            return True
+        lease = attempt.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        return bool(
+            task.status in _TERMINAL_RUN or task.cancel_requested
+            or attempt.task_id != task.id or attempt.status != "running"
+            or attempt.owner_token != str(owner_token)
+            or lease is None or lease <= now)
+
+
+def heartbeat_durable_task(task_id: str, attempt_id: str, owner_token: str) -> bool:
+    with session() as s:
+        now = _durable_task_db_now(s)
+        result = s.execute(update(DurableTaskAttempt).where(
+            DurableTaskAttempt.id == str(attempt_id),
+            DurableTaskAttempt.task_id == str(task_id),
+            DurableTaskAttempt.owner_token == str(owner_token),
+            DurableTaskAttempt.status == "running",
+            DurableTaskAttempt.lease_until > now,
+        ).values(
+            heartbeat_at=now,
+            lease_until=now + datetime.timedelta(seconds=_DURABLE_TASK_LEASE_SECONDS),
+        ))
+        return result.rowcount == 1
+
+
+def update_durable_task_status(
+        task_id: str, attempt_id: str, owner_token: str, status_doc: dict) -> bool:
+    from hub.models import RunStatus
+    status = RunStatus.model_validate(status_doc)
+    if status.run_id != str(task_id):
+        raise ValueError("durable task status changed its task identity")
+    if status.status in _TERMINAL_RUN:
+        return finish_durable_task_attempt(
+            task_id, attempt_id, owner_token, status.model_dump())
+    payload = json.dumps(status.model_dump(), default=str)
+    with session() as s:
+        task = s.get(DurableTask, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until if attempt is not None else None
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        task.status = "running"
+        task.status_doc = payload
+        task.progress = status.progress
+        task.updated_at = now
+        attempt.progress = status.progress
+        return True
+
+
+def finish_durable_task_attempt(
+        task_id: str, attempt_id: str, owner_token: str, status_doc: dict) -> bool:
+    from hub.models import RunStatus
+    status = RunStatus.model_validate(status_doc)
+    if status.status not in _TERMINAL_RUN or status.run_id != str(task_id):
+        raise ValueError("durable task completion requires its terminal task status")
+    receipt = None
+    if status.status == "done":
+        receipts = [output.write_receipt for output in status.outputs
+                    if output.outcome == "committed" and output.write_receipt is not None]
+        if len(status.outputs) != 1 or len(receipts) != 1:
+            raise ValueError("successful durable write task requires one exact WriteReceipt")
+        receipt = receipts[0].model_dump(by_alias=True, mode="json")
+    payload = json.dumps(status.model_dump(), default=str)
+    receipt_payload = json.dumps(receipt, sort_keys=True) if receipt is not None else None
+    with session() as s:
+        task = s.get(DurableTask, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        if task is None or attempt is None:
+            return False
+        if task.status in _TERMINAL_RUN:
+            return task.status == status.status and task.status_doc == payload
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        attempt.status = status.status
+        attempt.progress = status.progress
+        attempt.error = status.error
+        attempt.output_receipt = receipt_payload
+        attempt.completed_at = now
+        attempt.lease_until = now
+        task.status = status.status
+        task.status_doc = payload
+        task.progress = status.progress
+        task.error = status.error
+        task.output_receipt = receipt_payload
+        task.completed_at = now
+        task.updated_at = now
+        return True
+
+
+def request_durable_task_cancel(task_id: str) -> dict | None:
+    with session() as s:
+        task = s.get(DurableTask, str(task_id), with_for_update=True)
+        if task is None:
+            return None
+        if task.status not in _TERMINAL_RUN:
+            now = _durable_task_db_now(s)
+            task.cancel_requested = True
+            task.updated_at = now
+            attempt = s.scalar(select(DurableTaskAttempt).where(
+                DurableTaskAttempt.task_id == task.id,
+            ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+            if attempt is not None and attempt.cancel_requested_at is None:
+                attempt.cancel_requested_at = now
+        return _durable_task_doc(s, task)
+
+
+def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
+    retry_request_id = str(retry_request_id).lower()
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        if task is None:
+            raise KeyError(task_id)
+        replay = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task.id,
+            DurableTaskAttempt.retry_request_id == retry_request_id,
+        ).limit(1))
+        if replay is not None:
+            return _durable_task_doc(s, task)
+        if task.status not in ("failed", "cancelled"):
+            raise ValueError("only a failed or cancelled durable task can be retried")
+        last = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task.id,
+        ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+        if last is None or last.attempt_number >= task.max_attempts:
+            raise ValueError("durable task retry limit is exhausted")
+        now = _durable_task_db_now(s)
+        number = last.attempt_number + 1
+        s.add(DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task.id, attempt_number=number,
+            retry_request_id=retry_request_id, status="queued", created_at=now))
+        task.status = "queued"
+        task.cancel_requested = False
+        task.retry_count = number - 1
+        task.progress = None
+        task.error = None
+        task.output_receipt = None
+        task.completed_at = None
+        task.updated_at = now
+        task.status_doc = json.dumps(
+            _task_status_doc(task.id, task.target_node_id), default=str)
+        s.flush()
+        return _durable_task_doc(s, task)
+
+
+def recoverable_durable_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired running tasks; live leased owners are left untouched."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
 
 
 def local_run_submission_id(uid: str, canvas_id: str | None, submission_id: str) -> str:
@@ -3556,6 +4004,14 @@ def delete_canvas_cascade(canvas_id: str) -> None:
                 f"canvas '{canvas_id}' has active run '{active}'; "
                 "cancel it and wait for terminal status"
             )
+        active_task = s.scalar(select(DurableTask.id).where(
+            DurableTask.canvas_id == canvas_id,
+            DurableTask.status.in_(("queued", "running")),
+        ).order_by(DurableTask.id).limit(1))
+        if active_task:
+            raise ActiveBackendJobsError(
+                f"canvas '{canvas_id}' has active durable task '{active_task}'; "
+                "cancel it and wait for terminal status")
         shares = list(s.scalars(select(CanvasShare).where(
             CanvasShare.canvas_id == canvas_id
         ).order_by(CanvasShare.user_id).with_for_update()))
@@ -3565,6 +4021,13 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         admissions = list(s.scalars(select(RunInputAdmission).where(
             RunInputAdmission.canvas_id == canvas_id
         ).order_by(RunInputAdmission.run_id).with_for_update()))
+        durable_tasks = list(s.scalars(select(DurableTask).where(
+            DurableTask.canvas_id == canvas_id,
+        ).order_by(DurableTask.id).with_for_update()))
+        durable_attempts = list(s.scalars(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id.in_([task.id for task in durable_tasks]),
+        ).order_by(DurableTaskAttempt.task_id, DurableTaskAttempt.attempt_number).with_for_update()
+        )) if durable_tasks else []
         versions = list(s.scalars(select(CanvasVersion).where(
             CanvasVersion.canvas_id == canvas_id
         ).order_by(CanvasVersion.id).with_for_update()))
@@ -3587,6 +4050,14 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         for admission in admissions:
             local_owners.append(("run_input_admission", admission.run_id))
             s.delete(admission)
+        for attempt in durable_attempts:
+            s.delete(attempt)
+        if durable_attempts:
+            # No ORM relationship orders these explicit bulk objects; honor the FK on Postgres before
+            # deleting their Task parents (SQLite's default FK mode would otherwise hide the bug).
+            s.flush()
+        for task in durable_tasks:
+            s.delete(task)
         for r in runs:
             _replace_attempt_ref(s, "run_record", r.id, None)
             local_owners.append(("run_record", r.id))
@@ -3896,6 +4367,79 @@ def list_workspace_runs(
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
                 backend=backend_name, backend_attempt=backend_attempt, source="state"))
+
+        task_identity = literal("t:") + DurableTask.id
+        task_predicates = [visible_canvas]
+        if canvas_id:
+            task_predicates.append(DurableTask.canvas_id == canvas_id)
+        if run_id:
+            task_predicates.append(DurableTask.id == run_id)
+        if status:
+            task_predicates.append(DurableTask.status == status)
+        if node_id:
+            task_predicates.append(DurableTask.target_node_id == node_id)
+        if backend:
+            task_predicates.append(DurableTask.backend_kind == backend)
+        if recorded_after:
+            task_predicates.append(DurableTask.created_at >= recorded_after)
+        if recorded_before:
+            task_predicates.append(DurableTask.created_at <= recorded_before)
+        if normalized_text:
+            literal_text = normalized_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{literal_text}%"
+            task_predicates.append(or_(
+                func.lower(Canvas.name).like(pattern, escape="\\"),
+                func.lower(DurableTask.target_node_id).like(pattern, escape="\\"),
+                func.lower(DurableTask.id).like(pattern, escape="\\"),
+                func.lower(func.coalesce(DurableTask.error, "")).like(pattern, escape="\\"),
+                func.lower(DurableTask.graph_doc).like(pattern, escape="\\"),
+            ))
+        if decoded:
+            stamp, identity = decoded
+            task_predicates.append(or_(
+                DurableTask.created_at < stamp,
+                and_(DurableTask.created_at == stamp, task_identity < identity),
+            ))
+        task_rows = s.execute(select(DurableTask, Canvas.name).join(
+            Canvas, Canvas.id == DurableTask.canvas_id,
+        ).where(*task_predicates).order_by(
+            DurableTask.created_at.desc(), DurableTask.id.desc()).limit(fetch_limit)).all()
+        for task, name in task_rows:
+            task_doc = _durable_task_doc(s, task)
+            status_doc = task_doc["status_doc"]
+            created_at = task.created_at or _now()
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+            attempts = task_doc["attempts"]
+            latest = attempts[-1]
+            per_node = status_doc.get("per_node") or []
+            node_label = next((str(item.get("label")) for item in per_node
+                               if item.get("node_id") == task.target_node_id
+                               and item.get("label")), None)
+            candidates.append(((created_at, f"t:{task.id}"), {
+                "id": f"t:{task.id}", "runId": task.id, "requestId": None,
+                "jobType": "run", "status": task.status,
+                "targetNodeId": task.target_node_id, "targetPortId": None,
+                "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
+                "error": task.error, "inputManifest": task_doc["input_manifest"],
+                "outputs": status_doc.get("outputs") or [], "profile": None,
+                "perNode": per_node or None, "createdAt": created_at.isoformat(),
+                "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
+                "backend": "local", "placement": "local", "attempt": latest["id"],
+                "taskId": task.id,
+                "taskAttempts": [{
+                    "id": item["id"], "attemptNumber": item["attempt_number"],
+                    "status": item["status"], "progress": item["progress"],
+                    "error": item["error"],
+                    "startedAt": item["started_at"].isoformat() if item["started_at"] else None,
+                    "completedAt": item["completed_at"].isoformat() if item["completed_at"] else None,
+                } for item in attempts],
+                "cancelRequested": task.cancel_requested,
+                "canRetry": task.status in ("failed", "cancelled")
+                    and latest["attempt_number"] < task.max_attempts,
+                "writeIntent": task_doc["write_intent"],
+                "outputReceipt": task_doc["output_receipt"],
+            }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]
     has_more = len(candidates) > limit
