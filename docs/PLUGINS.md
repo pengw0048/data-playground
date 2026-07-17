@@ -226,6 +226,11 @@ a finite `limit` (1–500) and an opaque cursor; order must be deterministic. A 
 read succeeded. Use the matching `bounded_*` helper at a consumer boundary when a synchronous provider
 must not delay local work: deadline, cancellation, and availability failures are normalized to an
 honest unavailable result, while a provider can return an explicit truthful partial result itself.
+For `resolve`, set `ProviderResourceResult.failure` to `offline`, `permission_lost`, `not_found`, or
+`provider_error` when the result is not ready. Workspace treats `not_found` as a terminal detached
+binding: a later object with the same display name or provider ID does not revive the old reference;
+the user must explicitly relink it. Providers must not put credentials or unauthorized metadata in
+`reason`.
 
 Lexical search is optional and must be declared with `ProviderCapabilities(search=True)`. A declared
 provider implements `search(mount, query, limit=, cursor=)` and returns `ProviderSearchPage`, including

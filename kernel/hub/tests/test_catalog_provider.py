@@ -11,8 +11,11 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from hub.catalog_provider import (
-    _PROVIDER_READ_CONCURRENCY, CatalogMount, ProviderPage, bounded_list_children,
+    _PROVIDER_READ_CONCURRENCY, CatalogMount, ProviderPage, ProviderResourceResult,
+    bounded_list_children,
 )
 
 
@@ -94,6 +97,14 @@ def test_bounded_listing_caps_background_work_and_normalizes_failures():
     time.sleep(0.25)
     cancelled = bounded_list_children(_CancelledProvider(), mount, None, limit=1)
     assert cancelled.state == "unavailable" and cancelled.reason == "request cancelled"
+
+
+def test_resource_failures_are_explicitly_classified():
+    with pytest.raises(ValueError, match="must classify"):
+        ProviderResourceResult(state="unavailable", reason="ambiguous failure")
+    assert ProviderResourceResult(
+        state="unavailable", reason="access revoked", failure="permission_lost",
+    ).failure == "permission_lost"
 
 
 def _run(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

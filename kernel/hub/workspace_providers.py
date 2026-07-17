@@ -37,6 +37,10 @@ _SOURCE_STATES = {
 _ERROR_STATES = {"partial", "unavailable", "unsupported"}
 
 
+class ProviderRelinkUnavailable(RuntimeError):
+    """The explicitly selected replacement could not be resolved right now."""
+
+
 @dataclass(frozen=True)
 class _MountedProvider:
     mount: CatalogMount
@@ -126,53 +130,94 @@ def _mount_fingerprint(mounts: list[_MountedProvider], invalid: bool) -> str:
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
-def _external_identity(mount_id: str, resource_id: str) -> str:
-    payload = json.dumps([mount_id, resource_id], separators=(",", ":")).encode()
+def _external_identity(mount_id: str, resource_id: str, binding_id: str) -> str:
+    payload = json.dumps([mount_id, resource_id, binding_id], separators=(",", ":")).encode()
     return _EXTERNAL_PREFIX + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
-def _decode_external_identity(identity: str) -> tuple[str, str]:
+def _decode_external_identity(identity: str) -> tuple[str, str, str]:
     if not identity.startswith(_EXTERNAL_PREFIX):
         raise KeyError("invalid external Workspace resource reference")
     try:
         encoded = identity.removeprefix(_EXTERNAL_PREFIX)
         raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-        mount_id, resource_id = json.loads(raw)
+        mount_id, resource_id, binding_id = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise KeyError("invalid external Workspace resource reference") from exc
     if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
             or not isinstance(resource_id, str) or not resource_id or len(resource_id) > 512):
         raise KeyError("invalid external Workspace resource reference")
-    return mount_id, resource_id
+    if (not isinstance(binding_id, str) or len(binding_id) != 32
+            or any(char not in "0123456789abcdef" for char in binding_id)):
+        raise KeyError("invalid external Workspace resource reference")
+    return mount_id, resource_id, binding_id
 
 
-def _workspace_resource(item: CatalogResource, mounted: _MountedProvider) -> dict:
-    identity = _external_identity(mounted.mount.id, item.id)
-    parent_id = (
-        f"container:{_external_identity(mounted.mount.id, item.parent_id)}"
-        if item.parent_id is not None
-        else f"container:{mounted.container_id}"
+def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
+    identity = _external_identity(
+        binding["mountId"], binding["resourceId"], binding["bindingId"])
+    parent = (
+        metadb.workspace_provider_binding(binding["parentBindingId"])
+        if binding.get("parentBindingId") else None
     )
+    parent_id = (
+        f"container:{_external_identity(parent['mountId'], parent['resourceId'], parent['bindingId'])}"
+        if parent is not None else f"container:{binding['containerId']}"
+    )
+    state = binding["referenceState"]
     return {
-        "id": f"{item.kind}:{identity}",
-        "kind": item.kind,
-        "name": item.name,
+        "id": f"{binding['kind']}:{identity}",
+        "kind": binding["kind"],
+        "name": binding["name"],
         "parentId": parent_id,
-        "detached": False,
+        "detached": state == "detached",
         "source": "provider",
-        "mountId": mounted.mount.id,
-        "provider": mounted.mount.provider,
-        "resourceId": item.id,
+        "mountId": binding["mountId"],
+        "provider": binding["provider"],
+        "resourceId": binding["resourceId"],
+        "bindingId": binding["bindingId"],
+        "referenceState": state,
+        "lastKnown": state != "current",
+        "lastResolvedAt": binding["lastResolvedAt"],
     }
 
 
-def _source_status(source: _Source, completeness: str, error: str | None = None) -> dict:
+def _workspace_resource(
+    item: CatalogResource, mounted: _MountedProvider, *, parent_binding_id: str | None = None,
+) -> dict:
+    parent_is_known = item.parent_id is None or parent_binding_id is not None
+    if parent_binding_id is None and item.parent_id is not None:
+        parent = metadb.workspace_provider_binding_for_resource(
+            mount_id=mounted.mount.id,
+            provider=mounted.mount.provider,
+            resource_id=item.parent_id,
+        )
+        parent_binding_id = parent["bindingId"] if parent is not None else None
+        parent_is_known = parent is not None
+    binding = metadb.workspace_provider_cache_resource(
+        mount_id=mounted.mount.id,
+        provider=mounted.mount.provider,
+        container_id=mounted.container_id,
+        resource_id=item.id,
+        kind=item.kind,
+        name=item.name,
+        parent_binding_id=parent_binding_id,
+        parent_is_known=parent_is_known,
+    )
+    return _binding_resource(binding, mounted)
+
+
+def _source_status(
+    source: _Source, completeness: str, error: str | None = None,
+    reference_state: str | None = None,
+) -> dict:
     if source.kind == "local":
         return {"id": "local", "kind": "local", "completeness": completeness,
-                "error": error}
+                "error": error, "referenceState": reference_state}
     if source.kind == "configuration":
         return {"id": "configuration", "kind": "configuration",
-                "completeness": completeness, "error": error}
+                "completeness": completeness, "error": error,
+                "referenceState": reference_state}
     assert source.mounted is not None
     return {
         "id": f"mount:{source.mounted.mount.id}",
@@ -181,6 +226,7 @@ def _source_status(source: _Source, completeness: str, error: str | None = None)
         "provider": source.mounted.mount.provider,
         "completeness": completeness,
         "error": error,
+        "referenceState": reference_state,
     }
 
 
@@ -355,38 +401,74 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
 
 def _remote_page(identity: str, *, limit: int, cursor: str | None,
                  mounts: list[_MountedProvider], invalid: bool) -> dict:
-    mount_id, resource_id = _decode_external_identity(identity)
+    mount_id, resource_id, binding_id = _decode_external_identity(identity)
+    cached = metadb.workspace_provider_binding(
+        binding_id, mount_id=mount_id, resource_id=resource_id)
+    if cached is None:
+        raise KeyError("Workspace provider binding not found")
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
     if mounted is None:
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="detached", error="catalog mount is not configured")
+        cached_mount = _MountedProvider(
+            CatalogMount(id=mount_id, provider=cached["provider"], config={}),
+            cached["containerId"],
+        )
         source = _Source("configuration")
         return {
-            "container": None, "items": [], "nextCursor": None, "hasMore": False,
+            "container": _binding_resource(cached, cached_mount), "items": [],
+            "nextCursor": None, "hasMore": False,
             "completeness": "partial",
-            "sources": [_source_status(source, "unavailable", "catalog mount is not configured")],
+            "sources": [_source_status(
+                source, "unavailable", "catalog mount is not configured", "detached")],
         }
+    if cached["provider"] != mounted.mount.provider:
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="detached", error="catalog mount provider changed")
+        status = _source_status(
+            _Source("provider", mounted), "unavailable",
+            "catalog mount provider changed", "detached")
+        return {"container": _binding_resource(cached, mounted), "items": [],
+                "nextCursor": None, "hasMore": False, "completeness": "partial",
+                "sources": [status]}
     source = _Source("provider", mounted)
     fingerprint = _mount_fingerprint([mounted], invalid)
     source_index, source_cursor, history = _cursor_decode(
         cursor, container_id=identity, fingerprint=fingerprint, source_count=1)
     assert source_index == 0 and not history
+    if cached["referenceState"] == "detached":
+        status = _source_status(
+            source, "unavailable", cached.get("lastError") or "resource is detached",
+            "detached",
+        )
+        return {"container": _binding_resource(cached, mounted), "items": [],
+                "nextCursor": None, "hasMore": False, "completeness": "partial",
+                "sources": [status]}
     try:
         provider = _load_provider(mounted.mount.provider)
     except Exception:  # noqa: BLE001 -- activation failure is an honest source result
-        status = _source_status(source, "unavailable", _activation_error())
-        return {"container": None, "items": [], "nextCursor": None, "hasMore": False,
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="offline", error=_activation_error())
+        status = _source_status(source, "unavailable", _activation_error(), "offline")
+        return {"container": _binding_resource(cached, mounted), "items": [], "nextCursor": None, "hasMore": False,
                 "completeness": "partial", "sources": [status]}
-
     resolved = bounded_resolve(provider, mounted.mount, resource_id)
     if resolved.state != "ready" or resolved.item is None:
-        status = _source_status(source, resolved.state, resolved.reason)
-        return {"container": None, "items": [], "nextCursor": None, "hasMore": False,
+        state = _reference_state(resolved.failure, resolved.state)
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state=state, error=resolved.reason)
+        status = _source_status(source, resolved.state, resolved.reason, state)
+        return {"container": _binding_resource(cached, mounted), "items": [], "nextCursor": None, "hasMore": False,
                 "completeness": "partial", "sources": [status]}
     if resolved.item.id != resource_id or resolved.item.kind != "container":
         raise KeyError(f"Workspace resource 'container:{identity}' is not a container")
     container = _workspace_resource(resolved.item, mounted)
     page = bounded_list_children(
         provider, mounted.mount, resource_id, limit=limit, cursor=source_cursor)
-    items = [_workspace_resource(item, mounted) for item in page.items]
+    items = [
+        _workspace_resource(item, mounted, parent_binding_id=container["bindingId"])
+        for item in page.items
+    ]
     next_cursor = None
     if page.state == "ready" and page.next_cursor is not None:
         if not page.items:
@@ -424,6 +506,40 @@ def _unavailable_resolution(source: _Source, completeness: str, error: str | Non
             "source": _source_status(source, completeness, error)}
 
 
+def _reference_state(failure: str | None, provider_state: str) -> str:
+    if failure == "permission_lost":
+        return "permission_lost"
+    if failure == "not_found":
+        return "detached"
+    if failure == "offline":
+        return "offline"
+    if failure == "provider_error" or provider_state == "unsupported":
+        return "provider_error"
+    return "provider_error"
+
+
+def _cached_resolution(
+    binding: dict, mounted: _MountedProvider, source: _Source, *, uid: str, completeness: str,
+    error: str | None,
+) -> dict:
+    try:
+        local_parent = metadb.workspace_resolve(
+            f"container:{binding['containerId']}", uid=uid)
+        local_ancestors = [*local_parent["ancestors"], local_parent["resource"]]
+    except KeyError:
+        local_ancestors = []
+    cached_ancestors = [
+        _binding_resource(item, mounted)
+        for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
+    ]
+    return {
+        "resource": _binding_resource(binding, mounted),
+        "ancestors": [*local_ancestors, *cached_ancestors],
+        "source": _source_status(
+            source, completeness, error, binding["referenceState"]),
+    }
+
+
 def resolve(resource_ref: str, *, uid: str) -> dict:
     """Resolve local or provider identity and bounded ancestors without catalog materialization."""
     try:
@@ -433,24 +549,58 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     if kind not in {"container", "dataset"} or not identity.startswith(_EXTERNAL_PREFIX):
         return metadb.workspace_resolve(resource_ref, uid=uid)
 
-    mount_id, resource_id = _decode_external_identity(identity)
+    mount_id, resource_id, binding_id = _decode_external_identity(identity)
+    cached = metadb.workspace_provider_binding(
+        binding_id, mount_id=mount_id, resource_id=resource_id)
+    if cached is None or cached["kind"] != kind:
+        raise KeyError("Workspace provider binding not found")
     mounts, _invalid = _configured_mounts()
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
     if mounted is None:
-        return _unavailable_resolution(
-            _Source("configuration"), "unavailable", "catalog mount is not configured")
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="detached", error="catalog mount is not configured")
+        cached_mount = _MountedProvider(
+            CatalogMount(id=mount_id, provider=cached["provider"], config={}),
+            cached["containerId"],
+        )
+        return _cached_resolution(
+            cached, cached_mount, _Source("configuration"), uid=uid,
+            completeness="unavailable", error="catalog mount is not configured")
     source = _Source("provider", mounted)
+    if cached["provider"] != mounted.mount.provider:
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="detached", error="catalog mount provider changed")
+        return _cached_resolution(
+            cached, mounted, source, uid=uid, completeness="unavailable",
+            error="catalog mount provider changed")
+    if cached["referenceState"] == "detached":
+        return _cached_resolution(
+            cached, mounted, source, uid=uid, completeness="unavailable",
+            error=cached.get("lastError") or "resource is detached")
     try:
         provider = _load_provider(mounted.mount.provider)
     except Exception:  # noqa: BLE001 -- activation failure is isolated from local Workspace reads
-        return _unavailable_resolution(source, "unavailable", _activation_error())
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="offline", error=_activation_error())
+        return _cached_resolution(
+            cached, mounted, source, uid=uid, completeness="unavailable",
+            error=_activation_error())
 
     resolved = bounded_resolve(provider, mounted.mount, resource_id)
     if resolved.state != "ready" or resolved.item is None:
-        return _unavailable_resolution(source, resolved.state, resolved.reason)
+        state = _reference_state(resolved.failure, resolved.state)
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state=state, error=resolved.reason)
+        return _cached_resolution(
+            cached, mounted, source, uid=uid, completeness=resolved.state,
+            error=resolved.reason)
     if resolved.item.id != resource_id or resolved.item.kind != kind:
-        return _unavailable_resolution(
-            source, "unavailable", "catalog provider returned a mismatched resource identity")
+        cached = metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error",
+            error="catalog provider returned a mismatched resource identity")
+        return _cached_resolution(
+            cached, mounted, source, uid=uid, completeness="unavailable",
+            error="catalog provider returned a mismatched resource identity")
 
     try:
         local_parent = metadb.workspace_resolve(
@@ -461,19 +611,101 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     ancestors = bounded_ancestors(provider, mounted.mount, resource_id)
     provider_ancestors = [item for item in ancestors.items if item.kind == "container"]
     dropped = len(provider_ancestors) != len(ancestors.items)
-    combined = [
-        *local_parent["ancestors"], local_parent["resource"],
-        *(_workspace_resource(item, mounted) for item in provider_ancestors),
-    ]
+    provider_resources: list[dict] = []
+    parent_binding_id: str | None = None
+    for item in provider_ancestors:
+        resource = _workspace_resource(
+            item, mounted, parent_binding_id=parent_binding_id)
+        provider_resources.append(resource)
+        parent_binding_id = resource["bindingId"]
+    current = _workspace_resource(
+        resolved.item, mounted, parent_binding_id=parent_binding_id)
     completeness = "complete" if ancestors.state == "ready" and not dropped else (
         "partial" if ancestors.state == "ready" else ancestors.state)
     error = (
         "catalog provider returned a non-container ancestor" if dropped else ancestors.reason
     )
+    if completeness != "complete":
+        # A partial ancestor read must not erase the last-known path.  The target facts are current,
+        # but the explanatory navigation context is explicitly stale until Retry converges.
+        provider_resources = [
+            _binding_resource(item, mounted)
+            for item in metadb.workspace_provider_binding_ancestors(current["bindingId"])
+        ]
+        current = {**current, "lastKnown": True}
+    combined = [
+        *local_parent["ancestors"], local_parent["resource"], *provider_resources,
+    ]
     return {
-        "resource": _workspace_resource(resolved.item, mounted),
+        "resource": current,
         "ancestors": combined,
         "source": _source_status(source, completeness, error),
+    }
+
+
+def relink(
+    resource_ref: str, *, uid: str, mount_id: str, resource_id: str,
+) -> dict:
+    """Resolve an explicit replacement and mint a new binding; never repair by display name."""
+    try:
+        kind, identity = resource_ref.split(":", 1)
+    except ValueError as exc:
+        raise KeyError("invalid Workspace resource reference") from exc
+    if kind not in {"container", "dataset"} or not identity.startswith(_EXTERNAL_PREFIX):
+        raise ValueError("only external Workspace resources can be relinked")
+    old_mount_id, old_resource_id, old_binding_id = _decode_external_identity(identity)
+    old = metadb.workspace_provider_binding(
+        old_binding_id, mount_id=old_mount_id, resource_id=old_resource_id)
+    if old is None or old["kind"] != kind:
+        raise KeyError("Workspace provider binding not found")
+
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    if mounted is None:
+        raise KeyError("replacement catalog mount is not configured")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation failure is an unavailable replacement
+        raise ProviderRelinkUnavailable(_activation_error()) from exc
+    resolved = bounded_resolve(provider, mounted.mount, resource_id)
+    if resolved.state != "ready" or resolved.item is None:
+        if resolved.failure == "permission_lost":
+            raise PermissionError(resolved.reason or "replacement permission was lost")
+        if resolved.failure == "not_found":
+            raise KeyError(resolved.reason or "replacement resource was not found")
+        raise ProviderRelinkUnavailable(
+            resolved.reason or "replacement provider is unavailable")
+    if resolved.item.id != resource_id:
+        raise ProviderRelinkUnavailable(
+            "catalog provider returned a mismatched replacement identity")
+    if resolved.item.kind != kind:
+        raise ValueError("replacement resource kind does not match the detached reference")
+
+    ancestors = bounded_ancestors(provider, mounted.mount, resource_id)
+    provider_ancestors = [item for item in ancestors.items if item.kind == "container"]
+    parent_binding_id: str | None = None
+    for item in provider_ancestors:
+        parent = _workspace_resource(
+            item, mounted, parent_binding_id=parent_binding_id)
+        parent_binding_id = parent["bindingId"]
+    previous, fresh = metadb.workspace_provider_relink_binding(
+        old_binding_id,
+        mount_id=mounted.mount.id,
+        provider=mounted.mount.provider,
+        container_id=mounted.container_id,
+        resource_id=resolved.item.id,
+        kind=resolved.item.kind,
+        name=resolved.item.name,
+        parent_binding_id=parent_binding_id,
+    )
+    return {
+        "ok": True,
+        "resource": _binding_resource(fresh, mounted),
+        "previousResource": _binding_resource(previous, _MountedProvider(
+            CatalogMount(
+                id=previous["mountId"], provider=previous["provider"], config={}),
+            previous["containerId"],
+        )),
     }
 
 

@@ -28,6 +28,8 @@ from hub.models import (
     WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceResourceResolution,
+    WorkspaceProviderRelinkRequest,
+    WorkspaceProviderRelinkResult,
     WorkspaceSearchPage,
 )
 from hub.security import RequestIdentity, current_identity, current_user
@@ -439,6 +441,56 @@ def resolve_workspace_resource(resource_id: str, uid: str = Depends(current_user
         return workspace_providers.resolve(resource_id, uid=uid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.post(
+    "/workspace/resources/{resource_id}/relink",
+    response_model=WorkspaceProviderRelinkResult,
+)
+def relink_workspace_resource(
+    resource_id: str,
+    body: WorkspaceProviderRelinkRequest,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Mint a new external binding from one explicit mount/resource selection."""
+    from hub.observability import AuditAction, AuditOutcome, emit_audit
+
+    try:
+        result = workspace_providers.relink(
+            resource_id, uid=uid, mount_id=body.mount_id,
+            resource_id=body.resource_id,
+        )
+    except KeyError as exc:
+        emit_audit(
+            AuditAction.WORKSPACE_RELINK, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_binding",
+        )
+        raise HTTPException(404, str(exc)) from exc
+    except PermissionError as exc:
+        emit_audit(
+            AuditAction.WORKSPACE_RELINK, AuditOutcome.DENIED,
+            principal_id=uid, resource_type="workspace_provider_binding",
+        )
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        emit_audit(
+            AuditAction.WORKSPACE_RELINK, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_binding",
+        )
+        raise HTTPException(422, str(exc)) from exc
+    except workspace_providers.ProviderRelinkUnavailable as exc:
+        emit_audit(
+            AuditAction.WORKSPACE_RELINK, AuditOutcome.FAILURE,
+            principal_id=uid, resource_type="workspace_provider_binding",
+        )
+        raise HTTPException(503, str(exc)) from exc
+    emit_audit(
+        AuditAction.WORKSPACE_RELINK, AuditOutcome.SUCCESS,
+        principal_id=uid, resource_type="workspace_provider_binding",
+        resource_id=result["resource"]["bindingId"],
+        attrs={"operation": "explicit_relink"},
+    )
+    return result
 
 
 @router.post("/workspace/canvases")

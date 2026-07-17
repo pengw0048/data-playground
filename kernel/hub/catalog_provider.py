@@ -18,6 +18,7 @@ from pydantic import Field, model_validator
 from hub.models import ColumnSchema, Wire
 
 ProviderState = Literal["ready", "partial", "unavailable", "unsupported"]
+ProviderFailure = Literal["offline", "permission_lost", "not_found", "provider_error"]
 _PROVIDER_READ_CONCURRENCY = 8
 _provider_read_slots = threading.BoundedSemaphore(_PROVIDER_READ_CONCURRENCY)
 _provider_read_executor = concurrent.futures.ThreadPoolExecutor(
@@ -85,6 +86,17 @@ class ProviderResourceResult(Wire):
     state: ProviderState = "ready"
     item: CatalogResource | None = None
     reason: str | None = Field(default=None, max_length=512)
+    failure: ProviderFailure | None = None
+
+    @model_validator(mode="after")
+    def _failure_shape(self) -> "ProviderResourceResult":
+        if self.state == "ready" and self.failure is not None:
+            raise ValueError("a ready provider resource cannot carry a failure")
+        if self.state != "ready" and self.item is not None:
+            raise ValueError("a failed provider resource cannot carry an item")
+        if self.state != "ready" and self.failure is None:
+            raise ValueError("a failed provider resource must classify its failure")
+        return self
 
 
 class ProviderAncestors(Wire):
@@ -170,9 +182,10 @@ def bounded_resolve(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
     """Resolve one provider identity without letting synchronous provider I/O block Workspace."""
     return _bounded_provider_read(
         lambda: provider.resolve(mount, resource_id),
-        unavailable=lambda reason: ProviderResourceResult(state="unavailable", reason=reason),
+        unavailable=lambda reason: ProviderResourceResult(
+            state="unavailable", reason=reason, failure="offline"),
         unsupported=lambda: ProviderResourceResult(
-            state="unsupported", reason="resolve is unsupported"),
+            state="unsupported", reason="resolve is unsupported", failure="provider_error"),
         timeout=timeout,
     )
 

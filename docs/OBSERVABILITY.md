@@ -92,6 +92,7 @@ resource_id?, request_id?, run_id?, attempt_id?, attrs, ts}`.
 | `job.cancel` | success / failure / denied | principal = caller; `run_id` | |
 | `secret_ref.change` | success / failure | — | **Schema only** until secret references (#107) |
 | `policy.denial` | denied | principal + resource | **Schema only** until policy surfaces land |
+| `workspace.relink` | success / failure / denied | principal + provider binding | Explicit manual external Workspace binding replacement; no provider config or URI |
 
 Redaction rules: never include raw row values, plaintext secrets, or credential-bearing URIs in
 `attrs` or metric labels. Use resource identity (dataset id / canvas id / setting key) only.

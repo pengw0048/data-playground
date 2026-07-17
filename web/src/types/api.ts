@@ -167,6 +167,10 @@ export interface WorkspaceResource {
   mountId?: string | null
   provider?: string | null
   resourceId?: string | null
+  bindingId?: string | null
+  referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error'
+  lastKnown?: boolean
+  lastResolvedAt?: string | null
 }
 export interface WorkspaceSourceStatus {
   id: string
@@ -175,6 +179,7 @@ export interface WorkspaceSourceStatus {
   mountId?: string | null
   provider?: string | null
   error?: string | null
+  referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
 }
 export interface WorkspaceBrowsePage {
   container: WorkspaceResource | null
@@ -188,6 +193,11 @@ export interface WorkspaceResourceResolution {
   resource: WorkspaceResource | null
   ancestors: WorkspaceResource[]
   source: WorkspaceSourceStatus
+}
+export interface WorkspaceProviderRelinkResult {
+  ok: boolean
+  resource: WorkspaceResource
+  previousResource: WorkspaceResource
 }
 export interface WorkspaceSearchSourceStatus extends WorkspaceSourceStatus {
   freshness: 'current' | 'stale' | 'unknown'

@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0007_workspace_provider_bindings", "0006_typed_local_writes"),
         ("0006_typed_local_writes", "0005_profile_output_ports"),
         ("0005_profile_output_ports", "0004_local_run_input_admissions"),
         ("0004_local_run_input_admissions", "0003_repair_historical_metadata"),
@@ -61,8 +62,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0006_typed_local_writes"]
-    assert metadb.expected_schema_head() == "0006_typed_local_writes"
+    assert scripts.get_heads() == ["0007_workspace_provider_bindings"]
+    assert metadb.expected_schema_head() == "0007_workspace_provider_bindings"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -83,6 +84,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0006_typed_local_writes.py": (
             "132a4a8ff77a5a48ad45538beaded4480b45b7bf4006fe504e02e1481845507c"
+        ),
+        "0007_workspace_provider_bindings.py": (
+            "5bd4feb0205b08e19275f6513644b347a5d5fd0fe1d45d9bd5e47a3fc1b3800c"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

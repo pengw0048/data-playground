@@ -290,7 +290,7 @@ class _WorkspaceFixtureProvider:
     def resolve(self, mount, resource_id):
         item = next((item for item in self._resources(mount.id) if item.id == resource_id), None)
         return ProviderResourceResult(item=item) if item else ProviderResourceResult(
-            state="unavailable", reason="resource not found")
+            state="unavailable", reason="resource not found", failure="not_found")
 
     def ancestors(self, mount, resource_id):
         if resource_id == "nested-dataset":
@@ -374,7 +374,7 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         assert statuses["mount:a-slow"] == {
             "id": "mount:a-slow", "kind": "provider", "mountId": "a-slow",
             "provider": "fixture", "completeness": "unavailable",
-            "error": "deadline exceeded",
+            "error": "deadline exceeded", "referenceState": None,
         }
         assert statuses["mount:b-partial"]["completeness"] == "partial"
         assert statuses["mount:b-partial"]["error"] == "provider returned a bounded subset"
@@ -431,6 +431,128 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
     # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
     # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
     time.sleep(0.03)
+
+
+def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-repair")
+    mount_id = f"repair-{token}"
+    provider = _WorkspaceFixtureProvider()
+    mode = {"failure": None}
+    ancestor_partial = {"value": False}
+    resolve_calls = 0
+    normal_resolve = provider.resolve
+    normal_ancestors = provider.ancestors
+
+    def resolve(mount, resource_id):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        failure = mode["failure"]
+        if failure is None:
+            return normal_resolve(mount, resource_id)
+        return ProviderResourceResult(
+            state="unavailable",
+            reason={
+                "offline": "provider offline",
+                "permission_lost": "access revoked: must-not-be-cached",
+                "not_found": "resource not found",
+                "provider_error": "provider response invalid",
+            }[failure],
+            failure=failure,
+        )
+
+    monkeypatch.setattr(provider, "resolve", resolve)
+    monkeypatch.setattr(provider, "ancestors", lambda mount, resource_id: (
+        ProviderAncestors(state="partial", reason="ancestor read interrupted")
+        if ancestor_partial["value"] else normal_ancestors(mount, resource_id)
+    ))
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+        "config": {"credential": "must-not-be-cached"},
+    }]))
+
+    with TestClient(app) as client:
+        page = client.get(f"/api/workspace/containers/{folder['id']}").json()
+        resource = next(
+            item for item in page["items"] if item.get("resourceId") == "dataset-a")
+        stable_ref = resource["id"]
+        binding_id = resource["bindingId"]
+
+        current = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert current.status_code == 200, current.text
+        assert current.json()["resource"]["referenceState"] == "current"
+
+        ancestor_partial["value"] = True
+        stale_path = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert stale_path.status_code == 200, stale_path.text
+        assert stale_path.json()["resource"]["lastKnown"] is True
+        assert stale_path.json()["source"]["completeness"] == "partial"
+        ancestor_partial["value"] = False
+
+        mode["failure"] = "offline"
+        offline = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert offline.status_code == 200, offline.text
+        offline_resource = offline.json()["resource"]
+        assert offline_resource["id"] == stable_ref
+        assert offline_resource["name"] == "shared"
+        assert offline_resource["referenceState"] == "offline"
+        assert offline_resource["lastKnown"] is True
+        assert offline.json()["source"]["referenceState"] == "offline"
+
+        # Retry re-resolves this exact binding and converges when the provider returns.
+        mode["failure"] = None
+        recovered = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["resource"]["referenceState"] == "current"
+        assert recovered.json()["resource"]["bindingId"] == binding_id
+
+        mode["failure"] = "permission_lost"
+        denied = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert denied.json()["resource"]["referenceState"] == "permission_lost"
+        with metadb.session() as session:
+            persisted = session.get(metadb.WorkspaceProviderBinding, binding_id)
+            assert persisted is not None
+            assert persisted.last_error == "provider permission was lost"
+        mode["failure"] = "provider_error"
+        failed = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert failed.json()["resource"]["referenceState"] == "provider_error"
+
+        mode["failure"] = "not_found"
+        detached = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert detached.json()["resource"]["referenceState"] == "detached"
+        assert detached.json()["resource"]["detached"] is True
+
+        # Recreating the same name and provider ID cannot revive the terminal old binding.
+        mode["failure"] = None
+        calls_before = resolve_calls
+        still_detached = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert still_detached.json()["resource"]["referenceState"] == "detached"
+        assert resolve_calls == calls_before
+
+        relinked = client.post(f"/api/workspace/resources/{stable_ref}/relink", json={
+            "mountId": mount_id, "resourceId": "dataset-a",
+        })
+        assert relinked.status_code == 200, relinked.text
+        fresh = relinked.json()["resource"]
+        assert fresh["id"] != stable_ref
+        assert fresh["bindingId"] != binding_id
+        assert fresh["referenceState"] == "current"
+        assert client.get(f"/api/workspace/resources/{stable_ref}").json()[
+            "resource"]["referenceState"] == "detached"
+        assert client.get(f"/api/workspace/resources/{fresh['id']}").json()[
+            "resource"]["referenceState"] == "current"
+
+    with metadb.session() as session:
+        old = session.get(metadb.WorkspaceProviderBinding, binding_id)
+        new = session.get(metadb.WorkspaceProviderBinding, fresh["bindingId"])
+        assert old is not None and old.state == "detached" and old.active is False
+        assert new is not None and new.relinked_from_id == binding_id and new.active is True
+        serialized = json.dumps(metadb._workspace_provider_binding_doc(new), default=str)
+        assert "must-not-be-cached" not in serialized
+        assert "uri" not in serialized.lower()
 
 
 def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partial_truth(

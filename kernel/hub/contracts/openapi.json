@@ -4950,9 +4950,63 @@
         "title": "WorkspaceMoveCanvasBody",
         "type": "object"
       },
+      "WorkspaceProviderRelinkRequest": {
+        "properties": {
+          "mountId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Mountid",
+            "type": "string"
+          },
+          "resourceId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Resourceid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mountId",
+          "resourceId"
+        ],
+        "title": "WorkspaceProviderRelinkRequest",
+        "type": "object"
+      },
+      "WorkspaceProviderRelinkResult": {
+        "properties": {
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "previousResource": {
+            "$ref": "#/components/schemas/WorkspaceResource"
+          },
+          "resource": {
+            "$ref": "#/components/schemas/WorkspaceResource"
+          }
+        },
+        "required": [
+          "resource",
+          "previousResource"
+        ],
+        "title": "WorkspaceProviderRelinkResult",
+        "type": "object"
+      },
       "WorkspaceResource": {
         "description": "One Workspace child addressed by an opaque, path-independent reference.",
         "properties": {
+          "bindingId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bindingid"
+          },
           "detached": {
             "default": false,
             "title": "Detached",
@@ -4970,6 +5024,23 @@
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "lastKnown": {
+            "default": false,
+            "title": "Lastknown",
+            "type": "boolean"
+          },
+          "lastResolvedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastresolvedat"
           },
           "mountId": {
             "anyOf": [
@@ -5018,6 +5089,18 @@
               }
             ],
             "title": "Provider"
+          },
+          "referenceState": {
+            "default": "current",
+            "enum": [
+              "current",
+              "offline",
+              "permission_lost",
+              "detached",
+              "provider_error"
+            ],
+            "title": "Referencestate",
+            "type": "string"
           },
           "resourceId": {
             "anyOf": [
@@ -5478,6 +5561,24 @@
             ],
             "title": "Provider"
           },
+          "referenceState": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "offline",
+                  "permission_lost",
+                  "detached",
+                  "provider_error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Referencestate"
+          },
           "searchMode": {
             "enum": [
               "native",
@@ -5558,6 +5659,24 @@
               }
             ],
             "title": "Provider"
+          },
+          "referenceState": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "offline",
+                  "permission_lost",
+                  "detached",
+                  "provider_error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Referencestate"
           }
         },
         "required": [
@@ -14299,6 +14418,98 @@
           }
         },
         "summary": "Resolve Workspace Resource"
+      }
+    },
+    "/api/workspace/resources/{resource_id}/relink": {
+      "post": {
+        "description": "Mint a new external binding from one explicit mount/resource selection.",
+        "operationId": "relink_workspace_resource_api_workspace_resources__resource_id__relink_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "resource_id",
+            "required": true,
+            "schema": {
+              "title": "Resource Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceProviderRelinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceProviderRelinkResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Relink Workspace Resource"
       }
     },
     "/api/workspace/search": {
