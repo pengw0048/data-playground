@@ -12,9 +12,10 @@ steps below differ by profile.
 
 | Item | Why it matters |
 |---|---|
-| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
-| **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results and local-result artifacts), and `plugins/` (operator-installed packs). |
+| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
+| **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results plus immutable core-owned revision artifacts under `.dp-results/`), and `plugins/` (operator-installed packs). Preserve the complete `.dp-results` namespace metadata and record hashes for every core-owned artifact referenced by `managed_local_file_revisions`; copying only current catalog heads loses retained history. |
 | **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
+| **Provider-owned history evidence (not provider bytes)** | The database retains opaque registration / dataset IDs, exact provider revision IDs, pinned Source refs, and admitted run manifests. The logical backup does **not** include provider-owned Lance or plugin-provider bytes. Back those up through the provider's own system if required, and classify each restored exact read as available or unavailable instead of treating a current same-name/path dataset as the old revision. |
 | **Credential references** | Cred rows and plugin `secret` settings contain SecretRefs plus non-secret connection metadata, not resolved credential values. Back up the referenced environment, files, or external secret manager separately; a metadata restore cannot recreate them. |
 | **Release identity** | Record `GET /api/version` (`sha`, `db` dialect, `storage` scheme) and the Alembic revision stored in the metadata DB (`alembic_version.version_num`, also exposed by `metadb.expected_schema_head()` / `metadb.require_schema_at_head()`). A restore must land on a release that understands that schema. |
 
@@ -24,8 +25,10 @@ steps below differ by profile.
 2. Snapshot the **metadata database** and the **artifact / object store** as close together as possible. Prefer: freeze writers → dump DB → copy object generations and the namespace marker → copy local workspace files that are not already in the DB dump.
 3. Resume writers only after the backup set is complete and verified (checksums or byte sizes recorded).
 
-A backup taken while writers are still active can leave dangling artifact URIs or a metadata
-revision that does not match the files on disk.
+A backup taken while writers are still active can leave dangling artifact URIs, a retention ref
+without its immutable artifact, or a manifest revision that does not match the files on disk. Do
+not synthesize expired read leases after restore; durable refs and tombstones come from the database
+snapshot, while a new process acquires fresh DB-clock leases for new reads.
 
 ## Profile A — SQLite + local files
 
@@ -45,6 +48,10 @@ mkdir -p backup
 cp -a "$DP_WORKSPACE/dataplay.db" backup/dataplay.db
 cp -a "$DP_WORKSPACE/outputs" backup/outputs
 cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
+# Record content evidence relative to outputs/ (use `shasum -a 256` where sha256sum is unavailable):
+(cd "$DP_WORKSPACE/outputs" && \
+  find ./.dp-results -type f ! -path '*/.locks/*' -print0 | sort -z | \
+  xargs -0 sha256sum) > backup/core-artifacts.sha256
 # Alembic revision is inside dataplay.db (table alembic_version). Keep version.json with the set.
 ```
 
@@ -55,14 +62,26 @@ source installation is still running.
 
 ```bash
 RESTORE=/tmp/dp-restore-$$
+BACKUP="$(cd backup && pwd)"
 mkdir -p "$RESTORE"
-cp -a backup/dataplay.db "$RESTORE/dataplay.db"
-cp -a backup/outputs "$RESTORE/outputs"
-cp -a backup/plugins "$RESTORE/plugins" 2>/dev/null || true
+cp -a "$BACKUP/dataplay.db" "$RESTORE/dataplay.db"
+cp -a "$BACKUP/outputs" "$RESTORE/outputs"
+cp -a "$BACKUP/plugins" "$RESTORE/plugins" 2>/dev/null || true
+(cd "$RESTORE/outputs" && sha256sum -c "$BACKUP/core-artifacts.sha256")
+
+# Built-in local-result and managed-revision URIs are exact absolute paths. For an isolated
+# clone, mount the copied outputs tree at the original recorded output path inside the clone's
+# container/sandbox. A plain copy to a different host path does not rebind those identities.
+# Set DP_STORAGE_URL to that mounted outputs root (the parent of the recorded
+# local_result_artifacts.storage_root) so exact reads acquire the restored DB read lease.
+# If the original path cannot be reproduced, exact reads must report unavailable and the
+# mismatch evidence below must name the expected URI and copied candidate; never rewrite or
+# follow the latest dataset implicitly.
 
 # Assign a fresh storage namespace and isolate BEFORE any provider / object-attempt access.
 export DP_WORKSPACE="$RESTORE"
 export DP_DATABASE_URL="sqlite:///$RESTORE/dataplay.db"
+export DP_STORAGE_URL="<mounted original outputs root>"
 # Read the source namespace from the restored DB, then isolate:
 python - <<'PY'
 from hub import metadb
@@ -80,8 +99,11 @@ dataplay --workspace "$RESTORE"
 
 After isolation the clone has a new owner token and namespace; inherited managed object attempts
 are quarantined and their catalog/cache visibility revoked. Local canvases, ordinary catalog
-rows, run history, lineage among non-attempt URIs, and local-result artifact registry rows remain
-readable. The source installation's files and DB are untouched because the clone never opened them.
+rows, run history, lineage among non-attempt URIs, revision ledgers, manifests, tombstones, and
+retention references remain present. A core-owned exact revision is readable only when its copied
+artifact is present at the recorded exact URI (normally by reproducing the original mount path in
+the isolated environment). Provider-owned exact history is independently available or unavailable
+according to provider read-back; it is never supplied by this backup set.
 
 ### Documented limitation (skipped isolation)
 
@@ -127,6 +149,8 @@ mc cp --recursive "dp/${DP_S3_BUCKET}/" "backup/objects/"
 
 # 5. Workspace plugins (optional but recommended):
 cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
+# If this deployment also has built-in local outputs, copy and fingerprint the complete tree exactly
+# as in Profile A; PostgreSQL does not move local revision bytes into the object store.
 ```
 
 Consistency ordering for this profile: stop writers → `pg_dump` → object-store copy (generations
@@ -143,6 +167,9 @@ pg_restore --clean --if-exists --no-owner --no-acl -d "$RESTORE_DATABASE_URL_LIB
 
 # Copy objects into a scratch prefix if you need file presence for local checks; the clone must
 # NOT claim the source namespace marker. Isolation creates a new claim under the replacement namespace.
+# Restore any built-in local `outputs/` tree at the same absolute mount path recorded by
+# `local_result_artifacts.storage_root`, and set DP_STORAGE_URL to its parent outputs directory;
+# a new Postgres database does not rewrite file URIs or local read-lease ownership.
 
 export DP_DATABASE_URL="postgresql+psycopg://..."   # the restore DB only
 export DP_STORAGE_URL="s3://..."                    # bucket/prefix the clone may use
@@ -169,6 +196,41 @@ export DP_STORAGE_NAMESPACE="<replacement>"
 - **Not a secret-backend backup.** The metadata database restores Cred and plugin SecretRefs,
   but it does not restore referenced environment variables, mounted secret files, or an external
   secret manager. Restore those through the deployment system before exercising the credentials.
+- **Not a provider-data backup.** Provider-owned revision IDs and exact references are retained as
+  evidence, but provider files, object versions, credentials, and retention policy remain owned by
+  that provider. A 410 exact-unavailable result is truthful; opening provider head instead is not.
+- **Not identity repair.** Do not recreate a missing catalog registration from a restored display
+  name or path. The restored opaque dataset ID and revision ID either resolve together or remain
+  unavailable. Unregistered logical rows stay tombstones and must not be projected as current.
+- **Not cross-schema conversion.** This is the current pre-1.0 logical schema contract. Restore the
+  recorded schema with a release that understands it; do not drop, rename, or infer revision rows as
+  an unpublished compatibility migration.
+
+## Revision recovery verification
+
+Before allowing runs or edits against a restore, verify the revision consistency unit and retain
+the output with the drill evidence:
+
+1. Compare the restored Alembic head and release identity with `version.json`.
+2. Confirm every pinned Source and every `run_input_admissions.manifest` /
+   `run_records.input_manifest` pair has the original ordered opaque dataset/revision IDs.
+3. Join `managed_local_file_revisions` to `local_result_artifacts` and
+   `local_result_references`. Verify every retained core artifact exists at its exact URI and matches
+   the hash recorded with the backup. An active head, historical revision, or unregistered tombstone
+   without its retention row is a restore mismatch.
+4. Open each core-owned selected revision by its original dataset/revision pair. Opening current
+   head is not a substitute. Confirm the read holds a fresh `read_lease` reference against the
+   restored artifact. Missing or changed bytes are an actionable backup failure.
+5. Exact-read each provider-owned selected revision. Report `available`, `unavailable`,
+   `permission_lost`, or `provider_offline` from that exact read. Do not copy provider bytes into the
+   core set and do not retry by resolving latest.
+6. Confirm unregistered `catalog_logical_datasets` still have `current_uri IS NULL` and state
+   `unregistered`; a same path/name must not silently acquire the old opaque identity.
+
+The automated drill emits `BACKUP_RESTORE_REVISION_EVIDENCE` on success. A failure emits
+`BACKUP_RESTORE_REVISION_MISMATCH` JSON entries with a `subject`, `expected`, and `actual` value so
+operators can distinguish a missing DB row, identity drift, a missing/corrupt core artifact, and an
+unexpected provider result.
 
 ## Automated restore drill
 
@@ -187,16 +249,17 @@ cd kernel && uv run pytest -q hub/tests/test_backup_restore_drill.py -k postgres
 
 ### How to read RPO / RTO evidence
 
-Each passing drill prints two structured lines (also captured in CI logs):
+Each passing drill prints three structured lines (also captured in CI logs):
 
 ```
+BACKUP_RESTORE_REVISION_EVIDENCE: <JSON exact-read and identity summary>
 BACKUP_RESTORE_DRILL RPO: <human summary of which fixture writes the backup captured>
 BACKUP_RESTORE_DRILL RTO_MS: <integer milliseconds from restore start to verified restore>
 ```
 
 - **RPO (recovery point)** — which durable writes the fixture backup is known to contain
-  (canvas id, catalog URIs, run id, lineage fact and publication receipt, artifact URI, Alembic head,
-  release sha).
+  (canvas id, catalog URIs, run/admission id, lineage fact and publication receipt, artifact URI,
+  managed dataset/revision identity, unregistered tombstone, Alembic head, release sha).
   Anything written *after* that freeze is outside the recovery point by definition.
 - **RTO (recovery time)** — wall-clock duration from the moment restore begins (copy/load of
   the backup set into the clone) through isolation and the verification assertions. It is a

@@ -9,15 +9,22 @@ import shutil
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
+import pyarrow as pa
+import pyarrow.parquet as pq
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
 from hub import handoff, metadb
-from hub.models import RunOutput
+from hub.models import CatalogTable, RunOutput
+from hub.plugins.adapters import (
+    DuckDBAdapter, LanceAdapter, ManagedLocalFileRevisionAdapter, RevisionUnavailable,
+)
+from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
 
 
@@ -57,6 +64,20 @@ def _tree_fingerprint(root: Path) -> dict[str, str]:
         if path.is_file():
             out[str(path.relative_to(root))] = _file_sha256(path)
     return out
+
+
+@contextmanager
+def _mount_restored_outputs_at_exact_path(source_root: Path, restored_root: Path):
+    """Model the documented isolated-container mount without reading source artifact bytes."""
+    parked = source_root.with_name(f"{source_root.name}.source-{uuid.uuid4().hex}")
+    source_root.rename(parked)
+    try:
+        shutil.copytree(restored_root, source_root)
+        yield
+    finally:
+        if source_root.exists():
+            shutil.rmtree(source_root)
+        parked.rename(source_root)
 
 
 class _ClaimProvider:
@@ -137,6 +158,62 @@ def _attempt_inventory(handle: dict) -> list[dict]:
     ]
 
 
+def _publish_core_revision(
+        storage: LocalStorage, catalog: InMemoryCatalog, logical_uri: str, value: int) -> dict:
+    run_id = f"backup-revision-{uuid.uuid4().hex}"
+    artifact = storage.begin_result(f"backup-revision:{logical_uri}", run_id)
+    pq.write_table(pa.table({"value": [value]}), artifact)
+    storage.commit_result(artifact, run_id)
+    try:
+        published = catalog.publish_managed_local_file_output(
+            name="backup_revision", logical_uri=logical_uri, artifact_uri=artifact)
+    except Exception:
+        storage.abort_result(artifact, run_id)
+        raise
+    assert storage.release_result(artifact, run_id) is True
+    return {
+        "dataset_id": published["dataset_id"],
+        "revision_id": published["revision_id"],
+        "artifact_uri": artifact,
+        "artifact_rel": str(Path(artifact).resolve().relative_to(Path(storage.root).resolve())),
+        "artifact_sha256": _file_sha256(Path(artifact)),
+        "value": value,
+    }
+
+
+def _register_provider_revision(path: Path, name: str, value: int) -> dict:
+    lance = pytest.importorskip("lance")
+    lance.write_dataset(pa.table({"value": [value]}), str(path))
+    table = CatalogTable(id=f"tbl_{uuid.uuid4().hex}", name=name, uri=str(path), columns=[])
+    assert metadb.catalog_upsert_entry(
+        str(path), name, table.model_dump(by_alias=True)) is True
+    binding = metadb.catalog_revision_binding_for_uri(str(path))
+    assert binding is not None
+    revision = LanceAdapter().resolve_revision(str(path))
+    return {
+        "dataset_id": binding["dataset_id"],
+        "revision_id": revision["revision_id"],
+        "uri": str(path),
+        "value": value,
+    }
+
+
+def _exact_source_node(node_id: str, ref: dict) -> dict:
+    return {
+        "id": node_id,
+        "type": "source",
+        "position": {"x": 0, "y": 0},
+        "data": {"config": {
+            "uri": ref.get("artifact_uri", ref.get("uri")),
+            "datasetRef": {
+                "kind": "exact",
+                "datasetId": ref["dataset_id"],
+                "revisionId": ref["revision_id"],
+            },
+        }},
+    }
+
+
 def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
                   provider: _ClaimProvider) -> dict:
     metadb.init_db()
@@ -196,7 +273,65 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     assert lineage_receipt["version"] is None
     assert lineage_receipt["fingerprint"].startswith("lineage-publication:v2:sha256:")
 
-    run_id = f"drill-run-{uuid.uuid4().hex}"
+    revision_catalog = InMemoryCatalog(str(data_dir), lambda _uri: DuckDBAdapter())
+    managed_logical_uri = str(data_dir / "managed-recovery.parquet")
+    core_original = _publish_core_revision(
+        storage, revision_catalog, managed_logical_uri, 101)
+    core_head = _publish_core_revision(
+        storage, revision_catalog, managed_logical_uri, 202)
+    assert core_original["dataset_id"] == core_head["dataset_id"]
+
+    tombstone_logical_uri = str(data_dir / "unregistered-recovery.parquet")
+    tombstone = _publish_core_revision(
+        storage, revision_catalog, tombstone_logical_uri, 303)
+    metadb.catalog_delete_entry(tombstone["artifact_uri"])
+
+    provider_root = workspace / "provider-owned"
+    provider_root.mkdir()
+    provider_available = _register_provider_revision(
+        provider_root / "available.lance", "provider-available", 404)
+    provider_unavailable = _register_provider_revision(
+        provider_root / "unavailable.lance", "provider-unavailable", 505)
+
+    exact_refs = [core_original, provider_available, provider_unavailable]
+    canvas_doc = {
+        "id": canvas_id,
+        "nodes": [
+            _exact_source_node("core", core_original),
+            _exact_source_node("provider-available", provider_available),
+            _exact_source_node("provider-unavailable", provider_unavailable),
+        ],
+        "edges": [],
+    }
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        canvas.doc = json.dumps(canvas_doc)
+        metadb.sync_local_result_owner(session, "canvas", canvas_id, canvas_doc)
+
+    admitted_manifest = [
+        {
+            "node_id": node_id,
+            "dataset_id": ref["dataset_id"],
+            "revision_id": ref["revision_id"],
+            "provider": provider_name,
+            "resolved_at": "2026-07-16T00:00:00+00:00",
+        }
+        for node_id, provider_name, ref in (
+            ("core", "managed-local-file", core_original),
+            ("provider-available", "lance", provider_available),
+            ("provider-unavailable", "lance", provider_unavailable),
+        )
+    ]
+    run_id, created = metadb.admit_local_run_inputs(
+        uid=metadb.DEFAULT_USER_ID,
+        canvas_id=canvas_id,
+        submission_id=str(uuid.uuid4()),
+        target_node_id="core",
+        intent_sha256=hashlib.sha256(b"backup-restore-revision-drill").hexdigest(),
+        manifest=admitted_manifest,
+    )
+    assert created is True
     artifact_uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
     Path(artifact_uri).write_bytes(b"drill-local-result-bytes")
     storage.commit_result(artifact_uri, run_id)
@@ -270,6 +405,14 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "lineage_publication_key": lineage_publication_key,
         "lineage_receipt": lineage_receipt,
         "run_id": run_id,
+        "admitted_manifest": admitted_manifest,
+        "exact_refs": exact_refs,
+        "core_original": core_original,
+        "core_head": core_head,
+        "tombstone": tombstone,
+        "tombstone_logical_uri": tombstone_logical_uri,
+        "provider_available": provider_available,
+        "provider_unavailable": provider_unavailable,
         "artifact_uri": artifact_uri,
         "artifact_rel": artifact_rel,
         "artifact_bytes": Path(artifact_uri).read_bytes(),
@@ -286,12 +429,15 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
     with metadb.session() as session:
         canvas = session.get(metadb.Canvas, info["canvas_id"])
         assert canvas is not None and canvas.name == "backup-restore-drill"
-        assert json.loads(canvas.doc)["nodes"][0]["id"] == "n1"
+        assert [node["id"] for node in json.loads(canvas.doc)["nodes"]] == [
+            "core", "provider-available", "provider-unavailable",
+        ]
         runs = list(session.scalars(
             select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == info["canvas_id"])))
         assert any(
             row.run_id == info["run_id"]
             and json.loads(row.outputs)[0]["uri"] == info["artifact_uri"]
+            and json.loads(row.input_manifest) == info["admitted_manifest"]
             for row in runs
         )
         state = session.get(metadb.RunState, info["run_id"])
@@ -340,6 +486,184 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
     assert restored_file.read_bytes() == info["artifact_bytes"]
 
 
+def _assert_revision_recovery(
+        info: dict, *, outputs_root: Path, exact_storage: LocalStorage) -> None:
+    """Verify exact revision identity/read-back and emit actionable mismatch evidence."""
+    mismatches: list[dict[str, object]] = []
+
+    def check(subject: str, actual, expected) -> None:
+        if actual != expected:
+            mismatches.append({"subject": subject, "expected": expected, "actual": actual})
+
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, info["canvas_id"])
+        canvas_refs = []
+        if canvas is not None:
+            for node in json.loads(canvas.doc).get("nodes", []):
+                ref = node.get("data", {}).get("config", {}).get("datasetRef")
+                if isinstance(ref, dict):
+                    canvas_refs.append((ref.get("datasetId"), ref.get("revisionId")))
+        check(
+            "canvas exact references",
+            canvas_refs,
+            [(ref["dataset_id"], ref["revision_id"]) for ref in info["exact_refs"]],
+        )
+
+        admission = session.get(metadb.RunInputAdmission, info["run_id"])
+        check(
+            "immutable run admission manifest",
+            json.loads(admission.manifest) if admission is not None else None,
+            info["admitted_manifest"],
+        )
+        history = session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.run_id == info["run_id"],
+            metadb.RunRecord.canvas_id == info["canvas_id"],
+        ))
+        check(
+            "run history manifest",
+            json.loads(history.input_manifest) if history and history.input_manifest else None,
+            info["admitted_manifest"],
+        )
+
+        core_revisions = list(session.scalars(select(metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.logical_id == info["core_original"]["dataset_id"],
+        ).order_by(metadb.ManagedLocalFileRevision.publish_seq)))
+        check(
+            "managed revision ledger",
+            [(row.revision_id, row.artifact_uri) for row in core_revisions],
+            [
+                (info["core_original"]["revision_id"], info["core_original"]["artifact_uri"]),
+                (info["core_head"]["revision_id"], info["core_head"]["artifact_uri"]),
+            ],
+        )
+        core_logical = session.get(
+            metadb.CatalogLogicalDataset, info["core_original"]["dataset_id"])
+        check(
+            "managed current pointer",
+            (core_logical.logical_id, core_logical.current_uri, core_logical.state)
+            if core_logical is not None else None,
+            (info["core_original"]["dataset_id"], info["core_head"]["artifact_uri"], "active"),
+        )
+
+        tombstone_logical = session.get(
+            metadb.CatalogLogicalDataset, info["tombstone"]["dataset_id"])
+        check(
+            "unregistered logical tombstone",
+            (tombstone_logical.logical_id, tombstone_logical.logical_uri,
+             tombstone_logical.current_uri, tombstone_logical.state)
+            if tombstone_logical is not None else None,
+            (info["tombstone"]["dataset_id"], info["tombstone_logical_uri"], None, "unregistered"),
+        )
+        check(
+            "tombstoned revision ledger",
+            session.get(
+                metadb.ManagedLocalFileRevision, info["tombstone"]["revision_id"]
+            ) is not None,
+            True,
+        )
+
+        for label, ref in (
+                ("core original retention", info["core_original"]),
+                ("core head retention", info["core_head"]),
+                ("tombstone retention", info["tombstone"])):
+            retained = session.get(metadb.LocalResultReference, {
+                "uri": ref["artifact_uri"],
+                "owner_kind": "managed_file_revision",
+                "owner_key": ref["revision_id"],
+            })
+            check(label, retained is not None, True)
+        for owner_kind, owner_key in (
+                ("canvas", info["canvas_id"]),
+                ("run_input_admission", info["run_id"])):
+            ref = session.get(metadb.LocalResultReference, {
+                "uri": info["core_original"]["artifact_uri"],
+                "owner_kind": owner_kind,
+                "owner_key": owner_key,
+            })
+            check(f"exact core {owner_kind} reference", ref is not None, True)
+
+    for label, ref in (
+            ("core original artifact", info["core_original"]),
+            ("core head artifact", info["core_head"]),
+            ("tombstone artifact", info["tombstone"])):
+        restored = outputs_root / ref["artifact_rel"]
+        check(f"{label} present", restored.is_file(), True)
+        check(
+            f"{label} sha256",
+            _file_sha256(restored) if restored.is_file() else None,
+            ref["artifact_sha256"],
+        )
+
+    core_binding = metadb.catalog_revision_binding(info["core_original"]["dataset_id"])
+    check(
+        "core opaque dataset binding",
+        core_binding,
+        {"dataset_id": info["core_original"]["dataset_id"],
+         "uri": info["core_head"]["artifact_uri"]},
+    )
+    try:
+        with exact_storage.acquire_result_read(
+                info["core_original"]["artifact_uri"], "backup-restore-verifier"):
+            with metadb.session() as session:
+                read_lease = session.scalar(select(metadb.LocalResultReference).where(
+                    metadb.LocalResultReference.uri == info["core_original"]["artifact_uri"],
+                    metadb.LocalResultReference.owner_kind == "read_lease",
+                ))
+                check("core exact read lease", read_lease is not None, True)
+            core_rows = ManagedLocalFileRevisionAdapter().open_revision(
+                info["core_head"]["artifact_uri"],
+                info["core_original"]["revision_id"],
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — report exact operational evidence
+        mismatches.append({
+            "subject": "core exact revision read-back",
+            "expected": [[info["core_original"]["value"]]],
+            "actual": f"{type(exc).__name__}: {exc}",
+        })
+    else:
+        check("core exact revision read-back", [list(row) for row in core_rows],
+              [[info["core_original"]["value"]]])
+
+    provider_status: dict[str, str] = {}
+    for label, ref, expected_status in (
+            ("available", info["provider_available"], "available"),
+            ("unavailable", info["provider_unavailable"], "unavailable")):
+        binding = metadb.catalog_revision_binding(ref["dataset_id"])
+        check(
+            f"provider {label} opaque dataset binding",
+            binding,
+            {"dataset_id": ref["dataset_id"], "uri": ref["uri"]},
+        )
+        try:
+            rows = LanceAdapter().open_revision(ref["uri"], ref["revision_id"]).fetchall()
+        except RevisionUnavailable:
+            provider_status[label] = "unavailable"
+        except Exception as exc:  # noqa: BLE001 — classify unexpected restore failures precisely
+            provider_status[label] = f"{type(exc).__name__}: {exc}"
+        else:
+            provider_status[label] = "available"
+            check(f"provider {label} exact rows", [list(row) for row in rows], [[ref["value"]]])
+        check(f"provider {label} exact status", provider_status[label], expected_status)
+
+    if mismatches:
+        pytest.fail(
+            "BACKUP_RESTORE_REVISION_MISMATCH: "
+            + json.dumps(mismatches, sort_keys=True, default=str)
+        )
+    print(
+        "BACKUP_RESTORE_REVISION_EVIDENCE: "
+        + json.dumps({
+            "core": "verified",
+            "provider_available": provider_status["available"],
+            "provider_unavailable": provider_status["unavailable"],
+            "dataset_id": info["core_original"]["dataset_id"],
+            "revision_id": info["core_original"]["revision_id"],
+            "tombstone_dataset_id": info["tombstone"]["dataset_id"],
+        }, sort_keys=True),
+        flush=True,
+    )
+
+
 def _assert_isolation_applied(info: dict, replacement: str, provider: _ClaimProvider) -> None:
     assert metadb.object_storage_namespace() == replacement
     assert metadb.object_attempt_owner_id() != info["owner"]
@@ -365,6 +689,10 @@ def _emit_evidence(info: dict, rto_ms: int) -> None:
         f"run={info['run_id']} lineage=drill_parent->drill_child "
         f"lineage_receipt={info['lineage_publication_key']} "
         f"artifact={info['artifact_uri']} "
+        f"managed_dataset={info['core_original']['dataset_id']} "
+        f"managed_revision={info['core_original']['revision_id']} "
+        f"tombstone_dataset={info['tombstone']['dataset_id']} "
+        f"admission={info['run_id']} "
         f"managed_attempt={info['managed_uri']} "
         f"namespace_marker={info['claim_key'][0]}/_dp_control/namespaces/{info['namespace']}.json "
         f"alembic={info['alembic_head']} release_sha={info['release_sha']}",
@@ -456,6 +784,8 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
             "sha": info["release_sha"], "db": "sqlite", "storage": "local",
             "alembic": info["alembic_head"],
         }), encoding="utf-8")
+        assert not any("provider-owned" in path.parts for path in backup.rglob("*"))
+        shutil.rmtree(info["provider_unavailable"]["uri"])
 
         # Failure path: restored clone + fresh DP_STORAGE_NAMESPACE without isolation.
         probe = tmp_path / "probe"
@@ -481,10 +811,21 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
         assert metadb.isolate_cloned_object_storage(info["namespace"], replacement) == replacement
         monkeypatch.setenv("DP_STORAGE_NAMESPACE", replacement)
         try:
-            _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
-            _assert_isolation_applied(info, replacement, provider)
-            # Source absolute artifact path is unchanged; restored relative tree is also complete.
-            assert (restore_ws / "outputs" / info["artifact_rel"]).is_file()
+            # Exact local artifact URIs are absolute. Model the isolated clone/container mounting the
+            # copied tree at that recorded path, while parking the source bytes so no assertion can
+            # accidentally read them.
+            with _mount_restored_outputs_at_exact_path(
+                    source_outputs, restore_ws / "outputs"):
+                exact_storage = LocalStorage(str(source_outputs))
+                try:
+                    _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
+                    _assert_revision_recovery(
+                        info, outputs_root=restore_ws / "outputs",
+                        exact_storage=exact_storage)
+                    _assert_isolation_applied(info, replacement, provider)
+                    assert (restore_ws / "outputs" / info["artifact_rel"]).is_file()
+                finally:
+                    exact_storage.close()
         finally:
             monkeypatch.delenv("DP_STORAGE_NAMESPACE", raising=False)
 
@@ -549,7 +890,9 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
-                          metadb.LocalResultArtifact, metadb.ObjectAttempt):
+                          metadb.LocalResultArtifact, metadb.LocalResultReference,
+                          metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
+                          metadb.RunInputAdmission, metadb.ObjectAttempt):
                 source_row_counts[model.__tablename__] = session.scalar(
                     select(func.count()).select_from(model))
         source_outputs_fp = _tree_fingerprint(source_outputs)
@@ -571,6 +914,8 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
             "sha": info["release_sha"], "db": "postgresql", "storage": "s3",
             "alembic": info["alembic_head"], "namespace": info["namespace"],
         }), encoding="utf-8")
+        assert not any("provider-owned" in path.parts for path in backup.rglob("*"))
+        shutil.rmtree(info["provider_unavailable"]["uri"])
 
         probe_url = _ensure_sibling_database(url, probe_name)
         created.append(probe_name)
@@ -604,11 +949,18 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         assert metadb.isolate_cloned_object_storage(info["namespace"], replacement) == replacement
         monkeypatch.setenv("DP_STORAGE_NAMESPACE", replacement)
         try:
-            # Artifact URI remains the source absolute path (still present and readable);
-            # restored outputs tree is verified by relative layout.
-            assert Path(info["artifact_uri"]).is_file()
-            _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
-            _assert_isolation_applied(info, replacement, provider)
+            with _mount_restored_outputs_at_exact_path(
+                    source_outputs, restore_ws / "outputs"):
+                exact_storage = LocalStorage(str(source_outputs))
+                try:
+                    assert Path(info["artifact_uri"]).is_file()
+                    _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
+                    _assert_revision_recovery(
+                        info, outputs_root=restore_ws / "outputs",
+                        exact_storage=exact_storage)
+                    _assert_isolation_applied(info, replacement, provider)
+                finally:
+                    exact_storage.close()
         finally:
             monkeypatch.delenv("DP_STORAGE_NAMESPACE", raising=False)
 
@@ -621,7 +973,9 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
-                          metadb.LocalResultArtifact, metadb.ObjectAttempt):
+                          metadb.LocalResultArtifact, metadb.LocalResultReference,
+                          metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
+                          metadb.RunInputAdmission, metadb.ObjectAttempt):
                 assert session.scalar(select(func.count()).select_from(model)) == \
                     source_row_counts[model.__tablename__]
             assert _lineage_receipt_identity(
