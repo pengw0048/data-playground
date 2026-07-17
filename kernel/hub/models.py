@@ -1125,6 +1125,7 @@ class RunOutput(Wire):
     error: str | None = Field(default=None, max_length=4096)
     # Evidence travels with the durable output snapshot so result history survives restart.
     sample_provenance: SampleProvenance | None = None
+    write_receipt: WriteReceipt | None = None
 
     @model_validator(mode="after")
     def _publication_shape(self) -> "RunOutput":
@@ -1141,7 +1142,15 @@ class RunOutput(Wire):
                 raise ValueError("a non-catalog run output cannot carry a table identity")
             if self.publication_kind == "result" and self.version is not None:
                 raise ValueError("a non-catalog run output cannot carry a catalog version")
-        elif self.uri is not None or self.table is not None or self.version is not None:
+            if self.write_receipt is not None:
+                if self.publication_kind != "catalog":
+                    raise ValueError("a write receipt requires a catalog output")
+                if (self.write_receipt.publication.artifact_uri != self.uri
+                        or self.write_receipt.publication.catalog_version != self.version
+                        or self.write_receipt.rows != self.rows):
+                    raise ValueError("a write receipt must describe the exact run output")
+        elif (self.uri is not None or self.table is not None or self.version is not None
+              or self.write_receipt is not None):
             raise ValueError(
                 "a non-committed run output cannot expose a URI, table, or catalog version")
         return self
@@ -1619,3 +1628,27 @@ class RunRequest(Wire):
     # A full run launched from a preview admits the preview's exact Source set instead of resolving
     # mutable heads again. The server validates graph coverage and reopens every revision.
     input_manifest: list[dict[str, str]] | None = None
+    # The default local Write card obtains this frozen, side-effect-free admission before execution.
+    # The server revalidates it against the submitted graph and current destination head.
+    write_intent: WriteIntent | None = None
+
+
+class WriteAdmissionRequest(Wire):
+    graph: Graph
+    node_id: str
+    submission_id: UUID4
+    input_manifest: list[dict[str, str]] | None = None
+
+
+class WriteAdmission(Wire):
+    node_id: str
+    managed: bool
+    destination: str
+    mode: Literal["create", "replace", "overwrite", "append"]
+    provider: str
+    expected_schema: list[ColumnSchema] = Field(default_factory=list, max_length=1024)
+    partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
+    expected_head: ExactDatasetRef | None = None
+    intent: WriteIntent | None = None
+    recovered_receipt: WriteReceipt | None = None
+    blocker: str | None = Field(default=None, max_length=4096)

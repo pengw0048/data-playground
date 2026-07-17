@@ -118,6 +118,20 @@ def expected_sink_uri(spec: SinkSpec, target_uri: str, adapter) -> str:
     return target_uri
 
 
+def is_core_managed_local_file_sink(spec: SinkSpec, uri: str, adapter, storage) -> bool:
+    """Whether core can certify this sink through its immutable local revision ledger."""
+    from hub.plugins.adapters import is_object_uri
+
+    return (
+        not is_object_uri(uri) and spec.mode == "overwrite"
+        and not spec.partition_by
+        and spec.extension.lower() in (".parquet", ".pq")
+        and adapter.__class__.__module__ == "hub.plugins.adapters"
+        and callable(getattr(storage, "begin_result", None))
+        and callable(getattr(storage, "commit_result", None))
+    )
+
+
 def commit_sink(spec: SinkSpec, relation, workspace: str, storage, resolve_adapter,
                 target_uri: str | None = None, write_adapter=None) -> SinkCommit:
     """Write a relation through the selected adapter using the normalized sink contract."""

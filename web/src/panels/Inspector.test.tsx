@@ -138,6 +138,31 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByRole('button', { name: /add port/i })).toBeDisabled()
     expect(screen.getByRole('status')).toHaveTextContent(/maximum 64 output ports/i)
   })
+
+  it('shows managed create admission and the exact durable revision receipt', () => {
+    selectNode('write', undefined)
+    useStore.setState({
+      runs: { node: {
+        phase: 'done',
+        writeAdmission: {
+          nodeId: 'node', managed: true, destination: '/outputs/output.parquet',
+          mode: 'replace', provider: 'managed-local-file', expectedSchema: cols,
+          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'rev-1' },
+        },
+        status: { outputs: [{ writeReceipt: {
+          datasetId: 'dataset-1', revisionId: 'rev-2', rows: 2, bytes: 512,
+        } }] },
+      } },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/replace.*managed-local-file/i)
+    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/expected revision rev-1/i)
+    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/durable revision rev-2/i)
+    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/512 bytes/i)
+    expect(screen.queryByText(/^overwrite$/i)).not.toBeInTheDocument()
+  })
 })
 
 describe('PortRow — port schema badge', () => {

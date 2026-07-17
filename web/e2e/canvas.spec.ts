@@ -1024,6 +1024,102 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByText('Workspace outputs')).toBeVisible() // target shown in the inspector
   })
 
+  test('a default-local write certifies create then replace and exposes exact receipts', async ({ page }) => {
+    const settings = await page.request.get('/api/settings')
+    const previousBackend = (await settings.json()).global?.backend ?? ''
+    await page.request.put('/api/settings', { data: {
+      scope: 'global', key: 'backend', value: 'local-out-of-core',
+    } })
+    try {
+      await fresh(page)
+      await addWorkspaceDatasetToCurrentCanvas(page, 'events')
+      await page.locator('.react-flow__node .react-flow__handle-right').first().click()
+      await page.locator('.dp-panel').getByText('write', { exact: true }).click()
+      const inspector = page.getByTestId('inspector')
+      const filename = `issue399-${Date.now()}.parquet`
+      await inspector.getByRole('button', { name: /Change destination/ }).click()
+      const dialog = page.locator('.dp-modal-overlay')
+      await dialog.locator('input').fill(filename)
+      await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+
+      const admission = inspector.getByLabel('Write admission')
+      await expect(admission).toContainText('create · managed-local-file')
+      await expect(admission).toContainText(/schema field/)
+      await expect(admission).toContainText('unpartitioned')
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      const firstReceipt = inspector.getByLabel('Write receipt')
+      await expect(firstReceipt).toContainText('durable revision', { timeout: 20_000 })
+      const firstRevision = (await firstReceipt.textContent())?.match(/durable revision\s+(\S+)/)?.[1]
+      expect(firstRevision).toBeTruthy()
+
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      await expect.poll(async () => {
+        const text = await inspector.getByLabel('Write receipt').textContent()
+        return text?.match(/durable revision\s+(\S+)/)?.[1]
+      }, { timeout: 20_000 }).not.toBe(firstRevision)
+      await expect(inspector.getByLabel('Write receipt')).toContainText(/dataset .* rows .* bytes/)
+    } finally {
+      await page.request.put('/api/settings', { data: {
+        scope: 'global', key: 'backend', value: previousBackend,
+      } })
+    }
+  })
+
+  test('a managed-local write retry adopts the original receipt after response loss', async ({ page }) => {
+    const settings = await page.request.get('/api/settings')
+    const previousBackend = (await settings.json()).global?.backend ?? ''
+    await page.request.put('/api/settings', { data: {
+      scope: 'global', key: 'backend', value: 'local-out-of-core',
+    } })
+    try {
+      await fresh(page)
+      await addWorkspaceDatasetToCurrentCanvas(page, 'events')
+      await page.locator('.react-flow__node .react-flow__handle-right').first().click()
+      await page.locator('.dp-panel').getByText('write', { exact: true }).click()
+      const inspector = page.getByTestId('inspector')
+      await inspector.getByRole('button', { name: /Change destination/ }).click()
+      const dialog = page.locator('.dp-modal-overlay')
+      await dialog.locator('input').fill(`issue399-recovery-${Date.now()}.parquet`)
+      await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+      await expect(inspector.getByLabel('Write admission')).toContainText('create · managed-local-file')
+
+      await page.route('**/api/run/estimate', async (route) => {
+        const response = await route.fetch()
+        const estimate = await response.json()
+        await route.fulfill({ response, json: { ...estimate, needsConfirm: true } })
+      })
+      const submissionIds: string[] = []
+      await page.route('**/api/run', async (route) => {
+        const request = route.request().postDataJSON() as { submissionId: string }
+        submissionIds.push(request.submissionId)
+        const response = await route.fetch()
+        if (submissionIds.length <= 3) {
+          await route.abort('connectionfailed')
+          return
+        }
+        await route.fulfill({ response })
+      })
+
+      await inspector.getByRole('button', { name: 'Run', exact: true }).click()
+      const runPanel = page.getByTestId('panel-run')
+      await expect(runPanel.getByText('HEADS UP')).toBeVisible()
+      await runPanel.getByRole('button', { name: 'Run', exact: true }).click()
+      await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
+      await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
+
+      await expect(inspector.getByLabel('Write receipt')).toContainText(
+        'durable revision', { timeout: 20_000 },
+      )
+      expect(submissionIds).toHaveLength(4)
+      expect(new Set(submissionIds).size).toBe(1)
+    } finally {
+      await page.unrouteAll({ behavior: 'wait' })
+      await page.request.put('/api/settings', { data: {
+        scope: 'global', key: 'backend', value: previousBackend,
+      } })
+    }
+  })
+
   test('the source node can browse files (open dialog)', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Sources & sinks', 'source')

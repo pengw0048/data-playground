@@ -110,7 +110,8 @@ def _selected_output(status: RunStatus, port_id: str | None) -> tuple[int, RunOu
 
 def committed_output_snapshot(
         status: RunStatus, *, uri: str, rows: int, table: str | None = None,
-        version: str | None = None, port_id: str | None = None) -> RunOutput:
+        version: str | None = None, port_id: str | None = None,
+        write_receipt=None) -> RunOutput:
     """Build and validate a committed snapshot without making it public."""
     _index, expected = _selected_output(status, port_id)
     provenance = (expected.sample_provenance.model_copy(update={"returned_rows": rows})
@@ -127,6 +128,7 @@ def committed_output_snapshot(
         version=version,
         rows=rows,
         sample_provenance=provenance,
+        write_receipt=write_receipt,
     )
 
 

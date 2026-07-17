@@ -44,7 +44,9 @@ from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CompilePlan,
     CompileRequest,
+    ColumnSchema,
     EstimateRequest,
+    ExactDatasetRef,
     InputDrift,
     InputDriftRequest,
     InputDriftSource,
@@ -61,6 +63,13 @@ from hub.models import (
     RunOutput,
     RunStatus,
     SampleResult,
+    WriteAdmission,
+    WriteAdmissionRequest,
+    WriteDestination,
+    WriteIntent,
+    WritePartitionExpectation,
+    WriteProvenance,
+    WriteReceipt,
     dataset_ref_identity,
 )
 
@@ -83,11 +92,21 @@ _EXPORT_MEDIA_TYPES = {
 
 def _local_run_intent_sha256(
         graph, target_node_id: str | None,
-        input_manifest: list[dict[str, str]] | None = None) -> str:
+        input_manifest: list[dict[str, str]] | None = None,
+        write_intent: WriteIntent | None = None) -> str:
     """Hash caller intent before source resolution so a retry cannot be retargeted by a moved head."""
     doc = graph.model_dump(mode="json")
+    if write_intent is not None:
+        # Canvas run status is operational UI evidence, not write intent. A response-loss retry changes
+        # it from running to failed before replaying the same frozen write submission.
+        for node in doc.get("nodes", []):
+            data = node.get("data") if isinstance(node, dict) else None
+            if isinstance(data, dict):
+                data.pop("status", None)
     payload = json.dumps(
-        {"graph": doc, "target_node_id": target_node_id, "input_manifest": input_manifest},
+        {"graph": doc, "target_node_id": target_node_id, "input_manifest": input_manifest,
+         "write_intent": (write_intent.model_dump(by_alias=True, mode="json")
+                          if write_intent is not None else None)},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -154,6 +173,149 @@ def _bind_local_run_manifest(
         ) from exc
 
 
+def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
+    """Whether this exact runner owns the issue-399 typed local publication contract."""
+    supports = getattr(runner, "supports_managed_local_write_intents", None)
+    if runner is not deps.runner or not callable(supports):
+        return False
+    try:
+        return bool(supports())
+    except Exception:
+        return False
+
+
+def _write_admission_for_graph(
+        deps, graph, node_id: str, uid: str, submission_id: str,
+        supplied: WriteIntent | None = None) -> WriteAdmission:
+    """Resolve one metadata-only Write card contract without allocating an artifact."""
+    from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
+    from hub.sinks import (
+        SinkSpec, is_core_managed_local_file_sink, preflight_sink,
+    )
+
+    node = next((candidate for candidate in graph.nodes if candidate.id == node_id), None)
+    if node is None or node.type != "write":
+        raise HTTPException(400, f"node '{node_id}' is not a write")
+    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    spec = SinkSpec.from_config(
+        cfg, node.data.get("title") if isinstance(node.data, dict) else None)
+    logical_uri = preflight_sink(
+        spec, deps.workspace, deps.storage, deps.resolve_adapter)
+    adapter = deps.resolve_adapter(logical_uri)
+    managed = (
+        is_core_managed_local_file_sink(spec, logical_uri, adapter, deps.storage)
+        and type(deps.catalog) is InMemoryCatalog
+    )
+    pick_runner = getattr(deps, "pick_runner", None)
+    if managed and callable(pick_runner):
+        plan = compiler.compile_plan(
+            graph, node_id, deps.registry, getattr(deps, "node_specs", {}),
+            getattr(deps, "node_ir", {}))
+        # #391's typed publisher is the in-process local consumer. Other bundled/plugin transports
+        # retain their provider-neutral sink contract and must not be labelled create/replace.
+        runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
+        managed = _runner_supports_managed_local_write_intents(deps, runner)
+    partitions = [WritePartitionExpectation(field=field.strip()) for field in
+                  spec.partition_by.split(",") if field.strip()]
+    provider_name = str(getattr(adapter, "name", "") or "provider-neutral")
+    if not managed:
+        if supplied is not None:
+            raise HTTPException(
+                409, "the selected destination uses provider-neutral sink semantics; "
+                "discard the managed-local admission and retry")
+        return WriteAdmission(
+            node_id=node_id,
+            managed=False,
+            destination=logical_uri,
+            mode=spec.mode,
+            provider=provider_name,
+            partitions=partitions,
+        )
+    try:
+        schemas = schema_for_graph(
+            graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
+            getattr(deps, "node_specs", {}), storage=deps.storage)
+        schema = schemas.get(node_id)
+    except ManagedSourceReadError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception:
+        schema = None
+    if schema is None:
+        return WriteAdmission(
+            node_id=node_id,
+            managed=True,
+            destination=logical_uri,
+            mode="replace" if supplied and supplied.mode == "replace" else "create",
+            provider="managed-local-file",
+            partitions=partitions,
+            blocker=("input schema is not available from bounded metadata; "
+                     "declare the upstream output schema before running"),
+        )
+
+    run_id = metadb.local_run_submission_id(
+        str(uid), str(getattr(graph, "id", "") or "") or None, str(submission_id))
+    lineage = lineage_for_output(graph, run_id, node_id)
+    parents = metadb.catalog_lineage_parent_tokens(
+        graph_mod.all_upstream_publication_uris(graph, node_id))
+    head = metadb.catalog_managed_local_write_head(logical_uri)
+    replacing = bool(
+        head is not None and head.get("state") == "active" and head.get("revision_id"))
+    expected_head = (ExactDatasetRef(
+        kind="exact",
+        dataset_id=str(head["dataset_id"]),
+        revision_id=str(head["revision_id"]),
+    ) if replacing else None)
+    intent = supplied or WriteIntent(
+        destination=WriteDestination(
+            logical_uri=logical_uri,
+            name=spec.name,
+            dataset_id=(str(head["dataset_id"]) if replacing else None),
+        ),
+        mode=("replace" if replacing else "create"),
+        expected_schema=schema,
+        expected_head=expected_head,
+        idempotency_key=lineage.idempotency_key,
+        partitions=partitions,
+        provenance=WriteProvenance(publication=lineage, parents=parents),
+    )
+    if supplied is not None and (
+            intent.destination.logical_uri != logical_uri
+            or intent.destination.name != spec.name
+            or intent.expected_schema != [ColumnSchema.model_validate(column) for column in schema]):
+        raise HTTPException(409, "write admission does not match the submitted graph")
+    if supplied is not None and (
+            intent.idempotency_key != lineage.idempotency_key
+            or intent.provenance != WriteProvenance(publication=lineage, parents=parents)
+            or intent.partitions != partitions):
+        raise HTTPException(409, "write admission does not match the submitted graph")
+    try:
+        recovered = metadb.catalog_admit_managed_local_write(
+            intent.model_dump(by_alias=True, mode="json"))
+    except metadb.ManagedLocalWriteConflict as exc:
+        raise HTTPException(
+            409, "write admission is stale; re-admit the current destination head and retry") from exc
+    receipt = WriteReceipt.model_validate(recovered) if recovered is not None else None
+    return WriteAdmission(
+        node_id=node_id,
+        managed=True,
+        destination=logical_uri,
+        mode=intent.mode,
+        provider="managed-local-file",
+        expected_schema=intent.expected_schema,
+        partitions=intent.partitions,
+        expected_head=intent.expected_head,
+        intent=intent,
+        recovered_receipt=receipt,
+    )
+
+
+def _inject_write_intent(graph, node_id: str, intent: WriteIntent) -> None:
+    node = next(candidate for candidate in graph.nodes if candidate.id == node_id)
+    cfg = dict(node.data.get("config", {}))
+    cfg["_admittedWriteIntent"] = intent.model_dump(by_alias=True, mode="json")
+    node.data["config"] = cfg
+
+
 def _inspection_manifest_graph(
         graph, target_node_id: str | None, supplied: list[dict[str, str]] | None, deps,
 ) -> tuple[object, list[dict[str, str]] | None]:
@@ -182,6 +344,21 @@ def _inspection_manifest_graph(
         if supplied is not None or pinned:
             raise
         return graph, None
+
+
+@router.post("/run/write-admission", response_model=WriteAdmission)
+def write_admission(
+        req: WriteAdmissionRequest, uid: str = Depends(current_user)) -> WriteAdmission:
+    """Certify one default-local Write card without creating or mutating an artifact."""
+    _require_graph_read_access(req.graph, uid)
+    deps = get_deps()
+    graph = req.graph.model_copy(deep=True)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+    if req.input_manifest is not None:
+        graph = _bind_local_run_manifest(graph, req.input_manifest, deps, req.node_id)
+    _reject_invalid(graph, deps, req.node_id)
+    return _write_admission_for_graph(
+        deps, graph, req.node_id, uid, str(req.submission_id))
 
 
 def _input_drift(
@@ -1287,7 +1464,8 @@ class RunNeedsConfirm(Exception):
 
 def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False,
               submission_id: str | None = None,
-              input_manifest: list[dict[str, str]] | None = None):
+              input_manifest: list[dict[str, str]] | None = None,
+              write_intent: WriteIntent | None = None):
     """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
     agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
@@ -1307,7 +1485,12 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     # Capture caller intent before catalog references are resolved or private exact-revision bindings are
     # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
     # browser-supplied id remains stable across response-loss retries.
-    intent_sha256 = _local_run_intent_sha256(graph, target_node_id, input_manifest)
+    intent_graph = graph.model_copy(deep=True)
+    target = next((node for node in graph.nodes if node.id == target_node_id), None)
+    if write_intent is not None and (target is None or target.type != "write"):
+        raise HTTPException(400, "writeIntent requires a Write target")
+    if write_intent is not None and submission_id is None:
+        raise HTTPException(400, "writeIntent requires a submissionId")
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
     if input_manifest is not None:
@@ -1315,6 +1498,18 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         # population as the preview, even if latest moved after the preview was rendered.
         graph = _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
     _reject_invalid(graph, deps, target_node_id)
+    write_admission = None
+    effective_write_intent = write_intent
+    if target is not None and target.type == "write" and submission_id is not None:
+        write_admission = _write_admission_for_graph(
+            deps, graph, target_node_id, uid, submission_id, supplied=write_intent)
+        if write_admission.managed:
+            if write_admission.blocker or write_admission.intent is None:
+                raise HTTPException(409, write_admission.blocker or "write admission failed")
+            effective_write_intent = write_admission.intent
+            _inject_write_intent(graph, target_node_id, write_admission.intent)
+    intent_sha256 = _local_run_intent_sha256(
+        intent_graph, target_node_id, input_manifest, effective_write_intent)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
@@ -1323,6 +1518,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone
+    if (write_admission is not None and write_admission.managed
+            and not _runner_supports_managed_local_write_intents(deps, runner)):
+        raise HTTPException(
+            409, "the selected execution backend cannot consume the managed-local write admission; "
+            "discard it and retry with local-out-of-core")
     multi_output = False
     if output_target is not None:
         multi_output = _require_backend_run_output_support(
@@ -1506,6 +1706,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             get_deps(), req.graph, req.target_node_id, uid, req.confirmed,
             str(req.submission_id) if req.submission_id is not None else None,
             req.input_manifest,
+            req.write_intent,
         )
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")

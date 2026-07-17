@@ -26,6 +26,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const est = run?.estimate
   const st = run?.status
   const pinnedInputs = pinnedSourceInputs(doc, nodeId)
+  const writeAdmission = run?.writeAdmission
+  const writeSubmissionUnresolved = Boolean(
+    writeAdmission?.managed && writeAdmission.intent && run?.writeSubmissionId,
+  )
 
   return (
     <div className="p-3.5">
@@ -42,6 +46,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </span>
           </div>
           {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
+          {writeAdmission && <WriteAdmissionSummary admission={writeAdmission} />}
           {pinnedInputs.length > 0 && (
             <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
               <div className="font-semibold text-foreground">Pinned exact inputs for this run</div>
@@ -139,7 +144,11 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </div>
           {st && <RunOutputs outputs={st.outputs} />}
           <div className="mt-3 flex gap-2">
-            <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="flex-1">Retry</Button>
+            <Button size="sm" variant="outline"
+              onClick={() => writeSubmissionUnresolved
+                ? doRun(nodeId, !!est?.needsConfirm)
+                : estimate(nodeId)}
+              className="flex-1">Retry</Button>
             {(run?.inputDrift || hasRetainedPreviewBinding) && <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)}
               disabled={!canEdit} className="flex-1">Refresh to latest</Button>}
           </div>
@@ -219,10 +228,32 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
               )}>{output.outcome}</span>
             </div>
             {output.uri && <div className="dp-mono mt-1 overflow-hidden text-ellipsis whitespace-nowrap text-muted-foreground" title={output.uri}>→ {output.uri}</div>}
+            {output.writeReceipt && (
+              <div aria-label="Durable write receipt" className="mt-1 text-muted-foreground">
+                <span className="font-semibold text-foreground">revision {output.writeReceipt.revisionId}</span>
+                {' · '}dataset {output.writeReceipt.datasetId}
+                {' · '}{output.writeReceipt.bytes.toLocaleString()} bytes
+                {output.writeReceipt.parentHead ? ` · parent ${output.writeReceipt.parentHead.revisionId}` : ' · no parent'}
+              </div>
+            )}
             {output.error && <div className="dp-mono mt-1 whitespace-pre-wrap text-destructive">{output.error}</div>}
           </div>
         )
       })}
+    </div>
+  )
+}
+
+function WriteAdmissionSummary({ admission }: { admission: import('../types/api').WriteAdmission }) {
+  return (
+    <div aria-label="Write admission" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+      <div className="font-semibold text-foreground">
+        {admission.managed ? `${admission.mode} · ${admission.provider}` : `${admission.mode} · provider-neutral`}
+      </div>
+      <div className="dp-mono mt-0.5 break-all">{admission.destination}</div>
+      <div className="mt-0.5">{admission.expectedSchema.length} schema fields · {admission.partitions.length ? `${admission.partitions.length} partitions` : 'unpartitioned'}</div>
+      {admission.expectedHead && <div className="dp-mono mt-0.5">expected revision {admission.expectedHead.revisionId}</div>}
+      {admission.blocker && <div className="mt-1 text-destructive">{admission.blocker}</div>}
     </div>
   )
 }

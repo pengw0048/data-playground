@@ -5,7 +5,7 @@ import type {
 } from '../types/graph'
 import type {
   CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
-  RunInputManifestItem, RunStatus, SampleResult,
+  RunInputManifestItem, RunStatus, SampleResult, WriteAdmission,
 } from '../types/api'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
@@ -339,6 +339,16 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId) ? retained : undefined
 }
 
+function writeAdmissionFingerprint(doc: CanvasDoc): string {
+  return JSON.stringify({
+    ...doc,
+    nodes: doc.nodes.map((node) => {
+      const { status: _status, ...data } = node.data
+      return { ...node, data }
+    }),
+  })
+}
+
 function sameInputManifest(
   left: RunInputManifestItem[] | undefined,
   right: RunInputManifestItem[] | undefined,
@@ -370,6 +380,9 @@ interface RunState {
   error?: string
   inputDrift?: InputDrift
   driftInputManifest?: RunInputManifestItem[]
+  writeAdmission?: WriteAdmission
+  writeSubmissionId?: string
+  writeAdmissionFingerprint?: string
 }
 
 export interface ProfileJobState {
@@ -808,6 +821,7 @@ interface Store {
   refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
+  prepareWrite: (id: string) => Promise<WriteAdmission | undefined>
   run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
   rerunAll: () => void
   cancelRun: (id: string) => Promise<void>
@@ -1227,7 +1241,18 @@ export const useStore = create<Store>((set, get) => ({
             : []
         })
       }
-      return { doc: { ...s.doc, nodes, edges } }
+      const runs = { ...s.runs }
+      for (const node of nodes) {
+        if (node.type !== 'write' || (!stale.has(node.id) && node.id !== id)) continue
+        const current = runs[node.id]
+        if (current) runs[node.id] = {
+          ...current,
+          writeAdmission: undefined,
+          writeSubmissionId: undefined,
+          writeAdmissionFingerprint: undefined,
+        }
+      }
+      return { doc: { ...s.doc, nodes, edges }, runs }
     })
   },
 
@@ -1631,6 +1656,35 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
+  prepareWrite: async (id) => {
+    const doc = get().doc
+    const node = doc.nodes.find((candidate) => candidate.id === id)
+    if (node?.type !== 'write') return undefined
+    const fingerprint = writeAdmissionFingerprint(doc)
+    const existing = get().runs[id]
+    if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
+      return existing.writeAdmission
+    }
+    const submissionId = globalThis.crypto.randomUUID()
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? { phase: 'idle' as const }),
+      writeSubmissionId: submissionId,
+      writeAdmissionFingerprint: fingerprint,
+      writeAdmission: undefined,
+    } } }))
+    const binding = currentPreviewBinding(get(), id)
+    const admission = await api.writeAdmission(
+      doc, id, submissionId, binding?.inputManifest)
+    const current = get().runs[id]
+    if (current?.writeSubmissionId !== submissionId
+        || current.writeAdmissionFingerprint !== fingerprint
+        || writeAdmissionFingerprint(get().doc) !== fingerprint) return undefined
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
+    } } }))
+    return admission
+  },
+
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
@@ -1669,26 +1723,57 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast('Preview inputs changed; preview again before running.', 'info')
       return
     }
-    // no openPanels here — status shows on the card; the user opens the run panel if they want detail
+    let writeAdmission: WriteAdmission | undefined
+    if (doc.nodes.find((node) => node.id === id)?.type === 'write') {
+      try {
+        writeAdmission = await get().prepareWrite(id)
+        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+        if (writeAdmission.blocker) throw new Error(writeAdmission.blocker)
+      } catch (e) {
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
+        } } }))
+        get().pushToast((e as Error).message || 'Could not admit the write', 'error')
+        return
+      }
+    }
+    // no openPanels here — status shows on the card; the user opens details if they want them
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? {}), phase: 'running', inputDrift: undefined,
       driftInputManifest: undefined, error: undefined,
     } } }))
     get().updateData(id, { status: 'running' })
     try {
-      const submissionId = globalThis.crypto.randomUUID()
-      const status = binding
-        ? await api.run(doc, id, confirmed, submissionId, binding.inputManifest)
-        : await api.run(doc, id, confirmed, submissionId)
+      const submissionId = writeAdmission
+        ? get().runs[id]?.writeSubmissionId ?? globalThis.crypto.randomUUID()
+        : globalThis.crypto.randomUUID()
+      const status = writeAdmission
+        ? await api.run(
+          doc, id, confirmed, submissionId, binding?.inputManifest,
+          writeAdmission.intent ?? undefined,
+        )
+        : binding
+          ? await api.run(doc, id, confirmed, submissionId, binding.inputManifest)
+          : await api.run(doc, id, confirmed, submissionId)
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId)
     } catch (e) {
-      if (e instanceof KernelError && e.status === 409) {
+      if (e instanceof KernelError && e.status === 409 && !e.message.includes('write admission')) {
         set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'confirm' } } }))
         get().updateData(id, { status: 'stale' })
         return
       }
-      set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message } } }))
+      const preserveWriteSubmission = Boolean(
+        writeAdmission?.managed && writeAdmission.intent
+        && (!(e instanceof KernelError) || e.status >= 500),
+      )
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
+        ...(!preserveWriteSubmission ? {
+          writeAdmission: undefined, writeSubmissionId: undefined,
+          writeAdmissionFingerprint: undefined,
+        } : {}),
+      } } }))
       get().updateData(id, { status: 'failed' })
       get().pushToast((e as Error).message || 'Run failed to start', 'error')
     }
@@ -3146,7 +3231,11 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       const resultRows = status.totalRows
         ?? (status.outputs.length === 1 ? status.outputs[0]?.rows ?? undefined : undefined)
       const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
-      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: { ...(s.runs[nodeId] ?? { phase } as any), status, phase } } }))
+      set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
+        ...(s.runs[nodeId] ?? { phase } as any), status, phase,
+        writeAdmission: undefined, writeSubmissionId: undefined,
+        writeAdmissionFingerprint: undefined,
+      } } }))
       if (status.status === 'failed') get().pushToast(cleanRunError(status.error), 'error')
       const g = get()
       g.updateData(nodeId, {

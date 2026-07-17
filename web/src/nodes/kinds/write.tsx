@@ -8,14 +8,29 @@ function Write({ id, data }: NodeComponentProps) {
   const name = String(data.config.filename ?? data.config.name ?? '')
   const mode = (data.config.writeMode as 'append' | 'overwrite') ?? 'overwrite'
   const dest = (data.config.destName as string | undefined) ?? 'Workspace outputs'
+  const prepareWrite = useStore((s) => s.prepareWrite)
+  const admission = useStore((s) => s.runs[id]?.writeAdmission)
+  const receipt = useStore((s) => s.runs[id]?.status?.outputs
+    .find((output) => output.writeReceipt)?.writeReceipt)
+  useEffect(() => {
+    void prepareWrite(id).catch(() => { /* the Run panel surfaces actionable admission failures */ })
+  }, [id, data.config, prepareWrite])
+  const semantics = receipt
+    ? `revision ${receipt.revisionId}`
+    : admission?.managed
+      ? admission.blocker ? `blocked · ${admission.blocker}` : `${admission.mode} · ${admission.expectedSchema.length} cols`
+      : admission ? `${admission.mode} · ${admission.provider}` : 'checking destination…'
   return (
-    <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${mode}` : 'name an output → (destination in the panel)'}>
+    <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${semantics}` : 'name an output → (destination in the panel)'}>
       <div className="flex gap-2">
         <Field label="file name" style={{ flex: 1.6 }}>
           <MiniInput value={name} placeholder="output.parquet" onChange={(v) => updateConfig(id, { filename: v })} />
         </Field>
         <Field label="mode" style={{ flex: 1 }}>
-          <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[{ value: 'overwrite', label: 'overwrite' }, { value: 'append', label: 'append' }]} />
+          <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[
+            { value: 'overwrite', label: admission?.managed ? 'create / replace (auto)' : 'overwrite' },
+            { value: 'append', label: 'append' },
+          ]} />
         </Field>
       </div>
     </NodeCard>
@@ -36,3 +51,4 @@ register(
   },
   Write,
 )
+import { useEffect } from 'react'
