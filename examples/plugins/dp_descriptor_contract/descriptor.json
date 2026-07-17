@@ -1,0 +1,105 @@
+[
+  {
+    "kind": "descriptor_contract",
+    "title": "descriptor contract",
+    "category": "compute",
+    "tag": "contract",
+    "inputs": [
+      {
+        "id": "items",
+        "label": "Ordered items",
+        "wire": "dataset",
+        "accepts": ["dataset"],
+        "multi": true
+      }
+    ],
+    "outputs": [
+      {
+        "id": "out",
+        "label": "Rows",
+        "wire": "dataset",
+        "accepts": null,
+        "multi": false
+      }
+    ],
+    "params": [
+      {
+        "name": "columns",
+        "type": "columns",
+        "default": null,
+        "options": null,
+        "label": "Selected columns",
+        "lang": null,
+        "required": true,
+        "showWhen": null
+      },
+      {
+        "name": "count",
+        "type": "int",
+        "default": null,
+        "options": null,
+        "label": "Count",
+        "lang": null,
+        "required": true,
+        "showWhen": null
+      },
+      {
+        "name": "ratio",
+        "type": "float",
+        "default": 0.5,
+        "options": null,
+        "label": "Ratio",
+        "lang": null,
+        "required": false,
+        "showWhen": null
+      }
+    ],
+    "canBypass": false,
+    "previewable": true,
+    "blurb": "installed descriptor fidelity contract",
+    "requires": {
+      "cpu": 1.0,
+      "mem": null,
+      "gpu": null,
+      "gpuType": null,
+      "labels": {}
+    }
+  },
+  {
+    "kind": "descriptor_contract_unavailable",
+    "title": "descriptor contract unavailable",
+    "category": "compute",
+    "tag": "contract",
+    "inputs": [
+      {
+        "id": "in",
+        "label": "Input",
+        "wire": "dataset",
+        "accepts": ["dataset"],
+        "multi": false
+      }
+    ],
+    "outputs": [
+      {
+        "id": "out",
+        "label": "Rows",
+        "wire": "dataset",
+        "accepts": null,
+        "multi": false
+      }
+    ],
+    "params": [],
+    "canBypass": false,
+    "previewable": false,
+    "blurb": "installed unavailable descriptor contract",
+    "requires": {
+      "cpu": null,
+      "mem": null,
+      "gpu": 1,
+      "gpuType": null,
+      "labels": {
+        "engine": "descriptor-contract"
+      }
+    }
+  }
+]
