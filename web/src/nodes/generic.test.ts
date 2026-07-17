@@ -1,8 +1,41 @@
 import { describe, expect, it } from 'vitest'
 import { getSpec, portMulti } from './registry'
-import { nodeInvalidReason, parseNumericParam, registerGenericNodes } from './generic'
+import contractDescriptors from '../../../examples/plugins/dp_descriptor_contract/descriptor.json'
+import type { BackendNodeSpec } from '../api/client'
+import { getBackendSpec, nodeInvalidReason, parseNumericParam, registerGenericNodes } from './generic'
 
 describe('generic node registration', () => {
+  it('preserves the installed fixture descriptor at every frontend registration boundary', () => {
+    const descriptors = contractDescriptors as unknown as BackendNodeSpec[]
+    expect(registerGenericNodes(descriptors)).toBe(2)
+
+    expect(getBackendSpec('descriptor_contract')).toEqual(descriptors[0])
+    expect(getSpec('descriptor_contract')).toMatchObject({
+      inputs: [{
+        id: 'items', label: 'Ordered items', wire: 'dataset', accepts: ['dataset'], multi: true,
+      }],
+      outputs: [{ id: 'out', label: 'Rows', wire: 'dataset' }],
+      previewable: true,
+      requires: { cpu: 1, labels: {} },
+    })
+    expect(getSpec('descriptor_contract')!.defaultData().config).toEqual({ ratio: 0.5 })
+
+    const node = (config: Record<string, unknown>) => ({
+      type: 'descriptor_contract', data: { config },
+    })
+    const valid = { columns: ['source', 'ordinal'], count: 7, ratio: 1.25 }
+    expect(nodeInvalidReason(node(valid), [{ name: 'source' }, { name: 'ordinal' }])).toBeNull()
+    expect(nodeInvalidReason(node({ ...valid, columns: 'source,ordinal' }))).toContain('ordered list')
+    expect(nodeInvalidReason(node(valid), undefined, { count: '12abc' })).toContain('safe integer')
+    expect(nodeInvalidReason(node(valid), undefined, { ratio: 'Infinity' })).toContain('finite number')
+
+    expect(getBackendSpec('descriptor_contract_unavailable')).toEqual(descriptors[1])
+    expect(getSpec('descriptor_contract_unavailable')).toMatchObject({
+      previewable: false,
+      requires: { gpu: 1, labels: { engine: 'descriptor-contract' } },
+    })
+  })
+
   it('preserves a plugin multi-input descriptor for canvas connection validation', () => {
     registerGenericNodes([{
       kind: 'plugin-multi-input-contract', title: 'Plugin multi input', category: 'compute',
