@@ -5094,6 +5094,162 @@
         "title": "WorkspaceResourceResolution",
         "type": "object"
       },
+      "WorkspaceSearchGroup": {
+        "properties": {
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceResource"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/WorkspaceSearchSourceStatus"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "WorkspaceSearchGroup",
+        "type": "object"
+      },
+      "WorkspaceSearchPage": {
+        "properties": {
+          "completeness": {
+            "default": "complete",
+            "enum": [
+              "complete",
+              "page",
+              "partial"
+            ],
+            "title": "Completeness",
+            "type": "string"
+          },
+          "groups": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceSearchGroup"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "hasMore": {
+            "default": false,
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "WorkspaceSearchPage",
+        "type": "object"
+      },
+      "WorkspaceSearchSourceStatus": {
+        "properties": {
+          "completeness": {
+            "enum": [
+              "complete",
+              "page",
+              "pending",
+              "partial",
+              "unavailable",
+              "unsupported"
+            ],
+            "title": "Completeness",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "freshness": {
+            "enum": [
+              "current",
+              "stale",
+              "unknown"
+            ],
+            "title": "Freshness",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "local",
+              "provider",
+              "configuration"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "mountId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mountid"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "searchMode": {
+            "enum": [
+              "native",
+              "fallback",
+              "unsupported"
+            ],
+            "title": "Searchmode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "completeness",
+          "freshness",
+          "searchMode"
+        ],
+        "title": "WorkspaceSearchSourceStatus",
+        "type": "object"
+      },
       "WorkspaceSourceStatus": {
         "description": "Completeness of one independently bounded source in a mixed Workspace page.",
         "properties": {
@@ -13651,6 +13807,114 @@
           }
         },
         "summary": "Resolve Workspace Resource"
+      }
+    },
+    "/api/workspace/search": {
+      "get": {
+        "description": "One bounded lexical page grouped by local and mounted provider source.",
+        "operationId": "search_workspace_api_workspace_search_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceSearchPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Search Workspace"
       }
     },
     "/mcp": {

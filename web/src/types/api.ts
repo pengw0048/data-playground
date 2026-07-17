@@ -189,6 +189,21 @@ export interface WorkspaceResourceResolution {
   ancestors: WorkspaceResource[]
   source: WorkspaceSourceStatus
 }
+export interface WorkspaceSearchSourceStatus extends WorkspaceSourceStatus {
+  freshness: 'current' | 'stale' | 'unknown'
+  searchMode: 'native' | 'fallback' | 'unsupported'
+}
+export interface WorkspaceSearchGroup {
+  source: WorkspaceSearchSourceStatus
+  items: WorkspaceResource[]
+}
+export interface WorkspaceSearchPage {
+  query: string
+  groups: WorkspaceSearchGroup[]
+  nextCursor?: string | null
+  hasMore: boolean
+  completeness: 'complete' | 'page' | 'partial'
+}
 export interface WorkspaceCreateCanvasResult {
   ok: boolean
   id: string

@@ -5,7 +5,7 @@ import type {
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
   WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
-  WorkspaceMoveCanvasResult, WorkspaceResourceResolution,
+  WorkspaceMoveCanvasResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -209,6 +209,12 @@ export const api = {
   },
   workspaceResource: (resourceId: string) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`),
+  workspaceSearch: (query: string, params?: { cursor?: string; limit?: number }) => {
+    const search = new URLSearchParams({ q: query })
+    if (params?.cursor) search.set('cursor', params.cursor)
+    if (params?.limit) search.set('limit', String(params.limit))
+    return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
+  },
   workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetId?: string }) =>
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),

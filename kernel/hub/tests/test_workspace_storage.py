@@ -19,8 +19,10 @@ from hub import main as hub_main, metadb, workspace_providers
 from hub.catalog_provider import (
     CatalogResource,
     ProviderAncestors,
+    ProviderCapabilities,
     ProviderPage,
     ProviderResourceResult,
+    ProviderSearchPage,
 )
 from hub.main import app
 
@@ -299,7 +301,25 @@ class _WorkspaceFixtureProvider:
         return self.resolve(mount, resource_id)
 
     def capabilities(self, _mount):
-        raise AssertionError("Workspace composition does not need capability-wide materialization")
+        return ProviderCapabilities(search=_mount.id != "e-unsupported")
+
+    def search(self, mount, query, *, limit, cursor=None):
+        if mount.id == "a-slow":
+            time.sleep(0.02)
+        tokens = query.casefold().split()
+        resources = sorted(
+            (item for item in self._resources(mount.id)
+             if all(token in item.name.casefold() for token in tokens)),
+            key=lambda item: (item.name.casefold(), item.kind, item.id),
+        )
+        start = int(cursor or 0)
+        items = resources[start:start + limit]
+        if mount.id == "b-partial":
+            return ProviderSearchPage(
+                state="partial", items=items[:1], reason="search snapshot is stale",
+                freshness="stale")
+        next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
+        return ProviderSearchPage(items=items, next_cursor=next_cursor)
 
 
 @pytest.mark.parametrize("config", [[], "", 0, False])
@@ -407,6 +427,102 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
     # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
     # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
     time.sleep(0.03)
+
+
+def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partial_truth(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    local_match = metadb.workspace_create_container(
+        metadb.local_workspace_root()["id"], f"workspace-{token}-shared")
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    bounded = workspace_providers.bounded_search
+    monkeypatch.setattr(
+        workspace_providers, "bounded_search",
+        lambda *args, **kwargs: bounded(*args, **kwargs, timeout=0.001),
+    )
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": "a-slow", "provider": "fixture"},
+        {"id": "b-partial", "provider": "fixture"},
+        {"id": "c-first", "provider": "fixture"},
+        {"id": "d-second", "provider": "fixture"},
+        {"id": "e-unsupported", "provider": "fixture"},
+    ]))
+
+    with TestClient(app) as client:
+        started = time.monotonic()
+        response = client.get("/api/workspace/search", params={"q": "shared", "limit": 1})
+        assert time.monotonic() - started < 0.15
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert page["query"] == "shared"
+        assert page["completeness"] == "partial"
+        assert page["hasMore"] is True
+        groups = {group["source"]["id"]: group for group in page["groups"]}
+        assert groups["local"]["source"]["completeness"] in {"complete", "page"}
+        assert groups["local"]["source"]["freshness"] == "current"
+        assert groups["local"]["source"]["searchMode"] == "native"
+        assert groups["local"]["items"]
+        assert groups["mount:a-slow"]["source"]["completeness"] == "unavailable"
+        assert groups["mount:a-slow"]["source"]["error"] == "deadline exceeded"
+        assert groups["mount:b-partial"]["source"]["freshness"] == "stale"
+        assert groups["mount:b-partial"]["source"]["completeness"] == "partial"
+        assert groups["mount:e-unsupported"]["source"]["searchMode"] == "unsupported"
+        assert groups["mount:e-unsupported"]["source"]["completeness"] == "unsupported"
+
+        found: list[dict] = [
+            item for group in page["groups"] for item in group["items"]
+        ]
+        cursor = page["nextCursor"]
+        while cursor:
+            continued = client.get("/api/workspace/search", params={
+                "q": "shared", "limit": 1, "cursor": cursor,
+            })
+            assert continued.status_code == 200, continued.text
+            document = continued.json()
+            assert document["completeness"] == "partial"
+            found.extend(item for group in document["groups"] for item in group["items"])
+            cursor = document["nextCursor"]
+        duplicates = [item for item in found if item["name"] == "shared"]
+        assert f"container:{local_match['id']}" in {item["id"] for item in found}
+        assert {item["mountId"] for item in duplicates if item.get("resourceId") == "dataset-a"} == {
+            "c-first", "d-second",
+        }
+        assert len({item["id"] for item in duplicates}) == len(duplicates)
+
+        mismatched = client.get("/api/workspace/search", params={
+            "q": "different", "limit": 1, "cursor": page["nextCursor"],
+        })
+        assert mismatched.status_code == 422
+    time.sleep(0.03)
+
+
+def test_workspace_search_finds_local_kinds_with_stable_identity_and_bounded_pages(
+        workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    name = f"workspace-{token}-needle"
+    container = metadb.workspace_create_container(root["id"], name)
+    placement = metadb.workspace_create_placement(
+        container["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"], name=name)
+    try:
+        with TestClient(app) as client:
+            first = client.get("/api/workspace/search", params={"q": name, "limit": 1})
+            assert first.status_code == 200, first.text
+            page = first.json()
+            assert page["completeness"] == "page"
+            assert [group["source"]["id"] for group in page["groups"]] == ["local"]
+            assert page["groups"][0]["items"][0]["id"] == f"container:{container['id']}"
+            second = client.get("/api/workspace/search", params={
+                "q": name, "limit": 1, "cursor": page["nextCursor"],
+            })
+            assert second.status_code == 200, second.text
+            assert second.json()["completeness"] == "complete"
+            assert second.json()["groups"][0]["items"][0]["id"] == (
+                f"canvas:{workspace_scope['canvas_id']}")
+    finally:
+        metadb.workspace_delete_placement(placement["id"], expected_version=placement["version"])
+        metadb.workspace_delete_container(container["id"], expected_version=container["version"])
 
 
 def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_names(workspace_scope):

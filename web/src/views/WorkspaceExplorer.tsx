@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
-import type { CatalogTable, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSourceStatus } from '../types/api'
+import type {
+  CatalogTable, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
+  WorkspaceSourceStatus,
+} from '../types/api'
 import { Icon } from '../ui/Icon'
 import { CatalogDetail } from './CatalogView'
 
@@ -22,6 +25,8 @@ const statusMessage = (status: WorkspaceSourceStatus) => status.error
 export function WorkspaceExplorer() {
   const requestedResourceId = useStore((s) => s.workspaceResourceId)
   const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
+  const searchQuery = useStore((s) => s.workspaceSearchQuery)
+  const setWorkspaceSearchQuery = useStore((s) => s.setWorkspaceSearchQuery)
   const openFile = useStore((s) => s.openFile)
   const files = useStore((s) => s.files)
   const refreshFiles = useStore((s) => s.refreshFiles)
@@ -52,10 +57,13 @@ export function WorkspaceExplorer() {
   } | null>(null)
   const [undoBusy, setUndoBusy] = useState(false)
   const [revision, setRevision] = useState(0)
+  const [searchDraft, setSearchDraft] = useState(searchQuery)
   const request = useRef(0)
   const loadedContainer = useRef<string | null>(null)
   const selectionRequest = useRef<string | null>(null)
   const selectionContainer = useRef<WorkspaceResource | null>(null)
+
+  useEffect(() => { setSearchDraft(searchQuery) }, [searchQuery])
 
   const load = useCallback(async (targetId: string, nextCursor?: string | null) => {
     const sequence = ++request.current
@@ -111,6 +119,7 @@ export function WorkspaceExplorer() {
       if (!requestedResourceId) {
         selectionContainer.current = null
         setCrumbs([])
+        if (searchQuery) { setLoading(false); return }
         await load(LOCAL_ROOT_ID)
         return
       }
@@ -134,7 +143,12 @@ export function WorkspaceExplorer() {
           : resolved.ancestors
         if (resolved.source.completeness === 'complete' || !refreshingSelection) setCrumbs(resolvedCrumbs)
         else setCrumbs((current) => current.length ? current : resolvedCrumbs)
-        await load(identity(container))
+        if (searchQuery) {
+          setContainerId(identity(container))
+          loadedContainer.current = identity(container)
+          setContainer(container)
+          setLoading(false)
+        } else await load(identity(container))
         if (cancelled) return
         if (resolved.resource.kind !== 'dataset') {
           setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
@@ -174,7 +188,7 @@ export function WorkspaceExplorer() {
     }
     void resolve()
     return () => { cancelled = true; request.current += 1 }
-  }, [requestedResourceId, load, revision])
+  }, [requestedResourceId, searchQuery, load, revision])
 
   const open = (resource: WorkspaceResource) => {
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
@@ -221,6 +235,18 @@ export function WorkspaceExplorer() {
           </nav>
         </div>
         <span className="flex-1" />
+        <form aria-label="Workspace search" onSubmit={(event) => {
+          event.preventDefault()
+          setWorkspaceSearchQuery(searchDraft)
+        }} className="flex min-w-[220px] max-w-sm flex-1 items-center gap-1 rounded-md border border-border bg-card px-2">
+          <Icon name="search" size={13} />
+          <input aria-label="Search datasets, canvases, and containers" value={searchDraft}
+            onChange={(event) => setSearchDraft(event.target.value)} placeholder="Search Workspace"
+            className="min-w-0 flex-1 bg-transparent py-1.5 text-[12px] outline-none" />
+          {searchDraft && <button type="button" aria-label="Clear Workspace search" onClick={() => {
+            setSearchDraft(''); setWorkspaceSearchQuery('')
+          }}><Icon name="close" size={12} /></button>}
+        </form>
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
           <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading || isExternal(container)}
             title={isExternal(container) ? 'Read-only external mounts do not support creating canvases'
@@ -238,7 +264,7 @@ export function WorkspaceExplorer() {
         <button onClick={() => setUndoMove(null)} aria-label="Dismiss move confirmation"><Icon name="close" size={13} /></button>
       </div>}
 
-      {(sources.some((source) => source.kind !== 'local') || completeness === 'partial')
+      {!searchQuery && (sources.some((source) => source.kind !== 'local') || completeness === 'partial')
         && <SourceStatusBar sources={sources} completeness={completeness} />}
       {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
         <span className="min-w-0 flex-1 truncate">This selection could not be fully refreshed: {resolutionError}</span>
@@ -246,7 +272,7 @@ export function WorkspaceExplorer() {
       </div>}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
-        {error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
+        {searchQuery ? <WorkspaceSearchResults query={searchQuery} onOpen={open} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
           <button onClick={reload} className="font-semibold underline">Retry</button>
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : items.length ? <div className="mx-auto grid max-w-5xl gap-2">
@@ -281,6 +307,106 @@ export function WorkspaceExplorer() {
         }} />}
     </div>
   )
+}
+
+function WorkspaceSearchResults({ query, onOpen }: {
+  query: string; onOpen: (resource: WorkspaceResource) => void
+}) {
+  const [groups, setGroups] = useState<WorkspaceSearchGroup[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const request = useRef(0)
+
+  const load = useCallback(async (nextCursor?: string | null) => {
+    const sequence = ++request.current
+    const more = !!nextCursor
+    if (more) setLoadingMore(true)
+    else { setLoading(true); setGroups([]) }
+    setError(null)
+    try {
+      const page = await api.workspaceSearch(query, {
+        limit: 25, cursor: nextCursor ?? undefined,
+      })
+      if (sequence !== request.current) return
+      setCompleteness(page.completeness)
+      setGroups((current) => page.groups.map((group) => {
+        const previous = more ? current.find((item) => item.source.id === group.source.id) : undefined
+        const items = previous ? [...previous.items] : []
+        const seen = new Set(items.map((item) => item.id))
+        items.push(...group.items.filter((item) => !seen.has(item.id)))
+        return { source: group.source, items }
+      }))
+      setCursor(page.nextCursor ?? null)
+      setHasMore(page.hasMore)
+    } catch (caught) {
+      if (sequence === request.current) setError(errorMessage(caught))
+    } finally {
+      if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
+    }
+  }, [query])
+
+  useEffect(() => {
+    void load()
+    return () => { request.current += 1 }
+  }, [load])
+
+  const resultCount = groups.reduce((count, group) => count + group.items.length, 0)
+  if (loading) return <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Searching Workspace…</div>
+  if (error) return <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
+    <span>Couldn't search Workspace: {error}</span>
+    <button onClick={() => void load()} className="font-semibold underline">Retry</button>
+  </div>
+  return <div className="mx-auto grid max-w-5xl gap-4" data-testid="workspace-search-results">
+    <div className={`rounded-lg border px-3 py-2 text-[12px] ${completeness === 'partial'
+      ? 'border-amber-300/50 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100'
+      : 'border-border bg-muted/25 text-muted-foreground'}`}>
+      <strong>{completeness === 'partial' ? 'Partial search results' : `${resultCount} result${resultCount === 1 ? '' : 's'}`}</strong>
+      <span> for “{query}”</span>
+      {completeness === 'partial' && <span> — unavailable, stale, or unsupported sources are labeled below.</span>}
+    </div>
+    {groups.map((group) => <SearchSourceGroup key={group.source.id} group={group} onOpen={onOpen} />)}
+    {!resultCount && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[13px] text-muted-foreground">
+      {completeness === 'partial'
+        ? 'No matches were returned by the available sources. This is not a complete empty result.'
+        : 'No datasets, canvases, or containers match this query.'}
+    </div>}
+    {hasMore && <button onClick={() => void load(cursor)} disabled={loadingMore}
+      data-testid="workspace-search-load-more"
+      className="mx-auto rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
+      {loadingMore ? 'Loading…' : 'Load more results'}
+    </button>}
+  </div>
+}
+
+function SearchSourceGroup({ group, onOpen }: {
+  group: WorkspaceSearchGroup; onOpen: (resource: WorkspaceResource) => void
+}) {
+  const source = group.source
+  const name = source.kind === 'local' ? 'Local Workspace'
+    : source.kind === 'provider' ? `Mount ${source.mountId ?? source.id}` : 'Mount configuration'
+  const error = statusMessage(source)
+  const detail = [
+    source.provider,
+    source.searchMode === 'native' ? 'native search' : source.searchMode,
+    source.freshness,
+    source.completeness,
+  ].filter(Boolean).join(' · ')
+  return <section aria-label={`Search source ${name}`} className="grid gap-2">
+    <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
+      <h2 className="text-[12px] font-bold text-foreground">{name}</h2>
+      <span>{detail}</span>
+      {error && <span className="text-amber-700 dark:text-amber-300">— {error}</span>}
+    </div>
+    {group.items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => onOpen(resource)} />)}
+    {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
+      {source.completeness === 'complete' ? 'No matches from this source.'
+        : error ?? `This source is ${source.completeness}.`}
+    </div>}
+  </section>
 }
 
 function SourceStatusBar({ sources, completeness }: {

@@ -8,7 +8,9 @@ import io
 import sys
 from importlib.metadata import entry_points
 
-from hub.catalog_provider import CatalogMount, ReadOnlyCatalogProvider, bounded_list_children
+from hub.catalog_provider import (
+    CatalogMount, ReadOnlyCatalogProvider, bounded_list_children, bounded_search,
+)
 
 
 def _failure(stage: str, message: str) -> int:
@@ -72,6 +74,11 @@ def main(argv: list[str] | None = None) -> int:
             return _failure("capability", "provider pagination was not stable")
         if first.items[0].name != second.items[0].name:
             return _failure("capability", "provider did not preserve duplicate display names")
+        if capabilities.search:
+            searched = bounded_search(provider, mount, first.items[0].name, limit=1)
+            if (searched.state != "ready" or len(searched.items) != 1
+                    or searched.items[0].name != first.items[0].name):
+                return _failure("capability", "provider search was not bounded and stable")
         resolved = provider.resolve(mount, first.items[0].id)
         if resolved.state != "ready" or resolved.item is None or resolved.item.id != first.items[0].id:
             return _failure("capability", "provider could not resolve its opaque resource ID")

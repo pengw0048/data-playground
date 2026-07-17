@@ -3,13 +3,19 @@
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
 
-export interface Route { view: DpView; canvasId?: string; workspaceResourceId?: string }
+export interface Route { view: DpView; canvasId?: string; workspaceResourceId?: string; workspaceQuery?: string }
 
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
-  const [seg, id] = h.split('/')
+  const [path, rawQuery = ''] = h.split('?', 2)
+  const [seg, id] = path.split('/')
+  const workspaceQuery = new URLSearchParams(rawQuery).get('q')?.trim() || undefined
   if (seg === 'canvas' && id) return { view: 'canvas', canvasId: decodeURIComponent(id) }
-  if (seg === 'workspace') return { view: 'workspace', workspaceResourceId: id ? decodeURIComponent(id) : undefined }
+  if (seg === 'workspace') return {
+    view: 'workspace',
+    workspaceResourceId: id ? decodeURIComponent(id) : undefined,
+    ...(workspaceQuery ? { workspaceQuery } : {}),
+  }
   // Recents and Tables are intentionally redirected to the single local Workspace explorer.
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
   if (seg === 'transforms' || seg === 'relationships') return { view: seg }
@@ -17,9 +23,12 @@ export function parseHash(): Route {
   return { view: 'canvas' }
 }
 
-export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string): string {
-  return view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}` : `#/${view}`
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string): string {
+  const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}` : `#/${view}`
     + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
+  const query = view === 'workspace' && workspaceQuery?.trim()
+    ? `?${new URLSearchParams({ q: workspaceQuery.trim() })}` : ''
+  return path + query
 }
 
 /** A shareable absolute link that opens straight into this canvas. */
@@ -29,12 +38,14 @@ export function canvasLink(id: string): string {
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterStore {
-  getState: () => { view: DpView; doc: { id: string }; workspaceResourceId: string | null; setView: (v: DpView) => void; setWorkspaceResource: (id: string | null) => void; openFile: (id: string) => Promise<boolean> }
-  subscribe: (fn: (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null }) => void) => void
+  getState: () => { view: DpView; doc: { id: string }; workspaceResourceId: string | null; workspaceSearchQuery: string; setView: (v: DpView) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
+  subscribe: (fn: (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null; workspaceSearchQuery: string }) => void) => void
 }
 
-const hashFor = (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null }) =>
-  routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined, s.view === 'workspace' ? s.workspaceResourceId ?? undefined : undefined)
+const hashFor = (s: { view: DpView; doc: { id: string }; workspaceResourceId: string | null; workspaceSearchQuery: string }) =>
+  routeHash(s.view, s.view === 'canvas' ? s.doc.id : undefined,
+    s.view === 'workspace' ? s.workspaceResourceId ?? undefined : undefined,
+    s.view === 'workspace' ? s.workspaceSearchQuery : undefined)
 
 let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
@@ -56,8 +67,11 @@ export function initRouter(store: RouterStore): void {
             history.replaceState(null, '', hashFor(store.getState()))
           }
         } else if (st.view !== 'canvas') st.setView('canvas')
-      } else if (r.view === 'workspace' && (st.view !== 'workspace' || st.workspaceResourceId !== (r.workspaceResourceId ?? null))) {
+      } else if (r.view === 'workspace' && (st.view !== 'workspace'
+          || st.workspaceResourceId !== (r.workspaceResourceId ?? null)
+          || st.workspaceSearchQuery !== (r.workspaceQuery ?? ''))) {
         st.setWorkspaceResource(r.workspaceResourceId ?? null)
+        st.setWorkspaceSearchQuery(r.workspaceQuery ?? '')
       } else if (st.view !== r.view) {
         st.setView(r.view)
       }

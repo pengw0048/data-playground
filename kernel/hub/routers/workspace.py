@@ -26,6 +26,7 @@ from hub.models import (
     RunStatus,
     WorkspaceBrowsePage,
     WorkspaceResourceResolution,
+    WorkspaceSearchPage,
 )
 from hub.security import RequestIdentity, current_identity, current_user
 
@@ -415,6 +416,16 @@ def browse_workspace_container(container_id: str, limit: int = 50, cursor: str |
             container_id, uid=uid, limit=limit, cursor=cursor)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/workspace/search", response_model=WorkspaceSearchPage)
+def search_workspace(q: str, limit: int = 25, cursor: str | None = None,
+                     uid: str = Depends(current_user)) -> dict:
+    """One bounded lexical page grouped by local and mounted provider source."""
+    try:
+        return workspace_providers.search(q, uid=uid, limit=limit, cursor=cursor)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 

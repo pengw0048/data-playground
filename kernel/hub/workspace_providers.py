@@ -18,14 +18,17 @@ from hub.catalog_provider import (
     CatalogMount,
     CatalogResource,
     ProviderPage,
+    ProviderSearchPage,
     ReadOnlyCatalogProvider,
     bounded_ancestors,
     bounded_list_children,
     bounded_resolve,
+    bounded_search,
 )
 
 _EXTERNAL_PREFIX = "external."
 _CURSOR_VERSION = 1
+_SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
 _MAX_CONFIG_BYTES = 1024 * 1024
 _SOURCE_STATES = {
@@ -471,4 +474,196 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         "resource": _workspace_resource(resolved.item, mounted),
         "ancestors": combined,
         "source": _source_status(source, completeness, error),
+    }
+
+
+def _search_source_status(source: _Source, completeness: str, *,
+                          error: str | None = None, freshness: str = "unknown",
+                          search_mode: str = "native") -> dict:
+    return {
+        **_source_status(source, completeness, error),
+        "freshness": freshness,
+        "searchMode": search_mode,
+    }
+
+
+def _search_cursor_encode(query: str, fingerprint: str, states: list[dict]) -> str:
+    raw = json.dumps(
+        [_SEARCH_CURSOR_VERSION, query, fingerprint, states],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _search_cursor_decode(cursor: str | None, *, query: str, fingerprint: str,
+                          source_ids: list[str]) -> list[dict] | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 32_768:
+        raise ValueError("invalid Workspace search cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        version, bound_query, bound_fingerprint, states = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid Workspace search cursor") from exc
+    valid = (
+        version == _SEARCH_CURSOR_VERSION
+        and bound_query == query
+        and bound_fingerprint == fingerprint
+        and isinstance(states, list)
+        and len(states) == len(source_ids)
+    )
+    if not valid:
+        raise ValueError("invalid Workspace search cursor")
+    for expected_id, state in zip(source_ids, states, strict=True):
+        if (not isinstance(state, dict) or set(state) != {
+                "id", "active", "cursor", "completeness", "error", "freshness", "searchMode"}
+                or state["id"] != expected_id
+                or not isinstance(state["active"], bool)
+                or state["cursor"] is not None and (
+                    not isinstance(state["cursor"], str) or len(state["cursor"]) > 4096)
+                or state["completeness"] not in _SOURCE_STATES
+                or state["error"] is not None and (
+                    not isinstance(state["error"], str) or len(state["error"]) > 512)
+                or state["freshness"] not in {"current", "stale", "unknown"}
+                or state["searchMode"] not in {"native", "fallback", "unsupported"}):
+            raise ValueError("invalid Workspace search cursor")
+    return states
+
+
+def _provider_searches(sources: list[_Source], states: list[dict], *,
+                       query: str, limit: int) -> dict[int, ProviderSearchPage | str]:
+    """Fan out only active mount searches; every read keeps its own bounded provider deadline."""
+    reads: dict[int, ProviderSearchPage | str] = {}
+    futures: dict[concurrent.futures.Future[ProviderSearchPage], int] = {}
+    active = [
+        (index, source) for index, source in enumerate(sources)
+        if source.kind == "provider" and states[index]["active"]
+    ]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(active)),
+            thread_name_prefix="dp-workspace-search") as executor:
+        for index, source in active:
+            assert source.mounted is not None
+            try:
+                provider = _load_provider(source.mounted.mount.provider)
+            except Exception:  # noqa: BLE001 -- one activation failure is isolated
+                reads[index] = _activation_error()
+                continue
+            future = executor.submit(
+                bounded_search, provider, source.mounted.mount, query,
+                limit=limit, cursor=states[index]["cursor"],
+            )
+            futures[future] = index
+        for future, index in futures.items():
+            try:
+                reads[index] = future.result()
+            except Exception:  # noqa: BLE001 -- bounded wrapper should not leak failures
+                reads[index] = "catalog provider search failed"
+    return reads
+
+
+def search(query: str, *, uid: str, limit: int = 25,
+           cursor: str | None = None) -> dict:
+    """Search local metadata and declared provider search surfaces in source-grouped pages."""
+    normalized = " ".join(query.split()).lower()
+    if not normalized:
+        raise ValueError("Workspace search query must not be blank")
+    if len(normalized.encode("utf-8")) > 512:
+        raise ValueError("Workspace search query must be at most 512 UTF-8 bytes")
+    limit = max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT))
+    mounts, invalid = _configured_mounts()
+    sources = [_Source("local"), *(_Source("provider", item) for item in mounts)]
+    if invalid:
+        sources.append(_Source("configuration"))
+    source_ids = [_source_status(source, "pending")["id"] for source in sources]
+    fingerprint = _mount_fingerprint(mounts, invalid)
+    states = _search_cursor_decode(
+        cursor, query=normalized, fingerprint=fingerprint, source_ids=source_ids)
+    if states is None:
+        states = [{
+            "id": source_id, "active": True, "cursor": None,
+            "completeness": "pending", "error": None,
+            "freshness": "unknown", "searchMode": "native",
+        } for source_id in source_ids]
+
+    provider_pages = _provider_searches(
+        sources, states, query=normalized, limit=limit)
+    groups: list[dict] = []
+    next_states: list[dict] = []
+    for index, source in enumerate(sources):
+        previous = states[index]
+        items: list[dict] = []
+        if not previous["active"]:
+            status = _search_source_status(
+                source, previous["completeness"], error=previous["error"],
+                freshness=previous["freshness"], search_mode=previous["searchMode"])
+            next_state = dict(previous)
+        elif source.kind == "local":
+            page = metadb.workspace_search(
+                normalized, uid=uid, limit=limit, cursor=previous["cursor"])
+            items = page["items"]
+            completeness = "page" if page["nextCursor"] is not None else "complete"
+            status = _search_source_status(
+                source, completeness, freshness="current", search_mode="native")
+            next_state = {
+                "id": previous["id"], "active": page["nextCursor"] is not None,
+                "cursor": page["nextCursor"], "completeness": completeness,
+                "error": None, "freshness": "current", "searchMode": "native",
+            }
+        elif source.kind == "configuration":
+            status = _search_source_status(
+                source, "unavailable", error=_configured_source_error(),
+                freshness="unknown", search_mode="unsupported")
+            next_state = {
+                "id": previous["id"], "active": False, "cursor": None,
+                "completeness": "unavailable", "error": _configured_source_error(),
+                "freshness": "unknown", "searchMode": "unsupported",
+            }
+        else:
+            provider_page = provider_pages[index]
+            if isinstance(provider_page, str):
+                completeness, error, freshness, search_mode = (
+                    "unavailable", provider_page, "unknown", "native")
+                next_cursor = None
+            else:
+                seen: set[str] = set()
+                for item in provider_page.items:
+                    resource = _workspace_resource(item, source.mounted)  # type: ignore[arg-type]
+                    if resource["id"] not in seen:
+                        seen.add(resource["id"])
+                        items.append(resource)
+                next_cursor = (
+                    provider_page.next_cursor if provider_page.state == "ready" else None)
+                completeness = (
+                    "page" if provider_page.state == "ready" and next_cursor is not None
+                    else "complete" if provider_page.state == "ready" else provider_page.state)
+                error = provider_page.reason
+                freshness = provider_page.freshness
+                search_mode = "unsupported" if provider_page.state == "unsupported" else "native"
+                if next_cursor is not None and not items:
+                    completeness, error, next_cursor = (
+                        "unavailable", "catalog provider returned a non-advancing search page", None)
+            status = _search_source_status(
+                source, completeness, error=error,
+                freshness=freshness, search_mode=search_mode)
+            next_state = {
+                "id": previous["id"], "active": next_cursor is not None,
+                "cursor": next_cursor, "completeness": completeness,
+                "error": error, "freshness": freshness, "searchMode": search_mode,
+            }
+        groups.append({"source": status, "items": items})
+        next_states.append(next_state)
+
+    has_more = any(state["active"] for state in next_states)
+    partial = any(
+        group["source"]["completeness"] in _ERROR_STATES for group in groups)
+    next_cursor = (
+        _search_cursor_encode(normalized, fingerprint, next_states) if has_more else None)
+    return {
+        "query": normalized,
+        "groups": groups,
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+        "completeness": "partial" if partial else "page" if has_more else "complete",
     }
