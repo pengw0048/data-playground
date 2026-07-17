@@ -177,24 +177,49 @@ def test_external_wait_fixture_wheel_passes_sanitized_conformance(tmp_path):
     }
     setup = r'''
 import json, os, uuid
+from pathlib import Path
 from hub import metadb
+from hub.models import LineagePublication, WriteDestination, WriteIntent, WriteProvenance
 
 metadb.init_db()
 canvas_id, submission = "external-restart", str(uuid.uuid4())
-graph = {"id": canvas_id, "version": 1, "nodes": [{
-    "id": "wait", "type": "external_wait_fixture",
-    "data": {"config": {"operation": "conformance.response-loss", "documentJson": "{}"}},
-}], "edges": []}
+key = f"external-restart:{submission}"
+destination = str(Path(os.environ["DP_DATA_DIR"]) / "external-restart.parquet")
+intent = WriteIntent(
+    destination=WriteDestination(logical_uri=destination, name="external_restart"),
+    mode="create", expected_schema=[{"name": "value", "type": "int"}],
+    idempotency_key=key,
+    provenance=WriteProvenance(
+        publication=LineagePublication(idempotency_key=key, provenance="manual")),
+)
+graph = {"id": canvas_id, "version": 1, "nodes": [
+    {
+        "id": "wait", "type": "external_wait_fixture",
+        "data": {"config": {
+            "operation": "conformance.response-loss", "documentJson": "{}",
+            "outputSchema": [{"name": "value", "type": "int"}],
+        }},
+    },
+    {"id": "write", "type": "write", "data": {"config": {
+        "destination": destination, "mode": "create"}}},
+], "edges": [{
+    "id": "wait-write", "source": "wait", "target": "write",
+    "sourceHandle": "out", "targetHandle": "in",
+}]}
 with metadb.session() as session:
     session.add(metadb.Canvas(
         id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
         name="External restart", doc=json.dumps(graph)))
 task, _ = metadb.submit_durable_external_wait_task(
     uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, submission_id=submission,
-    target_node_id="wait", intent_sha256="a" * 64, graph_doc=graph,
-    provider_kind="fixture-local", operation="conformance.response-loss", document_json="{}")
+    target_node_id="write", intent_sha256="a" * 64, graph_doc=graph,
+    provider_kind="fixture-local", operation="conformance.response-loss", document_json="{}",
+    write_intent=intent.model_dump(by_alias=True, mode="json"))
 claim = metadb.claim_external_wait_transition(task["id"], "crashed-hub-owner")
-print(json.dumps({"task_id": task["id"], "attempt_id": claim["attempt_id"]}))
+print(json.dumps({
+    "task_id": task["id"], "attempt_id": claim["attempt_id"],
+    "destination": destination,
+}))
 '''
     prepared = _run([str(python), "-c", setup], cwd=tmp_path, env=restart_env)
     assert prepared.returncode == 0, prepared.stderr
@@ -270,11 +295,16 @@ with metadb.session() as session:
             time.sleep(.05)
         assert final is not None and final["status"] == "done", final
         assert [item["id"] for item in final["taskAttempts"]] == [expected["attempt_id"]]
-        assert final["externalWait"]["phase"] == "provider_succeeded"
+        assert final["externalWait"]["phase"] == "published"
         assert final["externalWait"]["attemptNumber"] == 1
-        assert final["outputs"] == [] and final["outputReceipt"] is None
+        assert len(final["outputs"]) == 1 and final["outputReceipt"] is not None
+        assert final["outputs"][0]["writeReceipt"] == final["outputReceipt"]
+        assert final["outputs"][0]["rows"] == 1
+        assert final["outputReceipt"]["publication"]["logicalUri"] == expected["destination"]
+        assert final["outputReceipt"]["publication"]["publishSequence"] == 1
+        assert Path(final["outputReceipt"]["publication"]["artifactUri"]).is_file()
         encoded = json.dumps(final)
-        for sentinel in ("job_id", "checkpoint", "documentJson",
+        for sentinel in ("job_id", "checkpoint", "documentJson", ".dp-external-stage",
                          "external-wait-secret-sentinel", "/private/configured/path"):
             assert sentinel not in encoded
     finally:

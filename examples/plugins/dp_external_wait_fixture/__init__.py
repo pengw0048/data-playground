@@ -10,7 +10,7 @@ from hub.external_wait import (ExternalWaitCheckpoint, ExternalWaitDiagnostic,
                                ExternalWaitDownloadEvidence, ExternalWaitHandle,
                                ExternalWaitPollOutcome, ExternalWaitRetryHint,
                                ExternalWaitSubmitRequest)
-from hub.sdk import NodeSpec, ParamSpec
+from hub.sdk import NodeSpec, ParamSpec, PortSpec
 
 PROVIDER_KIND = "fixture-local"
 NODE_KIND = "external_wait_fixture"
@@ -120,10 +120,10 @@ class FixtureExternalWaitAdapter:
     def download(self, handle: ExternalWaitHandle, target: Path):
         job = self._job(handle)
         if job.scenario == "invalid-download-digest":
-            target.write_bytes(b"fixture-result")
-            return {"result_id": "fixture-result", "bytes_written": 14,
-                    "sha256": "not-a-digest", "media_type": "application/octet-stream"}
-        content = f"result:{job.handle.job_id}".encode()
+            target.write_bytes(b"value\n1\n")
+            return {"result_id": "fixture-result", "bytes_written": 8,
+                    "sha256": "not-a-digest", "media_type": "text/csv"}
+        content = b"value\n1\n"
         if job.scenario == "invalid-download-path":
             target.parent.rmdir()
             target.parent.symlink_to(target.parent.parent, target_is_directory=True)
@@ -132,7 +132,7 @@ class FixtureExternalWaitAdapter:
         return ExternalWaitDownloadEvidence(
             result_id=f"result-{job.handle.job_id}",
             bytes_written=len(content) + (1 if job.scenario == "invalid-download-size" else 0),
-            sha256=hashlib.sha256(content).hexdigest(), media_type="application/octet-stream",
+            sha256=hashlib.sha256(content).hexdigest(), media_type="text/csv",
         )
 
 
@@ -140,7 +140,7 @@ def register(reg) -> None:
     reg.add_external_wait_adapter(FixtureExternalWaitAdapter(reg.workspace_identity()))
     reg.add_external_wait_node(NodeSpec(
         kind=NODE_KIND, title="external wait fixture", category="control", tag="wait",
-        inputs=[], outputs=[], previewable=False,
+        inputs=[], outputs=[PortSpec(id="out", wire="dataset")], previewable=False,
         params=[ParamSpec(
             name="operation", type="select", default="conformance.success",
             options=["conformance.success", "conformance.response-loss", "conformance.failed",

@@ -30,6 +30,7 @@ from hub.backends import (
     backend_supports_admitted_input_manifests, backend_supports_named_multi_output_runs,
 )
 from hub.deps import get_deps
+from hub.executors.engine import declared_schema
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
@@ -113,15 +114,20 @@ def _local_run_intent_sha256(
 
 
 def _external_wait_request(deps, graph, target_node_id: str | None):
-    """Recognize only the installed zero-port fixture consumer, before ordinary compile/output gates."""
+    """Recognize only one installed external result feeding one built-in Write."""
     external = [node for node in graph.nodes if node.type in getattr(deps, "external_wait_nodes", {})]
     if not external:
         return None
-    if (len(graph.nodes) != 1 or len(external) != 1 or graph.edges
-            or target_node_id != external[0].id):
-        raise HTTPException(409, "external-wait tasks require exactly one zero-port target")
+    target = next((node for node in graph.nodes if node.id == target_node_id), None)
+    edge = graph.edges[0] if len(graph.edges) == 1 else None
+    if (len(graph.nodes) != 2 or len(external) != 1 or target is None or target.type != "write"
+            or edge is None or edge.source != external[0].id or edge.target != target.id
+            or edge.source_handle not in (None, "out") or edge.target_handle not in (None, "in")):
+        raise HTTPException(409, "external-wait tasks require exactly one fixture-to-Write edge")
     cfg = external[0].data.get("config", {}) if isinstance(external[0].data, dict) else {}
-    if not isinstance(cfg, dict) or set(cfg) - {"operation", "documentJson"}:
+    if (not isinstance(cfg, dict)
+            or set(cfg) - {"operation", "documentJson", "outputSchema"}
+            or not isinstance(cfg.get("outputSchema"), list) or not cfg["outputSchema"]):
         raise HTTPException(409, "external-wait node configuration is not supported")
     from hub.external_wait import ExternalWaitSubmitRequest
     try:
@@ -207,7 +213,7 @@ def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
 
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
-        supplied: WriteIntent | None = None) -> WriteAdmission:
+        supplied: WriteIntent | None = None, *, direct_local: bool = False) -> WriteAdmission:
     """Resolve one metadata-only Write card contract without allocating an artifact."""
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
@@ -234,7 +240,7 @@ def _write_admission_for_graph(
     )
     managed = managed_file or lance_candidate
     pick_runner = getattr(deps, "pick_runner", None)
-    if managed and callable(pick_runner):
+    if managed and callable(pick_runner) and not direct_local:
         plan = compiler.compile_plan(
             graph, node_id, deps.registry, getattr(deps, "node_specs", {}),
             getattr(deps, "node_ir", {}))
@@ -277,9 +283,11 @@ def _write_admission_for_graph(
             partitions=partitions,
         )
     try:
-        schemas = schema_for_graph(
-            graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
-            getattr(deps, "node_specs", {}), storage=deps.storage)
+        schemas = ({node_id: declared_schema(next(
+            candidate for candidate in graph.nodes if candidate.id != node_id))}
+            if direct_local else schema_for_graph(
+                graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
+                getattr(deps, "node_specs", {}), storage=deps.storage))
         schema = schemas.get(node_id)
     except ManagedSourceReadError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1643,28 +1651,31 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a submissionId")
     external_request = _external_wait_request(deps, graph, target_node_id)
     if external_request is not None:
-        if input_manifest is not None or write_intent is not None or submission_id is None:
+        if input_manifest is not None or submission_id is None:
             raise HTTPException(
-                409, "external-wait tasks require a submissionId and no inputs or write intent")
+                409, "external-wait tasks require a submissionId and no inputs")
+        admission = _write_admission_for_graph(
+            deps, graph, str(target_node_id), uid, str(submission_id),
+            supplied=write_intent, direct_local=True)
+        if (not admission.managed or admission.intent is None
+                or admission.intent.mode not in ("create", "replace")
+                or admission.intent.destination.provider != "managed-local-file"
+                or admission.intent.partitions):
+            raise HTTPException(409, admission.blocker or "external-wait Write is not managed-local")
         operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
         if not operational_canvas or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "durable external waits require a saved canvas")
-        semantic = intent_graph.model_dump(mode="json")
-        for node in semantic.get("nodes", []):
-            if isinstance(node.get("data"), dict):
-                node["data"].pop("status", None)
-        intent_sha256 = hashlib.sha256(json.dumps(
-            {"graph": semantic, "target": target_node_id,
-             "provider": external_request.provider_kind,
-             "operation": external_request.operation,
-             "document": external_request.document_json},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+        semantic = _local_run_intent_sha256(
+            intent_graph, target_node_id, write_intent=admission.intent)
+        intent_sha256 = hashlib.sha256(
+            f"{semantic}\0{external_request.model_dump_json()}".encode()).hexdigest()
         task, _created = metadb.submit_durable_external_wait_task(
             uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
             target_node_id=str(target_node_id), intent_sha256=intent_sha256,
             graph_doc=graph.model_dump(by_alias=True, mode="json"),
             provider_kind=external_request.provider_kind,
-            operation=external_request.operation, document_json=external_request.document_json)
+            operation=external_request.operation, document_json=external_request.document_json,
+            write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
         from hub.external_wait_tasks import recover
         recover(deps)
         return RunStatus.model_validate(task["status_doc"]), None

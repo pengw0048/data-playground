@@ -1328,7 +1328,9 @@ class DurableTaskAttemptView(Wire):
 class DurableExternalWaitView(Wire):
     provider_kind: str = Field(min_length=1, max_length=64)
     phase: Literal["unsubmitted", "submitting", "accepted", "running", "provider_succeeded",
-                   "provider_failed", "provider_cancelled", "cancelled_before_submit"]
+                   "downloading", "downloaded", "publishing", "published", "provider_failed",
+                   "provider_cancelled", "finalization_failed", "cancelled_before_submit",
+                   "cancelled_after_success"]
     next_poll_at: str
     deadline_at: str
     poll_count: int = Field(ge=0, le=64)
