@@ -2457,7 +2457,8 @@ def test_failed_partial_late_key_and_escaped_inventory_quarantine():
     handoff.set_managed_object_provider(provider)
     try:
         result = handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
-        assert result["quarantined"] == [escaped["uri"]]
+        # Reaping is global, so only assert ownership of this test's attempt.
+        assert escaped["uri"] in result["quarantined"]
         assert _state(escaped["uri"]) == "quarantined"
         assert provider.calls == []
     finally:
@@ -2817,7 +2818,8 @@ def test_final_empty_barrier_quarantines_a_late_member():
         provider.members[late["member_id"]] = late
         _force_delete_verification_due(handle["uri"])
         second = handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
-        assert second["quarantined"] == [handle["uri"]]
+        # Reaping is global, so only assert ownership of this test's attempt.
+        assert handle["uri"] in second["quarantined"]
         assert _state(handle["uri"]) == "quarantined"
     finally:
         handoff.set_managed_object_provider(None)
