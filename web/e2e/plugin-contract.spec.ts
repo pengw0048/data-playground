@@ -1,7 +1,18 @@
 import { expect, test } from '@playwright/test'
 
 test('the installed descriptor fixture survives registration, editing, reload, and preview', async ({ page, request }) => {
-  const descriptorsResponse = await request.get('/api/nodes')
+  // The default E2E user is shared across workers. A worker opening its newest canvas can otherwise
+  // briefly join this contract canvas and race its own "New file" transition into the same Yjs room.
+  const createdUser = await request.post('/api/users', {
+    data: { name: `Descriptor contract ${Date.now()}` },
+    headers: { 'X-DP-User': 'local' },
+  })
+  expect(createdUser.ok()).toBe(true)
+  const userId = (await createdUser.json() as { id: string }).id
+  const headers = { 'X-DP-User': userId }
+  await page.addInitScript((id) => localStorage.setItem('dp-user', id), userId)
+
+  const descriptorsResponse = await request.get('/api/nodes', { headers })
   expect(descriptorsResponse.ok()).toBe(true)
   const descriptors = await descriptorsResponse.json() as Array<Record<string, any>>
   const contract = descriptors.find((item) => item.kind === 'descriptor_contract')
@@ -21,7 +32,7 @@ test('the installed descriptor fixture survives registration, editing, reload, a
     requires: { gpu: 1, labels: { engine: 'descriptor-contract' } },
   })
 
-  const catalogResponse = await request.get('/api/catalog/tables?q=events')
+  const catalogResponse = await request.get('/api/catalog/tables?q=events', { headers })
   expect(catalogResponse.ok()).toBe(true)
   const catalog = await catalogResponse.json() as { items: Array<{ name: string; uri: string }> }
   const events = catalog.items.find((item) => item.name === 'events')
@@ -50,7 +61,7 @@ test('the installed descriptor fixture survives registration, editing, reload, a
       edge('contract', 'unavailable', 'in'),
     ],
   }
-  const saved = await request.put(`/api/canvas/${canvasId}`, { data: graph })
+  const saved = await request.put(`/api/canvas/${canvasId}`, { data: graph, headers })
   expect(saved.ok()).toBe(true)
 
   await page.goto(`/#/canvas/${canvasId}`)
@@ -76,7 +87,7 @@ test('the installed descriptor fixture survives registration, editing, reload, a
   await ratio.blur()
   await contractNode.getByRole('button', { name: 'Move amount up' }).click()
   await expect.poll(async () => {
-    const restored = await request.get(`/api/canvas/${canvasId}`)
+    const restored = await request.get(`/api/canvas/${canvasId}`, { headers })
     if (!restored.ok()) return null
     const body = await restored.json() as typeof graph
     return body.nodes.find((item) => item.id === 'contract')?.data.config
