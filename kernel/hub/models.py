@@ -386,7 +386,7 @@ class WriteDestination(Wire):
     logical_uri: str = Field(min_length=1, max_length=4096)
     name: str = Field(min_length=1, max_length=512)
     dataset_id: str | None = Field(default=None, min_length=1, max_length=128)
-    provider: Literal["managed-local-file"] = "managed-local-file"
+    provider: Literal["managed-local-file", "managed-local-lance"] = "managed-local-file"
 
     @model_validator(mode="after")
     def validate_identity(self) -> "WriteDestination":
@@ -441,12 +441,12 @@ class WriteProvenance(Wire):
 
 
 class WriteIntent(Wire):
-    """Frozen pre-1.0 contract for one local create or compare-and-swap replace."""
+    """Frozen pre-1.0 contract for one managed local create, replace, or Lance append."""
 
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
     destination: WriteDestination
-    mode: Literal["create", "replace"]
+    mode: Literal["create", "replace", "append"]
     expected_schema: list[ColumnSchema] = Field(default_factory=list, max_length=1024)
     expected_head: ExactDatasetRef | None = None
     idempotency_key: str = Field(min_length=1, max_length=2048)
@@ -474,21 +474,31 @@ class WriteIntent(Wire):
                 raise ValueError("create write cannot claim an existing dataset or expected head")
         else:
             if self.destination.dataset_id is None or self.expected_head is None:
-                raise ValueError("replace write requires destination dataset and expected head")
+                raise ValueError(
+                    f"{self.mode} write requires destination dataset and expected head")
             if self.expected_head.dataset_id != self.destination.dataset_id:
-                raise ValueError("replace expected head must belong to the destination dataset")
+                raise ValueError(
+                    f"{self.mode} expected head must belong to the destination dataset")
+        if self.mode == "append":
+            if self.destination.provider != "managed-local-lance":
+                raise ValueError("append write requires the managed-local-lance provider")
+            if not self.destination.logical_uri.lower().endswith(".lance"):
+                raise ValueError("append write requires a .lance destination")
+        elif self.destination.provider != "managed-local-file":
+            raise ValueError("create/replace writes require the managed-local-file provider")
         return self
 
 
 class WritePublicationIdentity(Wire):
-    """Durable provider-side identity of one local managed-file publication."""
+    """Durable provider-side identity of one managed local publication."""
 
-    provider: Literal["managed-local-file"] = "managed-local-file"
+    provider: Literal["managed-local-file", "managed-local-lance"] = "managed-local-file"
     logical_uri: str
     artifact_uri: str
     publish_sequence: int = Field(ge=1, le=MAX_SAFE_INTEGER)
     idempotency_key: str
     catalog_version: str | None = Field(default=None, min_length=1, max_length=512)
+    backend_version: str | None = Field(default=None, min_length=1, max_length=512)
 
 
 class WriteReceipt(Wire):

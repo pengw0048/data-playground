@@ -817,6 +817,23 @@ class ManagedLocalFileRevision(Base):
     )
 
 
+class ManagedLocalLanceWriteReceipt(Base):
+    """One durable typed receipt for an exact provider-owned local Lance version."""
+    __tablename__ = "managed_local_lance_write_receipts"
+    idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(String, nullable=False)
+    logical_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    write_intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    write_receipt_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    committed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id", "revision_id", name="uq_managed_local_lance_write_revision"),
+    )
+
+
 class SettingRevision(Base):
     """One optimistic-concurrency counter per independently editable settings scope."""
     __tablename__ = "setting_revisions"
@@ -9290,7 +9307,7 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
 
 
 class ManagedLocalWriteConflict(RuntimeError):
-    """A create/replace precondition no longer matches the durable destination head."""
+    """A typed local-write precondition no longer matches its durable destination head."""
 
 
 def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, str]:
@@ -9332,6 +9349,54 @@ def _managed_local_write_receipt_in_session(
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
+
+
+def _managed_local_lance_write_receipt_in_session(
+        s, idempotency_key: str, intent_doc: str, *, lock: bool = False) -> dict | None:
+    query = select(ManagedLocalLanceWriteReceipt).where(
+        ManagedLocalLanceWriteReceipt.idempotency_key == str(idempotency_key)).limit(1)
+    if lock:
+        query = query.with_for_update()
+    row = s.scalars(query).first()
+    if row is None:
+        return None
+    if row.write_intent_doc != intent_doc:
+        raise RuntimeError(f"managed local write idempotency key collision: {idempotency_key}")
+    try:
+        from hub.models import WriteReceipt
+
+        receipt = WriteReceipt.model_validate(json.loads(row.write_receipt_doc))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("managed local Lance write receipt is invalid") from exc
+    if (receipt.dataset_id != row.dataset_id
+            or receipt.revision_id != row.revision_id
+            or receipt.publication.provider != "managed-local-lance"
+            or receipt.publication.logical_uri != row.logical_uri
+            or receipt.publication.artifact_uri != row.logical_uri
+            or receipt.publication.idempotency_key != idempotency_key):
+        raise RuntimeError("managed local Lance write receipt lost its exact revision evidence")
+    return receipt.model_dump(by_alias=True, mode="json")
+
+
+def _validate_managed_local_lance_destination_in_session(
+        s, intent, *, lock: bool) -> CatalogEntry:
+    if intent.mode != "append" or intent.destination.provider != "managed-local-lance":
+        raise ValueError("managed local Lance writes support append only")
+    if intent.partitions:
+        raise ValueError("managed local Lance append does not support partitions")
+    query = select(CatalogEntry).where(
+        CatalogEntry.uri == intent.destination.logical_uri).limit(1)
+    if lock:
+        query = query.with_for_update()
+    entry = s.scalars(query).first()
+    if (entry is None or entry.logical_id is not None
+            or entry.registration_id != intent.destination.dataset_id):
+        raise ManagedLocalWriteConflict("append destination does not exist")
+    if entry.name != intent.destination.name:
+        raise ManagedLocalWriteConflict("append destination identity changed")
+    if not entry.uri.lower().endswith(".lance"):
+        raise ManagedLocalWriteConflict("append destination is not Lance")
+    return entry
 
 
 def _managed_local_write_head_in_session(s, logical_uri: str, *, lock: bool = False) -> dict | None:
@@ -9398,10 +9463,16 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
 def catalog_admit_managed_local_write(value: object) -> dict | None:
     """Validate a frozen intent before artifact allocation, returning a prior durable receipt."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    if intent.mode not in ("create", "replace"):
+        raise ValueError("managed local-file writes support create/replace only")
     if intent.partitions:
         raise ValueError("managed local-file create/replace does not support partitions")
     with session() as s:
         prior = _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+        if prior is not None:
+            return prior
+        prior = _managed_local_lance_write_receipt_in_session(
             s, intent.idempotency_key, canonical)
         if prior is not None:
             return prior
@@ -9413,8 +9484,90 @@ def catalog_managed_local_write_receipt(value: object) -> dict | None:
     """Recover an exact typed write receipt by idempotency key after response loss."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
     with session() as s:
-        return _managed_local_write_receipt_in_session(
+        prior = _managed_local_write_receipt_in_session(
             s, intent.idempotency_key, canonical)
+        return prior if prior is not None else _managed_local_lance_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+
+
+def catalog_admit_managed_local_lance_write(value: object) -> dict | None:
+    """Validate one registered local Lance append before any provider-side allocation."""
+    intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    with session() as s:
+        prior = _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+        if prior is not None:
+            return prior
+        prior = _managed_local_lance_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+        if prior is not None:
+            return prior
+        _validate_managed_local_lance_destination_in_session(s, intent, lock=False)
+        return None
+
+
+def catalog_managed_local_lance_write_receipt(value: object) -> dict | None:
+    """Recover one exact native Lance receipt by its frozen idempotent intent."""
+    intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    with session() as s:
+        prior = _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+        return prior if prior is not None else _managed_local_lance_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+
+
+def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
+    """Serialize one admitted Lance append and persist its exact provider receipt.
+
+    ``publish`` runs while the registered destination row is locked. The external provider commit is
+    intentionally recoverable rather than transactionally coupled to metadata: its transaction evidence
+    lets a retry reconstruct this row if the database response is lost after Lance commits.
+    """
+    intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    with session() as s:
+        _catalog_sqlite_write_fence(s)
+        _lock_catalog_namespace_tokens(
+            s, [f"managed-local-write:{intent.idempotency_key}"])
+        prior = _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical, lock=True)
+        if prior is not None:
+            return prior
+        prior = _managed_local_lance_write_receipt_in_session(
+            s, intent.idempotency_key, canonical, lock=True)
+        if prior is not None:
+            return prior
+        _validate_managed_local_lance_destination_in_session(s, intent, lock=True)
+        from hub.models import WriteReceipt
+
+        receipt = WriteReceipt.model_validate(publish())
+        expected = intent.expected_head
+        if (expected is None
+                or receipt.dataset_id != intent.destination.dataset_id
+                or receipt.head.dataset_id != receipt.dataset_id
+                or receipt.head.revision_id != receipt.revision_id
+                or receipt.parent_head != expected
+                or receipt.publication.provider != "managed-local-lance"
+                or receipt.publication.logical_uri != intent.destination.logical_uri
+                or receipt.publication.artifact_uri != intent.destination.logical_uri
+                or receipt.publication.publish_sequence != int(receipt.revision_id)
+                or receipt.publication.idempotency_key != intent.idempotency_key
+                or receipt.provenance != intent.provenance):
+            raise RuntimeError("managed local Lance publication receipt changed after admission")
+        committed_at = receipt.head.committed_at or _now()
+        if committed_at.tzinfo is None or committed_at.utcoffset() is None:
+            committed_at = committed_at.replace(tzinfo=datetime.timezone.utc)
+        s.add(ManagedLocalLanceWriteReceipt(
+            idempotency_key=intent.idempotency_key,
+            dataset_id=receipt.dataset_id,
+            logical_uri=intent.destination.logical_uri,
+            revision_id=receipt.revision_id,
+            write_intent_doc=canonical,
+            write_receipt_doc=json.dumps(
+                receipt.model_dump(by_alias=True, mode="json"),
+                sort_keys=True, separators=(",", ":")),
+            committed_at=committed_at,
+        ))
+        return receipt.model_dump(by_alias=True, mode="json")
 
 
 def catalog_publish_managed_local_file(
@@ -9440,6 +9593,8 @@ def catalog_publish_managed_local_file(
     typed_intent = intent_payload = intent_doc = None
     if write_intent is not None:
         typed_intent, intent_payload, intent_doc = _canonical_managed_local_write_intent(write_intent)
+        if typed_intent.mode not in ("create", "replace"):
+            raise ValueError("managed local-file writes support create/replace only")
         if (typed_intent.destination.logical_uri != logical_uri
                 or typed_intent.destination.name != str(name)):
             raise ValueError("managed local write intent changed its destination")
@@ -9519,6 +9674,10 @@ def catalog_publish_managed_local_file(
                     lineage=canonical_lineage,
                 )
                 return prior_write
+            prior_lance_write = _managed_local_lance_write_receipt_in_session(
+                s, typed_intent.idempotency_key, intent_doc, lock=True)
+            if prior_lance_write is not None:  # pragma: no cover - mode validation forbids this replay
+                return prior_lance_write
         prior_head = (_validate_managed_local_write_precondition(
             s, typed_intent, lock=True) if typed_intent is not None else None)
         receipt = _managed_local_file_publication_receipt_in_session(
