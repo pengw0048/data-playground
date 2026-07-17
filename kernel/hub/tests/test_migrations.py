@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0012_linear_checkpoint_admission", "0011_external_wait_publication"),
         ("0011_external_wait_publication", "0010_durable_external_waits"),
         ("0010_durable_external_waits", "0009_durable_local_write_tasks"),
         ("0009_durable_local_write_tasks", "0008_managed_local_lance_writes"),
@@ -66,8 +67,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0011_external_wait_publication"]
-    assert metadb.expected_schema_head() == "0011_external_wait_publication"
+    assert scripts.get_heads() == ["0012_linear_checkpoint_admission"]
+    assert metadb.expected_schema_head() == "0012_linear_checkpoint_admission"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -104,6 +105,9 @@ def test_committed_migration_revisions_are_immutable():
         "0011_external_wait_publication.py": (
             "bc779148f2d745f0ef0a0e227dd1877eb08b92d7ac8184f28c6608e3fefebfaf"
         ),
+        "0012_linear_checkpoint_admission.py": (
+            "83237f57a39bdb92aa52d660aea9d7c4dddfc4bf7636ff18523b3fcec418214f"
+        ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
 
@@ -114,6 +118,37 @@ def test_committed_migration_revisions_are_immutable():
         assert hashlib.sha256(revision_paths[name].read_bytes()).hexdigest() == expected_hash, (
             "committed migration revisions are immutable; add a forward migration instead"
         )
+
+
+def test_linear_checkpoint_downgrade_rejects_retained_hidden_rows(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'checkpoint-downgrade.db'}"):
+        metadb.migrate_db()
+        now = metadb._now()
+        with metadb.session() as session:
+            session.add(metadb.User(id="checkpoint-owner", name="Checkpoint owner"))
+            session.flush()
+            session.add(metadb.Canvas(
+                id="checkpoint-canvas", owner_id="checkpoint-owner", name="Checkpoint", doc="{}"))
+            session.flush()
+            session.add(metadb.DurableTask(
+                id="checkpoint-task", owner_id="checkpoint-owner", canvas_id="checkpoint-canvas",
+                submission_id="submission", intent_sha256="a" * 64,
+                target_node_id="final", task_kind="linear_checkpoint_write",
+                backend_kind="local", graph_doc="{}", input_manifest="[]", write_intent="{}",
+                status="queued", status_doc="{}", created_at=now, updated_at=now))
+        with metadb.engine().connect() as connection:
+            with pytest.raises(RuntimeError, match="cannot downgrade"):
+                command.downgrade(
+                    metadb._alembic_cfg(connection), "0011_external_wait_publication")
+        assert metadb._current_schema_heads() == ("0012_linear_checkpoint_admission",)
+
+        with metadb.session() as session:
+            session.delete(session.get(metadb.DurableTask, "checkpoint-task"))
+        with metadb.engine().connect() as connection:
+            command.downgrade(
+                metadb._alembic_cfg(connection), "0011_external_wait_publication")
+            assert "durable_checkpoints" not in inspect(connection).get_table_names()
+            command.upgrade(metadb._alembic_cfg(connection), "head")
 
 
 def test_historical_baseline_upgrade_repairs_workspace_metadata_without_data_loss(tmp_path):
