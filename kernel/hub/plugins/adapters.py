@@ -37,8 +37,25 @@ class RevisionUnavailable(RuntimeError):
     """An exact provider-native revision cannot be opened; callers must never fall back to head."""
 
 
+class RevisionPermissionLost(RuntimeError):
+    """An exact revision still has identity, but the provider now denies access to it."""
+
+
+class RevisionProviderOffline(RuntimeError):
+    """An exact revision could not be checked because its provider is temporarily unreachable."""
+
+
 class RevisionResolutionAmbiguous(RuntimeError):
     """A provider cannot prove one exact revision for the requested ordering boundary."""
+
+
+def _raise_revision_access_error(exc: Exception) -> None:
+    """Preserve the small public recovery taxonomy without guessing from provider prose."""
+    if isinstance(exc, PermissionError):
+        raise RevisionPermissionLost("revision_permission_lost") from exc
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        raise RevisionProviderOffline("revision_provider_offline") from exc
+    raise RevisionUnavailable("revision_unavailable") from exc
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -805,7 +822,7 @@ class ManagedLocalFileRevisionAdapter:
             artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
             return DuckDBAdapter().scan(artifact_uri)
         except (KeyError, OSError, duckdb.Error) as exc:
-            raise RevisionUnavailable("revision_unavailable") from exc
+            _raise_revision_access_error(exc)
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded facts and preview from one exact immutable local Parquet artifact."""
@@ -838,7 +855,7 @@ class ManagedLocalFileRevisionAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            raise RevisionUnavailable("revision_unavailable") from exc
+            _raise_revision_access_error(exc)
 
 
 def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAdapter | None:
@@ -1015,7 +1032,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            raise RevisionUnavailable("revision_unavailable") from exc
+            _raise_revision_access_error(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
@@ -1063,7 +1080,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            raise RevisionUnavailable("revision_unavailable") from exc
+            _raise_revision_access_error(exc)
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:

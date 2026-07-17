@@ -99,9 +99,11 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 
 function unavailableEvidence(error: unknown, table: CatalogTable | null): ManifestEvidence {
   const status = errorStatus(error)
-  if (status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this exact revision was lost.' }
-  if (status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This exact revision or its registration is missing or compacted. Latest was not substituted.' }
-  if (status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
+  const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code : undefined
+  if (code === 'permission_denied' || status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this exact revision was lost.' }
+  if (code === 'resource_gone' || status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This exact revision or its registration is missing or compacted. Latest was not substituted.' }
+  if (code === 'service_unavailable' || status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
   return { table, detail: null, availability: 'error', message: `Couldn't verify this exact revision: ${errorText(error)}` }
 }
 

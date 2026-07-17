@@ -26,8 +26,9 @@ from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri,
-    path_of, relation_columns, revision_adapter_for_uri,
+    BoundedPreviewUnsupported, RevisionPermissionLost, RevisionProviderOffline,
+    RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
+    revision_adapter_for_uri,
 )
 from hub.plugins.importer import ImporterNotConfigured
 from hub.sampling import provenance_for_dataset
@@ -368,6 +369,12 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
     try:
         adapter = _revision_adapter(table.uri)
         rows, next_cursor = adapter.revision_history(table.uri, limit=limit, cursor=cursor)
+    except (RevisionPermissionLost, PermissionError):
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False)
+    except (RevisionProviderOffline, ConnectionError, TimeoutError):
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
@@ -441,6 +448,12 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         with db.base_guard():
             raw = adapter.revision_detail(
                 binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
+    except (RevisionPermissionLost, PermissionError):
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False)
+    except (RevisionProviderOffline, ConnectionError, TimeoutError):
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)

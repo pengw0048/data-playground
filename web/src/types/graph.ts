@@ -21,6 +21,7 @@ export interface ExactDatasetRef {
   kind: 'exact'
   datasetId: string
   revisionId: string
+  lastKnown?: { committedAt: string | null }
 }
 
 export interface AsOfDatasetRef {

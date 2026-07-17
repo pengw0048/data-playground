@@ -140,23 +140,56 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     fireEvent.click(await screen.findByRole('button', { name: /Pin exact revision/i }))
     fireEvent.click(screen.getAllByRole('button').find((button) => button.textContent?.startsWith('1'))!)
 
-    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({ kind: 'exact', datasetId: 'dataset-1', revisionId: '1' })
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({
+      kind: 'exact', datasetId: 'dataset-1', revisionId: '1',
+      lastKnown: { committedAt: '2026-07-15T12:00:00Z' },
+    })
     expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
     expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
   })
 
   it('preserves an unavailable pinned selection with a recoverable explanation', async () => {
-    const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'missing' }
+    const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'missing',
+      lastKnown: { committedAt: '2026-07-15T12:00:00Z' } }
     const data = { title: 'orders', status: 'stale', config: {
       uri: '/data/orders.lance', tableId: 't1', datasetRef: selected,
     } }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.lance' }],
       doc: { id: 'c', name: 'test', version: 1, nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
-    mocks.datasetRevision.mockRejectedValueOnce(new Error('HTTP 410: dataset_revision_unavailable'))
+    mocks.datasetRevision.mockRejectedValueOnce(Object.assign(
+      new Error('dataset_revision_unavailable'),
+      { status: 410, code: 'resource_gone', retryable: false },
+    ))
     render1(data)
 
-    expect(await screen.findByText(/Selected revision missing is unavailable.*Selection preserved/i)).toBeInTheDocument()
+    expect(await screen.findByText(/revision missing.*missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(/Last known provider commit.*stale/i)
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
+  })
+
+  it('distinguishes permission loss and retries the same exact identity', async () => {
+    const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: '7' }
+    const data = { title: 'orders', status: 'stale', config: {
+      uri: '/data/orders.lance', tableId: 't1', datasetRef: selected,
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.lance' }],
+      doc: { id: 'c', name: 'test', version: 1, nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
+    mocks.datasetRevision
+      .mockRejectedValueOnce(Object.assign(new Error('dataset_revision_permission_lost'), {
+        status: 403, code: 'permission_denied', retryable: false,
+      }))
+      .mockResolvedValueOnce({
+        datasetId: 'dataset-1', revisionId: '7', retentionOwner: 'provider', summary: { rowCount: 1 },
+        preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
+      })
+    render1(data)
+
+    expect(await screen.findByText(/Permission to open exact revision 7 was lost.*latest was not substituted/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry exact revision' }))
+    expect(await screen.findByText(/Pinned exact revision 7.*1 rows/i)).toBeInTheDocument()
+    expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
 
