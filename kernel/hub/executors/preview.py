@@ -12,7 +12,8 @@ from typing import Any
 
 from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable
-from hub.models import Graph, SampleResult
+from hub.models import Graph, SampleResult, dataset_ref_identity
+from hub.plugins.adapters import revision_adapter_for_uri
 from hub.sampling import provenance_for_graph
 from hub.sandbox import run_with_timeout
 from hub.storage import ManagedSourceReadError
@@ -81,8 +82,10 @@ def _reservoir_source_total(graph: Graph, node_id: str, resolve_adapter) -> int 
         adapter = resolve_adapter(uri) if uri else None
         dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
         if adapter is not None and isinstance(dataset_ref, dict):
+            adapter = revision_adapter_for_uri(uri, resolve_adapter)
+            _dataset_id, revision_id = dataset_ref_identity(dataset_ref)
             detail = adapter.revision_detail(
-                uri, str(dataset_ref.get("revisionId") or ""), preview_limit=1)
+                uri, revision_id, preview_limit=1)
             value = detail.get("row_count")
         else:
             count = getattr(adapter, "metadata_count", None)

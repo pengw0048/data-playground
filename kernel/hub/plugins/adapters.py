@@ -37,6 +37,10 @@ class RevisionUnavailable(RuntimeError):
     """An exact provider-native revision cannot be opened; callers must never fall back to head."""
 
 
+class RevisionResolutionAmbiguous(RuntimeError):
+    """A provider cannot prove one exact revision for the requested ordering boundary."""
+
+
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
     """Fence a staged write before its externally visible publish point."""
     if cancelled is not None and cancelled():
@@ -774,6 +778,9 @@ class ManagedLocalFileRevisionAdapter:
 
     name = "managed-local-file"
     retention_owner = "core"
+    revision_selectors = frozenset({"exact", "latest", "as_of"})
+    revision_as_of_ordering = "latest_committed_at_at_or_before"
+    revision_timezone = "UTC"
 
     def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
         from hub import metadb
@@ -845,6 +852,11 @@ def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAda
     return _MANAGED_LOCAL_FILE_REVISION_ADAPTER
 
 
+def revision_adapter_for_uri(uri: str, resolve_adapter) -> object:
+    """Return the provider owning revision identity, which may differ from the scan adapter."""
+    return managed_local_file_revision_adapter(uri) or resolve_adapter(uri)
+
+
 _MANAGED_LOCAL_FILE_REVISION_ADAPTER = ManagedLocalFileRevisionAdapter()
 
 
@@ -856,6 +868,9 @@ class LanceAdapter:
     """
 
     name = "lance"
+    revision_selectors = frozenset({"exact", "latest", "as_of"})
+    revision_as_of_ordering = "latest_committed_at_at_or_before"
+    revision_timezone = "UTC"
 
     def matches(self, uri: str) -> bool:
         return _read_uri(uri).lower().rstrip("/").endswith(".lance")
@@ -973,8 +988,21 @@ class LanceAdapter:
             if as_of is None:
                 dataset = self._dataset(uri)
             else:
-                dataset = self._dataset(uri, asof=as_of)
-            return {"revision_id": self._revision_id(dataset.version), "committed_at": None}
+                # Lance defines native commit timestamps as UTC but currently expects a naive UTC
+                # datetime at its Python boundary and interprets `asof` as strictly-before. The public
+                # contract is inclusive at-or-before, so advance one Python timestamp quantum after
+                # timezone normalization; Lance commit evidence has the same microsecond precision.
+                instant = as_of.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+                dataset = (self._dataset(uri) if instant == datetime.datetime.max
+                           else self._dataset(uri, asof=instant + datetime.timedelta(microseconds=1)))
+            revision_id = self._revision_id(dataset.version)
+            entry = next((item for item in self._dataset(uri).versions()
+                          if self._revision_id(item.get("version")) == revision_id), None)
+            if entry is None or entry.get("timestamp") is None:
+                raise RevisionResolutionAmbiguous("revision_resolution_ambiguous")
+            return {"revision_id": revision_id, "committed_at": entry["timestamp"]}
+        except RevisionResolutionAmbiguous:
+            raise
         except RevisionUnavailable:
             raise
         except Exception as exc:

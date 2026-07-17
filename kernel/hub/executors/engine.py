@@ -17,8 +17,8 @@ import pyarrow as pa
 
 from hub import db, graph as g, sandbox
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
-from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode
-from hub.plugins.adapters import BoundedPreviewUnsupported, display_type
+from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode, dataset_ref_identity
+from hub.plugins.adapters import BoundedPreviewUnsupported, display_type, managed_local_file_revision_adapter
 from hub.plugins.capabilities import tag_columns
 # The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
 # detection matches execution exactly — handling quoting / string literals / a column named `input2` /
@@ -589,22 +589,25 @@ class BuildEngine:
             # resolver — passed only when set, so an adapter whose scan() predates the kwarg keeps working
             extra = {"options": cfg["options"]} if cfg.get("options") else {}
             adapter = self.resolve_adapter(uri)
+            revision_adapter = managed_local_file_revision_adapter(uri) or adapter
             dataset_ref = cfg.get("datasetRef")
             if isinstance(dataset_ref, dict):
                 # A persisted Source pin is path-independent. Re-resolve the current catalog binding
                 # before every interactive read so unregister/re-register at the same URI cannot
-                # retarget an old reference to a numerically identical Lance version.
+                # retarget an old reference to a numerically identical provider version.
                 from hub import metadb
                 binding = metadb.catalog_revision_binding_for_uri(uri)
-                if (binding is None
-                        or str(binding.get("dataset_id") or "") != str(dataset_ref.get("datasetId") or "")
-                        or getattr(adapter, "name", None) != "lance"):
-                    raise NotPreviewable(node, "selected pinned revision is unavailable; choose another revision or follow latest")
-                open_revision = getattr(adapter, "open_revision", None)
-                if not callable(open_revision):
-                    raise NotPreviewable(node, "selected pinned revision is unavailable; choose another revision or follow latest")
                 try:
-                    exact = open_revision(uri, str(dataset_ref.get("revisionId") or ""))
+                    dataset_id, revision_id = dataset_ref_identity(dataset_ref)
+                except ValueError as exc:
+                    raise NotPreviewable(node, "selected revision reference is invalid") from exc
+                open_revision = getattr(revision_adapter, "open_revision", None)
+                if (binding is None
+                        or str(binding.get("dataset_id") or "") != dataset_id
+                        or not callable(open_revision)):
+                    raise NotPreviewable(node, "selected revision is unavailable; choose another revision or follow latest")
+                try:
+                    exact = open_revision(uri, revision_id)
                     if self.schema_only:
                         return exact.limit(0)
                     # Keep the existing interactive preview work bound. Exact open fixes identity; it
@@ -614,7 +617,7 @@ class BuildEngine:
                     return exact
                 except Exception as exc:
                     raise NotPreviewable(
-                        node, "selected pinned revision is unavailable; choose another revision or follow latest") from exc
+                        node, "selected revision is unavailable; choose another revision or follow latest") from exc
             if self.schema_only:
                 return adapter.scan(uri, limit=0, **extra)  # metadata only — never materialize
             if self.pushdown and node.id != self._output_node:
@@ -630,7 +633,7 @@ class BuildEngine:
             # exact revision is deliberately preferred to scanning the mutable provider head.
             revision_id = cfg.get("_input_revision_id")
             if revision_id is not None:
-                open_revision = getattr(adapter, "open_revision", None)
+                open_revision = getattr(revision_adapter, "open_revision", None)
                 if not callable(open_revision):
                     raise NotPreviewable(node, "persisted input revision is unavailable")
                 try:

@@ -7,7 +7,7 @@ import json
 
 from hub import graph as graph_ops
 from hub.ir import resolve_config
-from hub.models import Graph, SampleProvenance
+from hub.models import Graph, SampleProvenance, dataset_ref_identity
 from hub.plan_key import plan_hash
 
 
@@ -27,8 +27,7 @@ def provenance_for_graph(
         if isinstance(uri, str) and uri:
             dataset_ref = config.get("datasetRef")
             if isinstance(dataset_ref, dict):
-                dataset_identity = str(dataset_ref.get("datasetId") or "") or None
-                dataset_revision = str(dataset_ref.get("revisionId") or "") or None
+                dataset_identity, dataset_revision = dataset_ref_identity(dataset_ref)
             else:
                 dataset_identity = uri
                 try:

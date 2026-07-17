@@ -11,7 +11,7 @@ import json
 import platform
 
 from hub import graph as g
-from hub.models import Graph
+from hub.models import Graph, dataset_ref_identity
 
 # Bump when the KEYING SCHEME changes — old cache entries then fall out of the namespace and recompute
 # instead of being served stale. v1 folded requirements + runtime env into the key (P0-CACHE-01).
@@ -68,8 +68,9 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
             if uri:
                 dataset_ref = cfg.get("datasetRef")
                 if isinstance(dataset_ref, dict):
+                    dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                     parts.append(
-                        f"{prefix}ref:{dataset_ref.get('datasetId')}:{dataset_ref.get('revisionId')}")
+                        f"{prefix}ref:{dataset_id}:{revision_id}")
                 else:
                     try:
                         parts.append(f"{prefix}fp:{resolve_adapter(uri).fingerprint(uri)}")

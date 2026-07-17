@@ -10,8 +10,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub.main import app
-from hub.models import Graph
+from hub.models import CatalogTable, Graph
 from hub.plugins.adapters import LanceAdapter
+from hub.routers import catalog as catalog_router
 
 client = TestClient(app)
 
@@ -46,7 +47,7 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     resolved = client.get(f"/api/catalog/tables/{table['id']}/revisions/resolve")
     assert resolved.status_code == 200 and resolved.json()["revisionId"] == latest
     as_of = client.get(f"/api/catalog/tables/{table['id']}/revisions/resolve",
-                       params={"asOf": datetime.datetime.now().isoformat()})
+                       params={"asOf": datetime.datetime.now(datetime.timezone.utc).isoformat()})
     assert as_of.status_code == 200, as_of.text
     assert as_of.json()["selector"] == "as_of"
     assert as_of.json()["revisionId"] == latest
@@ -62,6 +63,83 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     assert detail["preview"]["rows"] == [{"value": 1}]
     assert detail["preview"]["hasMore"] is False
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
+
+
+def test_lance_as_of_resolution_is_inclusive_bounded_and_advertised(tmp_path):
+    _uri, table = _register_lance(tmp_path)
+    history = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"]
+    latest, first = history[0], history[-1]
+    first_at = datetime.datetime.fromisoformat(first["committedAt"]).replace(
+        tzinfo=datetime.timezone.utc)
+    latest_at = datetime.datetime.fromisoformat(latest["committedAt"]).replace(
+        tzinfo=datetime.timezone.utc)
+
+    capabilities = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions/capabilities")
+    assert capabilities.status_code == 200, capabilities.text
+    assert capabilities.json() == {
+        "selectors": ["exact", "latest", "as_of"],
+        "asOfOrdering": "latest_committed_at_at_or_before", "timezone": "UTC",
+    }
+
+    boundary = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions/resolve",
+        params={"asOf": first_at.isoformat()},
+    )
+    assert boundary.status_code == 200, boundary.text
+    assert boundary.json()["revisionId"] == first["revisionId"]
+    assert boundary.json()["committedAt"].endswith("Z")
+
+    before_first = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions/resolve",
+        params={"asOf": (first_at - datetime.timedelta(microseconds=1)).isoformat()},
+    )
+    assert before_first.status_code == 410
+    assert before_first.json()["detail"] == "dataset_revision_unavailable"
+
+    after_head = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions/resolve",
+        params={"asOf": (latest_at + datetime.timedelta(seconds=1)).isoformat()},
+    )
+    assert after_head.status_code == 200, after_head.text
+    assert after_head.json()["revisionId"] == latest["revisionId"]
+
+
+def test_as_of_resolution_rejects_ambiguous_evidence_and_capability_absence(monkeypatch):
+    table = CatalogTable(id="as-of-fake", name="fake", uri="fake://dataset", columns=[])
+    binding = {"dataset_id": "dataset-fake", "uri": table.uri}
+
+    class AmbiguousAdapter:
+        revision_selectors = frozenset({"exact", "latest", "as_of"})
+        revision_as_of_ordering = "latest_committed_at_at_or_before"
+        revision_timezone = "UTC"
+        retention_owner = "provider"
+
+        def resolve_revision(self, _uri, *, as_of=None):
+            return {"revision_id": "opaque", "committed_at": None}
+
+    monkeypatch.setattr(catalog_router, "_revision_binding_for_table", lambda _table_id: (table, binding))
+    monkeypatch.setattr(catalog_router, "_revision_adapter", lambda _uri: AmbiguousAdapter())
+    ambiguous = client.get(
+        "/api/catalog/tables/as-of-fake/revisions/resolve",
+        params={"asOf": "2026-07-16T12:00:00Z"},
+    )
+    assert ambiguous.status_code == 409
+    assert ambiguous.json()["detail"] == "dataset_revision_resolution_ambiguous"
+
+    class ExactOnlyAdapter(AmbiguousAdapter):
+        revision_selectors = frozenset({"exact", "latest"})
+
+    monkeypatch.setattr(catalog_router, "_revision_adapter", lambda _uri: ExactOnlyAdapter())
+    capabilities = client.get("/api/catalog/tables/as-of-fake/revisions/capabilities")
+    assert capabilities.status_code == 200
+    assert capabilities.json()["selectors"] == ["exact", "latest"]
+    unavailable = client.get(
+        "/api/catalog/tables/as-of-fake/revisions/resolve",
+        params={"asOf": "2026-07-16T12:00:00Z"},
+    )
+    assert unavailable.status_code == 501
+    assert unavailable.json()["detail"] == "dataset_revision_as_of_unavailable"
 
 
 def test_lance_exact_revision_detail_is_bounded_and_keeps_parent_after_head_moves(tmp_path):
@@ -169,7 +247,7 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
             "id": "source", "type": "source", "position": {"x": 0, "y": 0},
             "data": {"title": "source", "status": "draft", "config": {
                 "uri": uri, "tableId": table["id"],
-                "datasetRef": {"datasetId": selected["datasetId"],
+                "datasetRef": {"kind": "exact", "datasetId": selected["datasetId"],
                                "revisionId": selected["revisionId"]},
             }},
         }],
@@ -181,7 +259,8 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
         restored = client.get(f"/api/canvas/{canvas_id}")
         assert restored.status_code == 200, restored.text
         assert restored.json()["nodes"][0]["data"]["config"]["datasetRef"] == {
-            "datasetId": selected["datasetId"], "revisionId": selected["revisionId"]}
+            "kind": "exact", "datasetId": selected["datasetId"],
+            "revisionId": selected["revisionId"]}
 
         lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
         preview = client.post("/api/run/preview", json={
@@ -191,6 +270,47 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
         assert payload["rows"] == [{"value": 1}]
         assert payload["sampleProvenance"]["datasetIdentity"] == selected["datasetId"]
         assert payload["sampleProvenance"]["datasetRevision"] == selected["revisionId"]
+    finally:
+        client.delete(f"/api/canvas/{canvas_id}")
+
+
+def test_as_of_source_persists_intent_and_exact_result_across_append_and_reload(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri, table = _register_lance(tmp_path)
+    history = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"]
+    first = history[-1]
+    requested = datetime.datetime.fromisoformat(first["committedAt"]).replace(
+        tzinfo=datetime.timezone.utc).isoformat()
+    resolution_response = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions/resolve", params={"asOf": requested})
+    assert resolution_response.status_code == 200, resolution_response.text
+    resolution = resolution_response.json()
+    assert resolution["revisionId"] == first["revisionId"]
+
+    canvas_id = f"as-of-{uuid.uuid4().hex}"
+    dataset_ref = {"kind": "as_of", "asOf": requested, "resolved": resolution}
+    graph = {
+        "id": canvas_id, "name": "as-of", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"title": "source", "status": "draft", "config": {
+                "uri": uri, "tableId": table["id"], "datasetRef": dataset_ref,
+            }},
+        }], "edges": [],
+    }
+    try:
+        saved = client.put(f"/api/canvas/{canvas_id}", json=graph)
+        assert saved.status_code == 200, saved.text
+        lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
+
+        restored = client.get(f"/api/canvas/{canvas_id}")
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["nodes"][0]["data"]["config"]["datasetRef"] == dataset_ref
+        preview = client.post("/api/run/preview", json={
+            "graph": restored.json(), "nodeId": "source", "k": 50, "offset": 0})
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["rows"] == [{"value": 1}]
+        assert preview.json()["inputManifest"][0]["revision_id"] == first["revisionId"]
     finally:
         client.delete(f"/api/canvas/{canvas_id}")
 
@@ -242,7 +362,7 @@ def test_pinned_source_missing_revision_fails_without_retargeting_latest(tmp_pat
         "nodes": [{
             "id": "source", "type": "source", "position": {"x": 0, "y": 0},
             "data": {"config": {"uri": table["uri"], "tableId": table["id"],
-                                  "datasetRef": {"datasetId": current["datasetId"],
+                                  "datasetRef": {"kind": "exact", "datasetId": current["datasetId"],
                                                  "revisionId": "999999"}}},
         }], "edges": [],
     }
@@ -250,7 +370,7 @@ def test_pinned_source_missing_revision_fails_without_retargeting_latest(tmp_pat
         "graph": graph, "nodeId": "source", "k": 50, "offset": 0})
     assert response.status_code == 200, response.text
     assert response.json()["notPreviewable"] is True
-    assert "selected pinned revision is unavailable" in response.json()["reason"]
+    assert "selected revision is unavailable" in response.json()["reason"]
 
 
 def test_pinned_dataset_ref_is_a_strict_typed_graph_value():
@@ -259,6 +379,6 @@ def test_pinned_dataset_ref_is_a_strict_typed_graph_value():
             "id": "bad-pin", "nodes": [{
                 "id": "source", "type": "source", "position": {"x": 0, "y": 0},
                 "data": {"config": {"uri": "dataset.lance",
-                                      "datasetRef": {"revisionId": "1"}}},
+                                      "datasetRef": {"kind": "exact", "revisionId": "1"}}},
             }], "edges": [],
         })

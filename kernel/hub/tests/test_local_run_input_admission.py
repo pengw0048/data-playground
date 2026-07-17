@@ -106,7 +106,8 @@ def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(
     graph = _graph(uri)
     graph.nodes[0].data["config"] |= {
         "tableId": table.id,
-        "datasetRef": {"datasetId": binding["dataset_id"], "revisionId": selected},
+        "datasetRef": {"kind": "exact", "datasetId": binding["dataset_id"],
+                       "revisionId": selected},
     }
     deps = SimpleNamespace(resolve_adapter=lambda _uri: LanceAdapter())
 

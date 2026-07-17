@@ -809,6 +809,52 @@
         "title": "DatasetRevision",
         "type": "object"
       },
+      "DatasetRevisionCapabilities": {
+        "description": "Provider-advertised revision selectors and their portable ordering contract.",
+        "properties": {
+          "asOfOrdering": {
+            "anyOf": [
+              {
+                "const": "latest_committed_at_at_or_before",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Asofordering"
+          },
+          "selectors": {
+            "items": {
+              "enum": [
+                "exact",
+                "latest",
+                "as_of"
+              ],
+              "type": "string"
+            },
+            "title": "Selectors",
+            "type": "array"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "const": "UTC",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "selectors"
+        ],
+        "title": "DatasetRevisionCapabilities",
+        "type": "object"
+      },
       "DatasetRevisionDetail": {
         "description": "Inspectable facts and a bounded preview for one retained exact revision.",
         "properties": {
@@ -8671,6 +8717,88 @@
           }
         },
         "summary": "List Dataset Revisions"
+      }
+    },
+    "/api/catalog/tables/{table_id}/revisions/capabilities": {
+      "get": {
+        "description": "Expose only provider-declared revision selectors and portable ordering semantics.",
+        "operationId": "dataset_revision_capabilities_api_catalog_tables__table_id__revisions_capabilities_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetRevisionCapabilities"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Dataset Revision Capabilities"
       }
     },
     "/api/catalog/tables/{table_id}/revisions/resolve": {

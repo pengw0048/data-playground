@@ -5,7 +5,7 @@ import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
-import type { CanvasDoc, DatasetRef } from '../types/graph'
+import { datasetRefIdentity, type CanvasDoc, type DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -45,11 +45,13 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           {pinnedInputs.length > 0 && (
             <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
               <div className="font-semibold text-foreground">Pinned exact inputs for this run</div>
-              {pinnedInputs.map((input) => (
-                <div key={input.nodeId} className="mt-0.5 break-all">
-                  {input.title} · dataset {input.ref.datasetId} · revision {input.ref.revisionId}
+              {pinnedInputs.map((input) => {
+                const exact = datasetRefIdentity(input.ref)
+                return <div key={input.nodeId} className="mt-0.5 break-all">
+                  {input.title} · dataset {exact.datasetId} · revision {exact.revisionId}
+                  {input.ref.kind === 'as_of' ? ` · as of ${new Date(input.ref.asOf).toLocaleString()}` : ''}
                 </div>
-              ))}
+              })}
             </div>
           )}
           {phase === 'confirm' ? (

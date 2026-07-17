@@ -1,5 +1,6 @@
 // The canvas document model. Node ids are stable + globally unique (CRDT-friendly).
 import type { WireType } from '../theme/tokens'
+import type { DatasetRevisionResolution } from './api'
 
 export type NodeStatus = 'draft' | 'latest' | 'stale' | 'queued' | 'running' | 'failed'
 export type TransformSource = 'library' | 'adhoc'
@@ -16,9 +17,22 @@ export interface PortSpec {
   multi?: boolean // an input port that accepts MANY incoming edges (e.g. union stacks N inputs)
 }
 
-export interface DatasetRef {
+export interface ExactDatasetRef {
+  kind: 'exact'
   datasetId: string
   revisionId: string
+}
+
+export interface AsOfDatasetRef {
+  kind: 'as_of'
+  asOf: string
+  resolved: DatasetRevisionResolution & { selector: 'as_of' }
+}
+
+export type DatasetRef = ExactDatasetRef | AsOfDatasetRef
+
+export function datasetRefIdentity(ref: DatasetRef): { datasetId: string; revisionId: string } {
+  return ref.kind === 'as_of' ? ref.resolved : ref
 }
 
 export interface NodeConfig {
