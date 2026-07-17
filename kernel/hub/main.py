@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import logging
+import math
 import os
 import secrets
 import threading
@@ -437,6 +438,25 @@ def _local_result_reaper_loop(stop: threading.Event) -> None:
     from hub.deps import get_deps
 
     while not stop.wait(metadb.KERNEL_STALE_S):
+        try:
+            raw_retention = os.environ.get(
+                "DP_MANAGED_REVISION_RETENTION_SECONDS", str(7 * 24 * 60 * 60))
+            retention = float(raw_retention)
+            if not math.isfinite(retention) or retention < 0:
+                raise ValueError(
+                    "DP_MANAGED_REVISION_RETENTION_SECONDS must be a finite non-negative number")
+            revision_gc = metadb.managed_local_file_revision_gc_batch(
+                retention, limit=50)
+            if revision_gc["retired"]:
+                logging.getLogger("hub").info(
+                    "managed local revision GC retired %s ledger entries",
+                    revision_gc["retired"])
+            if revision_gc["has_more"]:
+                logging.getLogger("hub").warning(
+                    "managed local revision retention pressure remains after bounded GC batch")
+        except Exception:  # one transient DB/config failure must not stop result-artifact cleanup
+            logging.getLogger("hub").warning(
+                "managed local revision GC cycle failed (continuing)", exc_info=True)
         try:
             prune = getattr(get_deps().storage, "prune_results", None)
             if callable(prune):

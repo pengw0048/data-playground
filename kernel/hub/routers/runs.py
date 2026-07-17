@@ -761,7 +761,8 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                     try:
                         reservation = metadb.preallocate_or_adopt_profile_run_owner(
                             submission_id, uid, auth_canvas, operational_canvas,
-                            req.node_id, port_id, authoritative_digest, request_id=request_id,
+                            req.node_id, port_id, authoritative_digest,
+                            input_manifest=manifest, request_id=request_id,
                         )
                     except metadb.ProfileSubmissionConflict as exc:
                         raise HTTPException(409, str(exc)) from exc

@@ -2,11 +2,12 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), tableByRegistration: vi.fn(),
+  workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceAddDataset: vi.fn(), workspaceMoveCanvas: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
+  workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
   setWorkspaceResource: vi.fn(), openFile: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
   files: [] as { id: string; name: string; version: number; role: 'owner' | 'editor' | 'viewer' }[],
   refreshFiles: vi.fn(),
@@ -33,11 +34,13 @@ describe('WorkspaceExplorer', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     store.workspaceResourceId = null
+    store.workspaceSearchQuery = ''
     store.files = []
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
+    mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
   })
   afterEach(() => cleanup())
@@ -61,6 +64,45 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByTestId('workspace-load-more'))
     await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', { limit: 50, cursor: 'cursor-2' }))
     expect(await screen.findByText('observations')).toBeInTheDocument()
+  })
+
+  it('shows source-grouped partial search results and opens stable identities', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'observations', completeness: 'partial', hasMore: false, nextCursor: null,
+      groups: [
+        { source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' }, items: [DATASET] },
+        { source: { id: 'mount:warehouse', kind: 'provider', mountId: 'warehouse', provider: 'fixture', completeness: 'unavailable', error: 'deadline exceeded', freshness: 'unknown', searchMode: 'native' }, items: [] },
+      ],
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('Partial search results')).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Search source Mount warehouse' })).toHaveTextContent('deadline exceeded')
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset observations' }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(DATASET.id)
+    expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 25, cursor: undefined })
+  })
+
+  it('keeps completed search pages visible when loading the continuation fails', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValueOnce({
+      query: 'observations', completeness: 'page', hasMore: true, nextCursor: 'next',
+      groups: [{
+        source: { id: 'local', kind: 'local', completeness: 'page', freshness: 'current', searchMode: 'native' },
+        items: [DATASET],
+      }],
+    }).mockRejectedValueOnce(new Error('network unavailable'))
+    render(<WorkspaceExplorer />)
+
+    const result = await screen.findByRole('button', { name: 'Open dataset observations' })
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Couldn't load more search results: network unavailable",
+    )
+    expect(result).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Retry load more' })).toBeVisible()
   })
 
   it('creates a canvas in the exact visible destination', async () => {

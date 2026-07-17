@@ -12,7 +12,7 @@ from pathlib import Path
 
 from hub.catalog_provider import (
     CatalogMount, CatalogResource, ProviderAncestors, ProviderCapabilities, ProviderPage,
-    ProviderResourceResult,
+    ProviderResourceResult, ProviderSearchPage,
 )
 
 
@@ -26,7 +26,7 @@ class FileCatalogProvider:
         return resources
 
     def capabilities(self, mount: CatalogMount) -> ProviderCapabilities:
-        return ProviderCapabilities()
+        return ProviderCapabilities(search=True)
 
     def list_children(self, mount: CatalogMount, parent_id: str | None, *, limit: int,
                       cursor: str | None = None) -> ProviderPage:
@@ -68,6 +68,21 @@ class FileCatalogProvider:
         if result.item is not None and result.item.kind != "dataset":
             return ProviderResourceResult(state="unsupported", reason="resource is not a dataset")
         return result
+
+    def search(self, mount: CatalogMount, query: str, *, limit: int,
+               cursor: str | None = None) -> ProviderSearchPage:
+        tokens = [token.casefold() for token in query.split() if token]
+        resources = sorted(
+            (item for item in self._resources(mount)
+             if all(token in item.name.casefold() for token in tokens)),
+            key=lambda item: (item.name.casefold(), item.kind, item.id),
+        )
+        start = int(cursor) if cursor is not None else 0
+        if start < 0 or start > len(resources):
+            raise ValueError("cursor is outside this search")
+        items = resources[start:start + limit]
+        next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
+        return ProviderSearchPage(items=items, next_cursor=next_cursor)
 
 
 def provider() -> FileCatalogProvider:
