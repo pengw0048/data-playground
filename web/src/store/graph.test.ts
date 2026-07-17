@@ -4,7 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
-  estimate: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
+  estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -21,6 +21,8 @@ vi.mock('../api/client', () => ({
             ? apiMocks.preview
             : property === 'estimate'
               ? apiMocks.estimate
+              : property === 'inputDrift'
+                ? apiMocks.inputDrift
               : property === 'run'
                 ? apiMocks.run
               : property === 'profileEstimate'
@@ -79,6 +81,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
+    apiMocks.inputDrift.mockReset().mockResolvedValue({ drifted: false, sources: [] })
     apiMocks.run.mockReset().mockResolvedValue({
       runId: 'run-store-test', status: 'running', jobType: 'run', targetNodeId: 'target',
       rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
@@ -344,6 +347,63 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: doc.id }), 'section',
     ))
     expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('keeps preview inputs for full runs and refreshes moved heads only after acceptance', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    source.data.status = 'latest'
+    const target = NODE('target', 'filter')
+    target.data.config = { predicate: 'value > 0' }
+    target.data.status = 'latest'
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    const oldManifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'lance', resolved_at: 'before',
+    }]
+    const latestManifest = [{ ...oldManifest[0], revision_id: '2', resolved_at: 'after' }]
+    useStore.setState({ doc, previews: {}, previewBindings: {}, runs: {} })
+    apiMocks.preview.mockResolvedValueOnce({ ...previewResult('old'), inputManifest: oldManifest })
+
+    await useStore.getState().runPreview('target')
+    apiMocks.inputDrift.mockResolvedValueOnce({
+      drifted: true,
+      sources: [{
+        nodeId: 'source', datasetId: 'dataset', previewRevisionId: '1', latestRevisionId: '2',
+        oldRevisionReadable: true,
+        compatibility: { status: 'unknown', fields: [{ kind: 'added', status: 'unknown', newName: 'extra', reason: 'nullability unknown' }] },
+      }],
+    })
+
+    await useStore.getState().requestRun('target')
+    expect(apiMocks.estimate).toHaveBeenCalledWith(doc, 'target', oldManifest)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.target).toMatchObject({ phase: 'drift' })
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['latest', 'latest'])
+
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [],
+      outputs: [{ nodeId: 'target', portId: 'out', wire: 'dataset', publicationKind: 'result', outcome: 'committed', uri: '/result.parquet', rows: 1 }],
+    })
+    await useStore.getState().run('target', false, true)
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      doc, 'target', false, expect.any(String), oldManifest,
+    )
+    await vi.waitFor(() => expect(useStore.getState().runs.target.phase).toBe('done'))
+
+    apiMocks.preview.mockResolvedValueOnce({ ...previewResult('latest'), inputManifest: latestManifest })
+    await useStore.getState().refreshPreviewInputs('target')
+    expect(apiMocks.preview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: doc.id }), 'target', 50, 0, undefined,
+    )
+    expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+
+    useStore.getState().loadDoc(doc, 'owner')
+    expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
   })
 
   it('records named output count instead of rowsProcessed as result cardinality', async () => {

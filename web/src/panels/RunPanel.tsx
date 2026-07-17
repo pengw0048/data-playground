@@ -4,7 +4,7 @@ import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import type { RunOutput } from '../types/api'
+import type { InputDrift, RunOutput } from '../types/api'
 import type { CanvasDoc, DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
@@ -12,6 +12,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const estimate = useStore((s) => s.estimate)
   const doRun = useStore((s) => s.run)
   const cancel = useStore((s) => s.cancelRun)
+  const refreshPreviewInputs = useStore((s) => s.refreshPreviewInputs)
+  const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
 
@@ -58,6 +60,26 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           ) : (
             <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="mt-3.5 w-full">Run</Button>
           )}
+        </>
+      )}
+
+      {phase === 'drift' && run?.inputDrift && (
+        <>
+          <Label>PREVIEW INPUTS MOVED</Label>
+          <div className="mt-1 text-[11px] text-muted-foreground">
+            Latest changed after this preview. The full run will keep the preview's exact inputs unless you explicitly refresh.
+          </div>
+          <InputDriftNotice drift={run.inputDrift} doc={doc} />
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" onClick={() => doRun(nodeId, !!est?.needsConfirm, true)} disabled={!canEdit}
+              title={canEdit ? 'Run the exact preview inputs' : 'View-only canvas'} className="flex-1">
+              Run preview inputs
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)} disabled={!canEdit}
+              title={canEdit ? 'Accept latest inputs and refresh the preview' : 'View-only canvas'} className="flex-1">
+              Refresh to latest
+            </Button>
+          </div>
         </>
       )}
 
@@ -114,11 +136,39 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             {run?.error ?? st?.error ?? 'unknown error'}
           </div>
           {st && <RunOutputs outputs={st.outputs} />}
-          <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="mt-3 w-full">Retry</Button>
+          <div className="mt-3 flex gap-2">
+            <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="flex-1">Retry</Button>
+            {(run?.inputDrift || hasRetainedPreviewBinding) && <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)}
+              disabled={!canEdit} className="flex-1">Refresh to latest</Button>}
+          </div>
         </div>
       )}
     </div>
   )
+}
+
+function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc }) {
+  const titles = new Map(doc.nodes.map((node) => [node.id, node.data.title]))
+  return <div aria-label="Preview input drift" className="mt-2 flex flex-col gap-1.5">
+    {drift.sources.map((source) => {
+      const compatibility = source.compatibility
+      const notable = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
+      return <div key={`${source.nodeId}:${source.previewRevisionId}`} className="rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px]">
+        <div className="font-semibold text-foreground">{titles.get(source.nodeId) ?? source.nodeId}</div>
+        <div className="dp-mono mt-0.5 break-all text-muted-foreground">
+          revision {source.previewRevisionId} → {source.latestRevisionId ?? 'latest unavailable'}
+        </div>
+        <div className="mt-0.5 text-muted-foreground">
+          {!source.oldRevisionReadable ? 'Preview input is no longer readable; refresh is required before another run.'
+            : compatibility ? `Schema compatibility: ${compatibility.status}` : 'Schema compatibility: unknown' }
+        </div>
+        {notable.slice(0, 3).map((field, index) => <div key={`${field.fieldId ?? field.oldName ?? field.newName}:${index}`}
+          className="mt-0.5 text-[9.5px] text-muted-foreground">
+          <span className="font-semibold text-foreground">{field.newName ?? field.oldName ?? field.fieldId ?? 'field'}: </span>{field.reason}
+        </div>)}
+      </div>
+    })}
+  </div>
 }
 
 function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: string; title: string; ref: DatasetRef }[] {

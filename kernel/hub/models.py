@@ -615,6 +615,9 @@ class SampleResult(Wire):
     )
     sample_provenance: SampleProvenance | None = None
     preview_ref: str | None = None
+    # The exact, secret-free Source revisions used for this preview. Inner keys intentionally remain
+    # snake_case because the same minimal dict is persisted verbatim in run admission/history.
+    input_manifest: list[dict[str, str]] | None = None
     not_previewable: bool = False
     error: bool = False        # a real failure (bad code / bad query), distinct from P8 not_previewable
     reason: str | None = None
@@ -1232,6 +1235,31 @@ class PreviewRequest(Wire):
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
     k: int | None = None  # None → fall back to settings.preview_k (DP_PREVIEW_K); an explicit int wins
     offset: int = 0
+    # Reusing this binding makes pagination/refresh read the same preview population. Omitting it is
+    # the explicit request to resolve a new latest binding.
+    input_manifest: list[dict[str, str]] | None = None
+
+
+class InputDriftRequest(Wire):
+    """Compare a retained preview binding with current provider heads without changing either."""
+
+    graph: Graph
+    target_node_id: str
+    input_manifest: list[dict[str, str]]
+
+
+class InputDriftSource(Wire):
+    node_id: str
+    dataset_id: str
+    preview_revision_id: str
+    latest_revision_id: str | None = None
+    old_revision_readable: bool
+    compatibility: SchemaCompatibility | None = None
+
+
+class InputDrift(Wire):
+    drifted: bool
+    sources: list[InputDriftSource] = []
 
 
 class ProfileEstimateRequest(Wire):
@@ -1266,6 +1294,7 @@ class ProfileJobRequest(Wire):
 class EstimateRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class RunRequest(Wire):
@@ -1275,3 +1304,6 @@ class RunRequest(Wire):
     # A browser retains this UUID across a response-loss retry.  The hub derives the durable run
     # identity from it rather than treating a repeated POST as another dispatch.
     submission_id: UUID4 | None = None
+    # A full run launched from a preview admits the preview's exact Source set instead of resolving
+    # mutable heads again. The server validates graph coverage and reopens every revision.
+    input_manifest: list[dict[str, str]] | None = None

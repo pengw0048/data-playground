@@ -195,6 +195,45 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
         client.delete(f"/api/canvas/{canvas_id}")
 
 
+def test_preview_manifest_reports_drift_and_reuses_exact_membership_until_refresh(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri, table = _register_lance(tmp_path)
+    graph = {
+        "id": f"preview-binding-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {"uri": uri, "tableId": table["id"]}},
+        }], "edges": [],
+    }
+    preview = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "source", "k": 50, "offset": 0})
+    assert preview.status_code == 200, preview.text
+    retained = preview.json()["inputManifest"]
+    assert preview.json()["rows"] == [{"value": 1}, {"value": 2}]
+
+    lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
+    drift = client.post("/api/run/input-drift", json={
+        "graph": graph, "targetNodeId": "source", "inputManifest": retained})
+    assert drift.status_code == 200, drift.text
+    assert drift.json()["drifted"] is True
+    assert drift.json()["sources"][0]["previewRevisionId"] == retained[0]["revision_id"]
+    assert drift.json()["sources"][0]["oldRevisionReadable"] is True
+
+    reused = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "source", "k": 50, "offset": 0,
+        "inputManifest": retained,
+    })
+    assert reused.status_code == 200, reused.text
+    assert reused.json()["rows"] == [{"value": 1}, {"value": 2}]
+    assert reused.json()["inputManifest"] == retained
+
+    refreshed = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "source", "k": 50, "offset": 0})
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["rows"] == [{"value": 1}, {"value": 2}, {"value": 3}]
+    assert refreshed.json()["inputManifest"][0]["revision_id"] != retained[0]["revision_id"]
+
+
 def test_pinned_source_missing_revision_fails_without_retargeting_latest(tmp_path):
     _uri, table = _register_lance(tmp_path)
     current = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
