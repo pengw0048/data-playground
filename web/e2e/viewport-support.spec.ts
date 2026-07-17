@@ -188,6 +188,20 @@ test.describe('minimum viewport support', () => {
     const fittedNode = await boxOf(page.locator('.react-flow__node').first())
     expect(fittedNode.x).toBeGreaterThanOrEqual(fittedFlow.x)
     expect(fittedNode.x + fittedNode.width).toBeLessThanOrEqual(fittedFlow.x + fittedFlow.width)
+
+    // An already-open floating panel must be re-anchored after the Inspector changes width.
+    const node = page.locator('.react-flow__node').first()
+    await node.getByText('DATASET', { exact: true }).click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const dataPanel = page.getByTestId('panel-data')
+    await expect(dataPanel).toBeVisible()
+    await page.getByTestId('inspector-collapse').click()
+    await page.getByTestId('inspector-collapse').click()
+    await expect.poll(async () => {
+      const expandedInspector = await boxOf(inspector)
+      const repositionedPanel = await boxOf(dataPanel)
+      return repositionedPanel.x + repositionedPanel.width - expandedInspector.x
+    }).toBeLessThanOrEqual(0)
   })
 
   test('1024px browse and inspect stays navigable with compact chrome', async ({ page }) => {
