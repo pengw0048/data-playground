@@ -372,6 +372,13 @@ seams — DuckDB/Lance adapters, InMemoryCatalog, and local runners are the firs
 registered. Managed immutable-attempt publication is the exception: lifecycle ownership, catalog
 pointer/ref swaps, and deletion fences remain core authority.
 
+An execution backend that preserves inputs bound by a hub-admitted exact-revision manifest implements
+the optional `AdmittedInputManifestBackend.supports_admitted_input_manifests()` capability. Missing,
+false, or broken probes fail closed before run identity or resource allocation, including when the
+backend owns one region in a `RunController` plan. Claiming support means every allocation and worker
+boundary reopens the admitted revisions; independently resolving mutable source head is not conformant.
+The built-in Local, Kernel, and same-host Subprocess transports advertise this capability.
+
 A distributed runner that places work on typed workers can also implement optional `PlaceableBackend`
 (`backends.py`): `workers()`, `place(requires)`, `run_unit(graph, output_node, output_uri)`, and
 `reachable_tiers()`. Core feature-detects these. A run splits into regions (maximal same-backend

@@ -106,6 +106,17 @@ class RunController:
             return []
         return regions
 
+    def supports_admitted_input_manifests(self, regions: list, uid: str | None = None) -> bool:
+        """Whether every backend selected by this concrete region plan preserves admitted inputs."""
+        from hub.backends import backend_supports_admitted_input_manifests
+        try:
+            return bool(regions) and all(
+                backend_supports_admitted_input_manifests(self._backend_runner(region, uid))
+                for region in regions
+            )
+        except Exception:  # noqa: BLE001 - backend selection/probing must fail closed
+            return False
+
     def plan_summary(self, graph: Graph, target: str) -> list[dict]:
         """A human-facing execution plan: the regions this run splits into, each with its backend, the
         storage tier its boundary materializes to, and its estimated output size. Powers the UI 'run
