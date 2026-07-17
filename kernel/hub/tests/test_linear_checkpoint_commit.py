@@ -343,7 +343,7 @@ def test_evidence_read_detects_truncation_during_streaming(tmp_path, monkeypatch
 def test_reopen_detects_committed_evidence_mismatch(tmp_path):
     store = _storage(tmp_path)
     ctx = _reserve(_identity(), store)
-    evidence = _commit(store, ctx, _parquet_bytes(5))
+    _commit(store, ctx, _parquet_bytes(5))
     uri = ctx["candidate"]["uri"]
 
     # Corrupt the committed content record so reopen's full evidence revalidation fails closed.
