@@ -293,13 +293,21 @@ class _ExportResources:
 
     def __init__(self, stack: contextlib.ExitStack):
         self._stack = stack
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._closed = False
+        self._closing_thread_id: int | None = None
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            current_thread_id = threading.get_ident()
+            if self._closing_thread_id == current_thread_id:
+                # Closing the ExitStack can finalize the response body iterator, whose ``finally``
+                # calls back into this owner. The same-thread recursion must not wait on itself or
+                # start a second traversal of callbacks that are already being closed.
+                return
+            self._closing_thread_id = current_thread_id
             try:
                 # Keep the lock until every callback has completed. A concurrent response-finally caller
                 # must not observe "closed" and return while the iterator thread still owns the FD/lease.
@@ -308,6 +316,7 @@ class _ExportResources:
                 logging.getLogger("hub").exception("full-result export resource cleanup is pending")
             finally:
                 self._closed = True
+                self._closing_thread_id = None
 
 
 class _OwnedStreamingResponse(StreamingResponse):
