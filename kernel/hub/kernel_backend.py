@@ -131,6 +131,10 @@ class KernelBackend:
     def estimate(self, plan: CompilePlan, rows, byts=None) -> RunEstimate:
         return self.base.estimate(plan, rows, byts)
 
+    @staticmethod
+    def supports_admitted_input_manifests() -> bool:
+        return True  # the persisted admission is matched before the kernel is ensured or dispatched
+
     def supports_selected_destination_credentials(self) -> bool:
         # The default kernel offloads full runs to a metadata-isolated subprocess. Opting out keeps the
         # run in this long-lived process, where the authoritative Cred resolver is available.

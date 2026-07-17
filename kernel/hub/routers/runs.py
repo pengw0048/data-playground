@@ -26,7 +26,8 @@ from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
 from hub.backends import (
-    BackendStatusUnavailable, DatasetRevisionAdapter, backend_supports_named_multi_output_runs,
+    BackendStatusUnavailable, DatasetRevisionAdapter,
+    backend_supports_admitted_input_manifests, backend_supports_named_multi_output_runs,
 )
 from hub.deps import get_deps
 from hub.executors.preview import preview_node
@@ -431,6 +432,33 @@ def _controller_regions_for_run(
         # owner only when it will really split; collapsed plans continue through the selected runner.
         _require_backend_run_output_support(deps.controller, graph, output_target, deps)
     return regions
+
+
+def _require_admitted_input_manifest_transport(
+        runner, controller, controller_regions: list, uid: str) -> None:
+    """Reject an exact-revision run before any selected execution owner can allocate resources."""
+    if controller_regions:
+        try:
+            probe = getattr(controller, "supports_admitted_input_manifests", None)
+            supported = bool(probe(controller_regions, uid)) if callable(probe) else False
+        except Exception:  # noqa: BLE001 - a broken controller/backend probe fails closed
+            supported = False
+        owner = controller
+    else:
+        supported = backend_supports_admitted_input_manifests(runner)
+        owner = runner
+    if supported:
+        return
+    try:
+        owner_name = str(getattr(owner, "name", "unknown"))
+    except Exception:  # noqa: BLE001 - diagnostic metadata must not escape the admission error
+        owner_name = "unknown"
+    owner_name = owner_name.replace("\n", " ").replace("\r", " ")[:120]
+    raise HTTPException(
+        400,
+        f"Execution transport '{owner_name}' does not support admitted exact-revision input "
+        "manifests; no run identity, worker, artifact, or remote job was allocated",
+    )
 
 
 @router.post("/graph/compile", response_model=CompilePlan)
@@ -1301,6 +1329,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     if controller_regions is None:
         controller_regions = deps.controller.plan_for_run(
             graph, target_node_id, sizes=sizes)
+    if input_manifest is not None:
+        _require_admitted_input_manifest_transport(
+            runner, deps.controller, controller_regions, uid)
     from hub.observability import (
         AuditAction, AuditOutcome, emit_audit, get_request_id, invoke_backend_run,
     )

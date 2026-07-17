@@ -26,6 +26,12 @@ Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_r
 resolved requirements contain `labels.engine=ray`. Set `DP_RAY_REMOTE=1` when Ray workers do not share
 the kernel's filesystem; remote placement then requires a configured object-storage tier.
 
+Ray does not yet transport the hub's admitted exact-revision input manifest. Until
+[#302](https://github.com/pengw0048/data-playground/issues/302) is implemented, a run carrying that
+manifest cannot use Ray as either the selected whole-graph backend or a placed region. Core rejects the
+run before controller/run identity, worker, artifact, driver, or remote-job allocation. The built-in
+in-process, Kernel, and same-host Subprocess transports continue to support exact-revision runs.
+
 With no Ray Jobs address, the local `Popen` driver uses the same workload process-scope contract as
 ordinary isolated runs. On POSIX, the direct child owns a new process group; cancellation and
 `DP_RUN_DEADLINE_S` send TERM followed by a bounded KILL, and terminal status waits for the group fence

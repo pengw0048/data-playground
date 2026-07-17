@@ -281,6 +281,10 @@ class LocalRunner:
     name = "local-out-of-core"
     cancel_acknowledges_stop = True  # cancelled is set only after the adapter can no longer publish
 
+    @staticmethod
+    def supports_admitted_input_manifests() -> bool:
+        return True  # exact revisions are already bound and reopened inside this process
+
     def supports_named_multi_output_runs(self) -> bool:
         return True
 

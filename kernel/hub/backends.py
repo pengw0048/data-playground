@@ -129,6 +129,29 @@ def backend_supports_named_multi_output_runs(backend) -> bool:
 
 
 @runtime_checkable
+class AdmittedInputManifestBackend(Protocol):
+    """Optional capability for executing inputs bound to one admitted exact revision manifest.
+
+    Backends must opt in explicitly because an execution transport that independently re-resolves a
+    mutable source head can violate the hub's admitted input identity.  The capability covers every
+    allocation and worker boundary owned by the backend, not merely accepting the bound graph shape.
+    """
+
+    def supports_admitted_input_manifests(self) -> bool: ...
+
+
+def backend_supports_admitted_input_manifests(backend) -> bool:
+    """Feature-detect exact-revision transport support; missing or broken probes fail closed."""
+    try:
+        probe = getattr(backend, "supports_admitted_input_manifests", None)
+        if not callable(probe):
+            return False
+        return bool(probe())
+    except Exception:  # noqa: BLE001 - an uncertain input identity must never reach allocation
+        return False
+
+
+@runtime_checkable
 class SelectedDestinationCredentialsBackend(Protocol):
     """Optional execution capability for a backend that can honor a selected destination Cred.
 
