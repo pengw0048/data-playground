@@ -1,0 +1,207 @@
+{
+  "schemaVersion": 1,
+  "issue": 282,
+  "executedAt": "2026-07-17T05:14:50Z",
+  "product": {
+    "repository": "pengw0048/data-playground",
+    "commit": "dbc872f4b8a9a99666ad857fb9f3c4a1c109ab79",
+    "subject": "Stabilize object result cache wait (#388)"
+  },
+  "environment": {
+    "os": "macOS 26.5.1 (25F80)",
+    "python": "3.12.13",
+    "uv": "0.10.10",
+    "node": "26.5.0",
+    "npm": "11.17.0",
+    "playwright": "1.61.1",
+    "browser": "Playwright Chromium",
+    "postgresql": "18, disposable container",
+    "metadataProfiles": [
+      "SQLite",
+      "PostgreSQL"
+    ]
+  },
+  "capabilities": [
+    {
+      "id": "lance-revisions",
+      "status": "supported",
+      "selectors": [
+        "latest",
+        "exact",
+        "as_of"
+      ],
+      "retentionOwner": "provider"
+    },
+    {
+      "id": "managed-local-file-revisions",
+      "status": "supported",
+      "selectors": [
+        "latest",
+        "exact"
+      ],
+      "retentionOwner": "core"
+    },
+    {
+      "id": "default-local-admitted-input-manifests",
+      "status": "supported",
+      "transports": [
+        "in-process",
+        "Kernel",
+        "same-host Subprocess"
+      ]
+    },
+    {
+      "id": "ray-admitted-input-manifests",
+      "status": "unsupported-fail-closed-before-allocation",
+      "trackingIssue": 302
+    },
+    {
+      "id": "ray-jobs-admitted-input-manifests",
+      "status": "unsupported-fail-closed-before-allocation",
+      "trackingIssue": 303
+    }
+  ],
+  "journeys": [
+    {
+      "id": "history-pin-inspect-run-reopen",
+      "status": "passed",
+      "evidence": [
+        "web/e2e/workspace.spec.ts",
+        "web/e2e/ux-golden-workflows.spec.ts",
+        "web/src/panels/RunHistoryModal.test.tsx",
+        "kernel/hub/tests/test_dataset_revisions.py"
+      ]
+    },
+    {
+      "id": "concurrent-head-movement-and-explicit-refresh",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_dataset_revisions.py",
+        "kernel/hub/tests/test_local_run_input_admission.py"
+      ]
+    },
+    {
+      "id": "ordered-multi-source-manifest",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_dataset_revisions.py",
+        "kernel/hub/tests/test_local_run_input_admission.py"
+      ]
+    },
+    {
+      "id": "provider-and-core-retention-loss-aba",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_dataset_revisions.py",
+        "kernel/hub/tests/test_managed_local_file_revisions.py"
+      ]
+    },
+    {
+      "id": "restart-across-admission-dispatch-publication",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_local_run_input_admission.py",
+        "kernel/hub/tests/test_local_run_input_transport.py",
+        "kernel/hub/tests/test_managed_local_file_revisions.py"
+      ]
+    },
+    {
+      "id": "backup-restore-revision-identity",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_backup_restore_drill.py"
+      ]
+    },
+    {
+      "id": "unsupported-optional-transport-preallocation",
+      "status": "passed",
+      "evidence": [
+        "kernel/hub/tests/test_admitted_input_manifest_transport.py"
+      ]
+    },
+    {
+      "id": "supported-viewport-provider-recovery",
+      "status": "passed",
+      "evidence": [
+        "web/e2e/workspace.spec.ts",
+        "docs/acceptance/issue-282/screenshots/1280x720-provider-offline.png",
+        "docs/acceptance/issue-282/screenshots/1280x720-provider-recovered.png"
+      ]
+    }
+  ],
+  "validation": [
+    {
+      "gate": "exact-revision backend contracts",
+      "result": "82 passed, 1 PostgreSQL environment skip superseded by the dedicated PostgreSQL run"
+    },
+    {
+      "gate": "PostgreSQL pg_dump/pg_restore drill",
+      "result": "1 passed"
+    },
+    {
+      "gate": "web unit tests",
+      "result": "38 files, 396 tests passed"
+    },
+    {
+      "gate": "web typecheck",
+      "result": "passed"
+    },
+    {
+      "gate": "production web build",
+      "result": "passed"
+    },
+    {
+      "gate": "full disposable-workspace Playwright matrix",
+      "result": "86 passed, 1 worker"
+    },
+    {
+      "gate": "#388 affected object lifecycle test module",
+      "result": "116 passed, 17 skipped"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "docs/acceptance/issue-282/screenshots/1280x720-provider-offline.png",
+      "sha256": "b7f012bd1abae5a6ac9a17fa9b1e2da6809fe2528ece7c6b1f7bce583a6b03ec"
+    },
+    {
+      "path": "docs/acceptance/issue-282/screenshots/1280x720-provider-recovered.png",
+      "sha256": "4cf656f88b4e814cad9b809ce5c26c75c546f3b76f0dcc1efb21f5d3b233e0aa"
+    },
+    {
+      "path": "web/.e2e-workspace/data/ux-fixtures/manifest.json",
+      "sha256": "3bbaab41ae122661ff71a2eb0f7d0de5ac1abbc2768665953d7d405c74748b0d",
+      "retainedBy": "UX acceptance workflow artifact"
+    }
+  ],
+  "remoteMainEvidence": [
+    {
+      "workflow": "CI",
+      "conclusion": "success",
+      "url": "https://github.com/pengw0048/data-playground/actions/runs/29556678473"
+    },
+    {
+      "workflow": "CodeQL",
+      "conclusion": "success",
+      "url": "https://github.com/pengw0048/data-playground/actions/runs/29556678454"
+    },
+    {
+      "workflow": "Secret scan",
+      "conclusion": "success",
+      "url": "https://github.com/pengw0048/data-playground/actions/runs/29556678429"
+    }
+  ],
+  "findings": [
+    {
+      "issue": 383,
+      "status": "closed",
+      "resolutionCommit": "4d89f36fcf2fe2c550ed7698414106be322c0459",
+      "summary": "Unsupported optional transports now reject admitted exact-revision manifests before allocation."
+    },
+    {
+      "status": "fixed-in-evidence-change",
+      "summary": "Exact-history browser coverage now paginates the shared full-profile Workspace instead of assuming the selected dataset is on the first page."
+    }
+  ],
+  "conclusion": "passed"
+}
