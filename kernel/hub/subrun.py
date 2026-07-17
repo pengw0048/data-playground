@@ -358,6 +358,16 @@ def main() -> int:
         deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
         graph = Graph(**job["graph"])
         _validate_admitted_input_manifest(job, graph)
+        # The parent serialized this private binding into the one-shot job graph. Restore it only after
+        # validating the admitted manifest; the attestation check below then requires the same exact
+        # URI in ``managedLocalSources`` before any adapter scan.
+        for node in graph.nodes:
+            data = node.data if isinstance(node.data, dict) else {}
+            config = data.get("config") if isinstance(data.get("config"), dict) else {}
+            artifact_uri = config.get("_input_artifact_uri")
+            if (node.type == "source" and isinstance(artifact_uri, str)
+                    and artifact_uri and config.get("_input_revision_id")):
+                graph._input_artifact_uris[node.id] = artifact_uri
         # The disposable child DB cannot prove lifecycle ownership. Accept managed source attempts only
         # when the durable parent attested the exact physical URI and is holding its renewable read lease.
         deps.runner.parent_attested_source_uris = _parent_attested_source_uris(job, graph)

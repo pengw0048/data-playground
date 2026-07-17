@@ -9,7 +9,7 @@ import math
 
 from dataclasses import dataclass
 
-from hub.models import Graph, GraphEdge, GraphNode, Position
+from hub.models import Graph, GraphEdge, GraphNode, Position, dataset_ref_identity
 
 
 class CycleError(Exception):
@@ -126,7 +126,8 @@ def require_output_port(
     return found
 
 
-def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
+def _execution_source_bindings(
+        graph: Graph, roots: list[GraphNode]) -> list[tuple[GraphNode, dict]]:
     """Source configs a selected execution cone can actually reach, including section bodies.
 
     A section executes its ``parent_id`` children rather than ordinary graph edges. Bound the
@@ -140,7 +141,7 @@ def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict
 
     queue = list(roots)
     seen: set[str] = set()
-    configs: list[dict] = []
+    bindings: list[tuple[GraphNode, dict]] = []
     cursor = 0
     while cursor < len(queue):
         if cursor >= _MAX_EXECUTION_SOURCE_NODES:
@@ -153,10 +154,14 @@ def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict
         data = node.data if isinstance(node.data, dict) else {}
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
         if node.type == "source":
-            configs.append(config)
+            bindings.append((node, config))
         if node.type == "section":
             queue.extend(children.get(node.id, []))
-    return configs
+    return bindings
+
+
+def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
+    return [config for _node, config in _execution_source_bindings(graph, roots)]
 
 
 def resolve_source_refs(graph: Graph, resolve) -> None:
@@ -165,10 +170,27 @@ def resolve_source_refs(graph: Graph, resolve) -> None:
     This includes section-contained children. Without that shared traversal the engine could execute
     an unresolved token while ownership guards protected a different (or no) URI.
     """
-    for cfg in _execution_source_configs(graph, list(graph.nodes)):
+    for node, cfg in _execution_source_bindings(graph, list(graph.nodes)):
         value = cfg.get("uri")
         if value:
             cfg["uri"] = resolve(value)
+        # A pinned/as-of core revision is read from its immutable artifact rather than the mutable
+        # catalog head. Carry that server-resolved physical identity privately so every preview,
+        # inspection, and execution read scope fences the same file the adapter will actually open.
+        # Admission-bound graphs already carry an authoritative private binding and must retain it.
+        if str(node.id) in graph._input_artifact_uris:
+            continue
+        dataset_ref = cfg.get("datasetRef")
+        if not isinstance(dataset_ref, dict):
+            continue
+        try:
+            dataset_id, revision_id = dataset_ref_identity(dataset_ref)
+        except ValueError:
+            continue
+        from hub import metadb
+        artifact_uri = metadb.managed_local_file_revision_artifact(dataset_id, revision_id)
+        if artifact_uri is not None:
+            graph._input_artifact_uris[str(node.id)] = artifact_uri
 
 
 def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:
@@ -221,8 +243,9 @@ def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
     """Every executable source URI feeding a node, including section-contained sources."""
     uris: list[str] = []
     seen: set[str] = set()
-    for config in _execution_source_configs(graph, upstream_chain(graph, node_id)):
-        uri = config.get("uri")
+    exact_artifacts = getattr(graph, "_input_artifact_uris", {})
+    for node, config in _execution_source_bindings(graph, upstream_chain(graph, node_id)):
+        uri = exact_artifacts.get(node.id) or config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)
@@ -263,8 +286,9 @@ def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]
         return all_upstream_source_uris(graph, target_node_id)
     uris: list[str] = []
     seen: set[str] = set()
-    for config in _execution_source_configs(graph, list(graph.nodes)):
-        uri = config.get("uri")
+    exact_artifacts = getattr(graph, "_input_artifact_uris", {})
+    for node, config in _execution_source_bindings(graph, list(graph.nodes)):
+        uri = exact_artifacts.get(node.id) or config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)

@@ -1260,6 +1260,7 @@ class Graph(Wire):
     # Parent-owned provenance for synthetic region ref-sources. PrivateAttr keeps this control-plane
     # metadata out of the client wire model, workload serialization, and user-controlled node data.
     _publication_source_uris: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
+    _input_artifact_uris: dict[str, str] = PrivateAttr(default_factory=dict)
     _publication_run_id: str | None = PrivateAttr(default=None)
     _publication_attempt_id: str | None = PrivateAttr(default=None)
     _publication_producer_id: str | None = PrivateAttr(default=None)
