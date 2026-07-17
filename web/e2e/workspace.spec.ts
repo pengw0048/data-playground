@@ -126,7 +126,7 @@ test('browses and opens one exact retained dataset revision without drifting to 
   })
 
   await page.goto('/#/workspace')
-  await page.getByRole('button', { name: `Open dataset ${dataset.name}` }).click()
+  await (await workspaceResource(page, 'dataset', dataset.name)).click()
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
   await expect(page.getByText('rev-2')).toBeVisible()
   await page.getByTestId('revision-history-load-more').click()
@@ -205,6 +205,69 @@ test('pins a Source revision, persists it across reload, and keeps the control i
     expect(box!.y).toBeGreaterThanOrEqual(0)
     expect(box!.x + box!.width).toBeLessThanOrEqual(1024)
     expect(box!.y + box!.height).toBeLessThanOrEqual(768)
+  } finally {
+    await page.request.delete(`/api/canvas/${canvasId}`)
+  }
+})
+
+test('keeps an exact Source binding through provider outage and retries at the supported viewport @ux-smoke', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 })
+  const canvasId = `source-recovery-${Date.now()}`
+  const table = {
+    id: 'recovery-table', name: 'Recoverable Lance source', uri: '/mock/recoverable-source.lance',
+    rowCount: 1, version: 'v1', columns: [{ name: 'value', type: 'bigint', capabilities: [] }],
+  }
+  const selected = {
+    kind: 'exact', datasetId: 'recovery-dataset', revisionId: '1',
+    lastKnown: { committedAt: '2026-07-15T12:00:00Z' },
+  }
+  const created = await page.request.post('/api/canvas', { data: {
+    id: canvasId, name: 'Exact revision recovery', version: 1,
+    nodes: [{ id: 'source', type: 'source', position: { x: 80, y: 80 }, data: {
+      title: 'Recoverable source', status: 'stale', config: {
+        uri: table.uri, tableId: table.id, datasetRef: selected,
+      },
+    } }], edges: [],
+  } })
+  expect(created.ok()).toBe(true)
+
+  await page.route('**/api/catalog/tables?*', async (route) => {
+    await route.fulfill({ json: { items: [table], total: 1, offset: 0, limit: 50, hasMore: false } })
+  })
+  await page.route('**/api/catalog/tables/recovery-table/revisions*', async (route) => {
+    if (new URL(route.request().url()).pathname.endsWith('/capabilities')) {
+      await route.fulfill({ json: { selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null } })
+      return
+    }
+    await route.fulfill({ json: { items: [
+      { datasetId: 'recovery-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z', retentionOwner: 'provider' },
+    ], nextCursor: null, hasMore: false } })
+  })
+  let providerAvailable = false
+  await page.route('**/api/catalog/revisions/recovery-dataset/1', async (route) => {
+    if (!providerAvailable) {
+      await route.fulfill({ status: 503, json: {
+        detail: 'revision provider unavailable', code: 'service_unavailable', retryable: true,
+      } })
+      return
+    }
+    await route.fulfill({ json: {
+      datasetId: 'recovery-dataset', revisionId: '1', committedAt: '2026-07-15T12:00:00Z',
+      retentionOwner: 'provider', parentRevisionId: null, producerOperation: 'create',
+      summary: { rowCount: 1, dataFileCount: 1, totalBytes: 8, fragmentCount: 1 },
+      preview: { columns: table.columns, rows: [{ value: 1 }], hasMore: false, rowLimit: 100 },
+    } })
+  })
+
+  try {
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.getByText(/provider is offline.*exact revision 1.*latest was not substituted/i)).toBeVisible()
+
+    providerAvailable = true
+    await page.getByRole('button', { name: 'Retry provider' }).click()
+    await expect(page.getByText(/Pinned exact revision 1 · 1 rows/)).toBeVisible()
+    const response = await page.request.get(`/api/canvas/${canvasId}`)
+    expect((await response.json()).nodes[0].data.config.datasetRef).toEqual(selected)
   } finally {
     await page.request.delete(`/api/canvas/${canvasId}`)
   }
