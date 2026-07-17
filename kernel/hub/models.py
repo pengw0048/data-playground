@@ -1141,6 +1141,48 @@ class RunHistoryRecord(Wire):
         return self
 
 
+class WorkspaceRunRecord(Wire):
+    """One visible run in the workspace-wide, read-only Jobs projection."""
+
+    id: str
+    run_id: str | None = None
+    request_id: str | None = None
+    job_type: Literal["run", "profile"]
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    target_node_id: str | None = None
+    target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    rows: int | None = Field(default=None, ge=0)
+    ms: int | None = Field(default=None, ge=0)
+    error: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
+    outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
+    profile: ProfileResult | None = None
+    per_node: list[PerNodeStatus] | None = None
+    created_at: str | None = None
+    canvas_id: str
+    canvas_name: str
+    node_label: str | None = None
+    backend: str
+    placement: Placement
+    attempt: str
+
+    @model_validator(mode="after")
+    def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
+        keys = [(output.node_id, output.port_id) for output in self.outputs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("workspace run outputs must have unique (nodeId, portId) identities")
+        if self.status in ("done", "failed", "cancelled") and any(
+                output.outcome == "pending" for output in self.outputs):
+            raise ValueError("terminal workspace runs cannot retain pending outputs")
+        return self
+
+
+class WorkspaceRunPage(Wire):
+    items: list[WorkspaceRunRecord]
+    next_cursor: str | None = None
+    has_more: bool
+
+
 class PlanStep(Wire):
     node_id: str
     kind: str

@@ -434,6 +434,20 @@ export const api = {
     req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
+  workspaceJobs: (params: WorkspaceJobsQuery = {}) => {
+    const query = new URLSearchParams()
+    if (params.limit != null) query.set('limit', String(params.limit))
+    if (params.cursor) query.set('cursor', params.cursor)
+    if (params.status) query.set('status', params.status)
+    if (params.canvasId) query.set('canvas_id', params.canvasId)
+    if (params.nodeId) query.set('node_id', params.nodeId)
+    if (params.runId) query.set('run_id', params.runId)
+    if (params.backend) query.set('backend', params.backend)
+    if (params.after) query.set('after', params.after)
+    if (params.before) query.set('before', params.before)
+    if (params.q) query.set('q', params.q)
+    return req<WorkspaceJobsPage>(`/jobs?${query}`)
+  },
   // named/versioned schema contracts (workspace artifacts a node can reference by name)
   listSchemas: () => req<SchemaContractDto[]>('/schemas'),
   saveSchema: (name: string, columns: ColumnSchema[]) =>
@@ -462,6 +476,9 @@ export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string }
+export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
+export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }
 export interface SchemaCompatibilityDto { status: 'compatible' | 'breaking' | 'unknown'; fields: SchemaFieldCompatibilityDto[] }
