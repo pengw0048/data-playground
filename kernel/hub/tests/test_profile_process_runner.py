@@ -146,7 +146,11 @@ def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
     source = tmp_path / "rows.lance"
     lance.write_dataset(pa.table({"x": [1, 2, 3], "y": ["a", "b", None]}), source)
     graph = _graph(str(source))
-    graph.nodes[0].data["config"]["_input_revision_id"] = "1"
+    graph.nodes[0].data["config"].update({
+        "_input_dataset_id": "dataset-source",
+        "_input_provider": "lance",
+        "_input_revision_id": "1",
+    })
     input_manifest = [{
         "node_id": "source", "dataset_id": "dataset-source",
         "revision_id": "1", "provider": "lance",
