@@ -463,8 +463,15 @@ export interface PluginConfigField {
 }
 export interface PluginInfo {
   name: string
+  package?: string
   source: string
   version?: string
+  state?: 'active' | 'inactive' | 'degraded' | 'conflict' | 'failed'
+  required?: boolean
+  failure_impact?: 'startup-blocking' | 'optional-degradation'
+  effective_capabilities?: string[]
+  process_placement?: string[]
+  failure_summary?: string
   error?: string
   config?: PluginConfigField[]          // the declared schema (present only if the pack declares one)
   config_values?: Record<string, unknown>  // current non-secret values from settings

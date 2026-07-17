@@ -529,7 +529,12 @@ reference in-process during `register()`. To add a third-party backend (such as 
 case-insensitive and follow the URI grammar `[A-Za-z][A-Za-z0-9+.-]*`; conflicting registrations,
 including attempts to replace a built-in, are rejected.
 
-`GET /api/plugins` surfaces each pack's schema and current values (for secrets, the reference string,
-not the resolved credential). A changed setting applies on the next kernel start — plugins register
-once at startup, same as their env fallbacks. Config fields need a drop-in `dataplay.toml`;
-`DP_PLUGINS` / entry-point packs still read env directly. `dp_sql_catalog` is the worked example.
+`GET /api/plugins` surfaces each discovered pack's package/source/version, activation state
+(`active`, `inactive`, `degraded`, `conflict`, or `failed`), effective capabilities, relevant process
+placement, and whether a failure is startup-blocking or an optional degradation. Failure summaries are
+sanitized; implementation exceptions and tracebacks stay in server logs. The endpoint also includes each
+pack's schema and current values (for secrets, the reference string, not the resolved credential).
+
+A changed setting applies on the next kernel start — plugins register once at startup, same as their env
+fallbacks. Config fields need a drop-in `dataplay.toml`; `DP_PLUGINS` / entry-point packs still read env
+directly. `dp_sql_catalog` is the worked example.

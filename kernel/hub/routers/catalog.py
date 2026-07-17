@@ -13,6 +13,7 @@ import os
 import re
 import tempfile
 import uuid
+from typing import Any, Literal
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -87,6 +88,26 @@ router = APIRouter()
 DATA_SAMPLE_PREVIEW_ROW_BUDGET = 2_000
 DATASET_REVISION_PREVIEW_ROWS = 100
 
+
+class PluginStatus(BaseModel):
+    """Bounded operator-facing status; implementation exceptions and tracebacks are intentionally absent."""
+
+    name: str
+    package: str
+    source: str
+    version: str | None = None
+    state: Literal["active", "inactive", "degraded", "conflict", "failed"]
+    required: bool
+    failure_impact: Literal["startup-blocking", "optional-degradation"]
+    effective_capabilities: list[str]
+    process_placement: list[str]
+    failure_summary: str | None = None
+    error: str | None = None  # deprecated compatibility alias; always the sanitized failure_summary
+    config: list[dict[str, Any]] | None = None
+    config_values: dict[str, Any] | None = None
+    config_set: list[str] | None = None
+
+
 @router.get("/kernel", response_model=KernelInfo)
 def kernel_info() -> KernelInfo:
     return get_deps().info()
@@ -98,15 +119,29 @@ def list_nodes() -> list[dict]:
     return [s.model_dump(by_alias=True) for s in get_deps().node_specs.values()]
 
 
-@router.get("/plugins")
-def list_plugins() -> list[dict]:
+@router.get("/plugins", response_model=list[PluginStatus])
+def list_plugins() -> list[PluginStatus]:
     # Enrich each pack that declares a [[config]] schema with its CURRENT values (from settings), so the
     # Settings UI can render + pre-fill a form. Secret fields store references (env:/file:), not material
     # values — the reference string is safe to echo; presence is also listed in config_set.
     from hub.secrets import redact_secret_for_display
-    out: list[dict] = []
+    out: list[PluginStatus] = []
     for p in get_deps().plugins:
-        entry = dict(p)
+        # Internal ownership/problem bookkeeping never crosses the API boundary. In particular, raw
+        # exceptions and tracebacks belong in server logs; this endpoint returns only the sanitized,
+        # actionable failure_summary produced by the lifecycle model.
+        entry = {key: value for key, value in p.items() if not key.startswith("_")}
+        # Keep direct test/custom integrations that append the legacy shape readable while the real
+        # loader always supplies the complete lifecycle fields above.
+        entry.setdefault("package", entry["name"])
+        entry.setdefault("state", "failed" if entry.get("error") else "active")
+        entry.setdefault("required", False)
+        entry.setdefault("failure_impact", "optional-degradation")
+        entry.setdefault("effective_capabilities", [])
+        entry.setdefault("process_placement", [])
+        if entry.get("error") and not entry.get("failure_summary"):
+            entry["failure_summary"] = "Plugin activation failed; check server logs."
+            entry["error"] = entry["failure_summary"]
         schema = entry.get("config")
         if schema:
             values: dict = {}
@@ -119,7 +154,7 @@ def list_plugins() -> list[dict]:
                 values[f["key"]] = (redact_secret_for_display(stored) if f.get("secret") else stored)
             entry["config_values"] = values
             entry["config_set"] = is_set
-        out.append(entry)
+        out.append(PluginStatus.model_validate(entry))
     return out
 
 

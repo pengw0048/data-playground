@@ -551,6 +551,19 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Saved', { exact: true })).toBeVisible()
   })
 
+  test('settings reports effective plugin activation and placement', async ({ page }) => {
+    await page.goto('/')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Settings', { exact: true }).click()
+    await page.getByRole('button', { name: 'Plugins' }).click()
+
+    const builtin = page.getByTestId('plugin-status-default-catalog')
+    await expect(builtin).toContainText('active')
+    await expect(builtin).toContainText('catalog')
+    await expect(builtin).toContainText('required at startup')
+    await expect(builtin).toContainText('Placement: application')
+  })
+
   test('settings keeps dirty edits across owned dismissals and warns before unload', async ({ page }) => {
     await page.goto('/')
     await page.getByTestId('app-menu').click()

@@ -63,6 +63,17 @@ type CanonicalPluginValue = { valid: true; value: unknown } | { valid: false }
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 
+const pluginState = (plugin: PluginInfo): NonNullable<PluginInfo['state']> =>
+  plugin.state ?? (plugin.error ? 'failed' : 'active')
+
+const pluginStateTone: Record<NonNullable<PluginInfo['state']>, string> = {
+  active: 'bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300',
+  inactive: 'bg-secondary text-secondary-foreground',
+  degraded: 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  conflict: 'bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300',
+  failed: 'bg-destructive text-destructive-foreground',
+}
+
 const sameJson = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right)
 
 const hasOwn = (value: object, key: string) => Object.prototype.hasOwnProperty.call(value, key)
@@ -847,20 +858,41 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
                 {canGlobal && active === 'plugins' && <Section id="plugins" title="Plugins">
                   <p className="mb-2 text-[11.5px] leading-relaxed text-muted-foreground">
-                    Loaded plugin packs. A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
+                    Discovered plugin packs and the capabilities that are effective in this application instance. Installed does not mean active.
+                    A pack that declares config fields (in its <code>dataplay.toml</code>) can be set here.
                     Changes take effect on the next kernel start.
                   </p>
-                  <div className="mb-2.5 flex flex-col gap-1">
-                    {plugins.map((p) => (
-                      <div key={p.name} className="flex items-center gap-2 text-xs text-foreground">
-                        <span className="flex items-center text-muted-foreground"><Icon name={p.error ? 'close' : 'check'} size={12} /></span>
-                        <span className="font-semibold">{p.name}</span>
-                        {p.version && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{p.version}</Badge>}
-                        <span className="text-[10px] text-muted-foreground">{p.source}</span>
-                        {p.error && <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[10.5px] text-destructive">{p.error}</span>}
+                  <div className="mb-2.5 flex flex-col gap-2">
+                    {plugins.map((p, index) => {
+                      const state = pluginState(p)
+                      const failure = p.failure_summary ?? p.error
+                      return (
+                      <div key={`${p.source}:${p.name}:${index}`} data-testid={`plugin-status-${p.name}`} className="rounded-md border border-border p-2.5 text-xs text-foreground">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="flex items-center text-muted-foreground"><Icon name={state === 'active' ? 'check' : state === 'inactive' ? 'minus' : 'close'} size={12} /></span>
+                          <span className="font-semibold">{p.name}</span>
+                          {p.package && p.package !== p.name && <span className="text-[10px] text-muted-foreground">package {p.package}</span>}
+                          {p.version && <Badge variant="secondary" className="rounded px-1.5 py-0 text-[10px] font-normal">{p.version}</Badge>}
+                          <span className="text-[10px] text-muted-foreground">{p.source}</span>
+                          <Badge variant="outline" className={cn('rounded border-0 px-1.5 py-0 text-[10px] font-medium', pluginStateTone[state])}>{state}</Badge>
+                          {p.required && <Badge variant="outline" className="rounded px-1.5 py-0 text-[10px] font-normal">required at startup</Badge>}
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-1" aria-label={`Effective capabilities for ${p.name}`}>
+                          {(p.effective_capabilities ?? []).map((capability) => (
+                            <Badge key={capability} variant="secondary" className="rounded px-1.5 py-0 text-[9.5px] font-normal">{capability}</Badge>
+                          ))}
+                          {(p.effective_capabilities?.length ?? 0) === 0 && <span className="text-[10.5px] text-muted-foreground">No effective capabilities.</span>}
+                        </div>
+                        {(p.process_placement?.length ?? 0) > 0 && <div className="mt-1.5 text-[10px] text-muted-foreground">
+                          Placement: {p.process_placement!.join(', ')}
+                        </div>}
+                        {failure && <div className={cn('mt-1.5 text-[10.5px]', state === 'degraded' ? 'text-amber-700 dark:text-amber-300' : 'text-destructive')}>
+                          {failure} {p.failure_impact === 'optional-degradation' && 'The application continues without the unavailable capability.'}
+                        </div>}
                       </div>
-                    ))}
-                    {plugins.length === 0 && <div className="text-[11.5px] text-muted-foreground">No plugins loaded.</div>}
+                      )
+                    })}
+                    {plugins.length === 0 && <div className="rounded-md border border-dashed border-border p-3 text-[11.5px] text-muted-foreground">No plugins discovered.</div>}
                   </div>
 
                   {configurable.map((p) => (
