@@ -339,6 +339,16 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId) ? retained : undefined
 }
 
+function writeAdmissionFingerprint(doc: CanvasDoc): string {
+  return JSON.stringify({
+    ...doc,
+    nodes: doc.nodes.map((node) => {
+      const { status: _status, ...data } = node.data
+      return { ...node, data }
+    }),
+  })
+}
+
 function sameInputManifest(
   left: RunInputManifestItem[] | undefined,
   right: RunInputManifestItem[] | undefined,
@@ -1650,7 +1660,7 @@ export const useStore = create<Store>((set, get) => ({
     const doc = get().doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
-    const fingerprint = JSON.stringify(doc)
+    const fingerprint = writeAdmissionFingerprint(doc)
     const existing = get().runs[id]
     if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
       return existing.writeAdmission
@@ -1668,7 +1678,7 @@ export const useStore = create<Store>((set, get) => ({
     const current = get().runs[id]
     if (current?.writeSubmissionId !== submissionId
         || current.writeAdmissionFingerprint !== fingerprint
-        || JSON.stringify(get().doc) !== fingerprint) return undefined
+        || writeAdmissionFingerprint(get().doc) !== fingerprint) return undefined
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
     } } }))
@@ -1753,10 +1763,13 @@ export const useStore = create<Store>((set, get) => ({
         get().updateData(id, { status: 'stale' })
         return
       }
+      const writeSubmissionRejected = writeAdmission && e instanceof KernelError && e.status < 500
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
-        writeAdmission: undefined, writeSubmissionId: undefined,
-        writeAdmissionFingerprint: undefined,
+        ...(writeSubmissionRejected ? {
+          writeAdmission: undefined, writeSubmissionId: undefined,
+          writeAdmissionFingerprint: undefined,
+        } : {}),
       } } }))
       get().updateData(id, { status: 'failed' })
       get().pushToast((e as Error).message || 'Run failed to start', 'error')

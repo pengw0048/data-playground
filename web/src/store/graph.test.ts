@@ -898,6 +898,53 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
   })
 
+  it('reuses the admitted write submission after an ambiguous response loss', async () => {
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] }
+    useStore.setState({ doc })
+    const intent = {
+      destination: { logicalUri: '/outputs/output.parquet', name: 'output', provider: 'managed-local-file' as const },
+      mode: 'create' as const, expectedSchema: [], expectedHead: null,
+      idempotencyKey: 'write-key', partitions: [], provenance: { publication: {
+        idempotencyKey: 'write-key', runId: 'run-write', producer: 'c', producerVersion: 1,
+        stepId: 'write', provenance: 'run',
+      }, parents: [] },
+    }
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'create' as const,
+      provider: 'managed-local-file', expectedSchema: [], partitions: [], intent,
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(admission)
+    apiMocks.run.mockRejectedValueOnce(new Error('network response lost')).mockResolvedValueOnce({
+      runId: 'run-write', status: 'running', jobType: 'run', targetNodeId: 'write', rowsProcessed: 0,
+      ms: 0, placement: 'local', perNode: [], outputs: [],
+    })
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-write', status: 'done', jobType: 'run', targetNodeId: 'write', rowsProcessed: 2,
+      totalRows: 2, ms: 5, placement: 'local', perNode: [], outputs: [{
+        nodeId: 'write', portId: 'out', wire: 'dataset', publicationKind: 'catalog',
+        outcome: 'committed', uri: '/artifacts/rev.parquet', table: 'output', version: 'rev-1', rows: 2,
+      }],
+    })
+
+    await useStore.getState().run('write')
+
+    const submissionId = apiMocks.writeAdmission.mock.calls[0][2]
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'failed', writeAdmission: admission, writeSubmissionId: submissionId,
+    })
+
+    await useStore.getState().run('write')
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+    expect(apiMocks.run.mock.calls[1].slice(1)).toEqual([
+      'write', false, submissionId, undefined, intent,
+    ])
+    expect(apiMocks.run.mock.calls[1][0].nodes[0].data.config).toEqual(doc.nodes[0].data.config)
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+  })
+
   it('reuses one submission id across bounded ambiguous submission retries', async () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     useStore.setState({ doc })

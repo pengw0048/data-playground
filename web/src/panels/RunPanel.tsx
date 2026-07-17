@@ -27,6 +27,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const st = run?.status
   const pinnedInputs = pinnedSourceInputs(doc, nodeId)
   const writeAdmission = run?.writeAdmission
+  const writeSubmissionUnresolved = !!writeAdmission && !!run?.writeSubmissionId
 
   return (
     <div className="p-3.5">
@@ -141,7 +142,11 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </div>
           {st && <RunOutputs outputs={st.outputs} />}
           <div className="mt-3 flex gap-2">
-            <Button size="sm" variant="outline" onClick={() => estimate(nodeId)} className="flex-1">Retry</Button>
+            <Button size="sm" variant="outline"
+              onClick={() => writeSubmissionUnresolved
+                ? doRun(nodeId, !!est?.needsConfirm)
+                : estimate(nodeId)}
+              className="flex-1">Retry</Button>
             {(run?.inputDrift || hasRetainedPreviewBinding) && <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)}
               disabled={!canEdit} className="flex-1">Refresh to latest</Button>}
           </div>

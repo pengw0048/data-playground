@@ -96,6 +96,13 @@ def _local_run_intent_sha256(
         write_intent: WriteIntent | None = None) -> str:
     """Hash caller intent before source resolution so a retry cannot be retargeted by a moved head."""
     doc = graph.model_dump(mode="json")
+    if write_intent is not None:
+        # Canvas run status is operational UI evidence, not write intent. A response-loss retry changes
+        # it from running to failed before replaying the same frozen write submission.
+        for node in doc.get("nodes", []):
+            data = node.get("data") if isinstance(node, dict) else None
+            if isinstance(data, dict):
+                data.pop("status", None)
     payload = json.dumps(
         {"graph": doc, "target_node_id": target_node_id, "input_manifest": input_manifest,
          "write_intent": (write_intent.model_dump(by_alias=True, mode="json")
@@ -166,6 +173,17 @@ def _bind_local_run_manifest(
         ) from exc
 
 
+def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
+    """Whether this exact runner owns the issue-399 typed local publication contract."""
+    supports = getattr(runner, "supports_managed_local_write_intents", None)
+    if runner is not deps.runner or not callable(supports):
+        return False
+    try:
+        return bool(supports())
+    except Exception:
+        return False
+
+
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
         supplied: WriteIntent | None = None) -> WriteAdmission:
@@ -195,7 +213,8 @@ def _write_admission_for_graph(
             getattr(deps, "node_ir", {}))
         # #391's typed publisher is the in-process local consumer. Other bundled/plugin transports
         # retain their provider-neutral sink contract and must not be labelled create/replace.
-        managed = pick_runner(plan, uid) is deps.runner
+        runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
+        managed = _runner_supports_managed_local_write_intents(deps, runner)
     partitions = [WritePartitionExpectation(field=field.strip()) for field in
                   spec.partition_by.split(",") if field.strip()]
     provider_name = str(getattr(adapter, "name", "") or "provider-neutral")
@@ -1499,6 +1518,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     runner = _route_by_capability(
         deps, deps.pick_runner(plan, uid), graph, target_node_id
     )  # honor requirements only in the target's executable cone
+    if (write_admission is not None and write_admission.managed
+            and not _runner_supports_managed_local_write_intents(deps, runner)):
+        raise HTTPException(
+            409, "the selected execution backend cannot consume the managed-local write admission; "
+            "discard it and retry with local-out-of-core")
     multi_output = False
     if output_target is not None:
         multi_output = _require_backend_run_output_support(

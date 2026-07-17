@@ -20,6 +20,7 @@ from hub.plugins.catalog import InMemoryCatalog
 from hub.plugins.processors import InMemoryProcessorRegistry
 from hub.routers.runs import _write_admission_for_graph
 from hub.routers.runs import _inject_write_intent
+from hub.routers.runs import _local_run_intent_sha256
 from hub.routers import runs as run_routes
 from hub.main import app
 from hub.local_writes import write_managed_local_file
@@ -150,6 +151,23 @@ def test_repeated_admission_recovers_the_exact_durable_receipt(contract):
     assert recovered.recovered_receipt.publication.artifact_uri == receipt.publication.artifact_uri
 
 
+def test_write_submission_identity_ignores_only_operational_node_status(contract):
+    deps, graph = contract
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "43333333-3333-4333-8333-333333333333")
+    assert admission.intent is not None
+    initial = _local_run_intent_sha256(graph, "write", write_intent=admission.intent)
+
+    retried = graph.model_copy(deep=True)
+    next(node for node in retried.nodes if node.id == "write").data["status"] = "failed"
+    assert _local_run_intent_sha256(
+        retried, "write", write_intent=admission.intent) == initial
+
+    next(node for node in retried.nodes if node.id == "write").data["config"]["filename"] = "other.parquet"
+    assert _local_run_intent_sha256(
+        retried, "write", write_intent=admission.intent) != initial
+
+
 def test_external_destination_keeps_provider_neutral_mode(contract):
     deps, graph = contract
     write = next(node for node in graph.nodes if node.id == "write")
@@ -167,12 +185,28 @@ def test_external_destination_keeps_provider_neutral_mode(contract):
 
 def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):
     deps, graph = contract
-    deps.runner = object()
+    deps.runner = SimpleNamespace(supports_managed_local_write_intents=lambda: True)
     deps.pick_runner = lambda _plan, _uid: object()
+    deps.runners = []
     deps.node_ir = {}
 
     admission = _write_admission_for_graph(
         deps, graph, "write", "researcher", "52222222-2222-4222-8222-222222222222")
+
+    assert admission.managed is False
+    assert admission.mode == "overwrite"
+    assert admission.intent is None
+
+
+def test_runner_without_typed_write_capability_is_not_mislabeled_managed(contract):
+    deps, graph = contract
+    deps.runner = object()
+    deps.pick_runner = lambda _plan, _uid: deps.runner
+    deps.runners = []
+    deps.node_ir = {}
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "53333333-3333-4333-8333-333333333333")
 
     assert admission.managed is False
     assert admission.mode == "overwrite"

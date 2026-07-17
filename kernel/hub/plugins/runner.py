@@ -278,6 +278,10 @@ class LocalRunner:
     def supports_admitted_input_manifests() -> bool:
         return True  # exact revisions are already bound and reopened inside this process
 
+    @staticmethod
+    def supports_managed_local_write_intents() -> bool:
+        return True  # this process owns the typed local create/replace publication boundary
+
     def supports_named_multi_output_runs(self) -> bool:
         return True
 
@@ -1475,6 +1479,10 @@ class LocalRunner:
             _is_core_managed_local_file_sink(spec, logical_uri, logical_adapter, self.storage)
             and not parent_contract and type(self.catalog) is InMemoryCatalog
         )
+        admitted = cfg.get("_admittedWriteIntent")
+        if admitted is not None and not managed_local:
+            raise RuntimeError(
+                "managed local write admission reached an incompatible execution sink")
         parent_assigned_attempt = self.forced_sink_attempts.get(node.id)
         if parent_assigned_attempt and not managed_object:
             raise RuntimeError(
@@ -1529,7 +1537,6 @@ class LocalRunner:
 
             if lineage is None:  # parent-owned transports are excluded by managed_local admission
                 raise RuntimeError("managed local-file write requires local provenance identity")
-            admitted = cfg.get("_admittedWriteIntent")
             if admitted is None:
                 # Direct runner callers do not cross the HTTP admission seam. Keep that low-level API
                 # usable while every product run supplies the frozen intent below.
