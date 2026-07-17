@@ -358,16 +358,22 @@ def test_postgres_linear_checkpoint_two_owner_retire_and_release(tmp_path):
     calls = [(attempt_b, "owner-b")] * 5 + [(attempt_a, "owner-a")] * 5
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
         futures = [pool.submit(recover, attempt_id, owner) for attempt_id, owner in calls]
-    actions, fenced = [], 0
+    outcomes, fenced = [], 0
     for future in futures:
         try:
-            actions.append(future.result()["action"])
+            outcomes.append(future.result())
         except RuntimeError as exc:
             assert "stale or fenced" in str(exc)
             fenced += 1
+    actions = [outcome["action"] for outcome in outcomes]
     assert fenced == 5  # every stale old-owner recovery is refused
     assert actions.count("retire") == 1  # exactly one superseded candidate is retired
     assert set(actions) <= {"retire", "reserve"}
+    # Metadata retire only marks the exact artifact reclaimable; the winner deletes its file, as
+    # lc.recover_checkpoint does in production.
+    retire = next(outcome for outcome in outcomes if outcome["action"] == "retire")
+    assert retire["uri"] == old["uri"]
+    store.discard_checkpoint_artifact(retire["uri"], retire["delete_token"], retire["lock_token"])
     assert not os.path.exists(old["uri"])  # the superseded file is gone
     assert metadb.reconcile_linear_checkpoint(admission["task_id"])["phase"] == "pending"
 
