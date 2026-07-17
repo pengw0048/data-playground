@@ -10,6 +10,8 @@ import { register } from '../nodes/registry'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
+  tableByRegistration: vi.fn(),
+  datasetRevision: vi.fn(),
   sample: vi.fn(),
   runOutputSample: vi.fn(),
   preview: vi.fn(),
@@ -39,6 +41,8 @@ function registerAssertUiTestNode() {
 
 beforeEach(() => {
   apiMock.listRuns.mockReset()
+  apiMock.tableByRegistration.mockReset()
+  apiMock.datasetRevision.mockReset()
   apiMock.sample.mockReset()
   apiMock.runOutputSample.mockReset()
   apiMock.preview.mockReset()
@@ -110,6 +114,87 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
   })
 })
 
+describe('admitted run inputs', () => {
+  const manifestItem = (nodeId: string, datasetId: string, revisionId: string) => ({
+    node_id: nodeId, dataset_id: datasetId, revision_id: revisionId,
+    provider: 'lance', resolved_at: '2026-07-16T12:00:00Z',
+  })
+  const revisionDetail = (datasetId: string, revisionId: string) => ({
+    datasetId, revisionId, committedAt: '2026-07-16T11:00:00Z', retentionOwner: 'provider' as const,
+    parentRevisionId: 'parent-1', producerOperation: null,
+    summary: { rowCount: 12, dataFileCount: 1, totalBytes: 100, fragmentCount: 1 },
+    preview: { columns: [], rows: [{ value: 1 }], hasMore: false, rowLimit: 100 as const },
+  })
+
+  it('preserves manifest order and opens the admitted exact revision through Catalog', async () => {
+    useStore.setState({ doc: {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [
+        { id: 'source-b', type: 'source', position: { x: 0, y: 0 }, data: { title: 'Customers', status: 'latest', config: {}, history: [] } },
+        { id: 'source-a', type: 'source', position: { x: 0, y: 0 }, data: { title: 'Orders', status: 'latest', config: {}, history: [] } },
+      ],
+    } } as any)
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'manifest-history', runId: 'manifest-run', jobType: 'run', status: 'done', outputs: [],
+      inputManifest: [manifestItem('source-a', 'dataset-a', 'revision-a'), manifestItem('source-b', 'dataset-b', 'revision-b')],
+    }])
+    apiMock.tableByRegistration.mockImplementation(async (datasetId: string) => ({
+      id: datasetId, name: datasetId === 'dataset-a' ? 'Orders dataset' : 'Customers dataset',
+      uri: `file:///${datasetId}.parquet`, columns: [],
+    }))
+    apiMock.datasetRevision.mockImplementation(async (datasetId: string, revisionId: string) => revisionDetail(datasetId, revisionId))
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    await user.click(await screen.findByRole('button', { name: /Admitted inputs/i }))
+    const list = screen.getByRole('list')
+    const items = within(list).getAllByRole('listitem')
+    expect(items).toHaveLength(2)
+    expect(within(items[0]).getByText('Source Orders')).toBeInTheDocument()
+    expect(within(items[1]).getByText('Source Customers')).toBeInTheDocument()
+    expect(await within(items[0]).findByText('Orders dataset')).toBeInTheDocument()
+    expect(within(items[0]).getByText('Exact revision revision-a')).toBeInTheDocument()
+    expect(within(items[0]).getByText(/Reference intent was not stored/)).toBeInTheDocument()
+    await user.click(within(items[0]).getByRole('button', { name: 'Open Catalog revision detail' }))
+    expect(within(items[0]).getByText('12')).toBeInTheDocument()
+    expect(apiMock.datasetRevision).toHaveBeenCalledWith('dataset-a', 'revision-a')
+  })
+
+  it('reports unavailable, permission-lost, and provider-offline revisions without substituting latest', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'unavailable-history', runId: 'unavailable-run', jobType: 'run', status: 'failed', outputs: [],
+      inputManifest: [
+        manifestItem('missing', 'dataset-missing', 'revision-missing'),
+        manifestItem('denied', 'dataset-denied', 'revision-denied'),
+        manifestItem('offline', 'dataset-offline', 'revision-offline'),
+      ],
+    }])
+    apiMock.tableByRegistration.mockRejectedValue(Object.assign(new Error('registration unavailable'), { status: 404 }))
+    apiMock.datasetRevision.mockImplementation(async (datasetId: string) => {
+      const status = datasetId === 'dataset-missing' ? 410 : datasetId === 'dataset-denied' ? 403 : 503
+      throw Object.assign(new Error('unavailable'), { status })
+    })
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    await user.click(await screen.findByRole('button', { name: /Admitted inputs/i }))
+    expect(await screen.findByText('permission lost')).toBeInTheDocument()
+    expect(screen.getByText('provider offline')).toBeInTheDocument()
+    expect(screen.getByText(/missing or compacted.*Latest was not substituted/i)).toBeInTheDocument()
+    expect(screen.getByText(/provider is offline or unavailable/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open Catalog revision detail' })).not.toBeInTheDocument()
+  })
+
+  it('labels a pre-manifest run as legacy evidence', async () => {
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'legacy-history', runId: 'legacy-run', jobType: 'run', status: 'done', outputs: [], inputManifest: null,
+    }])
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    expect(await screen.findByText('No admitted input manifest was recorded for this legacy run.')).toBeInTheDocument()
+    expect(apiMock.datasetRevision).not.toHaveBeenCalled()
+  })
+})
+
 describe('durable full results', () => {
   const committedOutput = (uri: string, rows: number, portId = 'out') => ({
     nodeId: 'target', portId, wire: 'dataset' as const, publicationKind: 'result' as const,
@@ -143,20 +228,6 @@ describe('durable full results', () => {
     ))
     expect(apiMock.fullResultExportUrl).not.toHaveBeenCalled()
     expect(document.querySelector('iframe')?.getAttribute('src')).toBe('/api/run/full-result-export')
-  })
-
-  it('shows the exact resolved input manifest retained with a run', async () => {
-    apiMock.listRuns.mockResolvedValue([{
-      id: 'pinned-history', runId: 'pinned-run', status: 'done', targetNodeId: 'target', rows: 1,
-      inputManifest: [{ nodeId: 'source', datasetId: 'dataset-opaque', revisionId: '7',
-        provider: 'lance', resolvedAt: '2026-07-16T12:00:00Z' }],
-      outputs: [committedOutput('/outputs/pinned.parquet', 1)],
-    }])
-
-    render(<RunHistoryModal onClose={() => {}} />)
-
-    expect(await screen.findByText('Resolved exact inputs')).toBeInTheDocument()
-    expect(screen.getByText(/source · dataset dataset-opaque · revision 7 · lance/)).toBeInTheDocument()
   })
 
   it('shows every named history output and keeps a committed artifact inspectable after overall failure', async () => {

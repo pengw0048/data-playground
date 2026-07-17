@@ -344,11 +344,12 @@ export interface RunOutput {
 }
 
 export interface RunInputManifestItem {
-  nodeId: string
-  datasetId: string
-  revisionId: string
+  // Run history persists this deliberately minimal dict verbatim, so its inner keys remain snake_case.
+  node_id: string
+  dataset_id: string
+  revision_id: string
   provider: string
-  resolvedAt: string
+  resolved_at: string
 }
 
 export interface RunStatus {

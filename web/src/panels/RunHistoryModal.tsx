@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
-import type { RunOutput } from '../types/api'
+import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
@@ -61,16 +61,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
-                  {r.inputManifest && r.inputManifest.length > 0 && (
-                    <div aria-label={`Resolved inputs for run ${r.id}`} className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
-                      <div className="font-semibold text-foreground">Resolved exact inputs</div>
-                      {r.inputManifest.map((input) => (
-                        <div key={input.nodeId} className="mt-0.5 break-all">
-                          {input.nodeId} · dataset {input.datasetId} · revision {input.revisionId} · {input.provider}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
                       outputs={r.outputs} openKey={resultOpen}
@@ -89,6 +80,135 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
       </DialogContent>
     </Dialog>
   )
+}
+
+type ManifestAvailability = 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
+interface ManifestEvidence {
+  table: CatalogTable | null
+  detail: DatasetRevisionDetail | null
+  availability: ManifestAvailability
+  message: string
+}
+
+const errorStatus = (error: unknown) => typeof error === 'object' && error !== null && typeof (error as { status?: unknown }).status === 'number'
+  ? (error as { status: number }).status : undefined
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error)
+
+function unavailableEvidence(error: unknown, table: CatalogTable | null): ManifestEvidence {
+  const status = errorStatus(error)
+  if (status === 403) return { table, detail: null, availability: 'permission', message: 'Permission to inspect this exact revision was lost.' }
+  if (status === 410 || status === 404) return { table, detail: null, availability: 'unavailable', message: 'This exact revision or its registration is missing or compacted. Latest was not substituted.' }
+  if (status != null && status >= 500) return { table, detail: null, availability: 'offline', message: 'The revision provider is offline or unavailable; availability could not be verified.' }
+  return { table, detail: null, availability: 'error', message: `Couldn't verify this exact revision: ${errorText(error)}` }
+}
+
+function RunInputManifest({ historyId, manifest }: {
+  historyId: string
+  manifest?: RunInputManifestItem[] | null
+}) {
+  const nodes = useStore((s) => s.doc.nodes)
+  const [open, setOpen] = useState(false)
+  const [evidence, setEvidence] = useState<(ManifestEvidence | null)[]>([])
+  const [generation, setGeneration] = useState(0)
+
+  useEffect(() => {
+    if (!open || !manifest?.length) return
+    let live = true
+    setEvidence(manifest.map(() => null))
+    void Promise.all(manifest.map(async (item, index) => {
+      let table: CatalogTable | null = null
+      try { table = await api.tableByRegistration(item.dataset_id) } catch { /* exact detail decides availability */ }
+      let next: ManifestEvidence
+      try {
+        const detail = await api.datasetRevision(item.dataset_id, item.revision_id)
+        next = { table, detail, availability: 'available', message: 'Exact revision is available.' }
+      } catch (error) { next = unavailableEvidence(error, table) }
+      if (live) setEvidence((current) => current.map((value, position) => position === index ? next : value))
+    }))
+    return () => { live = false }
+  }, [open, manifest, generation])
+
+  if (manifest == null) {
+    return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
+      No admitted input manifest was recorded for this legacy run.
+    </div>
+  }
+  if (manifest.length === 0) {
+    return <div className="border-t border-border bg-muted/20 px-4 py-2 text-[10.5px] text-muted-foreground">
+      This run admitted no Source inputs.
+    </div>
+  }
+  return <div aria-label={`Admitted inputs for run ${historyId}`} className="border-t border-border bg-muted/20">
+    <button type="button" onClick={() => setOpen((value) => !value)} aria-expanded={open}
+      className="flex w-full items-center gap-2 px-4 py-2 text-left text-[11px] hover:bg-muted/40">
+      <span className="text-muted-foreground">{open ? '▾' : '▸'}</span>
+      <span className="font-semibold text-foreground">Admitted inputs</span>
+      <Badge variant="outline" className="h-5 px-1.5 text-[9px]">{manifest.length}</Badge>
+      <span className="text-muted-foreground">ordered exact bindings</span>
+    </button>
+    {open && <div className="border-t border-border/60 px-4 py-2">
+      <ol className="flex flex-col gap-2">
+        {manifest.map((item, index) => {
+          const current = evidence[index]
+          const source = nodes.find((node) => node.id === item.node_id)
+          return <li key={`${item.node_id}:${item.dataset_id}:${item.revision_id}`} className="rounded-md border border-border bg-card p-2 text-[10.5px]">
+            <div className="flex items-start gap-2">
+              <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-muted text-[9px] font-semibold text-muted-foreground">{index + 1}</span>
+              <div className="min-w-0 flex-1">
+                <div className="font-semibold text-foreground">Source {source?.data.title || item.node_id}</div>
+                {source?.data.title && source.data.title !== item.node_id && <div className="dp-mono break-all text-[9.5px] text-muted-foreground">node {item.node_id}</div>}
+                <div className="mt-1 break-all text-muted-foreground">
+                  Dataset <span className="font-semibold text-foreground">{current?.table?.name ?? item.dataset_id}</span>
+                  {current?.table?.name && <span className="dp-mono"> · {item.dataset_id}</span>}
+                </div>
+                <div className="dp-mono break-all text-muted-foreground">Exact revision {item.revision_id}</div>
+                <div className="text-muted-foreground">Provider {item.provider} · resolved {formatManifestTime(item.resolved_at)}</div>
+                <div className="text-muted-foreground">Reference intent was not stored; this row reports only admitted resolution evidence.</div>
+              </div>
+              <AvailabilityBadge availability={current?.availability ?? 'checking'} />
+            </div>
+            <div className={`mt-1.5 ${current?.availability === 'error' || current?.availability === 'permission' ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {current?.message ?? 'Checking the exact revision without opening latest…'}
+            </div>
+            {current?.availability === 'error' || current?.availability === 'offline' ? <button type="button"
+              onClick={() => setGeneration((value) => value + 1)} className="mt-1 font-semibold text-primary underline">Retry availability check</button> : null}
+            {current?.detail && <ExactRevisionFacts detail={current.detail} />}
+          </li>
+        })}
+      </ol>
+    </div>}
+  </div>
+}
+
+function AvailabilityBadge({ availability }: { availability: ManifestAvailability }) {
+  const labels: Record<ManifestAvailability, string> = {
+    checking: 'checking', available: 'available', unavailable: 'unavailable', permission: 'permission lost',
+    offline: 'provider offline', error: 'check failed',
+  }
+  return <Badge variant={availability === 'available' ? 'secondary' : 'outline'} className="h-5 shrink-0 px-1.5 text-[9px]">
+    {labels[availability]}
+  </Badge>
+}
+
+function ExactRevisionFacts({ detail }: { detail: DatasetRevisionDetail }) {
+  const [open, setOpen] = useState(false)
+  return <div className="mt-2 border-t border-border/60 pt-1.5">
+    <button type="button" onClick={() => setOpen((value) => !value)} className="font-semibold text-primary underline">
+      {open ? 'Hide Catalog revision detail' : 'Open Catalog revision detail'}
+    </button>
+    {open && <div data-testid="run-input-revision-detail" className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 rounded bg-muted/40 p-2 text-muted-foreground">
+      <span>Committed</span><span>{detail.committedAt ? formatManifestTime(detail.committedAt) : 'not provided'}</span>
+      <span>Retention</span><span>{detail.retentionOwner}</span>
+      <span>Parent</span><span className="dp-mono break-all">{detail.parentRevisionId ?? 'not evidenced'}</span>
+      <span>Rows</span><span>{detail.summary.rowCount == null ? 'unknown' : detail.summary.rowCount.toLocaleString()}</span>
+      <span>Preview</span><span>{detail.preview.rows.length.toLocaleString()} exact row{detail.preview.rows.length === 1 ? '' : 's'}{detail.preview.hasMore ? ' (truncated)' : ''}</span>
+    </div>}
+  </div>
+}
+
+function formatManifestTime(value: string): string {
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toISOString().replace('.000Z', 'Z')
 }
 
 function historyOutputKey(runId: string, output: RunOutput): string {
