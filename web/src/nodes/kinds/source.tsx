@@ -182,7 +182,7 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       </Popover>
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
-      {table && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
+      {(table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
@@ -193,7 +193,7 @@ function Source({ id, data }: NodeComponentProps) {
 
 function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   nodeId: string
-  table: CatalogTable
+  table?: CatalogTable
   selected?: DatasetRef
   canEdit: boolean
   onChange: (value: DatasetRef | undefined) => void
@@ -219,12 +219,16 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
 
   // #279 deliberately owns only the built-in Lance journey. Other exact-revision providers keep
   // their Catalog history UI but do not gain a Source configuration surface here.
-  const lance = table.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance')
+  const lance = table?.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance') ?? false
   useEffect(() => {
     const generation = ++historyGeneration.current
     let live = true
     setOpen(false); setRevisions([]); setCursor(null); setHasMore(false); setHistoryError('')
     setAsOfError(''); setAsOfAvailable(false); setAsOfResolving(false); setCapabilitiesChecking(true)
+    if (!table) {
+      setAvailability('unavailable'); setCapabilitiesChecking(false)
+      return () => { live = false }
+    }
     api.datasetRevisionCapabilities(table.id).then((capabilities) => {
       if (!live || generation !== historyGeneration.current) return
       setAsOfAvailable(capabilities.selectors.includes('as_of')
@@ -255,7 +259,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
       setAvailability('unavailable')
     }
     return () => { live = false }
-  }, [table.id, table.uri, lance, request])
+  }, [table?.id, table?.uri, lance, request])
 
   useEffect(() => {
     let live = true
@@ -273,6 +277,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   }, [selected, detailRequest])
 
   const resolveAsOf = async () => {
+    if (!table) return
     const requested = new Date(`${asOfLocal}Z`)
     if (!asOfLocal || Number.isNaN(requested.getTime())) {
       setAsOfError('Choose a valid UTC date and time.'); return
@@ -303,7 +308,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   }
 
   const loadMore = async () => {
-    if (!cursor || loadingMore) return
+    if (!table || !cursor || loadingMore) return
     const generation = ++historyGeneration.current
     setLoadingMore(true); setHistoryError('')
     try {
@@ -329,6 +334,8 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     ? <> Last known provider commit {new Date(lastKnownAt).toLocaleString()} <span className="font-semibold">(stale)</span>.</>
     : null
   const controlAvailable = availability === 'available' || asOfAvailable
+  const registrationReplaced = selectedExact != null && revisions.length > 0
+    && revisions.every((revision) => revision.datasetId !== selectedExact.datasetId)
   const checking = availability === 'checking' || capabilitiesChecking
   const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
     : !controlAvailable ? 'Revision selection unavailable'
@@ -362,9 +369,11 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           Selected revision {selectedExact.revisionId} or its registration is missing or compacted. Selection preserved; latest was not substituted.
           {staleLastKnown}{' '}
+          {registrationReplaced && 'The current catalog registration has a different dataset identity. '}
           {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another retained revision</button>}
           {controlAvailable && ' or '}
-          <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow current latest explicitly</button>.
+          {table ? <><button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow current latest explicitly</button>.</>
+            : 'Choose a new dataset above to create a new binding.'}
         </div>
       )}
       {selectedExact && detailState === 'permission' && (

@@ -168,6 +168,27 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
 
+  it('keeps pinned recovery visible after the dataset registration disappears', async () => {
+    const selected = { kind: 'exact' as const, datasetId: 'removed-dataset', revisionId: '3',
+      lastKnown: { committedAt: '2026-07-15T12:00:00Z' } }
+    const data = { title: 'removed source', status: 'stale', config: {
+      uri: '/data/removed.lance', tableId: 'removed-table', datasetRef: selected,
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1,
+      nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
+    mocks.datasetRevision.mockRejectedValueOnce(Object.assign(
+      new Error('dataset_revision_unavailable'),
+      { status: 410, code: 'resource_gone', retryable: false },
+    ))
+    render1(data)
+
+    expect(await screen.findByText(/revision 3.*registration is missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(/Choose a new dataset above to create a new binding/i)
+    expect(screen.queryByRole('button', { name: /follow current latest explicitly/i })).not.toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
+  })
+
   it('distinguishes permission loss and retries the same exact identity', async () => {
     const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: '7' }
     const data = { title: 'orders', status: 'stale', config: {
