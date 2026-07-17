@@ -235,6 +235,7 @@ print(json.dumps({"task_id": task["id"], "attempt_id": claim["attempt_id"]}))
         assert before["status"] == "running"
         assert [item["id"] for item in before["taskAttempts"]] == [expected["attempt_id"]]
         assert before["externalWait"]["phase"] == "submitting"
+        assert before["externalWait"]["diagnosticCode"] is None
     finally:
         first.terminate()
         first.wait(timeout=10)
@@ -247,6 +248,7 @@ print(json.dumps({"task_id": task["id"], "attempt_id": claim["attempt_id"]}))
             second_base, f"/jobs?run_id={expected['task_id']}")["items"][0]
         assert [item["id"] for item in before_expiry["taskAttempts"]] == [expected["attempt_id"]]
         assert before_expiry["externalWait"]["phase"] == "submitting"
+        assert before_expiry["externalWait"]["diagnosticCode"] is None
         expire = r'''
 import datetime, os
 from hub import metadb

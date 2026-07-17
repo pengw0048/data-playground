@@ -3470,7 +3470,9 @@ def submit_durable_external_wait_task(
         attempt = DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
             status="queued", created_at=now)
-        s.add_all((task, attempt, DurableExternalWait(
+        s.add(task)
+        s.flush()
+        s.add_all((attempt, DurableExternalWait(
             task_id=task_id, provider_kind=request.provider_kind,
             submit_request=request_payload, idempotency_key=request.idempotency_key,
             phase="unsubmitted", next_poll_at=now,
