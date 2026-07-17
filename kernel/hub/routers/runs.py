@@ -114,7 +114,7 @@ def _local_run_intent_sha256(
 
 def _external_wait_request(deps, graph, target_node_id: str | None):
     """Recognize only the installed zero-port fixture consumer, before ordinary compile/output gates."""
-    external = [node for node in graph.nodes if node.type in deps.external_wait_nodes]
+    external = [node for node in graph.nodes if node.type in getattr(deps, "external_wait_nodes", {})]
     if not external:
         return None
     if (len(graph.nodes) != 1 or len(external) != 1 or graph.edges
