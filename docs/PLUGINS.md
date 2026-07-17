@@ -215,16 +215,17 @@ only bounded reads. Workspace persistence and mixed Workspace browse are consume
 not responsibilities of a provider wheel.
 
 Import only these public types: `CatalogMount`, `CatalogResource`, `ProviderCapabilities`, `ProviderPage`,
-`ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`, and `bounded_list_children`.
+`ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`, `bounded_list_children`,
+`bounded_resolve`, and `bounded_ancestors`.
 A `CatalogMount(id, provider, config)` identifies a local placement; `id` is not a provider resource
 ID. A provider resource has an opaque stable `id`; display names and parent paths are never identity.
 
 Implement `capabilities`, `list_children`, `resolve`, `ancestors`, and `dataset_detail`. Children take
 a finite `limit` (1–500) and an opaque cursor; order must be deterministic. A provider returns
 `ready`, `partial`, `unavailable`, or `unsupported` rather than pretending an offline or unsupported
-read succeeded. Use `bounded_list_children` at a consumer boundary when a synchronous provider must
-not delay local work: deadline, cancellation, and availability failures are normalized to an honest
-unavailable result, while a provider can return an explicit truthful partial result itself.
+read succeeded. Use the matching `bounded_*` helper at a consumer boundary when a synchronous provider
+must not delay local work: deadline, cancellation, and availability failures are normalized to an
+honest unavailable result, while a provider can return an explicit truthful partial result itself.
 
 Distribute a provider wheel through the `dataplay.catalog_providers` entry-point group. The entry point
 is a zero-argument factory returning the provider; mount configuration is passed on each call. Verify
@@ -239,6 +240,22 @@ The command verifies capability discovery, bounded pagination, opaque resolve, a
 detail, and stable identities after a provider restart. The reference
 [`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) reads a `catalog.json`
 document from its `root` mount config and never writes it.
+
+Place installed providers into bounded Workspace browse with `DP_CATALOG_MOUNTS`, a JSON array of
+local mount configuration. Mounts default to the local Workspace root; `containerId` can place a
+mount's root resources in another local overlay container. For example:
+
+```bash
+export DP_CATALOG_MOUNTS='[
+  {"id":"research-a","provider":"dp-file-catalog","config":{"root":"/data/catalog-a"}},
+  {"id":"research-b","provider":"dp-file-catalog","config":{"root":"/data/catalog-b"}}
+]'
+```
+
+`id` is the stable local mount identity and must be unique. Configuration is passed only to the
+installed provider and is never returned by the API; changing mount identity or configuration
+invalidates outstanding mixed-browse cursors. A malformed entry or failed provider activation is
+reported as an unavailable source while local and other healthy sources remain browseable.
 
 Use a conformance fixture whose first two deterministic root resources share a display name but have
 distinct IDs, and whose first root container has a dataset child with schema. This makes the command

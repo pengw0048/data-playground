@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import threading
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
 from pydantic import Field, model_validator
 
@@ -23,6 +24,7 @@ _provider_read_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=_PROVIDER_READ_CONCURRENCY,
     thread_name_prefix="dp-catalog-provider",
 )
+_R = TypeVar("_R")
 
 
 class CatalogMount(Wire):
@@ -96,21 +98,45 @@ class ReadOnlyCatalogProvider(Protocol):
     def dataset_detail(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult: ...
 
 
-def _unavailable(reason: str) -> ProviderPage:
-    return ProviderPage(state="unavailable", reason=reason)
-
-
-def _list_children(
-    provider: ReadOnlyCatalogProvider,
-    mount: CatalogMount,
-    parent_id: str | None,
-    limit: int,
-    cursor: str | None,
-) -> ProviderPage:
+def _provider_read(function: Callable[[], _R]) -> _R:
     try:
-        return provider.list_children(mount, parent_id, limit=limit, cursor=cursor)
+        return function()
     finally:
         _provider_read_slots.release()
+
+
+def _bounded_provider_read(
+    function: Callable[[], _R],
+    *,
+    unavailable: Callable[[str], _R],
+    unsupported: Callable[[], _R],
+    timeout: float,
+) -> _R:
+    if timeout <= 0:
+        return unavailable("deadline exceeded")
+    if not _provider_read_slots.acquire(blocking=False):
+        return unavailable("provider busy")
+    try:
+        future = _provider_read_executor.submit(_provider_read, function)
+    except Exception:  # noqa: BLE001 -- executor shutdown is an unavailable provider result
+        _provider_read_slots.release()
+        return unavailable("provider unavailable")
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        if future.cancel():
+            _provider_read_slots.release()
+        return unavailable("deadline exceeded")
+    except concurrent.futures.CancelledError:
+        return unavailable("request cancelled")
+    except asyncio.CancelledError:
+        return unavailable("request cancelled")
+    except NotImplementedError:
+        return unsupported()
+    except OSError:
+        return unavailable("provider unavailable")
+    except Exception:  # noqa: BLE001 -- provider failures must not take down local browse
+        return unavailable("provider read failed")
 
 
 def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
@@ -123,29 +149,34 @@ def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount
     """
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
-    if timeout <= 0:
-        return _unavailable("deadline exceeded")
-    if not _provider_read_slots.acquire(blocking=False):
-        return _unavailable("provider busy")
-    try:
-        future = _provider_read_executor.submit(
-            _list_children, provider, mount, parent_id, limit, cursor)
-    except Exception:  # noqa: BLE001 -- executor shutdown must stay an unavailable provider result
-        _provider_read_slots.release()
-        return _unavailable("provider unavailable")
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        if future.cancel():
-            _provider_read_slots.release()
-        return _unavailable("deadline exceeded")
-    except concurrent.futures.CancelledError:
-        return _unavailable("request cancelled")
-    except asyncio.CancelledError:
-        return _unavailable("request cancelled")
-    except NotImplementedError:
-        return ProviderPage(state="unsupported", reason="list_children is unsupported")
-    except OSError:
-        return _unavailable("provider unavailable")
-    except Exception:  # noqa: BLE001 -- provider failures must not take down local browse
-        return _unavailable("provider read failed")
+    return _bounded_provider_read(
+        lambda: provider.list_children(mount, parent_id, limit=limit, cursor=cursor),
+        unavailable=lambda reason: ProviderPage(state="unavailable", reason=reason),
+        unsupported=lambda: ProviderPage(
+            state="unsupported", reason="list_children is unsupported"),
+        timeout=timeout,
+    )
+
+
+def bounded_resolve(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
+                    resource_id: str, *, timeout: float = 1.0) -> ProviderResourceResult:
+    """Resolve one provider identity without letting synchronous provider I/O block Workspace."""
+    return _bounded_provider_read(
+        lambda: provider.resolve(mount, resource_id),
+        unavailable=lambda reason: ProviderResourceResult(state="unavailable", reason=reason),
+        unsupported=lambda: ProviderResourceResult(
+            state="unsupported", reason="resolve is unsupported"),
+        timeout=timeout,
+    )
+
+
+def bounded_ancestors(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
+                      resource_id: str, *, timeout: float = 1.0) -> ProviderAncestors:
+    """Read one bounded ancestor chain without materializing a provider catalog."""
+    return _bounded_provider_read(
+        lambda: provider.ancestors(mount, resource_id),
+        unavailable=lambda reason: ProviderAncestors(state="unavailable", reason=reason),
+        unsupported=lambda: ProviderAncestors(
+            state="unsupported", reason="ancestors is unsupported"),
+        timeout=timeout,
+    )
