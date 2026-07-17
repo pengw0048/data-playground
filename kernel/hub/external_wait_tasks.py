@@ -7,6 +7,7 @@ import os
 import queue
 import shutil
 import stat
+import tempfile
 import threading
 import uuid
 from pathlib import Path
@@ -96,7 +97,7 @@ def _stage_lock(lock_path: Path):
         os.close(fd)
 
 
-def _prepare_stage(claim: dict, deps, token: str) -> tuple[Path, tuple[int, int]]:
+def _prepare_stage(claim: dict, deps, token: str) -> tuple[Path, tuple[int, int], int]:
     stage, target, _lock = _stage_paths(claim, deps)
     _managed_dir(stage.parent)
     expected = (claim.get("stage_dev"), claim.get("stage_ino"))
@@ -113,13 +114,19 @@ def _prepare_stage(claim: dict, deps, token: str) -> tuple[Path, tuple[int, int]
             raise ValueError("external wait staging root identity changed")
     if not stage.exists():
         stage.mkdir(mode=0o700)
-    info = stage.lstat()
+    root_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    info = os.fstat(root_fd)
     identity = (int(info.st_dev), int(info.st_ino))
-    if not metadb.pin_external_wait_stage(
-        claim["task_id"], claim["attempt_id"], token, *identity
-    ):
+    try:
+        pinned = metadb.pin_external_wait_stage(
+            claim["task_id"], claim["attempt_id"], token, *identity)
+    except BaseException:
+        os.close(root_fd)
+        raise
+    if not pinned:
+        os.close(root_fd)
         raise RuntimeError("external wait staging owner was fenced")
-    return target, identity
+    return target, identity, root_fd
 
 
 def _cleanup_stage(claim: dict, deps, identity: tuple[int, int]) -> bool:
@@ -149,18 +156,20 @@ def _remove_empty_stage(claim: dict, deps, identity: tuple[int, int]) -> None:
             stage.rmdir()
 
 
-def _validate_download(target: Path, identity: tuple[int, int], raw) -> dict:
+def _validate_download(
+        target: Path, identity: tuple[int, int], raw, *, root_fd: int | None = None,
+        sink=None) -> dict:
     from hub.external_wait import ExternalWaitDownloadEvidence
 
     evidence = ExternalWaitDownloadEvidence.model_validate(raw)
     root = target.parent
     root_info = root.lstat()
+    pinned = os.fstat(root_fd) if root_fd is not None else root_info
+    if (root_info.st_dev, root_info.st_ino) != identity or (
+            pinned.st_dev, pinned.st_ino) != identity or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("staging root identity changed")
     info = target.lstat()
     entries = list(root.iterdir())
-    if (root_info.st_dev, root_info.st_ino) != identity or not stat.S_ISDIR(
-        root_info.st_mode
-    ):
-        raise ValueError("staging root identity changed")
     if (
         not stat.S_ISREG(info.st_mode)
         or info.st_nlink != 1
@@ -188,6 +197,8 @@ def _validate_download(target: Path, identity: tuple[int, int], raw) -> dict:
             raise ValueError("download result identity changed during validation")
         while chunk := os.read(fd, 1024 * 1024):
             digest.update(chunk)
+            if sink is not None:
+                sink.write(chunk)
         after_file = os.fstat(fd)
         if (
             after_file.st_dev,
@@ -206,6 +217,8 @@ def _validate_download(target: Path, identity: tuple[int, int], raw) -> dict:
         entry.name for entry in root.iterdir()
     ] != [target.name]:
         raise ValueError("staging root identity changed")
+    if sink is not None:
+        sink.seek(0)
     return evidence.model_dump(mode="json")
 
 
@@ -222,6 +235,7 @@ def _download(claim: dict, token: str, deps) -> None:
                 permanent=False,
             )
             return
+        root_fd = None
         try:
             if claim.get("action") == "cancel_after_success":
                 identity = (claim.get("stage_dev"), claim.get("stage_ino"))
@@ -237,7 +251,7 @@ def _download(claim: dict, token: str, deps) -> None:
                     if done:
                         _remove_empty_stage(claim, deps, identity)
                 return
-            target, identity = _prepare_stage(claim, deps, token)
+            target, identity, root_fd = _prepare_stage(claim, deps, token)
             if claim["cancel_requested"]:
                 if _cleanup_stage(claim, deps, identity):
                     metadb.cancel_external_wait_after_success(
@@ -249,7 +263,7 @@ def _download(claim: dict, token: str, deps) -> None:
                 raise RuntimeError("external wait adapter is unavailable")
             handle = ExternalWaitHandle.model_validate(claim["handle"])
             evidence = _validate_download(
-                target, identity, adapter.download(handle, target)
+                target, identity, adapter.download(handle, target), root_fd=root_fd
             )
             committed = metadb.commit_external_wait_download(
                 claim["task_id"], claim["attempt_id"], token, evidence
@@ -290,6 +304,9 @@ def _download(claim: dict, token: str, deps) -> None:
                 "external_wait_download_failed",
                 permanent=False,
             )
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
 
 
 def _publish(claim: dict, token: str, deps) -> None:
@@ -315,8 +332,10 @@ def _publish(claim: dict, token: str, deps) -> None:
             intent = WriteIntent.model_validate(claim["write_intent"])
 
             def write_candidate(uri: str) -> None:
-                _validate_download(target, identity, claim["download_evidence"])
-                parquet.write_table(arrow_csv.read_csv(target), uri)
+                with tempfile.TemporaryFile() as snapshot:
+                    _validate_download(
+                        target, identity, claim["download_evidence"], sink=snapshot)
+                    parquet.write_table(arrow_csv.read_csv(snapshot), uri)
 
             receipt = write_managed_local_file(
                 storage=deps.storage,

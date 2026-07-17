@@ -30,6 +30,7 @@ from hub.backends import (
     backend_supports_admitted_input_manifests, backend_supports_named_multi_output_runs,
 )
 from hub.deps import get_deps
+from hub.executors.engine import declared_schema
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
@@ -282,9 +283,11 @@ def _write_admission_for_graph(
             partitions=partitions,
         )
     try:
-        schemas = schema_for_graph(
-            graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
-            getattr(deps, "node_specs", {}), storage=deps.storage)
+        schemas = ({node_id: declared_schema(next(
+            candidate for candidate in graph.nodes if candidate.id != node_id))}
+            if direct_local else schema_for_graph(
+                graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
+                getattr(deps, "node_specs", {}), storage=deps.storage))
         schema = schemas.get(node_id)
     except ManagedSourceReadError as exc:
         raise HTTPException(400, str(exc)) from exc

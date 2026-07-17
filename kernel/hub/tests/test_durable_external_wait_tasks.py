@@ -235,7 +235,7 @@ def test_submit_response_loss_restart_download_and_publish(identity, tmp_path):
         assert sentinel not in encoded
 
 
-def test_publication_response_loss_recovers_exact_receipt(identity, tmp_path):
+def test_publication_response_loss_recovers_exact_receipt(identity, tmp_path, monkeypatch):
     task, _ = _submit(identity)
     _provider_succeeded(task["id"])
     storage = LocalStorage(str(tmp_path / "outputs"))
@@ -252,6 +252,16 @@ def test_publication_response_loss_recovers_exact_receipt(identity, tmp_path):
 
         publish = metadb.claim_external_wait_transition(task["id"], "publish")
         assert publish is not None and publish["action"] == "publish"
+        _stage, target, _lock = external_wait_tasks._stage_paths(publish, deps)
+        import pyarrow.csv as arrow_csv
+        read_csv = arrow_csv.read_csv
+
+        def replace_path_after_validation(source, *args, **kwargs):
+            target.unlink()
+            target.write_bytes(b"value\n999\n")
+            return read_csv(source, *args, **kwargs)
+
+        monkeypatch.setattr(arrow_csv, "read_csv", replace_path_after_validation)
         committed = catalog.publish_managed_local_write
         calls = 0
 
@@ -273,6 +283,9 @@ def test_publication_response_loss_recovers_exact_receipt(identity, tmp_path):
         assert WriteReceipt.model_validate(
             final["status_doc"]["outputs"][0]["write_receipt"]
         ) == WriteReceipt.model_validate(final["output_receipt"])
+        import pyarrow.parquet as parquet
+        receipt = WriteReceipt.model_validate(final["output_receipt"])
+        assert parquet.read_table(receipt.publication.artifact_uri).to_pylist() == [{"value": 1}]
         assert not list((tmp_path / ".dp-external-stage" / "attempts").glob("*"))
     finally:
         storage.close()
@@ -389,8 +402,9 @@ def test_retry_fences_old_attempt_stage_and_download_evidence(identity, tmp_path
     old_token = "old-download"
     old = metadb.claim_external_wait_transition(task["id"], old_token)
     assert old is not None and old["action"] == "download"
-    _target, identity_token = external_wait_tasks._prepare_stage(old, SimpleNamespace(
-        workspace=str(tmp_path)), old_token)
+    _target, identity_token, root_fd = external_wait_tasks._prepare_stage(
+        old, SimpleNamespace(workspace=str(tmp_path)), old_token)
+    os.close(root_fd)
     metadb.request_durable_task_cancel(task["id"])
     assert external_wait_tasks._cleanup_stage(
         old, SimpleNamespace(workspace=str(tmp_path)), identity_token)
@@ -857,7 +871,8 @@ def test_malformed_inactive_and_hung_adapters_stay_bounded(identity):
         _wait_until(lambda: hanging_task["id"] not in external_wait_tasks._inflight)
 
 
-def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, monkeypatch):
+def test_exact_route_admission_and_persistence_failure_submit_nothing(
+        identity, monkeypatch, tmp_path):
     from fastapi import HTTPException
     from hub.models import Graph
     from hub.routers import runs
@@ -876,6 +891,22 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, 
         "edges": [{"id": "wait-write", "source": "wait", "target": "write",
                    "sourceHandle": "out", "targetHandle": "in"}],
     })
+
+    real_graph = graph.model_copy(deep=True)
+    storage_root = tmp_path / "outputs"
+    real_graph.nodes[1].data["config"]["destination"] = str(storage_root / "result.parquet")
+    storage = LocalStorage(str(storage_root))
+    try:
+        real_admission = runs._write_admission_for_graph(
+            SimpleNamespace(
+                workspace=str(tmp_path), storage=storage,
+                catalog=InMemoryCatalog(str(tmp_path / "catalog"), lambda _uri: DuckDBAdapter()),
+                resolve_adapter=lambda _uri: DuckDBAdapter()),
+            real_graph, "write", uid, submission, direct_local=True)
+    finally:
+        storage.close()
+    assert [(column.name, column.type) for column in real_admission.intent.expected_schema] == [
+        ("value", "int")]
 
     class Counting(Adapter):
         def __init__(self):
