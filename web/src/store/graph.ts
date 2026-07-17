@@ -2216,7 +2216,9 @@ export const useStore = create<Store>((set, get) => ({
       const role = file?.role ?? null
       const accessRemoved = roleRefreshed && !file
       if (accessRemoved) rememberRole(userId, id, null) // authoritative revoke/delete
+      const selectedId = get().doc.id === id ? get().selectedId : null
       get().loadDoc(doc, role)
+      if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor

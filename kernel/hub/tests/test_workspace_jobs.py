@@ -85,6 +85,27 @@ def test_workspace_jobs_are_accessible_filtered_and_keyset_paginated():
     assert [item["runId"] for item in node["items"]] == [f"failed-{suffix}"]
 
 
+def test_workspace_jobs_keep_the_durable_backend_attempt_after_live_state_pruning():
+    uid, suffix = _identity()
+    canvas_id = f"jobs-a-{suffix}"
+    run_id = f"durable-attempt-{suffix}"
+    assert metadb.record_run(canvas_id, None, "run", "done", run_id=run_id)
+    with metadb.session() as session:
+        session.add(metadb.RunBackendJob(
+            run_id=run_id,
+            backend="ray-jobs",
+            attempt_id=f"attempt-{suffix}",
+            submission_id=f"submission-{suffix}",
+            job_uri=f"s3://jobs/{suffix}",
+            result_uri=f"s3://results/{suffix}",
+        ))
+
+    page = metadb.list_workspace_runs(uid, run_id=run_id)
+
+    assert page["items"][0]["backend"] == "ray-jobs"
+    assert page["items"][0]["attempt"] == f"attempt-{suffix}"
+
+
 def test_workspace_jobs_route_enforces_visibility_and_rejects_bad_cursor():
     uid, suffix = _identity()
     canvas_id = f"jobs-a-{suffix}"

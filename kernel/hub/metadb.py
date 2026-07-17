@@ -3426,7 +3426,8 @@ def _workspace_run_cursor_decode(cursor: str | None) -> tuple[datetime.datetime,
 
 
 def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
-                       backend: str | None, source: str) -> tuple[tuple[datetime.datetime, str], dict]:
+                       backend: str | None, backend_attempt: str | None,
+                       source: str) -> tuple[tuple[datetime.datetime, str], dict]:
     """Normalize terminal history and live state without inventing another lifecycle."""
     if source == "history":
         outputs = json.loads(row.outputs)
@@ -3474,7 +3475,9 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
     effective_backend = str(
         backend or backend_ref.get("backend")
         or (placement if state_doc is not None else "unknown"))
-    attempt = str(backend_ref.get("attempt_id") or profile_attempt or doc.get("runId") or doc["id"])
+    attempt = str(
+        backend_ref.get("attempt_id") or backend_attempt
+        or profile_attempt or doc.get("runId") or doc["id"])
     doc.update({
         "canvasId": row.canvas_id, "canvasName": canvas_name,
         "nodeLabel": node_label, "backend": effective_backend,
@@ -3552,7 +3555,10 @@ def list_workspace_runs(
                 and_(RunRecord.created_at == stamp, history_identity < identity),
             ))
         history_rows = s.execute(
-            select(RunRecord, Canvas.name, RunState.doc, RunBackendJob.backend)
+            select(
+                RunRecord, Canvas.name, RunState.doc,
+                RunBackendJob.backend, RunBackendJob.attempt_id,
+            )
             .join(Canvas, Canvas.id == RunRecord.canvas_id)
             .outerjoin(RunState, and_(
                 RunState.run_id == RunRecord.run_id,
@@ -3562,11 +3568,11 @@ def list_workspace_runs(
             .where(*history_predicates)
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, raw_state, backend_name in history_rows:
+        for row, name, raw_state, backend_name, backend_attempt in history_rows:
             state_doc = json.loads(raw_state) if raw_state else None
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
-                backend=backend_name, source="history"))
+                backend=backend_name, backend_attempt=backend_attempt, source="history"))
 
         state_identity = literal("s:") + RunState.run_id
         state_predicates = [
@@ -3606,20 +3612,23 @@ def list_workspace_runs(
                 and_(RunState.created_at == stamp, state_identity < identity),
             ))
         state_rows = s.execute(
-            select(RunState, Canvas.name, RunBackendJob.backend)
+            select(
+                RunState, Canvas.name,
+                RunBackendJob.backend, RunBackendJob.attempt_id,
+            )
             .join(Canvas, Canvas.id == RunState.canvas_id)
             .outerjoin(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
             .where(*state_predicates)
             .order_by(RunState.created_at.desc(), RunState.run_id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, backend_name in state_rows:
+        for row, name, backend_name, backend_attempt in state_rows:
             try:
                 state_doc = json.loads(row.doc)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("persisted run state is invalid") from exc
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
-                backend=backend_name, source="state"))
+                backend=backend_name, backend_attempt=backend_attempt, source="state"))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]
     has_more = len(candidates) > limit
