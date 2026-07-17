@@ -126,7 +126,8 @@ def require_output_port(
     return found
 
 
-def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
+def _execution_source_bindings(
+        graph: Graph, roots: list[GraphNode]) -> list[tuple[GraphNode, dict]]:
     """Source configs a selected execution cone can actually reach, including section bodies.
 
     A section executes its ``parent_id`` children rather than ordinary graph edges. Bound the
@@ -140,7 +141,7 @@ def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict
 
     queue = list(roots)
     seen: set[str] = set()
-    configs: list[dict] = []
+    bindings: list[tuple[GraphNode, dict]] = []
     cursor = 0
     while cursor < len(queue):
         if cursor >= _MAX_EXECUTION_SOURCE_NODES:
@@ -153,10 +154,14 @@ def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict
         data = node.data if isinstance(node.data, dict) else {}
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
         if node.type == "source":
-            configs.append(config)
+            bindings.append((node, config))
         if node.type == "section":
             queue.extend(children.get(node.id, []))
-    return configs
+    return bindings
+
+
+def _execution_source_configs(graph: Graph, roots: list[GraphNode]) -> list[dict]:
+    return [config for _node, config in _execution_source_bindings(graph, roots)]
 
 
 def resolve_source_refs(graph: Graph, resolve) -> None:
@@ -221,8 +226,9 @@ def all_upstream_source_uris(graph: Graph, node_id: str) -> list[str]:
     """Every executable source URI feeding a node, including section-contained sources."""
     uris: list[str] = []
     seen: set[str] = set()
-    for config in _execution_source_configs(graph, upstream_chain(graph, node_id)):
-        uri = config.get("uri")
+    exact_artifacts = getattr(graph, "_input_artifact_uris", {})
+    for node, config in _execution_source_bindings(graph, upstream_chain(graph, node_id)):
+        uri = exact_artifacts.get(node.id) or config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)
@@ -263,8 +269,9 @@ def execution_source_uris(graph: Graph, target_node_id: str | None) -> list[str]
         return all_upstream_source_uris(graph, target_node_id)
     uris: list[str] = []
     seen: set[str] = set()
-    for config in _execution_source_configs(graph, list(graph.nodes)):
-        uri = config.get("uri")
+    exact_artifacts = getattr(graph, "_input_artifact_uris", {})
+    for node, config in _execution_source_bindings(graph, list(graph.nodes)):
+        uri = exact_artifacts.get(node.id) or config.get("uri")
         if uri and uri not in seen:
             seen.add(uri)
             uris.append(uri)

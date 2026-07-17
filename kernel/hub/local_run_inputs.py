@@ -99,4 +99,10 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
         config["_input_dataset_id"] = item["dataset_id"]
         config["_input_provider"] = item["provider"]
         config["_input_revision_id"] = item["revision_id"]
+        artifact_uri = metadb.managed_local_file_revision_artifact(
+            item["dataset_id"], item["revision_id"])
+        if artifact_uri is not None:
+            # Execution ownership must fence the selected old artifact, not the mutable catalog head.
+            config["_input_artifact_uri"] = artifact_uri
+            bound._input_artifact_uris[str(node.id)] = artifact_uri
     return bound

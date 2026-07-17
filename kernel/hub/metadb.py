@@ -1654,6 +1654,7 @@ def _terminalize_unadmitted_profile(
     }
     _abandon_run_preallocation_attempts(s, state.run_id)
     _replace_attempt_ref(s, "run_state", state.run_id, None)
+    _drop_local_result_owner(s, "profile_job", state.run_id)
     state.status = "failed"
     state.doc = json.dumps(failed, default=str)
     state.preallocation_token = None
@@ -1759,6 +1760,7 @@ def preallocate_or_adopt_profile_run_owner(
         submission_id: str, uid: str, auth_canvas_id: str | None,
         operational_canvas_id: str, target_node_id: str, target_port_id: str,
         plan_digest: str,
+        input_manifest: list[dict[str, str]] | None = None,
         request_id: str | None = None,
         ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> ProfileRunReservation:
     """Reserve once or return the exact durable state bound to this submission id."""
@@ -1820,6 +1822,9 @@ def preallocate_or_adopt_profile_run_owner(
             preallocation_token=token,
             preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
         ))
+        s.flush()
+        if input_manifest is not None:
+            sync_local_result_owner(s, "profile_job", run_id, input_manifest)
         return ProfileRunReservation(
             run_id, token, attempt_order, status_doc, True)
 
@@ -1827,6 +1832,7 @@ def preallocate_or_adopt_profile_run_owner(
 def preallocate_profile_run_owner(
         run_id: str, uid: str, auth_canvas_id: str | None, operational_canvas_id: str,
         target_node_id: str, target_port_id: str, plan_digest: str,
+        input_manifest: list[dict[str, str]] | None = None,
         request_id: str | None = None,
         ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> tuple[str, int]:
     """Mint a durable profile identity and DB-monotonic attempt order before kernel allocation.
@@ -1882,6 +1888,9 @@ def preallocate_profile_run_owner(
             preallocation_token=token,
             preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
         ))
+        s.flush()
+        if input_manifest is not None:
+            sync_local_result_owner(s, "profile_job", run_id, input_manifest)
     return token, attempt_order
 
 
@@ -2887,6 +2896,8 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
             submission_id=str(submission_id).lower(), target_node_id=target_node_id,
             intent_sha256=intent_sha256, manifest=payload,
         ))
+        s.flush()
+        sync_local_result_owner(s, "run_input_admission", run_id, manifest)
         return run_id, True
 
 
@@ -3090,9 +3101,12 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         s.delete(obj)
     if stale:
         _lock_local_result_registry(s)
-    sync_local_result_owner(s, "run_record", rid, {"outputs": output_docs})
+    sync_local_result_owner(
+        s, "run_record", rid, {"outputs": output_docs}, rec.input_manifest, rec.profile)
     for obj in stale:
         _drop_local_result_owner_locked(s, "run_record", obj.id)
+        if obj.run_id:
+            _drop_local_result_owner_locked(s, "run_input_admission", obj.run_id)
     return True
 
 
@@ -3180,6 +3194,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         for sh in shares:
             s.delete(sh)
         for admission in admissions:
+            local_owners.append(("run_input_admission", admission.run_id))
             s.delete(admission)
         for r in runs:
             _replace_attempt_ref(s, "run_record", r.id, None)
@@ -3189,6 +3204,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             local_owners.append(("canvas_version", v.id))
             s.delete(v)
         for latest in profile_latest:
+            local_owners.append(("profile_job", latest.run_id))
             s.delete(latest)
         if profile_retention is not None:
             s.delete(profile_retention)
@@ -3200,6 +3216,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
                 s.delete(job)
             _replace_attempt_ref(s, "run_state", rs.run_id, None)
             local_owners.append(("run_state", rs.run_id))
+            if rs.job_type == "profile":
+                local_owners.append(("profile_job", rs.run_id))
             s.delete(rs)
         # Keep the opaque anti-resurrection fence, but sever every authorization handle into a deleted,
         # reusable canvas namespace. A replacement canvas must never inherit retained runs.
@@ -3381,6 +3399,7 @@ def _upsert_profile_latest(
         ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
         with_for_update=True, populate_existing=True,
     )
+    retired_run_ids: set[str] = set()
     if current is None:
         if (retention.cutoff_attempt_order is not None
                 and attempt_order <= retention.cutoff_attempt_order):
@@ -3398,6 +3417,7 @@ def _upsert_profile_latest(
         current.doc = payload
         current.updated_at = now
     elif attempt_order > current.attempt_order:
+        retired_run_ids.add(current.run_id)
         current.run_id = run_id
         current.doc = payload
         current.attempt_order = attempt_order
@@ -3418,7 +3438,12 @@ def _upsert_profile_latest(
             retention.cutoff_attempt_order = evicted_order
             retention.updated_at = now
     for row in stale:
+        retired_run_ids.add(row.run_id)
         s.delete(row)
+    if retired_run_ids:
+        _lock_local_result_registry(s)
+        for retired_run_id in sorted(retired_run_ids - {run_id}):
+            _drop_local_result_owner_locked(s, "profile_job", retired_run_id)
 
 
 def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
@@ -5374,7 +5399,7 @@ _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
-    "run_record", "run_state",
+    "profile_job", "run_input_admission", "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LOCAL_RESULT_DIR = ".dp-results"
@@ -5451,9 +5476,77 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     elif owner_kind in ("canvas", "canvas_version"):
         for value in values:
             candidates.update(_canvas_local_result_candidates(value))
+    elif owner_kind in ("profile_job", "run_input_admission"):
+        pass
     else:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
     return sorted(candidates)
+
+
+def _manifest_revision_identities(value: object) -> set[tuple[str, str]]:
+    """Extract the fixed, secret-free dataset/revision pairs from one persisted manifest surface."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return set()
+    if isinstance(value, dict):
+        identities: set[tuple[str, str]] = set()
+        for key in ("input_manifest", "inputManifest"):
+            if key in value:
+                identities.update(_manifest_revision_identities(value[key]))
+        profile = value.get("profile")
+        if isinstance(profile, dict):
+            identities.update(_manifest_revision_identities(profile))
+        return identities
+    if not isinstance(value, list):
+        return set()
+    identities = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        dataset_id = item.get("dataset_id")
+        revision_id = item.get("revision_id")
+        if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
+            identities.add((dataset_id, revision_id))
+    return identities
+
+
+def _canvas_revision_identities(value: object) -> set[tuple[str, str]]:
+    """Extract exact core-revision selections from one canonical canvas document."""
+    if not isinstance(value, dict):
+        return set()
+    nodes = value.get("nodes", [])
+    if not isinstance(nodes, list) or len(nodes) > 5000:
+        return set()
+    identities: set[tuple[str, str]] = set()
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") != "source":
+            continue
+        data = node.get("data")
+        config = data.get("config") if isinstance(data, dict) else None
+        ref = config.get("datasetRef") if isinstance(config, dict) else None
+        if not isinstance(ref, dict):
+            continue
+        selected = ref.get("resolved") if ref.get("kind") == "as_of" else ref
+        if not isinstance(selected, dict):
+            continue
+        dataset_id = selected.get("datasetId", selected.get("dataset_id"))
+        revision_id = selected.get("revisionId", selected.get("revision_id"))
+        if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
+            identities.add((dataset_id, revision_id))
+    return identities
+
+
+def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    if owner_kind in ("canvas", "canvas_version"):
+        for value in values:
+            identities.update(_canvas_revision_identities(value))
+    elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
+        for value in values:
+            identities.update(_manifest_revision_identities(value))
+    return sorted(identities)
 
 
 def _lock_local_result_registry(s) -> LocalResultRegistry:
@@ -5499,7 +5592,8 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
     if owner_kind not in _LOCAL_RESULT_OWNER_KINDS:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
     candidates = _local_result_owner_candidates(owner_kind, values)
-    if not candidates and s.scalar(select(LocalResultReference.uri).where(
+    revision_identities = _local_result_revision_identities(owner_kind, values)
+    if not candidates and not revision_identities and s.scalar(select(LocalResultReference.uri).where(
             LocalResultReference.owner_kind == owner_kind,
             LocalResultReference.owner_key == str(owner_key)).limit(1)) is None:
         # The durable owner row/key is already serialized by its caller. Avoid turning every ordinary
@@ -5507,6 +5601,25 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
         return
     _lock_local_result_registry(s)
     _drop_local_result_owner_locked(s, owner_kind, str(owner_key))
+    if revision_identities:
+        revision_ids = [revision_id for _dataset_id, revision_id in revision_identities]
+        revisions = {row.revision_id: row for row in s.scalars(
+            select(ManagedLocalFileRevision).where(
+                ManagedLocalFileRevision.revision_id.in_(revision_ids))
+            .order_by(ManagedLocalFileRevision.revision_id).with_for_update())}
+        managed_dataset_ids = set(s.scalars(select(CatalogLogicalDataset.logical_id).where(
+            CatalogLogicalDataset.logical_id.in_(
+                [dataset_id for dataset_id, _revision_id in revision_identities]))))
+        for dataset_id, revision_id in revision_identities:
+            revision = revisions.get(revision_id)
+            if revision is None:
+                if dataset_id in managed_dataset_ids:
+                    raise RuntimeError("core-managed revision reference is unavailable")
+                continue
+            if revision.logical_id != dataset_id:
+                raise RuntimeError("core-managed revision reference does not match its dataset")
+            candidates.append(revision.artifact_uri)
+        candidates = sorted(set(candidates))
     artifacts: list[LocalResultArtifact] = []
     for start in range(0, len(candidates), _LOCAL_RESULT_QUERY_CHUNK):
         chunk = candidates[start:start + _LOCAL_RESULT_QUERY_CHUNK]
@@ -9859,6 +9972,87 @@ def managed_local_file_revision_open(uri: str, revision_id: str) -> str:
         if artifact is None or artifact.state != "ready":
             raise KeyError(revision_id)
         return row.artifact_uri
+
+
+def managed_local_file_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
+    """Resolve one exact core-owned revision to its managed artifact for read fencing."""
+    with session() as s:
+        row = s.get(ManagedLocalFileRevision, str(revision_id))
+        if row is None or row.logical_id != str(dataset_id):
+            return None
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            return None
+        return row.artifact_uri
+
+
+def managed_local_file_revision_gc_batch(
+        retention_seconds: float, *, limit: int = 50) -> dict[str, int | bool]:
+    """Retire one DB-clock-bounded batch of expired, unreferenced core revisions.
+
+    The revision's existing ``managed_file_revision`` reference is its retention hold. Every real
+    owner (canvas, admission, durable profile, cache/history, or live reader) uses the same artifact
+    reference table and therefore excludes the revision here. File deletion remains the established
+    local-result GC's job, including its exact lock/token fencing and retryable ``deleting`` state.
+    """
+    retention = _gc_seconds(retention_seconds, "managed revision retention_seconds")
+    bounded = max(0, min(int(limit), 500))
+    if bounded == 0:
+        return {"retired": 0, "has_more": False}
+    with session() as s:
+        _lock_local_result_registry(s)
+        cutoff = _db_now(s) - datetime.timedelta(seconds=retention)
+        external_reference = select(LocalResultReference.uri).where(
+            LocalResultReference.uri == ManagedLocalFileRevision.artifact_uri,
+            or_(
+                LocalResultReference.owner_kind != "managed_file_revision",
+                LocalResultReference.owner_key != ManagedLocalFileRevision.revision_id,
+            ),
+        ).exists()
+        statement = (select(ManagedLocalFileRevision)
+            .join(CatalogLogicalDataset,
+                  CatalogLogicalDataset.logical_id == ManagedLocalFileRevision.logical_id)
+            .where(
+                ManagedLocalFileRevision.committed_at <= cutoff,
+                or_(
+                    CatalogLogicalDataset.current_uri.is_(None),
+                    CatalogLogicalDataset.current_uri != ManagedLocalFileRevision.artifact_uri,
+                ),
+                ~external_reference,
+            )
+            .order_by(
+                ManagedLocalFileRevision.committed_at,
+                ManagedLocalFileRevision.revision_id,
+            ).limit(bounded + 1))
+        if s.get_bind().dialect.name == "postgresql":
+            statement = statement.with_for_update(of=ManagedLocalFileRevision)
+        rows = list(s.scalars(statement))
+        retired = 0
+        for revision in rows[:bounded]:
+            logical = s.get(CatalogLogicalDataset, revision.logical_id)
+            if logical is not None and logical.current_uri == revision.artifact_uri:
+                continue
+            artifact = s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
+            retention_ref = s.get(LocalResultReference, {
+                "uri": revision.artifact_uri,
+                "owner_kind": "managed_file_revision",
+                "owner_key": revision.revision_id,
+            }, with_for_update=True)
+            other_ref = s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == revision.artifact_uri,
+                or_(
+                    LocalResultReference.owner_kind != "managed_file_revision",
+                    LocalResultReference.owner_key != revision.revision_id,
+                ),
+            ).limit(1))
+            if other_ref is not None:
+                continue
+            if artifact is None or retention_ref is None or artifact.state != "ready":
+                raise RuntimeError("managed local revision retention ownership is inconsistent")
+            s.delete(retention_ref)
+            s.delete(revision)
+            retired += 1
+        return {"retired": retired, "has_more": len(rows) > bounded}
 
 
 def managed_local_file_revision_detail(uri: str, revision_id: str) -> dict:

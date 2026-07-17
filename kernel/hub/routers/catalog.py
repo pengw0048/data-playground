@@ -479,10 +479,17 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     try:
+        deps = get_deps()
         adapter = _revision_adapter(binding["uri"])
-        with db.base_guard():
-            raw = adapter.revision_detail(
-                binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
+        artifact_uri = metadb.managed_local_file_revision_artifact(dataset_id, revision_id)
+        source_scope = (source_read_scope(
+            deps.storage, [artifact_uri],
+            owner=f"catalog-revision:{dataset_id}:{uuid.uuid4().hex}")
+            if artifact_uri is not None else contextlib.nullcontext())
+        with source_scope:
+            with db.base_guard():
+                raw = adapter.revision_detail(
+                    binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)

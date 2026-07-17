@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import uuid
@@ -14,9 +15,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from hub import metadb
+from hub import graph as graph_mod, metadb
+from hub.local_run_inputs import bind_manifest
 from hub.main import app
-from hub.models import LineagePublication
+from hub.models import Graph, LineagePublication
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import catalog as catalog_routes
@@ -104,7 +106,7 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
     assert adapter.open_revision(second_uri, second["revision_id"]).fetchall() == [(2,)]
 
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
-        catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
+        catalog=catalog, storage=storage, resolve_adapter=lambda _uri: DuckDBAdapter()))
     table_id = catalog.get_table(second_uri).id
     page = catalog_routes.list_dataset_revisions(table_id, limit=1, cursor=None)
     assert page.items[0].dataset_id == second["dataset_id"]
@@ -320,3 +322,132 @@ def test_committed_publication_rejects_a_different_lineage_replay(local_catalog,
             metadb.CatalogPublicationEvent.effect_type == "lineage")))
         assert len(lineage_events) == 1
         assert len(list(session.scalars(select(metadb.CatalogLineageFact)))) == 1
+
+
+def _exact_canvas_doc(canvas_id: str, uri: str, dataset_id: str, revision_id: str) -> dict:
+    return {
+        "id": canvas_id,
+        "name": "Pinned revision",
+        "version": 1,
+        "nodes": [{
+            "id": "source",
+            "type": "source",
+            "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "uri": uri,
+                "datasetRef": {
+                    "kind": "exact", "datasetId": dataset_id, "revisionId": revision_id,
+                },
+            }},
+        }],
+        "edges": [],
+    }
+
+
+def test_revision_gc_waits_for_canvas_and_live_reader_then_converges(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "retained.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    second_uri, second = _publish(storage, catalog, logical_uri, 2)
+    canvas_id = f"canvas-{uuid.uuid4().hex}"
+    doc = _exact_canvas_doc(
+        canvas_id, second_uri, first["dataset_id"], first["revision_id"])
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id="owner", name="Pinned revision", version=1,
+            doc=json.dumps(doc)))
+        session.flush()
+        metadb.sync_local_result_owner(session, "canvas", canvas_id, doc)
+
+    assert metadb.managed_local_file_revision_gc_batch(0, limit=1) == {
+        "retired": 0, "has_more": False,
+    }
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        empty = {**doc, "nodes": [], "version": 2}
+        canvas.doc, canvas.version = json.dumps(empty), 2
+        metadb.sync_local_result_owner(session, "canvas", canvas_id, empty)
+
+    with storage.acquire_result_read(first_uri, "revision-gc-test"):
+        assert metadb.managed_local_file_revision_gc_batch(0, limit=1)["retired"] == 0
+
+    assert metadb.managed_local_file_revision_gc_batch(0, limit=1) == {
+        "retired": 1, "has_more": False,
+    }
+    storage.prune_results()
+    assert not pathlib.Path(first_uri).exists()
+    assert pathlib.Path(second_uri).exists()
+    with metadb.session() as session:
+        assert session.get(metadb.ManagedLocalFileRevision, first["revision_id"]) is None
+        assert session.get(metadb.ManagedLocalFileRevision, second["revision_id"]) is not None
+
+
+def test_admission_and_durable_profile_own_exact_revision_artifacts(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "jobs.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    second_uri, _second = _publish(storage, catalog, logical_uri, 2)
+    manifest = [{
+        "node_id": "source",
+        "dataset_id": first["dataset_id"],
+        "revision_id": first["revision_id"],
+        "provider": "managed-local-file",
+        "resolved_at": "2026-07-16T00:00:00+00:00",
+    }]
+    run_id, created = metadb.admit_local_run_inputs(
+        uid="owner", canvas_id=None, submission_id=str(uuid.uuid4()),
+        target_node_id=None, intent_sha256="a" * 64, manifest=manifest)
+    assert created is True
+
+    canvas_id = f"profile-canvas-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id="owner", name="Profile", version=1,
+            doc=json.dumps({"id": canvas_id, "nodes": [], "edges": []})))
+    profile = metadb.preallocate_or_adopt_profile_run_owner(
+        str(uuid.uuid4()), "owner", canvas_id, canvas_id,
+        "source", "out", "b" * 64, input_manifest=manifest)
+
+    with metadb.session() as session:
+        admission_ref = session.get(metadb.LocalResultReference, {
+            "uri": first_uri, "owner_kind": "run_input_admission", "owner_key": run_id,
+        })
+        profile_ref = session.get(metadb.LocalResultReference, {
+            "uri": first_uri, "owner_kind": "profile_job", "owner_key": profile.run_id,
+        })
+        assert admission_ref is not None and profile_ref is not None
+    assert metadb.managed_local_file_revision_gc_batch(0)["retired"] == 0
+    assert pathlib.Path(first_uri).exists() and pathlib.Path(second_uri).exists()
+
+
+def test_bound_execution_fences_the_selected_artifact_without_trusting_client_private_data(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "bound.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    second_uri, _second = _publish(storage, catalog, logical_uri, 2)
+    graph = Graph.model_validate({
+        "id": "bound-canvas",
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "uri": second_uri,
+                "_input_artifact_uri": "/tmp/client-forged.parquet",
+                "datasetRef": {
+                    "kind": "exact", "datasetId": first["dataset_id"],
+                    "revisionId": first["revision_id"],
+                },
+            }},
+        }],
+        "edges": [],
+    })
+    assert graph_mod.execution_source_uris(graph, "source") == [second_uri]
+
+    manifest = [{
+        "node_id": "source", "dataset_id": first["dataset_id"],
+        "revision_id": first["revision_id"], "provider": "managed-local-file",
+        "resolved_at": "2026-07-16T00:00:00+00:00",
+    }]
+    bound = bind_manifest(graph, "source", manifest, lambda _uri: DuckDBAdapter())
+    assert graph_mod.execution_source_uris(bound, "source") == [first_uri]
