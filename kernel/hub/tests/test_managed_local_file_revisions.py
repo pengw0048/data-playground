@@ -451,3 +451,53 @@ def test_bound_execution_fences_the_selected_artifact_without_trusting_client_pr
     }]
     bound = bind_manifest(graph, "source", manifest, lambda _uri: DuckDBAdapter())
     assert graph_mod.execution_source_uris(bound, "source") == [first_uri]
+
+
+def test_exact_canvas_reads_fence_the_selected_artifact_and_not_the_mutable_head(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "pinned-read.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    second_uri, _second = _publish(storage, catalog, logical_uri, 2)
+    graph = Graph.model_validate({
+        "id": "pinned-read-canvas",
+        "nodes": [{
+            "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "uri": second_uri,
+                "datasetRef": {
+                    "kind": "exact", "datasetId": first["dataset_id"],
+                    "revisionId": first["revision_id"],
+                },
+            }},
+        }],
+        "edges": [],
+    })
+
+    graph_mod.resolve_source_refs(graph, lambda uri: uri)
+
+    assert graph_mod.execution_source_uris(graph, "source") == [first_uri]
+    with storage.acquire_result_read(first_uri, "exact-canvas-read"):
+        assert metadb.managed_local_file_revision_gc_batch(0)["retired"] == 0
+
+
+def test_provider_owned_manifests_do_not_create_core_revision_ownership(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "provider-owned.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    manifest = [{
+        "node_id": "source",
+        "dataset_id": first["dataset_id"],
+        "revision_id": first["revision_id"],
+        "provider": "external-provider",
+        "resolved_at": "2026-07-16T00:00:00+00:00",
+    }]
+
+    with metadb.session() as session:
+        metadb.sync_local_result_owner(session, "run_input_admission", "external-run", manifest)
+    with metadb.session() as session:
+        assert session.get(metadb.LocalResultReference, {
+            "uri": first_uri,
+            "owner_kind": "run_input_admission",
+            "owner_key": "external-run",
+        }) is None

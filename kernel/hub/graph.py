@@ -9,7 +9,7 @@ import math
 
 from dataclasses import dataclass
 
-from hub.models import Graph, GraphEdge, GraphNode, Position
+from hub.models import Graph, GraphEdge, GraphNode, Position, dataset_ref_identity
 
 
 class CycleError(Exception):
@@ -170,10 +170,27 @@ def resolve_source_refs(graph: Graph, resolve) -> None:
     This includes section-contained children. Without that shared traversal the engine could execute
     an unresolved token while ownership guards protected a different (or no) URI.
     """
-    for cfg in _execution_source_configs(graph, list(graph.nodes)):
+    for node, cfg in _execution_source_bindings(graph, list(graph.nodes)):
         value = cfg.get("uri")
         if value:
             cfg["uri"] = resolve(value)
+        # A pinned/as-of core revision is read from its immutable artifact rather than the mutable
+        # catalog head. Carry that server-resolved physical identity privately so every preview,
+        # inspection, and execution read scope fences the same file the adapter will actually open.
+        # Admission-bound graphs already carry an authoritative private binding and must retain it.
+        if str(node.id) in graph._input_artifact_uris:
+            continue
+        dataset_ref = cfg.get("datasetRef")
+        if not isinstance(dataset_ref, dict):
+            continue
+        try:
+            dataset_id, revision_id = dataset_ref_identity(dataset_ref)
+        except ValueError:
+            continue
+        from hub import metadb
+        artifact_uri = metadb.managed_local_file_revision_artifact(dataset_id, revision_id)
+        if artifact_uri is not None:
+            graph._input_artifact_uris[str(node.id)] = artifact_uri
 
 
 def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:

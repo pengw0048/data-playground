@@ -5505,6 +5505,10 @@ def _manifest_revision_identities(value: object) -> set[tuple[str, str]]:
     for item in value:
         if not isinstance(item, dict):
             continue
+        # Provider revision ids are opaque within their provider. Only the built-in managed-local-file
+        # provider may establish core artifact ownership; external history remains provider-retained.
+        if item.get("provider") != "managed-local-file":
+            continue
         dataset_id = item.get("dataset_id")
         revision_id = item.get("revision_id")
         if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
