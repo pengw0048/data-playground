@@ -762,9 +762,15 @@ class ManagedLocalFileRevision(Base):
         Text, ForeignKey("local_result_artifacts.uri"), nullable=False, unique=True)
     publish_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
     table_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    write_idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    write_intent_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    write_receipt_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     committed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
+        UniqueConstraint(
+            "write_idempotency_key",
+            name="uq_managed_local_file_revision_write_key"),
         UniqueConstraint("logical_id", "publish_seq", name="uq_managed_local_file_revision_sequence"),
         Index("ix_managed_local_file_revisions_history", "logical_id", "publish_seq"),
     )
@@ -9039,9 +9045,138 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
         return True
 
 
+class ManagedLocalWriteConflict(RuntimeError):
+    """A create/replace precondition no longer matches the durable destination head."""
+
+
+def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, str]:
+    from hub.models import WriteIntent
+
+    intent = WriteIntent.model_validate(value)
+    payload = intent.model_dump(by_alias=True, mode="json")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return intent, payload, canonical
+
+
+def _managed_local_write_receipt_in_session(
+        s, idempotency_key: str, intent_doc: str, *, lock: bool = False) -> dict | None:
+    query = select(ManagedLocalFileRevision).where(
+        ManagedLocalFileRevision.write_idempotency_key == str(idempotency_key)).limit(1)
+    if lock:
+        query = query.with_for_update()
+    revision = s.scalars(query).first()
+    if revision is None:
+        return None
+    if revision.write_intent_doc != intent_doc:
+        raise RuntimeError(f"managed local write idempotency key collision: {idempotency_key}")
+    try:
+        from hub.models import WriteReceipt
+
+        receipt = WriteReceipt.model_validate(json.loads(revision.write_receipt_doc or ""))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("managed local write receipt is invalid") from exc
+    ref = s.get(LocalResultReference, {
+        "uri": revision.artifact_uri,
+        "owner_kind": "managed_file_revision",
+        "owner_key": revision.revision_id,
+    })
+    if (receipt.dataset_id != revision.logical_id
+            or receipt.revision_id != revision.revision_id
+            or receipt.publication.artifact_uri != revision.artifact_uri
+            or receipt.publication.publish_sequence != revision.publish_seq
+            or receipt.publication.idempotency_key != idempotency_key
+            or ref is None):
+        raise RuntimeError("managed local write receipt lost its exact revision evidence")
+    return receipt.model_dump(by_alias=True, mode="json")
+
+
+def _managed_local_write_head_in_session(s, logical_uri: str, *, lock: bool = False) -> dict | None:
+    logical_id = _catalog_logical_id(logical_uri)
+    logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=lock)
+    if logical is None:
+        return None
+    revision = None
+    if logical.current_uri:
+        query = select(ManagedLocalFileRevision).where(
+            ManagedLocalFileRevision.logical_id == logical.logical_id,
+            ManagedLocalFileRevision.artifact_uri == logical.current_uri,
+        ).limit(1)
+        if lock:
+            query = query.with_for_update()
+        revision = s.scalars(query).first()
+    name = None
+    if revision is not None:
+        try:
+            name = json.loads(revision.table_doc).get("name")
+        except (TypeError, ValueError):
+            name = None
+    return {
+        "dataset_id": logical.logical_id,
+        "logical_uri": logical.logical_uri,
+        "state": logical.state,
+        "artifact_uri": logical.current_uri,
+        "revision_id": revision.revision_id if revision is not None else None,
+        "publish_seq": revision.publish_seq if revision is not None else None,
+        "name": name,
+    }
+
+
+def _validate_managed_local_write_precondition(s, intent, *, lock: bool) -> dict | None:
+    head = _managed_local_write_head_in_session(
+        s, intent.destination.logical_uri, lock=lock)
+    if intent.mode == "create":
+        if head is not None:
+            raise ManagedLocalWriteConflict("create destination identity already exists")
+        return None
+    if (head is None or head["state"] != "active" or head["revision_id"] is None
+            or head["artifact_uri"] is None):
+        raise ManagedLocalWriteConflict("replace destination does not exist")
+    expected = intent.expected_head
+    if (head["dataset_id"] != intent.destination.dataset_id
+            or expected is None
+            or head["dataset_id"] != expected.dataset_id
+            or head["revision_id"] != expected.revision_id):
+        raise ManagedLocalWriteConflict("replace expected head is stale")
+    if head["name"] != intent.destination.name:
+        raise ManagedLocalWriteConflict("replace destination identity changed")
+    return head
+
+
+def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
+    """Return the exact current managed-local head used to construct a replace intent."""
+    normalized = str(logical_uri).rstrip("/")
+    if not normalized:
+        raise ValueError("managed local write requires a logical destination URI")
+    with session() as s:
+        return _managed_local_write_head_in_session(s, normalized)
+
+
+def catalog_admit_managed_local_write(value: object) -> dict | None:
+    """Validate a frozen intent before artifact allocation, returning a prior durable receipt."""
+    intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    if intent.partitions:
+        raise ValueError("managed local-file create/replace does not support partitions")
+    with session() as s:
+        prior = _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+        if prior is not None:
+            return prior
+        _validate_managed_local_write_precondition(s, intent, lock=False)
+        return None
+
+
+def catalog_managed_local_write_receipt(value: object) -> dict | None:
+    """Recover an exact typed write receipt by idempotency key after response loss."""
+    intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    with session() as s:
+        return _managed_local_write_receipt_in_session(
+            s, intent.idempotency_key, canonical)
+
+
 def catalog_publish_managed_local_file(
         logical_uri: str, artifact_uri: str, name: str, doc: dict, *,
-        parents: list[str] | None = None, lineage: dict | None = None) -> dict:
+        parents: list[str] | None = None, lineage: dict | None = None,
+        write_intent: object | None = None, total_bytes: int | None = None) -> dict:
     """Atomically publish one already-validated local artifact as a new immutable revision.
 
     The catalog retains only the current physical projection; the revision ledger owns every physical
@@ -9058,6 +9193,36 @@ def catalog_publish_managed_local_file(
         raise ValueError("managed local publication table does not match its artifact")
     parent_tokens = catalog_lineage_parent_tokens(parents)
     canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
+    typed_intent = intent_payload = intent_doc = None
+    if write_intent is not None:
+        typed_intent, intent_payload, intent_doc = _canonical_managed_local_write_intent(write_intent)
+        if (typed_intent.destination.logical_uri != logical_uri
+                or typed_intent.destination.name != str(name)):
+            raise ValueError("managed local write intent changed its destination")
+        if typed_intent.partitions:
+            raise ValueError("managed local-file create/replace does not support partitions")
+        expected_schema = [
+            (column.name, column.type) for column in typed_intent.expected_schema
+        ]
+        actual_schema = [
+            (str(column.get("name") or ""), str(column.get("type") or ""))
+            for column in payload.get("columns") or []
+        ]
+        if expected_schema != actual_schema:
+            raise ValueError("managed local write output schema does not match its intent")
+        if (canonical_lineage is None
+                or canonical_lineage["idempotency_key"] != typed_intent.idempotency_key
+                or parent_tokens != typed_intent.provenance.parents):
+            raise ValueError("managed local write provenance changed after admission")
+        comparable_lineage = {
+            key: value for key, value in canonical_lineage.items()
+            if key not in ("field_mappings_json", "schema_version")
+        }
+        if comparable_lineage != typed_intent.provenance.publication.model_dump():
+            raise ValueError("managed local write provenance changed after admission")
+        if (isinstance(total_bytes, bool) or not isinstance(total_bytes, int)
+                or total_bytes < 0):
+            raise ValueError("managed local write requires bounded non-negative bytes")
     with session() as s:
         # Take the lineage reservation before the managed output projection. This matches the
         # composite-publication ordering used by the other catalog writers and keeps both effects
@@ -9093,7 +9258,25 @@ def catalog_publish_managed_local_file(
                 for token in parent_tokens
             ]
         logical_id, catalog_key = _catalog_managed_namespace_identity(logical_uri, f"tbl_{name}")
-        _lock_catalog_namespace_tokens(s, [logical_uri, logical_id, catalog_key])
+        namespace_tokens = [logical_uri, logical_id, catalog_key]
+        if typed_intent is not None:
+            namespace_tokens.append(
+                f"managed-local-write:{typed_intent.idempotency_key}")
+        _lock_catalog_namespace_tokens(s, namespace_tokens)
+        if typed_intent is not None:
+            prior_write = _managed_local_write_receipt_in_session(
+                s, typed_intent.idempotency_key, intent_doc, lock=True)
+            if prior_write is not None:
+                _catalog_require_lineage_publication(
+                    s,
+                    destination_uri=prior_write["publication"]["artifactUri"],
+                    destination_version=prior_write["publication"].get("catalogVersion"),
+                    parent_tokens=parent_tokens,
+                    lineage=canonical_lineage,
+                )
+                return prior_write
+        prior_head = (_validate_managed_local_write_precondition(
+            s, typed_intent, lock=True) if typed_intent is not None else None)
         receipt = _managed_local_file_publication_receipt_in_session(
             s, logical_uri, artifact_uri, str(name))
         if receipt is not None:
@@ -9147,12 +9330,51 @@ def catalog_publish_managed_local_file(
         _sync_children(s, artifact_uri, tags, cols)
         revision_id = uuid.uuid4().hex
         committed_at = _db_now(s)
-        s.add(ManagedLocalFileRevision(
+        revision = ManagedLocalFileRevision(
             revision_id=revision_id, logical_id=logical.logical_id,
             artifact_uri=artifact_uri, publish_seq=publish_seq,
             table_doc=json.dumps(payload, default=str),
             committed_at=committed_at,
-        ))
+        )
+        if typed_intent is not None:
+            from hub.models import (
+                CatalogTable, DatasetRevision, ExactDatasetRef, WritePublicationIdentity, WriteReceipt,
+            )
+
+            parent_head = (ExactDatasetRef(
+                kind="exact",
+                dataset_id=prior_head["dataset_id"],
+                revision_id=prior_head["revision_id"],
+            ) if prior_head is not None else None)
+            receipt = WriteReceipt(
+                dataset_id=logical.logical_id,
+                revision_id=revision_id,
+                parent_head=parent_head,
+                head=DatasetRevision(
+                    dataset_id=logical.logical_id,
+                    revision_id=revision_id,
+                    committed_at=committed_at,
+                    retention_owner="core",
+                ),
+                rows=int(payload.get("rowCount") or 0),
+                bytes=total_bytes,
+                schema=CatalogTable.model_validate(payload).columns,
+                partitions=typed_intent.partitions,
+                publication=WritePublicationIdentity(
+                    logical_uri=logical_uri,
+                    artifact_uri=artifact_uri,
+                    publish_sequence=publish_seq,
+                    idempotency_key=typed_intent.idempotency_key,
+                    catalog_version=payload.get("version"),
+                ),
+                provenance=typed_intent.provenance,
+            )
+            revision.write_idempotency_key = typed_intent.idempotency_key
+            revision.write_intent_doc = intent_doc
+            revision.write_receipt_doc = json.dumps(
+                receipt.model_dump(by_alias=True, mode="json"),
+                sort_keys=True, separators=(",", ":"))
+        s.add(revision)
         logical.current_uri = artifact_uri
         logical.current_publish_seq = publish_seq
         logical.state = "active"
@@ -9190,6 +9412,8 @@ def catalog_publish_managed_local_file(
                 s, destination["catalog_key"], artifact_uri, observed_version,
                 target_snapshots[1:], locked_logicals, locked_entries,
                 canonical_lineage, lineage_publication_key)
+        if typed_intent is not None:
+            return receipt.model_dump(by_alias=True, mode="json")
         return {
             "dataset_id": logical.logical_id,
             "revision_id": revision_id,

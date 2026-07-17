@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import threading
 import uuid
 from types import SimpleNamespace
 
@@ -18,7 +19,16 @@ from sqlalchemy.orm import Session
 from hub import graph as graph_mod, metadb
 from hub.local_run_inputs import bind_manifest
 from hub.main import app
-from hub.models import Graph, LineagePublication
+from hub.local_writes import write_managed_local_file
+from hub.models import (
+    ColumnSchema,
+    ExactDatasetRef,
+    Graph,
+    LineagePublication,
+    WriteDestination,
+    WriteIntent,
+    WriteProvenance,
+)
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import catalog as catalog_routes
@@ -75,6 +85,44 @@ def _lineage(key: str) -> LineagePublication:
     return LineagePublication(idempotency_key=key, provenance="manual")
 
 
+def _write_intent(
+        logical_uri: str, key: str, *, head: dict | None = None,
+        name: str = "managed_local",
+        expected_schema: list[ColumnSchema] | None = None) -> WriteIntent:
+    replacing = head is not None
+    return WriteIntent(
+        destination=WriteDestination(
+            logical_uri=logical_uri,
+            name=name,
+            dataset_id=(head["dataset_id"] if replacing else None),
+        ),
+        mode=("replace" if replacing else "create"),
+        expected_schema=(expected_schema if expected_schema is not None
+                         else [ColumnSchema(name="value", type="int")]),
+        expected_head=(ExactDatasetRef(
+            kind="exact",
+            dataset_id=head["dataset_id"],
+            revision_id=head["revision_id"],
+        ) if replacing else None),
+        idempotency_key=key,
+        provenance=WriteProvenance(
+            publication=_lineage(key),
+        ),
+    )
+
+
+def _typed_write(storage, catalog, intent: WriteIntent, value: int):
+    def writer(uri: str) -> None:
+        pq.write_table(pa.table({"value": [value]}), uri)
+
+    return write_managed_local_file(
+        storage=storage,
+        catalog=catalog,
+        intent=intent,
+        write_artifact=writer,
+    )
+
+
 def _register_source(catalog, tmp_path) -> str:
     source_uri = str(tmp_path / "source.parquet")
     pq.write_table(pa.table({"source": [1]}), source_uri)
@@ -124,6 +172,218 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
             metadb.LocalResultReference.owner_kind == "managed_file_revision",
         )))
     assert {ref.uri for ref in refs} == {first_uri, second_uri}
+
+
+def test_typed_local_create_replace_receipts_reopen_exact_revisions_after_restart(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "typed.parquet")
+    created = _typed_write(
+        storage, catalog, _write_intent(logical_uri, "typed-create"), 1)
+    frozen_head = metadb.catalog_managed_local_write_head(logical_uri)
+    assert frozen_head is not None
+    replaced = _typed_write(
+        storage, catalog,
+        _write_intent(logical_uri, "typed-replace", head=frozen_head),
+        2,
+    )
+
+    assert created.dataset_id == replaced.dataset_id
+    assert replaced.parent_head is not None
+    assert replaced.parent_head.revision_id == created.revision_id
+    assert replaced.head.revision_id == replaced.revision_id
+    assert replaced.rows == 1 and replaced.bytes > 0
+    assert [(column.name, column.type) for column in replaced.schema] == [("value", "int")]
+    assert replaced.publication.publish_sequence == 2
+    assert replaced.provenance.publication.idempotency_key == "typed-replace"
+
+    restarted = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    recovered = metadb.catalog_managed_local_write_receipt(
+        _write_intent(logical_uri, "typed-replace", head=frozen_head).model_dump(
+            by_alias=True, mode="json"))
+    assert recovered is not None and recovered["revisionId"] == replaced.revision_id
+    adapter = ManagedLocalFileRevisionAdapter()
+    assert adapter.open_revision(
+        replaced.publication.artifact_uri, created.revision_id).fetchall() == [(1,)]
+    assert adapter.open_revision(
+        replaced.publication.artifact_uri, replaced.revision_id).fetchall() == [(2,)]
+    assert restarted.get_table(replaced.publication.artifact_uri).id
+
+
+def test_typed_local_write_preconditions_fail_before_artifact_allocation(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "preconditions.parquet")
+    created = _typed_write(
+        storage, catalog, _write_intent(logical_uri, "precondition-create"), 1)
+    old_head = metadb.catalog_managed_local_write_head(logical_uri)
+    assert old_head is not None and old_head["revision_id"] == created.revision_id
+    replaced = _typed_write(
+        storage, catalog,
+        _write_intent(logical_uri, "precondition-replace", head=old_head),
+        2,
+    )
+
+    allocations = 0
+    begin = storage.begin_result
+
+    def track_begin(*args, **kwargs):
+        nonlocal allocations
+        allocations += 1
+        return begin(*args, **kwargs)
+
+    monkeypatch.setattr(storage, "begin_result", track_begin)
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="already exists"):
+        _typed_write(
+            storage, catalog, _write_intent(logical_uri, "duplicate-create"), 3)
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="stale"):
+        _typed_write(
+            storage, catalog,
+            _write_intent(logical_uri, "stale-replace", head=old_head),
+            3,
+        )
+    with pytest.raises(RuntimeError, match="idempotency key collision"):
+        _typed_write(
+            storage, catalog,
+            _write_intent(logical_uri, "precondition-create", head=old_head),
+            3,
+        )
+    missing = str(tmp_path / "published" / "missing.parquet")
+    forged_head = {
+        "dataset_id": replaced.dataset_id,
+        "revision_id": replaced.revision_id,
+    }
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="does not exist"):
+        _typed_write(
+            storage, catalog,
+            _write_intent(missing, "missing-replace", head=forged_head),
+            3,
+        )
+    assert allocations == 0
+
+
+def test_typed_local_write_response_loss_replays_one_durable_receipt(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "response-loss-typed.parquet")
+    intent = _write_intent(logical_uri, "typed-response-loss")
+    publish = metadb.catalog_publish_managed_local_file
+
+    def commit_then_lose_response(*args, **kwargs):
+        publish(*args, **kwargs)
+        raise OSError("write response lost")
+
+    monkeypatch.setattr(
+        metadb, "catalog_publish_managed_local_file", commit_then_lose_response)
+    first = _typed_write(storage, catalog, intent, 7)
+    monkeypatch.setattr(metadb, "catalog_publish_managed_local_file", publish)
+    replayed = _typed_write(storage, catalog, intent, 999)
+
+    assert replayed == first
+    assert ManagedLocalFileRevisionAdapter().open_revision(
+        first.publication.artifact_uri, first.revision_id).fetchall() == [(7,)]
+    with metadb.session() as session:
+        revisions = list(session.scalars(select(metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.write_idempotency_key == "typed-response-loss")))
+        assert len(revisions) == 1
+
+
+def test_typed_local_write_precommit_failure_aborts_candidate_and_preserves_head(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "precommit.parquet")
+    created = _typed_write(
+        storage, catalog, _write_intent(logical_uri, "precommit-create"), 1)
+    head = metadb.catalog_managed_local_write_head(logical_uri)
+    assert head is not None
+    candidate = None
+
+    def fail_after_write(uri: str) -> None:
+        nonlocal candidate
+        candidate = uri
+        pq.write_table(pa.table({"value": [2]}), uri)
+        raise RuntimeError("writer failed before commit")
+
+    with pytest.raises(RuntimeError, match="writer failed before commit"):
+        write_managed_local_file(
+            storage=storage,
+            catalog=catalog,
+            intent=_write_intent(logical_uri, "precommit-replace", head=head),
+            write_artifact=fail_after_write,
+        )
+    assert candidate is not None and not pathlib.Path(candidate).exists()
+    current = metadb.catalog_managed_local_write_head(logical_uri)
+    assert current is not None and current["revision_id"] == created.revision_id
+
+    schema_candidate = None
+
+    def write_wrong_schema(uri: str) -> None:
+        nonlocal schema_candidate
+        schema_candidate = uri
+        pq.write_table(pa.table({"value": [3]}), uri)
+
+    with pytest.raises(ValueError, match="schema does not match"):
+        write_managed_local_file(
+            storage=storage,
+            catalog=catalog,
+            intent=_write_intent(
+                logical_uri,
+                "precommit-schema-mismatch",
+                head=head,
+                expected_schema=[ColumnSchema(name="other", type="int")],
+            ),
+            write_artifact=write_wrong_schema,
+        )
+    assert schema_candidate is not None and not pathlib.Path(schema_candidate).exists()
+    current = metadb.catalog_managed_local_write_head(logical_uri)
+    assert current is not None and current["revision_id"] == created.revision_id
+
+
+def test_typed_local_concurrent_replacements_have_one_cas_winner(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "concurrent.parquet")
+    _typed_write(storage, catalog, _write_intent(logical_uri, "concurrent-create"), 0)
+    head = metadb.catalog_managed_local_write_head(logical_uri)
+    assert head is not None
+    barrier = threading.Barrier(2)
+    receipts = []
+    errors = []
+    candidates: list[str] = []
+
+    def replace(key: str, value: int) -> None:
+        def writer(uri: str) -> None:
+            candidates.append(uri)
+            pq.write_table(pa.table({"value": [value]}), uri)
+            barrier.wait(timeout=10)
+
+        try:
+            receipts.append(write_managed_local_file(
+                storage=storage,
+                catalog=catalog,
+                intent=_write_intent(logical_uri, key, head=head),
+                write_artifact=writer,
+            ))
+        except Exception as exc:  # noqa: BLE001 - the assertion checks the exact typed conflict
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=replace, args=("concurrent-a", 1)),
+        threading.Thread(target=replace, args=("concurrent-b", 2)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+        assert not thread.is_alive()
+
+    assert len(receipts) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], metadb.ManagedLocalWriteConflict)
+    assert sum(pathlib.Path(uri).exists() for uri in candidates) == 1
+    with metadb.session() as session:
+        assert len(list(session.scalars(select(metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.logical_id == receipts[0].dataset_id)))) == 2
 
 
 def test_failed_local_publication_never_advances_the_catalog_head(

@@ -1529,24 +1529,62 @@ class LocalRunner:
                     discard_attempt(attempt_uri)
                 raise
         elif managed_local:
-            from hub.plugins.catalog import core_managed_local_file_publisher
-            managed_publisher = core_managed_local_file_publisher(self.catalog)
-            if managed_publisher is None:
-                raise RuntimeError(
-                    "managed local-file writes require the core transactional catalog publisher")
-            attempt_uri = self.storage.begin_result(
-                f"managed-file:{logical_uri}", status.run_id)
-            try:
+            from hub.local_writes import write_managed_local_file
+            from hub.models import ExactDatasetRef, WriteDestination, WriteIntent, WriteProvenance
+            from hub.plugins.adapters import relation_columns
+
+            if lineage is None:  # parent-owned transports are excluded by managed_local admission
+                raise RuntimeError("managed local-file write requires local provenance identity")
+            head = metadb.catalog_managed_local_write_head(logical_uri)
+            replacing = bool(
+                head is not None and head.get("state") == "active"
+                and head.get("revision_id"))
+            expected_head = (ExactDatasetRef(
+                kind="exact",
+                dataset_id=str(head["dataset_id"]),
+                revision_id=str(head["revision_id"]),
+            ) if replacing else None)
+            intent = WriteIntent(
+                destination=WriteDestination(
+                    logical_uri=logical_uri,
+                    name=spec.name,
+                    dataset_id=(str(head["dataset_id"]) if replacing else None),
+                ),
+                mode=("replace" if replacing else "create"),
+                expected_schema=relation_columns(parent_rel),
+                expected_head=expected_head,
+                idempotency_key=lineage.idempotency_key,
+                provenance=WriteProvenance(
+                    publication=lineage,
+                    parents=parent_uris,
+                ),
+            )
+            def write_candidate(candidate_uri: str) -> None:
                 committed_output_snapshot(
-                    status, uri=attempt_uri, table=spec.name, rows=0)
+                    status, uri=candidate_uri, table=spec.name, rows=0)
                 result = self._adapter_write(
-                    logical_adapter, attempt_uri, parent_rel, spec.mode, cancel)
-                rows = int(result.get("rows") or 0)
-                self.storage.commit_result(attempt_uri, status.run_id)
-                committed = SinkCommit(name=spec.name, uri=attempt_uri, rows=rows)
-            except Exception:
-                _safe_abort_local_result(self.storage, attempt_uri, status.run_id)
-                raise
+                    logical_adapter, candidate_uri, parent_rel, spec.mode, cancel)
+                if result.get("uri", candidate_uri) != candidate_uri:
+                    raise RuntimeError(
+                        "adapter did not write the exact reserved local write artifact")
+
+            receipt = write_managed_local_file(
+                storage=self.storage,
+                catalog=self.catalog,
+                intent=intent,
+                write_artifact=write_candidate,
+                before_publish=(None if pre_publish is None
+                                else lambda: pre_publish(check_cancel=True)),
+            )
+            committed_snapshot = committed_output_snapshot(
+                status,
+                uri=receipt.publication.artifact_uri,
+                table=spec.name,
+                version=receipt.publication.catalog_version,
+                rows=receipt.rows,
+            )
+            status.outputs = [committed_snapshot]
+            return receipt.rows
         else:
             # Built-in sink semantics have a deterministic published URI. Custom adapters may return
             # another URI, which is checked authoritatively immediately after their write below.
