@@ -38,6 +38,27 @@ def test_plugin_status_reports_only_effective_runtime_capabilities(tmp_path):
     assert inactive["process_placement"] == []
 
 
+def test_plugin_status_transfers_replaced_processor_capability(tmp_path):
+    workspace = tmp_path / "workspace"
+    processor = (
+        "from hub.plugins.processors import RegisteredProcessor\n"
+        "def register(reg):\n"
+        "    reg.add_processor(RegisteredProcessor(id='shared', title=TITLE, mode='map'))\n"
+    )
+    _write_plugin(workspace, "status_processor_first", "TITLE = 'first'\n" + processor)
+    _write_plugin(workspace, "status_processor_second", "TITLE = 'second'\n" + processor)
+
+    deps = Deps(str(workspace), str(tmp_path / "data"))
+    first = next(p for p in deps.plugins if p["name"] == "status_processor_first")
+    second = next(p for p in deps.plugins if p["name"] == "status_processor_second")
+
+    assert deps.registry.get("shared").title == "second"
+    assert first["state"] == "inactive"
+    assert first["effective_capabilities"] == []
+    assert second["state"] == "active"
+    assert second["effective_capabilities"] == ["processor:shared"]
+
+
 def test_plugin_status_distinguishes_partial_conflict_and_sanitized_failure(tmp_path):
     workspace = tmp_path / "workspace"
     # Add a runner factory after the effective node so the plugin remains partially usable.

@@ -196,7 +196,9 @@ class Registry:
 
     def add_processor(self, proc) -> None:
         self.deps.registry.register(proc)
-        self._activate(f"processor:{proc.id}", "execution")
+        # Processor dispatch is keyed by id and intentionally keeps the latest registration.
+        # Transfer status ownership as well so an overridden plugin is not still reported as effective.
+        self._activate(f"processor:{proc.id}", "execution", replace=True)
 
     def set_catalog(self, catalog) -> None:
         if not isinstance(catalog, CatalogProvider):
