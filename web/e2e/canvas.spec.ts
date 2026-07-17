@@ -42,6 +42,19 @@ async function openWorkspaceDataset(page: Page, name: string) {
   await (await workspaceResource(page, 'dataset', name)).click()
 }
 
+async function addWorkspaceDatasetToCurrentCanvas(page: Page, name: string) {
+  const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+  await backToWorkspace(page)
+  await openWorkspaceDataset(page, name)
+  await page.getByTestId('detail-use').click()
+  await page.getByRole('button', { name: /^Add to canvas/ }).click()
+  await page.getByLabel('Target canvas').selectOption(canvasId)
+  await page.getByRole('button', { name: 'Add and open' }).click()
+  await expect(page.getByTestId('toolbar')).toBeVisible()
+  await page.locator('.react-flow__node').getByText('DATASET', { exact: true }).click()
+  await expect(page.getByTestId('inspector').getByRole('button', { name: 'View data' })).toBeVisible()
+}
+
 // Prove the app's collab socket has joined THIS canvas before driving an out-of-band edit. The
 // autosave label only proves the HTTP canvas exists; it says nothing about websocket readiness. A
 // short-lived peer waits for the app's presence frame, which the server can relay only after the app
@@ -736,8 +749,8 @@ test.describe('Data Playground canvas', () => {
   test('the app menu goes to Workspace and the rail destinations remain operable', async ({ page }) => {
     await fresh(page)
     await backToWorkspace(page)
-    await expect(page.getByRole('button', { name: 'New canvas' })).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Add dataset' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Add dataset' })).toHaveCount(0)
     await expect(await workspaceResource(page, 'dataset', 'images')).toBeVisible()
     await page.getByTestId('rail-transforms').click()
     await expect(page.getByRole('heading', { name: 'Transforms' })).toBeVisible()
@@ -950,10 +963,7 @@ test.describe('Data Playground canvas', () => {
   test('the data viewer opens a row detail and paginates', async ({ page }) => {
     await fresh(page)
     // start a pipeline from the seeded 'events' dataset via Workspace
-    await backToWorkspace(page)
-    await openWorkspaceDataset(page, 'events')                 // opens the dataset detail drawer
-    await page.getByTestId('detail-use').click()               // "Use" drops a source onto the canvas
-    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await addWorkspaceDatasetToCurrentCanvas(page, 'events')
     await expect(page.locator('.react-flow__node')).toHaveCount(1) // the events source landed
     // preview via the Inspector's View data (always visible for the selected node — no hover needed)
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
@@ -968,9 +978,7 @@ test.describe('Data Playground canvas', () => {
 
   test('editing a graph blocks rows from the previous preview until it is refreshed', async ({ page }) => {
     await fresh(page)
-    await backToWorkspace(page)
-    await openWorkspaceDataset(page, 'events')
-    await page.getByTestId('detail-use').click()
+    await addWorkspaceDatasetToCurrentCanvas(page, 'events')
     await page.route('**/api/run/preview', (route) => route.fulfill({
       contentType: 'application/json',
       body: JSON.stringify({
@@ -1014,11 +1022,7 @@ test.describe('Data Playground canvas', () => {
 
   test('a Workspace dataset is added to the canvas from its preserved detail surface', async ({ page }) => {
     await fresh(page) // empty new canvas is the current doc
-    await backToWorkspace(page)
-    // clicking a dataset row opens its detail drawer; "Use" drops a source onto the canvas
-    await openWorkspaceDataset(page, 'images')
-    await page.getByTestId('detail-use').click()
-    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await addWorkspaceDatasetToCurrentCanvas(page, 'images')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
   })
 
