@@ -180,7 +180,10 @@ test('pins a Source revision, persists it across reload, and keeps the control i
     await expect.poll(async () => {
       const response = await page.request.get(`/api/canvas/${canvasId}`)
       return (await response.json()).nodes[0].data.config.datasetRef
-    }).toEqual({ kind: 'exact', datasetId: 'opaque-dataset', revisionId: '1' })
+    }).toEqual({
+      kind: 'exact', datasetId: 'opaque-dataset', revisionId: '1',
+      lastKnown: { committedAt: '2026-07-15T12:00:00Z' },
+    })
 
     await page.reload()
     const control = page.getByRole('button', { name: 'Change pinned revision 1' })

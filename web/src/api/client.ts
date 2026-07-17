@@ -17,9 +17,13 @@ export function setApiUser(id: string | null) { _userId = id }
 
 export class KernelError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  code?: string
+  retryable?: boolean
+  constructor(status: number, message: string, code?: string, retryable?: boolean) {
     super(message)
     this.status = status
+    this.code = code
+    this.retryable = retryable
   }
 }
 
@@ -32,13 +36,19 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { ...opts, headers })
   if (!res.ok) {
     let detail = res.statusText
+    let code: string | undefined
+    let retryable: boolean | undefined
     try {
       const body = await res.json()
       detail = body.detail ?? detail
+      code = typeof body.code === 'string' ? body.code : undefined
+      retryable = typeof body.retryable === 'boolean' ? body.retryable : undefined
     } catch {
       /* noop */
     }
-    throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
+    throw new KernelError(
+      res.status, typeof detail === 'string' ? detail : JSON.stringify(detail), code, retryable,
+    )
   }
   return res.json() as Promise<T>
 }

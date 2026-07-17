@@ -5,9 +5,24 @@ import { roleCanEdit, useStore } from '../../store/graph'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
-import { api, KernelError } from '../../api/client'
+import { api } from '../../api/client'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
 import { datasetRefIdentity, type DatasetRef } from '../../types/graph'
+
+type ExactRevisionState = 'idle' | 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
+
+const kernelErrorStatus = (error: unknown) => typeof error === 'object' && error !== null
+  && typeof (error as { status?: unknown }).status === 'number'
+  ? (error as { status: number }).status : undefined
+
+function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle' | 'checking' | 'available'> {
+  const facts = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; status?: unknown } : {}
+  if (facts.code === 'permission_denied' || facts.status === 403) return 'permission'
+  if (facts.code === 'service_unavailable' || facts.status === 503) return 'offline'
+  if (facts.code === 'resource_gone' || facts.status === 404 || facts.status === 410) return 'unavailable'
+  return 'error'
+}
 
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
@@ -167,7 +182,7 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       </Popover>
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
-      {table && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
+      {(table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
@@ -178,7 +193,7 @@ function Source({ id, data }: NodeComponentProps) {
 
 function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   nodeId: string
-  table: CatalogTable
+  table?: CatalogTable
   selected?: DatasetRef
   canEdit: boolean
   onChange: (value: DatasetRef | undefined) => void
@@ -194,7 +209,8 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const [loadingMore, setLoadingMore] = useState(false)
   const [historyError, setHistoryError] = useState('')
   const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const [detailState, setDetailState] = useState<'idle' | 'checking' | 'available' | 'unavailable'>('idle')
+  const [detailState, setDetailState] = useState<ExactRevisionState>('idle')
+  const [detailRequest, setDetailRequest] = useState(0)
   const [capabilitiesChecking, setCapabilitiesChecking] = useState(true)
   const [asOfAvailable, setAsOfAvailable] = useState(false)
   const [asOfLocal, setAsOfLocal] = useState('')
@@ -203,12 +219,16 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
 
   // #279 deliberately owns only the built-in Lance journey. Other exact-revision providers keep
   // their Catalog history UI but do not gain a Source configuration surface here.
-  const lance = table.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance')
+  const lance = table?.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance') ?? false
   useEffect(() => {
     const generation = ++historyGeneration.current
     let live = true
     setOpen(false); setRevisions([]); setCursor(null); setHasMore(false); setHistoryError('')
     setAsOfError(''); setAsOfAvailable(false); setAsOfResolving(false); setCapabilitiesChecking(true)
+    if (!table) {
+      setAvailability('unavailable'); setCapabilitiesChecking(false)
+      return () => { live = false }
+    }
     api.datasetRevisionCapabilities(table.id).then((capabilities) => {
       if (!live || generation !== historyGeneration.current) return
       setAsOfAvailable(capabilities.selectors.includes('as_of')
@@ -228,7 +248,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
         setAvailability('available')
       }).catch((error) => {
         if (!live || generation !== historyGeneration.current) return
-        if (error instanceof KernelError && (error.status === 410 || error.status === 501)) {
+        if (kernelErrorStatus(error) === 410 || kernelErrorStatus(error) === 501) {
           setAvailability('unavailable')
         } else {
           setHistoryError(error instanceof Error ? error.message : String(error))
@@ -239,7 +259,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
       setAvailability('unavailable')
     }
     return () => { live = false }
-  }, [table.id, table.uri, lance, request])
+  }, [table?.id, table?.uri, lance, request])
 
   useEffect(() => {
     let live = true
@@ -250,13 +270,14 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     api.datasetRevision(exact.datasetId, exact.revisionId).then((next) => {
       if (!live) return
       setDetail(next); setDetailState('available')
-    }).catch(() => {
-      if (live) setDetailState('unavailable')
+    }).catch((error) => {
+      if (live) setDetailState(exactRevisionFailure(error))
     })
     return () => { live = false }
-  }, [selected])
+  }, [selected, detailRequest])
 
   const resolveAsOf = async () => {
+    if (!table) return
     const requested = new Date(`${asOfLocal}Z`)
     if (!asOfLocal || Number.isNaN(requested.getTime())) {
       setAsOfError('Choose a valid UTC date and time.'); return
@@ -274,9 +295,9 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
       setOpen(false)
     } catch (error) {
       if (generation !== historyGeneration.current) return
-      if (error instanceof KernelError && error.status === 410) {
+      if (kernelErrorStatus(error) === 410) {
         setAsOfError('No retained revision exists at or before that instant.')
-      } else if (error instanceof KernelError && error.status === 409) {
+      } else if (kernelErrorStatus(error) === 409) {
         setAsOfError('The provider could not prove one exact revision for that instant.')
       } else {
         setAsOfError(error instanceof Error ? error.message : String(error))
@@ -287,7 +308,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   }
 
   const loadMore = async () => {
-    if (!cursor || loadingMore) return
+    if (!table || !cursor || loadingMore) return
     const generation = ++historyGeneration.current
     setLoadingMore(true); setHistoryError('')
     try {
@@ -306,7 +327,15 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   }
 
   const selectedExact = selected ? datasetRefIdentity(selected) : null
+  const lastKnownAt = selected?.kind === 'as_of'
+    ? selected.resolved.committedAt
+    : selected?.lastKnown?.committedAt
+  const staleLastKnown = lastKnownAt
+    ? <> Last known provider commit {new Date(lastKnownAt).toLocaleString()} <span className="font-semibold">(stale)</span>.</>
+    : null
   const controlAvailable = availability === 'available' || asOfAvailable
+  const registrationReplaced = selectedExact != null && revisions.length > 0
+    && revisions.every((revision) => revision.datasetId !== selectedExact.datasetId)
   const checking = availability === 'checking' || capabilitiesChecking
   const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
     : !controlAvailable ? 'Revision selection unavailable'
@@ -338,8 +367,31 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
       )}
       {selectedExact && detailState === 'unavailable' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Selected revision {selectedExact.revisionId} is unavailable. Selection preserved; choose another revision or{' '}
-          <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow latest</button>.
+          Selected revision {selectedExact.revisionId} or its registration is missing or compacted. Selection preserved; latest was not substituted.
+          {staleLastKnown}{' '}
+          {registrationReplaced && 'The current catalog registration has a different dataset identity. '}
+          {controlAvailable && <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => setOpen(true)}>Choose another retained revision</button>}
+          {controlAvailable && ' or '}
+          {table ? <><button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow current latest explicitly</button>.</>
+            : 'Choose a new dataset above to create a new binding.'}
+        </div>
+      )}
+      {selectedExact && detailState === 'permission' && (
+        <div role="alert" className="mt-1 text-[9.5px] text-destructive">
+          Permission to open exact revision {selectedExact.revisionId} was lost. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry exact revision</button>
+        </div>
+      )}
+      {selectedExact && detailState === 'offline' && (
+        <div role="alert" className="mt-1 text-[9.5px] text-destructive">
+          The provider is offline, so exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry provider</button>
+        </div>
+      )}
+      {selectedExact && detailState === 'error' && (
+        <div role="alert" className="mt-1 text-[9.5px] text-destructive">
+          Exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
+          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry verification</button>
         </div>
       )}
       <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
@@ -356,7 +408,10 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           return (
             <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
               aria-pressed={active} onClick={() => {
-                onChange({ kind: 'exact', datasetId: revision.datasetId, revisionId: revision.revisionId }); setOpen(false)
+                onChange({
+                  kind: 'exact', datasetId: revision.datasetId, revisionId: revision.revisionId,
+                  lastKnown: { committedAt: revision.committedAt ?? null },
+                }); setOpen(false)
               }} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`}>
               <span className="dp-mono min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground">{revision.revisionId}</span>
               {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest retained</span>}

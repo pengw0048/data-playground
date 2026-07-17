@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime
+import os
+import shutil
 import uuid
 
 import pyarrow as pa
@@ -11,7 +13,9 @@ from fastapi.testclient import TestClient
 
 from hub.main import app
 from hub.models import CatalogTable, Graph
-from hub.plugins.adapters import LanceAdapter
+from hub.plugins.adapters import (
+    LanceAdapter, RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable,
+)
 from hub.routers import catalog as catalog_router
 
 client = TestClient(app)
@@ -309,15 +313,37 @@ def test_lance_exact_revision_detail_does_not_invent_parent_across_retention_gap
 
 
 def test_unregistered_lance_binding_never_retargets_same_path(tmp_path):
+    lance = pytest.importorskip("lance")
     uri, table = _register_lance(tmp_path)
     history = client.get(f"/api/catalog/tables/{table['id']}/revisions")
-    old = history.json()["items"][0]
+    old = history.json()["items"][-1]
     assert client.delete(f"/api/catalog/tables/{table['id']}").status_code == 200
+    shutil.rmtree(uri)
+    lance.write_dataset(pa.table({"value": [999]}), uri)
     replacement = client.post("/api/catalog/register", json={"uri": uri, "name": table["name"]})
     assert replacement.status_code == 200, replacement.text
     assert client.get(f"/api/catalog/revisions/{old['datasetId']}/{old['revisionId']}").status_code == 410
+    stale_preview = client.post("/api/run/preview", json={
+        "graph": {
+            "id": f"stale-aba-{uuid.uuid4().hex}", "version": 1,
+            "nodes": [{
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"config": {
+                    "uri": uri, "tableId": table["id"],
+                    "datasetRef": {"kind": "exact", "datasetId": old["datasetId"],
+                                   "revisionId": old["revisionId"]},
+                }},
+            }], "edges": [],
+        },
+        "nodeId": "source", "k": 50, "offset": 0,
+    })
+    assert stale_preview.status_code == 200, stale_preview.text
+    assert stale_preview.json()["notPreviewable"] is True
+    assert "selected revision is unavailable" in stale_preview.json()["reason"]
+    assert stale_preview.json().get("rows", []) == []
     fresh = client.get(f"/api/catalog/tables/{replacement.json()['id']}/revisions")
     assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["items"][0]["revisionId"] == old["revisionId"]
     assert fresh.json()["items"][0]["datasetId"] != old["datasetId"]
 
 
@@ -330,6 +356,89 @@ def test_missing_lance_revision_is_a_stable_unavailable_error(tmp_path):
     assert response.json()["code"] == "resource_gone"
 
 
+def test_compacted_lance_revision_is_unavailable_without_opening_latest(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri, table = _register_lance(tmp_path)
+    first = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][-1]
+    lance.dataset(uri).cleanup_old_versions(
+        older_than=datetime.timedelta(0), retain_versions=1,
+        error_if_tagged_old_versions=False)
+
+    response = client.get(
+        f"/api/catalog/revisions/{first['datasetId']}/{first['revisionId']}")
+    assert response.status_code == 410
+    assert response.json() == {
+        "detail": "dataset_revision_unavailable",
+        "code": "resource_gone", "retryable": False,
+    }
+    latest = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
+    assert latest["revisionId"] != first["revisionId"]
+
+
+@pytest.mark.parametrize(("failure", "status", "detail", "code", "retryable"), [
+    (PermissionError("denied"), 403, "dataset_revision_permission_lost",
+     "permission_denied", False),
+    (RevisionProviderOffline("offline"), 503, "dataset_revision_provider_offline",
+     "service_unavailable", True),
+])
+def test_exact_revision_normalizes_recoverable_provider_failures(
+        monkeypatch, failure, status, detail, code, retryable):
+    class FailingAdapter:
+        retention_owner = "provider"
+
+        def revision_detail(self, _uri, _revision_id, *, preview_limit):
+            assert preview_limit == 100
+            raise failure
+
+    monkeypatch.setattr(catalog_router.metadb, "catalog_revision_binding",
+                        lambda _dataset_id: {"dataset_id": "dataset", "uri": "fake://dataset"})
+    monkeypatch.setattr(catalog_router, "_revision_adapter", lambda _uri: FailingAdapter())
+
+    response = client.get("/api/catalog/revisions/dataset/revision")
+    assert response.status_code == status
+    assert response.json() == {"detail": detail, "code": code, "retryable": retryable}
+
+
+@pytest.mark.parametrize(("wrapped", "expected"), [
+    (ValueError("LanceError(IO): Permission denied (os error 13)"), RevisionPermissionLost),
+    (ValueError("LanceError(IO): connection timed out"), RevisionProviderOffline),
+    (ValueError("LanceError(IO): corrupt transaction metadata"), RevisionUnavailable),
+])
+def test_lance_adapter_classifies_wrapped_provider_access_failures(
+        monkeypatch, wrapped, expected):
+    adapter = LanceAdapter()
+
+    def fail(*_args, **_kwargs):
+        raise wrapped
+
+    monkeypatch.setattr(adapter, "_dataset", fail)
+    with pytest.raises(expected) as caught:
+        adapter.revision_detail("wrapped.lance", "1", preview_limit=1)
+    assert caught.value.__cause__ is wrapped
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                    reason="requires enforceable POSIX owner permissions")
+def test_inaccessible_lance_revision_maps_to_permission_lost_at_adapter_and_api(tmp_path):
+    uri, table = _register_lance(tmp_path)
+    revision = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
+    os.chmod(uri, 0)
+    try:
+        with pytest.raises(RevisionPermissionLost):
+            LanceAdapter().revision_detail(uri, revision["revisionId"], preview_limit=1)
+        response = client.get(
+            f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
+    finally:
+        os.chmod(uri, 0o700)
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "dataset_revision_permission_lost",
+        "code": "permission_denied", "retryable": False,
+    }
+
+
 def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(tmp_path):
     lance = pytest.importorskip("lance")
     uri, table = _register_lance(tmp_path)
@@ -338,14 +447,18 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
         f"/api/catalog/tables/{table['id']}/revisions?limit=1&cursor={first['nextCursor']}").json()
     selected = older["items"][0]
     canvas_id = f"pinned-{uuid.uuid4().hex}"
+    selected_ref = {
+        "kind": "exact", "datasetId": selected["datasetId"],
+        "revisionId": selected["revisionId"],
+        "lastKnown": {"committedAt": selected["committedAt"]},
+    }
     graph = {
         "id": canvas_id, "name": "pinned", "version": 1,
         "nodes": [{
             "id": "source", "type": "source", "position": {"x": 0, "y": 0},
             "data": {"title": "source", "status": "draft", "config": {
                 "uri": uri, "tableId": table["id"],
-                "datasetRef": {"kind": "exact", "datasetId": selected["datasetId"],
-                               "revisionId": selected["revisionId"]},
+                "datasetRef": selected_ref,
             }},
         }],
         "edges": [],
@@ -355,9 +468,7 @@ def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(t
         assert saved.status_code == 200, saved.text
         restored = client.get(f"/api/canvas/{canvas_id}")
         assert restored.status_code == 200, restored.text
-        assert restored.json()["nodes"][0]["data"]["config"]["datasetRef"] == {
-            "kind": "exact", "datasetId": selected["datasetId"],
-            "revisionId": selected["revisionId"]}
+        assert restored.json()["nodes"][0]["data"]["config"]["datasetRef"] == selected_ref
 
         lance.write_dataset(pa.table({"value": [3]}), uri, mode="append")
         preview = client.post("/api/run/preview", json={

@@ -153,6 +153,11 @@ class DatasetRevision(Wire):
     retention_owner: Literal["provider", "core"] = "provider"
 
 
+class DatasetRevisionLastKnown(Wire):
+    """Bounded non-sensitive display evidence saved with an exact Source selection."""
+    committed_at: datetime.datetime | None = None
+
+
 class ExactDatasetRef(Wire):
     """Opaque, path-independent identity for one exact retained dataset revision."""
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
@@ -160,6 +165,7 @@ class ExactDatasetRef(Wire):
     kind: Literal["exact"]
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
+    last_known: DatasetRevisionLastKnown | None = None
 
 
 class DatasetRevisionPage(Wire):

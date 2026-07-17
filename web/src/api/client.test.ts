@@ -1,10 +1,25 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { api, setApiUser, toGraph } from './client'
+import { api, KernelError, setApiUser, toGraph } from './client'
 import type { CanvasDoc } from '../types/graph'
 
 afterEach(() => {
   setApiUser(null)
   vi.restoreAllMocks()
+})
+
+describe('API error recovery contract', () => {
+  it('preserves the stable machine code and retryability for revision recovery UI', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      detail: 'dataset_revision_provider_offline', code: 'service_unavailable', retryable: true,
+    }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+
+    const error = await api.datasetRevision('dataset-a', 'revision-1').catch((caught) => caught)
+    expect(error).toBeInstanceOf(KernelError)
+    expect(error).toMatchObject({
+      status: 503, message: 'dataset_revision_provider_offline',
+      code: 'service_unavailable', retryable: true,
+    })
+  })
 })
 
 describe('toGraph wire serialization', () => {
