@@ -24,10 +24,11 @@ workstation) with a Python wheel (`data-playground`) and application container i
 
 ### Metadata schema
 
-- **Current Alembic history:** one fresh-database revision, `0001_schema_baseline` (head).
-- Databases created by earlier pre-release commits are intentionally unsupported. Recreate the
-  workspace/SQLite database or PostgreSQL schema; there is no upgrade or backfill path into this
-  baseline.
+- **Current Alembic history:** `0001_schema_baseline` through `0012_linear_checkpoint_admission`
+  (head).
+- Databases created by pre-baseline commits (before `0001_schema_baseline`) are intentionally
+  unsupported. Recreate the workspace/SQLite database or PostgreSQL schema; there is no upgrade or
+  backfill path into this baseline.
 - **Required release step (non-SQLite):** stop metadata writers, run one `dataplay migrate`, then
   start hubs/kernels. Services fail closed when the schema is not at this build's exact head
   (`metadb.require_schema_at_head`). Local SQLite auto-migrates on startup.
