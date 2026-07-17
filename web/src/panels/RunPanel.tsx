@@ -27,7 +27,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const st = run?.status
   const pinnedInputs = pinnedSourceInputs(doc, nodeId)
   const writeAdmission = run?.writeAdmission
-  const writeSubmissionUnresolved = !!writeAdmission && !!run?.writeSubmissionId
+  const writeSubmissionUnresolved = Boolean(
+    writeAdmission?.managed && writeAdmission.intent && run?.writeSubmissionId,
+  )
 
   return (
     <div className="p-3.5">

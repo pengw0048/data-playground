@@ -945,6 +945,25 @@ describe('graph store — core authority ops', () => {
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
   })
 
+  it('does not turn provider-neutral sink retries into typed write recovery', async () => {
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.csv', writeMode: 'append' }
+    useStore.setState({
+      doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] },
+    })
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      nodeId: 'write', managed: false, destination: '/outputs/output', mode: 'append',
+      provider: 'duckdb', expectedSchema: [], partitions: [],
+    })
+    apiMocks.run.mockRejectedValueOnce(new Error('network response lost'))
+
+    await useStore.getState().run('write')
+
+    expect(useStore.getState().runs.write).toMatchObject({ phase: 'failed' })
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+  })
+
   it('reuses one submission id across bounded ambiguous submission retries', async () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
     useStore.setState({ doc })

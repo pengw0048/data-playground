@@ -1763,10 +1763,13 @@ export const useStore = create<Store>((set, get) => ({
         get().updateData(id, { status: 'stale' })
         return
       }
-      const writeSubmissionRejected = writeAdmission && e instanceof KernelError && e.status < 500
+      const preserveWriteSubmission = Boolean(
+        writeAdmission?.managed && writeAdmission.intent
+        && (!(e instanceof KernelError) || e.status >= 500),
+      )
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
-        ...(writeSubmissionRejected ? {
+        ...(!preserveWriteSubmission ? {
           writeAdmission: undefined, writeSubmissionId: undefined,
           writeAdmissionFingerprint: undefined,
         } : {}),
