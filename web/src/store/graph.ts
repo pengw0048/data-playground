@@ -386,6 +386,7 @@ export interface ProfileJobState {
   // durable authority used to bind a recovered result to the graph and source content it profiled.
   planIdentity: string
   planDigest?: string
+  inputManifest?: RunInputManifestItem[] | null
   // A submission id survives an ambiguous POST response so every automatic or explicit retry adopts
   // the same server-side job. It is replaced only by a new preflight/start intent.
   submissionId?: string
@@ -458,13 +459,16 @@ async function submitFullProfile(
   planDigest: string,
   submissionId: string,
   userId: string,
+  inputManifest?: RunInputManifestItem[] | null,
 ): Promise<RunStatus> {
   for (let attempt = 0; ; attempt += 1) {
     if (_profileSubmissionUserId !== userId) {
       throw new KernelError(401, 'User changed while the full profile was being submitted')
     }
     try {
-      return await api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true)
+      return await (inputManifest
+        ? api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true, inputManifest)
+        : api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true))
     } catch (error) {
       if (!retryableProfileRequest(error) || attempt >= PROFILE_RETRY_DELAYS_MS.length) throw error
       await wait(PROFILE_RETRY_DELAYS_MS[attempt])
@@ -494,6 +498,7 @@ interface PendingProfileSubmission {
   nodeId: string
   portId?: string
   planDigest: string
+  inputManifest?: RunInputManifestItem[] | null
   submissionId: string
   userId: string
   canCancel: boolean
@@ -682,9 +687,14 @@ function reconcileAndCancelProfileSubmission(entry: PendingProfileSubmission): v
       }
       let status: RunStatus
       try {
-        status = await api.fullProfile(
-          entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
-        )
+        status = await (entry.inputManifest
+          ? api.fullProfile(
+            entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+            entry.inputManifest,
+          )
+          : api.fullProfile(
+            entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+          ))
       } catch (error) {
         if (!retryableProfileRequest(error)) {
           forgetProfileSubmission(entry)
@@ -1729,13 +1739,18 @@ export const useStore = create<Store>((set, get) => ({
     } }))
     let estimate: RunEstimate
     let planDigest: string
+    let inputManifest: RunInputManifestItem[] | null | undefined
     try {
-      const preflight = await api.profileEstimate(doc, id, portId)
+      const retainedManifest = currentPreviewBinding(get(), id)?.inputManifest
+      const preflight = await (retainedManifest
+        ? api.profileEstimate(doc, id, portId, retainedManifest)
+        : api.profileEstimate(doc, id, portId))
       if (portId !== undefined && preflight.targetPortId !== portId) {
         throw new Error('Profile estimate returned a different output port')
       }
       estimate = preflight
       planDigest = preflight.planDigest
+      inputManifest = preflight.inputManifest
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({ profileJobs: { ...s.profileJobs, [initialJobKey]: {
@@ -1745,7 +1760,8 @@ export const useStore = create<Store>((set, get) => ({
     }
     if (!isCurrent()) return
     set((s) => ({ profileJobs: { ...s.profileJobs, [initialJobKey]: {
-      ...(s.profileJobs[initialJobKey]!), estimate, planDigest, phase: 'preflight', error: undefined,
+      ...(s.profileJobs[initialJobKey]!), estimate, planDigest, inputManifest,
+      phase: 'preflight', error: undefined,
     } } }))
   },
 
@@ -1765,14 +1781,14 @@ export const useStore = create<Store>((set, get) => ({
       } } }))
       return
     }
-    const { planDigest, requestGeneration } = job
+    const { planDigest, requestGeneration, inputManifest } = job
     const submissionId = retryingUnknownSubmission && job.submissionId
       ? job.submissionId
       : globalThis.crypto.randomUUID()
     let pendingSubmission = _pendingProfileSubmissions.get(submissionId)
     if (!pendingSubmission) {
       pendingSubmission = {
-        doc: _clone(doc), nodeId: id, portId, planDigest, submissionId,
+        doc: _clone(doc), nodeId: id, portId, planDigest, inputManifest, submissionId,
         userId: submissionUserId, canCancel: true,
         cancelRequested: false, reconciling: false,
       }
@@ -1802,7 +1818,7 @@ export const useStore = create<Store>((set, get) => ({
       // This click is the explicit confirmation. The server recomputes admission from the submitted
       // graph and still rejects a large/unknown direct API call that omits ``confirmed``.
       status = await submitFullProfile(
-        doc, id, portId, planDigest, submissionId, submissionUserId,
+        doc, id, portId, planDigest, submissionId, submissionUserId, inputManifest,
       )
     } catch (e) {
       const unresolved = retryableProfileRequest(e)
@@ -2690,7 +2706,10 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       pending = (async () => {
         for (let attempt = 0; ; attempt += 1) {
           try {
-            const currentIdentity = await api.profileIdentity(doc, nodeId, portId)
+            const retainedManifest = currentPreviewBinding(get(), nodeId)?.inputManifest
+            const currentIdentity = await (retainedManifest
+              ? api.profileIdentity(doc, nodeId, portId, retainedManifest)
+              : api.profileIdentity(doc, nodeId, portId))
             if (currentIdentity.targetPortId !== portId) {
               throw new Error('Profile identity returned a different output port')
             }
@@ -2762,6 +2781,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         canvasId, nodeId, portId, principalId: reattachUserId!, canCancel: recoveryCanCancel,
         planIdentity: profilePlanIdentity(s.doc, nodeId, portId),
         planDigest: st.planDigest ?? undefined,
+        inputManifest: st.profile?.inputManifest,
         requestGeneration,
         status,
         identityVerified: verification === 'verified',

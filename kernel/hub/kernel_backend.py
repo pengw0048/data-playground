@@ -226,7 +226,8 @@ class KernelBackend:
 
     def profile_job(self, graph: Graph, node_id: str, port_id: str, plan_digest: str,
                     run_id: str, admission_token: str,
-                    request_id: str | None = None) -> RunStatus:
+                    request_id: str | None = None,
+                    input_manifest: list[dict[str, str]] | None = None) -> RunStatus:
         """Queue a whole-dataset profile on the canvas's durable execution owner.
 
         The kernel stamps its fenced ``kernel_id`` onto the shared RunState. Any stateless hub can
@@ -245,6 +246,7 @@ class KernelBackend:
             "port_id": selected_port,
             "plan_digest": plan_digest,
             "request_id": request_id,
+            "input_manifest": input_manifest,
         }))
 
     def status(self, run_id: str) -> RunStatus:

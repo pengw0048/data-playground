@@ -32,10 +32,39 @@ jobs:
         run: cd kernel && uv sync --extra dev
       - name: Check committed OpenAPI contract
         run: cd kernel && uv run python -m hub.contracts.openapi --check
-      - name: Run tests
-        # Dump every thread if one test stalls for a minute. The job-level cap prevents runaway spend;
-        # this makes an intermittent deadlock actionable instead of ending with only "operation canceled".
-        run: cd kernel && uv run pytest -q -o faulthandler_timeout=60
+      - name: Run tests (three isolated shards)
+        # The suite has no cross-file state contract. Separate pytest processes get independent SQLite
+        # databases from conftest.py; give each an independent seeded-data directory too. This avoids
+        # the serial suite's late-run SQLite/data-dir contention while retaining every test in this
+        # required check. Do not use pytest-xdist here: its file scheduling leaves the large kernel
+        # test module as a straggler.
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd kernel
+
+          run_shard() {
+            local name="$1"
+            shift
+            DP_DATA_DIR="$RUNNER_TEMP/dp-test-data-$name" \
+              uv run pytest -q -o faulthandler_timeout=60 "$@"
+          }
+
+          run_shard kernel hub/tests/test_kernel.py &
+          kernel_pid=$!
+          run_shard lifecycle hub/tests/test_ray_jobs.py hub/tests/test_object_lifecycle.py &
+          lifecycle_pid=$!
+          run_shard remainder \
+            --ignore=hub/tests/test_kernel.py \
+            --ignore=hub/tests/test_ray_jobs.py \
+            --ignore=hub/tests/test_object_lifecycle.py &
+          remainder_pid=$!
+
+          result=0
+          wait "$kernel_pid" || result=1
+          wait "$lifecycle_pid" || result=1
+          wait "$remainder_pid" || result=1
+          exit "$result"
 
   python-quality:
     # QA-01 / issue #111 — Ruff + basedpyright. No Ray, no browsers; a few minutes on ubuntu-latest.

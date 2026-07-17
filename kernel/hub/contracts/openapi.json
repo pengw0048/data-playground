@@ -712,6 +712,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "targetNodeId": {
             "anyOf": [
               {
@@ -2610,6 +2627,23 @@
             ],
             "title": "Bytes"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "needsConfirm": {
             "title": "Needsconfirm",
             "type": "boolean"
@@ -2662,6 +2696,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
@@ -2690,6 +2741,23 @@
       "ProfileIdentity": {
         "description": "Current server identity for recovery without re-running the size estimate.",
         "properties": {
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "planDigest": {
             "maxLength": 64,
             "minLength": 64,
@@ -2716,6 +2784,23 @@
         "properties": {
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "nodeId": {
             "title": "Nodeid",
@@ -2752,6 +2837,23 @@
           },
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "nodeId": {
             "title": "Nodeid",
@@ -2817,6 +2919,23 @@
             "default": false,
             "title": "Error",
             "type": "boolean"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "notPreviewable": {
             "default": false,
@@ -4574,13 +4693,21 @@
             "default": "complete",
             "enum": [
               "complete",
-              "page"
+              "page",
+              "partial"
             ],
             "title": "Completeness",
             "type": "string"
           },
           "container": {
-            "$ref": "#/components/schemas/WorkspaceResource"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "hasMore": {
             "default": false,
@@ -4605,6 +4732,14 @@
               }
             ],
             "title": "Nextcursor"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceSourceStatus"
+            },
+            "title": "Sources",
+            "type": "array"
           }
         },
         "required": [
@@ -4676,7 +4811,7 @@
         "type": "object"
       },
       "WorkspaceResource": {
-        "description": "One local Workspace child addressed by an opaque, path-independent reference.",
+        "description": "One Workspace child addressed by an opaque, path-independent reference.",
         "properties": {
           "detached": {
             "default": false,
@@ -4695,6 +4830,17 @@
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "mountId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mountid"
           },
           "name": {
             "title": "Name",
@@ -4721,6 +4867,37 @@
               }
             ],
             "title": "Placementid"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "resourceId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resourceid"
+          },
+          "source": {
+            "default": "local",
+            "enum": [
+              "local",
+              "provider"
+            ],
+            "title": "Source",
+            "type": "string"
           },
           "version": {
             "anyOf": [
@@ -4753,13 +4930,98 @@
             "type": "array"
           },
           "resource": {
-            "$ref": "#/components/schemas/WorkspaceResource"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/WorkspaceSourceStatus",
+            "default": {
+              "completeness": "complete",
+              "id": "local",
+              "kind": "local"
+            }
           }
         },
         "required": [
           "resource"
         ],
         "title": "WorkspaceResourceResolution",
+        "type": "object"
+      },
+      "WorkspaceSourceStatus": {
+        "description": "Completeness of one independently bounded source in a mixed Workspace page.",
+        "properties": {
+          "completeness": {
+            "enum": [
+              "complete",
+              "page",
+              "pending",
+              "partial",
+              "unavailable",
+              "unsupported"
+            ],
+            "title": "Completeness",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "local",
+              "provider",
+              "configuration"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "mountId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mountid"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "completeness"
+        ],
+        "title": "WorkspaceSourceStatus",
         "type": "object"
       }
     }
@@ -12970,7 +13232,7 @@
     },
     "/api/workspace/containers/{container_id}": {
       "get": {
-        "description": "One bounded, mixed local Workspace page; this route never invokes provider mutation APIs.",
+        "description": "One bounded mixed Workspace page across local and configured read-only provider sources.",
         "operationId": "browse_workspace_container_api_workspace_containers__container_id__get",
         "parameters": [
           {
@@ -13172,7 +13434,7 @@
     },
     "/api/workspace/resources/{resource_id}": {
       "get": {
-        "description": "Resolve a stable local resource reference plus its bounded navigation ancestors.",
+        "description": "Resolve a stable local/provider reference plus its bounded navigation ancestors.",
         "operationId": "resolve_workspace_resource_api_workspace_resources__resource_id__get",
         "parameters": [
           {

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from hub.models import Graph
+from hub.plan_key import plan_hash
 from hub.profile_identity import profile_plan_digest
 
 
@@ -75,6 +76,25 @@ def test_profile_identity_changes_for_execution_and_source_revisions():
     assert _digest(title_edit) != _digest(original)
 
     assert _digest(original, "generation-2") != _digest(original, "generation-1")
+
+
+def test_admitted_identity_distinguishes_dataset_or_provider_replacement_at_same_revision():
+    original = _graph()
+    config = next(node for node in original.nodes if node.id == "source").data["config"]
+    config.update({
+        "_input_dataset_id": "dataset-a",
+        "_input_provider": "lance",
+        "_input_revision_id": "1",
+    })
+
+    for field, replacement in (
+            ("_input_dataset_id", "dataset-b"),
+            ("_input_provider", "replacement-provider")):
+        replaced = deepcopy(original)
+        next(node for node in replaced.nodes if node.id == "source").data["config"][field] = replacement
+        assert _digest(replaced) != _digest(original)
+        assert plan_hash(replaced, "metric", lambda _uri: None) != plan_hash(
+            original, "metric", lambda _uri: None)
 
 
 def test_profile_identity_changes_for_the_selected_output_port():

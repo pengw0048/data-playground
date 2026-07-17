@@ -6,6 +6,7 @@ import asyncio
 import json
 import sqlite3
 import threading
+import time
 import uuid
 from typing import cast
 
@@ -14,7 +15,13 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, event, select
 
-from hub import main as hub_main, metadb
+from hub import main as hub_main, metadb, workspace_providers
+from hub.catalog_provider import (
+    CatalogResource,
+    ProviderAncestors,
+    ProviderPage,
+    ProviderResourceResult,
+)
 from hub.main import app
 
 
@@ -244,6 +251,162 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
 
     assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
                    and "catalog_" in statement for statement in statements)
+
+
+class _WorkspaceFixtureProvider:
+    def __init__(self):
+        self.list_calls = 0
+
+    @staticmethod
+    def _resources(mount_id: str) -> list[CatalogResource]:
+        return [
+            CatalogResource(id="container-a", kind="container", name="shared"),
+            CatalogResource(
+                id="dataset-a", kind="dataset", name="shared",
+                uri=f"file:///{mount_id}.parquet"),
+            CatalogResource(
+                id="nested-dataset", kind="dataset", name="nested",
+                parent_id="container-a", uri=f"file:///{mount_id}-nested.parquet"),
+        ]
+
+    def list_children(self, mount, parent_id, *, limit, cursor=None):
+        self.list_calls += 1
+        if mount.id == "a-slow":
+            time.sleep(0.02)
+        resources = sorted(
+            (item for item in self._resources(mount.id) if item.parent_id == parent_id),
+            key=lambda item: (item.name, item.id),
+        )
+        start = int(cursor or 0)
+        items = resources[start:start + limit]
+        if mount.id == "b-partial":
+            return ProviderPage(
+                state="partial", items=items[:1], reason="provider returned a bounded subset")
+        next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
+        return ProviderPage(items=items, next_cursor=next_cursor)
+
+    def resolve(self, mount, resource_id):
+        item = next((item for item in self._resources(mount.id) if item.id == resource_id), None)
+        return ProviderResourceResult(item=item) if item else ProviderResourceResult(
+            state="unavailable", reason="resource not found")
+
+    def ancestors(self, mount, resource_id):
+        if resource_id == "nested-dataset":
+            return ProviderAncestors(items=[self._resources(mount.id)[0]])
+        return ProviderAncestors()
+
+    def dataset_detail(self, mount, resource_id):
+        return self.resolve(mount, resource_id)
+
+    def capabilities(self, _mount):
+        raise AssertionError("Workspace composition does not need capability-wide materialization")
+
+
+@pytest.mark.parametrize("config", [[], "", 0, False])
+def test_workspace_rejects_falsy_non_object_mount_config(monkeypatch, config):
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": "invalid-config", "provider": "fixture", "config": config},
+    ]))
+
+    mounts, invalid = workspace_providers._configured_mounts()
+
+    assert mounts == []
+    assert invalid
+
+
+def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_deep_links(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-providers")
+    local_child = metadb.workspace_create_container(
+        folder["id"], f"workspace-{token}-local-child")
+    provider = _WorkspaceFixtureProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    bounded = workspace_providers.bounded_list_children
+    monkeypatch.setattr(
+        workspace_providers, "bounded_list_children",
+        lambda *args, **kwargs: bounded(*args, **kwargs, timeout=0.001),
+    )
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": "a-slow", "provider": "fixture", "containerId": folder["id"]},
+        {"id": "b-partial", "provider": "fixture", "containerId": folder["id"]},
+        {"id": "c-first", "provider": "fixture", "containerId": folder["id"]},
+        {"id": "d-second", "provider": "fixture", "containerId": folder["id"]},
+    ]))
+
+    with TestClient(app) as client:
+        started = time.monotonic()
+        response = client.get(
+            f"/api/workspace/containers/{folder['id']}", params={"limit": 100})
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert elapsed < 0.15
+        assert page["completeness"] == "partial"
+        assert f"container:{local_child['id']}" in {item["id"] for item in page["items"]}
+        statuses = {item["id"]: item for item in page["sources"]}
+        assert statuses["local"]["completeness"] == "complete"
+        assert statuses["mount:a-slow"] == {
+            "id": "mount:a-slow", "kind": "provider", "mountId": "a-slow",
+            "provider": "fixture", "completeness": "unavailable",
+            "error": "deadline exceeded",
+        }
+        assert statuses["mount:b-partial"]["completeness"] == "partial"
+        assert statuses["mount:b-partial"]["error"] == "provider returned a bounded subset"
+
+        duplicates = [item for item in page["items"]
+                      if item["name"] == "shared" and item.get("resourceId") == "dataset-a"]
+        assert {item["mountId"] for item in duplicates} == {"c-first", "d-second"}
+        assert len({item["id"] for item in duplicates}) == 2
+        assert all(item["provider"] == "fixture" and item["source"] == "provider"
+                   for item in duplicates)
+
+        paged_ids: list[str] = []
+        cursor = None
+        while True:
+            current = client.get(f"/api/workspace/containers/{folder['id']}", params={
+                "limit": 2, **({"cursor": cursor} if cursor else {}),
+            })
+            assert current.status_code == 200, current.text
+            document = current.json()
+            paged_ids.extend(item["id"] for item in document["items"])
+            cursor = document["nextCursor"]
+            if cursor is None:
+                break
+        assert paged_ids == [item["id"] for item in page["items"]]
+        assert len(paged_ids) == len(set(paged_ids))
+
+        remote_container = next(item for item in page["items"]
+                                if item.get("mountId") == "c-first"
+                                and item.get("resourceId") == "container-a")
+        remote_identity = remote_container["id"].split(":", 1)[1]
+        nested = client.get(f"/api/workspace/containers/{remote_identity}")
+        assert nested.status_code == 200, nested.text
+        nested_resource = nested.json()["items"][0]
+        resolved = client.get(f"/api/workspace/resources/{nested_resource['id']}")
+        assert resolved.status_code == 200, resolved.text
+        resolution = resolved.json()
+        assert resolution["resource"]["id"] == nested_resource["id"]
+        assert resolution["source"]["completeness"] == "complete"
+        assert [item["id"] for item in resolution["ancestors"]] == [
+            f"container:{root['id']}", f"container:{folder['id']}", remote_container["id"],
+        ]
+
+        reads_before_canvas_action = provider.list_calls
+        created = client.post("/api/workspace/canvases", json={
+            "containerId": folder["id"], "expectedContainerVersion": folder["version"],
+            "name": "Provider write guard",
+        })
+        assert created.status_code == 200, created.text
+        assert provider.list_calls == reads_before_canvas_action
+        created_document = created.json()
+        metadb.workspace_delete_placement(
+            created_document["resource"]["placementId"], expected_version=1)
+        metadb.delete_canvas_cascade(created_document["id"])
+    # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
+    # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
+    time.sleep(0.03)
 
 
 def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_names(workspace_scope):

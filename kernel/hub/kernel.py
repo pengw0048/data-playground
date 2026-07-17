@@ -50,6 +50,7 @@ class ProfileJobBody(BaseModel):
     port_id: str = Field(min_length=1, max_length=128)
     plan_digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     request_id: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
 
 
 def _liveness_busy(inflight_count: int, runs) -> bool:
@@ -149,7 +150,8 @@ def _cancel_with_profile_admission(
 
 def _start_admitted_profile(
         *, profile_runner, graph, node_id: str, port_id: str, plan_digest: str, run_id: str,
-        request_id: str | None, profile_attempt_order: int, persist_failure) -> object:
+        request_id: str | None, profile_attempt_order: int, persist_failure,
+        input_manifest=None) -> object:
     """Register/spawn an admitted profile or terminalize a proven pre-spawn failure.
 
     The caller holds the kernel's profile admission mutex. If a subprocess runner retains a possibly
@@ -159,11 +161,14 @@ def _start_admitted_profile(
     from hub.models import PerNodeStatus, RunStatus
 
     try:
-        return profile_runner.run(
-            graph, node_id, port_id=port_id, plan_digest=plan_digest,
-            profile_attempt_order=profile_attempt_order, run_id=run_id,
-            request_id=request_id,
-        )
+        kwargs = {
+            "port_id": port_id, "plan_digest": plan_digest,
+            "profile_attempt_order": profile_attempt_order, "run_id": run_id,
+            "request_id": request_id,
+        }
+        if input_manifest is not None:
+            kwargs["input_manifest"] = input_manifest
+        return profile_runner.run(graph, node_id, **kwargs)
     except Exception as exc:
         try:
             return profile_runner.status(run_id)
@@ -245,6 +250,7 @@ def _dispatch_profile_job(
             plan_digest=body.plan_digest, run_id=body.run_id,
             request_id=body.request_id,
             profile_attempt_order=profile_attempt_order,
+            input_manifest=body.input_manifest,
             persist_failure=lambda _graph, st: metadata.save_run_state(
                 st.run_id, st.model_dump(), canvas_id=kernel_canvas,
                 kernel_id=kernel_id),

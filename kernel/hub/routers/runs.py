@@ -153,6 +153,36 @@ def _bind_local_run_manifest(
         ) from exc
 
 
+def _inspection_manifest_graph(
+        graph, target_node_id: str | None, supplied: list[dict[str, str]] | None, deps,
+) -> tuple[object, list[dict[str, str]] | None]:
+    """Reuse the local-run manifest contract for one exact inspector input set.
+
+    Registered revision providers are resolved once and immediately reopened. Existing unversioned
+    inspector behavior remains available when no manifest can be minted, but a caller-supplied or
+    explicitly pinned binding always fails closed instead of substituting latest.
+    """
+    pinned = any(
+        isinstance(node.data.get("config"), dict)
+        and node.data["config"].get("datasetRef") is not None
+        for node in _local_run_source_nodes(graph, target_node_id)
+    )
+    try:
+        with source_read_scope(
+                deps.storage, graph_mod.execution_source_uris(graph, target_node_id),
+                owner=f"inspection-manifest:{uuid.uuid4().hex}"):
+            manifest = supplied if supplied is not None else _resolve_local_run_manifest(
+                graph, target_node_id, deps)
+            return _bind_local_run_manifest(
+                graph, manifest, deps, target_node_id), manifest
+    except ManagedSourceReadError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except APIError:
+        if supplied is not None or pinned:
+            raise
+        return graph, None
+
+
 def _input_drift(
         graph, target_node_id: str, preview_manifest: list[dict[str, str]], deps) -> InputDrift:
     """Compare exact preview inputs with latest heads while keeping the preview binding untouched."""
@@ -484,16 +514,22 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
-    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
+    graph, manifest = _inspection_manifest_graph(
+        req.graph, req.node_id, req.input_manifest, deps)
+    _reject_invalid(graph, deps, req.node_id)
+    port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return ProfileResult(**kb.profile(
-                req.graph, req.node_id, full=False, port_id=port_id))
+            result = ProfileResult(**kb.profile(
+                graph, req.node_id, full=False, port_id=port_id))
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
-            return ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
-    return profile_node(req.graph, req.node_id, deps.resolve_adapter, deps.registry,
-                        deps.node_builders, deps.node_specs, full=False, storage=deps.storage,
-                        port_id=port_id)
+            result = ProfileResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
+    else:
+        result = profile_node(graph, req.node_id, deps.resolve_adapter, deps.registry,
+                              deps.node_builders, deps.node_specs, full=False,
+                              storage=deps.storage, port_id=port_id)
+    result.input_manifest = manifest
+    return result
 
 
 def _profile_job_estimate(graph, node_id: str, deps) -> RunEstimate:
@@ -558,16 +594,20 @@ def estimate_full_profile(req: ProfileEstimateRequest,
     _reject_invalid(req.graph, deps, req.node_id)
     port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
+    graph, manifest = _inspection_manifest_graph(
+        req.graph, req.node_id, req.input_manifest, deps)
+    _reject_invalid(graph, deps, req.node_id)
     # Pin one managed-source generation across both observations. Their internal scopes remain useful
     # in direct-call paths, while this outer lease prevents size and digest from describing two different
     # generations if retention races the endpoint between those calls.
     with source_read_scope(
-            deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
+            deps.storage, graph_mod.execution_source_uris(graph, req.node_id),
             owner=f"profile-preflight:{uuid.uuid4().hex}"):
-        estimate = _profile_job_estimate(req.graph, req.node_id, deps)
-        digest = _profile_plan_digest(req.graph, req.node_id, port_id, deps)
+        estimate = _profile_job_estimate(graph, req.node_id, deps)
+        digest = _profile_plan_digest(graph, req.node_id, port_id, deps)
     return ProfileEstimate(
-        **estimate.model_dump(), target_port_id=port_id, plan_digest=digest)
+        **estimate.model_dump(), target_port_id=port_id, plan_digest=digest,
+        input_manifest=manifest)
 
 
 @router.post("/run/profile-identity", response_model=ProfileIdentity)
@@ -580,9 +620,13 @@ def current_profile_identity(req: ProfileIdentityRequest,
     _reject_invalid(req.graph, deps, req.node_id)
     port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
     _require_full_profile_containment(req.graph, req.node_id, deps)
+    graph, manifest = _inspection_manifest_graph(
+        req.graph, req.node_id, req.input_manifest, deps)
+    _reject_invalid(graph, deps, req.node_id)
     return ProfileIdentity(
         target_port_id=port_id,
-        plan_digest=_profile_plan_digest(req.graph, req.node_id, port_id, deps),
+        plan_digest=_profile_plan_digest(graph, req.node_id, port_id, deps),
+        input_manifest=manifest,
     )
 
 
@@ -676,15 +720,18 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
             # Port selection is validated before source acquisition or run-id allocation. Immutable
             # replay above adopts only the exact stored node/port/digest identity.
             _require_full_profile_containment(req.graph, req.node_id, deps)
+            graph, manifest = _inspection_manifest_graph(
+                req.graph, req.node_id, req.input_manifest, deps)
+            _reject_invalid(graph, deps, req.node_id)
 
             # Keep managed inputs pinned from identity minting until the kernel-side process runner has
             # synchronously claimed its own exact-generation leases. This closes the fingerprint->dispatch
             # retirement gap while still letting the child own the long-lived execution leases.
             with source_read_scope(
-                    deps.storage, graph_mod.execution_source_uris(req.graph, req.node_id),
+                    deps.storage, graph_mod.execution_source_uris(graph, req.node_id),
                     owner=f"profile-submit:{uuid.uuid4().hex}"):
                 authoritative_digest = _profile_plan_digest(
-                    req.graph, req.node_id, port_id, deps)
+                    graph, req.node_id, port_id, deps)
                 if req.plan_digest != authoritative_digest:
                     if existing is None or not existing.should_dispatch:
                         raise HTTPException(
@@ -704,7 +751,7 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                     run_id = existing.run_id
                     status = RunStatus(**settled)
                 else:
-                    estimate = _profile_job_estimate(req.graph, req.node_id, deps)
+                    estimate = _profile_job_estimate(graph, req.node_id, deps)
                     if estimate.needs_confirm and not req.confirmed:
                         raise HTTPException(
                             409, "full profile needs confirmation (large or unknown whole-dataset scan)")
@@ -775,10 +822,18 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                                 status = RunStatus(**admitted)
                             else:
                                 try:
+                                    import inspect
+                                    profile_kwargs = {
+                                        "run_id": run_id,
+                                        "admission_token": preallocation_token,
+                                        "request_id": request_id,
+                                    }
+                                    if "input_manifest" in inspect.signature(
+                                            owner.profile_job).parameters:
+                                        profile_kwargs["input_manifest"] = manifest
                                     returned = owner.profile_job(
-                                        req.graph, req.node_id, port_id, authoritative_digest,
-                                        run_id=run_id, admission_token=preallocation_token,
-                                        request_id=request_id,
+                                        graph, req.node_id, port_id, authoritative_digest,
+                                        **profile_kwargs,
                                     )
                                     if (returned.run_id != run_id
                                             or returned.job_type != "profile"
@@ -855,8 +910,15 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
+    if req.input_manifest is not None and req.target_node_id is None:
+        raise HTTPException(400, "schema inputManifest requires targetNodeId")
+    graph = req.graph
+    if req.input_manifest is not None:
+        graph, _manifest = _inspection_manifest_graph(
+            req.graph, req.target_node_id, req.input_manifest, deps)
+        _reject_invalid(graph, deps, req.target_node_id)
     try:
-        return schema_for_graph_ports(req.graph, deps.resolve_adapter, deps.registry,
+        return schema_for_graph_ports(graph, deps.resolve_adapter, deps.registry,
                                       deps.node_builders, deps.node_specs, storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))

@@ -18,7 +18,7 @@ from hub.models import Graph, dataset_ref_identity
 # v2 invalidates results produced before the central SQL/expression execution policy; a cache hit happens
 # before BuildEngine lowering, so namespace invalidation is what prevents a legacy unsafe plan from being
 # served without passing the new gate.
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 @functools.lru_cache(maxsize=1)
@@ -66,8 +66,13 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
         if n.type == "source":
             uri = cfg.get("uri")
             if uri:
+                admitted_revision = cfg.get("_input_revision_id")
                 dataset_ref = cfg.get("datasetRef")
-                if isinstance(dataset_ref, dict):
+                if isinstance(admitted_revision, str) and admitted_revision:
+                    # Exact preview/run/profile bindings must not consult mutable head while keying
+                    # work. The private revision is attached only to the dispatch/inspection copy.
+                    parts.append(f"{prefix}admitted:{admitted_revision}")
+                elif isinstance(dataset_ref, dict):
                     dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                     parts.append(
                         f"{prefix}ref:{dataset_id}:{revision_id}")

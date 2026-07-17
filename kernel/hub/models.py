@@ -521,7 +521,7 @@ class CatalogBrowse(Wire):
 
 
 class WorkspaceResource(Wire):
-    """One local Workspace child addressed by an opaque, path-independent reference."""
+    """One Workspace child addressed by an opaque, path-independent reference."""
     id: str
     kind: Literal["container", "canvas", "dataset"]
     name: str
@@ -529,27 +529,47 @@ class WorkspaceResource(Wire):
     placement_id: str | None = None
     version: int | None = None
     detached: bool = False
+    source: Literal["local", "provider"] = "local"
+    mount_id: str | None = None
+    provider: str | None = None
+    resource_id: str | None = None
+
+
+class WorkspaceSourceStatus(Wire):
+    """Completeness of one independently bounded source in a mixed Workspace page."""
+    id: str
+    kind: Literal["local", "provider", "configuration"]
+    completeness: Literal[
+        "complete", "page", "pending", "partial", "unavailable", "unsupported"
+    ]
+    mount_id: str | None = None
+    provider: str | None = None
+    error: str | None = None
 
 
 class WorkspaceBrowsePage(Wire):
-    container: WorkspaceResource
+    container: WorkspaceResource | None
     items: list[WorkspaceResource] = []
     next_cursor: str | None = None
     has_more: bool = False
-    completeness: Literal["complete", "page"] = "complete"
+    completeness: Literal["complete", "page", "partial"] = "complete"
+    sources: list[WorkspaceSourceStatus] = []
 
     @model_validator(mode="after")
     def validate_cursor_state(self) -> "WorkspaceBrowsePage":
         if self.has_more != (self.next_cursor is not None):
             raise ValueError("Workspace browse continuation state is inconsistent")
-        if self.completeness != ("page" if self.has_more else "complete"):
+        if self.completeness != "partial" and self.completeness != (
+                "page" if self.has_more else "complete"):
             raise ValueError("Workspace browse completeness is inconsistent")
         return self
 
 
 class WorkspaceResourceResolution(Wire):
-    resource: WorkspaceResource
+    resource: WorkspaceResource | None
     ancestors: list[WorkspaceResource] = []
+    source: WorkspaceSourceStatus = WorkspaceSourceStatus(
+        id="local", kind="local", completeness="complete")
 
 
 class CatalogFolder(Wire):
@@ -769,6 +789,9 @@ class ProfileResult(Wire):
     # Present only when the profile was measured from a bounded preview or an explicit Sample node.
     # A complete profile over an unsampled graph must not acquire sample evidence by implication.
     sample_provenance: SampleProvenance | None = None
+    # Exact Source revisions measured by this profile. The established local-run manifest shape is
+    # reused verbatim so preview, run, and profile recovery have one durable input identity contract.
+    input_manifest: list[dict[str, str]] | None = None
     not_previewable: bool = False
     error: bool = False
     reason: str | None = None
@@ -845,12 +868,14 @@ class ProfileEstimate(RunEstimate):
     """Whole-profile preflight plus the server-minted identity required by submission."""
     target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileIdentity(Wire):
     """Current server identity for recovery without re-running the size estimate."""
     target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class PerNodeStatus(Wire):
@@ -1267,6 +1292,7 @@ class ImportRequest(Wire):
 class CompileRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class PreviewRequest(Wire):
@@ -1309,6 +1335,7 @@ class ProfileEstimateRequest(Wire):
     graph: Graph
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileIdentityRequest(Wire):
@@ -1316,6 +1343,7 @@ class ProfileIdentityRequest(Wire):
     graph: Graph
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class ProfileJobRequest(Wire):
@@ -1331,6 +1359,7 @@ class ProfileJobRequest(Wire):
     plan_digest: PlanDigest
     submission_id: UUID4
     confirmed: bool = False
+    input_manifest: list[dict[str, str]] | None = None
 
 
 class EstimateRequest(Wire):

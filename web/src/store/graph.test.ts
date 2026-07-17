@@ -406,6 +406,46 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().previewBindings.target.inputManifest).toEqual(latestManifest)
   })
 
+  it('recovers a durable full profile against the retained preview manifest after reload', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source], edges: [],
+    }
+    const manifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'lance',
+      resolved_at: 'before',
+    }]
+    const digest = 'b'.repeat(64)
+    useStore.setState({ doc, previews: {}, previewBindings: {}, profileJobs: {} })
+    apiMocks.preview.mockResolvedValueOnce({ ...previewResult('old'), inputManifest: manifest })
+    await useStore.getState().runPreview('source')
+
+    apiMocks.profileIdentity.mockResolvedValueOnce({
+      targetPortId: 'out', planDigest: digest, inputManifest: manifest,
+    })
+    apiMocks.profileJobs.mockResolvedValueOnce([{
+      runId: 'profile-recovered-manifest', status: 'done', jobType: 'profile',
+      targetNodeId: 'source', targetPortId: 'out', planDigest: digest,
+      profileAttemptOrder: 1, rowsProcessed: 0, ms: 10, placement: 'local', perNode: [],
+      outputs: [], profile: {
+        targetPortId: 'out', columns: [], rowCount: 1, sampled: false,
+        completeness: 'complete', notPreviewable: false, inputManifest: manifest,
+      },
+    }])
+
+    useStore.getState().loadDoc(doc, 'owner')
+
+    await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalledWith(
+      doc, 'source', 'out', manifest,
+    ))
+    await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'done', identityVerified: true, inputManifest: manifest,
+      status: { runId: 'profile-recovered-manifest', profile: { inputManifest: manifest } },
+    }))
+    expect(useStore.getState().previewBindings.source.inputManifest).toEqual(manifest)
+  })
+
   it('invalidates downstream state when refresh replaces the dataset at the same revision id', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/events.lance' }
@@ -713,17 +753,25 @@ describe('graph store — core authority ops', () => {
 
   it('keeps a whole-dataset profile behind visible preflight and an explicit start', async () => {
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [NODE('source')], edges: [] }
-    useStore.setState({ doc })
+    const manifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'lance',
+      resolved_at: 'before',
+    }]
+    useStore.setState({ doc, previewBindings: { source: {
+      canvasId: doc.id, nodeId: 'source', planIdentity: previewPlanIdentity(doc, 'source'),
+      inputManifest: manifest,
+    } } })
     apiMocks.profileEstimate.mockResolvedValueOnce({
       rows: null, bytes: null, placement: 'local', needsConfirm: true,
-      targetPortId: 'out', planDigest: 'a'.repeat(64),
+      targetPortId: 'out', planDigest: 'a'.repeat(64), inputManifest: manifest,
     })
 
     await useStore.getState().prepareFullProfile('source')
 
     expect(useStore.getState().profileJobs.source).toMatchObject({
-      phase: 'preflight', estimate: { needsConfirm: true },
+      phase: 'preflight', estimate: { needsConfirm: true }, inputManifest: manifest,
     })
+    expect(apiMocks.profileEstimate).toHaveBeenCalledWith(doc, 'source', 'out', manifest)
     expect(apiMocks.fullProfile).not.toHaveBeenCalled()
 
     apiMocks.fullProfile.mockResolvedValueOnce({
@@ -735,7 +783,7 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.fullProfile).toHaveBeenCalledWith(
       doc, 'source', 'out', useStore.getState().profileJobs.source.planDigest,
-      expect.any(String), true,
+      expect.any(String), true, manifest,
     )
   })
 

@@ -12,7 +12,7 @@ import threading
 import time
 import types
 
-import duckdb
+import pyarrow as pa
 import pytest
 
 from hub.models import Graph, RunStatus
@@ -142,24 +142,34 @@ def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str, *,
 
 
 def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
-    source = tmp_path / "rows.parquet"
-    duckdb.connect().execute(
-        f"COPY (SELECT * FROM (VALUES (1,'a'),(2,'b'),(3,NULL)) t(x,y)) "
-        f"TO '{source}' (FORMAT PARQUET)"
-    )
+    lance = pytest.importorskip("lance")
+    source = tmp_path / "rows.lance"
+    lance.write_dataset(pa.table({"x": [1, 2, 3], "y": ["a", "b", None]}), source)
+    graph = _graph(str(source))
+    graph.nodes[0].data["config"].update({
+        "_input_dataset_id": "dataset-source",
+        "_input_provider": "lance",
+        "_input_revision_id": "1",
+    })
+    input_manifest = [{
+        "node_id": "source", "dataset_id": "dataset-source",
+        "revision_id": "1", "provider": "lance",
+        "resolved_at": "2026-07-16T00:00:00Z",
+    }]
     with _isolated_metadata(tmp_path / "parent.db"):
         runner = _runner(tmp_path)
         started = runner.run(
-            _graph(str(source)),
+            graph,
             "source",
             plan_digest=_digest("real-profile"),
             profile_attempt_order=7,
             run_id="profile-real-child",
             request_id="request-real-child",
+            input_manifest=input_manifest,
         )
         final = _wait(runner, started.run_id)
 
-    assert final.status == "done"
+    assert final.status == "done", final.error
     assert final.profile is not None and not final.profile.sampled
     assert final.profile.row_count == 3
     assert [column.name for column in final.profile.columns] == ["x", "y"]
@@ -168,6 +178,7 @@ def test_full_profile_roundtrips_through_real_subrun_and_reaps(tmp_path):
     assert final.plan_digest == _digest("real-profile")
     assert final.profile_attempt_order == 7
     assert final.request_id == "request-real-child"
+    assert final.profile.input_manifest == input_manifest
     _wait_for_supervisor_cleanup(runner, started.run_id)
     assert started.run_id not in runner._procs
 

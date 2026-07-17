@@ -130,6 +130,36 @@ def test_file_provider_wheel_passes_public_conformance(tmp_path):
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout.strip() == "catalog provider conformance passed"
 
+    second_root = tmp_path / "catalog-two"
+    _write_catalog(second_root, _resources("file:///reference-two.parquet"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    mixed_env = {
+        **clean_env,
+        "DP_WORKSPACE": str(workspace),
+        "DP_DATA_DIR": str(workspace / "data"),
+        "DP_DATABASE_URL": f"sqlite:///{workspace / 'dataplay.db'}",
+        "DP_EXECUTION": "local-out-of-core",
+        "DP_CATALOG_MOUNTS": json.dumps([
+            {"id": "wheel-a", "provider": "dp-file-catalog", "config": {"root": str(root)}},
+            {"id": "wheel-b", "provider": "dp-file-catalog", "config": {"root": str(second_root)}},
+        ]),
+    }
+    composed = _run([str(python), "-c", """
+from hub import metadb, workspace_providers
+metadb.migrate_db()
+page = workspace_providers.browse(
+    metadb.LOCAL_WORKSPACE_ROOT_ID, uid=metadb.DEFAULT_USER_ID, limit=100)
+duplicates = [item for item in page['items']
+              if item['name'] == 'shared' and item.get('resourceId') == 'dataset-a']
+assert {item['mountId'] for item in duplicates} == {'wheel-a', 'wheel-b'}
+assert len({item['id'] for item in duplicates}) == 2
+assert all(source['completeness'] == 'complete' for source in page['sources'])
+print('installed provider Workspace composition passed')
+"""], cwd=tmp_path, env=mixed_env)
+    assert composed.returncode == 0, composed.stderr
+    assert composed.stdout.strip().endswith("installed provider Workspace composition passed")
+
     unique_names = _resources("file:///reference.parquet")
     unique_names[1]["name"] = "different"
     (root / "catalog.json").write_text(json.dumps({"resources": unique_names}))

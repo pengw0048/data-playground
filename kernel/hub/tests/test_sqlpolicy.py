@@ -606,4 +606,4 @@ def test_policy_version_and_cache_namespace_are_explicit_security_boundaries():
     _require_supported_version(SUPPORTED_DUCKDB_VERSION)
     with pytest.raises(RuntimeError, match="Review the AST policy"):
         _require_supported_version("9.9.9")
-    assert CACHE_SCHEMA_VERSION == 2
+    assert CACHE_SCHEMA_VERSION == 3
