@@ -1250,7 +1250,8 @@ class SubprocessRunner:
             child_outputs = st.outputs
             committed_count = 0
             valid_child_commit = (
-                not cancelled and proc.returncode == 0
+                not cancelled
+                and (proc.returncode == 0 or st.status == "failed")
                 and st.status in ("done", "failed")
                 and len(child_outputs) == len(reservations)
                 and all(

@@ -314,7 +314,8 @@ def test_subprocess_object_second_port_failure_publishes_prefix_and_abandons_res
     ).model_dump()))
 
     class FinishedProcess:
-        returncode = 0
+        # hub.subrun exits non-zero after publishing a truthful failed status with a committed prefix.
+        returncode = 1
 
         @staticmethod
         def poll():
