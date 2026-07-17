@@ -302,7 +302,7 @@ class DurableTask(Base):
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (
         UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
-        CheckConstraint("task_kind IN ('managed_local_write','external_wait')",
+        CheckConstraint("task_kind IN ('managed_local_write','external_wait','linear_checkpoint_write')",
                         name="ck_durable_task_kind"),
         CheckConstraint("backend_kind = 'local'", name="ck_durable_task_backend"),
         CheckConstraint("status IN ('queued','running','done','failed','cancelled')", name="ck_durable_task_status"),
@@ -368,6 +368,52 @@ class DurableExternalWait(Base):
                         "(stage_dev IS NOT NULL AND stage_ino IS NOT NULL "
                         "AND stage_dev >= 0 AND stage_ino >= 0)",
                         name="ck_external_wait_stage_identity"),
+    )
+
+
+class DurableCheckpoint(Base):
+    """Minimal DB-only admission and candidate binding for one hidden checkpoint."""
+    __tablename__ = "durable_checkpoints"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    checkpoint_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    checkpoint_node_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    output_port_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    task_intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    graph_prefix_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    phase: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending")
+    candidate_uri: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("local_result_artifacts.uri"), nullable=True)
+    candidate_generation: Mapped[str | None] = mapped_column(
+        String(64), nullable=True)
+    candidate_attempt_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("durable_task_attempts.id"), nullable=True)
+    candidate_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    candidate_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        UniqueConstraint("checkpoint_id", name="uq_durable_checkpoint_id"),
+        UniqueConstraint("candidate_uri", name="uq_durable_checkpoint_candidate_uri"),
+        UniqueConstraint(
+            "candidate_generation", name="uq_durable_checkpoint_candidate_generation"),
+        CheckConstraint("phase IN ('pending','reserved')", name="ck_durable_checkpoint_phase"),
+        CheckConstraint(
+            "(candidate_uri IS NULL AND candidate_generation IS NULL "
+            "AND candidate_attempt_id IS NULL) OR (candidate_uri IS NOT NULL "
+            "AND candidate_generation IS NOT NULL AND candidate_attempt_id IS NOT NULL)",
+            name="ck_durable_checkpoint_candidate_binding"),
+        CheckConstraint(
+            "(candidate_dev IS NULL AND candidate_ino IS NULL) OR "
+            "(candidate_dev IS NOT NULL AND candidate_ino IS NOT NULL "
+            "AND candidate_dev >= 0 AND candidate_ino >= 0)",
+            name="ck_durable_checkpoint_candidate_inode"),
+        CheckConstraint(
+            "(phase = 'pending' AND candidate_uri IS NULL) OR "
+            "(phase = 'reserved' AND candidate_uri IS NOT NULL)",
+            name="ck_durable_checkpoint_phase_binding"),
     )
 
 
@@ -3427,6 +3473,171 @@ def submit_durable_local_write_task(
         return _durable_task_doc(s, task), True
 
 
+def _linear_checkpoint_identity(value: object, field: str, limit: int) -> str:
+    value = str(value)
+    if (not value or len(value) > limit or value != value.strip() or "\x00" in value
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value)):
+        raise ValueError(f"checkpoint {field} is not a canonical identity")
+    return value
+
+
+def _linear_checkpoint_payloads(
+        graph_doc: dict, input_manifest: list[dict[str, str]], write_intent: dict,
+        final_target_node_id: object, checkpoint_node_id: object,
+        output_port_id: object) -> tuple[str, str, str, str, str, str]:
+    from hub.local_run_inputs import validate_manifest
+    from hub.models import Graph, WriteIntent
+
+    graph = Graph.model_validate(graph_doc, extra="forbid")
+    manifest = validate_manifest(input_manifest)
+    intent = WriteIntent.model_validate(write_intent, extra="forbid")
+    final_id = _linear_checkpoint_identity(final_target_node_id, "final target", 256)
+    checkpoint_id = _linear_checkpoint_identity(checkpoint_node_id, "node", 256)
+    port_id = _linear_checkpoint_identity(output_port_id, "output port", 128)
+    node_ids = {str(node.id) for node in graph.nodes}
+    if final_id not in node_ids or checkpoint_id not in node_ids:
+        raise ValueError("checkpoint admission nodes must exist in the saved graph")
+    payloads = (
+        json.dumps(graph.model_dump(by_alias=True, mode="json"),
+                   sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+        json.dumps(intent.model_dump(by_alias=True, mode="json"),
+                   sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+    )
+    if any(len(payload.encode("utf-8")) > _DURABLE_TASK_DOC_MAX_BYTES for payload in payloads):
+        raise ValueError("checkpoint frozen admission exceeds the bounded limit")
+    return (*payloads, final_id, checkpoint_id, port_id)
+
+
+def _linear_checkpoint_admission_doc(
+        s, task: DurableTask, checkpoint: DurableCheckpoint) -> dict:
+    first = s.scalar(select(DurableTaskAttempt).where(
+        DurableTaskAttempt.task_id == task.id,
+        DurableTaskAttempt.attempt_number == 1))
+    try:
+        graph_doc = json.loads(task.graph_doc)
+        input_manifest = json.loads(task.input_manifest)
+        write_intent = json.loads(task.write_intent)
+        canonical = _linear_checkpoint_payloads(
+            graph_doc, input_manifest, write_intent, task.target_node_id,
+            checkpoint.checkpoint_node_id, checkpoint.output_port_id)
+    except Exception as exc:
+        raise DurableTaskSubmissionConflict("checkpoint admission is invalid") from exc
+    if (first is None or checkpoint.task_id != task.id
+            or canonical[:3] != (task.graph_doc, task.input_manifest, task.write_intent)
+            or checkpoint.task_intent_sha256 != task.intent_sha256
+            or hashlib.sha256(task.input_manifest.encode()).hexdigest()
+            != checkpoint.input_manifest_sha256):
+        raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
+    return {
+        "task_id": task.id, "attempt_id": first.id,
+        "owner_id": task.owner_id, "canvas_id": task.canvas_id,
+        "submission_id": task.submission_id,
+        "final_target_node_id": task.target_node_id,
+        "graph_doc": graph_doc, "input_manifest": input_manifest,
+        "write_intent": write_intent,
+        "checkpoint_id": checkpoint.checkpoint_id,
+        "checkpoint_node_id": checkpoint.checkpoint_node_id,
+        "output_port_id": checkpoint.output_port_id,
+        "task_intent_sha256": checkpoint.task_intent_sha256,
+        "graph_prefix_sha256": checkpoint.graph_prefix_sha256,
+        "input_manifest_sha256": checkpoint.input_manifest_sha256,
+        "phase": checkpoint.phase,
+    }
+
+
+def submit_linear_checkpoint_task(
+        *, uid: str, canvas_id: str, submission_id: str,
+        final_target_node_id: str, checkpoint_id: str, checkpoint_node_id: str,
+        output_port_id: str, task_intent_sha256: str, graph_prefix_sha256: str,
+        input_manifest_sha256: str, graph_doc: dict,
+        input_manifest: list[dict[str, str]], write_intent: dict) -> tuple[dict, bool]:
+    """Atomically persist one complete hidden Task, first Attempt, and checkpoint."""
+    graph, manifest, intent, final_id, node_id, port_id = _linear_checkpoint_payloads(
+        graph_doc, input_manifest, write_intent, final_target_node_id,
+        checkpoint_node_id, output_port_id)
+    checkpoint_id = _linear_checkpoint_identity(checkpoint_id, "ID", 128)
+    digests = tuple(map(str, (
+        task_intent_sha256, graph_prefix_sha256, input_manifest_sha256)))
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests):
+        raise ValueError("checkpoint admission requires canonical SHA-256 digests")
+    if hashlib.sha256(manifest.encode()).hexdigest() != digests[2]:
+        raise ValueError("checkpoint input-manifest digest does not match its document")
+    uid, canvas_id = str(uid), str(canvas_id)
+    normalized_submission = str(submission_id).lower()
+    _linear_checkpoint_identity(normalized_submission, "submission", 256)
+    task_id = durable_task_submission_id(uid, canvas_id, normalized_submission)
+    frozen = (uid, canvas_id, normalized_submission, final_id, digests[0],
+              graph, manifest, intent, checkpoint_id, node_id, port_id, *digests)
+    with session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            raise RuntimeError("checkpoint canvas does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+                updated_at=Canvas.updated_at))
+        task = s.get(DurableTask, task_id, with_for_update=True)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        if task is not None or checkpoint is not None:
+            if task is None or checkpoint is None:
+                raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
+            actual = (
+                task.owner_id, task.canvas_id, task.submission_id, task.target_node_id,
+                task.intent_sha256, task.graph_doc, task.input_manifest, task.write_intent,
+                checkpoint.checkpoint_id, checkpoint.checkpoint_node_id,
+                checkpoint.output_port_id, checkpoint.task_intent_sha256,
+                checkpoint.graph_prefix_sha256, checkpoint.input_manifest_sha256)
+            if task.task_kind != "linear_checkpoint_write" or actual != frozen:
+                raise DurableTaskSubmissionConflict(
+                    "checkpoint submission does not match its frozen admission")
+            _lock_local_result_registry(s)
+            _linear_checkpoint_candidate_doc(s, task, checkpoint)
+            return _linear_checkpoint_admission_doc(s, task, checkpoint), False
+        if (s.scalar(select(DurableCheckpoint.task_id).where(
+                DurableCheckpoint.checkpoint_id == checkpoint_id).limit(1)) is not None
+                or s.scalar(select(LocalResultArtifact.uri).where(
+                    LocalResultArtifact.writer_run_id == task_id).limit(1)) is not None):
+            raise DurableTaskSubmissionConflict("checkpoint identity has conflicting state")
+        now = _durable_task_db_now(s)
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=canvas_id,
+            submission_id=normalized_submission, intent_sha256=digests[0],
+            target_node_id=final_id, task_kind="linear_checkpoint_write",
+            backend_kind="local", graph_doc=graph, input_manifest=manifest,
+            write_intent=intent, status="queued",
+            status_doc=json.dumps(_task_status_doc(task_id, final_id), default=str),
+            created_at=now, updated_at=now)
+        attempt = DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            status="queued", created_at=now)
+        checkpoint = DurableCheckpoint(
+            task_id=task_id, checkpoint_id=checkpoint_id,
+            checkpoint_node_id=node_id, output_port_id=port_id,
+            task_intent_sha256=digests[0], graph_prefix_sha256=digests[1],
+            input_manifest_sha256=digests[2], phase="pending",
+            created_at=now, updated_at=now)
+        s.add_all((task, attempt))
+        s.flush()
+        s.add(checkpoint)
+        s.flush()
+        return _linear_checkpoint_admission_doc(s, task, checkpoint), True
+
+
+def linear_checkpoint_admission(task_id: str) -> dict | None:
+    """Internal exact readback; product task readers intentionally exclude this kind."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
+        if task is None and checkpoint is None:
+            return None
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        return _linear_checkpoint_admission_doc(s, task, checkpoint)
+
+
 def _external_wait_key(task_id: str, attempt_number: int) -> str:
     digest = hashlib.sha256(
         f"external-wait-v1\x00{task_id}\x00{attempt_number}".encode()).hexdigest()
@@ -3539,6 +3750,8 @@ def _durable_task_doc(s, task: DurableTask, *, include_admission: bool = True) -
 def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None:
     with session() as s:
         task = s.get(DurableTask, str(task_id))
+        if task is not None and task.task_kind == "linear_checkpoint_write":
+            return None
         return (_durable_task_doc(s, task, include_admission=include_admission)
                 if task is not None else None)
 
@@ -3546,7 +3759,8 @@ def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None
 def durable_task_auth(task_id: str) -> tuple[str, str] | None:
     with session() as s:
         row = s.execute(select(DurableTask.owner_id, DurableTask.canvas_id).where(
-            DurableTask.id == str(task_id))).one_or_none()
+            DurableTask.id == str(task_id),
+            DurableTask.task_kind != "linear_checkpoint_write")).one_or_none()
         return tuple(row) if row is not None else None
 
 
@@ -3566,11 +3780,12 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
 
 
-def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
+def _claim_durable_task_kind(
+        task_id: str, owner_token: str, task_kind: str) -> dict | None:
     """Claim queued work or fence one expired owner and create the next bounded attempt."""
     with session() as s:
         task = _lock_durable_task_for_write(s, task_id)
-        if (task is None or task.task_kind != "managed_local_write"
+        if (task is None or task.task_kind != task_kind
                 or task.status in _TERMINAL_RUN):
             return None
         now = _durable_task_db_now(s)
@@ -3620,6 +3835,15 @@ def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
         task.error = None
         task.updated_at = now
         return _durable_task_doc(s, task)
+
+
+def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
+    return _claim_durable_task_kind(task_id, owner_token, "managed_local_write")
+
+
+def claim_linear_checkpoint_task(task_id: str, owner_token: str) -> dict | None:
+    """Internal-only claimant; the generic recovery scanner never returns this kind."""
+    return _claim_durable_task_kind(task_id, owner_token, "linear_checkpoint_write")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -4586,6 +4810,9 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         durable_tasks = list(s.scalars(select(DurableTask).where(
             DurableTask.canvas_id == canvas_id,
         ).order_by(DurableTask.id).with_for_update()))
+        durable_checkpoints = list(s.scalars(select(DurableCheckpoint).where(
+            DurableCheckpoint.task_id.in_([task.id for task in durable_tasks]),
+        ).order_by(DurableCheckpoint.task_id).with_for_update())) if durable_tasks else []
         durable_attempts = list(s.scalars(select(DurableTaskAttempt).where(
             DurableTaskAttempt.task_id.in_([task.id for task in durable_tasks]),
         ).order_by(DurableTaskAttempt.task_id, DurableTaskAttempt.attempt_number).with_for_update()
@@ -4617,6 +4844,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(admission)
         for wait in durable_waits:
             s.delete(wait)
+        for checkpoint in durable_checkpoints:
+            s.delete(checkpoint)
+        if durable_checkpoints:
+            s.flush()
         for attempt in durable_attempts:
             s.delete(attempt)
         if durable_attempts or durable_waits:
@@ -4936,7 +5167,7 @@ def list_workspace_runs(
                 backend=backend_name, backend_attempt=backend_attempt, source="state"))
 
         task_identity = literal("t:") + DurableTask.id
-        task_predicates = [visible_canvas]
+        task_predicates = [visible_canvas, DurableTask.task_kind != "linear_checkpoint_write"]
         if canvas_id:
             task_predicates.append(DurableTask.canvas_id == canvas_id)
         if run_id:
@@ -7451,6 +7682,141 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
                     "managed local result must be published by its exact writer run first")
         s.add(LocalResultReference(
             uri=artifact.uri, owner_kind=owner_kind, owner_key=str(owner_key)))
+
+
+def _linear_checkpoint_generation(
+        task: DurableTask, checkpoint: DurableCheckpoint, attempt_id: str) -> str:
+    payload = "\x00".join((
+        "linear-checkpoint-candidate-v1", task.id, checkpoint.checkpoint_id,
+        checkpoint.task_intent_sha256, checkpoint.graph_prefix_sha256,
+        checkpoint.input_manifest_sha256, str(attempt_id)))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _linear_checkpoint_candidate_doc(
+        s, task: DurableTask, checkpoint: DurableCheckpoint) -> dict | None:
+    owned = list(s.scalars(select(LocalResultArtifact).where(
+        LocalResultArtifact.writer_run_id == task.id).order_by(
+            LocalResultArtifact.uri).with_for_update()))
+    if checkpoint.phase == "pending":
+        if (checkpoint.candidate_uri is not None
+                or checkpoint.candidate_generation is not None
+                or checkpoint.candidate_attempt_id is not None
+                or checkpoint.candidate_dev is not None or checkpoint.candidate_ino is not None
+                or owned):
+            raise RuntimeError("pending checkpoint has partial candidate state")
+        return None
+    if (checkpoint.phase != "reserved" or checkpoint.candidate_uri is None
+            or checkpoint.candidate_generation is None
+            or checkpoint.candidate_attempt_id is None or len(owned) != 1
+            or owned[0].uri != checkpoint.candidate_uri):
+        raise RuntimeError("checkpoint candidate binding is incomplete")
+    artifact = owned[0]
+    generation = _linear_checkpoint_generation(
+        task, checkpoint, checkpoint.candidate_attempt_id)
+    basename = f"{_LOCAL_RESULT_PREFIX}checkpoint_{generation}.parquet"
+    expected_uri = os.path.join(artifact.storage_root, basename)
+    expected_lock = f"{basename[:-len('.parquet')]}.lock"
+    if (checkpoint.candidate_generation != generation
+            or checkpoint.candidate_uri != expected_uri
+            or _local_result_candidate(expected_uri) != expected_uri
+            or artifact.lock_name != expected_lock or artifact.state != "writing"
+            or artifact.writer_token is None or artifact.committed_at is not None
+            or re.fullmatch(r"[0-9a-f]{32}", artifact.namespace_id) is None
+            or re.fullmatch(r"[0-9a-f]{32}", artifact.writer_token) is None
+            or bool(artifact.lock_protected) != bool(artifact.lock_token)
+            or (artifact.lock_token is not None
+                and re.fullmatch(r"[0-9a-f]{32}", artifact.lock_token) is None)
+            or artifact.delete_token is not None or artifact.delete_attempted_at is not None):
+        raise RuntimeError("checkpoint candidate disagrees with its artifact authority")
+    return {
+        "task_id": task.id, "checkpoint_id": checkpoint.checkpoint_id,
+        "uri": artifact.uri, "generation": generation,
+        "attempt_id": checkpoint.candidate_attempt_id,
+        "namespace_id": artifact.namespace_id, "storage_root": artifact.storage_root,
+        "lock_name": artifact.lock_name, "lock_token": artifact.lock_token,
+        "lock_protected": bool(artifact.lock_protected),
+        "writer_token": artifact.writer_token, "state": artifact.state,
+        "dev": checkpoint.candidate_dev, "ino": checkpoint.candidate_ino,
+    }
+
+
+def linear_checkpoint_candidate(task_id: str) -> dict | None:
+    """Read back only the exact DB binding after an unknown reservation response."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
+        if task is None and checkpoint is None:
+            return None
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        return _linear_checkpoint_candidate_doc(s, task, checkpoint)
+
+
+def reserve_linear_checkpoint_candidate(
+        *, task_id: str, attempt_id: str, owner_token: str,
+        namespace_id: str, storage_root: str, writer_token: str,
+        lock_token: str | None) -> dict:
+    """Atomically create or exactly replay one DB-only managed-local candidate."""
+    namespace_id, writer_token = str(namespace_id), str(writer_token)
+    storage_root, owner_token = str(storage_root), str(owner_token)
+    if (re.fullmatch(r"[0-9a-f]{32}", namespace_id) is None
+            or re.fullmatch(r"[0-9a-f]{32}", writer_token) is None
+            or (lock_token is not None
+                and re.fullmatch(r"[0-9a-f]{32}", str(lock_token)) is None)
+            or not owner_token or len(owner_token) > 512 or "\x00" in owner_token
+            or not os.path.isabs(storage_root) or os.path.normpath(storage_root) != storage_root
+            or os.path.basename(storage_root) != _LOCAL_RESULT_DIR
+            or len(storage_root) > _LOCAL_RESULT_MAX_URI or "\x00" in storage_root):
+        raise ValueError("checkpoint candidate authority is not canonical")
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
+        latest = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == str(task_id)).order_by(
+                DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+        if task is None or checkpoint is None or latest is None:
+            raise RuntimeError("checkpoint admission is incomplete")
+        now = _durable_task_db_now(s)
+        lease = latest.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task.task_kind != "linear_checkpoint_write" or task.status != "running"
+                or task.cancel_requested or latest.id != str(attempt_id)
+                or latest.status != "running" or latest.owner_token != owner_token
+                or lease is None or lease <= now):
+            raise RuntimeError("checkpoint candidate owner is stale or fenced")
+        _lock_local_result_registry(s)
+        existing = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        generation = _linear_checkpoint_generation(task, checkpoint, latest.id)
+        basename = f"{_LOCAL_RESULT_PREFIX}checkpoint_{generation}.parquet"
+        uri = os.path.join(storage_root, basename)
+        lock_name = f"{basename[:-len('.parquet')]}.lock"
+        if existing is not None:
+            expected = (latest.id, namespace_id, storage_root, writer_token, lock_token)
+            actual = (existing["attempt_id"], existing["namespace_id"],
+                      existing["storage_root"], existing["writer_token"],
+                      existing["lock_token"])
+            if existing["generation"] != generation or actual != expected:
+                raise RuntimeError("checkpoint reservation replay changed exact authority")
+            return existing
+        if _local_result_candidate(uri) != uri:
+            raise ValueError("derived checkpoint candidate is outside the managed namespace")
+        artifact = LocalResultArtifact(
+            uri=uri, namespace_id=namespace_id, storage_root=storage_root,
+            lock_name=lock_name, lock_token=str(lock_token) if lock_token else None,
+            lock_protected=lock_token is not None, state="writing",
+            writer_run_id=task.id, writer_token=writer_token, created_at=now)
+        s.add(artifact)
+        checkpoint.phase = "reserved"
+        checkpoint.candidate_uri = uri
+        checkpoint.candidate_generation = generation
+        checkpoint.candidate_attempt_id = latest.id
+        checkpoint.updated_at = now
+        s.flush()
+        return _linear_checkpoint_candidate_doc(s, task, checkpoint)
 
 
 def begin_local_result(uri: str, namespace_id: str, storage_root: str, lock_name: str,
