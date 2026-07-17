@@ -439,6 +439,23 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
     local_match = metadb.workspace_create_container(
         metadb.local_workspace_root()["id"], f"workspace-{token}-shared")
     provider = _WorkspaceFixtureProvider()
+    slow_search_started = threading.Event()
+    slow_search_released = threading.Event()
+    slow_search_finished = threading.Event()
+    provider_search = provider.search
+
+    def controlled_search(mount, query, *, limit, cursor=None):
+        if mount.id != "a-slow":
+            return provider_search(mount, query, limit=limit, cursor=cursor)
+        slow_search_started.set()
+        if not slow_search_released.wait(timeout=5):
+            raise AssertionError("test did not release the slow provider search")
+        try:
+            return provider_search(mount, query, limit=limit, cursor=cursor)
+        finally:
+            slow_search_finished.set()
+
+    monkeypatch.setattr(provider, "search", controlled_search)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     bounded = workspace_providers.bounded_search
     monkeypatch.setattr(
@@ -456,9 +473,13 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
     ]))
 
     with TestClient(app) as client:
-        started = time.monotonic()
-        response = client.get("/api/workspace/search", params={"q": "shared", "limit": 1})
-        assert time.monotonic() - started < 0.15
+        try:
+            response = client.get("/api/workspace/search", params={"q": "shared", "limit": 1})
+            assert slow_search_started.wait(timeout=1)
+            assert not slow_search_finished.is_set()
+        finally:
+            slow_search_released.set()
+        assert slow_search_finished.wait(timeout=1)
         assert response.status_code == 200, response.text
         page = response.json()
         assert page["query"] == "shared"
