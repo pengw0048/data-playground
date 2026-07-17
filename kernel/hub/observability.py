@@ -105,6 +105,7 @@ class AuditAction(str, Enum):
     JOB_CANCEL = "job.cancel"
     SECRET_REF_CHANGE = "secret_ref.change"
     POLICY_DENIAL = "policy.denial"
+    WORKSPACE_RELINK = "workspace.relink"
 
 
 class AuditOutcome(str, Enum):

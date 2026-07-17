@@ -127,6 +127,47 @@ class WorkspacePlacement(Base):
     )
 
 
+class WorkspaceProviderBinding(Base):
+    """Durable, non-sensitive display snapshot for one explicit external resource binding.
+
+    The binding ID is part of the Workspace reference.  A provider resource that was observed as
+    deleted therefore stays detached even if the provider later reuses the same resource ID; only an
+    explicit relink can mint a new binding.  We deliberately retain no URI, columns, provider config,
+    credentials, or other provider-owned metadata here.
+    """
+    __tablename__ = "workspace_provider_bindings"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    mount_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(256), nullable=False)
+    container_id: Mapped[str] = mapped_column(String, nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    name: Mapped[str] = mapped_column(String(512), nullable=False)
+    parent_binding_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("workspace_provider_bindings.id"), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="current")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    relinked_from_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("workspace_provider_bindings.id"), nullable=True)
+    last_resolved_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, index=True)
+    __table_args__ = (
+        CheckConstraint("kind IN ('container', 'dataset')", name="ck_workspace_provider_binding_kind"),
+        CheckConstraint(
+            "state IN ('current', 'offline', 'permission_lost', 'detached', 'provider_error')",
+            name="ck_workspace_provider_binding_state",
+        ),
+        Index(
+            "ix_workspace_provider_binding_resource",
+            "mount_id", "provider", "resource_id", "active",
+        ),
+    )
+
+
 class RunRecord(Base):
     """A finished run, kept with its canvas (run history survives restarts). One row per run."""
     __tablename__ = "run_records"
@@ -2770,6 +2811,209 @@ def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) ->
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
     }
+
+
+_WORKSPACE_PROVIDER_STATES = {
+    "current", "offline", "permission_lost", "detached", "provider_error",
+}
+
+
+def _workspace_provider_binding_doc(row: WorkspaceProviderBinding) -> dict:
+    return {
+        "bindingId": row.id,
+        "mountId": row.mount_id,
+        "provider": row.provider,
+        "containerId": row.container_id,
+        "resourceId": row.resource_id,
+        "kind": row.kind,
+        "name": row.name,
+        "parentBindingId": row.parent_binding_id,
+        "referenceState": row.state,
+        "active": row.active,
+        "lastError": row.last_error,
+        "relinkedFromId": row.relinked_from_id,
+        "lastResolvedAt": row.last_resolved_at,
+    }
+
+
+def _workspace_provider_initial_binding_id(
+    mount_id: str, provider: str, resource_id: str,
+) -> str:
+    payload = json.dumps(
+        [mount_id, provider, resource_id], separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()[:32]
+
+
+def workspace_provider_cache_resource(
+    *, mount_id: str, provider: str, container_id: str, resource_id: str, kind: str, name: str,
+    parent_binding_id: str | None = None, parent_is_known: bool = True,
+) -> dict:
+    """Persist only the bounded display facts needed to explain a broken external reference.
+
+    A terminal detached binding is never revived by a provider read.  This is the ABA fence that
+    prevents delete/recreate with a reused provider ID from silently rebinding an old Workspace URL.
+    """
+    if kind not in {"container", "dataset"}:
+        raise ValueError("invalid provider resource kind")
+    with session() as s:
+        row = s.scalar(select(WorkspaceProviderBinding).where(
+            WorkspaceProviderBinding.mount_id == mount_id,
+            WorkspaceProviderBinding.provider == provider,
+            WorkspaceProviderBinding.resource_id == resource_id,
+            WorkspaceProviderBinding.active.is_(True),
+        ).order_by(WorkspaceProviderBinding.updated_at.desc()))
+        if row is None:
+            row = s.scalar(select(WorkspaceProviderBinding).where(
+                WorkspaceProviderBinding.mount_id == mount_id,
+                WorkspaceProviderBinding.provider == provider,
+                WorkspaceProviderBinding.resource_id == resource_id,
+            ).order_by(WorkspaceProviderBinding.updated_at.desc()))
+        if row is None:
+            row = WorkspaceProviderBinding(
+                id=_workspace_provider_initial_binding_id(mount_id, provider, resource_id),
+                mount_id=mount_id,
+                provider=provider,
+                container_id=container_id,
+                resource_id=resource_id,
+                kind=kind,
+                name=name,
+                parent_binding_id=parent_binding_id,
+                state="current",
+                active=True,
+                last_resolved_at=_now(),
+            )
+            s.add(row)
+            try:
+                s.flush()
+            except IntegrityError:
+                # Concurrent request-time reads mint the same deterministic first binding.  Adopt
+                # the winner rather than failing a healthy provider read.
+                s.rollback()
+                row = s.get(WorkspaceProviderBinding, _workspace_provider_initial_binding_id(
+                    mount_id, provider, resource_id))
+                if row is None:
+                    raise
+        elif row.state != "detached":
+            row.kind = kind
+            row.name = name
+            row.container_id = container_id
+            if parent_is_known:
+                row.parent_binding_id = parent_binding_id
+            row.state = "current"
+            row.last_error = None
+            row.last_resolved_at = _now()
+        return _workspace_provider_binding_doc(row)
+
+
+def workspace_provider_binding(
+    binding_id: str, *, mount_id: str | None = None, provider: str | None = None,
+    resource_id: str | None = None,
+) -> dict | None:
+    with session() as s:
+        row = s.get(WorkspaceProviderBinding, binding_id)
+        if row is None:
+            return None
+        if (mount_id is not None and row.mount_id != mount_id
+                or provider is not None and row.provider != provider
+                or resource_id is not None and row.resource_id != resource_id):
+            return None
+        return _workspace_provider_binding_doc(row)
+
+
+def workspace_provider_binding_for_resource(
+    *, mount_id: str, provider: str, resource_id: str,
+) -> dict | None:
+    with session() as s:
+        row = s.scalar(select(WorkspaceProviderBinding).where(
+            WorkspaceProviderBinding.mount_id == mount_id,
+            WorkspaceProviderBinding.provider == provider,
+            WorkspaceProviderBinding.resource_id == resource_id,
+        ).order_by(
+            WorkspaceProviderBinding.active.desc(),
+            WorkspaceProviderBinding.updated_at.desc(),
+        ))
+        return _workspace_provider_binding_doc(row) if row is not None else None
+
+
+def workspace_provider_binding_ancestors(binding_id: str) -> list[dict]:
+    with session() as s:
+        row = s.get(WorkspaceProviderBinding, binding_id)
+        if row is None:
+            return []
+        ancestors: list[dict] = []
+        seen = {row.id}
+        current_id = row.parent_binding_id
+        while current_id is not None:
+            if current_id in seen or len(ancestors) >= _WORKSPACE_ANCESTOR_LIMIT:
+                break
+            seen.add(current_id)
+            current = s.get(WorkspaceProviderBinding, current_id)
+            if current is None:
+                break
+            ancestors.append(_workspace_provider_binding_doc(current))
+            current_id = current.parent_binding_id
+        return list(reversed(ancestors))
+
+
+def workspace_provider_mark_binding(binding_id: str, *, state: str, error: str | None) -> dict:
+    if state not in _WORKSPACE_PROVIDER_STATES or state == "current":
+        raise ValueError("invalid degraded provider reference state")
+    del error
+    # Provider reasons are useful on the live response but are not trusted persistence input: they
+    # may contain a URI, object name, or credential-shaped diagnostic.  Persist only a fixed safe
+    # explanation of the classified state.
+    safe_error = {
+        "offline": "provider is offline",
+        "permission_lost": "provider permission was lost",
+        "detached": "resource is detached",
+        "provider_error": "provider read failed",
+    }[state]
+    with session() as s:
+        row = s.get(WorkspaceProviderBinding, binding_id, with_for_update=True)
+        if row is None:
+            raise KeyError("Workspace provider binding not found")
+        if row.state != "detached":
+            row.state = state
+            row.last_error = safe_error
+        return _workspace_provider_binding_doc(row)
+
+
+def workspace_provider_relink_binding(
+    old_binding_id: str, *, mount_id: str, provider: str, container_id: str, resource_id: str,
+    kind: str, name: str, parent_binding_id: str | None,
+) -> tuple[dict, dict]:
+    """Mint a new binding and retain the old binding as an auditable detached reference."""
+    if kind not in {"container", "dataset"}:
+        raise ValueError("invalid provider resource kind")
+    with session() as s:
+        old = s.get(WorkspaceProviderBinding, old_binding_id, with_for_update=True)
+        if old is None:
+            raise KeyError("Workspace provider binding not found")
+        if not old.active:
+            raise ValueError("Workspace provider binding was already relinked")
+        if old.kind != kind:
+            raise ValueError("replacement resource kind does not match the detached reference")
+        old.active = False
+        old.state = "detached"
+        old.last_error = "relinked explicitly"
+        fresh = WorkspaceProviderBinding(
+            id=uuid.uuid4().hex,
+            mount_id=mount_id,
+            provider=provider,
+            container_id=container_id,
+            resource_id=resource_id,
+            kind=kind,
+            name=name,
+            parent_binding_id=parent_binding_id,
+            state="current",
+            active=True,
+            relinked_from_id=old.id,
+            last_resolved_at=_now(),
+        )
+        s.add(fresh)
+        s.flush()
+        return _workspace_provider_binding_doc(old), _workspace_provider_binding_doc(fresh)
 
 
 def _workspace_canvas_visible_clause(uid: str):

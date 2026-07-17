@@ -47,11 +47,13 @@ export function WorkspaceExplorer() {
   const [selectedTable, setSelectedTable] = useState<CatalogTable | null>(null)
   const [selectedDataset, setSelectedDataset] = useState<WorkspaceResource | null>(null)
   const [selectedSource, setSelectedSource] = useState<WorkspaceSourceStatus | null>(null)
+  const [selectedProviderResource, setSelectedProviderResource] = useState<WorkspaceResource | null>(null)
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [datasetAction, setDatasetAction] = useState<{ resource: WorkspaceResource; table: CatalogTable } | null>(null)
   const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
+  const [relinkResource, setRelinkResource] = useState<WorkspaceResource | null>(null)
   const [undoMove, setUndoMove] = useState<{
     resource: WorkspaceResource; previousContainer: WorkspaceResource; destination: WorkspaceResource
   } | null>(null)
@@ -114,7 +116,7 @@ export function WorkspaceExplorer() {
       if (!refreshingSelection) {
         selectionRequest.current = requestedResourceId
         selectionContainer.current = null
-        setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
+        setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null); setSelectedProviderResource(null)
       }
       if (!requestedResourceId) {
         selectionContainer.current = null
@@ -138,6 +140,7 @@ export function WorkspaceExplorer() {
         const preserveNavigation = refreshingSelection && resolved.source.completeness !== 'complete'
         const container = preserveNavigation ? selectionContainer.current ?? resolvedContainer : resolvedContainer
         if (!preserveNavigation) selectionContainer.current = resolvedContainer
+        setSelectedProviderResource(isExternal(resolved.resource) ? resolved.resource : null)
         const resolvedCrumbs = resolved.resource.kind === 'container'
           ? [...resolved.ancestors, resolved.resource]
           : resolved.ancestors
@@ -269,6 +272,7 @@ export function WorkspaceExplorer() {
       {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
         <span className="min-w-0 flex-1 truncate">This selection could not be fully refreshed: {resolutionError}</span>
         <button onClick={reload} disabled={loading} className="shrink-0 font-semibold underline disabled:opacity-50">Retry</button>
+        {selectedProviderResource && <button onClick={() => setRelinkResource(selectedProviderResource)} className="shrink-0 font-semibold underline">Relink</button>}
       </div>}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
@@ -292,7 +296,7 @@ export function WorkspaceExplorer() {
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
         onOpenTable={setSelectedTable} onFolder={() => pushToast('Dataset folders are not Workspace containers.', 'info')}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
-      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} />}
+      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && container?.version != null && <NewCanvasDialog container={container} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
@@ -304,6 +308,12 @@ export function WorkspaceExplorer() {
           setMoveResource(null)
           setUndoMove({ resource: result.resource, previousContainer: result.previousContainer, destination: result.container })
           reload()
+        }} />}
+      {relinkResource && <RelinkResourceDialog resource={relinkResource} onClose={() => setRelinkResource(null)}
+        onRelinked={(resource) => {
+          setRelinkResource(null)
+          pushToast(`Relinked to ${resource.name}`, 'success')
+          setWorkspaceResource(resource.id)
         }} />}
     </div>
   )
@@ -603,8 +613,9 @@ function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, onClose }: {
+function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
+  onRetry: () => void; onRelink: () => void
 }) {
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
@@ -613,6 +624,10 @@ function ExternalDatasetDetail({ resource, source, onClose }: {
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Read-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Stable identity</div><div className="break-all font-mono text-[11px]">{resource.id}</div></div>
         {resource.resourceId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Provider resource</div><div className="break-all font-mono text-[11px]">{resource.resourceId}</div></div>}
+        {(resource.lastKnown || resource.referenceState && resource.referenceState !== 'current') && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          Last-known metadata · {resource.referenceState && resource.referenceState !== 'current' ? resource.referenceState.replace('_', ' ') : 'stale path'}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
+          <div className="mt-2 flex gap-3"><button onClick={onRetry} className="font-semibold underline">Retry</button><button onClick={onRelink} className="font-semibold underline">Relink</button></div>
+        </div>}
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
       </div>
       <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
@@ -620,6 +635,33 @@ function ExternalDatasetDetail({ resource, source, onClose }: {
       </div>
     </div>
   </div>
+}
+
+function RelinkResourceDialog({ resource, onClose, onRelinked }: {
+  resource: WorkspaceResource; onClose: () => void; onRelinked: (resource: WorkspaceResource) => void
+}) {
+  const [mountId, setMountId] = useState(resource.mountId ?? '')
+  const [resourceId, setResourceId] = useState(resource.resourceId ?? '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (!mountId.trim() || !resourceId.trim() || busy) return
+    setBusy(true); setError(null)
+    try {
+      const result = await api.workspaceRelink(resource.id, {
+        mountId: mountId.trim(), resourceId: resourceId.trim(),
+      })
+      onRelinked(result.resource)
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Relink ${resource.name}`} onClose={onClose}>
+    <p className="text-[12px] leading-5 text-muted-foreground">Choose the exact provider identity. Names are never used to repair a binding, and this action creates a new auditable Workspace reference.</p>
+    <label className="grid gap-1 text-[11px] font-semibold">Mount ID<input aria-label="Replacement mount ID" value={mountId} onChange={(event) => setMountId(event.target.value)} className="rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[12px] font-normal" /></label>
+    <label className="grid gap-1 text-[11px] font-semibold">Provider resource ID<input aria-label="Replacement provider resource ID" value={resourceId} onChange={(event) => setResourceId(event.target.value)} className="rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[12px] font-normal" /></label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || !mountId.trim() || !resourceId.trim()} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Relinking…' : 'Relink'}</button></div>
+  </Modal>
 }
 
 function DetachedResource({ resource, onClose }: { resource: WorkspaceResource; onClose: () => void }) {

@@ -41,7 +41,8 @@ class FileCatalogProvider:
 
     def resolve(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult:
         item = next((item for item in self._resources(mount) if item.id == resource_id), None)
-        return ProviderResourceResult(item=item) if item else ProviderResourceResult(state="unavailable", reason="resource not found")
+        return ProviderResourceResult(item=item) if item else ProviderResourceResult(
+            state="unavailable", reason="resource not found", failure="not_found")
 
     def ancestors(self, mount: CatalogMount, resource_id: str) -> ProviderAncestors:
         by_id = {item.id: item for item in self._resources(mount)}
@@ -66,7 +67,9 @@ class FileCatalogProvider:
     def dataset_detail(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult:
         result = self.resolve(mount, resource_id)
         if result.item is not None and result.item.kind != "dataset":
-            return ProviderResourceResult(state="unsupported", reason="resource is not a dataset")
+            return ProviderResourceResult(
+                state="unsupported", reason="resource is not a dataset",
+                failure="provider_error")
         return result
 
     def search(self, mount: CatalogMount, query: str, *, limit: int,

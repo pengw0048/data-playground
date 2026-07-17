@@ -5,7 +5,7 @@ import type {
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
   WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
-  WorkspaceMoveCanvasResult, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
 
@@ -209,6 +209,11 @@ export const api = {
   },
   workspaceResource: (resourceId: string) =>
     req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`),
+  workspaceRelink: (resourceId: string, body: { mountId: string; resourceId: string }) =>
+    req<WorkspaceProviderRelinkResult>(
+      `/workspace/resources/${encodeURIComponent(resourceId)}/relink`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
   workspaceSearch: (query: string, params?: { cursor?: string; limit?: number }) => {
     const search = new URLSearchParams({ q: query })
     if (params?.cursor) search.set('cursor', params.cursor)

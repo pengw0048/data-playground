@@ -674,6 +674,12 @@ class WorkspaceResource(Wire):
     mount_id: str | None = None
     provider: str | None = None
     resource_id: str | None = None
+    binding_id: str | None = None
+    reference_state: Literal[
+        "current", "offline", "permission_lost", "detached", "provider_error"
+    ] = "current"
+    last_known: bool = False
+    last_resolved_at: datetime.datetime | None = None
 
 
 class WorkspaceSourceStatus(Wire):
@@ -686,6 +692,9 @@ class WorkspaceSourceStatus(Wire):
     mount_id: str | None = None
     provider: str | None = None
     error: str | None = None
+    reference_state: Literal[
+        "current", "offline", "permission_lost", "detached", "provider_error"
+    ] | None = None
 
 
 class WorkspaceBrowsePage(Wire):
@@ -711,6 +720,17 @@ class WorkspaceResourceResolution(Wire):
     ancestors: list[WorkspaceResource] = []
     source: WorkspaceSourceStatus = WorkspaceSourceStatus(
         id="local", kind="local", completeness="complete")
+
+
+class WorkspaceProviderRelinkRequest(Wire):
+    mount_id: str = Field(min_length=1, max_length=128)
+    resource_id: str = Field(min_length=1, max_length=512)
+
+
+class WorkspaceProviderRelinkResult(Wire):
+    ok: bool = True
+    resource: WorkspaceResource
+    previous_resource: WorkspaceResource
 
 
 class WorkspaceSearchSourceStatus(WorkspaceSourceStatus):

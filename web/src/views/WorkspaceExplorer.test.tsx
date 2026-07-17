@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tableByRegistration: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceAddDataset: vi.fn(), workspaceMoveCanvas: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceAddDataset: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
@@ -302,5 +302,32 @@ describe('WorkspaceExplorer', () => {
     expect(retry).toBeEnabled()
     fireEvent.click(retry)
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
+  })
+
+  it('shows last-known external state and relinks only to an explicit provider identity', async () => {
+    const stale = { ...EXTERNAL_DATASET, bindingId: 'old-binding', referenceState: 'offline' as const, lastKnown: true, lastResolvedAt: '2026-07-17T00:00:00Z' }
+    const fresh = { ...EXTERNAL_DATASET, id: 'dataset:external.fresh-binding', bindingId: 'fresh-binding', referenceState: 'current' as const, lastKnown: false }
+    store.workspaceResourceId = stale.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: stale, ancestors: [ROOT, EXTERNAL_FOLDER],
+      source: { ...PROVIDER_COMPLETE, completeness: 'unavailable', error: 'provider offline', referenceState: 'offline' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [stale], nextCursor: null, hasMore: false, completeness: 'partial', sources: [{ ...PROVIDER_COMPLETE, completeness: 'unavailable', error: 'provider offline', referenceState: 'offline' }] })
+    mocks.workspaceRelink.mockResolvedValue({ ok: true, resource: fresh, previousResource: { ...stale, referenceState: 'detached' } })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Last-known metadata · offline')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Relink' })[0])
+    const dialog = screen.getByRole('dialog', { name: 'Relink observations' })
+    expect(dialog).toHaveTextContent('Names are never used to repair a binding')
+    expect(screen.getByLabelText('Replacement mount ID')).toHaveValue('warehouse')
+    expect(screen.getByLabelText('Replacement provider resource ID')).toHaveValue('remote-dataset')
+    fireEvent.click(screen.getAllByRole('button', { name: 'Relink' }).at(-1)!)
+
+    await waitFor(() => expect(mocks.workspaceRelink).toHaveBeenCalledWith(stale.id, {
+      mountId: 'warehouse', resourceId: 'remote-dataset',
+    }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(fresh.id)
   })
 })
