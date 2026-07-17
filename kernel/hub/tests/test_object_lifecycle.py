@@ -2536,7 +2536,10 @@ def test_commit_crash_publish_lease_expires_and_secondary_pointers_fail_closed()
         for lease in session.scalars(select(metadb.ObjectAttemptLease).where(
                 metadb.ObjectAttemptLease.attempt_uri == uri)):
             lease.expires_at = past
-    assert metadb.object_attempt_gc_batch(10, 1000) == []
+    actions = metadb.object_attempt_gc_batch(10, 1000)
+    # GC scans the shared lifecycle shard globally, so earlier Ray Jobs tests may contribute work.
+    # This committed attempt should only transition to abandoned until its grace period expires.
+    assert uri not in {action["uri"] for action in actions}
     assert _state(uri) == "abandoned"
     metadb.quarantine_object_attempt(uri, "test cleanup")
 
