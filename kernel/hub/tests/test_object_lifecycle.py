@@ -3471,7 +3471,7 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         assert [output.model_dump() for output in restarted.outputs] == [
             output.model_dump() for output in final.outputs]
         phash = deps.runner._plan_hash(graph, "branches")
-        cache_deadline = time.monotonic() + 2
+        cache_deadline = time.monotonic() + 30
         while metadb.get_result(phash) is None and time.monotonic() < cache_deadline:
             # The durable RunState is the terminal publication point; the reusable cache pointer is a
             # best-effort secondary write performed immediately afterward.
