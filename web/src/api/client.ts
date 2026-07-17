@@ -2,7 +2,7 @@
 import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionDetail, DatasetRevisionPage, Facets,
-  JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
+  InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
   WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceResourceResolution,
@@ -273,8 +273,11 @@ export const api = {
   compile: (doc: CanvasDoc, targetNodeId?: string) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
-  preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0, portId?: string) =>
-    req<SampleResult>('/run/preview', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset }) }),
+  preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0, portId?: string,
+    inputManifest?: RunInputManifestItem[]) =>
+    req<SampleResult>('/run/preview', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest }),
+    }),
   profile: (doc: CanvasDoc, nodeId: string, portId?: string) =>
     req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
@@ -306,8 +309,15 @@ export const api = {
   deleteRelationship: (rel: Relationship) =>
     req<Relationship[]>('/catalog/relationships/delete', { method: 'POST', body: JSON.stringify(rel) }),
 
-  estimate: (doc: CanvasDoc, targetNodeId?: string) =>
-    req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
+  estimate: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[]) =>
+    req<RunEstimate>('/run/estimate', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+    }),
+
+  inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[]) =>
+    req<InputDrift>('/run/input-drift', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+    }),
 
   profileEstimate: (doc: CanvasDoc, nodeId: string, portId?: string) =>
     req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
@@ -315,14 +325,15 @@ export const api = {
   profileIdentity: (doc: CanvasDoc, nodeId: string, portId?: string) =>
     req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
-  run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string) => {
+  run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string,
+    inputManifest?: RunInputManifestItem[]) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId }),
+          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId, inputManifest }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error

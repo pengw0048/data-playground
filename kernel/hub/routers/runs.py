@@ -43,6 +43,9 @@ from hub.models import (
     CompilePlan,
     CompileRequest,
     EstimateRequest,
+    InputDrift,
+    InputDriftRequest,
+    InputDriftSource,
     JoinAnalysis,
     PreviewRequest,
     ProfileEstimate,
@@ -75,11 +78,13 @@ _EXPORT_MEDIA_TYPES = {
 }
 
 
-def _local_run_intent_sha256(graph, target_node_id: str | None) -> str:
+def _local_run_intent_sha256(
+        graph, target_node_id: str | None,
+        input_manifest: list[dict[str, str]] | None = None) -> str:
     """Hash caller intent before source resolution so a retry cannot be retargeted by a moved head."""
     doc = graph.model_dump(mode="json")
     payload = json.dumps(
-        {"graph": doc, "target_node_id": target_node_id},
+        {"graph": doc, "target_node_id": target_node_id, "input_manifest": input_manifest},
         sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -145,6 +150,64 @@ def _bind_local_run_manifest(
             code=APIErrorCode.RESOURCE_GONE if unavailable else APIErrorCode.INVALID_REQUEST,
             retryable=False,
         ) from exc
+
+
+def _input_drift(
+        graph, target_node_id: str, preview_manifest: list[dict[str, str]], deps) -> InputDrift:
+    """Compare exact preview inputs with latest heads while keeping the preview binding untouched."""
+    from hub.local_run_inputs import LocalRunInputError, validate_manifest_graph
+
+    try:
+        retained = validate_manifest_graph(
+            graph, target_node_id, preview_manifest, require_bound_revisions=False)
+    except LocalRunInputError as exc:
+        raise APIError(
+            409, "local_run_input_manifest_does_not_match_graph",
+            code=APIErrorCode.INVALID_REQUEST, retryable=False,
+        ) from exc
+    try:
+        latest = _resolve_local_run_manifest(graph, target_node_id, deps)
+    except APIError:
+        # A removed/replaced registration is itself drift. Keep the retained side inspectable and
+        # report latest as unavailable instead of turning comparison into an opaque route failure.
+        latest = []
+    latest_by_node = {item["node_id"]: item for item in latest}
+    sources: list[InputDriftSource] = []
+    for item in retained:
+        current = latest_by_node.get(item["node_id"])
+        if (current is not None
+                and current["dataset_id"] == item["dataset_id"]
+                and current["revision_id"] == item["revision_id"]):
+            continue
+        readable = False
+        compatibility = None
+        binding = metadb.catalog_revision_binding(item["dataset_id"])
+        if binding is not None:
+            adapter = deps.resolve_adapter(str(binding["uri"]))
+            if isinstance(adapter, DatasetRevisionAdapter):
+                try:
+                    with db.base_guard():
+                        before = adapter.revision_detail(
+                            str(binding["uri"]), item["revision_id"], preview_limit=1)
+                        readable = True
+                        if (current is not None
+                                and current["dataset_id"] == item["dataset_id"]):
+                            after = adapter.revision_detail(
+                                str(binding["uri"]), current["revision_id"], preview_limit=1)
+                            compatibility = metadb.diff_columns(
+                                before["columns"], after["columns"])
+                except Exception:
+                    # Drift must remain inspectable when retention has already removed the old input.
+                    # The subsequent exact run still fails closed with the stable 410 admission error.
+                    readable = False
+                    compatibility = None
+        sources.append(InputDriftSource(
+            node_id=item["node_id"], dataset_id=item["dataset_id"],
+            preview_revision_id=item["revision_id"],
+            latest_revision_id=(current["revision_id"] if current is not None else None),
+            old_revision_readable=readable, compatibility=compatibility,
+        ))
+    return InputDrift(drifted=bool(sources), sources=sources)
 _EXPORT_OPENAPI_CONTENT = {
     media_type.split(";", 1)[0]: {"schema": {"type": "string", "format": "binary"}}
     for media_type in sorted(set(_EXPORT_MEDIA_TYPES.values()))
@@ -357,17 +420,56 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
-    port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
+    manifest: list[dict[str, str]] | None = None
+    preview_graph = req.graph
+    pinned = any(
+        isinstance(node.data.get("config"), dict)
+        and node.data["config"].get("datasetRef") is not None
+        for node in _local_run_source_nodes(req.graph, req.node_id)
+    )
+    try:
+        if req.input_manifest is not None:
+            manifest = req.input_manifest
+        else:
+            manifest = _resolve_local_run_manifest(req.graph, req.node_id, deps)
+        preview_graph = _bind_local_run_manifest(req.graph, manifest, deps, req.node_id)
+    except APIError:
+        if req.input_manifest is not None or pinned:
+            return SampleResult(
+                not_previewable=True,
+                reason=("selected pinned revision is unavailable" if pinned
+                        else "retained preview input revision is unavailable; refresh to latest"),
+            )
+        # Preview-only paths for unversioned/ad-hoc adapters retain their existing bounded behavior.
+        # They simply cannot promise preview-to-run reuse until the Source has provider revision facts.
+        manifest = None
+        preview_graph = req.graph
+    _reject_invalid(preview_graph, deps, req.node_id)
+    port_id = _inspection_port(preview_graph, req.node_id, req.port_id, deps)
     k = req.k if req.k is not None else settings.preview_k
     if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
         try:
-            return SampleResult(**kb.preview(
-                req.graph, req.node_id, k, max(0, req.offset), port_id))
+            result = SampleResult(**kb.preview(
+                preview_graph, req.node_id, k, max(0, req.offset), port_id))
+            result.input_manifest = manifest
+            return result
         except Exception as e:  # noqa: BLE001 — kernel unreachable / spawn timeout → a clean error, not a raw 500
             return SampleResult(error=True, reason=f"kernel unavailable: {type(e).__name__}: {e}")
-    return preview_node(req.graph, req.node_id, k,
-                        deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
-                        offset=max(0, req.offset), storage=deps.storage, port_id=port_id)
+    result = preview_node(preview_graph, req.node_id, k,
+                          deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
+                          offset=max(0, req.offset), storage=deps.storage, port_id=port_id)
+    result.input_manifest = manifest
+    return result
+
+
+@router.post("/run/input-drift", response_model=InputDrift)
+def input_drift(req: InputDriftRequest, uid: str = Depends(current_user)) -> InputDrift:
+    """Report moved Source heads and #125 compatibility without replacing preview inputs."""
+    _require_graph_read_access(req.graph, uid)
+    deps = get_deps()
+    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    _reject_invalid(req.graph, deps, req.target_node_id)
+    return _input_drift(req.graph, req.target_node_id, req.input_manifest, deps)
 
 
 @router.post("/run/profile", response_model=ProfileResult)
@@ -1048,22 +1150,25 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     deps = get_deps()
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
-    plan = compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
+    graph = (_bind_local_run_manifest(req.graph, req.input_manifest, deps, req.target_node_id)
+             if req.input_manifest is not None else req.graph)
+    _reject_invalid(graph, deps, req.target_node_id)
+    plan = compiler.compile_plan(graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
         raise HTTPException(400, plan.error or "graph has a cycle")
-    _require_satisfiable_hard_requirements(deps, req.graph, req.target_node_id)
+    _require_satisfiable_hard_requirements(deps, graph, req.target_node_id)
     output_target = _run_output_preflight(plan, req.target_node_id)
     runner = _route_by_capability(
-        deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
+        deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
     multi_output = False
     if output_target is not None:
         multi_output = _require_backend_run_output_support(
-            runner, req.graph, output_target, deps)
-    _require_destination_credential_preflight(deps, runner, plan, req.graph)
-    rows, byts, sizes = _cone_size(req.graph, req.target_node_id, deps)
+            runner, graph, output_target, deps)
+    _require_destination_credential_preflight(deps, runner, plan, graph)
+    rows, byts, sizes = _cone_size(graph, req.target_node_id, deps)
     if multi_output:
         _controller_regions_for_run(
-            deps, req.graph, req.target_node_id, output_target, sizes, multi_output=True)
+            deps, graph, req.target_node_id, output_target, sizes, multi_output=True)
     est = runner.estimate(plan, rows, byts)
     return est
 
@@ -1080,7 +1185,8 @@ class RunNeedsConfirm(Exception):
 
 
 def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False,
-              submission_id: str | None = None):
+              submission_id: str | None = None,
+              input_manifest: list[dict[str, str]] | None = None):
     """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
     agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
@@ -1100,8 +1206,13 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     # Capture caller intent before catalog references are resolved or private exact-revision bindings are
     # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
     # browser-supplied id remains stable across response-loss retries.
-    intent_sha256 = _local_run_intent_sha256(graph, target_node_id)
+    intent_sha256 = _local_run_intent_sha256(graph, target_node_id, input_manifest)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_invalid(graph, deps, target_node_id)
+    if input_manifest is not None:
+        # Bind before validation/compile/estimate so schema checks and execution see the same exact
+        # population as the preview, even if latest moved after the preview was rendered.
+        graph = _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
     _reject_invalid(graph, deps, target_node_id)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
     if not plan.acyclic:
@@ -1147,7 +1258,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     prebound_local_run_id: str | None = None
     if local_admission:
         assert submission_id is not None
-        manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
+        manifest = (input_manifest if input_manifest is not None
+                    else _resolve_local_run_manifest(graph, target_node_id, deps))
         operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
         if operational_canvas is None:
             raise RuntimeError("local run admission requires a persisted canvas")
@@ -1289,6 +1401,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
         status, _ = start_run(
             get_deps(), req.graph, req.target_node_id, uid, req.confirmed,
             str(req.submission_id) if req.submission_id is not None else None,
+            req.input_manifest,
         )
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")

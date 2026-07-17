@@ -53,6 +53,16 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
     bound = graph.model_copy(deep=True)
     sources = source_nodes(bound, target_node_id)
     for node, item in zip(sources, admitted, strict=True):
+        config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        source_uri = str(config.get("uri") or "") if isinstance(config, dict) else ""
+        source_binding = metadb.catalog_revision_binding_for_uri(source_uri)
+        dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
+        if (source_binding is None
+                or str(source_binding["dataset_id"]) != item["dataset_id"]
+                or (isinstance(dataset_ref, dict) and (
+                    str(dataset_ref.get("datasetId") or "") != item["dataset_id"]
+                    or str(dataset_ref.get("revisionId") or "") != item["revision_id"]))):
+            raise LocalRunInputError("local run input manifest does not match the graph")
         try:
             binding = metadb.catalog_revision_binding(item["dataset_id"])
         except Exception as exc:

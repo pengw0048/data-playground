@@ -1109,6 +1109,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "targetNodeId": {
             "anyOf": [
               {
@@ -1482,6 +1499,105 @@
           "previewable"
         ],
         "title": "ImportStage",
+        "type": "object"
+      },
+      "InputDrift": {
+        "properties": {
+          "drifted": {
+            "title": "Drifted",
+            "type": "boolean"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InputDriftSource"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "drifted"
+        ],
+        "title": "InputDrift",
+        "type": "object"
+      },
+      "InputDriftRequest": {
+        "description": "Compare a retained preview binding with current provider heads without changing either.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Inputmanifest",
+            "type": "array"
+          },
+          "targetNodeId": {
+            "title": "Targetnodeid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph",
+          "targetNodeId",
+          "inputManifest"
+        ],
+        "title": "InputDriftRequest",
+        "type": "object"
+      },
+      "InputDriftSource": {
+        "properties": {
+          "compatibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SchemaCompatibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "datasetId": {
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "latestRevisionId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latestrevisionid"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "oldRevisionReadable": {
+            "title": "Oldrevisionreadable",
+            "type": "boolean"
+          },
+          "previewRevisionId": {
+            "title": "Previewrevisionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "datasetId",
+          "previewRevisionId",
+          "oldRevisionReadable"
+        ],
+        "title": "InputDriftSource",
         "type": "object"
       },
       "JoinAnalysis": {
@@ -2290,6 +2406,23 @@
         "properties": {
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "k": {
             "anyOf": [
@@ -3433,6 +3566,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "submissionId": {
             "anyOf": [
               {
@@ -3829,6 +3979,23 @@
             ],
             "description": "Whether another page exists within the current interactive scope: true/false is proven by lookahead, exact metadata, or a result-window boundary; null is unknown. It never asserts whether more rows exist in the full dataset beyond that scope.",
             "title": "Hasmore"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "limitReason": {
             "anyOf": [
@@ -10617,6 +10784,89 @@
           }
         },
         "summary": "Run Estimate"
+      }
+    },
+    "/api/run/input-drift": {
+      "post": {
+        "description": "Report moved Source heads and #125 compatibility without replacing preview inputs.",
+        "operationId": "input_drift_api_run_input_drift_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InputDriftRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InputDrift"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Input Drift"
       }
     },
     "/api/run/preview": {

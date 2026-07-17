@@ -259,6 +259,7 @@ export interface SampleResult {
   limitScope?: 'each-source' | 'result-window' | null
   sampleProvenance?: SampleProvenance | null
   previewRef?: string | null
+  inputManifest?: RunInputManifestItem[] | null
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
@@ -370,6 +371,20 @@ export interface RunInputManifestItem {
   revision_id: string
   provider: string
   resolved_at: string
+}
+
+export interface InputDriftSource {
+  nodeId: string
+  datasetId: string
+  previewRevisionId: string
+  latestRevisionId?: string | null
+  oldRevisionReadable: boolean
+  compatibility?: SchemaCompatibility | null
+}
+
+export interface InputDrift {
+  drifted: boolean
+  sources: InputDriftSource[]
 }
 
 export interface RunStatus {

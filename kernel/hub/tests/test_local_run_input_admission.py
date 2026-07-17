@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import event, func, select
 
 from hub import db, metadb
+from hub.api_errors import APIError
 from hub.models import Graph, RunEstimate, RunStatus
 from hub.plugins.adapters import LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
@@ -73,6 +74,25 @@ def test_manifest_is_ordered_secret_free_and_reopens_the_original_lance_head(tmp
         assert LanceAdapter().open_revision(cfg["uri"], cfg["_input_revision_id"]).fetchall() == [(1,)]
 
 
+def test_caller_manifest_cannot_retarget_a_source_to_another_dataset(tmp_path):
+    lance = pytest.importorskip("lance")
+    first_uri = str(tmp_path / "first.lance")
+    second_uri = str(tmp_path / "second.lance")
+    lance.write_dataset(pa.table({"value": [1]}), first_uri)
+    lance.write_dataset(pa.table({"value": [2]}), second_uri)
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: LanceAdapter())
+    catalog._add(name="first", uri=first_uri, strict_probe=True)
+    catalog._add(name="second", uri=second_uri, strict_probe=True)
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: LanceAdapter())
+    second_manifest = runs._resolve_local_run_manifest(_graph(second_uri), "source", deps)
+
+    with pytest.raises(APIError) as exc:
+        runs._bind_local_run_manifest(_graph(first_uri), second_manifest, deps, "source")
+
+    assert getattr(exc.value, "status_code", None) == 409
+    assert getattr(exc.value, "detail", None) == "local_run_input_manifest_does_not_match_graph"
+
+
 def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(tmp_path):
     lance = pytest.importorskip("lance")
     uri = str(tmp_path / "pinned-input.lance")
@@ -123,6 +143,30 @@ def test_same_submission_adopts_its_original_manifest_after_the_lance_head_moves
     )
     assert (adopted_id, created) == (run_id, False)
     assert metadb.local_run_input_manifest(run_id) == first
+
+
+def test_input_drift_reports_latest_revision_and_schema_compatibility(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri = str(tmp_path / "drift.lance")
+    lance.write_dataset(pa.table({"value": pa.array([1], type=pa.int32())}), uri)
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: LanceAdapter())
+    catalog._add(name="drift", uri=uri, strict_probe=True)
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: LanceAdapter())
+    graph = _graph(uri)
+    preview_manifest = runs._resolve_local_run_manifest(graph, "source", deps)
+
+    lance.write_dataset(
+        pa.table({"value": pa.array([2], type=pa.int32())}), uri, mode="append")
+    drift = runs._input_drift(graph, "source", preview_manifest, deps)
+
+    assert drift.drifted is True
+    assert len(drift.sources) == 1
+    source = drift.sources[0]
+    assert source.preview_revision_id == preview_manifest[0]["revision_id"]
+    assert source.latest_revision_id != source.preview_revision_id
+    assert source.old_revision_readable is True
+    assert source.compatibility is not None
+    assert source.compatibility.status in {"compatible", "unknown"}
 
 
 def test_manifest_rejects_secret_or_noncanonical_fields():
@@ -239,6 +283,36 @@ def test_queued_response_loss_adopts_the_claimed_local_run(monkeypatch):
     assert retry.status == "queued"
     assert owner is deps.runner
     assert calls == [first.run_id]
+
+
+def test_start_run_admits_the_caller_preview_manifest_without_resolving_latest(monkeypatch):
+    deps, graph = _local_start_context(monkeypatch)
+    preview_manifest = [{
+        "node_id": "source", "dataset_id": "dataset", "revision_id": "preview-revision",
+        "provider": "lance", "resolved_at": "preview-time",
+    }]
+    bound: list[list[dict[str, str]]] = []
+    monkeypatch.setattr(
+        runs, "_resolve_local_run_manifest",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("latest must not be resolved")),
+    )
+    monkeypatch.setattr(
+        runs, "_bind_local_run_manifest",
+        lambda current_graph, manifest, *_args: bound.append(manifest) or current_graph,
+    )
+    monkeypatch.setattr(
+        "hub.observability.invoke_backend_run",
+        lambda _runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs:
+        RunStatus(run_id=run_id, status="queued"),
+    )
+
+    status, _ = runs.start_run(
+        deps, graph, "source", "local", confirmed=True,
+        submission_id=str(uuid.uuid4()), input_manifest=preview_manifest,
+    )
+
+    assert bound == [preview_manifest, preview_manifest]
+    assert metadb.local_run_input_manifest(status.run_id) == preview_manifest
 
 
 def test_concurrent_duplicate_submission_has_one_local_dispatch_owner(monkeypatch):

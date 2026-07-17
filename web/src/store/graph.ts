@@ -4,7 +4,8 @@ import type {
   CanvasDoc, CanvasEdge, CanvasNode, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
-  CatalogTable, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate, RunStatus, SampleResult,
+  CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
+  RunInputManifestItem, RunStatus, SampleResult,
 } from '../types/api'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
@@ -29,6 +30,7 @@ const LS_KEY = 'dp-canvas'       // offline cache of the open doc
 const USER_KEY = 'dp-user'       // last-selected user id
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
+const PREVIEW_BINDINGS_KEY = (userId: string, canvasId: string) => `dp-preview-bindings-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
 
 export function roleCanEdit(role: CanvasRole | null | undefined): role is 'owner' | 'editor' {
   return role === 'owner' || role === 'editor'
@@ -158,6 +160,14 @@ export interface PreviewState {
   offset?: number
 }
 
+export interface PreviewBindingState {
+  canvasId: string
+  nodeId: string
+  portId?: string
+  planIdentity: string
+  inputManifest: RunInputManifestItem[]
+}
+
 function canonicalIdentityValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalIdentityValue)
   if (value && typeof value === 'object') {
@@ -280,6 +290,70 @@ export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: 
     && preview.planIdentity === previewPlanIdentity(doc, nodeId, portId)
 }
 
+function previewBindingIsCurrent(binding: PreviewBindingState, doc: CanvasDoc, nodeId: string): boolean {
+  return binding.canvasId === doc.id
+    && binding.nodeId === nodeId
+    && doc.nodes.some((node) => node.id === nodeId)
+    && binding.planIdentity === previewPlanIdentity(doc, nodeId, binding.portId)
+}
+
+function readPreviewBindings(userId: string | undefined, doc: CanvasDoc): Record<string, PreviewBindingState> {
+  if (!userId || !doc.id) return {}
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PREVIEW_BINDINGS_KEY(userId, doc.id)) ?? '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return Object.fromEntries(Object.entries(parsed).filter(([nodeId, value]) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+      const binding = value as PreviewBindingState
+      return typeof binding.canvasId === 'string'
+        && binding.nodeId === nodeId
+        && (binding.portId === undefined || typeof binding.portId === 'string')
+        && typeof binding.planIdentity === 'string'
+        && Array.isArray(binding.inputManifest)
+        && binding.inputManifest.every((item) => item && typeof item === 'object'
+          && ['node_id', 'dataset_id', 'revision_id', 'provider', 'resolved_at']
+            .every((field) => typeof item[field as keyof RunInputManifestItem] === 'string'))
+        && previewBindingIsCurrent(binding, doc, nodeId)
+    })) as Record<string, PreviewBindingState>
+  } catch {
+    return {}
+  }
+}
+
+function writePreviewBindings(userId: string | undefined, canvasId: string,
+  bindings: Record<string, PreviewBindingState>): void {
+  if (!userId || !canvasId) return
+  try { localStorage.setItem(PREVIEW_BINDINGS_KEY(userId, canvasId), JSON.stringify(bindings)) } catch { /* storage unavailable */ }
+}
+
+function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingState | undefined {
+  const live = state.previews[nodeId]
+  const manifest = live?.result?.inputManifest
+  if (live && manifest && previewIsCurrent(live, state.doc, nodeId)) {
+    return {
+      canvasId: live.canvasId, nodeId, portId: live.portId,
+      planIdentity: live.planIdentity, inputManifest: manifest,
+    }
+  }
+  const retained = state.previewBindings[nodeId]
+  return retained && previewBindingIsCurrent(retained, state.doc, nodeId) ? retained : undefined
+}
+
+function sameInputManifest(
+  left: RunInputManifestItem[] | undefined,
+  right: RunInputManifestItem[] | undefined,
+): boolean {
+  if (!left || !right || left.length !== right.length) return false
+  return left.every((item, index) => {
+    const other = right[index]
+    return item.node_id === other.node_id
+      && item.dataset_id === other.dataset_id
+      && item.revision_id === other.revision_id
+      && item.provider === other.provider
+      && item.resolved_at === other.resolved_at
+  })
+}
+
 // Schema hints and editor completions must follow the same reuse rule as the data panel. The
 // consumer of this map additionally matches its source handle, so a current preview for one named
 // output cannot supply columns for a sibling port.
@@ -292,8 +366,10 @@ export function currentPreviews(doc: CanvasDoc, previews: Record<string, Preview
 interface RunState {
   estimate?: RunEstimate
   status?: RunStatus
-  phase: 'idle' | 'estimating' | 'estimated' | 'confirm' | 'running' | 'done' | 'failed'
+  phase: 'idle' | 'estimating' | 'estimated' | 'confirm' | 'drift' | 'running' | 'done' | 'failed'
   error?: string
+  inputDrift?: InputDrift
+  driftInputManifest?: RunInputManifestItem[]
 }
 
 export interface ProfileJobState {
@@ -673,6 +749,7 @@ interface Store {
   selectedIds: string[]            // full multi-selection (box/shift-select)
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>
+  previewBindings: Record<string, PreviewBindingState>
   runs: Record<string, RunState>
   profileJobs: Record<string, ProfileJobState>
   past: CanvasDoc[]
@@ -717,10 +794,11 @@ interface Store {
   closePanel: (id: string) => void
 
   // -- execution --
-  runPreview: (id: string, offset?: number, portId?: string) => Promise<void>
+  runPreview: (id: string, offset?: number, portId?: string, refreshLatest?: boolean) => Promise<void>
+  refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
-  run: (id: string, confirmed?: boolean) => Promise<void>
+  run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
   rerunAll: () => void
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
@@ -1022,6 +1100,7 @@ export const useStore = create<Store>((set, get) => ({
   selectedIds: [],
   openPanels: {},
   previews: {},
+  previewBindings: {},
   runs: {},
   profileJobs: {},
   past: [],
@@ -1347,7 +1426,7 @@ export const useStore = create<Store>((set, get) => ({
   closePanel: (id) =>
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
 
-  runPreview: async (id: string, offset = 0, requestedPortId?: string) => {
+  runPreview: async (id: string, offset = 0, requestedPortId?: string, refreshLatest = false) => {
     // offset lives in the preview state (single source of truth) so an external Refresh (which
     // re-fetches page 0) and the panel's page controls never disagree.
     const doc = get().doc
@@ -1358,7 +1437,8 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     const ports = nodeOutputs(node)
-    const currentPortId = get().previews[id]?.portId
+    const previousPreview = get().previews[id]
+    const currentPortId = previousPreview?.portId
     const defaultPortId = ports.find((port) => port.id === 'out')?.id ?? ports[0]?.id
     const portId = requestedPortId ?? (ports.length > 1
       ? ports.find((port) => port.id === currentPortId)?.id ?? defaultPortId
@@ -1374,7 +1454,9 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => ({
       previews: {
         ...s.previews,
-        [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, loading: true, offset },
+        [id]: refreshLatest && previousPreview
+          ? { ...previousPreview, requestGeneration, loading: true, error: undefined }
+          : { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, loading: true, offset },
       },
       openPanels: { [id]: 'data' },
     }))
@@ -1405,20 +1487,77 @@ export const useStore = create<Store>((set, get) => ({
       // A chart renders its visible series at once, so request the explicit 2,000-point presentation
       // budget instead of a 50-row page. Durable run artifacts retain every group.
       const k = node.type === 'chart' ? 2000 : 50
-      const result = await api.preview(doc, id, k, offset, portId)
+      const retainedBinding = refreshLatest ? undefined : currentPreviewBinding(get(), id)?.inputManifest
+      const result = retainedBinding
+        ? await api.preview(doc, id, k, offset, portId, retainedBinding)
+        : await api.preview(doc, id, k, offset, portId)
       if (!isCurrent()) return
+      const binding = result.inputManifest ? {
+        canvasId: doc.id, nodeId: id, portId, planIdentity,
+        inputManifest: result.inputManifest,
+      } : undefined
+      const clearRetainedBinding = refreshLatest && !binding && !result.error && !result.notPreviewable
       set((s) => ({
         previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, result, offset } },
+        previewBindings: (() => {
+          if (binding) return { ...s.previewBindings, [id]: binding }
+          if (!clearRetainedBinding) return s.previewBindings
+          const retained = { ...s.previewBindings }
+          delete retained[id]
+          return retained
+        })(),
       }))
+      if (binding || clearRetainedBinding) {
+        writePreviewBindings(get().currentUser?.id, doc.id, get().previewBindings)
+      }
     } catch (e) {
       if (!isCurrent()) return
       set((s) => ({
         previews: {
           ...s.previews,
-          [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, error: (e as Error).message, offset },
+          [id]: refreshLatest && previousPreview
+            ? { ...previousPreview, requestGeneration, error: (e as Error).message, loading: false }
+            : { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, error: (e as Error).message, offset },
         },
       }))
     }
+  },
+
+  refreshPreviewInputs: async (id) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    const previous = currentPreviewBinding(get(), id)
+    if (!previous) return
+    await get().runPreview(id, 0, previous.portId, true)
+    const refreshed = get().previews[id]
+    if (!refreshed || !previewIsCurrent(refreshed, get().doc, id, previous.portId)
+        || refreshed.loading || refreshed.error || !refreshed.result
+        || refreshed.result.error || refreshed.result.notPreviewable) return
+    const next = currentPreviewBinding(get(), id)
+    if (next && sameInputManifest(next.inputManifest, previous.inputManifest)) return
+    const before = new Map(previous.inputManifest.map((item) => [item.node_id, item]))
+    const changedSources = next ? next.inputManifest.filter((item) => {
+      const prior = before.get(item.node_id)
+      return !prior || prior.dataset_id !== item.dataset_id
+        || prior.revision_id !== item.revision_id || prior.provider !== item.provider
+    }) : previous.inputManifest
+    if (!changedSources.length) return
+    set((s) => {
+      const stale = new Set<string>()
+      for (const source of changedSources) {
+        stale.add(source.node_id)
+        for (const nodeId of downstream(s.doc, source.node_id)) stale.add(nodeId)
+      }
+      return {
+        doc: { ...s.doc, nodes: s.doc.nodes.map((node) => stale.has(node.id) && node.data.status !== 'draft'
+          ? { ...node, data: { ...node.data, status: 'stale' as NodeStatus } }
+          : node) },
+        runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), phase: 'idle', estimate: undefined,
+          inputDrift: undefined, driftInputManifest: undefined, error: undefined,
+        } },
+      }
+    })
+    get().pushToast(`Refreshed ${changedSources.length} preview input${changedSources.length === 1 ? '' : 's'} to latest`, 'success')
   },
 
   // The play action: estimate, then start immediately for cheap work; only gate on expensive
@@ -1433,7 +1572,11 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
     let estimate
     try {
-      estimate = await api.estimate(get().doc, id)
+      const doc = get().doc
+      const binding = currentPreviewBinding(get(), id)
+      estimate = binding
+        ? await api.estimate(doc, id, binding.inputManifest)
+        : await api.estimate(doc, id)
     } catch (e) {
       set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
       get().pushToast((e as Error).message || 'Could not estimate the run', 'error')
@@ -1451,7 +1594,11 @@ export const useStore = create<Store>((set, get) => ({
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
     set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
     try {
-      const estimate = await api.estimate(get().doc, id)
+      const doc = get().doc
+      const binding = currentPreviewBinding(get(), id)
+      const estimate = binding
+        ? await api.estimate(doc, id, binding.inputManifest)
+        : await api.estimate(doc, id)
       set((s) => ({
         runs: { ...s.runs, [id]: { estimate, phase: estimate.needsConfirm ? 'confirm' : 'estimated' } },
       }))
@@ -1460,14 +1607,55 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  run: async (id, confirmed = false) => {
+  run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
+    const doc = get().doc
+    const binding = currentPreviewBinding(get(), id)
+    if (binding && !acceptPreviewDrift) {
+      try {
+        const inputDrift = await api.inputDrift(doc, id, binding.inputManifest)
+        if (inputDrift.drifted) {
+          set((s) => ({
+            runs: { ...s.runs, [id]: {
+              ...(s.runs[id] ?? {}), phase: 'drift', inputDrift,
+              driftInputManifest: binding.inputManifest, error: undefined,
+            } },
+            openPanels: { [id]: 'run' },
+          }))
+          return
+        }
+        if (!previewBindingIsCurrent(binding, get().doc, id)) return
+      } catch (e) {
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), phase: 'failed',
+          error: (e as Error).message || 'Could not verify preview input drift',
+        } } }))
+        get().pushToast((e as Error).message || 'Could not verify preview input drift', 'error')
+        return
+      }
+    }
+    if (acceptPreviewDrift && (!binding
+        || !sameInputManifest(binding.inputManifest, get().runs[id]?.driftInputManifest))) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'failed', estimate: undefined,
+        inputDrift: undefined, driftInputManifest: undefined,
+        error: 'Preview inputs changed; preview again before running.',
+      } } }))
+      get().pushToast('Preview inputs changed; preview again before running.', 'info')
+      return
+    }
     // no openPanels here — status shows on the card; the user opens the run panel if they want detail
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'running' } } }))
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'running', inputDrift: undefined,
+      driftInputManifest: undefined, error: undefined,
+    } } }))
     get().updateData(id, { status: 'running' })
     try {
-      const status = await api.run(get().doc, id, confirmed, globalThis.crypto.randomUUID())
+      const submissionId = globalThis.crypto.randomUUID()
+      const status = binding
+        ? await api.run(doc, id, confirmed, submissionId, binding.inputManifest)
+        : await api.run(doc, id, confirmed, submissionId)
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId)
     } catch (e) {
@@ -2231,7 +2419,7 @@ export const useStore = create<Store>((set, get) => ({
       // Agent requests are independent. A record from another canvas must never be displayed as
       // context for this one (or suggest that it will be sent with a future request).
       agentLog,
-      previews: {}, runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+      previews: {}, previewBindings: readPreviewBindings(get().currentUser?.id, d), runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
     })
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
