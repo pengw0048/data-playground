@@ -205,6 +205,9 @@ def _run_profile_job(job: dict, deps, graph, status_file: str, external_cancel) 
     node_id = job.get("target")
     if not isinstance(node_id, str) or not node_id:
         raise RuntimeError("profile job target is missing")
+    port_id = job.get("profilePortId")
+    if not isinstance(port_id, str) or not port_id:
+        raise RuntimeError("profile job output port is missing")
 
     started = time.monotonic()
 
@@ -216,6 +219,7 @@ def _run_profile_job(job: dict, deps, graph, status_file: str, external_cancel) 
             status=state,
             job_type="profile",
             target_node_id=node_id,
+            target_port_id=port_id,
             rows_processed=rows,
             total_rows=None,
             ms=elapsed_ms,
@@ -249,6 +253,7 @@ def _run_profile_job(job: dict, deps, graph, status_file: str, external_cancel) 
         storage=deps.storage,
         process_isolated=True,
         source_leases_preclaimed=True,
+        port_id=port_id,
     )
     if external_cancel and external_cancel():
         write("cancelled")

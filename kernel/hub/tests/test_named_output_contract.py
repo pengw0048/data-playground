@@ -779,7 +779,9 @@ def test_kernel_backend_rejects_ambiguous_run_all_before_kernel_claim(monkeypatc
     assert ensured == []
 
 
-def test_profile_process_runner_rejects_multi_output_before_lease_or_spawn(monkeypatch, tmp_path):
+@pytest.mark.parametrize("port_id", [None, "missing"])
+def test_profile_process_runner_rejects_missing_or_unknown_port_before_lease_or_spawn(
+        monkeypatch, tmp_path, port_id):
     runner = ProfileProcessRunner(
         str(tmp_path), str(tmp_path), storage=object(), node_specs=SPECS)
     calls = []
@@ -787,12 +789,35 @@ def test_profile_process_runner_rejects_multi_output_before_lease_or_spawn(monke
         runner, "_claim_source_leases", lambda *args: calls.append("lease"))
     monkeypatch.setattr(runner, "_spawn", lambda *args: calls.append("spawn"))
 
-    with pytest.raises(ValueError, match="does not yet support multi-output"):
+    with pytest.raises((ValueError, KeyError), match="output port"):
         runner.run(
-            _multi_graph(), "branches", plan_digest="a" * 64,
+            _multi_graph(), "branches", port_id=port_id, plan_digest="a" * 64,
             profile_attempt_order=1, run_id="profile-multi")
     assert calls == []
     assert "profile-multi" not in runner._profile_identities
+
+
+def test_profile_process_runner_binds_an_explicit_named_output_before_spawn(
+        monkeypatch, tmp_path):
+    runner = ProfileProcessRunner(
+        str(tmp_path), str(tmp_path), storage=object(), node_specs=SPECS)
+    spawned = []
+    monkeypatch.setattr(runner, "_claim_source_leases", lambda *_args: {
+        "attempts": [], "local_sources": [], "leases": [],
+    })
+
+    def spawn(status, job, *_args):
+        spawned.append((status, job))
+        return status
+
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    status = runner.run(
+        _multi_graph(), "branches", port_id="left", plan_digest="a" * 64,
+        profile_attempt_order=1, run_id="profile-left",
+    )
+
+    assert status.target_port_id == "left"
+    assert spawned[0][1]["profilePortId"] == "left"
 
 
 def test_run_history_route_serializes_camel_case_snapshot_and_job_type(monkeypatch):
@@ -814,11 +839,13 @@ def test_run_history_route_serializes_camel_case_snapshot_and_job_type(monkeypat
             "jobType": "profile",
             "status": "done",
             "targetNodeId": "target",
+            "targetPortId": "right",
             "rows": None,
             "outputs": [],
             "profile": {
                 "columns": [], "rowCount": 3, "sampled": False,
                 "completeness": "complete", "notPreviewable": False, "error": False,
+                "targetPortId": "right",
             },
             "perNode": [{"node_id": "target", "status": "done", "rows": 3}],
         },
@@ -837,5 +864,6 @@ def test_run_history_route_serializes_camel_case_snapshot_and_job_type(monkeypat
     assert not ({"outputUri", "outputTable", "output_uri", "output_table"} & record.keys())
     profile_record = response.json()[1]
     assert profile_record["jobType"] == "profile"
+    assert profile_record["targetPortId"] == "right"
     assert profile_record["rows"] is None and profile_record["outputs"] == []
     assert profile_record["profile"]["rowCount"] == 3

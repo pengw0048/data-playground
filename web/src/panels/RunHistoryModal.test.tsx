@@ -50,10 +50,11 @@ beforeEach(() => {
     columns: [], rowCount: 10, sampled: true, completeness: 'sample',
   })
   apiMock.profileEstimate.mockReset().mockResolvedValue({
-    rows: null, bytes: null, placement: 'local', needsConfirm: true, planDigest: 'a'.repeat(64),
+    rows: null, bytes: null, placement: 'local', needsConfirm: true,
+    targetPortId: 'out', planDigest: 'a'.repeat(64),
   })
   apiMock.fullProfile.mockReset().mockResolvedValue({
-    runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
+    runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
     planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
     rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
     profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
@@ -540,8 +541,14 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Stats' }))
     await waitFor(() => expect(apiMock.profile).toHaveBeenLastCalledWith(doc, 'target', 'pass'))
-    expect(screen.getByRole('button', { name: 'full dataset' })).toBeDisabled()
-    expect(screen.getByText(/Whole-dataset profiles are not available for multi-output nodes/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'full dataset' })).toBeEnabled()
+    apiMock.profileEstimate.mockResolvedValueOnce({
+      rows: null, bytes: null, placement: 'local', needsConfirm: true,
+      targetPortId: 'pass', planDigest: 'b'.repeat(64),
+    })
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
+    await waitFor(() => expect(apiMock.profileEstimate).toHaveBeenCalledWith(doc, 'target', 'pass'))
     await user.click(screen.getByRole('button', { name: 'Rows' }))
     await user.click(screen.getByRole('button', { name: 'Full result' }))
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenLastCalledWith(
@@ -949,7 +956,7 @@ describe('durable full results', () => {
         planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
         requestGeneration: 1, phase: 'done', identityVerified: true,
         status: {
-          runId: 'profile-distinct-compat', status: 'done', jobType: 'profile', targetNodeId: 'target',
+          runId: 'profile-distinct-compat', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
           planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10,
           ms: 10, placement: 'local', perNode: [],
           profile: {
@@ -977,7 +984,7 @@ describe('durable full results', () => {
   it('shows profile preflight before an explicit confirmed start', async () => {
     apiMock.profileEstimate.mockResolvedValueOnce({
       rows: 10, bytes: 5 * 1024 ** 3, placement: 'local', needsConfirm: true,
-      planDigest: 'a'.repeat(64),
+      targetPortId: 'out', planDigest: 'a'.repeat(64),
     })
     let finishProfile!: (status: any) => void
     apiMock.fullProfile.mockImplementationOnce(() => new Promise((resolve) => { finishProfile = resolve }))
@@ -1008,13 +1015,13 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Start whole-dataset profile' }))
     await waitFor(() => expect(apiMock.fullProfile).toHaveBeenCalledWith(
-      doc, 'target', expect.any(String), expect.any(String), true,
+      doc, 'target', 'out', expect.any(String), expect.any(String), true,
     ))
     expect(screen.getByText('Full profile queued…')).toBeInTheDocument()
     expect(screen.getByText(/Estimated 10 rows · 5 GiB · whole-dataset scan/i)).toBeInTheDocument()
 
     finishProfile({
-      runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target',
+      runId: 'profile-ui', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
       planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
       rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
@@ -1030,7 +1037,7 @@ describe('durable full results', () => {
     const planIdentity = profilePlanIdentity(doc, 'target')
     const planDigest = 'a'.repeat(64)
     const done = {
-      runId: 'profile-viewer', status: 'done', jobType: 'profile', targetNodeId: 'target',
+      runId: 'profile-viewer', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
       planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10, ms: 10, placement: 'local', perNode: [],
       profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
     }
@@ -1080,7 +1087,7 @@ describe('durable full results', () => {
         planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
         requestGeneration: 1, phase: 'verifying', identityVerified: false,
         status: {
-          runId: 'profile-unverified-active', status: 'running', jobType: 'profile', targetNodeId: 'target',
+          runId: 'profile-unverified-active', status: 'running', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
           planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
           placement: 'local', perNode: [],
           profile: { columns: [], rowCount: 999, sampled: false, completeness: 'complete' },
@@ -1100,7 +1107,7 @@ describe('durable full results', () => {
     expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
     expect(screen.queryByText(/whole dataset · 999 rows/i)).not.toBeInTheDocument()
     apiMock.cancelRun.mockResolvedValueOnce({
-      runId: 'profile-unverified-active', status: 'cancelled', jobType: 'profile', targetNodeId: 'target',
+      runId: 'profile-unverified-active', status: 'cancelled', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
       planDigest, profileAttemptOrder: 2, rowsProcessed: 5, ms: 10,
       placement: 'local', perNode: [],
     })
@@ -1126,7 +1133,7 @@ describe('durable full results', () => {
         planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
         requestGeneration: 1, phase: 'verifying', identityVerified: false,
         status: {
-          runId: `profile-terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'target',
+          runId: `profile-terminal-verifying-${role}`, status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
           planDigest, profileAttemptOrder: 2, rowsProcessed: 10, ms: 10,
           placement: 'local', perNode: [],
         },
@@ -1169,7 +1176,7 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'full dataset' }))
     await user.click(screen.getByRole('button', { name: 'Estimate full profile' }))
-    await waitFor(() => expect(apiMock.profileEstimate).toHaveBeenCalledWith(doc, 'target'))
+    await waitFor(() => expect(apiMock.profileEstimate).toHaveBeenCalledWith(doc, 'target', 'out'))
   })
 
   it('hides Alice full-profile statistics synchronously when identity changes to Bob', async () => {
@@ -1186,7 +1193,7 @@ describe('durable full results', () => {
         planIdentity: profilePlanIdentity(doc, 'target'), planDigest,
         requestGeneration: 1, phase: 'done', identityVerified: true,
         status: {
-          runId: 'alice-visible-profile', status: 'done', jobType: 'profile', targetNodeId: 'target',
+          runId: 'alice-visible-profile', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
           planDigest, profileAttemptOrder: 1, rowsProcessed: 10, totalRows: 10,
           ms: 10, placement: 'local', perNode: [],
           profile: { columns: [], rowCount: 10, sampled: false, completeness: 'complete' },
@@ -1221,7 +1228,7 @@ describe('durable full results', () => {
         planIdentity, planDigest,
         requestGeneration: 1, phase: 'failed', error: 'adapter timed out',
         status: {
-          runId: 'profile-failed', status: 'failed', jobType: 'profile', targetNodeId: 'target',
+          runId: 'profile-failed', status: 'failed', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
           planDigest, profileAttemptOrder: 1, rowsProcessed: 0, ms: 10,
           placement: 'local', perNode: [], error: 'adapter timed out',
         },

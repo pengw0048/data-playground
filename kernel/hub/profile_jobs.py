@@ -37,14 +37,16 @@ class ProfileProcessRunner(SubprocessRunner):
         self._terminal_publication_rejected: set[str] = set()
         self._completion_done: set[str] = set()
 
-    def run(self, graph: Graph, node_id: str, *, plan_digest: str,
+    def run(self, graph: Graph, node_id: str, *, port_id: str | None = None,
+            plan_digest: str,
             profile_attempt_order: int, run_id: str | None = None,
             request_id: str | None = None) -> RunStatus:
-        from hub.run_outputs import require_single_run_output
+        from hub.graph import require_output_port
         # ProfileProcessRunner is directly callable from a kernel, so the router's check is not a
         # sufficient allocation boundary. Reject before reserving an identity, claiming source
         # leases, or spawning a child.
-        require_single_run_output(graph, node_id, self.node_specs)
+        selected_port = require_output_port(
+            graph, node_id, self.node_specs, port_id).id
         if os.name != "posix":
             raise RuntimeError(
                 "full profiles require POSIX process-group containment on this backend")
@@ -53,6 +55,7 @@ class ProfileProcessRunner(SubprocessRunner):
         run_id = run_id or f"profile_{uuid.uuid4().hex[:10]}"
         identity = {
             "target_node_id": node_id,
+            "target_port_id": selected_port,
             "plan_digest": plan_digest,
             "profile_attempt_order": profile_attempt_order,
             "request_id": request_id,
@@ -62,6 +65,7 @@ class ProfileProcessRunner(SubprocessRunner):
             status="queued",
             job_type="profile",
             target_node_id=node_id,
+            target_port_id=selected_port,
             placement="local",
             per_node=[PerNodeStatus(node_id=node_id, status="queued", label="Full profile")],
             plan_digest=plan_digest,
@@ -95,6 +99,7 @@ class ProfileProcessRunner(SubprocessRunner):
                 "runId": run_id,
                 "managedSourceAttempts": source_leases["attempts"],
                 "managedLocalSources": source_leases["local_sources"],
+                "profilePortId": selected_port,
             }, graph, node_id)
         except Exception as exc:
             # Once Popen succeeds without reap proof, the base supervisor retains the exact child, job
@@ -117,11 +122,13 @@ class ProfileProcessRunner(SubprocessRunner):
         by the dead-kernel reaper because admission already bound the durable owner row.
         """
         if (status.status != "failed" or status.job_type != "profile"
-                or not status.target_node_id or not status.plan_digest
+                or not status.target_node_id or not status.target_port_id
+                or not status.plan_digest
                 or status.profile_attempt_order is None):
             raise ValueError("retained profile failure has an invalid durable identity")
         identity = {
             "target_node_id": status.target_node_id,
+            "target_port_id": status.target_port_id,
             "plan_digest": status.plan_digest,
             "profile_attempt_order": status.profile_attempt_order,
             "request_id": status.request_id,
@@ -281,6 +288,7 @@ class ProfileProcessRunner(SubprocessRunner):
         status.run_id = run_id
         status.job_type = "profile"
         status.target_node_id = str(identity["target_node_id"])
+        status.target_port_id = str(identity["target_port_id"])
         status.plan_digest = str(identity["plan_digest"])
         status.profile_attempt_order = int(identity["profile_attempt_order"])
         request_id = identity["request_id"]
@@ -296,6 +304,11 @@ class ProfileProcessRunner(SubprocessRunner):
         node_id = observed.target_node_id or ""
         if observed.status == "done":
             profile = observed.profile
+            if profile is not None:
+                profile = profile.model_copy(update={
+                    "target_port_id": observed.target_port_id,
+                })
+                observed.profile = profile
             if (profile is None or profile.sampled or profile.error or profile.not_previewable
                     or profile.row_count < 0):
                 observed.status = "failed"

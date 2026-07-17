@@ -138,6 +138,7 @@ class RunRecord(Base):
     # backends that do not propagate a request id.
     request_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    target_port_id: Mapped[str | None] = mapped_column(String, nullable=True)
     job_type: Mapped[str] = mapped_column(String, nullable=False, default="run", server_default="run")
     status: Mapped[str] = mapped_column(String)
     rows: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -191,6 +192,7 @@ class RunState(Base):
     # RunState remains globally bounded detail and must never be used to reconstruct latest-wins state.
     job_type: Mapped[str] = mapped_column(String, default="run", server_default="run")
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    target_port_id: Mapped[str | None] = mapped_column(String, nullable=True)
     plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     profile_attempt_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime.datetime | None] = mapped_column(
@@ -237,6 +239,7 @@ class ProfileJobLatest(Base):
     __tablename__ = "profile_job_latest"
     canvas_id: Mapped[str] = mapped_column(String, primary_key=True)
     target_node_id: Mapped[str] = mapped_column(String, primary_key=True)
+    target_port_id: Mapped[str] = mapped_column(String, nullable=False)
     plan_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
     run_id: Mapped[str] = mapped_column(String)
     doc: Mapped[str] = mapped_column(Text)
@@ -319,6 +322,7 @@ class RunTerminalFence(Base):
     canvas_id: Mapped[str | None] = mapped_column(String, nullable=True)
     job_type: Mapped[str] = mapped_column(String, default="run", server_default="run")
     target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    target_port_id: Mapped[str | None] = mapped_column(String, nullable=True)
     plan_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     profile_attempt_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
@@ -1466,7 +1470,7 @@ def _backfill_terminal_fence_identity(s, state: RunState) -> None:
         raise RuntimeError("terminal run fence canvas identity does not match its bound run state")
     for field in (
             "created_by", "auth_canvas_id", "job_type", "target_node_id",
-            "plan_digest", "profile_attempt_order"):
+            "target_port_id", "plan_digest", "profile_attempt_order"):
         expected = getattr(state, field)
         current = getattr(fence, field)
         if current is not None and current != expected:
@@ -1597,13 +1601,14 @@ def profile_submission_run_id(uid: str, canvas_id: str, submission_id: str) -> s
 
 def _profile_binding_matches(
         identity, *, uid: str, auth_canvas_id: str | None, canvas_id: str,
-        target_node_id: str, plan_digest: str) -> bool:
+        target_node_id: str, target_port_id: str, plan_digest: str) -> bool:
     return bool(
         identity.created_by == uid
         and identity.auth_canvas_id == auth_canvas_id
         and identity.canvas_id == canvas_id
         and identity.job_type == "profile"
         and identity.target_node_id == target_node_id
+        and identity.target_port_id == target_port_id
         and identity.plan_digest == plan_digest
         and isinstance(identity.profile_attempt_order, int)
         and identity.profile_attempt_order >= 1
@@ -1625,7 +1630,8 @@ def _terminalize_unadmitted_profile(
     """Permanently fail a reservation that never entered the latest-job projection."""
     if (state.job_type != "profile" or state.kernel_id is not None
             or state.preallocation_token is None
-            or state.target_node_id is None or state.plan_digest is None
+            or state.target_node_id is None or state.target_port_id is None
+            or state.plan_digest is None
             or state.profile_attempt_order is None):
         raise RuntimeError("only an exact unadmitted profile reservation can be terminalized")
     failed = {
@@ -1633,6 +1639,7 @@ def _terminalize_unadmitted_profile(
         "status": "failed",
         "job_type": "profile",
         "target_node_id": state.target_node_id,
+        "target_port_id": state.target_port_id,
         "plan_digest": state.plan_digest,
         "profile_attempt_order": int(state.profile_attempt_order),
         "request_id": state.request_id,
@@ -1657,13 +1664,14 @@ def _terminalize_unadmitted_profile(
 
 def _profile_reservation_from_bound_identity(
         s, *, run_id: str, uid: str, auth_canvas_id: str | None,
-        canvas_id: str, target_node_id: str, plan_digest: str,
+        canvas_id: str, target_node_id: str, target_port_id: str, plan_digest: str,
         terminalize_expired: bool) -> ProfileRunReservation | None:
     state = s.get(RunState, run_id, with_for_update=True)
     if state is not None:
         if not _profile_binding_matches(
                 state, uid=uid, auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
-                target_node_id=target_node_id, plan_digest=plan_digest):
+                target_node_id=target_node_id, target_port_id=target_port_id,
+                plan_digest=plan_digest):
             raise ProfileSubmissionConflict(
                 "profile submission id is already bound to a different identity")
         attempt_order = int(state.profile_attempt_order)
@@ -1687,7 +1695,8 @@ def _profile_reservation_from_bound_identity(
         return None
     if not _profile_binding_matches(
             fence, uid=uid, auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
-            target_node_id=target_node_id, plan_digest=plan_digest):
+            target_node_id=target_node_id, target_port_id=target_port_id,
+            plan_digest=plan_digest):
         raise ProfileSubmissionConflict(
             "profile submission id is already bound to a different identity")
     attempt_order = int(fence.profile_attempt_order)
@@ -1705,6 +1714,7 @@ def _profile_reservation_from_bound_identity(
             "status": fence.status,
             "job_type": "profile",
             "target_node_id": target_node_id,
+            "target_port_id": target_port_id,
             "plan_digest": plan_digest,
             "profile_attempt_order": attempt_order,
             "placement": "local",
@@ -1730,7 +1740,7 @@ def _profile_reservation_from_bound_identity(
 def lookup_profile_submission(
         submission_id: str, uid: str, auth_canvas_id: str | None,
         operational_canvas_id: str, target_node_id: str,
-        plan_digest: str) -> ProfileRunReservation | None:
+        target_port_id: str, plan_digest: str) -> ProfileRunReservation | None:
     """Adopt an existing submission before consulting mutable source state."""
     uid, operational_canvas_id = str(uid), str(operational_canvas_id)
     auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
@@ -1740,25 +1750,29 @@ def lookup_profile_submission(
         return _profile_reservation_from_bound_identity(
             s, run_id=run_id, uid=uid, auth_canvas_id=auth_canvas_id,
             canvas_id=operational_canvas_id, target_node_id=str(target_node_id),
-            plan_digest=str(plan_digest), terminalize_expired=True,
+            target_port_id=str(target_port_id), plan_digest=str(plan_digest),
+            terminalize_expired=True,
         )
 
 
 def preallocate_or_adopt_profile_run_owner(
         submission_id: str, uid: str, auth_canvas_id: str | None,
-        operational_canvas_id: str, target_node_id: str, plan_digest: str,
+        operational_canvas_id: str, target_node_id: str, target_port_id: str,
+        plan_digest: str,
         request_id: str | None = None,
         ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> ProfileRunReservation:
     """Reserve once or return the exact durable state bound to this submission id."""
     uid, operational_canvas_id = str(uid), str(operational_canvas_id or "")
     auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
-    target_node_id, plan_digest = str(target_node_id or ""), str(plan_digest or "")
+    target_node_id = str(target_node_id or "")
+    target_port_id = str(target_port_id or "")
+    plan_digest = str(plan_digest or "")
     if not operational_canvas_id:
         raise ValueError("profile run requires an operational canvas id")
     if auth_canvas_id is not None and operational_canvas_id != auth_canvas_id:
         raise RuntimeError("authorized run canvas and operational canvas must match")
-    if not target_node_id or not _valid_plan_digest(plan_digest):
-        raise ValueError("profile preallocation requires a target node and plan digest")
+    if not target_node_id or not target_port_id or not _valid_plan_digest(plan_digest):
+        raise ValueError("profile preallocation requires target node/port and plan digest")
     run_id = profile_submission_run_id(uid, operational_canvas_id, submission_id)
     token = secrets.token_urlsafe(32)
     with session() as s:
@@ -1773,7 +1787,8 @@ def preallocate_or_adopt_profile_run_owner(
         existing = _profile_reservation_from_bound_identity(
             s, run_id=run_id, uid=uid, auth_canvas_id=auth_canvas_id,
             canvas_id=operational_canvas_id, target_node_id=target_node_id,
-            plan_digest=plan_digest, terminalize_expired=True,
+            target_port_id=target_port_id, plan_digest=plan_digest,
+            terminalize_expired=True,
         )
         if existing is not None:
             return existing
@@ -1791,6 +1806,7 @@ def preallocate_or_adopt_profile_run_owner(
             "status": "queued",
             "job_type": "profile",
             "target_node_id": target_node_id,
+            "target_port_id": target_port_id,
             "plan_digest": plan_digest,
             "profile_attempt_order": attempt_order,
             "request_id": request_id,
@@ -1799,6 +1815,7 @@ def preallocate_or_adopt_profile_run_owner(
             run_id=run_id, canvas_id=operational_canvas_id, status="queued",
             doc=json.dumps(status_doc), created_by=uid, auth_canvas_id=auth_canvas_id,
             request_id=request_id, job_type="profile", target_node_id=target_node_id,
+            target_port_id=target_port_id,
             plan_digest=plan_digest, profile_attempt_order=attempt_order,
             preallocation_token=token,
             preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
@@ -1809,7 +1826,8 @@ def preallocate_or_adopt_profile_run_owner(
 
 def preallocate_profile_run_owner(
         run_id: str, uid: str, auth_canvas_id: str | None, operational_canvas_id: str,
-        target_node_id: str, plan_digest: str, request_id: str | None = None,
+        target_node_id: str, target_port_id: str, plan_digest: str,
+        request_id: str | None = None,
         ttl_seconds: float = RUN_PREALLOCATION_TTL_SECONDS) -> tuple[str, int]:
     """Mint a durable profile identity and DB-monotonic attempt order before kernel allocation.
 
@@ -1819,13 +1837,15 @@ def preallocate_profile_run_owner(
     run_id, uid = str(run_id), str(uid)
     auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
     operational_canvas_id = str(operational_canvas_id or "")
-    target_node_id, plan_digest = str(target_node_id or ""), str(plan_digest or "")
+    target_node_id = str(target_node_id or "")
+    target_port_id = str(target_port_id or "")
+    plan_digest = str(plan_digest or "")
     if not operational_canvas_id:
         raise ValueError("profile run requires an operational canvas id")
     if auth_canvas_id is not None and operational_canvas_id != auth_canvas_id:
         raise RuntimeError("authorized run canvas and operational canvas must match")
-    if not target_node_id or not _valid_plan_digest(plan_digest):
-        raise ValueError("profile preallocation requires a target node and plan digest")
+    if not target_node_id or not target_port_id or not _valid_plan_digest(plan_digest):
+        raise ValueError("profile preallocation requires target node/port and plan digest")
 
     token = secrets.token_urlsafe(32)
     with session() as s:
@@ -1848,6 +1868,7 @@ def preallocate_profile_run_owner(
             "status": "queued",
             "job_type": "profile",
             "target_node_id": target_node_id,
+            "target_port_id": target_port_id,
             "plan_digest": plan_digest,
             "profile_attempt_order": attempt_order,
             "request_id": request_id,
@@ -1856,6 +1877,7 @@ def preallocate_profile_run_owner(
             run_id=run_id, canvas_id=operational_canvas_id, status="queued",
             doc=json.dumps(status_doc), created_by=uid, auth_canvas_id=auth_canvas_id,
             request_id=request_id, job_type="profile", target_node_id=target_node_id,
+            target_port_id=target_port_id,
             plan_digest=plan_digest, profile_attempt_order=attempt_order,
             preallocation_token=token,
             preallocation_expires_at=_run_preallocation_deadline(s, ttl_seconds),
@@ -1865,7 +1887,8 @@ def preallocate_profile_run_owner(
 
 def consume_profile_run_preallocation(
         run_id: str, token: str, *, canvas_id: str, kernel_id: str,
-        target_node_id: str, plan_digest: str) -> tuple[bool, dict]:
+        target_node_id: str, target_port_id: str,
+        plan_digest: str) -> tuple[bool, dict]:
     """Atomically bind one profile preallocation to its kernel before child dispatch.
 
     Returns ``(True, queued_status)`` for the one token-consuming admission. A response-lost replay on
@@ -1874,12 +1897,15 @@ def consume_profile_run_preallocation(
     Any identity mismatch, expired initial token, or cross-kernel replay fails closed.
     """
     run_id, canvas_id, kernel_id = str(run_id), str(canvas_id), str(kernel_id)
-    target_node_id, plan_digest = str(target_node_id), str(plan_digest)
+    target_node_id = str(target_node_id)
+    target_port_id = str(target_port_id)
+    plan_digest = str(plan_digest)
     with session() as s:
         state = _lock_existing_run_identity(s, run_id)
         if (state is None or state.job_type != "profile"
                 or state.canvas_id != canvas_id
                 or state.target_node_id != target_node_id
+                or state.target_port_id != target_port_id
                 or state.plan_digest != plan_digest
                 or state.profile_attempt_order is None):
             raise RuntimeError("profile admission identity does not match its preallocation")
@@ -1910,6 +1936,7 @@ def consume_profile_run_preallocation(
         payload = json.dumps(queued, default=str)
         _upsert_profile_latest(
             s, canvas_id=canvas_id, target_node_id=target_node_id,
+            target_port_id=target_port_id,
             plan_digest=plan_digest, run_id=run_id, payload=payload,
             attempt_order=int(state.profile_attempt_order),
             submitted_at=state.created_at or _now(),
@@ -1919,7 +1946,8 @@ def consume_profile_run_preallocation(
 
 def admitted_profile_run_status(
         run_id: str, uid: str, auth_canvas_id: str | None, *, canvas_id: str,
-        target_node_id: str, plan_digest: str, attempt_order: int) -> dict | None:
+        target_node_id: str, target_port_id: str,
+        plan_digest: str, attempt_order: int) -> dict | None:
     """Return the durable status only after the exact profile preallocation was consumed."""
     with session() as s:
         state = s.get(RunState, str(run_id))
@@ -1929,6 +1957,7 @@ def admitted_profile_run_status(
                 or state.canvas_id != str(canvas_id)
                 or state.job_type != "profile"
                 or state.target_node_id != str(target_node_id)
+                or state.target_port_id != str(target_port_id)
                 or state.plan_digest != str(plan_digest)
                 or state.profile_attempt_order != int(attempt_order)
                 or state.preallocation_token is not None or state.kernel_id is None):
@@ -2006,7 +2035,8 @@ def discard_run_preallocation(
 
 def settle_profile_submission_failure(
         run_id: str, token: str, uid: str, auth_canvas_id: str | None, *,
-        canvas_id: str, target_node_id: str, plan_digest: str,
+        canvas_id: str, target_node_id: str, target_port_id: str,
+        plan_digest: str,
         attempt_order: int,
         reason: str = "execution kernel rejected profile submission before admission",
         ) -> tuple[str, dict | None]:
@@ -2019,7 +2049,9 @@ def settle_profile_submission_failure(
     """
     run_id, uid, canvas_id = str(run_id), str(uid), str(canvas_id)
     auth_canvas_id = str(auth_canvas_id) if auth_canvas_id is not None else None
-    target_node_id, plan_digest = str(target_node_id), str(plan_digest)
+    target_node_id = str(target_node_id)
+    target_port_id = str(target_port_id)
+    plan_digest = str(plan_digest)
     attempt_order = int(attempt_order)
     with session() as s:
         _lock_authorized_run_canvas(s, canvas_id)
@@ -2029,11 +2061,13 @@ def settle_profile_submission_failure(
             if (fence is None or not _profile_binding_matches(
                     fence, uid=uid, auth_canvas_id=auth_canvas_id,
                     canvas_id=canvas_id, target_node_id=target_node_id,
+                    target_port_id=target_port_id,
                     plan_digest=plan_digest)
                     or fence.profile_attempt_order != attempt_order):
                 return "identity_mismatch", None
             latest = s.get(
-                ProfileJobLatest, (canvas_id, target_node_id, plan_digest),
+                ProfileJobLatest,
+                (canvas_id, target_node_id, plan_digest),
                 with_for_update=True,
             )
             if (latest is not None and latest.run_id == run_id
@@ -2050,6 +2084,7 @@ def settle_profile_submission_failure(
         if (state.created_by != uid or state.auth_canvas_id != auth_canvas_id
                 or state.canvas_id != canvas_id or state.job_type != "profile"
                 or state.target_node_id != target_node_id
+                or state.target_port_id != target_port_id
                 or state.plan_digest != plan_digest
                 or state.profile_attempt_order != attempt_order):
             return "identity_mismatch", None
@@ -2845,6 +2880,7 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
 
 
 def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
+                       target_port_id: str | None,
                        job_type: str, status: str,
                        rows: int | None = None, ms: int | None = None, error: str | None = None,
                        outputs: list[dict] | None = None, per_node: list[dict] | None = None,
@@ -2863,6 +2899,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         "job_type": job_type,
         "status": status,
         "target_node_id": target_node_id,
+        "target_port_id": target_port_id,
         "rows": rows,
         "ms": ms,
         "error": error,
@@ -2887,8 +2924,9 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     rid = rec.id
     if request_id and not rec.request_id:
         rec.request_id = request_id
-    rec.target_node_id, rec.job_type, rec.status = (
-        history.target_node_id, history.job_type, history.status)
+    rec.target_node_id, rec.target_port_id, rec.job_type, rec.status = (
+        history.target_node_id, history.target_port_id,
+        history.job_type, history.status)
     rec.rows, rec.ms, rec.error = history.rows, history.ms, history.error
     admission = s.get(RunInputAdmission, str(run_id)) if run_id else None
     rec.input_manifest = admission.manifest if admission is not None else None
@@ -2920,6 +2958,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
 
 
 def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str, status: str,
+               target_port_id: str | None = None,
                rows: int | None = None, ms: int | None = None, error: str | None = None,
                outputs: list[dict] | None = None, per_node: list[dict] | None = None,
                profile: dict | None = None,
@@ -2935,6 +2974,7 @@ def record_run(canvas_id: str | None, target_node_id: str | None, job_type: str,
     with session() as s:
         return _upsert_run_record(
             s, canvas_id=canvas_id, target_node_id=target_node_id,
+            target_port_id=target_port_id,
             job_type=job_type, status=status,
             rows=rows, ms=ms, error=error, outputs=outputs, per_node=per_node, profile=profile,
             run_id=run_id, request_id=request_id,
@@ -3067,7 +3107,8 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
         return [{"id": r.id, "runId": r.run_id, "requestId": r.request_id, "status": r.status,
-                 "targetNodeId": r.target_node_id, "jobType": r.job_type, "rows": r.rows,
+                 "targetNodeId": r.target_node_id, "targetPortId": r.target_port_id,
+                 "jobType": r.job_type, "rows": r.rows,
                  "ms": r.ms, "error": r.error,
                  "outputs": json.loads(r.outputs),
                  "inputManifest": json.loads(r.input_manifest) if r.input_manifest else None,
@@ -3150,18 +3191,20 @@ def _record_terminal_fence(s, run_id: str, status: str) -> None:
     if current is None:
         identity = s.execute(select(
             RunState.created_by, RunState.auth_canvas_id, RunState.canvas_id,
-            RunState.job_type, RunState.target_node_id, RunState.plan_digest,
+            RunState.job_type, RunState.target_node_id, RunState.target_port_id,
+            RunState.plan_digest,
             RunState.profile_attempt_order,
         ).where(RunState.run_id == str(run_id))).one_or_none()
-        (created_by, auth_canvas_id, canvas_id, job_type, target_node_id,
+        (created_by, auth_canvas_id, canvas_id, job_type, target_node_id, target_port_id,
          plan_digest, profile_attempt_order) = (
             identity if identity is not None
-            else (None, None, None, "run", None, None, None)
+            else (None, None, None, "run", None, None, None, None)
         )
         s.add(RunTerminalFence(
             run_id=str(run_id), status=status, created_by=created_by,
             auth_canvas_id=auth_canvas_id, canvas_id=canvas_id,
             job_type=job_type, target_node_id=target_node_id,
+            target_port_id=target_port_id,
             plan_digest=plan_digest, profile_attempt_order=profile_attempt_order,
         ))
         s.flush()
@@ -3175,7 +3218,8 @@ def _valid_plan_digest(value: object) -> bool:
 
 
 def _upsert_profile_latest(
-        s, *, canvas_id: str, target_node_id: str, plan_digest: str,
+        s, *, canvas_id: str, target_node_id: str, target_port_id: str,
+        plan_digest: str,
         run_id: str, payload: str, attempt_order: int,
         submitted_at: datetime.datetime) -> None:
     """Atomically advance one canvas/node/plan pointer and retain its latest status document.
@@ -3185,6 +3229,7 @@ def _upsert_profile_latest(
     deliberately unaffected by global RunState detail retention.
     """
     canvas_id, target_node_id = str(canvas_id), str(target_node_id)
+    target_port_id = str(target_port_id)
     plan_digest, run_id = str(plan_digest), str(run_id)
     attempt_order = int(attempt_order)
     if attempt_order < 1:
@@ -3203,6 +3248,7 @@ def _upsert_profile_latest(
             return
         s.add(ProfileJobLatest(
             canvas_id=canvas_id, target_node_id=target_node_id,
+            target_port_id=target_port_id,
             plan_digest=plan_digest, run_id=run_id, doc=payload,
             attempt_order=attempt_order,
             submitted_at=submitted_at, updated_at=now,
@@ -3259,15 +3305,16 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         for uri in output_uris)
     job_type = str(status.get("job_type", status.get("jobType", "run")))
     target_node_id = status.get("target_node_id", status.get("targetNodeId"))
+    target_port_id = status.get("target_port_id", status.get("targetPortId"))
     plan_digest = status.get("plan_digest", status.get("planDigest"))
     profile_attempt_order = status.get(
         "profile_attempt_order", status.get("profileAttemptOrder"))
     if job_type == "profile" and (
-            not target_node_id or not _valid_plan_digest(plan_digest)
+            not target_node_id or not target_port_id or not _valid_plan_digest(plan_digest)
             or not isinstance(profile_attempt_order, int)
             or isinstance(profile_attempt_order, bool) or profile_attempt_order < 1):
         raise ValueError(
-            "profile status requires a target node, lowercase SHA-256 plan digest, "
+            "profile status requires target node/port, lowercase SHA-256 plan digest, "
             "and positive attempt order")
     with session() as s:
         stale_candidate_ids: list[str] = []
@@ -3316,6 +3363,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
         if r is not None and (job_type == "profile" or r.job_type == "profile"):
             if (job_type != "profile" or r.job_type != "profile"
                     or r.target_node_id != str(target_node_id)
+                    or r.target_port_id != str(target_port_id)
                     or r.plan_digest != str(plan_digest)
                     or r.profile_attempt_order != profile_attempt_order):
                 raise RunStatePublicationRejected(
@@ -3336,6 +3384,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
             r = RunState(run_id=run_id, canvas_id=canvas_id, status=st, doc=payload,
                          kernel_id=kernel_id, request_id=request_id,
                          job_type=job_type, target_node_id=target_node_id,
+                         target_port_id=target_port_id,
                          plan_digest=plan_digest,
                          profile_attempt_order=profile_attempt_order)
             s.add(r)
@@ -3357,6 +3406,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 if target_node_id is not None:
                     values["target_node_id"] = func.coalesce(
                         RunState.target_node_id, str(target_node_id))
+                if target_port_id is not None:
+                    values["target_port_id"] = func.coalesce(
+                        RunState.target_port_id, str(target_port_id))
                 if plan_digest is not None:
                     values["plan_digest"] = func.coalesce(
                         RunState.plan_digest, plan_digest)
@@ -3372,6 +3424,9 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 or_(target_node_id is None,
                     RunState.target_node_id.is_(None),
                     RunState.target_node_id == str(target_node_id)),
+                or_(target_port_id is None,
+                    RunState.target_port_id.is_(None),
+                    RunState.target_port_id == str(target_port_id)),
                 or_(profile_attempt_order is None,
                     RunState.profile_attempt_order.is_(None),
                     RunState.profile_attempt_order == profile_attempt_order),
@@ -3390,6 +3445,7 @@ def save_run_state(run_id: str, status: dict, canvas_id: str | None = None,
                 s,
                 canvas_id=str(profile_canvas_id),
                 target_node_id=str(target_node_id),
+                target_port_id=str(target_port_id),
                 plan_digest=str(plan_digest),
                 run_id=str(run_id),
                 payload=payload,
@@ -4803,6 +4859,7 @@ def finish_backend_publication(run_id: str, attempt_id: str, owner: str, result:
         _release_backend_source_pins(s, source_pins)
         _upsert_run_record(
             s, canvas_id=state.canvas_id, target_node_id=published.get("target_node_id"),
+            target_port_id=None,
             job_type="run", status=terminal,
             rows=published.get("total_rows"), ms=published.get("ms"),
             error=published.get("error"), outputs=published.get("outputs") or [],
@@ -10485,7 +10542,8 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
             admitted_profile = (
                 not preallocation_expired and r.kernel_id is not None
                 and r.job_type == "profile" and r.canvas_id is not None
-                and r.target_node_id is not None and r.plan_digest is not None
+                and r.target_node_id is not None and r.target_port_id is not None
+                and r.plan_digest is not None
                 and r.profile_attempt_order is not None
             )
             if preallocation_expired:
@@ -10508,6 +10566,7 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
                 d.update({
                     "job_type": "profile",
                     "target_node_id": str(r.target_node_id),
+                    "target_port_id": str(r.target_port_id),
                     "plan_digest": str(r.plan_digest),
                     "profile_attempt_order": int(r.profile_attempt_order or 0),
                 })
@@ -10534,6 +10593,7 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
                     status="failed",
                     job_type="profile" if admitted_profile else "run",
                     target_node_id=str(r.target_node_id) if r.target_node_id is not None else None,
+                    target_port_id=str(r.target_port_id) if admitted_profile else None,
                     error=interrupted_error,
                     plan_digest=str(r.plan_digest) if admitted_profile else None,
                     profile_attempt_order=(
@@ -10545,6 +10605,7 @@ def reap_orphaned_runs(only_kernel_runs: bool = False) -> int:
             if admitted_profile:
                 _upsert_profile_latest(
                     s, canvas_id=str(r.canvas_id), target_node_id=str(r.target_node_id),
+                    target_port_id=str(r.target_port_id),
                     plan_digest=str(r.plan_digest), run_id=r.run_id, payload=r.doc,
                     attempt_order=int(r.profile_attempt_order or 0),
                     submitted_at=r.created_at or _now(),

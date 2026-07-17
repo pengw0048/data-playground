@@ -131,11 +131,11 @@ def _admit_profile(metadb, graph: Graph, run_id: str, plan_digest: str, *,
         claimed = metadb.claim_kernel(graph.id, "profile-kernel", "profile-test-token")
         assert claimed["won"] is True
     token, attempt_order = metadb.preallocate_profile_run_owner(
-        run_id, "profile-owner", graph.id, graph.id, "source", plan_digest,
+        run_id, "profile-owner", graph.id, graph.id, "source", "out", plan_digest,
     )
     won, _status = metadb.consume_profile_run_preallocation(
         run_id, token, canvas_id=graph.id, kernel_id="profile-kernel",
-        target_node_id="source", plan_digest=plan_digest,
+        target_node_id="source", target_port_id="out", plan_digest=plan_digest,
     )
     assert won
     return attempt_order
@@ -344,7 +344,8 @@ def test_definitive_terminal_rejection_is_not_retried_or_completed(
         _graph(),
         RunStatus(
             run_id="profile-rejected", status="failed", job_type="profile",
-            target_node_id="source", plan_digest=_digest("rejected"),
+            target_node_id="source", target_port_id="out",
+            plan_digest=_digest("rejected"),
             profile_attempt_order=1, placement="local", per_node=[],
             error="pre-spawn failure",
         ),
@@ -374,7 +375,8 @@ def test_pending_terminal_survives_bounded_eviction_until_publication(
 
     terminal = RunStatus(
         run_id="profile-pending-eviction", status="failed", job_type="profile",
-        target_node_id="source", plan_digest=_digest("pending-eviction"),
+        target_node_id="source", target_port_id="out",
+        plan_digest=_digest("pending-eviction"),
         profile_attempt_order=1, placement="local", per_node=[], error="failed",
     )
     retained = runner.retain_terminal_failure(_graph(), terminal, blocked_publication)
@@ -513,7 +515,7 @@ def test_profile_history_retry_is_idempotent_after_commit_unknown(tmp_path, monk
             deps, g, target, status)
         status = RunStatus(
             run_id=run_id, status="failed", job_type="profile",
-            target_node_id="source", plan_digest=plan_digest,
+            target_node_id="source", target_port_id="out", plan_digest=plan_digest,
             profile_attempt_order=attempt_order, placement="local", per_node=[],
             error="pre-spawn failure",
         )
@@ -605,7 +607,7 @@ def test_late_profile_terminal_rejected_after_dead_kernel_fence(
             run_id,
             RunStatus(
                 run_id=run_id, status="running", job_type="profile",
-                target_node_id="source", plan_digest=plan_digest,
+                target_node_id="source", target_port_id="out", plan_digest=plan_digest,
                 profile_attempt_order=attempt_order, placement="local", per_node=[],
             ).model_dump(),
             canvas_id=graph.id, kernel_id="profile-kernel",
@@ -627,7 +629,7 @@ def test_late_profile_terminal_rejected_after_dead_kernel_fence(
         runner.on_complete = complete
         late_done = RunStatus(
             run_id=run_id, status="done", job_type="profile",
-            target_node_id="source", plan_digest=plan_digest,
+            target_node_id="source", target_port_id="out", plan_digest=plan_digest,
             profile_attempt_order=attempt_order, placement="local", per_node=[],
         )
         runner._complete(graph, "source", late_done)

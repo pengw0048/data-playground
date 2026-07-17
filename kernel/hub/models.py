@@ -705,6 +705,9 @@ class ColumnProfile(Wire):
 class ProfileResult(Wire):
     """Column statistics with an explicit, non-inferred measurement scope."""
 
+    # The relation that was measured. Durable full-profile jobs always populate this field; keeping it
+    # on ProfileResult (rather than manufacturing a RunOutput) preserves the inspection/job boundary.
+    target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
     columns: list[ColumnProfile] = Field(default_factory=list)
     row_count: int = Field(
         default=0, ge=0,
@@ -795,11 +798,13 @@ class RunEstimate(Wire):
 
 class ProfileEstimate(RunEstimate):
     """Whole-profile preflight plus the server-minted identity required by submission."""
+    target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
 
 
 class ProfileIdentity(Wire):
     """Current server identity for recovery without re-running the size estimate."""
+    target_port_id: str = Field(min_length=1, max_length=128)
     plan_digest: PlanDigest
 
 
@@ -894,6 +899,7 @@ class RunStatus(Wire):
     # profile completion for a newly materialized node result.
     job_type: Literal["run", "profile"] = "run"
     target_node_id: str | None = None   # the run's sink — lets a reattaching client re-bind the run to its node
+    target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
     rows_processed: int = 0
     total_rows: int | None = None
     ms: int = 0
@@ -937,7 +943,16 @@ class RunStatus(Wire):
                 raise ValueError("profile jobs cannot publish run outputs")
             if self.total_rows is not None:
                 raise ValueError("profile jobs report result rows only through profile.rowCount")
+            durable_identity = self.plan_digest is not None or self.profile_attempt_order is not None
+            if durable_identity and (
+                    self.target_node_id is None or self.target_port_id is None):
+                raise ValueError("profile jobs require target node and output port identities")
+            if (self.profile is not None and self.target_port_id is not None
+                    and self.profile.target_port_id != self.target_port_id):
+                raise ValueError("profile result target port must match the durable job identity")
         if self.job_type == "run":
+            if self.target_port_id is not None:
+                raise ValueError("ordinary runs do not have one profile target port")
             if self.outputs and self.target_node_id is None:
                 raise ValueError("run outputs require a targetNodeId")
             if self.target_node_id is not None and any(
@@ -965,6 +980,7 @@ class RunHistoryRecord(Wire):
     job_type: Literal["run", "profile"]
     status: Literal["done", "failed", "cancelled"]
     target_node_id: str | None = None
+    target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
     rows: int | None = Field(default=None, ge=0)
     ms: int | None = Field(default=None, ge=0)
     error: str | None = None
@@ -994,11 +1010,18 @@ class RunHistoryRecord(Wire):
         if self.job_type == "profile":
             if self.outputs or self.rows is not None:
                 raise ValueError("profile history stores result rows only in the profile status")
+            if self.target_node_id is None or self.target_port_id is None:
+                raise ValueError("profile history requires target node and output port identities")
             if self.status == "done" and self.profile is None:
                 raise ValueError("successful profile history requires a profile result")
             if self.status != "done" and self.profile is not None:
                 raise ValueError("unsuccessful profile history cannot carry a profile result")
+            if (self.profile is not None
+                    and self.profile.target_port_id != self.target_port_id):
+                raise ValueError("profile history result target port does not match its job")
         else:
+            if self.target_port_id is not None:
+                raise ValueError("ordinary run history cannot carry a profile target port")
             if self.profile is not None:
                 raise ValueError("run history cannot carry a profile result")
             if self.outputs and self.target_node_id is None:
@@ -1215,12 +1238,14 @@ class ProfileEstimateRequest(Wire):
     """Estimate a whole-dataset profile before the user chooses whether to submit it."""
     graph: Graph
     node_id: str
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ProfileIdentityRequest(Wire):
     """Compute the current server identity for one node without starting work."""
     graph: Graph
     node_id: str
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ProfileJobRequest(Wire):
@@ -1232,6 +1257,7 @@ class ProfileJobRequest(Wire):
     """
     graph: Graph
     node_id: str
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
     plan_digest: PlanDigest
     submission_id: UUID4
     confirmed: bool = False

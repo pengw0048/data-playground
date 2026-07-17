@@ -2460,11 +2460,18 @@
               }
             ],
             "title": "Rows"
+          },
+          "targetPortId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Targetportid",
+            "type": "string"
           }
         },
         "required": [
           "placement",
           "needsConfirm",
+          "targetPortId",
           "planDigest"
         ],
         "title": "ProfileEstimate",
@@ -2479,6 +2486,19 @@
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
           }
         },
         "required": [
@@ -2497,9 +2517,16 @@
             "pattern": "^[0-9a-f]{64}$",
             "title": "Plandigest",
             "type": "string"
+          },
+          "targetPortId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Targetportid",
+            "type": "string"
           }
         },
         "required": [
+          "targetPortId",
           "planDigest"
         ],
         "title": "ProfileIdentity",
@@ -2514,6 +2541,19 @@
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
           }
         },
         "required": [
@@ -2544,6 +2584,19 @@
             "pattern": "^[0-9a-f]{64}$",
             "title": "Plandigest",
             "type": "string"
+          },
+          "portId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Portid"
           },
           "submissionId": {
             "format": "uuid4",
@@ -2624,6 +2677,19 @@
             "description": "Whether statistics were computed from a bounded sample instead of all rows.",
             "title": "Sampled",
             "type": "boolean"
+          },
+          "targetPortId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetportid"
           }
         },
         "title": "ProfileResult",
@@ -3156,6 +3222,19 @@
               }
             ],
             "title": "Targetnodeid"
+          },
+          "targetPortId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetportid"
           }
         },
         "required": [
@@ -3539,6 +3618,19 @@
               }
             ],
             "title": "Targetnodeid"
+          },
+          "targetPortId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetportid"
           },
           "totalRows": {
             "anyOf": [

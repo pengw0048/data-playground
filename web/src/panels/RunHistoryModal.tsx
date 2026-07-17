@@ -53,6 +53,9 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <Badge variant="outline" className="w-[54px] justify-center capitalize">{r.jobType}</Badge>
                     <span className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-foreground">
                       {r.targetNodeId ?? '—'}
+                      {r.jobType === 'profile' && r.targetPortId && (
+                        <span className="text-muted-foreground">:{r.targetPortId}</span>
+                      )}
                       {r.outputs.length > 0 && <span className="text-muted-foreground"> · {r.outputs.length} output{r.outputs.length === 1 ? '' : 's'}</span>}
                       {r.error && <span className="text-destructive"> · {r.error}</span>}
                     </span>

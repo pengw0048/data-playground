@@ -45,7 +45,7 @@ def _graph() -> Graph:
 
 def _digest(graph: Graph, fingerprint: str = "generation-1") -> str:
     adapter = _Adapter({"file:///data.parquet": fingerprint})
-    return profile_plan_digest(graph, "metric", lambda _uri: adapter)
+    return profile_plan_digest(graph, "metric", "out", lambda _uri: adapter)
 
 
 def test_profile_identity_is_canonical_and_scoped_to_the_execution_cone():
@@ -75,3 +75,13 @@ def test_profile_identity_changes_for_execution_and_source_revisions():
     assert _digest(title_edit) != _digest(original)
 
     assert _digest(original, "generation-2") != _digest(original, "generation-1")
+
+
+def test_profile_identity_changes_for_the_selected_output_port():
+    graph = _graph()
+    adapter = _Adapter({"file:///data.parquet": "generation-1"})
+
+    left = profile_plan_digest(graph, "metric", "left", lambda _uri: adapter)
+    right = profile_plan_digest(graph, "metric", "right", lambda _uri: adapter)
+
+    assert left != right

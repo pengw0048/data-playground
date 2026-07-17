@@ -90,6 +90,45 @@ def test_profile_preflight_never_calls_ordinary_adapter_data_paths(monkeypatch):
     assert fingerprints == ["eager://whole-dataset"]
 
 
+def test_profile_preflight_requires_and_identifies_one_named_output_port(monkeypatch):
+    from hub.deps import get_deps
+    from hub.main import app
+
+    monkeypatch.setattr(get_deps(), "kernel_backend", lambda: None)
+    graph = {
+        "id": "named-profile-preflight", "version": 1,
+        "nodes": [{
+            "id": "branches", "type": "section", "position": {"x": 0, "y": 0},
+            "data": {"config": {
+                "outputs": ["left", "right"],
+                "outputSchema": [{"name": "value", "type": "int", "capabilities": []}],
+            }},
+        }],
+        "edges": [],
+    }
+    client = TestClient(app)
+
+    missing = client.post("/api/run/profile-estimate", json={
+        "graph": graph, "nodeId": "branches",
+    })
+    unknown = client.post("/api/run/profile-estimate", json={
+        "graph": graph, "nodeId": "branches", "portId": "missing",
+    })
+    left = client.post("/api/run/profile-estimate", json={
+        "graph": graph, "nodeId": "branches", "portId": "left",
+    })
+    right = client.post("/api/run/profile-estimate", json={
+        "graph": graph, "nodeId": "branches", "portId": "right",
+    })
+
+    assert missing.status_code == 400
+    assert unknown.status_code == 400
+    assert left.status_code == right.status_code == 200
+    assert left.json()["targetPortId"] == "left"
+    assert right.json()["targetPortId"] == "right"
+    assert left.json()["planDigest"] != right.json()["planDigest"]
+
+
 def test_profile_estimate_holds_one_source_scope_across_size_and_digest(monkeypatch):
     from hub.deps import get_deps
     from hub.main import app
@@ -410,13 +449,13 @@ def test_profile_admission_is_enforced_for_direct_http_call(monkeypatch):
             ))
 
     class Owner:
-        def profile_job(self, _graph, node_id, plan_digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, plan_digest, *, run_id, admission_token,
                         request_id=None):
             durable = run_routes.metadb.get_run_state(run_id)
             assert durable is not None and durable["job_type"] == "profile"
             won, queued = run_routes.metadb.consume_profile_run_preallocation(
                 run_id, admission_token, canvas_id=graph["id"], kernel_id="profile-http-kernel",
-                target_node_id=node_id, plan_digest=plan_digest,
+                target_node_id=node_id, target_port_id=port_id, plan_digest=plan_digest,
             )
             assert won
             submissions.append(request_id)
@@ -525,7 +564,7 @@ def test_profile_submission_failure_discards_the_exact_unconsumed_identity(monke
     captured: list[str] = []
 
     class Owner:
-        def profile_job(self, _graph, _node_id, _plan_digest, *, run_id, admission_token,
+        def profile_job(self, _graph, _node_id, _port_id, _plan_digest, *, run_id, admission_token,
                         request_id=None):
             assert admission_token and request_id
             assert run_routes.metadb.get_run_state(run_id) is not None
@@ -583,13 +622,13 @@ def test_profile_route_adopts_a_response_lost_after_kernel_admission(monkeypatch
     child_spawns = 0
 
     class KernelProfileRunner:
-        def run(self, _graph, node_id, *, plan_digest, profile_attempt_order, run_id,
+        def run(self, _graph, node_id, *, port_id, plan_digest, profile_attempt_order, run_id,
                 request_id=None):
             nonlocal child_spawns
             child_spawns += 1
             return RunStatus(
                 run_id=run_id, status="queued", job_type="profile",
-                target_node_id=node_id, plan_digest=plan_digest,
+                target_node_id=node_id, target_port_id=port_id, plan_digest=plan_digest,
                 profile_attempt_order=profile_attempt_order, request_id=request_id,
             )
 
@@ -597,13 +636,13 @@ def test_profile_route_adopts_a_response_lost_after_kernel_admission(monkeypatch
     admission_lock = threading.Lock()
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             returned = _dispatch_profile_job(
                 body=ProfileJobBody(
                     run_id=run_id, admission_token=admission_token,
                     graph=_graph.model_dump(by_alias=True), node_id=node_id,
-                    plan_digest=digest, request_id=request_id,
+                    port_id=port_id, plan_digest=digest, request_id=request_id,
                 ),
                 kernel_canvas=canvas_id, kernel_id="response-lost-kernel",
                 profile_runner=profile_runner, profile_admission_lock=admission_lock,
@@ -637,7 +676,7 @@ def test_profile_route_adopts_a_response_lost_after_kernel_admission(monkeypatch
     run_routes.metadb.save_run_state(
         run_id, RunStatus(
             run_id=run_id, status="failed", job_type="profile",
-            target_node_id="source", plan_digest=plan_digest,
+            target_node_id="source", target_port_id="out", plan_digest=plan_digest,
             profile_attempt_order=attempt_order,
         ).model_dump(),
         canvas_id=canvas_id, kernel_id="response-lost-kernel",
@@ -668,11 +707,12 @@ def test_profile_route_returns_retained_terminal_before_db_retry_converges(monke
     admitted: list[tuple[str, int]] = []
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             won, queued = run_routes.metadb.consume_profile_run_preallocation(
                 run_id, admission_token, canvas_id=canvas_id,
                 kernel_id="retained-terminal-kernel", target_node_id=node_id,
+                target_port_id=port_id,
                 plan_digest=digest,
             )
             assert won
@@ -680,7 +720,7 @@ def test_profile_route_returns_retained_terminal_before_db_retry_converges(monke
             admitted.append((run_id, attempt_order))
             return RunStatus(
                 run_id=run_id, status="failed", job_type="profile",
-                target_node_id=node_id, plan_digest=digest,
+                target_node_id=node_id, target_port_id=port_id, plan_digest=digest,
                 profile_attempt_order=attempt_order,
                 error="source lease unavailable before spawn",
             )
@@ -710,7 +750,7 @@ def test_profile_route_returns_retained_terminal_before_db_retry_converges(monke
     run_routes.metadb.save_run_state(
         run_id, RunStatus(
             run_id=run_id, status="failed", job_type="profile",
-            target_node_id="source", plan_digest=plan_digest,
+            target_node_id="source", target_port_id="out", plan_digest=plan_digest,
             profile_attempt_order=attempt_order,
         ).model_dump(),
         canvas_id=canvas_id, kernel_id="retained-terminal-kernel",
@@ -742,13 +782,14 @@ def test_same_submission_replay_adopts_after_source_identity_changes(monkeypatch
     dispatches = 0
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             nonlocal dispatches
             dispatches += 1
             won, queued = run_routes.metadb.consume_profile_run_preallocation(
                 run_id, admission_token, canvas_id=canvas_id,
                 kernel_id="idempotent-adopt-kernel", target_node_id=node_id,
+                target_port_id=port_id,
                 plan_digest=digest,
             )
             assert won
@@ -783,7 +824,7 @@ def test_same_submission_replay_adopts_after_source_identity_changes(monkeypatch
     assert replay.json()["runId"] == first.json()["runId"]
     assert replay.json()["profileAttemptOrder"] == first.json()["profileAttemptOrder"]
     assert wrong_digest.status_code == 409
-    assert wrong_node.status_code == 409
+    assert wrong_node.status_code == 400
     assert dispatches == 1
     deps.run_index.pop(first.json()["runId"], None)
     deps.run_owner.pop(first.json()["runId"], None)
@@ -810,7 +851,7 @@ def test_unconsumed_submission_replays_only_for_the_same_current_digest(monkeypa
                 version=1, doc="{}",
             ))
     reservation = run_routes.metadb.preallocate_or_adopt_profile_run_owner(
-        submission_id, "local", None, canvas_id, "source", old_digest,
+        submission_id, "local", None, canvas_id, "source", "out", old_digest,
     )
     assert reservation.should_dispatch and reservation.admission_token is not None
     dispatches = 0
@@ -860,18 +901,19 @@ def test_unconsumed_submission_with_unchanged_digest_reuses_token_and_order(monk
                 version=1, doc="{}",
             ))
     reservation = run_routes.metadb.preallocate_or_adopt_profile_run_owner(
-        submission_id, "local", None, canvas_id, "source", plan_digest,
+        submission_id, "local", None, canvas_id, "source", "out", plan_digest,
     )
     observed: list[tuple[str, str, int]] = []
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             assert run_id == reservation.run_id
             assert admission_token == reservation.admission_token
             won, queued = run_routes.metadb.consume_profile_run_preallocation(
                 run_id, admission_token, canvas_id=canvas_id,
                 kernel_id="unconsumed-same-kernel", target_node_id=node_id,
+                target_port_id=port_id,
                 plan_digest=digest,
             )
             assert won
@@ -923,7 +965,7 @@ def test_concurrent_same_submission_spawns_one_profile_attempt(monkeypatch):
     owner_lock = threading.Lock()
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             nonlocal child_spawns, owner_calls
             with owner_lock:
@@ -931,6 +973,7 @@ def test_concurrent_same_submission_spawns_one_profile_attempt(monkeypatch):
                 won, queued = run_routes.metadb.consume_profile_run_preallocation(
                     run_id, admission_token, canvas_id=canvas_id,
                     kernel_id="concurrent-submission-kernel", target_node_id=node_id,
+                    target_port_id=port_id,
                     plan_digest=digest,
                 )
                 if won:
@@ -980,12 +1023,12 @@ def test_profile_submission_binding_survives_terminal_detail_compaction(tmp_path
         _create_profile_canvas(metadb, canvas_id)
         reservation = metadb.preallocate_or_adopt_profile_run_owner(
             submission_id, "profile-owner", canvas_id, canvas_id,
-            "node", plan_digest,
+            "node", "out", plan_digest,
         )
         won, _queued = metadb.consume_profile_run_preallocation(
             reservation.run_id, reservation.admission_token,
             canvas_id=canvas_id, kernel_id="profile-kernel",
-            target_node_id="node", plan_digest=plan_digest,
+            target_node_id="node", target_port_id="out", plan_digest=plan_digest,
         )
         assert won
         metadb.save_run_state(
@@ -1004,13 +1047,14 @@ def test_profile_submission_binding_survives_terminal_detail_compaction(tmp_path
 
         replay = metadb.preallocate_or_adopt_profile_run_owner(
             submission_id, "profile-owner", canvas_id, canvas_id,
-            "node", plan_digest,
+            "node", "out", plan_digest,
         )
         assert replay.run_id == reservation.run_id
         assert replay.attempt_order == reservation.attempt_order
         assert replay.status["status"] == "done"
         assert replay.status["job_type"] == "profile"
         assert replay.status["target_node_id"] == "node"
+        assert replay.status["target_port_id"] == "out"
         assert replay.status["plan_digest"] == plan_digest
         assert not replay.should_dispatch and replay.admission_token is None
         with metadb.session() as db:
@@ -1026,18 +1070,18 @@ def test_same_submission_with_different_profile_identity_is_conflict(tmp_path):
         _create_profile_canvas(metadb, canvas_id)
         metadb.preallocate_or_adopt_profile_run_owner(
             submission_id, "profile-owner", canvas_id, canvas_id,
-            "node", plan_digest,
+            "node", "out", plan_digest,
         )
 
         with pytest.raises(metadb.ProfileSubmissionConflict):
             metadb.lookup_profile_submission(
                 submission_id, "profile-owner", canvas_id, canvas_id,
-                "other-node", plan_digest,
+                "other-node", "out", plan_digest,
             )
         with pytest.raises(metadb.ProfileSubmissionConflict):
             metadb.lookup_profile_submission(
                 submission_id, "profile-owner", canvas_id, canvas_id,
-                "node", _digest("different-plan"),
+                "node", "out", _digest("different-plan"),
             )
 
 
@@ -1050,7 +1094,7 @@ def test_existing_submission_adoption_does_not_reverse_projection_lock_order(
         _create_profile_canvas(metadb, canvas_id)
         first = metadb.preallocate_or_adopt_profile_run_owner(
             submission_id, "profile-owner", canvas_id, canvas_id,
-            "node", plan_digest,
+            "node", "out", plan_digest,
         )
 
         def retention_lock_must_not_run(*_args, **_kwargs):
@@ -1059,7 +1103,7 @@ def test_existing_submission_adoption_does_not_reverse_projection_lock_order(
         monkeypatch.setattr(metadb, "_lock_profile_retention", retention_lock_must_not_run)
         replay = metadb.preallocate_or_adopt_profile_run_owner(
             submission_id, "profile-owner", canvas_id, canvas_id,
-            "node", plan_digest,
+            "node", "out", plan_digest,
         )
 
         assert replay.run_id == first.run_id
@@ -1082,7 +1126,7 @@ def test_concurrent_sqlite_profile_reservations_converge_before_insert(tmp_path)
                 barrier.wait(timeout=5)
                 reservations.append(metadb.preallocate_or_adopt_profile_run_owner(
                     submission_id, "profile-owner", canvas_id, canvas_id,
-                    "node", plan_digest,
+                    "node", "out", plan_digest,
                 ))
             except BaseException as exc:  # noqa: BLE001 - surface thread failures
                 failures.append(exc)
@@ -1193,11 +1237,12 @@ def test_consumed_replay_bypasses_new_dispatch_containment_gate(monkeypatch):
             ))
 
     class Owner:
-        def profile_job(self, _graph, node_id, digest, *, run_id, admission_token,
+        def profile_job(self, _graph, node_id, port_id, digest, *, run_id, admission_token,
                         request_id=None):
             won, queued = run_routes.metadb.consume_profile_run_preallocation(
                 run_id, admission_token, canvas_id=canvas_id,
                 kernel_id="containment-adopt-kernel", target_node_id=node_id,
+                target_port_id=port_id,
                 plan_digest=digest,
             )
             assert won
@@ -1232,6 +1277,7 @@ def test_consumed_replay_bypasses_new_dispatch_containment_gate(monkeypatch):
 def _profile_status(run_id: str, state: str, plan: str, attempt_order: int) -> dict:
     return RunStatus(
         run_id=run_id, status=state, job_type="profile", target_node_id="node",
+        target_port_id="out",
         plan_digest=_digest(plan), profile_attempt_order=attempt_order,
     ).model_dump()
 
@@ -1247,11 +1293,11 @@ def _create_profile_canvas(metadb, canvas_id: str, owner: str = "profile-owner")
 
 def _admit_profile(metadb, canvas_id: str, run_id: str, plan: str) -> int:
     token, attempt_order = metadb.preallocate_profile_run_owner(
-        run_id, "profile-owner", canvas_id, canvas_id, "node", _digest(plan),
+        run_id, "profile-owner", canvas_id, canvas_id, "node", "out", _digest(plan),
     )
     won, _status = metadb.consume_profile_run_preallocation(
         run_id, token, canvas_id=canvas_id, kernel_id="profile-kernel",
-        target_node_id="node", plan_digest=_digest(plan),
+        target_node_id="node", target_port_id="out", plan_digest=_digest(plan),
     )
     assert won
     return attempt_order
@@ -1262,46 +1308,77 @@ def test_profile_preallocation_is_monotonic_token_fenced_and_idempotent(tmp_path
         canvas_id = "profile-admission-order"
         _create_profile_canvas(metadb, canvas_id)
         token_a, order_a = metadb.preallocate_profile_run_owner(
-            "profile-a", "profile-owner", canvas_id, canvas_id, "node", _digest("plan"),
+            "profile-a", "profile-owner", canvas_id, canvas_id, "node", "out",
+            _digest("plan"),
         )
         token_b, order_b = metadb.preallocate_profile_run_owner(
-            "profile-b", "profile-owner", canvas_id, canvas_id, "node", _digest("plan"),
+            "profile-b", "profile-owner", canvas_id, canvas_id, "node", "out",
+            _digest("plan"),
         )
         assert (order_a, order_b) == (1, 2)
 
         won, queued = metadb.consume_profile_run_preallocation(
             "profile-a", token_a, canvas_id=canvas_id, kernel_id="kernel-a",
-            target_node_id="node", plan_digest=_digest("plan"),
+            target_node_id="node", target_port_id="out", plan_digest=_digest("plan"),
         )
         assert won and queued["profile_attempt_order"] == order_a
         replay_won, replay = metadb.consume_profile_run_preallocation(
             "profile-a", token_a, canvas_id=canvas_id, kernel_id="kernel-a",
-            target_node_id="node", plan_digest=_digest("plan"),
+            target_node_id="node", target_port_id="out", plan_digest=_digest("plan"),
         )
         assert not replay_won and replay["run_id"] == "profile-a"
         replay_won, _ = metadb.consume_profile_run_preallocation(
             "profile-a", "consumed-capability", canvas_id=canvas_id, kernel_id="kernel-a",
-            target_node_id="node", plan_digest=_digest("plan"),
+            target_node_id="node", target_port_id="out", plan_digest=_digest("plan"),
         )
         assert not replay_won
         with pytest.raises(RuntimeError, match="different kernel"):
             metadb.consume_profile_run_preallocation(
                 "profile-a", token_a, canvas_id=canvas_id, kernel_id="kernel-b",
-                target_node_id="node", plan_digest=_digest("plan"),
+                target_node_id="node", target_port_id="out", plan_digest=_digest("plan"),
             )
         assert metadb.admitted_profile_run_status(
             "profile-a", "profile-owner", canvas_id,
-            canvas_id=canvas_id, target_node_id="node", plan_digest=_digest("plan"),
+            canvas_id=canvas_id, target_node_id="node", target_port_id="out",
+            plan_digest=_digest("plan"),
             attempt_order=order_a,
         ) is not None
         assert metadb.admitted_profile_run_status(
             "profile-a", "wrong-owner", canvas_id,
-            canvas_id=canvas_id, target_node_id="node", plan_digest=_digest("plan"),
+            canvas_id=canvas_id, target_node_id="node", target_port_id="out",
+            plan_digest=_digest("plan"),
             attempt_order=order_a,
         ) is None
 
         assert metadb.discard_run_preallocation(
             "profile-b", token_b, "profile-owner", canvas_id)
+
+
+def test_profile_projection_keeps_named_output_ports_as_distinct_durable_jobs(tmp_path):
+    with _isolated_metadata(tmp_path / "profile-output-ports.db") as metadb:
+        canvas_id = "profile-output-ports"
+        _create_profile_canvas(metadb, canvas_id)
+        identities = [
+            ("profile-left", "left", _digest("left-plan")),
+            ("profile-right", "right", _digest("right-plan")),
+        ]
+        for run_id, port_id, plan_digest in identities:
+            token, _attempt_order = metadb.preallocate_profile_run_owner(
+                run_id, "profile-owner", canvas_id, canvas_id, "node", port_id,
+                plan_digest,
+            )
+            won, _queued = metadb.consume_profile_run_preallocation(
+                run_id, token, canvas_id=canvas_id, kernel_id="profile-kernel",
+                target_node_id="node", target_port_id=port_id,
+                plan_digest=plan_digest,
+            )
+            assert won
+
+        latest = metadb.latest_profile_jobs(canvas_id)
+
+        assert {(row["run_id"], row["target_port_id"]) for row in latest} == {
+            ("profile-left", "left"), ("profile-right", "right"),
+        }
 
 
 def test_profile_submission_settlement_adopts_a_racing_token_consume(
@@ -1312,7 +1389,7 @@ def test_profile_submission_settlement_adopts_a_racing_token_consume(
         plan_digest = _digest("plan")
         _create_profile_canvas(metadb, canvas_id)
         token, attempt_order = metadb.preallocate_profile_run_owner(
-            run_id, "profile-owner", canvas_id, canvas_id, "node", plan_digest,
+            run_id, "profile-owner", canvas_id, canvas_id, "node", "out", plan_digest,
         )
         settlement_at_owner_lock = threading.Event()
         allow_settlement = threading.Event()
@@ -1333,6 +1410,7 @@ def test_profile_submission_settlement_adopts_a_racing_token_consume(
                 result.append(metadb.settle_profile_submission_failure(
                     run_id, token, "profile-owner", canvas_id,
                     canvas_id=canvas_id, target_node_id="node",
+                    target_port_id="out",
                     plan_digest=plan_digest, attempt_order=attempt_order,
                 ))
             except BaseException as exc:  # noqa: BLE001 - surface thread failures
@@ -1343,7 +1421,7 @@ def test_profile_submission_settlement_adopts_a_racing_token_consume(
         assert settlement_at_owner_lock.wait(timeout=5)
         won, _ = metadb.consume_profile_run_preallocation(
             run_id, token, canvas_id=canvas_id, kernel_id="profile-kernel",
-            target_node_id="node", plan_digest=plan_digest,
+            target_node_id="node", target_port_id="out", plan_digest=plan_digest,
         )
         assert won
         allow_settlement.set()
@@ -1394,7 +1472,7 @@ def test_profile_preallocation_requires_a_real_locked_canvas(tmp_path):
         with pytest.raises(RuntimeError, match="canvas does not exist"):
             metadb.preallocate_profile_run_owner(
                 "profile-missing", "profile-owner", None, "missing-canvas",
-                "node", _digest("plan"),
+                "node", "out", _digest("plan"),
             )
         assert metadb.get_run_state("profile-missing") is None
         with metadb.session() as db:
@@ -1412,7 +1490,7 @@ def test_kernel_rejects_a_wrong_canvas_profile_before_consume_or_spawn(tmp_path)
         _create_profile_canvas(metadb, canvas_id)
         _create_profile_canvas(metadb, wrong_canvas)
         token, _attempt_order = metadb.preallocate_profile_run_owner(
-            run_id, "profile-owner", canvas_id, canvas_id, "node", plan_digest,
+            run_id, "profile-owner", canvas_id, canvas_id, "node", "out", plan_digest,
         )
 
         class Runner:
@@ -1430,7 +1508,7 @@ def test_kernel_rejects_a_wrong_canvas_profile_before_consume_or_spawn(tmp_path)
                 "nodes": [{"id": "node", "type": "source", "data": {"config": {}}}],
                 "edges": [],
             },
-            node_id="node", plan_digest=plan_digest,
+            node_id="node", port_id="out", plan_digest=plan_digest,
         )
         with pytest.raises(RuntimeError, match="kernel canvas"):
             _dispatch_profile_job(
@@ -1458,7 +1536,7 @@ def test_profile_cancel_waits_for_consume_to_runner_registration(tmp_path):
         plan_digest = _digest("plan")
         _create_profile_canvas(metadb, canvas_id)
         token, attempt_order = metadb.preallocate_profile_run_owner(
-            run_id, "profile-owner", canvas_id, canvas_id, "node", plan_digest,
+            run_id, "profile-owner", canvas_id, canvas_id, "node", "out", plan_digest,
         )
         admission_lock = threading.Lock()
         registration_window = threading.Event()
@@ -1473,7 +1551,7 @@ def test_profile_cancel_waits_for_consume_to_runner_registration(tmp_path):
                 assert allow_registration.wait(timeout=5)
                 status = RunStatus(
                     run_id=run_id, status="running", job_type="profile",
-                    target_node_id="node", plan_digest=plan_digest,
+                    target_node_id="node", target_port_id="out", plan_digest=plan_digest,
                     profile_attempt_order=attempt_order,
                 )
                 self.runs[run_id] = status
@@ -1502,7 +1580,7 @@ def test_profile_cancel_waits_for_consume_to_runner_registration(tmp_path):
                 "nodes": [{"id": "node", "type": "source", "data": {"config": {}}}],
                 "edges": [],
             },
-            node_id="node", plan_digest=plan_digest,
+            node_id="node", port_id="out", plan_digest=plan_digest,
         )
         start_result: list[object] = []
         cancel_result: list[object] = []
@@ -1546,7 +1624,7 @@ def test_pre_spawn_failure_retries_terminal_persistence_while_kernel_is_live(
         _create_profile_canvas(metadb, canvas_id)
         metadb.claim_kernel(canvas_id, kernel_id, "kernel-token")
         token, attempt_order = metadb.preallocate_profile_run_owner(
-            run_id, "profile-owner", canvas_id, canvas_id, "node", plan_digest,
+            run_id, "profile-owner", canvas_id, canvas_id, "node", "out", plan_digest,
         )
         runner = ProfileProcessRunner(
             str(tmp_path / "workspace"), str(tmp_path / "data"),
@@ -1581,7 +1659,7 @@ def test_pre_spawn_failure_retries_terminal_persistence_while_kernel_is_live(
                 "nodes": [{"id": "node", "type": "source", "data": {"config": {}}}],
                 "edges": [],
             },
-            node_id="node", plan_digest=plan_digest,
+            node_id="node", port_id="out", plan_digest=plan_digest,
         )
         returned = _dispatch_profile_job(
             body=body, kernel_canvas=canvas_id, kernel_id=kernel_id,
@@ -1719,7 +1797,7 @@ def test_expired_unconsumed_profile_reservation_never_enters_projection(tmp_path
         run_id = "profile-never-admitted"
         _create_profile_canvas(metadb, canvas_id)
         metadb.preallocate_profile_run_owner(
-            run_id, "profile-owner", canvas_id, canvas_id, "node", _digest("plan"),
+            run_id, "profile-owner", canvas_id, canvas_id, "node", "out", _digest("plan"),
         )
         with metadb.session() as db:
             state = db.get(metadb.RunState, run_id)

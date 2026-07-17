@@ -296,11 +296,11 @@ export const api = {
   estimate: (doc: CanvasDoc, targetNodeId?: string) =>
     req<RunEstimate>('/run/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
 
-  profileEstimate: (doc: CanvasDoc, nodeId: string) =>
-    req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+  profileEstimate: (doc: CanvasDoc, nodeId: string, portId?: string) =>
+    req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
-  profileIdentity: (doc: CanvasDoc, nodeId: string) =>
-    req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId }) }),
+  profileIdentity: (doc: CanvasDoc, nodeId: string, portId?: string) =>
+    req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
 
   run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
@@ -318,9 +318,9 @@ export const api = {
     }
   },
 
-  fullProfile: (doc: CanvasDoc, nodeId: string, planDigest: string, submissionId: string, confirmed = false) =>
+  fullProfile: (doc: CanvasDoc, nodeId: string, portId: string | undefined, planDigest: string, submissionId: string, confirmed = false) =>
     req<RunStatus>('/run/profile-job', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, planDigest, submissionId, confirmed }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, planDigest, submissionId, confirmed }),
     }),
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),
@@ -401,7 +401,7 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
-export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }
 export interface SchemaCompatibilityDto { status: 'compatible' | 'breaking' | 'unknown'; fields: SchemaFieldCompatibilityDto[] }

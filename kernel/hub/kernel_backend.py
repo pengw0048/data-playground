@@ -218,17 +218,13 @@ class KernelBackend:
             self, graph: Graph, node_id: str, full: bool = False,
             port_id: str | None = None) -> dict:
         from hub.graph import require_output_port
-        from hub.run_outputs import require_single_run_output
-        if full:
-            selected = require_single_run_output(graph, node_id, self.base.node_specs)
-        else:
-            selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
+        selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
         endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
         return _post(endpoint, "/profile", token,
                      {"graph": graph.model_dump(), "node_id": node_id,
-                      "port_id": selected.port_id if full else selected.id, "full": full})
+                      "port_id": selected.id, "full": full})
 
-    def profile_job(self, graph: Graph, node_id: str, plan_digest: str,
+    def profile_job(self, graph: Graph, node_id: str, port_id: str, plan_digest: str,
                     run_id: str, admission_token: str,
                     request_id: str | None = None) -> RunStatus:
         """Queue a whole-dataset profile on the canvas's durable execution owner.
@@ -236,8 +232,9 @@ class KernelBackend:
         The kernel stamps its fenced ``kernel_id`` onto the shared RunState. Any stateless hub can
         therefore route cancellation back to the exact process and DuckDB scope that owns the scan.
         """
-        from hub.run_outputs import require_single_run_output
-        require_single_run_output(graph, node_id, self.base.node_specs)
+        from hub.graph import require_output_port
+        selected_port = require_output_port(
+            graph, node_id, self.base.node_specs, port_id).id
         canvas_id = getattr(graph, "id", None) or "canvas"
         endpoint, token = self._ensure_kernel(canvas_id)
         return RunStatus(**_post(endpoint, "/profile-job", token, {
@@ -245,6 +242,7 @@ class KernelBackend:
             "admission_token": admission_token,
             "graph": graph.model_dump(),
             "node_id": node_id,
+            "port_id": selected_port,
             "plan_digest": plan_digest,
             "request_id": request_id,
         }))

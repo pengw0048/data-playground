@@ -14,10 +14,10 @@ from hub import graph as graph_mod
 from hub.models import Graph
 
 
-_PROFILE_IDENTITY_SCHEMA = 1
+_PROFILE_IDENTITY_SCHEMA = 2
 
 
-def profile_plan_digest(graph: Graph, node_id: str, resolve_adapter) -> str:
+def profile_plan_digest(graph: Graph, node_id: str, port_id: str, resolve_adapter) -> str:
     """Return a canonical SHA-256 for the server-observed profile identity at ``node_id``.
 
     Layout, transient node status, history, edge ids, and document version are deliberately omitted.
@@ -77,6 +77,7 @@ def profile_plan_digest(graph: Graph, node_id: str, resolve_adapter) -> str:
         "schema": _PROFILE_IDENTITY_SCHEMA,
         "canvasId": graph.id,
         "targetNodeId": node_id,
+        "targetPortId": port_id,
         "requirements": sorted(graph.requirements or []),
         "nodes": nodes,
         "edges": edges,

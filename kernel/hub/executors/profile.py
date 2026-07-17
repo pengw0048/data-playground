@@ -193,7 +193,10 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                     result = _full_stats(eng, node_id, selected_port)
                     provenance = explicit_sample_provenance(
                         graph, node_id, resolve_adapter, returned_rows=result.row_count)
-                    return result.model_copy(update={"sample_provenance": provenance})
+                    return result.model_copy(update={
+                        "target_port_id": selected_port,
+                        "sample_provenance": provenance,
+                    })
 
         def on_timeout() -> None:
             sc = holder.get("scope")
@@ -208,11 +211,14 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                 return work()
             return run_with_timeout(work, PROFILE_FULL_BUDGET_S, on_timeout=on_timeout)
         except ManagedSourceReadError as e:
-            return ProfileResult(error=True, reason=str(e))
+            return ProfileResult(target_port_id=selected_port, error=True, reason=str(e))
         except NotPreviewable as e:
-            return ProfileResult(not_previewable=True, reason=e.reason)
+            return ProfileResult(
+                target_port_id=selected_port, not_previewable=True, reason=e.reason)
         except Exception as e:  # noqa: BLE001
-            return ProfileResult(error=True, reason=f"{type(e).__name__}: {e}")
+            return ProfileResult(
+                target_port_id=selected_port,
+                error=True, reason=f"{type(e).__name__}: {e}")
 
     reservoir_preview = _reservoir_profile_allowed(graph, node_id, resolve_adapter)
     engine = BuildEngine(graph, resolve_adapter, registry, sample_k=PREVIEW_SCAN, full=False,
@@ -245,7 +251,8 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
                             f"Each source was bounded to at most {PREVIEW_SCAN} rows; this profile describes that prefix only.",
                         ],
                     ))
-                return ProfileResult(columns=cols, row_count=n, sampled=True,
+                return ProfileResult(target_port_id=selected_port,
+                                     columns=cols, row_count=n, sampled=True,
                                      completeness="sample", sample_provenance=provenance)
 
     def on_timeout() -> None:
@@ -255,8 +262,11 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
     try:
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
     except ManagedSourceReadError as e:
-        return ProfileResult(error=True, reason=str(e))
+        return ProfileResult(target_port_id=selected_port, error=True, reason=str(e))
     except NotPreviewable as e:
-        return ProfileResult(not_previewable=True, reason=e.reason)
+        return ProfileResult(
+            target_port_id=selected_port, not_previewable=True, reason=e.reason)
     except Exception as e:  # noqa: BLE001
-        return ProfileResult(error=True, reason=f"{type(e).__name__}: {e}")
+        return ProfileResult(
+            target_port_id=selected_port,
+            error=True, reason=f"{type(e).__name__}: {e}")

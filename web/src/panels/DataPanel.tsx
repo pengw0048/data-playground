@@ -1,6 +1,6 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, roleCanEdit, useStore,
+  previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey, roleCanEdit, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
@@ -219,8 +219,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
           <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
         </>
       ) : activeTab === 'stats' ? (
-        <StatsView key={`${nodeId}:${requestPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
-          nodeId={nodeId} portId={requestPortId} multiOutput={outputPorts.length > 1} />
+        <StatsView key={`${nodeId}:${selectedPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
+          nodeId={nodeId} portId={selectedPortId} multiOutput={outputPorts.length > 1} />
       ) : (
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
@@ -432,12 +432,13 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   const doc = useStore((s) => s.doc)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const currentUserId = useStore((s) => s.currentUser?.id)
-  const profileJob = useStore((s) => s.profileJobs[nodeId])
+  const profileJob = useStore((s) => (
+    s.profileJobs[profileJobKey(nodeId, portId)] ?? s.profileJobs[nodeId]
+  ))
   const prepareFullProfile = useStore((s) => s.prepareFullProfile)
   const startFullProfile = useStore((s) => s.startFullProfile)
   const cancelFullProfile = useStore((s) => s.cancelFullProfile)
   const [full, setFull] = useState(false)
-  const fullProfileUnavailableId = useId()
   const planIdentity = previewPlanIdentity(doc, nodeId, portId)
   const sampleRequestGeneration = useRef(0)
   const [sampleState, setSampleState] = useState<{
@@ -469,7 +470,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   // before the effect above starts its replacement request.
   const st = sampleState.planIdentity === planIdentity ? sampleState : { planIdentity, loading: true }
   const job = currentUserId && profileJob?.principalId === currentUserId
-      && profileJobIsCurrent(profileJob, doc, nodeId)
+      && profileJobIsCurrent(profileJob, doc, nodeId, portId)
     ? profileJob
     : undefined
   const selectMode = (v: boolean) => {
@@ -479,53 +480,47 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
     <div className="flex flex-col items-end gap-1">
       <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[10px]">
         {([['sample', false], ['full dataset', true]] as const).map(([label, v]) => (
-          <button key={label} onClick={() => selectMode(v)} disabled={v && multiOutput}
-            aria-describedby={v && multiOutput ? fullProfileUnavailableId : undefined}
-            title={v && !multiOutput && !canEdit ? 'View full-dataset profile results' : undefined}
+          <button key={label} onClick={() => selectMode(v)}
+            title={v && !canEdit ? 'View full-dataset profile results' : undefined}
             className={`rounded px-1.5 py-0.5 disabled:cursor-not-allowed disabled:opacity-45 ${full === v ? 'bg-muted font-semibold text-foreground' : 'text-muted-foreground'}`}>
             {label}
           </button>
         ))}
       </div>
-      {multiOutput && (
-        <span id={fullProfileUnavailableId} className="max-w-[260px] text-right text-[9.5px] leading-snug text-muted-foreground">
-          Whole-dataset profiles are not available for multi-output nodes. Inspect each port’s sample statistics instead.
-        </span>
-      )}
     </div>
   )
   if (full) {
     if (!job || job.phase === 'cancelled') {
       return <FullProfilePrompt toggle={toggle}
-        onEstimate={() => prepareFullProfile(nodeId)} disabled={!canEdit} />
+        onEstimate={() => prepareFullProfile(nodeId, portId)} disabled={!canEdit} />
     }
     if (job.phase === 'preflight') {
       return canEdit
-        ? <FullProfilePreflight job={job} toggle={toggle} onStart={() => startFullProfile(nodeId)} />
+        ? <FullProfilePreflight job={job} toggle={toggle} onStart={() => startFullProfile(nodeId, portId)} />
         : <FullProfilePrompt toggle={toggle} onEstimate={() => {}} disabled />
     }
     if (job.phase === 'verifying') {
       const activeRun = job.status?.status === 'queued' || job.status?.status === 'running'
       return <FullProfileProgress job={job} toggle={toggle}
-        onCancel={canEdit && job.canCancel === true && activeRun ? () => cancelFullProfile(nodeId) : undefined} />
+        onCancel={canEdit && job.canCancel === true && activeRun ? () => cancelFullProfile(nodeId, portId) : undefined} />
     }
     if (job.phase === 'estimating' || job.phase === 'queued' || job.phase === 'running' || job.phase === 'cancelling') {
       return <FullProfileProgress job={job} toggle={toggle}
-        onCancel={canEdit ? () => cancelFullProfile(nodeId) : undefined} />
+        onCancel={canEdit ? () => cancelFullProfile(nodeId, portId) : undefined} />
     }
     if (job.phase === 'failed') {
       const activeRun = job.status && (job.status.status === 'queued' || job.status.status === 'running')
       const retry = job.submissionUnresolved
-        ? () => startFullProfile(nodeId)
-        : () => prepareFullProfile(nodeId)
+        ? () => startFullProfile(nodeId, portId)
+        : () => prepareFullProfile(nodeId, portId)
       return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState
         title={job.identityVerified === false ? 'Full profile not verified' : 'Full profile failed'}
         reason={job.error ?? 'full profile failed'}
         onRetry={canEdit ? retry : undefined}
-        onCancel={canEdit && activeRun ? () => cancelFullProfile(nodeId) : undefined} /></div>
+        onCancel={canEdit && activeRun ? () => cancelFullProfile(nodeId, portId) : undefined} /></div>
     }
     const res = job.identityVerified === false ? undefined : job.status?.profile
-    if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState title="Full profile failed" reason="full profile completed without statistics" onRetry={canEdit ? () => prepareFullProfile(nodeId) : undefined} /></div>
+    if (!res) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState title="Full profile failed" reason="full profile completed without statistics" onRetry={canEdit ? () => prepareFullProfile(nodeId, portId) : undefined} /></div>
     return <ProfileTable res={res} toggle={toggle} />
   }
   if (st.loading) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><Skeleton /></div>

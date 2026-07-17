@@ -274,6 +274,7 @@ export interface ColumnProfile {
 }
 
 export interface ProfileResult {
+  targetPortId?: string | null
   columns: ColumnProfile[]
   rowCount: number
   sampled: boolean
@@ -308,10 +309,12 @@ export interface RunEstimate {
 }
 
 export interface ProfileEstimate extends RunEstimate {
+  targetPortId: string
   planDigest: string
 }
 
 export interface ProfileIdentity {
+  targetPortId: string
   planDigest: string
 }
 
@@ -357,6 +360,7 @@ export interface RunStatus {
   status: RunState
   jobType: 'run' | 'profile'
   targetNodeId?: string | null
+  targetPortId?: string | null
   rowsProcessed: number
   totalRows?: number | null
   ms: number

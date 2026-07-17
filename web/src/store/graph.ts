@@ -251,8 +251,25 @@ export function previewPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: str
   return targetExecutionPlanIdentity(doc, nodeId, portId)
 }
 
-export function profilePlanIdentity(doc: CanvasDoc, nodeId: string): string {
-  return targetExecutionPlanIdentity(doc, nodeId)
+export function profilePlanIdentity(doc: CanvasDoc, nodeId: string, portId?: string): string {
+  return targetExecutionPlanIdentity(doc, nodeId, portId)
+}
+
+export function profileJobKey(nodeId: string, portId?: string): string {
+  return portId === undefined ? nodeId : JSON.stringify([nodeId, portId])
+}
+
+function resolvedProfilePort(doc: CanvasDoc, nodeId: string, portId?: string): string | undefined {
+  if (portId !== undefined) return portId
+  const node = doc.nodes.find((candidate) => candidate.id === nodeId)
+  const outputs = node ? nodeOutputs(node) : []
+  if (outputs.length === 1) return outputs[0].id
+  return node && node.type !== 'section' && outputs.length === 0 ? 'out' : undefined
+}
+
+function profileJobKeyForDoc(doc: CanvasDoc, nodeId: string, portId?: string): string {
+  const node = doc.nodes.find((candidate) => candidate.id === nodeId)
+  return node && nodeOutputs(node).length <= 1 ? nodeId : profileJobKey(nodeId, portId)
 }
 
 export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: string, portId = preview.portId): boolean {
@@ -282,6 +299,7 @@ interface RunState {
 export interface ProfileJobState {
   canvasId: string
   nodeId: string
+  portId?: string
   // Every lifecycle request for this job is fenced to the user that created or recovered it.
   // A user transition stops polling/cancellation instead of replaying a run id under another session.
   principalId?: string
@@ -307,11 +325,14 @@ export interface ProfileJobState {
   error?: string
 }
 
-export function profileJobIsCurrent(job: ProfileJobState, doc: CanvasDoc, nodeId: string): boolean {
+export function profileJobIsCurrent(
+  job: ProfileJobState, doc: CanvasDoc, nodeId: string, portId = job.portId,
+): boolean {
   return job.canvasId === doc.id
     && job.nodeId === nodeId
+    && job.portId === portId
     && doc.nodes.some((node) => node.id === nodeId)
-    && job.planIdentity === profilePlanIdentity(doc, nodeId)
+    && job.planIdentity === profilePlanIdentity(doc, nodeId, portId)
 }
 
 function profilePhase(status: RunStatus): ProfileJobState['phase'] {
@@ -329,6 +350,7 @@ function sameProfileAttempt(existing: RunStatus, incoming: RunStatus): boolean {
   return existing.jobType === 'profile' && incoming.jobType === 'profile'
     && existing.runId === incoming.runId
     && existing.targetNodeId === incoming.targetNodeId
+    && existing.targetPortId === incoming.targetPortId
     && !!existing.planDigest && existing.planDigest === incoming.planDigest
     && Number.isSafeInteger(existing.profileAttemptOrder)
     && existing.profileAttemptOrder === incoming.profileAttemptOrder
@@ -356,6 +378,7 @@ function retryableProfileRequest(error: unknown): boolean {
 async function submitFullProfile(
   doc: CanvasDoc,
   nodeId: string,
+  portId: string | undefined,
   planDigest: string,
   submissionId: string,
   userId: string,
@@ -365,7 +388,7 @@ async function submitFullProfile(
       throw new KernelError(401, 'User changed while the full profile was being submitted')
     }
     try {
-      return await api.fullProfile(doc, nodeId, planDigest, submissionId, true)
+      return await api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true)
     } catch (error) {
       if (!retryableProfileRequest(error) || attempt >= PROFILE_RETRY_DELAYS_MS.length) throw error
       await wait(PROFILE_RETRY_DELAYS_MS[attempt])
@@ -393,6 +416,7 @@ function sanitizeUnverifiedProfileStatus(status: RunStatus): RunStatus {
 interface PendingProfileSubmission {
   doc: CanvasDoc
   nodeId: string
+  portId?: string
   planDigest: string
   submissionId: string
   userId: string
@@ -406,6 +430,7 @@ const PROFILE_ORPHAN_RETRY_DELAYS_MS = [100, 300, 1_000, 3_000, 5_000]
 
 interface ProfileAttemptIdentity {
   targetNodeId: string | null
+  targetPortId: string | null
   planDigest: string
   attemptOrder: number
 }
@@ -422,10 +447,12 @@ const _detachedProfileCancellations = new Map<string, DetachedProfileCancellatio
 function validProfileSubmissionStatus(
   status: RunStatus,
   nodeId: string,
+  portId: string | undefined,
   planDigest: string,
 ): boolean {
   return status.jobType === 'profile'
     && status.targetNodeId === nodeId
+    && status.targetPortId === portId
     && status.planDigest === planDigest
     && Number.isSafeInteger(status.profileAttemptOrder)
     && status.profileAttemptOrder! > 0
@@ -437,6 +464,7 @@ function profileAttemptIdentity(status: RunStatus): ProfileAttemptIdentity | und
       && Number.isSafeInteger(status.profileAttemptOrder)
     ? {
         targetNodeId: status.targetNodeId ?? null,
+        targetPortId: status.targetPortId ?? null,
         planDigest: status.planDigest,
         attemptOrder: status.profileAttemptOrder!,
       }
@@ -455,6 +483,7 @@ function exactDetachedStatus(
     if (status.jobType !== 'profile') return false
     if (entry.identity) {
       return (status.targetNodeId ?? null) === entry.identity.targetNodeId
+        && (status.targetPortId ?? null) === entry.identity.targetPortId
         && status.planDigest === entry.identity.planDigest
         && status.profileAttemptOrder === entry.identity.attemptOrder
     }
@@ -462,6 +491,7 @@ function exactDetachedStatus(
   // A compact terminal fence can intentionally identify only runId + lifecycle after detail pruning.
   if (status.jobType === 'profile' && entry.identity) {
     return (status.targetNodeId ?? null) === entry.identity.targetNodeId
+      && (status.targetPortId ?? null) === entry.identity.targetPortId
       && status.planDigest === entry.identity.planDigest
       && status.profileAttemptOrder === entry.identity.attemptOrder
   }
@@ -577,7 +607,7 @@ function reconcileAndCancelProfileSubmission(entry: PendingProfileSubmission): v
       let status: RunStatus
       try {
         status = await api.fullProfile(
-          entry.doc, entry.nodeId, entry.planDigest, entry.submissionId, true,
+          entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
         )
       } catch (error) {
         if (!retryableProfileRequest(error)) {
@@ -591,7 +621,9 @@ function reconcileAndCancelProfileSubmission(entry: PendingProfileSubmission): v
         await wait(delay)
         continue
       }
-      if (!validProfileSubmissionStatus(status, entry.nodeId, entry.planDigest)) {
+      if (!validProfileSubmissionStatus(
+        status, entry.nodeId, entry.portId, entry.planDigest,
+      )) {
         // Never cancel an unrelated ordinary run. A malformed profile response that identifies itself
         // as a profile is supervised by exact run id until its terminal lifecycle is observed.
         if (status.jobType === 'profile' && status.runId
@@ -692,9 +724,9 @@ interface Store {
   rerunAll: () => void
   cancelRun: (id: string) => Promise<void>
   clearRun: (id: string) => void
-  prepareFullProfile: (id: string) => Promise<void>
-  startFullProfile: (id: string) => Promise<void>
-  cancelFullProfile: (id: string) => Promise<void>
+  prepareFullProfile: (id: string, portId?: string) => Promise<void>
+  startFullProfile: (id: string, portId?: string) => Promise<void>
+  cancelFullProfile: (id: string, portId?: string) => Promise<void>
   promote: (id: string) => Promise<void>
   restoreVersion: (id: string, versionId: string) => void
 
@@ -808,12 +840,13 @@ async function superviseTrackedProfileCancellation(
   get: () => Store,
   set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
   nodeId: string,
+  jobKey: string,
   requestGeneration: number,
   runId: string,
   principalId: string,
   observedTerminal?: RunStatus,
 ): Promise<void> {
-  const current = get().profileJobs[nodeId]
+  const current = get().profileJobs[jobKey]
   if (_profileSubmissionUserId !== principalId || get().currentUser?.id !== principalId
       || current?.principalId !== principalId || current.canCancel !== true
       || current.requestGeneration !== requestGeneration || current.status?.runId !== runId
@@ -823,7 +856,7 @@ async function superviseTrackedProfileCancellation(
   const expectedSubmissionId = current.submissionId
   const expectedCanvasId = current.canvasId
   const boundTrackedJob = (state: Store): ProfileJobState | undefined => {
-    const tracked = state.profileJobs[nodeId]
+    const tracked = state.profileJobs[jobKey]
     return _profileSubmissionUserId === principalId && state.currentUser?.id === principalId
         && tracked?.principalId === principalId && tracked.canCancel === true
         && tracked.canvasId === expectedCanvasId && tracked.nodeId === nodeId
@@ -850,7 +883,7 @@ async function superviseTrackedProfileCancellation(
       const phase = identityVerified
         ? profilePhase(status)
         : status.status === 'cancelled' ? 'cancelled' : 'failed'
-      return { profileJobs: { ...state.profileJobs, [nodeId]: {
+      return { profileJobs: { ...state.profileJobs, [jobKey]: {
         ...tracked, status, phase,
         error: !identityVerified && phase !== 'cancelled'
           ? tracked.error
@@ -874,7 +907,7 @@ async function superviseTrackedProfileCancellation(
       if (!tracked || !sameProfileAttempt(expectedStatus, tracked.status!)
           || !profileStatusCanAdvance(tracked.status!, status)) return {}
       const cancelled = status.status === 'cancelled'
-      return { profileJobs: { ...state.profileJobs, [nodeId]: {
+      return { profileJobs: { ...state.profileJobs, [jobKey]: {
         ...tracked,
         status,
         identityVerified: false,
@@ -1117,12 +1150,15 @@ export const useStore = create<Store>((set, get) => ({
 
   removeNode: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
-    cancelDetachedProfileJob(get().profileJobs[id])
+    Object.values(get().profileJobs).filter((job) => job.nodeId === id)
+      .forEach(cancelDetachedProfileJob)
     get().commit()
     set((s) => {
       const previews = { ...s.previews }; delete previews[id]
       const runs = { ...s.runs }; delete runs[id]
-      const profileJobs = { ...s.profileJobs }; delete profileJobs[id]
+      const profileJobs = Object.fromEntries(
+        Object.entries(s.profileJobs).filter(([, job]) => job.nodeId !== id),
+      )
       const numericParamDrafts = { ...s.numericParamDrafts }; delete numericParamDrafts[id]
       return {
         doc: {
@@ -1235,13 +1271,16 @@ export const useStore = create<Store>((set, get) => ({
     if (!roleCanEdit(get().canvasRole)) return
     const ids = get().selectedIds.length ? get().selectedIds : (get().selectedId ? [get().selectedId!] : [])
     if (!ids.length) return
-    for (const id of ids) cancelDetachedProfileJob(get().profileJobs[id])
+    Object.values(get().profileJobs).filter((job) => ids.includes(job.nodeId))
+      .forEach(cancelDetachedProfileJob)
     get().commit()
     const kill = new Set(ids)
     set((s) => {
       const previews = Object.fromEntries(Object.entries(s.previews).filter(([k]) => !kill.has(k)))
       const runs = Object.fromEntries(Object.entries(s.runs).filter(([k]) => !kill.has(k)))
-      const profileJobs = Object.fromEntries(Object.entries(s.profileJobs).filter(([k]) => !kill.has(k)))
+      const profileJobs = Object.fromEntries(
+        Object.entries(s.profileJobs).filter(([, job]) => !kill.has(job.nodeId)),
+      )
       return {
         doc: {
           ...s.doc,
@@ -1477,55 +1516,64 @@ export const useStore = create<Store>((set, get) => ({
 
   // A whole-dataset profile is always a two-step interaction: preflight first, then an explicit Start.
   // Capture graph identity around both calls and cancel any superseded scan without ever auto-submitting.
-  prepareFullProfile: async (id) => {
+  prepareFullProfile: async (id, requestedPortId) => {
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
     if (!doc.nodes.some((node) => node.id === id)) return
-    const planIdentity = profilePlanIdentity(doc, id)
+    const portId = resolvedProfilePort(doc, id, requestedPortId)
+    const initialJobKey = profileJobKeyForDoc(doc, id, portId)
+    const planIdentity = profilePlanIdentity(doc, id, portId)
     const requestGeneration = ++_profileRequestGeneration
-    const previous = get().profileJobs[id]
+    const previous = get().profileJobs[initialJobKey]
     cancelDetachedProfileJob(previous)
     const isCurrent = () => {
-      const job = get().profileJobs[id]
-      return job?.requestGeneration === requestGeneration && profileJobIsCurrent(job, get().doc, id)
+      const job = get().profileJobs[initialJobKey]
+      return job?.requestGeneration === requestGeneration
+        && profileJobIsCurrent(job, get().doc, id, portId)
     }
     set((s) => ({ profileJobs: {
       ...s.profileJobs,
-      [id]: {
-        canvasId: doc.id, nodeId: id, principalId: s.currentUser?.id,
+      [initialJobKey]: {
+        canvasId: doc.id, nodeId: id, portId,
+        principalId: s.currentUser?.id,
         canCancel: roleCanEdit(s.canvasRole), planIdentity, requestGeneration, phase: 'estimating',
       },
     } }))
     let estimate: RunEstimate
     let planDigest: string
     try {
-      const preflight = await api.profileEstimate(doc, id)
+      const preflight = await api.profileEstimate(doc, id, portId)
+      if (portId !== undefined && preflight.targetPortId !== portId) {
+        throw new Error('Profile estimate returned a different output port')
+      }
       estimate = preflight
       planDigest = preflight.planDigest
     } catch (e) {
       if (!isCurrent()) return
-      set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
-        ...(s.profileJobs[id]!), phase: 'failed', error: (e as Error).message || 'Could not estimate full profile',
+      set((s) => ({ profileJobs: { ...s.profileJobs, [initialJobKey]: {
+        ...(s.profileJobs[initialJobKey]!), phase: 'failed', error: (e as Error).message || 'Could not estimate full profile',
       } } }))
       return
     }
     if (!isCurrent()) return
-    set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
-      ...(s.profileJobs[id]!), estimate, planDigest, phase: 'preflight', error: undefined,
+    set((s) => ({ profileJobs: { ...s.profileJobs, [initialJobKey]: {
+      ...(s.profileJobs[initialJobKey]!), estimate, planDigest, phase: 'preflight', error: undefined,
     } } }))
   },
 
-  startFullProfile: async (id) => {
+  startFullProfile: async (id, portId) => {
     if (!roleCanEdit(get().canvasRole)) return
-    const job = get().profileJobs[id]
     const doc = get().doc
+    portId = resolvedProfilePort(doc, id, portId)
+    const jobKey = profileJobKeyForDoc(doc, id, portId)
+    const job = get().profileJobs[jobKey]
     const retryingUnknownSubmission = job?.phase === 'failed' && job.submissionUnresolved === true
     if (!job?.estimate || !job.planDigest || (job.phase !== 'preflight' && !retryingUnknownSubmission)
-        || !profileJobIsCurrent(job, doc, id)) return
+        || !profileJobIsCurrent(job, doc, id, portId)) return
     const submissionUserId = get().currentUser?.id
     if (!submissionUserId) {
-      set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
-        ...(s.profileJobs[id]!), phase: 'failed', error: 'A confirmed user is required to start a full profile',
+      set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+        ...(s.profileJobs[jobKey]!), phase: 'failed', error: 'A confirmed user is required to start a full profile',
       } } }))
       return
     }
@@ -1536,26 +1584,26 @@ export const useStore = create<Store>((set, get) => ({
     let pendingSubmission = _pendingProfileSubmissions.get(submissionId)
     if (!pendingSubmission) {
       pendingSubmission = {
-        doc: _clone(doc), nodeId: id, planDigest, submissionId,
+        doc: _clone(doc), nodeId: id, portId, planDigest, submissionId,
         userId: submissionUserId, canCancel: true,
         cancelRequested: false, reconciling: false,
       }
       _pendingProfileSubmissions.set(submissionId, pendingSubmission)
     }
     const isSameSubmission = () => {
-      const current = get().profileJobs[id]
+      const current = get().profileJobs[jobKey]
       return current?.requestGeneration === requestGeneration
         && current.submissionId === submissionId
         && current.principalId === submissionUserId
     }
     const isCurrent = () => {
-      const current = get().profileJobs[id]
+      const current = get().profileJobs[jobKey]
       return isSameSubmission()
         && _profileSubmissionUserId === submissionUserId
-        && profileJobIsCurrent(current, get().doc, id)
+        && profileJobIsCurrent(current, get().doc, id, portId)
     }
-    set((s) => ({ profileJobs: { ...s.profileJobs, [id]: {
-      ...(s.profileJobs[id]!), principalId: submissionUserId,
+    set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+      ...(s.profileJobs[jobKey]!), principalId: submissionUserId,
       canCancel: true,
       submissionId, submissionUnresolved: false,
       cancelRequested: retryingUnknownSubmission ? job.cancelRequested : false,
@@ -1565,14 +1613,16 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // This click is the explicit confirmation. The server recomputes admission from the submitted
       // graph and still rejects a large/unknown direct API call that omits ``confirmed``.
-      status = await submitFullProfile(doc, id, planDigest, submissionId, submissionUserId)
+      status = await submitFullProfile(
+        doc, id, portId, planDigest, submissionId, submissionUserId,
+      )
     } catch (e) {
       const unresolved = retryableProfileRequest(e)
       if (!unresolved) forgetProfileSubmission(pendingSubmission)
-      const current = get().profileJobs[id]
+      const current = get().profileJobs[jobKey]
       const sameSubmission = current?.requestGeneration === requestGeneration
         && current.submissionId === submissionId
-      const currentPlan = sameSubmission && profileJobIsCurrent(current, get().doc, id)
+      const currentPlan = sameSubmission && profileJobIsCurrent(current, get().doc, id, portId)
       const cancelRequested = current?.cancelRequested === true
       if (_profileSubmissionUserId !== submissionUserId) {
         forgetProfileSubmission(pendingSubmission)
@@ -1583,12 +1633,12 @@ export const useStore = create<Store>((set, get) => ({
         return
       }
       set((s) => {
-        const current = s.profileJobs[id]
+        const current = s.profileJobs[jobKey]
         if (!current || current.requestGeneration !== requestGeneration
             || current.submissionId !== submissionId
             || s.currentUser?.id !== submissionUserId
-            || !profileJobIsCurrent(current, s.doc, id)) return {}
-        return { profileJobs: { ...s.profileJobs, [id]: {
+            || !profileJobIsCurrent(current, s.doc, id, portId)) return {}
+        return { profileJobs: { ...s.profileJobs, [jobKey]: {
           ...current, phase: 'failed', submissionUnresolved: unresolved,
           error: unresolved
             ? cancelRequested
@@ -1599,7 +1649,7 @@ export const useStore = create<Store>((set, get) => ({
       })
       return
     }
-    const validIdentity = validProfileSubmissionStatus(status, id, planDigest)
+    const validIdentity = validProfileSubmissionStatus(status, id, portId, planDigest)
     if (!validIdentity) {
       forgetProfileSubmission(pendingSubmission)
       if (status.jobType === 'profile' && status.runId
@@ -1608,12 +1658,12 @@ export const useStore = create<Store>((set, get) => ({
       }
       if (!isCurrent()) return
       set((s) => {
-        const current = s.profileJobs[id]
+        const current = s.profileJobs[jobKey]
         if (!current || current.requestGeneration !== requestGeneration
             || current.submissionId !== submissionId
             || s.currentUser?.id !== submissionUserId
-            || !profileJobIsCurrent(current, s.doc, id)) return {}
-        return { profileJobs: { ...s.profileJobs, [id]: {
+            || !profileJobIsCurrent(current, s.doc, id, portId)) return {}
+        return { profileJobs: { ...s.profileJobs, [jobKey]: {
           ...current, phase: 'failed', submissionUnresolved: false,
           error: 'Full profile started with an invalid durable identity',
         } } }
@@ -1628,15 +1678,15 @@ export const useStore = create<Store>((set, get) => ({
     let installed = false
     let cancelRequested = false
     set((s) => {
-      const current = s.profileJobs[id]
+      const current = s.profileJobs[jobKey]
       if (!current || current.requestGeneration !== requestGeneration
           || current.submissionId !== submissionId
           || s.currentUser?.id !== submissionUserId
-          || !profileJobIsCurrent(current, s.doc, id)) return {}
+          || !profileJobIsCurrent(current, s.doc, id, portId)) return {}
       installed = true
       cancelRequested = current.cancelRequested === true
       const active = status.status === 'queued' || status.status === 'running'
-      return { profileJobs: { ...s.profileJobs, [id]: {
+      return { profileJobs: { ...s.profileJobs, [jobKey]: {
         ...current, status, identityVerified: true, submissionUnresolved: false,
         phase: active && cancelRequested ? 'cancelling' : profilePhase(status),
         error: status.error ?? undefined,
@@ -1647,13 +1697,13 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     if (status.status === 'queued' || status.status === 'running') {
-      pollProfile(get, set, id, status.runId, requestGeneration, submissionUserId, true)
+      pollProfile(get, set, id, jobKey, status.runId, requestGeneration, submissionUserId, true)
       if (cancelRequested) {
         if (_profileSubmissionUserId !== submissionUserId) return
         try {
           const cancelled = await api.cancelRun(status.runId)
           set((s) => {
-            const current = s.profileJobs[id]
+            const current = s.profileJobs[jobKey]
             if (current?.requestGeneration !== requestGeneration
                 || current.submissionId !== submissionId
                 || current.principalId !== submissionUserId
@@ -1662,29 +1712,29 @@ export const useStore = create<Store>((set, get) => ({
                 || !sameProfileAttempt(current.status, cancelled)
                 || !profileStatusCanAdvance(current.status, cancelled)) return {}
             const active = cancelled.status === 'queued' || cancelled.status === 'running'
-            return { profileJobs: { ...s.profileJobs, [id]: {
+            return { profileJobs: { ...s.profileJobs, [jobKey]: {
               ...current, status: cancelled,
               phase: active ? 'cancelling' : profilePhase(cancelled),
               error: cancelled.error ?? undefined,
             } } }
           })
           await superviseTrackedProfileCancellation(
-            get, set, id, requestGeneration, status.runId, submissionUserId,
+            get, set, id, jobKey, requestGeneration, status.runId, submissionUserId,
             exactProfileTerminal(status, cancelled) ? cancelled : undefined,
           )
         } catch (e) {
           if (retryableProfileRequest(e)) {
-            await superviseTrackedProfileCancellation(get, set, id, requestGeneration, status.runId, submissionUserId)
+            await superviseTrackedProfileCancellation(get, set, id, jobKey, requestGeneration, status.runId, submissionUserId)
           }
           set((s) => {
-            const current = s.profileJobs[id]
+            const current = s.profileJobs[jobKey]
             if (current?.requestGeneration !== requestGeneration
                 || current.submissionId !== submissionId
                 || current.principalId !== submissionUserId
                 || s.currentUser?.id !== submissionUserId
                 || current.status?.runId !== status.runId
                 || !['queued', 'running'].includes(current.status.status)) return {}
-            return { profileJobs: { ...s.profileJobs, [id]: {
+            return { profileJobs: { ...s.profileJobs, [jobKey]: {
               ...current, phase: 'cancelling',
               error: `Cancellation request could not be confirmed; still checking run status: ${(e as Error).message || 'request failed'}`,
             } } }
@@ -1694,9 +1744,11 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  cancelFullProfile: async (id) => {
+  cancelFullProfile: async (id, portId) => {
     if (!roleCanEdit(get().canvasRole)) return
-    const job = get().profileJobs[id]
+    portId = resolvedProfilePort(get().doc, id, portId)
+    const jobKey = profileJobKeyForDoc(get().doc, id, portId)
+    const job = get().profileJobs[jobKey]
     if (!job) return
     const principalId = job.principalId
     if (!principalId || !job.canCancel || _profileSubmissionUserId !== principalId) return
@@ -1706,10 +1758,10 @@ export const useStore = create<Store>((set, get) => ({
       // startFullProfile will reconcile the stable submission id and cancel as soon as it learns runId.
       if (!submissionId || (job.phase !== 'queued' && job.phase !== 'cancelling')) return
       set((s) => {
-        const current = s.profileJobs[id]
+        const current = s.profileJobs[jobKey]
         if (current?.requestGeneration !== requestGeneration || current.submissionId !== submissionId
             || current.principalId !== principalId || s.currentUser?.id !== principalId) return {}
-        return { profileJobs: { ...s.profileJobs, [id]: {
+        return { profileJobs: { ...s.profileJobs, [jobKey]: {
           ...current, cancelRequested: true, phase: 'cancelling',
         } } }
       })
@@ -1718,26 +1770,26 @@ export const useStore = create<Store>((set, get) => ({
     if (!['queued', 'running'].includes(job.status.status)) return
     const runId = job.status.runId
     set((s) => {
-      const current = s.profileJobs[id]
+      const current = s.profileJobs[jobKey]
       if (current?.requestGeneration !== requestGeneration
           || current.submissionId !== submissionId
           || current.principalId !== principalId
           || s.currentUser?.id !== principalId
           || current.status?.runId !== runId
           || !['queued', 'running'].includes(current.status.status)) return {}
-      return { profileJobs: { ...s.profileJobs, [id]: {
+      return { profileJobs: { ...s.profileJobs, [jobKey]: {
         ...current, cancelRequested: true, phase: 'cancelling',
       } } }
     })
     // Recovered fail-closed jobs do not start their normal status poll until identity verification.
     // Cancellation still needs an authoritative lifecycle poll because a lost cancel response is an
     // unknown outcome, not evidence that the job failed.
-    pollProfile(get, set, id, runId, requestGeneration, principalId, true)
+    pollProfile(get, set, id, jobKey, runId, requestGeneration, principalId, true)
     if (_profileSubmissionUserId !== principalId) return
     try {
       const cancelled = await api.cancelRun(runId)
       set((s) => {
-        const current = s.profileJobs[id]
+        const current = s.profileJobs[jobKey]
         if (current?.requestGeneration !== requestGeneration
             || current.submissionId !== submissionId
             || current.principalId !== principalId
@@ -1749,28 +1801,28 @@ export const useStore = create<Store>((set, get) => ({
           ? sanitizeUnverifiedProfileStatus(cancelled)
           : cancelled
         const active = status.status === 'queued' || status.status === 'running'
-        return { profileJobs: { ...s.profileJobs, [id]: {
+        return { profileJobs: { ...s.profileJobs, [jobKey]: {
           ...current, status, phase: active ? 'cancelling' : profilePhase(status),
           error: status.error ?? undefined,
         } } }
       })
       await superviseTrackedProfileCancellation(
-        get, set, id, requestGeneration, runId, principalId,
+        get, set, id, jobKey, requestGeneration, runId, principalId,
         exactProfileTerminal(job.status, cancelled) ? cancelled : undefined,
       )
     } catch (e) {
       if (retryableProfileRequest(e)) {
-        await superviseTrackedProfileCancellation(get, set, id, requestGeneration, runId, principalId)
+        await superviseTrackedProfileCancellation(get, set, id, jobKey, requestGeneration, runId, principalId)
       }
       set((s) => {
-        const current = s.profileJobs[id]
+        const current = s.profileJobs[jobKey]
         if (current?.requestGeneration !== requestGeneration
             || current.submissionId !== submissionId
             || current.principalId !== principalId
             || s.currentUser?.id !== principalId
             || current.status?.runId !== runId
             || !['queued', 'running'].includes(current.status.status)) return {}
-        return { profileJobs: { ...s.profileJobs, [id]: {
+        return { profileJobs: { ...s.profileJobs, [jobKey]: {
           ...current, phase: 'cancelling',
           error: `Cancellation request could not be confirmed; still checking run status: ${(e as Error).message || 'request failed'}`,
         } } }
@@ -2439,30 +2491,35 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       superviseDetachedProfileCancellation(status, reattachUserId, recoveryCanCancel)
     }
   }
-  const currentPlanByNode = new Map<string, Promise<{ identity: string; digest: string }>>()
+  const currentPlanByTarget = new Map<string, Promise<{ identity: string; digest: string }>>()
 
-  const currentPlan = (nodeId: string) => {
-    let pending = currentPlanByNode.get(nodeId)
+  const currentPlan = (nodeId: string, portId: string) => {
+    const targetKey = profileJobKeyForDoc(get().doc, nodeId, portId)
+    let pending = currentPlanByTarget.get(targetKey)
     if (!pending) {
-      const identity = profilePlanIdentity(get().doc, nodeId)
+      const identity = profilePlanIdentity(get().doc, nodeId, portId)
       const doc = get().doc
       pending = (async () => {
         for (let attempt = 0; ; attempt += 1) {
           try {
-            const { planDigest: digest } = await api.profileIdentity(doc, nodeId)
+            const currentIdentity = await api.profileIdentity(doc, nodeId, portId)
+            if (currentIdentity.targetPortId !== portId) {
+              throw new Error('Profile identity returned a different output port')
+            }
+            const { planDigest: digest } = currentIdentity
             return { identity, digest }
           } catch (error) {
-            if (!current() || identity !== profilePlanIdentity(get().doc, nodeId)
+            if (!current() || identity !== profilePlanIdentity(get().doc, nodeId, portId)
                 || !retryableProfileRequest(error) || attempt >= PROFILE_RETRY_DELAYS_MS.length) throw error
             await wait(PROFILE_RETRY_DELAYS_MS[attempt])
           }
         }
       })()
-      currentPlanByNode.set(nodeId, pending)
+      currentPlanByTarget.set(targetKey, pending)
       // A later recovery response must be able to retry after a persistent failure; never retain a
       // rejected Promise as the node's identity authority.
       void pending.catch(() => {
-        if (currentPlanByNode.get(nodeId) === pending) currentPlanByNode.delete(nodeId)
+        if (currentPlanByTarget.get(targetKey) === pending) currentPlanByTarget.delete(targetKey)
       })
     }
     return pending
@@ -2475,6 +2532,8 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     error?: string,
   ): { installed: boolean; requestGeneration?: number; blockedByLocalIntent: boolean } => {
     const nodeId = st.targetNodeId!
+    const portId = st.targetPortId!
+    const jobKey = profileJobKeyForDoc(get().doc, nodeId, portId)
     const attemptOrder = st.profileAttemptOrder!
     let installed = false
     let installedGeneration: number | undefined
@@ -2482,7 +2541,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     set((s: Store) => {
       if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId
           || s.currentUser?.id !== reattachUserId) return {}
-      const existingJob = s.profileJobs[nodeId]
+      const existingJob = s.profileJobs[jobKey]
       if (existingJob && existingJob.requestGeneration > localIntentWatermark
           && !recoveredRequestGenerations.has(existingJob.requestGeneration)) {
         blockedByLocalIntent = true
@@ -2511,9 +2570,9 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       const cancelRequested = sameAttempt && existingJob?.cancelRequested === true
       installed = true
       installedGeneration = requestGeneration
-      return { profileJobs: { ...s.profileJobs, [nodeId]: {
-        canvasId, nodeId, principalId: reattachUserId!, canCancel: recoveryCanCancel,
-        planIdentity: profilePlanIdentity(s.doc, nodeId),
+      return { profileJobs: { ...s.profileJobs, [jobKey]: {
+        canvasId, nodeId, portId, principalId: reattachUserId!, canCancel: recoveryCanCancel,
+        planIdentity: profilePlanIdentity(s.doc, nodeId, portId),
         planDigest: st.planDigest ?? undefined,
         requestGeneration,
         status,
@@ -2533,22 +2592,25 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
 
   const discardStaleRecoveredAttempt = (st: RunStatus) => {
     const nodeId = st.targetNodeId!
+    const portId = st.targetPortId!
+    const jobKey = profileJobKeyForDoc(get().doc, nodeId, portId)
     set((s: Store) => {
       if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId
           || s.currentUser?.id !== reattachUserId) return {}
-      const existing = s.profileJobs[nodeId]
+      const existing = s.profileJobs[jobKey]
       if (!existing?.status || existing.identityVerified === true
           || !sameProfileAttempt(existing.status, st)) return {}
       const next = { ...s.profileJobs }
-      delete next[nodeId]
+      delete next[jobKey]
       return { profileJobs: next }
     })
   }
 
   const installProfile = async (st: RunStatus) => {
     const nodeId = st.targetNodeId
+    const portId = st.targetPortId
     const attemptOrder = st.profileAttemptOrder
-    if (st.jobType !== 'profile' || !nodeId
+    if (st.jobType !== 'profile' || !nodeId || !portId
         || !Number.isSafeInteger(attemptOrder) || attemptOrder! < 1) return
     if (!current() || !get().doc.nodes.some((node) => node.id === nodeId)) {
       superviseRecoveredIfDetached(st)
@@ -2562,7 +2624,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     let planIdentity: string
     let planDigest: string
     try {
-      ({ identity: planIdentity, digest: planDigest } = await currentPlan(nodeId))
+      ({ identity: planIdentity, digest: planDigest } = await currentPlan(nodeId, portId))
     } catch (error) {
       if (!current()) {
         superviseRecoveredIfDetached(st)
@@ -2576,7 +2638,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       if (!failed.installed) superviseRecoveredIfDetached(st)
       return
     }
-    if (!current() || planIdentity !== profilePlanIdentity(get().doc, nodeId)) {
+    if (!current() || planIdentity !== profilePlanIdentity(get().doc, nodeId, portId)) {
       superviseRecoveredIfDetached(st)
       return
     }
@@ -2589,7 +2651,8 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     if (installed && requestGeneration !== undefined && current()
         && (st.status === 'queued' || st.status === 'running')) {
       pollProfile(
-        get, set, nodeId, st.runId, requestGeneration, reattachUserId!, recoveryCanCancel,
+        get, set, nodeId, profileJobKeyForDoc(get().doc, nodeId, portId), st.runId,
+        requestGeneration, reattachUserId!, recoveryCanCancel,
       )
     } else if (!installed || !current()) {
       superviseRecoveredIfDetached(st)
@@ -2635,13 +2698,13 @@ const _profilePolling = new Map<string, {
 }>()
 
 function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
-                     nodeId: string, runId: string, requestGeneration: number,
+                     nodeId: string, jobKey: string, runId: string, requestGeneration: number,
                      principalId: string, canCancel: boolean) {
   if (_profileSubmissionUserId !== principalId) return
   const existing = _profilePolling.get(runId)
   if (existing?.principalId !== undefined && existing.principalId !== principalId) return
   if (existing?.requestGeneration === requestGeneration) return
-  const initialStatus = get().profileJobs[nodeId]?.status
+  const initialStatus = get().profileJobs[jobKey]?.status
   if (!initialStatus || initialStatus.runId !== runId
       || (initialStatus.status !== 'queued' && initialStatus.status !== 'running')) return
   const token = Symbol(runId)
@@ -2664,7 +2727,7 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
       stopPolling()
       return
     }
-    const job = get().profileJobs[nodeId]
+    const job = get().profileJobs[jobKey]
     if (!job || job.principalId !== principalId
         || job.requestGeneration !== requestGeneration || job.status?.runId !== runId) {
       superviseIfDetached(initialStatus)
@@ -2691,10 +2754,10 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
         return
       }
       if (++failures <= 6) { setTimeout(tick, 800); return }
-      const current = get().profileJobs[nodeId]
+      const current = get().profileJobs[jobKey]
       if (current?.requestGeneration === requestGeneration && current.status?.runId === runId) {
-        set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-          ...(s.profileJobs[nodeId]!), phase: 'failed', error: (e as Error).message || 'Lost track of full profile',
+        set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+          ...(s.profileJobs[jobKey]!), phase: 'failed', error: (e as Error).message || 'Lost track of full profile',
         } } }))
       }
       stopPolling()
@@ -2705,7 +2768,7 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
       stopPolling()
       return
     }
-    const current = get().profileJobs[nodeId]
+    const current = get().profileJobs[jobKey]
     if (!current || current.principalId !== principalId
         || current.requestGeneration !== requestGeneration || current.status?.runId !== runId
         || !profileJobIsCurrent(current, get().doc, nodeId)) {
@@ -2730,15 +2793,15 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
             stopPolling()
             return
           }
-          const latest = get().profileJobs[nodeId]
+          const latest = get().profileJobs[jobKey]
           if (!latest || latest.requestGeneration !== requestGeneration
               || latest.status?.runId !== runId || !projected) {
             if (latest?.requestGeneration !== requestGeneration || latest?.status?.runId !== runId) {
               stopPolling()
               return
             }
-            set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-              ...(s.profileJobs[nodeId]!), phase: 'failed',
+            set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+              ...(s.profileJobs[jobKey]!), phase: 'failed',
               error: 'Full profile status identity changed unexpectedly',
             } } }))
             stopPolling()
@@ -2749,16 +2812,16 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
         } catch (e) {
           if (!ownsPoll()) return
           if (++projectionFailures <= 6) { setTimeout(tick, 800); return }
-          set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-            ...(s.profileJobs[nodeId]!), phase: 'failed',
+          set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+            ...(s.profileJobs[jobKey]!), phase: 'failed',
             error: (e as Error).message || 'Lost the durable full-profile projection',
           } } }))
           stopPolling()
           return
         }
       } else {
-        set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-          ...(s.profileJobs[nodeId]!), phase: 'failed',
+        set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+          ...(s.profileJobs[jobKey]!), phase: 'failed',
           error: 'Full profile status identity changed unexpectedly',
         } } }))
         stopPolling()
@@ -2766,8 +2829,8 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
       }
     }
     if (!sameProfileAttempt(current.status, status)) {
-      set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-        ...(s.profileJobs[nodeId]!), phase: 'failed',
+      set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+        ...(s.profileJobs[jobKey]!), phase: 'failed',
         error: 'Full profile status identity changed unexpectedly',
       } } }))
       stopPolling()
@@ -2787,11 +2850,11 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
       : current.cancelRequested === true && active
         ? 'cancelling'
         : profilePhase(status)
-    set((s) => ({ profileJobs: { ...s.profileJobs, [nodeId]: {
-      ...(s.profileJobs[nodeId]!), status: storedStatus, phase,
+    set((s) => ({ profileJobs: { ...s.profileJobs, [jobKey]: {
+      ...(s.profileJobs[jobKey]!), status: storedStatus, phase,
       error: !identityVerified && phase !== 'cancelled'
-        ? s.profileJobs[nodeId]?.error
-        : phase === 'cancelling' ? s.profileJobs[nodeId]?.error : status.error ?? undefined,
+        ? s.profileJobs[jobKey]?.error
+        : phase === 'cancelling' ? s.profileJobs[jobKey]?.error : status.error ?? undefined,
     } } }))
     if (status.status === 'done' || status.status === 'failed' || status.status === 'cancelled') {
       stopPolling()
