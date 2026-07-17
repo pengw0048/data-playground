@@ -346,6 +346,9 @@ class DurableExternalWait(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     handle_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     checkpoint_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    download_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    stage_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     phase: Mapped[str] = mapped_column(String(32), nullable=False, server_default="unsubmitted")
     poll_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     next_poll_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -356,9 +359,15 @@ class DurableExternalWait(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (
         CheckConstraint("phase IN ('unsubmitted','submitting','accepted','running','provider_succeeded',"
-                        "'provider_failed','provider_cancelled','cancelled_before_submit')",
+                        "'downloading','downloaded','publishing','published','provider_failed',"
+                        "'provider_cancelled','finalization_failed','cancelled_before_submit',"
+                        "'cancelled_after_success')",
                         name="ck_external_wait_phase"),
         CheckConstraint("poll_count >= 0", name="ck_external_wait_poll_count"),
+        CheckConstraint("(stage_dev IS NULL AND stage_ino IS NULL) OR "
+                        "(stage_dev IS NOT NULL AND stage_ino IS NOT NULL "
+                        "AND stage_dev >= 0 AND stage_ino >= 0)",
+                        name="ck_external_wait_stage_identity"),
     )
 
 
@@ -3427,7 +3436,7 @@ def _external_wait_key(task_id: str, attempt_number: int) -> str:
 def submit_durable_external_wait_task(
         *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
         intent_sha256: str, graph_doc: dict, provider_kind: str,
-        operation: str, document_json: str) -> tuple[dict, bool]:
+        operation: str, document_json: str, write_intent: dict) -> tuple[dict, bool]:
     from hub.external_wait import ExternalWaitSubmitRequest
     from hub.models import Graph
 
@@ -3438,6 +3447,10 @@ def submit_durable_external_wait_task(
     graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
     graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
     request_payload = request.model_dump_json(by_alias=False)
+    from hub.models import WriteIntent
+    intent_payload = json.dumps(
+        WriteIntent.model_validate(write_intent).model_dump(by_alias=True, mode="json"),
+        sort_keys=True, separators=(",", ":"))
     if not re.fullmatch(r"[0-9a-f]{64}", str(intent_sha256)):
         raise ValueError("durable task requires a SHA-256 semantic admission identity")
     if len(graph_payload.encode()) > _DURABLE_TASK_DOC_MAX_BYTES:
@@ -3465,7 +3478,7 @@ def submit_durable_external_wait_task(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
             submission_id=str(submission_id).lower(), intent_sha256=intent_sha256,
             target_node_id=target_node_id, task_kind="external_wait", backend_kind="local",
-            graph_doc=graph_payload, input_manifest="[]", write_intent="null",
+            graph_doc=graph_payload, input_manifest="[]", write_intent=intent_payload,
             status="queued", status_doc=status_doc, created_at=now, updated_at=now)
         attempt = DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
@@ -3818,6 +3831,8 @@ def expire_external_wait_deadlines(limit: int = 100) -> None:
             DurableExternalWait, DurableExternalWait.task_id == DurableTask.id).where(
                 DurableTask.task_kind == "external_wait",
                 DurableTask.status.in_(("queued", "running")),
+                DurableExternalWait.phase.in_((
+                    "unsubmitted", "submitting", "accepted", "running")),
                 DurableExternalWait.deadline_at <= now,
             ).order_by(DurableExternalWait.deadline_at).limit(limit)))
     for task_id in ids:
@@ -3852,6 +3867,8 @@ def claim_external_wait_transition(task_id: str, owner_token: str) -> dict | Non
             lease = lease.replace(tzinfo=datetime.timezone.utc)
         if lease is not None and lease > now:
             return None
+        finalizing = wait.phase in (
+            "provider_succeeded", "downloading", "downloaded", "publishing")
         if task.cancel_requested and wait.handle_doc is None and wait.phase == "unsubmitted":
             _external_wait_terminal(
                 s, task, attempt, wait, task_status="cancelled",
@@ -3861,23 +3878,31 @@ def claim_external_wait_transition(task_id: str, owner_token: str) -> dict | Non
             tzinfo=wait.deadline_at.tzinfo or datetime.timezone.utc)
         next_poll = wait.next_poll_at.replace(
             tzinfo=wait.next_poll_at.tzinfo or datetime.timezone.utc)
-        if deadline <= now:
+        if not finalizing and deadline <= now:
             _external_wait_terminal(
                 s, task, attempt, wait, task_status="failed",
                 phase="provider_failed", code="external_wait_deadline")
             return None
-        if wait.poll_count >= 64:
+        if not finalizing and wait.poll_count >= 64:
             _external_wait_terminal(
                 s, task, attempt, wait, task_status="failed",
                 phase="provider_failed", code="external_wait_poll_budget")
             return None
-        if not task.cancel_requested and next_poll > now:
+        if not finalizing and not task.cancel_requested and next_poll > now:
             return None
         wait.owner_token = str(owner_token)
         wait.lease_until = now + datetime.timedelta(seconds=_DURABLE_TASK_LEASE_SECONDS)
         wait.updated_at = now
         if wait.phase == "unsubmitted":
             wait.phase = "submitting"
+        elif wait.phase == "provider_succeeded" and not task.cancel_requested:
+            wait.phase = "downloading"
+        action = ("cancel_after_success" if task.cancel_requested
+                  and wait.phase in ("provider_succeeded", "downloading", "downloaded") else
+                  "download" if wait.phase == "downloading" else
+                  "publish" if wait.phase in ("downloaded", "publishing") else "provider")
+        if action == "publish":
+            wait.phase = "publishing"
         attempt.status = "running"
         attempt.started_at = attempt.started_at or now
         task.status = "running"
@@ -3891,7 +3916,13 @@ def claim_external_wait_transition(task_id: str, owner_token: str) -> dict | Non
                 "submit_request": json.loads(wait.submit_request),
                 "handle": json.loads(wait.handle_doc) if wait.handle_doc else None,
                 "checkpoint": json.loads(wait.checkpoint_doc) if wait.checkpoint_doc else None,
-                "phase": wait.phase, "cancel_requested": task.cancel_requested,
+                "phase": wait.phase, "action": action,
+                "attempt_number": attempt.attempt_number,
+                "stage_dev": wait.stage_dev, "stage_ino": wait.stage_ino,
+                "download_evidence": (json.loads(wait.download_evidence)
+                                      if wait.download_evidence else None),
+                "write_intent": json.loads(task.write_intent),
+                "cancel_requested": task.cancel_requested,
             }
         except (TypeError, ValueError):
             _external_wait_terminal(
@@ -3971,8 +4002,8 @@ def commit_external_wait_transition(
             wait.checkpoint_doc = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
         wait.diagnostic_code = (outcome.get("diagnostic") or {}).get("code")
         if phase == "succeeded":
-            _external_wait_terminal(
-                s, task, attempt, wait, task_status="done", phase="provider_succeeded")
+            wait.phase = "provider_succeeded"
+            wait.next_poll_at = now
         elif phase == "failed":
             _external_wait_terminal(
                 s, task, attempt, wait, task_status="failed", phase="provider_failed",
@@ -3985,6 +4016,157 @@ def commit_external_wait_transition(
             hint = float((outcome.get("retry") or {}).get("after_seconds") or .25)
             backoff = min(5.0, .05 * (2 ** min(wait.poll_count, 6)))
             wait.next_poll_at = now + datetime.timedelta(seconds=max(.05, min(5.0, max(hint, backoff))))
+        return True
+
+
+def pin_external_wait_stage(
+        task_id: str, attempt_id: str, owner_token: str, dev: int, ino: int) -> bool:
+    """Persist the exact attempt directory identity before untrusted download I/O."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.task_id != task.id or wait.phase != "downloading"
+                or wait.owner_token != str(owner_token) or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return False
+        identity = (int(dev), int(ino))
+        if wait.stage_dev is None:
+            wait.stage_dev, wait.stage_ino = identity
+        elif (wait.stage_dev, wait.stage_ino) != identity:
+            return False
+        return True
+
+
+def heartbeat_external_wait_transition(
+        task_id: str, attempt_id: str, owner_token: str) -> bool:
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.task_id != task.id or wait.owner_token != str(owner_token)
+                or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return False
+        wait.lease_until = now + datetime.timedelta(seconds=_DURABLE_TASK_LEASE_SECONDS)
+        wait.updated_at = now
+        return True
+
+
+def commit_external_wait_download(
+        task_id: str, attempt_id: str, owner_token: str, evidence: dict) -> str | None:
+    from hub.external_wait import ExternalWaitDownloadEvidence
+    payload = ExternalWaitDownloadEvidence.model_validate(evidence).model_dump(mode="json")
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.task_id != task.id or wait.phase != "downloading"
+                or wait.owner_token != str(owner_token) or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return None
+        wait.updated_at = wait.next_poll_at = now
+        if task.cancel_requested:
+            return "cancel_requested"
+        wait.owner_token = wait.lease_until = None
+        wait.download_evidence = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        wait.phase = "downloaded"
+        wait.diagnostic_code = None
+        return "downloaded"
+
+
+def cancel_external_wait_after_success(
+        task_id: str, attempt_id: str, owner_token: str) -> bool:
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or not task.cancel_requested
+                or attempt.task_id != task.id
+                or wait.phase not in ("provider_succeeded", "downloading", "downloaded")
+                or wait.owner_token != str(owner_token) or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return False
+        wait.stage_dev = wait.stage_ino = None
+        wait.download_evidence = None
+        _external_wait_terminal(
+            s, task, attempt, wait, task_status="cancelled", phase="cancelled_after_success")
+        return True
+
+
+def finish_external_wait_publication(
+        task_id: str, attempt_id: str, owner_token: str, receipt_doc: dict) -> bool:
+    from hub.models import RunOutput, RunStatus, WriteIntent, WriteReceipt
+    receipt = WriteReceipt.model_validate(receipt_doc)
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.task_id != task.id or wait.phase != "publishing"
+                or wait.owner_token != str(owner_token) or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return False
+        intent = WriteIntent.model_validate_json(task.write_intent)
+        if (receipt.publication.idempotency_key != intent.idempotency_key
+                or receipt.publication.logical_uri != intent.destination.logical_uri):
+            raise RuntimeError("external-wait publication receipt changed its frozen intent")
+        output = RunOutput(
+            node_id=task.target_node_id, port_id="out", wire="dataset",
+            publication_kind="catalog", outcome="committed",
+            uri=receipt.publication.artifact_uri, table=intent.destination.name,
+            version=receipt.publication.catalog_version, rows=receipt.rows,
+            write_receipt=receipt)
+        status = RunStatus(
+            run_id=task.id, status="done", target_node_id=task.target_node_id,
+            outputs=[output], total_rows=receipt.rows).model_dump()
+        receipt_json = json.dumps(receipt.model_dump(by_alias=True, mode="json"), sort_keys=True)
+        task.status = attempt.status = "done"
+        task.status_doc = json.dumps(status, default=str)
+        task.output_receipt = attempt.output_receipt = receipt_json
+        task.completed_at = attempt.completed_at = task.updated_at = now
+        wait.phase, wait.owner_token, wait.lease_until = "published", None, None
+        wait.stage_dev = wait.stage_ino = None
+        wait.download_evidence = None
+        wait.updated_at = now
+        return True
+
+
+def fail_external_wait_finalization(
+        task_id: str, attempt_id: str, owner_token: str, code: str, *, permanent: bool) -> bool:
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        wait = s.get(DurableExternalWait, str(task_id), with_for_update=True)
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = wait.lease_until if wait is not None else None
+        if (task is None or wait is None or attempt is None or task.status in _TERMINAL_RUN
+                or attempt.task_id != task.id or wait.phase not in ("downloading", "publishing")
+                or wait.owner_token != str(owner_token) or lease is None
+                or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
+            return False
+        wait.owner_token = wait.lease_until = None
+        wait.diagnostic_code = str(code)[:64]
+        wait.next_poll_at = wait.updated_at = now
+        if permanent:
+            wait.stage_dev = wait.stage_ino = None
+            wait.download_evidence = None
+            _external_wait_terminal(
+                s, task, attempt, wait, task_status="failed",
+                phase="finalization_failed", code=wait.diagnostic_code)
         return True
 
 
@@ -4033,6 +4215,8 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
             wait.submit_request = request.model_dump_json()
             wait.idempotency_key = request.idempotency_key
             wait.handle_doc = wait.checkpoint_doc = None
+            wait.download_evidence = None
+            wait.stage_dev = wait.stage_ino = None
             wait.phase = "unsubmitted"
             wait.poll_count = 0
             wait.next_poll_at = now

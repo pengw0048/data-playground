@@ -218,6 +218,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>Retry task</Button>}
       </div>
       {item.taskId && <div className="grid gap-2 sm:col-span-2">
+        {item.externalWait && <div><strong>External wait:</strong> {item.externalWait.providerKind} · {item.externalWait.phase.replaceAll('_', ' ')} · attempt #{item.externalWait.attemptNumber}</div>}
         <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
         {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
         {item.taskAttempts?.length ? <div><strong>Attempts:</strong> {item.taskAttempts.map((attempt) => `#${attempt.attemptNumber} ${attempt.status}`).join(' · ')}</div> : null}

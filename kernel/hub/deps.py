@@ -275,11 +275,11 @@ class Registry:
         self._activate(f"external-wait:{kind}", "application")
 
     def add_external_wait_node(self, spec: NodeSpec, provider_kind: str) -> None:
-        """Bind one zero-input plugin node to its provider without exposing provider code to core."""
+        """Bind one single-output plugin node to its provider without exposing provider code to core."""
         from hub.external_wait import normalize_provider_kind
         kind = normalize_provider_kind(provider_kind)
-        if spec.inputs or spec.outputs or kind not in self.deps.external_wait_adapters:
-            raise ValueError("external-wait node requires one active adapter and no ports")
+        if spec.inputs or len(spec.outputs) != 1 or kind not in self.deps.external_wait_adapters:
+            raise ValueError("external-wait node requires one active adapter and one output")
         if spec.kind in self.deps.builtin_kinds or spec.kind in self.deps.node_specs:
             raise ValueError("external-wait node kind conflicts with an existing node")
         self.add_node(spec)

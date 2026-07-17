@@ -1229,9 +1229,15 @@
               "accepted",
               "running",
               "provider_succeeded",
+              "downloading",
+              "downloaded",
+              "publishing",
+              "published",
               "provider_failed",
               "provider_cancelled",
-              "cancelled_before_submit"
+              "finalization_failed",
+              "cancelled_before_submit",
+              "cancelled_after_success"
             ],
             "title": "Phase",
             "type": "string"

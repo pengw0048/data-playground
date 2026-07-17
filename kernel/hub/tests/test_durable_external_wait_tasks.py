@@ -5,9 +5,11 @@ import datetime
 import hashlib
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +19,11 @@ from hub.external_wait import (
     ExternalWaitCheckpoint, ExternalWaitHandle, ExternalWaitPollOutcome,
     ExternalWaitRetryHint,
 )
+from hub.models import WriteDestination, WriteIntent, WriteProvenance, WriteReceipt
+from hub.models import LineagePublication
+from hub.plugins.adapters import DuckDBAdapter
+from hub.plugins.catalog import InMemoryCatalog
+from hub.storage import LocalStorage
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -49,16 +56,42 @@ def identity():
     return uid, canvas, submission
 
 
+def _write_intent(identity) -> WriteIntent:
+    _uid, canvas, submission = identity
+    key = f"external-wait-test:{submission}"
+    return WriteIntent(
+        destination=WriteDestination(
+            logical_uri=f"file:///tmp/{canvas}.parquet", name="external_result"),
+        mode="create",
+        expected_schema=[{"name": "value", "type": "int"}],
+        idempotency_key=key,
+        provenance=WriteProvenance(
+            publication=LineagePublication(idempotency_key=key, provenance="manual")),
+    )
+
+
 def _submit(identity, *, operation="conformance.success", digest="a" * 64):
     uid, canvas, submission = identity
-    graph = {"id": canvas, "version": 1, "nodes": [{
-        "id": "wait", "type": "external_wait_fixture",
-        "data": {"config": {"operation": operation, "documentJson": "{}"}},
-    }], "edges": []}
+    intent = _write_intent(identity)
+    graph = {"id": canvas, "version": 1, "nodes": [
+        {
+            "id": "wait", "type": "external_wait_fixture",
+            "data": {"config": {
+                "operation": operation, "documentJson": "{}",
+                "outputSchema": [{"name": "value", "type": "int"}],
+            }},
+        },
+        {"id": "write", "type": "write", "data": {"config": {
+            "destination": intent.destination.logical_uri, "mode": "create"}}},
+    ], "edges": [{
+        "id": "wait-write", "source": "wait", "target": "write",
+        "sourceHandle": "out", "targetHandle": "in",
+    }]}
     return metadb.submit_durable_external_wait_task(
-        uid=uid, canvas_id=canvas, submission_id=submission, target_node_id="wait",
+        uid=uid, canvas_id=canvas, submission_id=submission, target_node_id="write",
         intent_sha256=digest, graph_doc=graph, provider_kind="fixture-local",
-        operation=operation, document_json="{}")
+        operation=operation, document_json="{}",
+        write_intent=intent.model_dump(by_alias=True, mode="json"))
 
 
 def _make_due(task_id: str) -> None:
@@ -81,6 +114,26 @@ def _wait_until(predicate, timeout=3.0):
             return value
         time.sleep(.01)
     raise AssertionError("condition did not become true")
+
+
+def _provider_succeeded(task_id: str) -> None:
+    submit = metadb.claim_external_wait_transition(task_id, "submit-success")
+    assert submit is not None
+    assert metadb.commit_external_wait_transition(
+        task_id, submit["attempt_id"], "submit-success",
+        handle={"provider_kind": "fixture-local", "job_id": "fixture-job"})
+    _make_due(task_id)
+    poll = metadb.claim_external_wait_transition(task_id, "poll-success")
+    assert poll is not None
+    assert metadb.commit_external_wait_transition(
+        task_id, poll["attempt_id"], "poll-success",
+        outcome={
+            "phase": "succeeded",
+            "checkpoint": {"sequence": 1, "token": "success"},
+            "retry": None,
+            "diagnostic": None,
+        })
+    assert metadb.durable_task(task_id)["external_wait"]["phase"] == "provider_succeeded"
 
 
 class Adapter:
@@ -111,15 +164,20 @@ class Adapter:
         return ExternalWaitPollOutcome(
             phase="cancelled", checkpoint=ExternalWaitCheckpoint(sequence=sequence, token="cancelled"))
 
-    def download(self, *_args):
-        raise AssertionError("#408 must not download")
+    def download(self, _handle, target):
+        payload = b"value\n1\n"
+        Path(target).write_bytes(payload)
+        return {
+            "result_id": "fixture-result", "bytes_written": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(), "media_type": "text/csv",
+        }
 
 
 def _deps(adapter):
     return SimpleNamespace(_external_wait_adapter=lambda kind: adapter if kind == "fixture-local" else None)
 
 
-def test_submit_response_loss_restart_and_provider_success(identity):
+def test_submit_response_loss_restart_download_and_publish(identity, tmp_path):
     task, created = _submit(identity, operation="conformance.response-loss")
     assert created and task["task_kind"] == "external_wait"
     assert metadb.claim_durable_task(task["id"], "local-owner") is None
@@ -145,20 +203,314 @@ def test_submit_response_loss_restart_and_provider_success(identity):
             return None
         current = _wait_until(advanced)
         assert current["external_wait"]["phase"] == expected
-    final = metadb.durable_task(task["id"])
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage,
+        catalog=InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter()),
+        _external_wait_adapter=lambda kind: restarted if kind == "fixture-local" else None,
+    )
+    try:
+        external_wait_tasks.recover(deps)
+        _wait_until(
+            lambda: metadb.durable_task(task["id"])["external_wait"]["phase"] == "downloaded")
+        external_wait_tasks.recover(deps)
+        final = _wait_until(
+            lambda: metadb.durable_task(task["id"])
+            if metadb.durable_task(task["id"])["status"] == "done" else None)
+    finally:
+        storage.close()
     assert final["status"] == "done"
     assert len(final["attempts"]) == 1
-    assert final["output_receipt"] is None
-    assert final["status_doc"]["outputs"] == []
+    assert final["external_wait"]["phase"] == "published"
+    assert final["output_receipt"] is not None
+    assert len(final["status_doc"]["outputs"]) == 1
 
     page = metadb.list_workspace_runs(identity[0], run_id=task["id"])
     encoded = json.dumps(page)
     item = page["items"][0]
-    assert item["externalWait"]["phase"] == "provider_succeeded"
+    assert item["externalWait"]["phase"] == "published"
     assert item["externalWait"]["attemptNumber"] == 1
-    assert item["outputReceipt"] is None and item["outputs"] == []
-    for sentinel in ("job_id", "checkpoint", "documentJson", "SECRET", "/private"):
+    assert item["outputReceipt"] is not None and len(item["outputs"]) == 1
+    for sentinel in ("job_id", "checkpoint", "documentJson", "SECRET", ".dp-external-stage"):
         assert sentinel not in encoded
+
+
+def test_publication_response_loss_recovers_exact_receipt(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage, catalog=catalog,
+        _external_wait_adapter=lambda kind: Adapter() if kind == "fixture-local" else None,
+    )
+    try:
+        download = metadb.claim_external_wait_transition(task["id"], "download")
+        assert download is not None and download["action"] == "download"
+        external_wait_tasks._download(download, "download", deps)
+        assert metadb.durable_task(task["id"])["external_wait"]["phase"] == "downloaded"
+
+        publish = metadb.claim_external_wait_transition(task["id"], "publish")
+        assert publish is not None and publish["action"] == "publish"
+        committed = catalog.publish_managed_local_write
+        calls = 0
+
+        def lose_response(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            receipt = committed(*args, **kwargs)
+            if calls == 1:
+                raise OSError("publication response lost SECRET")
+            return receipt
+
+        catalog.publish_managed_local_write = lose_response
+        external_wait_tasks._publish(publish, "publish", deps)
+        final = metadb.durable_task(task["id"])
+        assert calls == 1
+        assert final["status"] == "done"
+        assert final["external_wait"]["phase"] == "published"
+        assert final["output_receipt"] == final["attempts"][0]["output_receipt"]
+        assert WriteReceipt.model_validate(
+            final["status_doc"]["outputs"][0]["write_receipt"]
+        ) == WriteReceipt.model_validate(final["output_receipt"])
+        assert not list((tmp_path / ".dp-external-stage" / "attempts").glob("*"))
+    finally:
+        storage.close()
+
+
+def test_task_receipt_finish_loss_reattaches_without_republishing(
+        identity, tmp_path, monkeypatch):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage, catalog=catalog,
+        _external_wait_adapter=lambda _kind: Adapter(),
+    )
+    try:
+        download = metadb.claim_external_wait_transition(task["id"], "download-finish-loss")
+        external_wait_tasks._download(download, "download-finish-loss", deps)
+        publish = metadb.claim_external_wait_transition(task["id"], "publish-finish-loss")
+        committed = catalog.publish_managed_local_write
+        publication_calls = 0
+
+        def counted_publish(*args, **kwargs):
+            nonlocal publication_calls
+            publication_calls += 1
+            return committed(*args, **kwargs)
+
+        catalog.publish_managed_local_write = counted_publish
+        finish = metadb.finish_external_wait_publication
+        monkeypatch.setattr(metadb, "finish_external_wait_publication", lambda *_args, **_kwargs: False)
+        external_wait_tasks._publish(publish, "publish-finish-loss", deps)
+        interrupted = metadb.durable_task(task["id"])
+        assert interrupted["status"] == "running"
+        assert interrupted["external_wait"]["phase"] == "publishing"
+        assert publication_calls == 1
+
+        _expire_wait_lease(task["id"])
+        replay = metadb.claim_external_wait_transition(task["id"], "publish-finish-replay")
+        assert replay is not None and replay["action"] == "publish"
+        monkeypatch.setattr(metadb, "finish_external_wait_publication", finish)
+        external_wait_tasks._publish(replay, "publish-finish-replay", deps)
+        final = metadb.durable_task(task["id"])
+        assert final["status"] == "done" and final["external_wait"]["phase"] == "published"
+        assert publication_calls == 1
+        assert final["output_receipt"]["publication"]["publishSequence"] == 1
+    finally:
+        storage.close()
+
+
+def test_committed_receipt_wins_over_staging_root_rename(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage, catalog=catalog,
+        _external_wait_adapter=lambda _kind: Adapter(),
+    )
+    try:
+        download = metadb.claim_external_wait_transition(task["id"], "download-root-rename")
+        external_wait_tasks._download(download, "download-root-rename", deps)
+        publish = metadb.claim_external_wait_transition(task["id"], "publish-root-rename")
+        stage, _target, _lock = external_wait_tasks._stage_paths(publish, deps)
+        committed = catalog.publish_managed_local_write
+        publication_calls = 0
+
+        def publish_then_replace_root(*args, **kwargs):
+            nonlocal publication_calls
+            publication_calls += 1
+            receipt = committed(*args, **kwargs)
+            stage.rename(stage.with_name(stage.name + ".moved"))
+            stage.mkdir(mode=0o700)
+            (stage / "untrusted").write_text("do not delete")
+            return receipt
+
+        catalog.publish_managed_local_write = publish_then_replace_root
+        external_wait_tasks._publish(publish, "publish-root-rename", deps)
+        final = metadb.durable_task(task["id"])
+        assert final["status"] == "done" and final["external_wait"]["phase"] == "published"
+        assert publication_calls == 1
+        assert final["output_receipt"]["publication"]["publishSequence"] == 1
+        assert (stage / "untrusted").read_text() == "do not delete"
+    finally:
+        storage.close()
+
+
+def test_cancel_after_provider_success_skips_download_and_cleans_stage(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+    metadb.request_durable_task_cancel(task["id"])
+
+    class NoDownload(Adapter):
+        def download(self, *_args):
+            raise AssertionError("cancel-after-success must fence provider download")
+
+    claim = metadb.claim_external_wait_transition(task["id"], "cancel-success")
+    assert claim is not None and claim["action"] == "cancel_after_success"
+    external_wait_tasks._download(
+        claim, "cancel-success",
+        SimpleNamespace(
+            workspace=str(tmp_path),
+            _external_wait_adapter=lambda _kind: NoDownload(),
+        ),
+    )
+    final = metadb.durable_task(task["id"])
+    assert final["status"] == "cancelled"
+    assert final["external_wait"]["phase"] == "cancelled_after_success"
+    assert not (tmp_path / ".dp-external-stage" / "attempts").exists()
+
+
+def test_retry_fences_old_attempt_stage_and_download_evidence(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+    old_token = "old-download"
+    old = metadb.claim_external_wait_transition(task["id"], old_token)
+    assert old is not None and old["action"] == "download"
+    _target, identity_token = external_wait_tasks._prepare_stage(old, SimpleNamespace(
+        workspace=str(tmp_path)), old_token)
+    metadb.request_durable_task_cancel(task["id"])
+    assert external_wait_tasks._cleanup_stage(
+        old, SimpleNamespace(workspace=str(tmp_path)), identity_token)
+    assert metadb.cancel_external_wait_after_success(
+        task["id"], old["attempt_id"], old_token)
+
+    retried = metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    assert len(retried["attempts"]) == 2
+    evidence = {
+        "result_id": "late-old-result", "bytes_written": 8,
+        "sha256": hashlib.sha256(b"value\n1\n").hexdigest(), "media_type": "text/csv",
+    }
+    assert metadb.commit_external_wait_download(
+        task["id"], old["attempt_id"], old_token, evidence) is None
+    assert not metadb.pin_external_wait_stage(
+        task["id"], old["attempt_id"], old_token, *identity_token)
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, task["id"])
+        assert wait.phase == "unsubmitted"
+        assert wait.download_evidence is None
+        assert wait.stage_dev is None and wait.stage_ino is None
+
+
+def test_replaced_staging_root_fails_closed_without_publication(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+
+    class ReplaceStage(Adapter):
+        def download(self, _handle, target):
+            target = Path(target)
+            shutil.rmtree(target.parent)
+            target.parent.mkdir(mode=0o700)
+            payload = b"value\n1\n"
+            target.write_bytes(payload)
+            return {
+                "result_id": "replaced-root", "bytes_written": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(), "media_type": "text/csv",
+            }
+
+    claim = metadb.claim_external_wait_transition(task["id"], "replace-stage")
+    assert claim is not None and claim["action"] == "download"
+    external_wait_tasks._download(
+        claim, "replace-stage",
+        SimpleNamespace(
+            workspace=str(tmp_path),
+            _external_wait_adapter=lambda _kind: ReplaceStage(),
+        ),
+    )
+    final = metadb.durable_task(task["id"])
+    assert final["status"] == "failed"
+    assert final["external_wait"]["phase"] == "finalization_failed"
+    assert final["external_wait"]["diagnostic_code"] == "external_wait_download_invalid"
+    assert final["output_receipt"] is None and final["status_doc"]["outputs"] == []
+
+
+def test_extra_staging_entry_fails_closed_and_is_not_deleted(identity, tmp_path):
+    task, _ = _submit(identity)
+    _provider_succeeded(task["id"])
+
+    class ExtraEntry(Adapter):
+        def download(self, _handle, target):
+            target = Path(target)
+            payload = b"value\n1\n"
+            target.write_bytes(payload)
+            (target.parent / "untrusted").write_text("do not delete")
+            return {
+                "result_id": "extra-entry", "bytes_written": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(), "media_type": "text/csv",
+            }
+
+    claim = metadb.claim_external_wait_transition(task["id"], "extra-entry")
+    assert claim is not None and claim["action"] == "download"
+    stage, _target, _lock = external_wait_tasks._stage_paths(
+        claim, SimpleNamespace(workspace=str(tmp_path)))
+    external_wait_tasks._download(
+        claim, "extra-entry",
+        SimpleNamespace(
+            workspace=str(tmp_path),
+            _external_wait_adapter=lambda _kind: ExtraEntry(),
+        ),
+    )
+    final = metadb.durable_task(task["id"])
+    assert final["status"] == "failed"
+    assert final["external_wait"]["phase"] == "finalization_failed"
+    assert final["external_wait"]["diagnostic_code"] == "external_wait_download_invalid"
+    assert final["output_receipt"] is None and final["status_doc"]["outputs"] == []
+    assert (stage / "untrusted").read_text() == "do not delete"
+
+
+def test_download_target_swapped_to_fifo_before_open_fails_without_blocking(
+        tmp_path, monkeypatch):
+    stage = tmp_path / "attempt"
+    stage.mkdir(mode=0o700)
+    target = stage / "result.csv"
+    payload = b"value\n1\n"
+    target.write_bytes(payload)
+    root_info = stage.lstat()
+    evidence = {
+        "result_id": "fifo-swap", "bytes_written": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(), "media_type": "text/csv",
+    }
+    real_open = os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == target and not swapped:
+            swapped = True
+            assert flags & os.O_NONBLOCK, "special-file validation must never use a blocking open"
+            target.unlink()
+            os.mkfifo(target, mode=0o600)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="identity changed"):
+        external_wait_tasks._validate_download(
+            target, (root_info.st_dev, root_info.st_ino), evidence)
+    assert swapped
+    assert time.monotonic() - started < .5
 
 
 def test_replay_conflict_cancel_retry_and_cleanup(identity):
@@ -387,14 +739,22 @@ def test_cancel_submit_loss_terminal_race_and_retry_fencing(identity):
         winners = list(pool.map(finish, outcomes))
     assert winners.count(True) == 1
     raced = metadb.durable_task(task["id"])
-    assert raced["status"] in ("done", "cancelled")
-    assert raced["external_wait"]["phase"] in ("provider_succeeded", "provider_cancelled")
-
-    if raced["status"] == "done":
-        with metadb.session() as session:
-            row = session.get(metadb.DurableTask, task["id"], with_for_update=True)
-            row.status = "failed"
-            row.error = "test retry"
+    if winners[0]:
+        assert raced["status"] == "running"
+        assert raced["external_wait"]["phase"] == "provider_succeeded"
+        assert raced["cancel_requested"] is True
+        finalization = metadb.claim_external_wait_transition(
+            task["id"], "cancel-after-success")
+        assert finalization is not None
+        assert finalization["action"] == "cancel_after_success"
+        assert metadb.cancel_external_wait_after_success(
+            task["id"], finalization["attempt_id"], "cancel-after-success")
+        raced = metadb.durable_task(task["id"])
+        assert raced["status"] == "cancelled"
+        assert raced["external_wait"]["phase"] == "cancelled_after_success"
+    else:
+        assert raced["status"] == "cancelled"
+        assert raced["external_wait"]["phase"] == "provider_cancelled"
     old_attempt = terminal["attempt_id"]
     action = str(uuid.uuid4())
     retried = metadb.retry_durable_task(task["id"], action)
@@ -500,14 +860,21 @@ def test_malformed_inactive_and_hung_adapters_stay_bounded(identity):
 def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, monkeypatch):
     from fastapi import HTTPException
     from hub.models import Graph
-    from hub.routers.runs import _external_wait_request, start_run
+    from hub.routers import runs
 
     uid, canvas, submission = identity
     graph = Graph.model_validate({
         "id": canvas, "version": 1,
-        "nodes": [{"id": "wait", "type": "external_wait_fixture", "data": {
-            "config": {"operation": "conformance.success", "documentJson": "{}"}}}],
-        "edges": [],
+        "nodes": [
+            {"id": "wait", "type": "external_wait_fixture", "data": {"config": {
+                "operation": "conformance.success", "documentJson": "{}",
+                "outputSchema": [{"name": "value", "type": "int"}]}}},
+            {"id": "write", "type": "write", "data": {"config": {
+                "destination": _write_intent(identity).destination.logical_uri,
+                "mode": "create"}}},
+        ],
+        "edges": [{"id": "wait-write", "source": "wait", "target": "write",
+                   "sourceHandle": "out", "targetHandle": "in"}],
     })
 
     class Counting(Adapter):
@@ -525,25 +892,24 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, 
     deps = SimpleNamespace(
         external_wait_nodes={"external_wait_fixture": "fixture-local"},
         _external_wait_adapter=lambda kind: adapter if kind == "fixture-local" else None)
-    request = _external_wait_request(deps, graph, "wait")
+    admission = SimpleNamespace(
+        managed=True, intent=_write_intent(identity), blocker=None)
+    monkeypatch.setattr(runs, "_write_admission_for_graph", lambda *_args, **_kwargs: admission)
+    request = runs._external_wait_request(deps, graph, "write")
     assert request.provider_kind == "fixture-local"
-    status, owner = start_run(deps, graph, "wait", uid, submission_id=submission)
+    status, owner = runs.start_run(deps, graph, "write", uid, submission_id=submission)
     assert status.status == "queued" and owner is None
     task_id = status.run_id
     _wait_until(lambda: metadb.durable_task(task_id)["external_wait"]["phase"] == "accepted")
-    replay, _ = start_run(deps, graph, "wait", uid, submission_id=submission)
+    replay, _ = runs.start_run(deps, graph, "write", uid, submission_id=submission)
     with metadb.session() as session:
         key = session.get(metadb.DurableExternalWait, task_id).idempotency_key
     assert replay.run_id == task_id and adapter.submitted_keys.count(key) == 1
 
     invalid = graph.model_copy(deep=True)
-    invalid.nodes.append(Graph.model_validate({
-        "id": canvas, "version": 1,
-        "nodes": [{"id": "other", "type": "external_wait_fixture", "data": {"config": {}}}],
-        "edges": [],
-    }).nodes[0])
+    invalid.edges = []
     with pytest.raises(HTTPException) as exc:
-        _external_wait_request(deps, invalid, "wait")
+        runs._external_wait_request(deps, invalid, "write")
     assert exc.value.status_code == 409
 
     blocked_adapter = Counting()
@@ -551,8 +917,8 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, 
         external_wait_nodes=deps.external_wait_nodes,
         _external_wait_adapter=lambda kind: blocked_adapter if kind == "fixture-local" else None)
     with pytest.raises(HTTPException) as exc:
-        start_run(blocked_deps, graph, "wait", uid, submission_id=str(uuid.uuid4()),
-                  input_manifest=[])
+        runs.start_run(blocked_deps, graph, "write", uid, submission_id=str(uuid.uuid4()),
+                       input_manifest=[])
     assert exc.value.status_code == 409 and blocked_adapter.submits == 0
 
     def persistence_failed(**_kwargs):
@@ -560,5 +926,5 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(identity, 
 
     monkeypatch.setattr(metadb, "submit_durable_external_wait_task", persistence_failed)
     with pytest.raises(RuntimeError, match="database unavailable"):
-        start_run(blocked_deps, graph, "wait", uid, submission_id=str(uuid.uuid4()))
+        runs.start_run(blocked_deps, graph, "write", uid, submission_id=str(uuid.uuid4()))
     assert blocked_adapter.submits == 0

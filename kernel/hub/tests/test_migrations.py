@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0011_external_wait_publication", "0010_durable_external_waits"),
         ("0010_durable_external_waits", "0009_durable_local_write_tasks"),
         ("0009_durable_local_write_tasks", "0008_managed_local_lance_writes"),
         ("0008_managed_local_lance_writes", "0007_workspace_provider_bindings"),
@@ -65,8 +66,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0010_durable_external_waits"]
-    assert metadb.expected_schema_head() == "0010_durable_external_waits"
+    assert scripts.get_heads() == ["0011_external_wait_publication"]
+    assert metadb.expected_schema_head() == "0011_external_wait_publication"
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -99,6 +100,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0010_durable_external_waits.py": (
             "183506ed4f43142cbaff7e63ee47267d5c9bcd7969c94efb28e62e3b84a4d7cf"
+        ),
+        "0011_external_wait_publication.py": (
+            "bc779148f2d745f0ef0a0e227dd1877eb08b92d7ac8184f28c6608e3fefebfaf"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
