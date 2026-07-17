@@ -479,7 +479,7 @@ class CatalogBrowse(Wire):
 
 
 class WorkspaceResource(Wire):
-    """One local Workspace child addressed by an opaque, path-independent reference."""
+    """One Workspace child addressed by an opaque, path-independent reference."""
     id: str
     kind: Literal["container", "canvas", "dataset"]
     name: str
@@ -487,27 +487,47 @@ class WorkspaceResource(Wire):
     placement_id: str | None = None
     version: int | None = None
     detached: bool = False
+    source: Literal["local", "provider"] = "local"
+    mount_id: str | None = None
+    provider: str | None = None
+    resource_id: str | None = None
+
+
+class WorkspaceSourceStatus(Wire):
+    """Completeness of one independently bounded source in a mixed Workspace page."""
+    id: str
+    kind: Literal["local", "provider", "configuration"]
+    completeness: Literal[
+        "complete", "page", "pending", "partial", "unavailable", "unsupported"
+    ]
+    mount_id: str | None = None
+    provider: str | None = None
+    error: str | None = None
 
 
 class WorkspaceBrowsePage(Wire):
-    container: WorkspaceResource
+    container: WorkspaceResource | None
     items: list[WorkspaceResource] = []
     next_cursor: str | None = None
     has_more: bool = False
-    completeness: Literal["complete", "page"] = "complete"
+    completeness: Literal["complete", "page", "partial"] = "complete"
+    sources: list[WorkspaceSourceStatus] = []
 
     @model_validator(mode="after")
     def validate_cursor_state(self) -> "WorkspaceBrowsePage":
         if self.has_more != (self.next_cursor is not None):
             raise ValueError("Workspace browse continuation state is inconsistent")
-        if self.completeness != ("page" if self.has_more else "complete"):
+        if self.completeness != "partial" and self.completeness != (
+                "page" if self.has_more else "complete"):
             raise ValueError("Workspace browse completeness is inconsistent")
         return self
 
 
 class WorkspaceResourceResolution(Wire):
-    resource: WorkspaceResource
+    resource: WorkspaceResource | None
     ancestors: list[WorkspaceResource] = []
+    source: WorkspaceSourceStatus = WorkspaceSourceStatus(
+        id="local", kind="local", completeness="complete")
 
 
 class CatalogFolder(Wire):
