@@ -578,6 +578,33 @@ class WorkspaceResourceResolution(Wire):
         id="local", kind="local", completeness="complete")
 
 
+class WorkspaceSearchSourceStatus(WorkspaceSourceStatus):
+    freshness: Literal["current", "stale", "unknown"]
+    search_mode: Literal["native", "fallback", "unsupported"]
+
+
+class WorkspaceSearchGroup(Wire):
+    source: WorkspaceSearchSourceStatus
+    items: list[WorkspaceResource] = []
+
+
+class WorkspaceSearchPage(Wire):
+    query: str
+    groups: list[WorkspaceSearchGroup] = []
+    next_cursor: str | None = None
+    has_more: bool = False
+    completeness: Literal["complete", "page", "partial"] = "complete"
+
+    @model_validator(mode="after")
+    def validate_cursor_state(self) -> "WorkspaceSearchPage":
+        if self.has_more != (self.next_cursor is not None):
+            raise ValueError("Workspace search continuation state is inconsistent")
+        if self.completeness != "partial" and self.completeness != (
+                "page" if self.has_more else "complete"):
+            raise ValueError("Workspace search completeness is inconsistent")
+        return self
+
+
 class CatalogFolder(Wire):
     """A first-class browse folder. Additive to the per-dataset `folder` path string: it lets an EMPTY
     folder exist and be renamed/deleted, so a folder can be created up front and filled later."""

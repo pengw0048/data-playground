@@ -852,6 +852,8 @@ interface Store {
   openRelationships: (uri: string | null) => void
   workspaceResourceId: string | null
   setWorkspaceResource: (resourceId: string | null) => void
+  workspaceSearchQuery: string
+  setWorkspaceSearchQuery: (query: string) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -1069,6 +1071,11 @@ export const useStore = create<Store>((set, get) => ({
   setWorkspaceResource: (resourceId) => {
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceResourceId: resourceId, view: 'workspace' })
+  },
+  workspaceSearchQuery: '',
+  setWorkspaceSearchQuery: (query) => {
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceSearchQuery: query.trim().replace(/\s+/g, ' '), view: 'workspace' })
   },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
@@ -2125,7 +2132,10 @@ export const useStore = create<Store>((set, get) => ({
         // A Workspace dataset/container deep link carries more identity than the top-level view.
         // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
         // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
-        if (route.view === 'workspace') get().setWorkspaceResource(route.workspaceResourceId ?? null)
+        if (route.view === 'workspace') {
+          get().setWorkspaceResource(route.workspaceResourceId ?? null)
+          get().setWorkspaceSearchQuery(route.workspaceQuery ?? '')
+        }
         else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {

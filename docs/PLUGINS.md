@@ -215,8 +215,8 @@ only bounded reads. Workspace persistence and mixed Workspace browse are consume
 not responsibilities of a provider wheel.
 
 Import only these public types: `CatalogMount`, `CatalogResource`, `ProviderCapabilities`, `ProviderPage`,
-`ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`, `bounded_list_children`,
-`bounded_resolve`, and `bounded_ancestors`.
+`ProviderSearchPage`, `ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`,
+`bounded_list_children`, `bounded_search`, `bounded_resolve`, and `bounded_ancestors`.
 A `CatalogMount(id, provider, config)` identifies a local placement; `id` is not a provider resource
 ID. A provider resource has an opaque stable `id`; display names and parent paths are never identity.
 
@@ -226,6 +226,12 @@ a finite `limit` (1–500) and an opaque cursor; order must be deterministic. A 
 read succeeded. Use the matching `bounded_*` helper at a consumer boundary when a synchronous provider
 must not delay local work: deadline, cancellation, and availability failures are normalized to an
 honest unavailable result, while a provider can return an explicit truthful partial result itself.
+
+Lexical search is optional and must be declared with `ProviderCapabilities(search=True)`. A declared
+provider implements `search(mount, query, limit=, cursor=)` and returns `ProviderSearchPage`, including
+`freshness` as `current`, `stale`, or `unknown`. Workspace search never probes an undeclared method: a
+mount without this capability is labeled unsupported, while a declared search runs under the same
+bounded read deadline and keeps its errors and continuation separate from every other source.
 
 Distribute a provider wheel through the `dataplay.catalog_providers` entry-point group. The entry point
 is a zero-argument factory returning the provider; mount configuration is passed on each call. Verify

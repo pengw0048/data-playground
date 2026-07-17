@@ -59,6 +59,7 @@ class ProviderCapabilities(Wire):
     resolve: bool = True
     ancestors: bool = True
     dataset_detail: bool = True
+    search: bool = False
 
 
 class ProviderPage(Wire):
@@ -72,6 +73,12 @@ class ProviderPage(Wire):
         if self.state != "ready" and self.next_cursor is not None:
             raise ValueError("non-ready provider results cannot continue")
         return self
+
+
+class ProviderSearchPage(ProviderPage):
+    """One provider-owned lexical page plus the freshness of that provider's result set."""
+
+    freshness: Literal["current", "stale", "unknown"] = "current"
 
 
 class ProviderResourceResult(Wire):
@@ -178,5 +185,29 @@ def bounded_ancestors(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
         unavailable=lambda reason: ProviderAncestors(state="unavailable", reason=reason),
         unsupported=lambda: ProviderAncestors(
             state="unsupported", reason="ancestors is unsupported"),
+        timeout=timeout,
+    )
+
+
+def bounded_search(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
+                   query: str, *, limit: int, cursor: str | None = None,
+                   timeout: float = 1.0) -> ProviderSearchPage:
+    """Use only an explicitly declared lexical search capability under one source deadline."""
+    if limit < 1 or limit > 500:
+        raise ValueError("limit must be between 1 and 500")
+
+    def read() -> ProviderSearchPage:
+        capabilities = provider.capabilities(mount)
+        search = getattr(provider, "search", None)
+        if not capabilities.search or not callable(search):
+            raise NotImplementedError
+        page = search(mount, query, limit=limit, cursor=cursor)
+        return ProviderSearchPage.model_validate(page)
+
+    return _bounded_provider_read(
+        read,
+        unavailable=lambda reason: ProviderSearchPage(state="unavailable", reason=reason),
+        unsupported=lambda: ProviderSearchPage(
+            state="unsupported", reason="search is unsupported", freshness="unknown"),
         timeout=timeout,
     )

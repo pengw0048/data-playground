@@ -2654,6 +2654,7 @@ def workspace_delete_placement(placement_id: str, *, expected_version: int) -> N
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
 _WORKSPACE_ANCESTOR_LIMIT = 32
+_WORKSPACE_SEARCH_CURSOR_VERSION = 1
 
 
 def _workspace_ref(kind: str, identity: str) -> str:
@@ -2685,6 +2686,52 @@ def _workspace_cursor_decode(cursor: str | None) -> tuple[int, int, str, str] | 
 def _workspace_name_order(column):
     """Use the same Unicode code-point ordering in SQLite, PostgreSQL, and Python."""
     return column.collate("BINARY" if _is_sqlite_database() else "C")
+
+
+def _workspace_search_cursor_encode(query: str, name: str, rank: int, identity: str) -> str:
+    raw = json.dumps(
+        [_WORKSPACE_SEARCH_CURSOR_VERSION, query, name, rank, identity],
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_search_cursor_decode(
+    cursor: str | None, *, query: str,
+) -> tuple[str, int, str] | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Workspace search cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        version, bound_query, name, rank, identity = json.loads(raw)
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("invalid Workspace search cursor") from exc
+    if (version != _WORKSPACE_SEARCH_CURSOR_VERSION or bound_query != query
+            or not isinstance(name, str)
+            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2)
+            or not isinstance(identity, str) or not identity):
+        raise ValueError("invalid Workspace search cursor")
+    return name, rank, identity
+
+
+def _workspace_search_after(name_column, id_column, rank: int, cursor):
+    if cursor is None:
+        return None
+    name, cursor_rank, identity = cursor
+    ordered_name = _workspace_name_order(func.lower(name_column))
+    return or_(
+        ordered_name > name,
+        and_(ordered_name == name, or_(
+            rank > cursor_rank,
+            and_(rank == cursor_rank, id_column > identity),
+        )),
+    )
+
+
+def _workspace_search_matches(name_column, tokens: list[str]):
+    return and_(*(func.lower(name_column).contains(token, autoescape=True) for token in tokens))
 
 
 def _workspace_after(ordinal_column, name_column, id_column, rank: int, cursor):
@@ -2801,6 +2848,82 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             "container": _workspace_container_resource(container),
             "items": [item for _key, item in page], "nextCursor": next_cursor,
             "hasMore": has_more, "completeness": "page" if has_more else "complete",
+        }
+
+
+def workspace_search(query: str, *, uid: str, limit: int = 25,
+                     cursor: str | None = None) -> dict:
+    """Search current local Workspace metadata without materializing the complete catalog."""
+    normalized = " ".join(query.split()).lower()
+    if not normalized:
+        raise ValueError("Workspace search query must not be blank")
+    if len(normalized.encode("utf-8")) > 512:
+        raise ValueError("Workspace search query must be at most 512 UTF-8 bytes")
+    limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    tokens = normalized.split()
+    decoded = _workspace_search_cursor_decode(cursor, query=normalized)
+    with session() as s:
+        container_after = _workspace_search_after(
+            WorkspaceContainer.name, WorkspaceContainer.id, 0, decoded)
+        containers = list(s.scalars(select(WorkspaceContainer).where(
+            _workspace_search_matches(WorkspaceContainer.name, tokens),
+            *([container_after] if container_after is not None else []),
+        ).order_by(
+            _workspace_name_order(func.lower(WorkspaceContainer.name)),
+            WorkspaceContainer.id,
+        ).limit(limit + 1)))
+
+        canvas_after = _workspace_search_after(
+            WorkspacePlacement.name, WorkspacePlacement.target_id, 1, decoded)
+        dataset_after = _workspace_search_after(
+            WorkspacePlacement.name, WorkspacePlacement.target_id, 2, decoded)
+        canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "canvas",
+            _workspace_canvas_visible_clause(uid),
+            _workspace_search_matches(WorkspacePlacement.name, tokens),
+            *([canvas_after] if canvas_after is not None else []),
+        ).order_by(
+            _workspace_name_order(func.lower(WorkspacePlacement.name)),
+            WorkspacePlacement.target_id,
+        ).limit(limit + 1)))
+        dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "dataset",
+            _workspace_search_matches(WorkspacePlacement.name, tokens),
+            *([dataset_after] if dataset_after is not None else []),
+        ).order_by(
+            _workspace_name_order(func.lower(WorkspacePlacement.name)),
+            WorkspacePlacement.target_id,
+        ).limit(limit + 1)))
+
+        dataset_ids = [row.target_id for row in dataset_placements]
+        live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
+            CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
+        rows: list[tuple[tuple[str, int, str], dict]] = []
+        rows.extend(
+            ((row.name.lower(), 0, row.id), _workspace_container_resource(row))
+            for row in containers
+        )
+        rows.extend(
+            ((row.name.lower(), 1, row.target_id),
+             _workspace_placement_resource(row, detached=False))
+            for row in canvas_placements
+        )
+        rows.extend(
+            ((row.name.lower(), 2, row.target_id),
+             _workspace_placement_resource(row, detached=row.target_id not in live_datasets))
+            for row in dataset_placements
+        )
+        rows.sort(key=lambda row: row[0])
+        page = rows[:limit]
+        has_more = len(rows) > limit
+        next_cursor = (
+            _workspace_search_cursor_encode(normalized, *page[-1][0])
+            if has_more and page else None
+        )
+        return {
+            "items": [item for _key, item in page],
+            "nextCursor": next_cursor,
+            "hasMore": has_more,
         }
 
 
