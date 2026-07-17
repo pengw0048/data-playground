@@ -43,14 +43,19 @@ async function openCanvasWithSource(page: Page) {
   await page.getByText('New file').click()
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previous)
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
+  const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
   await backToWorkspace(page)
 
   // The full UX fixture replaces the small smoke catalog, so follow bounded load-more pages.
   const starterTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
   await (await workspaceResource(page, 'dataset', starterTable)).click()
   await page.getByTestId('detail-use').click()
+  await page.getByRole('button', { name: /^Add to canvas/ }).click()
+  await page.getByLabel('Target canvas').selectOption(canvasId)
+  await page.getByRole('button', { name: 'Add and open' }).click()
   await expect(page.getByTestId('toolbar')).toBeVisible()
   await expect(page.locator('.react-flow__node')).toHaveCount(1)
+  await page.locator('.react-flow__node').getByText('DATASET', { exact: true }).click()
 }
 
 test.describe('minimum viewport support', () => {

@@ -73,7 +73,7 @@ test.describe('accessibility gate @ux-smoke', () => {
   test('axe smoke: Workspace', async ({ page }) => {
     await fresh(page)
     await backToWorkspace(page)
-    await expect(page.getByRole('button', { name: 'New canvas' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
     await expectNoSeriousAxe(page, 'Workspace')
   })
 
