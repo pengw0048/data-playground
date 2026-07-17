@@ -1,0 +1,17 @@
+[project]
+name = "dp-descriptor-contract"
+version = "0.1.0"
+description = "Installed fixture for the Data Playground node descriptor contract"
+requires-python = ">=3.11"
+dependencies = ["data-playground>=0.1.0"]
+
+[project.entry-points."dataplay.plugins"]
+dp-descriptor-contract = "dp_descriptor_contract:register"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel.force-include]
+"__init__.py" = "dp_descriptor_contract/__init__.py"
+"descriptor.json" = "dp_descriptor_contract/descriptor.json"

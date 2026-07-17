@@ -79,7 +79,7 @@ export default defineConfig({
   ],
   webServer: {
     // fresh metadata DB per run (the metadata DB persists canvases; tests need a clean slate)
-    command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && DP_DATABASE_URL=sqlite:///e2e-test.db uv run dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
+    command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && DP_DATABASE_URL=sqlite:///e2e-test.db uv run --with . --with ../examples/plugins/dp_descriptor_contract dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
     url: `http://127.0.0.1:${PORT}/api/livez`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
