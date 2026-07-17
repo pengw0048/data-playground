@@ -286,3 +286,125 @@ def test_postgres_linear_checkpoint_commit_is_single_owner_and_db_time_fenced(tm
         assert reopened.content_sha256 == evidence["content_sha256"]
     finally:
         guard.close()
+
+
+def _admit_checkpoint(suffix: str):
+    uid, canvas_id, submission = f"lc-user-{suffix}", f"lc-canvas-{suffix}", str(uuid.uuid4())
+    task_id = metadb.local_run_submission_id(uid, canvas_id, submission)
+    key = f"write:{task_id}"
+    graph = {"id": canvas_id, "version": 1, "nodes": [
+        {"id": "checkpoint", "type": "write", "data": {
+            "title": "checkpoint", "config": {"filename": "checkpoint.parquet"}}},
+        {"id": "final", "type": "write", "data": {
+            "title": "final", "config": {"filename": "final.parquet"}}},
+    ], "edges": []}
+    intent = {
+        "destination": {"logicalUri": f"/tmp/{suffix}/final.parquet", "name": "final",
+                        "provider": "managed-local-file"},
+        "mode": "create", "expectedSchema": [], "idempotencyKey": key,
+        "partitions": [], "provenance": {"publication": {
+            "idempotencyKey": key, "runId": task_id, "producer": canvas_id,
+            "producerVersion": 1, "stepId": "final", "provenance": "run",
+            "fieldMappings": []}, "parents": []}}
+    with metadb.session() as session:
+        session.add(metadb.User(id=uid, name="Postgres lifecycle owner"))
+        session.flush()
+        session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Checkpoint", doc="{}"))
+    admission, _ = metadb.submit_linear_checkpoint_task(
+        uid=uid, canvas_id=canvas_id, submission_id=submission,
+        final_target_node_id="final", checkpoint_id=f"lc:{suffix}",
+        checkpoint_node_id="checkpoint", output_port_id="out",
+        task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
+        input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
+        graph_doc=graph, input_manifest=[], write_intent=intent)
+    return admission, canvas_id
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
+def test_postgres_linear_checkpoint_two_owner_retire_and_release(tmp_path):
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import linear_checkpoint as lc
+    from hub.storage import LocalStorage
+
+    admission, canvas_id = _admit_checkpoint(uuid.uuid4().hex)
+    store = LocalStorage(str(tmp_path / "outputs"))
+
+    # A producer materializes an uncommitted candidate, then its lease expires and a new attempt wins.
+    first = metadb.claim_linear_checkpoint_task(admission["task_id"], "owner-a")
+    attempt_a = first["attempts"][-1]["id"]
+    old = metadb.reserve_linear_checkpoint_candidate(
+        task_id=admission["task_id"], attempt_id=attempt_a, owner_token="owner-a",
+        namespace_id=store.namespace_id, storage_root=store.result_root,
+        writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    w = store.materialize_checkpoint(old)
+    w.write(b"stale-bytes")
+    w.seal()
+    w.release()
+    with metadb.session() as session:
+        session.get(metadb.DurableTaskAttempt, attempt_a).lease_until = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
+    current = metadb.claim_linear_checkpoint_task(admission["task_id"], "owner-b")
+    attempt_b = current["attempts"][-1]["id"]
+
+    # Race the fenced old owner against the current owner. Exactly one retire wins, the current-owner
+    # replays are idempotent (reserve), and every stale old-owner call is fenced. The winner survives.
+    def recover(attempt_id, owner):
+        return metadb.reattach_or_retire_linear_checkpoint(admission["task_id"], attempt_id, owner)
+
+    calls = [(attempt_b, "owner-b")] * 5 + [(attempt_a, "owner-a")] * 5
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(recover, attempt_id, owner) for attempt_id, owner in calls]
+    outcomes, fenced = [], 0
+    for future in futures:
+        try:
+            outcomes.append(future.result())
+        except RuntimeError as exc:
+            assert "stale or fenced" in str(exc)
+            fenced += 1
+    actions = [outcome["action"] for outcome in outcomes]
+    assert fenced == 5  # every stale old-owner recovery is refused
+    assert actions.count("retire") == 1  # exactly one superseded candidate is retired
+    assert set(actions) <= {"retire", "reserve"}
+    # Metadata retire only marks the exact artifact reclaimable; the winner deletes its file, as
+    # lc.recover_checkpoint does in production.
+    retire = next(outcome for outcome in outcomes if outcome["action"] == "retire")
+    assert retire["uri"] == old["uri"]
+    store.discard_checkpoint_artifact(retire["uri"], retire["delete_token"], retire["lock_token"])
+    assert not os.path.exists(old["uri"])  # the superseded file is gone
+    assert metadb.reconcile_linear_checkpoint(admission["task_id"])["phase"] == "pending"
+
+    # The current attempt reserves and commits a fresh generation, installing exactly one owner.
+    new = metadb.reserve_linear_checkpoint_candidate(
+        task_id=admission["task_id"], attempt_id=attempt_b, owner_token="owner-b",
+        namespace_id=store.namespace_id, storage_root=store.result_root,
+        writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    sink = io.BytesIO()
+    pq.write_table(pa.table({"id": pa.array([1, 2], pa.int64())}), sink)
+    evidence = lc.materialize_and_commit_checkpoint(
+        store, task_id=admission["task_id"], attempt_id=attempt_b, owner_token="owner-b",
+        candidate=new, content=sink.getvalue())
+    assert evidence.generation == new["generation"] and new["generation"] != old["generation"]
+
+    # Concurrent explicit releases remove the owner and lifecycle exactly once; truth survives cleanup.
+    with metadb.session() as session:
+        session.get(metadb.DurableTaskAttempt, attempt_b).lease_until = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
+
+    def release():
+        return metadb.release_linear_checkpoint(admission["task_id"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = [future.result() for future in [pool.submit(release) for _ in range(6)]]
+    assert sum(1 for r in results if r is not None) == 1
+    with metadb.session() as session:
+        from sqlalchemy import func, select
+
+        assert session.get(metadb.DurableCheckpoint, admission["task_id"]) is None
+        assert session.scalar(select(func.count()).select_from(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.uri == new["uri"])) == 0
+    store.prune_results()
+    assert not os.path.exists(new["uri"])

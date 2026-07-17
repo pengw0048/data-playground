@@ -4,14 +4,19 @@ This is the second #418-dependent leaf. It turns one reserved DB-only candidate 
 ``metadb.reserve_linear_checkpoint_candidate``) into committed checkpoint truth backed by a single
 durable owner, and can rebuild a validated reader after the producing process is gone.
 
-It deliberately owns no attempt transfer/retention, terminal abort/release, GC, backup/restore,
-product route/worker/Jobs, or generic checkpoint SPI. Checkpoint truth is proven from the exact
-committed bytes on disk; no caller-supplied rows, hash, or schema can establish it.
+It also owns the exact hidden lifecycle after commit: reattaching or retiring an uncommitted
+candidate under a fenced recovery attempt, aborting uncommitted work, and explicitly releasing
+committed truth. It deliberately owns no product route/worker/Jobs, generic checkpoint SPI, GC
+policy, or backup/restore driver (retired/aborted/released artifacts become reclaimable through the
+existing bounded local-result GC). Checkpoint truth is proven from the exact committed bytes on disk;
+no caller-supplied rows, hash, or schema can establish it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import os
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -123,3 +128,81 @@ def reopen_checkpoint(storage, task_id: str) -> tuple[object, CheckpointEvidence
         raise RuntimeError("checkpoint is not committed")
     guard = storage.reopen_checkpoint(committed)
     return guard, CheckpointEvidence.from_doc(committed)
+
+
+def _reclaim_retired(storage, outcome: dict) -> None:
+    """Promptly delete a just-retired/aborted candidate; bounded GC is the durable guarantee."""
+    uri = outcome.get("uri")
+    if uri is None:
+        return
+    # The DB already marked the exact artifact deleting (reclaimable). A transient filesystem failure
+    # here must not undo that outcome — the local-result reaper finishes the exact deletion later.
+    with contextlib.suppress(OSError, RuntimeError):
+        storage.discard_checkpoint_artifact(
+            uri, outcome["delete_token"], outcome.get("lock_token"))
+
+
+def abort_checkpoint(storage, *, task_id: str, attempt_id: str, owner_token: str) -> None:
+    """Abort the current uncommitted candidate under its exact attempt and reclaim its exact file.
+
+    Refuses committed truth and is idempotent under response loss: a replay finds nothing bound and
+    leaves already-reclaimable state untouched.
+    """
+    outcome = metadb.abort_linear_checkpoint_candidate(task_id, attempt_id, owner_token)
+    _reclaim_retired(storage, outcome)
+
+
+def release_checkpoint(task_id: str) -> bool:
+    """Explicitly release committed truth so its bytes become reclaimable; idempotent when gone."""
+    return metadb.release_linear_checkpoint(task_id) is not None
+
+
+def recover_checkpoint(
+        storage, *, task_id: str, attempt_id: str, owner_token: str) -> dict:
+    """Decide, under the current fenced attempt, whether to reattach, retire, reserve, or read truth.
+
+    ``reattach`` returns the exact same-generation candidate for :func:`commit_reattached_checkpoint`;
+    ``retire`` has already abandoned the superseded candidate's exact file before returning; ``reserve``
+    means nothing is bound; ``committed`` returns already-won evidence a late owner must not mutate.
+    """
+    outcome = metadb.reattach_or_retire_linear_checkpoint(task_id, attempt_id, owner_token)
+    action = outcome["action"]
+    if action == "committed":
+        return {"action": "committed",
+                "evidence": CheckpointEvidence.from_doc(outcome["committed"])}
+    if action == "reattach":
+        return {"action": "reattach", "candidate": outcome["candidate"]}
+    if action == "retire":
+        _reclaim_retired(storage, outcome)
+        return {"action": "retire"}
+    return {"action": "reserve"}
+
+
+def commit_reattached_checkpoint(
+        storage, *, task_id: str, attempt_id: str, owner_token: str,
+        candidate: dict) -> CheckpointEvidence:
+    """Prove and fence-commit an already-materialized same-generation candidate after reattach.
+
+    The exact reserved file is never re-created; it is reopened under its own lock, proven from the
+    held descriptor, and committed. The pre-existing file is never destroyed on a failure, and any
+    rejection is surfaced unchanged; commit-response loss is recovered by the caller through
+    :func:`reconcile_checkpoint`, exactly as :func:`materialize_and_commit_checkpoint` requires.
+    """
+    lock_fd = storage.reattach_checkpoint(candidate)
+    proof = None
+    try:
+        proof = storage.open_checkpoint_proof(candidate["uri"], lock_fd)
+        evidence = proof.evidence
+        proof.recheck()
+        doc = metadb.commit_linear_checkpoint(
+            task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,
+            namespace_id=candidate["namespace_id"], writer_token=candidate["writer_token"],
+            lock_token=candidate["lock_token"], generation=candidate["generation"],
+            rows=evidence["rows"], size_bytes=evidence["bytes"],
+            content_sha256=evidence["content_sha256"], schema_sha256=evidence["schema_sha256"],
+            dev=evidence["dev"], ino=evidence["ino"])
+    finally:
+        if proof is not None:
+            proof.close()
+        os.close(lock_fd)
+    return CheckpointEvidence.from_doc(doc)
