@@ -854,6 +854,39 @@ class LocalStorage:
             raise
         return guard
 
+    def reattach_checkpoint(self, candidate: dict) -> int:
+        """Reopen only the exact reserved lock of a same-generation candidate, verifying its token.
+
+        The returned descriptor is the caller's fence for proving and committing an already
+        materialized candidate after a transient process loss; it never creates or discovers a file.
+        """
+        if (candidate.get("namespace_id") != self.namespace_id
+                or candidate.get("storage_root") != self.result_root):
+            raise RuntimeError("checkpoint candidate belongs to a different namespace")
+        if not candidate.get("lock_protected") or not candidate.get("lock_token"):
+            raise RuntimeError("checkpoint reattach requires a protected lock")
+        if not self.lock_supported:
+            raise RuntimeError("checkpoint reattach requires OS lock support")
+        _, lock_name = self._result_names(str(candidate["uri"]))
+        if lock_name != candidate.get("lock_name"):
+            raise RuntimeError("checkpoint candidate lock name is inconsistent")
+        lock_fd = self._open_shared_lock(lock_name)
+        try:
+            if self._read_lock_token(lock_fd) != str(candidate["lock_token"]):
+                raise RuntimeError("checkpoint reattach lock token changed")
+        except Exception:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            raise
+        return lock_fd
+
+    def discard_checkpoint_artifact(
+            self, uri: str, delete_token: str, lock_token: str | None) -> None:
+        """Delete the exact aborted/retired candidate file and lock, or just its row if unmaterialized."""
+        self.validate_result_uri(uri)
+        self._delete_claimed_result(
+            uri, str(delete_token), lock_token=lock_token, explicit=True)
+
     def list_outputs(self) -> list[str]:
         if not os.path.isdir(self.root):
             return []
@@ -1326,7 +1359,13 @@ class LocalStorage:
         fd = None
         if self.lock_supported:
             flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(lock_name, flags, 0o600, dir_fd=self._result_lock_dir_fd)
+            try:
+                fd = os.open(lock_name, flags, 0o600, dir_fd=self._result_lock_dir_fd)
+            except FileNotFoundError:
+                # A reserved candidate that never materialized (e.g. an aborted checkpoint) has a
+                # deleting DB row but no lock/data file. Its writer is fenced and nothing can hold the
+                # absent lock, so retire the row without one instead of stalling the reclaim forever.
+                fd = None
         try:
             if fd is not None:
                 self._require_regular_lock(fd)

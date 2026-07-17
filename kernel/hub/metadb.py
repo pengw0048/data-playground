@@ -4861,6 +4861,14 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(admission)
         for wait in durable_waits:
             s.delete(wait)
+        if durable_checkpoints:
+            # Terminal hidden checkpoints must release their durable owner / retire their candidate
+            # under the registry lock before the rows vanish, or a committed artifact would stay
+            # pinned forever and a reserved one would leak its exact writer file.
+            _lock_local_result_registry(s)
+            task_by_id = {task.id: task for task in durable_tasks}
+            for checkpoint in durable_checkpoints:
+                _purge_linear_checkpoint_for_delete(s, task_by_id[checkpoint.task_id], checkpoint)
         for checkpoint in durable_checkpoints:
             s.delete(checkpoint)
         if durable_checkpoints:
@@ -8033,6 +8041,224 @@ def linear_checkpoint_committed(task_id: str) -> dict | None:
             return None
         _lock_local_result_registry(s)
         return _linear_checkpoint_committed_doc(s, task, checkpoint)
+
+
+def _linear_checkpoint_latest_attempt(s, task_id: str) -> DurableTaskAttempt | None:
+    return s.scalar(select(DurableTaskAttempt).where(
+        DurableTaskAttempt.task_id == str(task_id)).order_by(
+            DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+
+
+def _detach_linear_checkpoint_candidate(
+        s, checkpoint: DurableCheckpoint, artifact: LocalResultArtifact | None,
+        now) -> str | None:
+    """Retire one uncommitted candidate: clear its binding and abandon only its exact writer file."""
+    delete_token = None
+    if artifact is not None:
+        artifact.writer_run_id = None
+        artifact.writer_token = None
+        artifact.state = "deleting"
+        artifact.delete_token = uuid.uuid4().hex
+        artifact.delete_attempted_at = now
+        delete_token = artifact.delete_token
+    checkpoint.phase = "pending"
+    checkpoint.candidate_uri = None
+    checkpoint.candidate_generation = None
+    checkpoint.candidate_attempt_id = None
+    checkpoint.candidate_dev = None
+    checkpoint.candidate_ino = None
+    checkpoint.updated_at = now
+    return delete_token
+
+
+def abort_linear_checkpoint_candidate(
+        task_id: str, attempt_id: str, owner_token: str) -> dict:
+    """Abort the exact current uncommitted candidate; refuse committed truth; idempotent on replay."""
+    task_id, attempt_id, owner_token = str(task_id), str(attempt_id), str(owner_token)
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        latest = _linear_checkpoint_latest_attempt(s, task_id)
+        if (task is None or checkpoint is None or latest is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        if checkpoint.phase == "committed":
+            raise RuntimeError("cannot abort a committed checkpoint")
+        now = _durable_task_db_now(s)
+        lease = latest.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task.status != "running" or latest.id != attempt_id
+                or latest.status != "running" or latest.owner_token != owner_token
+                or lease is None or lease <= now):
+            raise RuntimeError("checkpoint abort owner is stale or fenced")
+        candidate = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        if candidate is None:
+            # Response-loss replay: the exact candidate is already retired and reclaimable.
+            return {"uri": None, "delete_token": None, "lock_token": None,
+                    "namespace_id": None, "lock_name": None}
+        if candidate["attempt_id"] != attempt_id:
+            raise RuntimeError("checkpoint abort does not own the current generation")
+        artifact = s.get(LocalResultArtifact, candidate["uri"], with_for_update=True)
+        token = _detach_linear_checkpoint_candidate(s, checkpoint, artifact, now)
+        s.flush()
+        return {"uri": candidate["uri"], "delete_token": token,
+                "lock_token": candidate["lock_token"], "namespace_id": candidate["namespace_id"],
+                "lock_name": candidate["lock_name"]}
+
+
+def reattach_or_retire_linear_checkpoint(
+        task_id: str, attempt_id: str, owner_token: str) -> dict:
+    """Recover after loss: reattach the exact same-generation candidate or retire a superseded one.
+
+    Only the current unexpired attempt may act. A candidate produced by the same attempt is safely
+    reattached with its generation preserved; a candidate stranded by a fenced older attempt is
+    retired and abandoned before any replacement generation is reserved. Committed truth is never
+    mutated — a late owner only reads it back.
+    """
+    task_id, attempt_id, owner_token = str(task_id), str(attempt_id), str(owner_token)
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        latest = _linear_checkpoint_latest_attempt(s, task_id)
+        if (task is None or checkpoint is None or latest is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        if checkpoint.phase == "committed":
+            return {"action": "committed",
+                    "committed": _linear_checkpoint_committed_doc(s, task, checkpoint)}
+        now = _durable_task_db_now(s)
+        lease = latest.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task.status != "running" or latest.id != attempt_id
+                or latest.status != "running" or latest.owner_token != owner_token
+                or lease is None or lease <= now):
+            raise RuntimeError("checkpoint recovery owner is stale or fenced")
+        candidate = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        if candidate is None:
+            return {"action": "reserve"}
+        if candidate["attempt_id"] == attempt_id:
+            return {"action": "reattach", "candidate": candidate}
+        artifact = s.get(LocalResultArtifact, candidate["uri"], with_for_update=True)
+        token = _detach_linear_checkpoint_candidate(s, checkpoint, artifact, now)
+        s.flush()
+        return {"action": "retire", "uri": candidate["uri"], "delete_token": token,
+                "lock_token": candidate["lock_token"], "namespace_id": candidate["namespace_id"],
+                "lock_name": candidate["lock_name"]}
+
+
+def release_linear_checkpoint(task_id: str) -> dict | None:
+    """Explicitly release one committed checkpoint: drop its owner and full hidden lifecycle in order.
+
+    Validation fails closed and preserves primary truth; only a fully consistent committed set is
+    released. The artifact keeps its bytes but becomes unreferenced, so bounded GC may reclaim it.
+    Idempotent: a lifecycle already removed reports no release.
+    """
+    task_id = str(task_id)
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        if task is None and checkpoint is None:
+            return None
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        latest = _linear_checkpoint_latest_attempt(s, task_id)
+        _lock_local_result_registry(s)
+        committed = _linear_checkpoint_committed_doc(s, task, checkpoint)
+        now = _durable_task_db_now(s)
+        if latest is not None and latest.status == "running":
+            lease = latest.lease_until
+            if lease is not None and lease.tzinfo is None:
+                lease = lease.replace(tzinfo=datetime.timezone.utc)
+            if lease is not None and lease > now:
+                raise RuntimeError("cannot release a checkpoint with a live attempt lease")
+        artifact = s.get(LocalResultArtifact, committed["uri"], with_for_update=True)
+        for ref in s.scalars(select(LocalResultReference).where(
+                LocalResultReference.uri == committed["uri"],
+                LocalResultReference.owner_kind == _LINEAR_CHECKPOINT_OWNER_KIND,
+        ).with_for_update()):
+            s.delete(ref)
+        if artifact is not None:
+            artifact.updated_at = now
+        s.delete(checkpoint)
+        s.flush()
+        for attempt in s.scalars(select(DurableTaskAttempt).where(
+                DurableTaskAttempt.task_id == task.id).with_for_update()):
+            s.delete(attempt)
+        s.flush()
+        s.delete(task)
+        return {"released": True, "uri": committed["uri"],
+                "namespace_id": committed["namespace_id"],
+                "checkpoint_id": committed["checkpoint_id"]}
+
+
+def _purge_linear_checkpoint_for_delete(
+        s, task: DurableTask, checkpoint: DurableCheckpoint) -> None:
+    """Fail-closed teardown of one terminal hidden checkpoint before its rows are deleted.
+
+    Committed truth drops its sole durable owner and keeps its bytes reclaimable; an uncommitted
+    candidate is retired and abandoned. Only exact owner/writer state is touched, and any disagreement
+    with committed/candidate truth raises so a canvas is never deleted over inconsistent state.
+    """
+    if task.task_kind != "linear_checkpoint_write":
+        return
+    if checkpoint.phase == "committed":
+        committed = _linear_checkpoint_committed_doc(s, task, checkpoint)
+        s.get(LocalResultArtifact, committed["uri"], with_for_update=True)
+        for ref in s.scalars(select(LocalResultReference).where(
+                LocalResultReference.uri == committed["uri"],
+                LocalResultReference.owner_kind == _LINEAR_CHECKPOINT_OWNER_KIND,
+        ).with_for_update()):
+            s.delete(ref)
+        s.flush()
+        return
+    candidate = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+    if candidate is None:
+        return
+    now = _db_now(s)
+    artifact = s.get(LocalResultArtifact, candidate["uri"], with_for_update=True)
+    _detach_linear_checkpoint_candidate(s, checkpoint, artifact, now)
+    s.flush()
+
+
+def linear_checkpoint_restore_audit() -> list[dict]:
+    """Validate every hidden checkpoint forms one complete consistency set; raise to reject a restore.
+
+    A committed set must have consistent evidence, a ready artifact, and exactly one durable owner; an
+    uncommitted set must have a coherent candidate binding; and no durable owner may dangle without a
+    committed checkpoint. Any missing/mismatched member raises rather than fabricating or dropping
+    truth, so backup/restore accepts or rejects the lifecycle as a unit.
+    """
+    report: list[dict] = []
+    with session() as s:
+        tasks = {t.id: t for t in s.scalars(select(DurableTask).where(
+            DurableTask.task_kind == "linear_checkpoint_write").order_by(DurableTask.id))}
+        checkpoints = list(s.scalars(
+            select(DurableCheckpoint).order_by(DurableCheckpoint.task_id)))
+        _lock_local_result_registry(s)
+        committed_keys: set[str] = set()
+        for checkpoint in checkpoints:
+            task = tasks.get(checkpoint.task_id)
+            if task is None:
+                raise RuntimeError("restored checkpoint has no owning hidden task")
+            if checkpoint.phase == "committed":
+                doc = _linear_checkpoint_committed_doc(s, task, checkpoint)
+                committed_keys.add(checkpoint.checkpoint_id)
+                report.append({"task_id": task.id, "phase": "committed", "uri": doc["uri"]})
+            else:
+                candidate = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+                report.append({"task_id": task.id, "phase": checkpoint.phase,
+                               "uri": candidate["uri"] if candidate else None})
+        for ref in s.scalars(select(LocalResultReference).where(
+                LocalResultReference.owner_kind == _LINEAR_CHECKPOINT_OWNER_KIND).order_by(
+                    LocalResultReference.owner_key)):
+            if ref.owner_key not in committed_keys:
+                raise RuntimeError("restored durable checkpoint owner has no committed checkpoint")
+    return report
 
 
 def begin_local_result(uri: str, namespace_id: str, storage_root: str, lock_name: str,
