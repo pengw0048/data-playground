@@ -7711,6 +7711,10 @@ def _linear_checkpoint_candidate_doc(
             or checkpoint.candidate_attempt_id is None or len(owned) != 1
             or owned[0].uri != checkpoint.candidate_uri):
         raise RuntimeError("checkpoint candidate binding is incomplete")
+    candidate_attempt = s.get(
+        DurableTaskAttempt, checkpoint.candidate_attempt_id, with_for_update=True)
+    if candidate_attempt is None or candidate_attempt.task_id != task.id:
+        raise RuntimeError("checkpoint candidate attempt belongs to a different task")
     artifact = owned[0]
     generation = _linear_checkpoint_generation(
         task, checkpoint, checkpoint.candidate_attempt_id)

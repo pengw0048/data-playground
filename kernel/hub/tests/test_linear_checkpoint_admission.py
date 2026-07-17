@@ -201,6 +201,70 @@ def test_reservation_is_db_only_exact_and_replay_safe(tmp_path):
         session.get(metadb.DurableCheckpoint, admission["task_id"]).candidate_generation = original
 
 
+def test_candidate_attempt_must_belong_to_checkpoint_task(tmp_path):
+    values = _identity()
+    admission, _attempt, _kwargs, binding = _claim_and_reserve(values, tmp_path)
+    other, _ = _submit(_identity())
+
+    with metadb.session() as session:
+        task = session.get(metadb.DurableTask, admission["task_id"])
+        checkpoint = session.get(metadb.DurableCheckpoint, admission["task_id"])
+        old_artifact = session.get(metadb.LocalResultArtifact, binding["uri"])
+        generation = metadb._linear_checkpoint_generation(
+            task, checkpoint, other["attempt_id"])
+        basename = f"{metadb._LOCAL_RESULT_PREFIX}checkpoint_{generation}.parquet"
+        uri = os.path.join(old_artifact.storage_root, basename)
+        session.add(metadb.LocalResultArtifact(
+            uri=uri,
+            namespace_id=old_artifact.namespace_id,
+            storage_root=old_artifact.storage_root,
+            lock_name=f"{basename[:-len('.parquet')]}.lock",
+            lock_token=old_artifact.lock_token,
+            lock_protected=old_artifact.lock_protected,
+            state="writing",
+            writer_run_id=task.id,
+            writer_token=old_artifact.writer_token,
+            created_at=old_artifact.created_at,
+        ))
+        session.flush()
+        checkpoint.candidate_uri = uri
+        checkpoint.candidate_generation = generation
+        checkpoint.candidate_attempt_id = other["attempt_id"]
+        session.flush()
+        session.delete(old_artifact)
+
+    with pytest.raises(RuntimeError, match="different task"):
+        metadb.linear_checkpoint_candidate(admission["task_id"])
+
+
+def test_reservation_update_failure_rolls_back_flushed_artifact(tmp_path):
+    values = _identity()
+    admission, _ = _submit(values)
+    claimed = metadb.claim_linear_checkpoint_task(admission["task_id"], "rollback-owner")
+    attempt_id = claimed["attempts"][-1]["id"]
+
+    def fail_checkpoint_update(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().lower().startswith("update durable_checkpoints"):
+            raise RuntimeError("injected checkpoint binding failure")
+
+    event.listen(metadb.engine(), "before_cursor_execute", fail_checkpoint_update)
+    try:
+        with pytest.raises(RuntimeError, match="injected checkpoint binding failure"):
+            metadb.reserve_linear_checkpoint_candidate(
+                task_id=admission["task_id"], attempt_id=attempt_id,
+                owner_token="rollback-owner", namespace_id=uuid.uuid4().hex,
+                storage_root=str(tmp_path / ".dp-results"),
+                writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    finally:
+        event.remove(metadb.engine(), "before_cursor_execute", fail_checkpoint_update)
+
+    assert metadb.linear_checkpoint_candidate(admission["task_id"]) is None
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.LocalResultArtifact).where(
+                metadb.LocalResultArtifact.writer_run_id == admission["task_id"])) == 0
+
+
 def test_stale_owner_and_new_attempt_cannot_rebind_old_candidate(tmp_path):
     stale = _identity()
     admission, _ = _submit(stale)

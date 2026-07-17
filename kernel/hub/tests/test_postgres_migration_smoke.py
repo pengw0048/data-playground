@@ -169,6 +169,17 @@ def test_postgres_linear_checkpoint_db_time_fencing_and_reservation_race(tmp_pat
     writers = [uuid.uuid4().hex for _ in range(8)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(reserve, writer) for writer in writers]
-    winners = [future.result() for future in futures if future.exception() is None]
+    winners, errors = [], []
+    for future in futures:
+        try:
+            winners.append(future.result())
+        except Exception as exc:
+            errors.append(exc)
     assert len(winners) == 1
+    assert len(errors) == 7
+    assert all(
+        isinstance(error, RuntimeError)
+        and "changed exact authority" in str(error)
+        for error in errors
+    )
     assert metadb.linear_checkpoint_candidate(admission["task_id"]) == winners[0]
