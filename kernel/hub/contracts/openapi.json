@@ -1186,6 +1186,82 @@
         "title": "DriverStep",
         "type": "object"
       },
+      "DurableExternalWaitView": {
+        "properties": {
+          "attemptNumber": {
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Attemptnumber",
+            "type": "integer"
+          },
+          "canRetry": {
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "cancelRequested": {
+            "title": "Cancelrequested",
+            "type": "boolean"
+          },
+          "deadlineAt": {
+            "title": "Deadlineat",
+            "type": "string"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "nextPollAt": {
+            "title": "Nextpollat",
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "unsubmitted",
+              "submitting",
+              "accepted",
+              "running",
+              "provider_succeeded",
+              "provider_failed",
+              "provider_cancelled",
+              "cancelled_before_submit"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "pollCount": {
+            "maximum": 64.0,
+            "minimum": 0.0,
+            "title": "Pollcount",
+            "type": "integer"
+          },
+          "providerKind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Providerkind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "providerKind",
+          "phase",
+          "nextPollAt",
+          "deadlineAt",
+          "pollCount",
+          "attemptNumber",
+          "cancelRequested",
+          "canRetry"
+        ],
+        "title": "DurableExternalWaitView",
+        "type": "object"
+      },
       "DurableTaskAttemptView": {
         "properties": {
           "attemptNumber": {
@@ -5530,6 +5606,16 @@
               }
             ],
             "title": "Error"
+          },
+          "externalWait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableExternalWaitView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "id": {
             "title": "Id",
@@ -13944,7 +14030,7 @@
     },
     "/api/run/{run_id}/retry": {
       "post": {
-        "description": "Explicitly create the next bounded attempt for the one durable local Write task.",
+        "description": "Explicitly create the next bounded attempt for a durable Task.",
         "operationId": "run_retry_api_run__run_id__retry_post",
         "parameters": [
           {

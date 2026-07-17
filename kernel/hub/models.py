@@ -1325,6 +1325,19 @@ class DurableTaskAttemptView(Wire):
     completed_at: str | None = None
 
 
+class DurableExternalWaitView(Wire):
+    provider_kind: str = Field(min_length=1, max_length=64)
+    phase: Literal["unsubmitted", "submitting", "accepted", "running", "provider_succeeded",
+                   "provider_failed", "provider_cancelled", "cancelled_before_submit"]
+    next_poll_at: str
+    deadline_at: str
+    poll_count: int = Field(ge=0, le=64)
+    attempt_number: int = Field(ge=1, le=3)
+    cancel_requested: bool
+    can_retry: bool
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+
+
 class WorkspaceRunRecord(Wire):
     """One visible run in the workspace-wide, read-only Jobs projection."""
 
@@ -1355,6 +1368,7 @@ class WorkspaceRunRecord(Wire):
     can_retry: bool = False
     write_intent: WriteIntent | None = None
     output_receipt: WriteReceipt | None = None
+    external_wait: DurableExternalWaitView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":

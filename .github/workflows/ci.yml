@@ -175,6 +175,8 @@ jobs:
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_managed_local_lance_writes.py
+      - name: Verify durable external wait contracts on PostgreSQL
+        run: cd kernel && uv run pytest -q hub/tests/test_durable_external_wait_tasks.py
       - name: Verify durable Ray Jobs lifecycle on PostgreSQL
         # The PostgreSQL-gated Ray Jobs races skip on SQLite, so kernel-tests never runs them; select
         # them here by name so a regression cannot pass CI while every check stays green.
