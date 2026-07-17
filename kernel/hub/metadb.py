@@ -392,6 +392,12 @@ class DurableCheckpoint(Base):
         String, ForeignKey("durable_task_attempts.id"), nullable=True)
     candidate_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     candidate_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    committed_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    committed_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    schema_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    committed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (
@@ -399,7 +405,8 @@ class DurableCheckpoint(Base):
         UniqueConstraint("candidate_uri", name="uq_durable_checkpoint_candidate_uri"),
         UniqueConstraint(
             "candidate_generation", name="uq_durable_checkpoint_candidate_generation"),
-        CheckConstraint("phase IN ('pending','reserved')", name="ck_durable_checkpoint_phase"),
+        CheckConstraint(
+            "phase IN ('pending','reserved','committed')", name="ck_durable_checkpoint_phase"),
         CheckConstraint(
             "(candidate_uri IS NULL AND candidate_generation IS NULL "
             "AND candidate_attempt_id IS NULL) OR (candidate_uri IS NOT NULL "
@@ -412,8 +419,18 @@ class DurableCheckpoint(Base):
             name="ck_durable_checkpoint_candidate_inode"),
         CheckConstraint(
             "(phase = 'pending' AND candidate_uri IS NULL) OR "
-            "(phase = 'reserved' AND candidate_uri IS NOT NULL)",
+            "(phase IN ('reserved','committed') AND candidate_uri IS NOT NULL)",
             name="ck_durable_checkpoint_phase_binding"),
+        CheckConstraint(
+            "(phase <> 'committed' AND committed_rows IS NULL AND committed_bytes IS NULL "
+            "AND content_sha256 IS NULL AND schema_sha256 IS NULL AND committed_at IS NULL "
+            "AND candidate_dev IS NULL AND candidate_ino IS NULL) OR "
+            "(phase = 'committed' AND committed_rows IS NOT NULL AND committed_bytes IS NOT NULL "
+            "AND content_sha256 IS NOT NULL AND schema_sha256 IS NOT NULL "
+            "AND committed_at IS NOT NULL "
+            "AND candidate_dev IS NOT NULL AND candidate_ino IS NOT NULL "
+            "AND committed_rows >= 0 AND committed_bytes >= 0)",
+            name="ck_durable_checkpoint_committed_evidence"),
     )
 
 
@@ -7438,6 +7455,7 @@ _LOCAL_RESULT_OWNER_KINDS = {
     "profile_job", "run_input_admission", "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
+_LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
 _LOCAL_RESULT_DIR = ".dp-results"
 _LOCAL_RESULT_PREFIX = "__result_"
 _LOCAL_RESULT_MAX_URI = 4096
@@ -7826,6 +7844,195 @@ def reserve_linear_checkpoint_candidate(
         checkpoint.updated_at = now
         s.flush()
         return _linear_checkpoint_candidate_doc(s, task, checkpoint)
+
+
+def _linear_checkpoint_evidence_shape(
+        *, generation, rows, size_bytes, content_sha256, schema_sha256, dev, ino):
+    """Reject any non-canonical committed-evidence value before it can bind checkpoint truth."""
+    generation = str(generation)
+    content_sha256, schema_sha256 = str(content_sha256), str(schema_sha256)
+    if (re.fullmatch(r"[0-9a-f]{64}", generation) is None
+            or re.fullmatch(r"[0-9a-f]{64}", content_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", schema_sha256) is None
+            or not isinstance(rows, int) or isinstance(rows, bool) or rows < 0
+            or not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0
+            or not isinstance(dev, int) or isinstance(dev, bool) or dev < 0
+            or not isinstance(ino, int) or isinstance(ino, bool) or ino < 0):
+        raise ValueError("checkpoint commit evidence is not canonical")
+    return (generation, int(rows), int(size_bytes),
+            content_sha256, schema_sha256, int(dev), int(ino))
+
+
+def _linear_checkpoint_committed_doc(s, task: DurableTask, checkpoint: DurableCheckpoint) -> dict:
+    """One committed checkpoint is truth only when evidence, artifact, and one owner all agree."""
+    if (checkpoint.phase != "committed" or checkpoint.candidate_uri is None
+            or checkpoint.candidate_generation is None
+            or checkpoint.candidate_attempt_id is None
+            or checkpoint.candidate_dev is None or checkpoint.candidate_ino is None
+            or checkpoint.committed_rows is None or checkpoint.committed_bytes is None
+            or checkpoint.content_sha256 is None or checkpoint.schema_sha256 is None
+            or checkpoint.committed_at is None):
+        raise RuntimeError("committed checkpoint evidence is incomplete")
+    artifact = s.get(LocalResultArtifact, checkpoint.candidate_uri, with_for_update=True)
+    candidate_attempt = s.get(
+        DurableTaskAttempt, checkpoint.candidate_attempt_id, with_for_update=True)
+    refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.uri == checkpoint.candidate_uri).order_by(
+            LocalResultReference.owner_kind, LocalResultReference.owner_key).with_for_update()))
+    # Exactly one durable owner must exist. Ephemeral read leases are transient readers, not owners,
+    # so an active reopen guard must not make committed truth look inconsistent.
+    owners = [ref for ref in refs if ref.owner_kind != _LOCAL_RESULT_EPHEMERAL_OWNER_KIND]
+    generation = _linear_checkpoint_generation(
+        task, checkpoint, checkpoint.candidate_attempt_id)
+    if (artifact is None or artifact.uri != checkpoint.candidate_uri
+            or artifact.state != "ready" or artifact.committed_at is None
+            or artifact.writer_run_id is not None or artifact.writer_token is not None
+            or artifact.delete_token is not None or artifact.delete_attempted_at is not None
+            or re.fullmatch(r"[0-9a-f]{32}", artifact.namespace_id) is None
+            or bool(artifact.lock_protected) != bool(artifact.lock_token)
+            or (artifact.lock_token is not None
+                and re.fullmatch(r"[0-9a-f]{32}", artifact.lock_token) is None)
+            or checkpoint.candidate_generation != generation
+            or candidate_attempt is None or candidate_attempt.task_id != task.id
+            or len(owners) != 1 or owners[0].owner_kind != _LINEAR_CHECKPOINT_OWNER_KIND
+            or owners[0].owner_key != checkpoint.checkpoint_id):
+        raise RuntimeError("committed checkpoint truth is inconsistent")
+    committed_at = checkpoint.committed_at
+    if committed_at.tzinfo is None:
+        committed_at = committed_at.replace(tzinfo=datetime.timezone.utc)
+    return {
+        "task_id": task.id, "checkpoint_id": checkpoint.checkpoint_id,
+        "checkpoint_node_id": checkpoint.checkpoint_node_id,
+        "output_port_id": checkpoint.output_port_id,
+        "task_intent_sha256": checkpoint.task_intent_sha256,
+        "graph_prefix_sha256": checkpoint.graph_prefix_sha256,
+        "input_manifest_sha256": checkpoint.input_manifest_sha256,
+        "uri": artifact.uri, "generation": generation,
+        "attempt_id": checkpoint.candidate_attempt_id,
+        "namespace_id": artifact.namespace_id, "storage_root": artifact.storage_root,
+        "lock_name": artifact.lock_name, "lock_token": artifact.lock_token,
+        "lock_protected": bool(artifact.lock_protected), "state": artifact.state,
+        "phase": "committed",
+        "rows": int(checkpoint.committed_rows), "bytes": int(checkpoint.committed_bytes),
+        "content_sha256": checkpoint.content_sha256, "schema_sha256": checkpoint.schema_sha256,
+        "dev": int(checkpoint.candidate_dev), "ino": int(checkpoint.candidate_ino),
+        "committed_at": committed_at,
+    }
+
+
+def commit_linear_checkpoint(
+        *, task_id: str, attempt_id: str, owner_token: str, namespace_id: str,
+        writer_token: str, lock_token: str | None, generation: str,
+        rows: int, size_bytes: int, content_sha256: str, schema_sha256: str,
+        dev: int, ino: int) -> dict:
+    """Fence one exact checkpoint commit under the current DB-time lease and install one owner."""
+    task_id, attempt_id, owner_token = str(task_id), str(attempt_id), str(owner_token)
+    namespace_id, writer_token = str(namespace_id), str(writer_token)
+    lock_token = str(lock_token) if lock_token is not None else None
+    (generation, rows, size_bytes, content_sha256, schema_sha256, dev,
+     ino) = _linear_checkpoint_evidence_shape(
+        generation=generation, rows=rows, size_bytes=size_bytes,
+        content_sha256=content_sha256, schema_sha256=schema_sha256, dev=dev, ino=ino)
+    if (re.fullmatch(r"[0-9a-f]{32}", namespace_id) is None
+            or re.fullmatch(r"[0-9a-f]{32}", writer_token) is None
+            or (lock_token is not None and re.fullmatch(r"[0-9a-f]{32}", lock_token) is None)):
+        raise ValueError("checkpoint commit authority is not canonical")
+    with session() as s:
+        task = _lock_durable_task_for_write(s, task_id)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        latest = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task_id).order_by(
+                DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+        if (task is None or checkpoint is None or latest is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        if checkpoint.phase == "committed":
+            # Commit-before-response-loss: return the original evidence, never a fabricated one.
+            committed = _linear_checkpoint_committed_doc(s, task, checkpoint)
+            if (committed["generation"] != generation or committed["attempt_id"] != attempt_id
+                    or committed["namespace_id"] != namespace_id
+                    or committed["rows"] != rows or committed["bytes"] != size_bytes
+                    or committed["content_sha256"] != content_sha256
+                    or committed["schema_sha256"] != schema_sha256
+                    or committed["dev"] != dev or committed["ino"] != ino):
+                raise RuntimeError("checkpoint commit replay changed committed evidence")
+            return committed
+        existing = _linear_checkpoint_candidate_doc(s, task, checkpoint)
+        if existing is None:
+            raise RuntimeError("checkpoint candidate is not reserved for commit")
+        now = _durable_task_db_now(s)
+        lease = latest.lease_until
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task.status != "running" or task.cancel_requested
+                or latest.id != attempt_id or latest.status != "running"
+                or latest.owner_token != owner_token or lease is None or lease <= now):
+            raise RuntimeError("checkpoint commit owner is stale or fenced")
+        if (existing["generation"] != generation or existing["attempt_id"] != attempt_id
+                or existing["namespace_id"] != namespace_id
+                or existing["writer_token"] != writer_token
+                or existing["lock_token"] != lock_token):
+            raise RuntimeError("checkpoint commit does not match the reserved candidate")
+        artifact = s.get(LocalResultArtifact, existing["uri"], with_for_update=True)
+        if (artifact is None or artifact.state != "writing"
+                or artifact.committed_at is not None
+                or artifact.writer_run_id != task.id or artifact.writer_token != writer_token):
+            raise RuntimeError("checkpoint artifact is not the current uncommitted writer")
+        if s.scalar(select(LocalResultReference.uri).where(
+                LocalResultReference.uri == artifact.uri).limit(1)) is not None:
+            raise RuntimeError("checkpoint artifact already has a reference before commit")
+        # Install the sole durable owner, then mark ready and clear the writer pair atomically so no
+        # window exists where the committed file is both unreferenced and owner-cleared.
+        s.add(LocalResultReference(
+            uri=artifact.uri, owner_kind=_LINEAR_CHECKPOINT_OWNER_KIND,
+            owner_key=checkpoint.checkpoint_id))
+        artifact.state = "ready"
+        artifact.committed_at = now
+        artifact.writer_run_id = None
+        artifact.writer_token = None
+        checkpoint.phase = "committed"
+        checkpoint.candidate_dev = dev
+        checkpoint.candidate_ino = ino
+        checkpoint.committed_rows = rows
+        checkpoint.committed_bytes = size_bytes
+        checkpoint.content_sha256 = content_sha256
+        checkpoint.schema_sha256 = schema_sha256
+        checkpoint.committed_at = now
+        checkpoint.updated_at = now
+        s.flush()
+        return _linear_checkpoint_committed_doc(s, task, checkpoint)
+
+
+def reconcile_linear_checkpoint(task_id: str) -> dict | None:
+    """Reconcile after an unknown commit response; committed truth or the exact reserved binding."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
+        if task is None and checkpoint is None:
+            return None
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        _lock_local_result_registry(s)
+        if checkpoint.phase == "committed":
+            return _linear_checkpoint_committed_doc(s, task, checkpoint)
+        return {"phase": checkpoint.phase,
+                "candidate": _linear_checkpoint_candidate_doc(s, task, checkpoint)}
+
+
+def linear_checkpoint_committed(task_id: str) -> dict | None:
+    """Read exact committed evidence for reopen; None until the checkpoint is committed truth."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"):
+            raise RuntimeError("checkpoint admission is incomplete")
+        if checkpoint.phase != "committed":
+            return None
+        _lock_local_result_registry(s)
+        return _linear_checkpoint_committed_doc(s, task, checkpoint)
 
 
 def begin_local_result(uri: str, namespace_id: str, storage_root: str, lock_name: str,

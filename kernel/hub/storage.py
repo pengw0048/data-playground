@@ -169,6 +169,102 @@ class LocalResultReadGuard:
         return False
 
 
+class CheckpointWriter:
+    """One materialized checkpoint file held under its exact reserved writer lock and fence."""
+
+    def __init__(self, storage: "LocalStorage", uri: str, artifact_name: str,
+                 lock_name: str, lock_fd: int | None, artifact_fd: int):
+        self.storage = storage
+        self.uri = uri
+        self._artifact_name = artifact_name
+        self._lock_name = lock_name
+        self._lock_fd = lock_fd
+        self._artifact_fd = artifact_fd
+        self._sealed = False
+        self._closed = False
+
+    def fileno(self) -> int:
+        if self._artifact_fd < 0:
+            raise RuntimeError("checkpoint writer descriptor is not open")
+        return self._artifact_fd
+
+    def write(self, data: bytes) -> None:
+        self.storage._write_all(self.fileno(), bytes(data))
+
+    def lock_fileno(self) -> int | None:
+        return self._lock_fd
+
+    def seal(self) -> None:
+        """Durably persist the exact materialized bytes and close only the write descriptor."""
+        if self._sealed:
+            return
+        os.fsync(self.fileno())
+        self.storage._fsync_dir(self.storage._result_dir_fd)
+        os.close(self._artifact_fd)
+        self._artifact_fd = -1
+        self._sealed = True
+
+    def release(self) -> None:
+        """Close the retained writer lock/descriptors after a committed response."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._artifact_fd >= 0:
+            os.close(self._artifact_fd)
+            self._artifact_fd = -1
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    def abort(self) -> None:
+        """Close owned FDs and remove only the exact file and lock this failed writer created."""
+        if self._closed:
+            return
+        self._closed = True
+        artifact_fd, lock_fd = self._artifact_fd, self._lock_fd
+        self._artifact_fd, self._lock_fd = -1, None
+        if artifact_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(artifact_fd)
+        self.storage._unlink_result_member(self._artifact_name, lock=False)
+        if lock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)
+        self.storage._unlink_result_member(self._lock_name, lock=True)
+
+
+class CheckpointProof:
+    """One held read descriptor carrying the evidence proven from that exact inode's bytes."""
+
+    def __init__(self, storage: "LocalStorage", uri: str, artifact_fd: int,
+                 lock_fd: int | None, evidence: dict):
+        self.storage = storage
+        self.uri = uri
+        self._artifact_fd = artifact_fd
+        self._lock_fd = lock_fd
+        self.evidence = evidence
+        self._closed = False
+
+    def recheck(self) -> None:
+        """The final device/inode/size identity check that must pass immediately before commit."""
+        if self._closed:
+            raise RuntimeError("checkpoint proof descriptor is closed")
+        if self._lock_fd is not None:
+            os.fstat(self._lock_fd)
+        self.storage._check_result_read_identity(self.uri, self._artifact_fd)
+
+    def artifact_fileno(self) -> int:
+        return self._artifact_fd
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._artifact_fd >= 0:
+            os.close(self._artifact_fd)
+            self._artifact_fd = -1
+
+
 def preflight_managed_execution_sources(
         storage, uris, *, include_object_attempts: bool = True) -> list[str]:
     """Deduplicate and cap lifecycle-managed sources before acquiring any one of them."""
@@ -629,6 +725,134 @@ class LocalStorage:
                     "managed local result must remain an exact private single-link file")
         if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
             raise RuntimeError("managed local-result artifact identity changed during read")
+
+    def _unlink_result_member(self, name: str, *, lock: bool) -> None:
+        """Remove exactly one managed member by name; used only for owner-created cleanup."""
+        dir_fd = self._result_lock_dir_fd if lock else self._result_dir_fd
+        base = self._result_lock_root if lock else self.result_root
+        with contextlib.suppress(FileNotFoundError, OSError):
+            if dir_fd is not None:
+                os.unlink(name, dir_fd=dir_fd)
+            else:
+                os.unlink(os.path.join(base, name))
+
+    def _result_artifact_evidence(self, uri: str, artifact_fd: int) -> dict:
+        """Prove rows, bytes, content SHA-256, and canonical schema from one held inode's bytes."""
+        import hashlib
+        import json
+
+        self._check_result_read_identity(uri, artifact_fd)
+        info = os.fstat(artifact_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (
+                os.name == "posix" and info.st_mode & 0o077):
+            raise RuntimeError("managed local result must be an exact private single-link file")
+        size = int(info.st_size)
+        if size <= 0:
+            raise RuntimeError("managed local result must be non-empty")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < size:
+            chunk = os.pread(artifact_fd, 1024 * 1024, offset)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        if offset != size:
+            raise RuntimeError("managed local result changed size during read")
+        reader = os.fdopen(os.dup(artifact_fd), "rb")
+        try:
+            import pyarrow.parquet as pq
+
+            parquet = pq.ParquetFile(reader)
+            rows = int(parquet.metadata.num_rows)
+            schema = parquet.schema_arrow
+        finally:
+            reader.close()
+        columns = [{"name": field.name, "type": str(field.type)} for field in schema]
+        schema_json = json.dumps(
+            columns, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        # Post-read recheck against the same held descriptor: a truncate/grow or inode swap during the
+        # read must fail closed rather than produce evidence for the wrong bytes.
+        self._check_result_read_identity(uri, artifact_fd)
+        after = os.fstat(artifact_fd)
+        if (after.st_dev, after.st_ino, after.st_size, after.st_nlink) != (
+                info.st_dev, info.st_ino, info.st_size, info.st_nlink):
+            raise RuntimeError("managed local result changed during evidence read")
+        return {
+            "dev": int(info.st_dev), "ino": int(info.st_ino), "bytes": size, "rows": rows,
+            "content_sha256": digest.hexdigest(),
+            "schema_sha256": hashlib.sha256(schema_json.encode()).hexdigest(),
+        }
+
+    def materialize_checkpoint(self, candidate: dict) -> CheckpointWriter:
+        """Create the exact reserved candidate file and lock; never scan or derive a second one."""
+        uri = str(candidate["uri"])
+        if (candidate.get("namespace_id") != self.namespace_id
+                or candidate.get("storage_root") != self.result_root):
+            raise RuntimeError("checkpoint candidate belongs to a different namespace")
+        if not candidate.get("lock_protected") or not candidate.get("lock_token"):
+            raise RuntimeError("checkpoint materialization requires a protected lock")
+        if not self.lock_supported:
+            raise RuntimeError("checkpoint materialization requires OS lock support")
+        artifact_name, lock_name = self._result_names(uri)
+        if lock_name != candidate.get("lock_name"):
+            raise RuntimeError("checkpoint candidate lock name is inconsistent")
+        self.validate_result_uri(uri)
+        lock_fd = self._open_shared_lock(
+            lock_name, create=True, lock_token=str(candidate["lock_token"]))
+        artifact_fd = -1
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            artifact_fd = (os.open(artifact_name, flags, 0o600, dir_fd=self._result_dir_fd)
+                           if self._result_dir_fd is not None else os.open(uri, flags, 0o600))
+            info = os.fstat(artifact_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise RuntimeError("materialized checkpoint file is not a private regular file")
+            return CheckpointWriter(
+                self, uri, artifact_name, lock_name, lock_fd, artifact_fd)
+        except Exception:
+            if artifact_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(artifact_fd)
+                self._unlink_result_member(artifact_name, lock=False)
+            if lock_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(lock_fd)
+                self._unlink_result_member(lock_name, lock=True)
+            raise
+
+    def open_checkpoint_proof(
+            self, uri: str, lock_fd: int | None) -> CheckpointProof:
+        """Open one no-follow read descriptor and prove the full evidence from its exact bytes."""
+        self.validate_result_uri(uri)
+        artifact_fd = self._open_result_artifact(uri)
+        try:
+            if lock_fd is not None:
+                os.fstat(lock_fd)
+            evidence = self._result_artifact_evidence(uri, artifact_fd)
+            return CheckpointProof(self, uri, artifact_fd, lock_fd, evidence)
+        except Exception:
+            os.close(artifact_fd)
+            raise
+
+    def reopen_checkpoint(self, committed: dict) -> LocalResultReadGuard:
+        """Reconstruct a held reader for one committed checkpoint and fully revalidate evidence."""
+        if committed.get("namespace_id") != self.namespace_id:
+            raise RuntimeError("committed checkpoint belongs to a different namespace")
+        guard = self.acquire_result_read(str(committed["uri"]), owner="checkpoint")
+        try:
+            evidence = self._result_artifact_evidence(guard.uri, guard.artifact_fileno())
+            if (evidence["dev"] != committed["dev"] or evidence["ino"] != committed["ino"]
+                    or evidence["bytes"] != committed["bytes"]
+                    or evidence["rows"] != committed["rows"]
+                    or evidence["content_sha256"] != committed["content_sha256"]
+                    or evidence["schema_sha256"] != committed["schema_sha256"]):
+                raise RuntimeError("reopened checkpoint disagrees with committed evidence")
+            guard.check()
+        except Exception:
+            guard.close()
+            raise
+        return guard
 
     def list_outputs(self) -> list[str]:
         if not os.path.isdir(self.root):
