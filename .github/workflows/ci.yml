@@ -163,6 +163,7 @@ jobs:
           hub/tests/test_backend_source_pins.py
           hub/tests/test_catalog_folders.py
           hub/tests/test_lineage_facts.py
+          hub/tests/test_managed_local_file_revisions.py
           hub/tests/test_settings_batches.py
           hub/tests/test_run_identity.py
           hub/tests/test_object_lifecycle.py
