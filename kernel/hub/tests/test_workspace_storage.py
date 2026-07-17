@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
 import uuid
+from typing import cast
 
 import pytest
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, event, select
 
-from hub import metadb
+from hub import main as hub_main, metadb
 from hub.main import app
 
 
@@ -315,16 +318,11 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
 def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, monkeypatch):
     canvas_id = workspace_scope["canvas_id"]
     broadcasts: list[str] = []
-    active_room = False
 
     async def record_external_edit(changed_canvas_id: str) -> None:
         broadcasts.append(changed_canvas_id)
 
-    async def room_has_peers(_canvas_id: str) -> bool:
-        return active_room
-
     monkeypatch.setattr("hub.main._broadcast_external_edit", record_external_edit)
-    monkeypatch.setattr("hub.main._collab_room_has_peers", room_has_peers)
     with metadb.session() as session:
         canvas = session.get(metadb.Canvas, canvas_id)
         original_node = {
@@ -340,13 +338,15 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
         canvas.doc = json.dumps(original_doc)
 
     with TestClient(app) as client:
-        active_room = True
-        concurrent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
-            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
-        })
-        assert concurrent.status_code == 409
-        assert "currently open" in concurrent.json()["detail"]
-        active_room = False
+        hub_main._collab_rooms[canvas_id] = {cast(WebSocket, object())}
+        try:
+            concurrent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+                "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+            })
+            assert concurrent.status_code == 409
+            assert "currently open" in concurrent.json()["detail"]
+        finally:
+            hub_main._collab_rooms.pop(canvas_id, None)
 
         added = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
@@ -378,6 +378,46 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
             metadb.CanvasVersion.canvas_id == canvas_id)))
         assert any(snapshot.label == "before Workspace dataset add" for snapshot in snapshots)
     metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_workspace_add_guard_blocks_new_collab_admission_until_edit_finishes():
+    canvas_id = f"workspace-add-guard-{uuid.uuid4().hex}"
+
+    async def exercise() -> None:
+        edit_started = asyncio.Event()
+        finish_edit = asyncio.Event()
+        peer_joined = asyncio.Event()
+
+        async def edit() -> None:
+            async with hub_main._idle_collab_room_edit(canvas_id) as idle:
+                assert idle
+                edit_started.set()
+                await finish_edit.wait()
+
+        async def join() -> None:
+            await edit_started.wait()
+            lock = hub_main._retain_collab_room_lock(canvas_id)
+            try:
+                async with lock:
+                    hub_main._collab_rooms.setdefault(canvas_id, set()).add(
+                        cast(WebSocket, object()))
+                    peer_joined.set()
+            finally:
+                hub_main._release_collab_room_lock(canvas_id, lock)
+
+        edit_task = asyncio.create_task(edit())
+        join_task = asyncio.create_task(join())
+        await edit_started.wait()
+        await asyncio.sleep(0)
+        assert not peer_joined.is_set()
+        finish_edit.set()
+        await edit_task
+        await asyncio.wait_for(join_task, timeout=1)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        hub_main._collab_rooms.pop(canvas_id, None)
 
 
 def test_workspace_move_and_undo_change_only_canvas_placement(workspace_scope):

@@ -1491,12 +1491,18 @@ async def _broadcast_external_edit(canvas_id: str) -> None:
         _release_collab_room_lock(canvas_id, lock)
 
 
-async def _collab_room_has_peers(canvas_id: str) -> bool:
-    """Return whether this process currently has an open editor/viewer for one canvas."""
+@asynccontextmanager
+async def _idle_collab_room_edit(canvas_id: str):
+    """Hold the room admission boundary while one out-of-band document edit commits.
+
+    Checking the room and then releasing its lock before the metadata write leaves a window where a
+    new editor can join with the old document and later overwrite the committed edit.  Keeping this
+    lock across the off-loop write makes the empty-room decision and mutation one local boundary.
+    """
     lock = _retain_collab_room_lock(canvas_id)
     try:
         async with lock:
-            return bool(_collab_rooms.get(canvas_id))
+            yield not bool(_collab_rooms.get(canvas_id))
     finally:
         _release_collab_room_lock(canvas_id, lock)
 

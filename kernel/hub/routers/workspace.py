@@ -444,20 +444,21 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
 async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddDatasetBody,
                                           uid: str = Depends(current_user)) -> dict:
     """Add one exact local dataset to one explicitly named editable canvas."""
-    from hub.main import _broadcast_external_edit, _collab_room_has_peers
-    if await _collab_room_has_peers(canvas_id):
-        raise HTTPException(
-            409,
-            "target canvas is currently open; close active editors and retry so their unsaved work is not replaced",
-        )
-    try:
-        result = await run_in_threadpool(
-            metadb.workspace_add_dataset_action,
-            uid=uid, canvas_id=canvas_id,
-            expected_canvas_version=body.expected_canvas_version,
-            dataset_id=body.dataset_id)
-    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
-        _workspace_action_error(exc)
+    from hub.main import _broadcast_external_edit, _idle_collab_room_edit
+    async with _idle_collab_room_edit(canvas_id) as idle:
+        if not idle:
+            raise HTTPException(
+                409,
+                "target canvas is currently open; close active editors and retry so their unsaved work is not replaced",
+            )
+        try:
+            result = await run_in_threadpool(
+                metadb.workspace_add_dataset_action,
+                uid=uid, canvas_id=canvas_id,
+                expected_canvas_version=body.expected_canvas_version,
+                dataset_id=body.dataset_id)
+        except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+            _workspace_action_error(exc)
     # This is an out-of-band document edit, like MCP. Nudge any currently open collab room to refetch
     # the committed snapshot so a stale tab cannot later autosave over the appended source.
     await _broadcast_external_edit(canvas_id)
