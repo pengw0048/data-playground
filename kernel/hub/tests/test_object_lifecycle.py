@@ -2355,7 +2355,9 @@ def test_inventory_uncertainty_quarantines_without_deletion(mutation):
     handoff.set_managed_object_provider(provider)
     try:
         result = handoff.reap_attempts(retention_seconds=0, delete_grace_seconds=0)
-        assert result["quarantined"] == [handle["uri"]]
+        # Reaping is global, so other tests in this isolated lifecycle shard may leave unrelated
+        # expired attempts. This assertion only owns the attempt created above.
+        assert handle["uri"] in result["quarantined"]
         assert _state(handle["uri"]) == "quarantined"
         assert provider.calls == []
     finally:
