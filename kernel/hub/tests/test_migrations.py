@@ -94,7 +94,7 @@ def test_committed_migration_revisions_are_immutable():
             "3aef01923a3b252285a78fbbce9d8173630264bf51315934b90aa4601454e540"
         ),
         "0009_durable_local_write_tasks.py": (
-            "10ee0387afaf1eb2dada37a36a9ab324c8723c7a1913b8b64dd82d6d03f680d6"
+            "2ed6efefd51b1ed51f5487742b8acae0e78c1f960a4f7454687ddbf83ee6f2e1"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

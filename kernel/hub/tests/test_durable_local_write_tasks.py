@@ -7,20 +7,23 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from hub import metadb
+from hub import durable_tasks, metadb
 from hub.deps import Deps
 from hub.local_writes import write_managed_local_file
 from hub.models import Graph, RunStatus
 from hub.routers.runs import (
-    _inject_write_intent, _resolve_local_run_manifest, _write_admission_for_graph,
+    _inject_write_intent, _local_run_intent_sha256, _resolve_local_run_manifest,
+    _write_admission_for_graph,
 )
 
 
@@ -30,7 +33,8 @@ def _metadata_schema(tmp_path_factory):
 
     original_url = settings.database_url
     original_engine, original_session = metadb._engine, metadb._Session
-    settings.database_url = f"sqlite:///{tmp_path_factory.mktemp('durable-tasks') / 'metadata.db'}"
+    settings.database_url = os.environ.get("DP_TEST_DATABASE_URL") or (
+        f"sqlite:///{tmp_path_factory.mktemp('durable-tasks') / 'metadata.db'}")
     metadb._engine = metadb._Session = None
     metadb.init_db()
     try:
@@ -79,7 +83,8 @@ def _submit(identity):
     uid, canvas_id, submission, _task_id, graph, intent = identity
     return metadb.submit_durable_local_write_task(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
-        target_node_id="write", graph_doc=graph, input_manifest=[],
+        target_node_id="write", intent_sha256="a" * 64,
+        graph_doc=graph, input_manifest=[],
         write_intent=intent,
     )
 
@@ -90,6 +95,15 @@ def test_submission_is_atomic_idempotent_and_projects_into_jobs(task_identity):
 
     assert created is True and replay_created is False
     assert replay["id"] == first["id"] and len(replay["attempts"]) == 1
+    operational = json.loads(json.dumps(task_identity[4]))
+    operational["nodes"][0]["data"]["status"] = "failed"
+    adopted, adopted_created = metadb.submit_durable_local_write_task(
+        uid=task_identity[0], canvas_id=task_identity[1], submission_id=task_identity[2],
+        target_node_id="write", intent_sha256="a" * 64, graph_doc=operational,
+        input_manifest=[], write_intent=task_identity[5])
+    assert adopted_created is False
+    assert adopted["id"] == first["id"]
+    assert "status" not in adopted["graph_doc"]["nodes"][0]["data"]
     page = metadb.list_workspace_runs(task_identity[0], run_id=first["id"])
     assert len(page["items"]) == 1
     assert page["items"][0]["taskId"] == first["id"]
@@ -102,7 +116,8 @@ def test_submission_is_atomic_idempotent_and_projects_into_jobs(task_identity):
         metadb.submit_durable_local_write_task(
             uid=task_identity[0], canvas_id=task_identity[1],
             submission_id=task_identity[2], target_node_id="write",
-            graph_doc=task_identity[4], input_manifest=[], write_intent=changed)
+            intent_sha256="b" * 64, graph_doc=task_identity[4],
+            input_manifest=[], write_intent=changed)
 
 
 def test_concurrent_claim_has_one_owner_and_late_owner_is_fenced(task_identity):
@@ -164,6 +179,116 @@ def test_cancel_is_idempotent_and_retry_action_is_bounded(task_identity):
         metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
 
 
+def test_concurrent_retry_same_action_creates_one_bounded_attempt(task_identity):
+    task, _ = _submit(task_identity)
+    claimed = metadb.claim_durable_task(task["id"], "failed-owner")
+    first = claimed["attempts"][-1]
+    failed = RunStatus(
+        run_id=task["id"], status="failed", target_node_id="write", error="retry me")
+    assert metadb.finish_durable_task_attempt(
+        task["id"], first["id"], "failed-owner", failed.model_dump())
+
+    action = str(uuid.uuid4())
+    barrier = threading.Barrier(8)
+
+    def retry_once(_index):
+        barrier.wait()
+        return metadb.retry_durable_task(task["id"], action)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(retry_once, range(8)))
+    attempt_ids = {result["attempts"][-1]["id"] for result in results}
+    assert len(attempt_ids) == 1
+    assert {len(result["attempts"]) for result in results} == {2}
+    assert len(metadb.durable_task(task["id"])["attempts"]) == 2
+
+    second = metadb.claim_durable_task(task["id"], "second-owner")["attempts"][-1]
+    assert metadb.finish_durable_task_attempt(
+        task["id"], second["id"], "second-owner", failed.model_dump())
+    third = metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    third_attempt = metadb.claim_durable_task(task["id"], "third-owner")["attempts"][-1]
+    assert len(third["attempts"]) == 3
+    assert metadb.finish_durable_task_attempt(
+        task["id"], third_attempt["id"], "third-owner", failed.model_dump())
+    with pytest.raises(ValueError, match="retry limit is exhausted"):
+        metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+
+
+def _fake_worker_deps():
+    return SimpleNamespace(
+        resolve_adapter=lambda _uri: None, registry=object(), catalog=object(),
+        workspace="/tmp", node_builders={}, node_specs={}, node_ir={}, storage=None,
+    )
+
+
+def test_worker_waits_for_actual_join_before_terminalizing(task_identity, monkeypatch):
+    task, _ = _submit(task_identity)
+    waits = []
+
+    class FakeLocalRunner:
+        def __init__(self, *_args, **_kwargs):
+            self.on_status = self.on_complete = None
+
+        def run(self, _plan, _graph, _target, _placement, *, run_id, **_kwargs):
+            return RunStatus(
+                run_id=run_id, status="failed", target_node_id="write", error="worker failed")
+
+        def wait_for_worker(self, _run_id, timeout=None):
+            waits.append((timeout, metadb.durable_task(task["id"])["status"]))
+            return len(waits) >= 2
+
+        def cancel(self, _run_id):
+            raise AssertionError("owned worker should not be cancelled")
+
+    monkeypatch.setattr(durable_tasks, "LocalRunner", FakeLocalRunner)
+    monkeypatch.setattr(
+        durable_tasks.compiler, "compile_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(acyclic=True, error=None))
+
+    durable_tasks._worker(task["id"], _fake_worker_deps())
+
+    assert waits == [
+        (durable_tasks._JOIN_POLL_SECONDS, "running"),
+        (durable_tasks._JOIN_POLL_SECONDS, "running"),
+    ]
+    assert metadb.durable_task(task["id"])["status"] == "failed"
+
+
+def test_worker_losing_lease_cancels_without_terminalizing(task_identity, monkeypatch):
+    task, _ = _submit(task_identity)
+    cancellations = []
+    finishes = []
+
+    class FakeLocalRunner:
+        def __init__(self, *_args, **_kwargs):
+            self.on_status = self.on_complete = None
+
+        def run(self, _plan, _graph, _target, _placement, *, run_id, **_kwargs):
+            return RunStatus(
+                run_id=run_id, status="failed", target_node_id="write", error="late snapshot")
+
+        def wait_for_worker(self, _run_id, timeout=None):
+            return False
+
+        def cancel(self, run_id):
+            cancellations.append(run_id)
+
+    monkeypatch.setattr(durable_tasks, "LocalRunner", FakeLocalRunner)
+    monkeypatch.setattr(
+        durable_tasks.compiler, "compile_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(acyclic=True, error=None))
+    monkeypatch.setattr(metadb, "heartbeat_durable_task", lambda *_args: False)
+    monkeypatch.setattr(
+        metadb, "finish_durable_task_attempt",
+        lambda *args, **kwargs: finishes.append((args, kwargs)))
+
+    durable_tasks._worker(task["id"], _fake_worker_deps())
+
+    assert cancellations == [task["id"]]
+    assert finishes == []
+    assert metadb.durable_task(task["id"])["status"] == "running"
+
+
 def test_active_task_blocks_canvas_delete(task_identity):
     task, _ = _submit(task_identity)
     with pytest.raises(metadb.ActiveBackendJobsError, match="active durable task"):
@@ -211,7 +336,9 @@ def test_committed_response_loss_restarts_and_reconciles_one_receipt(tmp_path):
     manifest = _resolve_local_run_manifest(frozen, "write", deps)
     task, _ = metadb.submit_durable_local_write_task(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
-        target_node_id="write", graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+        target_node_id="write",
+        intent_sha256=_local_run_intent_sha256(graph, "write", write_intent=admission.intent),
+        graph_doc=frozen.model_dump(by_alias=True, mode="json"),
         input_manifest=manifest,
         write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
     )
@@ -258,6 +385,7 @@ from hub.deps import Deps
 from hub.local_writes import write_managed_local_file
 from hub.models import Graph
 from hub.routers.runs import _inject_write_intent, _resolve_local_run_manifest, _write_admission_for_graph
+from hub.routers.runs import _local_run_intent_sha256
 
 metadb.init_db()
 workspace, data_dir = os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"]
@@ -286,7 +414,9 @@ _inject_write_intent(frozen, "write", admission.intent)
 manifest = _resolve_local_run_manifest(frozen, "write", deps)
 task, _ = metadb.submit_durable_local_write_task(
     uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, submission_id=submission,
-    target_node_id="write", graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+    target_node_id="write",
+    intent_sha256=_local_run_intent_sha256(graph, "write", write_intent=admission.intent),
+    graph_doc=frozen.model_dump(by_alias=True, mode="json"),
     input_manifest=manifest,
     write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
 claimed = metadb.claim_durable_task(task["id"], "crashed-hub-owner")
@@ -295,9 +425,11 @@ receipt = write_managed_local_file(
     write_artifact=lambda uri: pq.write_table(pa.table({"value": [1, 2]}), uri))
 with metadb.session() as session:
     attempt = session.get(metadb.DurableTaskAttempt, claimed["attempts"][-1]["id"])
-    attempt.lease_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    lease_deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=6)
+    attempt.lease_until = lease_deadline
 print(json.dumps({"task_id": task["id"], "revision_id": receipt.revision_id,
-                  "artifact_uri": receipt.publication.artifact_uri}))
+                  "artifact_uri": receipt.publication.artifact_uri,
+                  "lease_deadline": lease_deadline.timestamp()}))
 deps.storage.close()
 '''
     prepared = subprocess.run(
@@ -323,6 +455,21 @@ deps.storage.close()
             return json.load(response)
 
     try:
+        ready_deadline = time.monotonic() + 5
+        while time.monotonic() < ready_deadline:
+            try:
+                if get_json("/livez")["ok"]:
+                    break
+            except Exception:
+                time.sleep(0.05)
+        else:
+            raise AssertionError("restarted Hub did not become ready")
+        assert time.time() < expected["lease_deadline"], \
+            "test did not start the replacement Hub before the old lease expired"
+        before_expiry = get_json(f"/jobs?run_id={expected['task_id']}")["items"][0]
+        assert before_expiry["status"] == "running"
+        assert [attempt["status"] for attempt in before_expiry["taskAttempts"]] == ["running"]
+
         deadline = time.monotonic() + 20
         observed = None
         last_error = None

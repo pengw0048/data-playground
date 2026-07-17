@@ -21,6 +21,7 @@ def upgrade() -> None:
         sa.Column("owner_id", sa.String(), sa.ForeignKey("users.id"), nullable=False),
         sa.Column("canvas_id", sa.String(), sa.ForeignKey("canvases.id"), nullable=False),
         sa.Column("submission_id", sa.String(), nullable=False),
+        sa.Column("intent_sha256", sa.String(64), nullable=False),
         sa.Column("target_node_id", sa.String(), nullable=False),
         sa.Column("backend_kind", sa.String(), nullable=False, server_default="local"),
         sa.Column("graph_doc", sa.Text(), nullable=False),

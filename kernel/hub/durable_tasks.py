@@ -18,7 +18,9 @@ from hub.plugins.runner import LocalRunner
 
 
 _active_lock = threading.Lock()
-_active: dict[str, tuple[LocalRunner, threading.Thread]] = {}
+_active: dict[str, tuple[LocalRunner | None, threading.Thread]] = {}
+_JOIN_POLL_SECONDS = 0.1
+_RECOVERY_SCAN_SECONDS = 0.25
 
 
 def _failed(task_id: str, target: str, exc: BaseException) -> dict:
@@ -26,6 +28,34 @@ def _failed(task_id: str, target: str, exc: BaseException) -> dict:
         run_id=task_id, status="failed", target_node_id=target,
         error=f"{type(exc).__name__}: {exc}",
     ).model_dump()
+
+
+def _cancel_quietly(runner: LocalRunner, task_id: str) -> None:
+    try:
+        runner.cancel(task_id)
+    except KeyError:
+        pass
+
+
+def _wait_for_owned_worker(
+        runner: LocalRunner, task_id: str, attempt_id: str, owner_token: str) -> bool:
+    """Join in bounded polls while this exact lease remains authoritative."""
+    while True:
+        try:
+            if runner.wait_for_worker(task_id, timeout=_JOIN_POLL_SECONDS):
+                return True
+        except KeyError:
+            return True  # run() failed before installing a worker
+        except BaseException:
+            _cancel_quietly(runner, task_id)
+            return False
+        if not metadb.heartbeat_durable_task(task_id, attempt_id, owner_token):
+            # A fenced/expired owner may ask its local worker to stop, but must never publish terminal
+            # truth after losing the token.
+            _cancel_quietly(runner, task_id)
+            return False
+        if metadb.durable_task_attempt_should_stop(task_id, attempt_id, owner_token):
+            _cancel_quietly(runner, task_id)
 
 
 def _worker(task_id: str, deps) -> None:
@@ -85,13 +115,15 @@ def _worker(task_id: str, deps) -> None:
                         runner.cancel(task_id)
                 time.sleep(0.1)
                 status = runner.status(task_id)
-            runner.wait_for_worker(task_id, timeout=5)
-            metadb.finish_durable_task_attempt(
-                task_id, attempt_id, owner_token, status.model_dump())
+            if _wait_for_owned_worker(runner, task_id, attempt_id, owner_token):
+                metadb.finish_durable_task_attempt(
+                    task_id, attempt_id, owner_token, status.model_dump())
         except BaseException as exc:
             logging.getLogger("hub").exception("durable local write task failed")
-            metadb.finish_durable_task_attempt(
-                task_id, attempt_id, owner_token, _failed(task_id, target, exc))
+            if runner is None or _wait_for_owned_worker(
+                    runner, task_id, attempt_id, owner_token):
+                metadb.finish_durable_task_attempt(
+                    task_id, attempt_id, owner_token, _failed(task_id, target, exc))
     finally:
         with _active_lock:
             current = _active.get(task_id)
@@ -110,13 +142,31 @@ def dispatch(task_id: str, deps) -> None:
             name=f"dp-durable-task-{str(task_id)[-12:]}",
         )
         # Store a harmless placeholder runner until the worker has claimed and constructed its owner.
-        _active[str(task_id)] = (None, thread)  # type: ignore[arg-type]
+        _active[str(task_id)] = (None, thread)
         thread.start()
 
 
 def recover(deps) -> None:
     for task_id in metadb.recoverable_durable_task_ids():
         dispatch(task_id, deps)
+
+
+def recovery_loop(deps, stop: threading.Event) -> None:
+    """Rescan only this bounded local Task type so leases expiring after startup are reclaimed."""
+    while not stop.is_set():
+        try:
+            recover(deps)
+        except BaseException:
+            logging.getLogger("hub").exception("durable local task recovery scan failed")
+        stop.wait(_RECOVERY_SCAN_SECONDS)
+
+
+def start_recovery_loop(deps, stop: threading.Event) -> threading.Thread:
+    thread = threading.Thread(
+        target=recovery_loop, args=(deps, stop), daemon=True,
+        name="dp-durable-task-recovery")
+    thread.start()
+    return thread
 
 
 def request_cancel(task_id: str) -> dict | None:

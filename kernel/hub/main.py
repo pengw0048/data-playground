@@ -225,16 +225,20 @@ _reaper_lifespan_users = 0
 _object_attempt_reaper_stop: threading.Event | None = None
 _object_attempt_reaper_thread: threading.Thread | None = None
 _local_result_reaper_thread: threading.Thread | None = None
+_durable_task_recovery_thread: threading.Thread | None = None
 
 
 @asynccontextmanager
 async def _lifespan(_app):
     global _reaper_lifespan_users, _object_attempt_reaper_stop
     global _object_attempt_reaper_thread, _local_result_reaper_thread
+    global _durable_task_recovery_thread
     with _reaper_lifecycle_lock:
         if _reaper_lifespan_users == 0:
             existing = tuple(
-                thread for thread in (_object_attempt_reaper_thread, _local_result_reaper_thread)
+                thread for thread in (
+                    _object_attempt_reaper_thread, _local_result_reaper_thread,
+                    _durable_task_recovery_thread)
                 if thread is not None
             )
             if any(thread.is_alive() for thread in existing):
@@ -242,6 +246,7 @@ async def _lifespan(_app):
             _object_attempt_reaper_stop = None
             _object_attempt_reaper_thread = None
             _local_result_reaper_thread = None
+            _durable_task_recovery_thread = None
 
             stop = threading.Event()
             object_thread = threading.Thread(
@@ -250,27 +255,35 @@ async def _lifespan(_app):
             local_thread = threading.Thread(
                 target=_local_result_reaper_loop, args=(stop,),
                 daemon=True, name="dp-local-result-reaper")
+            durable_thread = None
             try:
                 object_thread.start()
                 local_thread.start()
+                # This narrow scanner is not a scheduler: it can only reclaim the single durable-local
+                # Write Task type after a lease that was still live at startup expires.
+                from hub.deps import get_deps
+                from hub.durable_tasks import start_recovery_loop
+                durable_thread = start_recovery_loop(get_deps(), stop)
             except BaseException:
                 stop.set()
-                for thread in (object_thread, local_thread):
+                for thread in (object_thread, local_thread, durable_thread):
+                    if thread is None:
+                        continue
                     if thread.ident is not None:
                         thread.join(timeout=5)
                 _object_attempt_reaper_thread = object_thread if object_thread.is_alive() else None
                 _local_result_reaper_thread = local_thread if local_thread.is_alive() else None
-                if _object_attempt_reaper_thread is not None or _local_result_reaper_thread is not None:
+                _durable_task_recovery_thread = (
+                    durable_thread if durable_thread is not None and durable_thread.is_alive() else None)
+                if any(thread is not None for thread in (
+                        _object_attempt_reaper_thread, _local_result_reaper_thread,
+                        _durable_task_recovery_thread)):
                     _object_attempt_reaper_stop = stop
                 raise
             _object_attempt_reaper_stop = stop
             _object_attempt_reaper_thread = object_thread
             _local_result_reaper_thread = local_thread
-            # Reclaim only expired/queued managed-local durable tasks. SQL leases elect one owner;
-            # this lifespan hook is a recovery trigger, not a scheduler or an in-memory source of truth.
-            from hub.deps import get_deps
-            from hub.durable_tasks import recover as recover_durable_tasks
-            recover_durable_tasks(get_deps())
+            _durable_task_recovery_thread = durable_thread
         _reaper_lifespan_users += 1
     try:
         yield
@@ -282,14 +295,20 @@ async def _lifespan(_app):
                 assert _object_attempt_reaper_stop is not None
                 assert _object_attempt_reaper_thread is not None
                 assert _local_result_reaper_thread is not None
+                assert _durable_task_recovery_thread is not None
                 _object_attempt_reaper_stop.set()
                 _object_attempt_reaper_thread.join(timeout=5)
                 _local_result_reaper_thread.join(timeout=5)
+                _durable_task_recovery_thread.join(timeout=5)
                 if not _object_attempt_reaper_thread.is_alive():
                     _object_attempt_reaper_thread = None
                 if not _local_result_reaper_thread.is_alive():
                     _local_result_reaper_thread = None
-                if _object_attempt_reaper_thread is None and _local_result_reaper_thread is None:
+                if not _durable_task_recovery_thread.is_alive():
+                    _durable_task_recovery_thread = None
+                if all(thread is None for thread in (
+                        _object_attempt_reaper_thread, _local_result_reaper_thread,
+                        _durable_task_recovery_thread)):
                     _object_attempt_reaper_stop = None
                 drain_observability = True
         if drain_observability:

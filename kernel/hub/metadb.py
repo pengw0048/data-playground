@@ -279,6 +279,7 @@ class DurableTask(Base):
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False, index=True)
     submission_id: Mapped[str] = mapped_column(String, nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     target_node_id: Mapped[str] = mapped_column(String, nullable=False)
     backend_kind: Mapped[str] = mapped_column(
         String, nullable=False, default="local", server_default="local")
@@ -445,6 +446,10 @@ class TerminalRunIdError(RuntimeError):
 
 class ProfileSubmissionConflict(RuntimeError):
     """A submission id is already permanently bound to a different profile identity."""
+
+
+class DurableTaskSubmissionConflict(RuntimeError):
+    """A durable task submission id is bound to a different semantic admission."""
 
 
 @dataclass(frozen=True)
@@ -3324,11 +3329,15 @@ def _durable_task_db_now(s) -> datetime.datetime:
 
 def submit_durable_local_write_task(
         *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
-        graph_doc: dict, input_manifest: list[dict[str, str]], write_intent: dict) -> tuple[dict, bool]:
+        intent_sha256: str, graph_doc: dict, input_manifest: list[dict[str, str]],
+        write_intent: dict) -> tuple[dict, bool]:
     """Persist a task and its first attempt atomically, adopting an identical replay."""
     from hub.models import Graph, WriteIntent
 
     uid, canvas_id, target_node_id = str(uid), str(canvas_id), str(target_node_id)
+    intent_sha256 = str(intent_sha256).lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", intent_sha256):
+        raise ValueError("durable task requires a SHA-256 semantic admission identity")
     graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
     intent = WriteIntent.model_validate(write_intent)
     if intent.mode not in ("create", "replace"):
@@ -3357,14 +3366,14 @@ def submit_durable_local_write_task(
             if (existing.owner_id != uid or existing.canvas_id != canvas_id
                     or existing.submission_id != str(submission_id).lower()
                     or existing.target_node_id != target_node_id
-                    or existing.graph_doc != graph_payload
-                    or existing.input_manifest != manifest_payload
-                    or existing.write_intent != intent_payload):
-                raise RuntimeError("durable task submission does not match its frozen admission")
+                    or existing.intent_sha256 != intent_sha256):
+                raise DurableTaskSubmissionConflict(
+                    "durable task submission does not match its frozen admission")
             return _durable_task_doc(s, existing), False
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
-            submission_id=str(submission_id).lower(), target_node_id=target_node_id,
+            submission_id=str(submission_id).lower(), intent_sha256=intent_sha256,
+            target_node_id=target_node_id,
             backend_kind="local", graph_doc=graph_payload,
             input_manifest=manifest_payload, write_intent=intent_payload,
             status="queued", status_doc=status_doc, created_at=now, updated_at=now,
@@ -3425,19 +3434,26 @@ def durable_task_auth(task_id: str) -> tuple[str, str] | None:
         return tuple(row) if row is not None else None
 
 
+def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
+    """Lock one Task before making an ownership/action decision on SQLite or Postgres."""
+    task_id = str(task_id)
+    if s.get_bind().dialect.name == "sqlite":
+        # SQLite ignores SELECT ... FOR UPDATE. The canvas is a stable parent row for the lifetime of
+        # its Task; acquire the single writer lock before reading Task/action replay state.
+        canvas_id = s.scalar(select(DurableTask.canvas_id).where(DurableTask.id == task_id))
+        if canvas_id is None:
+            return None
+        locked = s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+            updated_at=Canvas.updated_at))
+        if locked.rowcount != 1:
+            return None
+    return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
+
+
 def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
     """Claim queued work or fence one expired owner and create the next bounded attempt."""
     with session() as s:
-        if s.get_bind().dialect.name == "sqlite":
-            # SQLite ignores SELECT ... FOR UPDATE. Acquire its single writer lock before observing
-            # Task/Attempt so concurrent processes cannot both claim the same queued attempt.
-            canvas_id = s.scalar(select(DurableTask.canvas_id).where(
-                DurableTask.id == str(task_id)))
-            if canvas_id is None:
-                return None
-            s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
-                updated_at=Canvas.updated_at))
-        task = s.get(DurableTask, str(task_id), with_for_update=True)
+        task = _lock_durable_task_for_write(s, task_id)
         if task is None or task.status in _TERMINAL_RUN:
             return None
         now = _durable_task_db_now(s)
@@ -3616,7 +3632,7 @@ def request_durable_task_cancel(task_id: str) -> dict | None:
 def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
     retry_request_id = str(retry_request_id).lower()
     with session() as s:
-        task = s.get(DurableTask, str(task_id), with_for_update=True)
+        task = _lock_durable_task_for_write(s, task_id)
         if task is None:
             raise KeyError(task_id)
         replay = s.scalar(select(DurableTaskAttempt).where(

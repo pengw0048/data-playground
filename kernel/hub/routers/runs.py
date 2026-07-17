@@ -1678,7 +1678,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                     else _resolve_local_run_manifest(graph, target_node_id, deps))
         task, _created = metadb.submit_durable_local_write_task(
             uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-            target_node_id=str(target_node_id),
+            target_node_id=str(target_node_id), intent_sha256=intent_sha256,
             graph_doc=graph.model_dump(by_alias=True, mode="json"),
             input_manifest=manifest,
             write_intent=effective_write_intent.model_dump(by_alias=True, mode="json"),
@@ -1861,6 +1861,8 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
         )
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
+    except metadb.DurableTaskSubmissionConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     return status
 
 
