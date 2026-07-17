@@ -68,9 +68,12 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
             if not isinstance(item, dict) or not set(item) <= {
                     "id", "provider", "containerId", "config"}:
                 raise ValueError
+            config = item.get("config", {})
+            if not isinstance(config, dict):
+                raise ValueError
             mount = CatalogMount.model_validate({
                 "id": item["id"], "provider": item["provider"],
-                "config": item.get("config") or {},
+                "config": config,
             })
             container_id = item.get("containerId", metadb.LOCAL_WORKSPACE_ROOT_ID)
             if ("\x00" in mount.id or "\x00" in mount.provider

@@ -302,6 +302,18 @@ class _WorkspaceFixtureProvider:
         raise AssertionError("Workspace composition does not need capability-wide materialization")
 
 
+@pytest.mark.parametrize("config", [[], "", 0, False])
+def test_workspace_rejects_falsy_non_object_mount_config(monkeypatch, config):
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": "invalid-config", "provider": "fixture", "config": config},
+    ]))
+
+    mounts, invalid = workspace_providers._configured_mounts()
+
+    assert mounts == []
+    assert invalid
+
+
 def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_deep_links(
         workspace_scope, monkeypatch):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
@@ -388,7 +400,10 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
         })
         assert created.status_code == 200, created.text
         assert provider.list_calls == reads_before_canvas_action
-        metadb.delete_canvas_cascade(created.json()["id"])
+        created_document = created.json()
+        metadb.workspace_delete_placement(
+            created_document["resource"]["placementId"], expected_version=1)
+        metadb.delete_canvas_cascade(created_document["id"])
     # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
     # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
     time.sleep(0.03)
