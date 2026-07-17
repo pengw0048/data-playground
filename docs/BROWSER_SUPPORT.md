@@ -1,8 +1,9 @@
 # Browser and viewport support
 
-Data Playground's workbench is a **desktop-first** graph editor: a fixed navigation rail, a
-persistent inspector, an open canvas, and floating data/run panels. It is not designed for phones
-or tablets. Touch interaction and responsive breakpoints are out of scope for the current product.
+Data Playground's workbench is a **desktop-first** graph editor: a collapsible navigation rail, a
+collapsible inspector, an open canvas, and floating data/run panels. It is not designed for phones
+or tablets. The shell compacts for browse and inspect at 1024px, but full canvas authoring there is
+exploratory rather than a release guarantee.
 
 ## Minimum viewport
 
@@ -14,8 +15,8 @@ That size is owned by the shared constant in [`web/support/min-viewport.ts`](../
 (`MIN_VIEWPORT`). CI's Playwright min-viewport project imports the same constant and fails if the
 docs and the tested size drift.
 
-Raise the documented minimum if a denser layout is unusable at a candidate size. Do not add mobile
-breakpoints in the same change.
+The rail and Inspector remember their expanded/collapsed state across ordinary refreshes. Fit View
+uses the remaining canvas after those panels change. Mobile canvas authoring remains out of scope.
 
 ## Browsers
 

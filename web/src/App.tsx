@@ -15,6 +15,7 @@ import { useStore } from './store/graph'
 import { initRouter } from './router'
 import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
+import { useCollapsibleRegion } from './layoutPreferences'
 
 export default function App() {
   const bootstrap = useStore((s) => s.bootstrap)
@@ -22,6 +23,7 @@ export default function App() {
   // gate on auth: null = checking; then either the login screen (auth on, no session) or the app.
   const [auth, setAuth] = useState<{ authEnabled: boolean; userId: string | null } | null>(null)
   const [booted, setBooted] = useState(false)
+  const [inspectorCollapsed, setInspectorCollapsed] = useCollapsibleRegion('inspector')
 
   useEffect(() => {
     api.authStatus()
@@ -55,8 +57,8 @@ export default function App() {
               <Toolbar />
               <AgentDock />
             </div>
-            {/* persistent right property panel (Figma-style) */}
-            <Inspector />
+            {/* collapsible right property panel (Figma-style) */}
+            <Inspector collapsed={inspectorCollapsed} onToggle={() => setInspectorCollapsed((value) => !value)} />
           </div>
         ) : (
           <Shell />

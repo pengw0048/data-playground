@@ -20,6 +20,7 @@ import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
 
 export const INSPECTOR_W = 300
+export const INSPECTOR_COLLAPSED_W = 44
 
 // Built-in node kinds with a hand-built card — everything else the app renders is a PLUGIN node.
 const BUILTIN_KINDS = new Set([
@@ -41,7 +42,7 @@ export const canDeclareNodeSchema = (kind: string, outputCount: number) => (
 // generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
 // multi-selection) is selected it shows a hint. The canvas cards still work; this is the persistent
 // place to inspect/edit one node.
-export function Inspector() {
+export function Inspector({ collapsed = false, onToggle }: { collapsed?: boolean; onToggle?: () => void }) {
   const selectedIds = useStore((s) => s.selectedIds)
   const nodes = useStore((s) => s.doc.nodes)
   const canvasRole = useStore((s) => s.canvasRole)
@@ -49,12 +50,34 @@ export function Inspector() {
   const id = selectedIds.length === 1 ? selectedIds[0] : null
   const node = id ? nodes.find((n) => n.id === id) : null
 
+  if (collapsed) {
+    return (
+      <aside data-testid="inspector" data-layout-region="inspector" aria-label="Inspector"
+        className="flex h-full flex-col items-center border-l border-border bg-card py-3"
+        style={{ width: INSPECTOR_COLLAPSED_W, flex: `0 0 ${INSPECTOR_COLLAPSED_W}px` }}>
+        <button type="button" data-testid="inspector-collapse" onClick={onToggle}
+          aria-expanded={false}
+          aria-label="Expand Inspector" title="Expand Inspector"
+          className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+          <Icon name="chevronLeft" size={14} />
+        </button>
+        <span aria-hidden className="mt-3 text-[10px] font-semibold uppercase tracking-[0.8px] text-muted-foreground [writing-mode:vertical-rl]">Inspector</span>
+      </aside>
+    )
+  }
+
   return (
-    <aside data-testid="inspector"
+    <aside data-testid="inspector" data-layout-region="inspector"
       className="flex h-full flex-col overflow-hidden border-l border-border bg-card"
       style={{ width: INSPECTOR_W, flex: `0 0 ${INSPECTOR_W}px` }}>
       <div className="flex h-[52px] flex-none items-center border-b border-border px-3.5 text-[13px] font-semibold text-foreground">
-        Inspector
+        <span className="flex-1">Inspector</span>
+        {onToggle && <button type="button" data-testid="inspector-collapse" onClick={onToggle}
+          aria-expanded
+          aria-label="Collapse Inspector" title="Collapse Inspector"
+          className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+          <Icon name="chevronRight" size={14} />
+        </button>}
       </div>
       {!canEdit && (
         <div className="flex-none border-b border-border bg-muted/60 px-3.5 py-2 text-[10.5px] text-muted-foreground">
