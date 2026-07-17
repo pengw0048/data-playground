@@ -10,8 +10,10 @@ from hub.external_wait import (ExternalWaitCheckpoint, ExternalWaitDiagnostic,
                                ExternalWaitDownloadEvidence, ExternalWaitHandle,
                                ExternalWaitPollOutcome, ExternalWaitRetryHint,
                                ExternalWaitSubmitRequest)
+from hub.sdk import NodeSpec, ParamSpec
 
 PROVIDER_KIND = "fixture-local"
+NODE_KIND = "external_wait_fixture"
 _SENTINEL = "external-wait-secret-sentinel /private/configured/path"
 
 
@@ -27,7 +29,8 @@ class _Job:
 class FixtureExternalWaitAdapter:
     provider_kind = PROVIDER_KIND
 
-    def __init__(self) -> None:
+    def __init__(self, namespace: str) -> None:
+        self._namespace = namespace
         self._by_key: dict[str, _Job] = {}
         self._by_id: dict[str, _Job] = {}
 
@@ -36,10 +39,10 @@ class FixtureExternalWaitAdapter:
         existing = self._by_key.get(request.idempotency_key)
         if existing is not None:
             return existing.handle
+        digest = hashlib.sha256(request.idempotency_key.encode()).hexdigest()[:16]
         handle = ExternalWaitHandle(
             provider_kind=self.provider_kind,
-            job_id=f"fixture-job-{len(self._by_key) + 1}",
-        )
+            job_id=f"fixture-{self._namespace}-{scenario}-{digest}")
         job = _Job(handle=handle, scenario=scenario)
         self._by_key[request.idempotency_key] = job
         self._by_id[handle.job_id] = job
@@ -51,6 +54,14 @@ class FixtureExternalWaitAdapter:
 
     def _job(self, handle: ExternalWaitHandle) -> _Job:
         job = self._by_id.get(handle.job_id)
+        prefix = f"fixture-{self._namespace}-"
+        if job is None and handle.job_id.startswith(prefix):
+            scenario = handle.job_id[len(prefix):].rsplit("-", 1)[0]
+            if scenario in {"success", "response-loss", "failed", "cancelled", "transient-status",
+                            "regressed-phase", "invalid-download-digest", "invalid-download-size",
+                            "invalid-download-path", "malformed-outcome", "non-finite-retry"}:
+                job = _Job(handle=handle, scenario=scenario)
+                self._by_id[handle.job_id] = job
         if job is None or handle.provider_kind != self.provider_kind:
             raise LookupError(_SENTINEL)
         return job
@@ -73,7 +84,6 @@ class FixtureExternalWaitAdapter:
         return ExternalWaitPollOutcome(phase=phase, checkpoint=checkpoint)
 
     def status(self, handle: ExternalWaitHandle, checkpoint: ExternalWaitCheckpoint | None = None):
-        del checkpoint
         job = self._job(handle)
         if job.cancelled is not None:
             return job.cancelled
@@ -91,13 +101,13 @@ class FixtureExternalWaitAdapter:
             "invalid-download-size": ("accepted", "running", "succeeded"),
             "invalid-download-path": ("accepted", "running", "succeeded"),
         }.get(job.scenario, ("accepted", "running", "succeeded"))
-        if job.scenario == "transient-status" and job.phase_index == 1 and not job.transient_failed:
+        index = checkpoint.sequence + 1 if checkpoint is not None else job.phase_index
+        if job.scenario == "transient-status" and index == 1 and not job.transient_failed:
             job.transient_failed = True
             raise ConnectionError(_SENTINEL)
-        index = min(job.phase_index, len(phases) - 1)
+        index = min(index, len(phases) - 1)
         outcome = self._outcome(phases[index], index)
-        if job.phase_index < len(phases) - 1:
-            job.phase_index += 1
+        job.phase_index = min(index + 1, len(phases) - 1)
         return outcome
 
     def cancel(self, handle: ExternalWaitHandle, checkpoint: ExternalWaitCheckpoint | None = None):
@@ -127,4 +137,14 @@ class FixtureExternalWaitAdapter:
 
 
 def register(reg) -> None:
-    reg.add_external_wait_adapter(FixtureExternalWaitAdapter())
+    reg.add_external_wait_adapter(FixtureExternalWaitAdapter(reg.workspace_identity()))
+    reg.add_external_wait_node(NodeSpec(
+        kind=NODE_KIND, title="external wait fixture", category="control", tag="wait",
+        inputs=[], outputs=[], previewable=False,
+        params=[ParamSpec(
+            name="operation", type="select", default="conformance.success",
+            options=["conformance.success", "conformance.response-loss", "conformance.failed",
+                     "conformance.transient-status", "conformance.cancelled"]),
+                ParamSpec(name="documentJson", type="text", default="{}")],
+        blurb="deterministic offline external-wait fixture",
+    ), PROVIDER_KIND)

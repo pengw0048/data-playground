@@ -74,6 +74,11 @@ class Registry:
         if self._entry is not None:
             self.deps._record_plugin_problem(self._entry, summary)
 
+    def workspace_identity(self) -> str:
+        """Return an opaque stable identity for instance-local deterministic plugin state."""
+        import hashlib
+        return hashlib.sha256(os.path.abspath(self.deps.workspace).encode()).hexdigest()[:16]
+
     def config(self, key: str, default=None):
         """Read a config value for the CURRENTLY-registering pack. Precedence: a UI-set value (metadb
         setting `plugin.<pack>.<key>`) > the field's declared `env` var > its declared `default` > the
@@ -269,6 +274,17 @@ class Registry:
         self.deps.external_wait_adapters[kind] = adapter
         self._activate(f"external-wait:{kind}", "application")
 
+    def add_external_wait_node(self, spec: NodeSpec, provider_kind: str) -> None:
+        """Bind one zero-input plugin node to its provider without exposing provider code to core."""
+        from hub.external_wait import normalize_provider_kind
+        kind = normalize_provider_kind(provider_kind)
+        if spec.inputs or spec.outputs or kind not in self.deps.external_wait_adapters:
+            raise ValueError("external-wait node requires one active adapter and no ports")
+        if spec.kind in self.deps.builtin_kinds or spec.kind in self.deps.node_specs:
+            raise ValueError("external-wait node kind conflicts with an existing node")
+        self.add_node(spec)
+        self.deps.external_wait_nodes[spec.kind] = kind
+
 
 def _persist_run(deps, graph, target, status) -> None:
     """Runner on_complete hook (bound to the owning deps): keep a finished run with its canvas
@@ -421,6 +437,7 @@ class Deps:
         self.telemetry_sinks: list = []
         self.managed_object_provider = None
         self.external_wait_adapters: dict[str, object] = {}
+        self.external_wait_nodes: dict[str, str] = {}
         self.plugins: list[dict] = []
         # Status is instance-owned: constructing a second app/kernel must not reuse the first one's
         # discoveries, failures, or effective capability ownership.

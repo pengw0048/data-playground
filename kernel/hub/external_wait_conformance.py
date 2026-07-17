@@ -244,7 +244,8 @@ def _run(plugin: str, kind: str, workspace: Path) -> None:
     status = next((entry for entry in deps.plugins if entry.get("name") == plugin), None)
     if status is None or status.get("state") != "active":
         raise _CheckFailed("activation", "entry_point_inactive")
-    if status.get("effective_capabilities") != [f"external-wait:{kind}"]:
+    if status.get("effective_capabilities") != [
+            f"external-wait:{kind}", "node:external_wait_fixture"]:
         raise _CheckFailed("activation", "capability_mismatch")
     adapter = deps._external_wait_adapter(kind)
     if adapter is None:

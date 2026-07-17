@@ -112,6 +112,27 @@ def _local_run_intent_sha256(
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _external_wait_request(deps, graph, target_node_id: str | None):
+    """Recognize only the installed zero-port fixture consumer, before ordinary compile/output gates."""
+    external = [node for node in graph.nodes if node.type in deps.external_wait_nodes]
+    if not external:
+        return None
+    if (len(graph.nodes) != 1 or len(external) != 1 or graph.edges
+            or target_node_id != external[0].id):
+        raise HTTPException(409, "external-wait tasks require exactly one zero-port target")
+    cfg = external[0].data.get("config", {}) if isinstance(external[0].data, dict) else {}
+    if not isinstance(cfg, dict) or set(cfg) - {"operation", "documentJson"}:
+        raise HTTPException(409, "external-wait node configuration is not supported")
+    from hub.external_wait import ExternalWaitSubmitRequest
+    try:
+        return ExternalWaitSubmitRequest(
+            provider_kind=deps.external_wait_nodes[external[0].type],
+            idempotency_key="admission", operation=cfg.get("operation", "conformance.success"),
+            document_json=cfg.get("documentJson", "{}"))
+    except ValueError as exc:
+        raise HTTPException(409, "external-wait node configuration is invalid") from exc
+
+
 def _local_run_source_nodes(graph, target_node_id: str | None):
     """Return execution-cone Sources in graph order; duplicate node ids are rejected upstream."""
     cone = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
@@ -1551,6 +1572,10 @@ def _require_destination_credential_preflight(deps, runner, plan, graph) -> None
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    if _external_wait_request(deps, req.graph, req.target_node_id) is not None:
+        if req.input_manifest is not None:
+            raise HTTPException(409, "external-wait tasks do not accept input manifests")
+        return RunEstimate(placement="local", needs_confirm=False)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.target_node_id)
     graph = (_bind_local_run_manifest(req.graph, req.input_manifest, deps, req.target_node_id)
@@ -1616,6 +1641,33 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
+    external_request = _external_wait_request(deps, graph, target_node_id)
+    if external_request is not None:
+        if input_manifest is not None or write_intent is not None or submission_id is None:
+            raise HTTPException(
+                409, "external-wait tasks require a submissionId and no inputs or write intent")
+        operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
+        if not operational_canvas or not metadb.canvas_exists(operational_canvas):
+            raise HTTPException(409, "durable external waits require a saved canvas")
+        semantic = intent_graph.model_dump(mode="json")
+        for node in semantic.get("nodes", []):
+            if isinstance(node.get("data"), dict):
+                node["data"].pop("status", None)
+        intent_sha256 = hashlib.sha256(json.dumps(
+            {"graph": semantic, "target": target_node_id,
+             "provider": external_request.provider_kind,
+             "operation": external_request.operation,
+             "document": external_request.document_json},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+        task, _created = metadb.submit_durable_external_wait_task(
+            uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+            target_node_id=str(target_node_id), intent_sha256=intent_sha256,
+            graph_doc=graph.model_dump(by_alias=True, mode="json"),
+            provider_kind=external_request.provider_kind,
+            operation=external_request.operation, document_json=external_request.document_json)
+        from hub.external_wait_tasks import recover
+        recover(deps)
+        return RunStatus.model_validate(task["status_doc"]), None
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
     if input_manifest is not None:
@@ -2486,10 +2538,10 @@ class DurableTaskRetryRequest(BaseModel):
 def run_retry(
         run_id: str, req: DurableTaskRetryRequest,
         uid: str = Depends(current_user)) -> RunStatus:
-    """Explicitly create the next bounded attempt for the one durable local Write task."""
+    """Explicitly create the next bounded attempt for a durable Task."""
     _require_run_mutate_access(run_id, uid)
     if metadb.durable_task_auth(run_id) is None:
-        raise HTTPException(409, "only durable managed-local write tasks support retry")
+        raise HTTPException(409, "only durable tasks support retry")
     from hub.durable_tasks import retry
     try:
         task = retry(run_id, str(req.action_id), get_deps())

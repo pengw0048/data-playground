@@ -1,8 +1,7 @@
-"""Bounded durable ownership for managed-local create/replace Write tasks.
+"""Bounded durable ownership and shared recovery for the two certified Task kinds.
 
-This is deliberately not a scheduler. It owns exactly one frozen saved-canvas Write consumer and
-delegates execution/cancellation to an isolated LocalRunner while SQL owns identity, leases, attempts,
-and terminal truth.
+This is deliberately not a scheduler. Local Write work uses one isolated LocalRunner; the same bounded
+scanner also dispatches due external-wait transitions while SQL owns identity and terminal truth.
 """
 
 from __future__ import annotations
@@ -149,15 +148,17 @@ def dispatch(task_id: str, deps) -> None:
 def recover(deps) -> None:
     for task_id in metadb.recoverable_durable_task_ids():
         dispatch(task_id, deps)
+    from hub.external_wait_tasks import recover as recover_external_waits
+    recover_external_waits(deps)
 
 
 def recovery_loop(deps, stop: threading.Event) -> None:
-    """Rescan only this bounded local Task type so leases expiring after startup are reclaimed."""
+    """Rescan the two bounded Task kinds; this remains the sole durable recovery scanner."""
     while not stop.is_set():
         try:
             recover(deps)
         except BaseException:
-            logging.getLogger("hub").exception("durable local task recovery scan failed")
+            logging.getLogger("hub").exception("durable task recovery scan failed")
         stop.wait(_RECOVERY_SCAN_SECONDS)
 
 
@@ -185,5 +186,6 @@ def request_cancel(task_id: str) -> dict | None:
 
 def retry(task_id: str, retry_request_id: str, deps) -> dict:
     task = metadb.retry_durable_task(task_id, retry_request_id)
-    dispatch(task_id, deps)
+    if task["task_kind"] == "managed_local_write":
+        dispatch(task_id, deps)
     return task
