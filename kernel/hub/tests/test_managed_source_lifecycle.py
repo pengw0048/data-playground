@@ -982,7 +982,15 @@ def test_source_lease_lost_after_child_done_blocks_every_publication(
         }}
     else:
         runner._object_results[run_id] = {
-            "uri": output_uri,
+            "results": [{
+                "nodeId": target_node_id,
+                "portId": "out",
+                "uri": output_uri,
+                "logicalUri": "s3://managed-source-loss/results/out.parquet",
+                "attemptId": "parent",
+                "generation": 1,
+                "storageNamespace": "installation",
+            }],
             "cache_key": None,
             "run_state_owner": True,
         }

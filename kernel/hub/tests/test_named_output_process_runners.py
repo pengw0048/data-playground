@@ -19,7 +19,11 @@ from hub.models import (
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.runner import LocalRunner
 from hub.run_controller import RunController, _RegionMaterialization
-from hub.run_outputs import require_single_run_output, sole_committed_document_output
+from hub.run_outputs import (
+    expected_run_outputs,
+    require_single_run_output,
+    sole_committed_document_output,
+)
 from hub.subprocess_runner import SubprocessRunner
 
 
@@ -174,28 +178,173 @@ def test_subprocess_multi_output_preallocation_failure_aborts_owned_prefix(
     assert runner._local_results == {}
 
 
-def test_subprocess_object_backed_multi_output_remains_fail_closed(
+def test_subprocess_object_backed_multi_output_preallocates_exact_ordered_attempts(
         tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     runner.storage = SimpleNamespace(
         output_uri=lambda name, ext: f"s3://results/{name}{ext}")
+    runner.resolve_adapter = lambda _uri: None
+    runner.on_status = lambda *_a: None
     graph = Graph(id="g", nodes=[
         _node("branches", "section", {"outputs": ["first", "second"]}),
     ], edges=[])
-    calls: list[str] = []
+    allocations: list[dict] = []
+    spawned: list[dict] = []
     monkeypatch.setattr(
         runner, "_claim_source_leases",
         lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
                      "attempts": {}, "local_sources": {}})
     monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
-    monkeypatch.setattr(runner, "_spawn", lambda *_a: calls.append("spawn"))
+    monkeypatch.setattr("hub.plan_key.plan_hash", lambda *_a: "plan")
+    monkeypatch.setattr("hub.plan_key.plan_cacheable", lambda *_a: True)
 
-    with pytest.raises(RuntimeError, match="do not support named multi-output"):
+    def allocate_attempt(**kwargs):
+        allocations.append(kwargs)
+        index = len(allocations) - 1
+        return {
+            "uri": f"s3://results/out-{index}.attempt-owned",
+            "attempt_id": f"attempt-{index}", "generation": 1,
+            "storage_namespace": "installation",
+        }
+
+    monkeypatch.setattr("hub.handoff.allocate_attempt", allocate_attempt)
+    monkeypatch.setattr(
+        runner, "_spawn",
+        lambda _status, extra, _graph, _target: spawned.append(extra))
+
+    runner.run(
+        _plan(("branches", "section"), target="branches"),
+        graph, "branches", "local")
+
+    assert [item["logical_uri"] for item in allocations] == [
+        "s3://results/__result_plan_00.parquet",
+        "s3://results/__result_plan_01.parquet",
+    ]
+    allocation_keys = [item["allocation_key"].split(":") for item in allocations]
+    assert allocation_keys[0][1] == allocation_keys[1][1]
+    assert allocation_keys[0][1].startswith("run_")
+    assert [parts[2:] for parts in allocation_keys] == [
+        ["plan", "branches", "first", "0"],
+        ["plan", "branches", "second", "1"],
+    ]
+    assert [item["portId"] for item in spawned[0]["forcedResults"]] == [
+        "first", "second"]
+    assert [item["uri"] for item in spawned[0]["forcedResults"]] == [
+        "s3://results/out-0.attempt-owned",
+        "s3://results/out-1.attempt-owned",
+    ]
+
+
+def test_subprocess_object_multi_output_preallocation_failure_abandons_owned_prefix(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    runner.storage = SimpleNamespace(
+        output_uri=lambda name, ext: f"s3://results/{name}{ext}")
+    runner.resolve_adapter = lambda _uri: None
+    runner.on_status = lambda *_a: None
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    monkeypatch.setattr(
+        runner, "_claim_source_leases",
+        lambda *_a: {"stack": SimpleNamespace(close=lambda: None), "guards": [],
+                     "attempts": {}, "local_sources": {}})
+    monkeypatch.setattr(runner, "_claim_sink_contracts", lambda *_a: ({}, {}, {}))
+    monkeypatch.setattr("hub.plan_key.plan_hash", lambda *_a: "plan")
+    monkeypatch.setattr("hub.plan_key.plan_cacheable", lambda *_a: True)
+    first_uri = "s3://results/first.attempt-owned"
+    calls = 0
+
+    def allocate_attempt(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second object allocation rejected")
+        return {
+            "uri": first_uri, "attempt_id": "first", "generation": 1,
+            "storage_namespace": "installation",
+        }
+
+    abandoned: list[str] = []
+    monkeypatch.setattr("hub.handoff.allocate_attempt", allocate_attempt)
+    monkeypatch.setattr(
+        "hub.subprocess_runner._safe_abandon_attempt",
+        lambda uri, **_kwargs: abandoned.append(uri))
+
+    with pytest.raises(RuntimeError, match="second object allocation rejected"):
         runner.run(
             _plan(("branches", "section"), target="branches"),
             graph, "branches", "local")
 
-    assert calls == []
+    assert abandoned == [first_uri]
+    assert runner._object_results == {}
+
+
+def test_subprocess_object_second_port_failure_publishes_prefix_and_abandons_rest(
+        tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    graph = Graph(id="g", nodes=[
+        _node("branches", "section", {"outputs": ["first", "second"]}),
+    ], edges=[])
+    expected = expected_run_outputs(graph, "branches", NODE_SPECS)
+    parent = RunStatus(
+        run_id="run", status="running", target_node_id="branches",
+        outputs=expected, per_node=[])
+    runner.runs["run"] = parent
+    runner._published_statuses["run"] = parent.model_copy(deep=True)
+    reservations = [{
+        "nodeId": "branches", "portId": port,
+        "uri": f"s3://results/{port}.attempt-owned",
+        "logicalUri": f"s3://results/{port}.parquet",
+        "attemptId": port, "generation": 1,
+        "storageNamespace": "installation",
+    } for port in ("first", "second")]
+    runner._object_results["run"] = {
+        "results": reservations, "cache_key": None, "run_state_owner": True}
+    job_dir = tmp_path / "object-partial"
+    job_dir.mkdir()
+    status_file = job_dir / "status.json"
+    status_file.write_text(json.dumps(RunStatus(
+        run_id="child", status="failed", target_node_id="branches", per_node=[],
+        error="second output failed", outputs=[
+            _committed_output(expected[0], reservations[0]["uri"], rows=3),
+            expected[1].model_copy(update={
+                "outcome": "failed", "error": "second output failed"}),
+        ],
+    ).model_dump()))
+
+    class FinishedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+    validated: list[str] = []
+    committed: list[str] = []
+    abandoned: list[str] = []
+    monkeypatch.setattr(
+        "hub.subprocess_runner._validate_object_result_commit",
+        lambda item, _output, _run_id: validated.append(item["uri"]))
+    monkeypatch.setattr("hub.handoff.prepare_attempt_commit", committed.append)
+    monkeypatch.setattr(
+        "hub.subprocess_runner._safe_abandon_attempt",
+        lambda uri, **_kwargs: abandoned.append(uri))
+
+    runner._watch(
+        "run", FinishedProcess(), str(status_file), str(job_dir), graph, "branches")
+
+    final = runner.status("run")
+    assert final.status == "failed"
+    assert [(output.port_id, output.outcome) for output in final.outputs] == [
+        ("first", "committed"), ("second", "failed")]
+    assert validated == committed == [reservations[0]["uri"]]
+    assert abandoned == [reservations[1]["uri"]]
+    assert "run" not in runner._object_results
 
 
 def test_subprocess_run_unit_rejects_multi_output_before_plan_or_claim(

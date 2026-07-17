@@ -137,6 +137,32 @@ def _run_output(
     )
 
 
+def _object_result_owner(
+        handle: dict | str, *, node_id: str = "source", port_id: str = "out",
+        cache_key: str | None = None, run_state_owner: bool = True) -> dict:
+    if isinstance(handle, dict):
+        uri = handle["uri"]
+        logical_uri = handle["logical_uri"]
+        attempt_id = handle["attempt_id"]
+        generation = handle["generation"]
+        namespace = handle["storage_namespace"]
+    else:
+        uri = str(handle)
+        logical_uri = uri.split(".attempt-", 1)[0]
+        attempt_id = "test-attempt"
+        generation = 1
+        namespace = "test-namespace"
+    return {
+        "results": [{
+            "nodeId": node_id, "portId": port_id, "uri": uri,
+            "logicalUri": logical_uri, "attemptId": attempt_id,
+            "generation": generation, "storageNamespace": namespace,
+        }],
+        "cache_key": cache_key,
+        "run_state_owner": run_state_owner,
+    }
+
+
 def _cache_document(uri: str, rows: int = 1, *, node_id: str = "source") -> dict:
     return {"outputs": [_run_output(uri, rows=rows, node_id=node_id).model_dump()]}
 
@@ -3392,48 +3418,69 @@ def test_moto_subprocess_backends_publish_parent_owned_object_full_result(
         runner = next(candidate for candidate in deps.runners if candidate.name == backend)
         graph = Graph.model_validate({
             "id": f"{backend}-object-result", "version": 1,
-            "nodes": [{
-                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
-                "data": {"config": {"uri": str(source)}},
-            }],
-            "edges": [],
+            "nodes": [
+                {
+                    "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                    "data": {"config": {"uri": str(source)}},
+                },
+                {
+                    "id": "branches", "type": "section", "position": {"x": 200, "y": 0},
+                    "data": {"config": {
+                        "script": (
+                            "emit('first', inputs['in'])\n"
+                            "emit('second', inputs['in'])\n"),
+                        "outputs": ["first", "second"], "params": {}, "maxRuns": 10,
+                    }},
+                },
+            ],
+            "edges": [{"id": "source-branches", "source": "source", "target": "branches"}],
         })
         plan = compiler.compile_plan(
-            graph, "source", deps.registry, deps.node_specs, deps.node_ir)
-        status = runner.run(plan, graph, "source", "local")
+            graph, "branches", deps.registry, deps.node_specs, deps.node_ir)
+        status = runner.run(plan, graph, "branches", "local")
         deadline = time.monotonic() + 30
         while runner.status(status.run_id).status not in ("done", "failed", "cancelled"):
             assert time.monotonic() < deadline
             time.sleep(0.05)
         final = runner.status(status.run_id)
         assert final.status == "done", final.error
-        assert len(final.outputs) == 1
-        output = final.outputs[0]
-        assert output.outcome == "committed" and output.uri and output.table is None
-        result_key = urlsplit(output.uri).path.lstrip("/").rstrip("/") \
-            + "/part-00000.parquet"
-        result_bytes = client.get_object(
-            Bucket="subprocess-full-result", Key=result_key)["Body"].read()
-        assert pq.read_table(pa.BufferReader(result_bytes)).num_rows == 3
+        assert [(output.port_id, output.outcome, output.rows) for output in final.outputs] == [
+            ("first", "committed", 3), ("second", "committed", 3)]
+        assert len({output.uri for output in final.outputs}) == 2
+        for output in final.outputs:
+            assert output.uri and output.table is None
+            result_key = urlsplit(output.uri).path.lstrip("/").rstrip("/") \
+                + "/part-00000.parquet"
+            result_bytes = client.get_object(
+                Bucket="subprocess-full-result", Key=result_key)["Body"].read()
+            assert pq.read_table(pa.BufferReader(result_bytes)).num_rows == 3
         with metadb.session() as session:
-            attempt = session.get(metadb.ObjectAttempt, output.uri)
-            assert attempt is not None and attempt.state == "published"
-            ref = session.get(metadb.ObjectAttemptRef, {
-                "ref_type": "run_state", "ref_key": final.run_id,
-                "ref_slot": metadb.run_output_ref_slot(output.node_id, output.port_id),
-            })
-            assert ref is not None and ref.attempt_uri == output.uri
-        phash = deps.runner._plan_hash(graph, "source")
+            for output in final.outputs:
+                attempt = session.get(metadb.ObjectAttempt, output.uri)
+                assert attempt is not None and attempt.state == "published"
+                ref = session.get(metadb.ObjectAttemptRef, {
+                    "ref_type": "run_state", "ref_key": final.run_id,
+                    "ref_slot": metadb.run_output_ref_slot(output.node_id, output.port_id),
+                })
+                assert ref is not None and ref.attempt_uri == output.uri
+        restarted = RunStatus.model_validate(metadb.get_run_state(final.run_id))
+        assert [output.model_dump() for output in restarted.outputs] == [
+            output.model_dump() for output in final.outputs]
+        phash = deps.runner._plan_hash(graph, "branches")
         cache_deadline = time.monotonic() + 2
         while metadb.get_result(phash) is None and time.monotonic() < cache_deadline:
             # The durable RunState is the terminal publication point; the reusable cache pointer is a
             # best-effort secondary write performed immediately afterward.
             time.sleep(0.01)
-        assert _cached_output(phash).uri == output.uri
+        cached = metadb.get_result(phash)
+        assert cached is not None
+        assert [output["uri"] for output in cached["outputs"]] == [
+            output.uri for output in final.outputs]
 
         _retire_terminal_run_state(final.run_id)
         _retire_result_cache(phash)
-        metadb.quarantine_object_attempt(output.uri, "test cleanup")
+        for output in final.outputs:
+            metadb.quarantine_object_attempt(output.uri, "test cleanup")
     finally:
         if runner is not None:
             runner._terminate_all()
@@ -3920,7 +3967,9 @@ def test_subprocess_parent_discards_object_result_only_after_child_reaped(
     runner.runs[handle["run_id"]] = RunStatus(
         run_id=handle["run_id"], status="running", per_node=[],
         target_node_id="source", outputs=[_run_output(outcome="pending")])
-    runner._object_results[handle["run_id"]] = {"uri": handle["uri"], "cache_key": None}
+    runner._published_statuses[handle["run_id"]] = runner.runs[
+        handle["run_id"]].model_copy(deep=True)
+    runner._object_results[handle["run_id"]] = _object_result_owner(handle)
     process = FinishedProcess()
     runner._process_scopes[handle["run_id"]] = OwnedProcessScope(
         process, owns_process_group=False)
@@ -4431,7 +4480,8 @@ def test_subprocess_managed_sink_cleanup_outage_does_not_block_terminalization(
     assert not job_dir.exists()
 
 
-def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, monkeypatch):
+def test_subprocess_object_result_commit_unknown_uses_exact_run_state_receipt(
+        tmp_path, monkeypatch):
     from hub.models import Graph, RunStatus
     from hub.subprocess_runner import SubprocessRunner
 
@@ -4459,21 +4509,73 @@ def test_subprocess_parent_persistence_failure_never_publishes_done(tmp_path, mo
     runner.runs[handle["run_id"]] = RunStatus(
         run_id=handle["run_id"], status="running", per_node=[],
         target_node_id="source", outputs=[_run_output(outcome="pending")])
-    runner._object_results[handle["run_id"]] = {"uri": handle["uri"], "cache_key": None}
-    runner.on_status = lambda _graph, status: (
-        (_ for _ in ()).throw(RuntimeError("metadata unavailable"))
-        if status.status == "done" else None)
+    runner._published_statuses[handle["run_id"]] = runner.runs[
+        handle["run_id"]].model_copy(deep=True)
+    runner._object_results[handle["run_id"]] = _object_result_owner(handle)
+    metadb.save_run_state(
+        handle["run_id"], runner.runs[handle["run_id"]].model_dump())
+
+    def persist_then_lose_response(_graph, status):
+        metadb.save_run_state(
+            handle["run_id"], status.model_dump(),
+            publish_region=status.status in ("done", "failed"))
+        if status.status == "done":
+            raise RuntimeError("database response lost after commit")
+
+    runner.on_status = persist_then_lose_response
+    monkeypatch.setattr(
+        "hub.subprocess_runner._validate_object_result_commit", lambda *_args: None)
     monkeypatch.setattr(handoff, "prepare_attempt_commit", lambda _uri: _commit(handle))
     runner._watch(
         handle["run_id"], FinishedProcess(), str(status_file), str(job_dir),
         Graph.model_validate({"id": "persist-fail", "version": 1,
                               "nodes": [], "edges": []}), "source")
     final = runner.status(handle["run_id"])
-    assert final.status == "failed"
-    assert final.outputs[0].outcome == "failed" and final.outputs[0].uri is None
-    assert "publication failed" in (final.error or "")
-    assert _state(handle["uri"]) == "abandoned"
+    assert final.status == "done"
+    assert final.outputs[0].outcome == "committed"
+    assert final.outputs[0].uri == handle["uri"]
+    assert _state(handle["uri"]) == "published"
+    _retire_terminal_run_state(handle["run_id"])
     metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
+
+
+def test_object_result_run_state_receipt_requires_complete_multi_port_generation_set():
+    run_id = f"receipt-{uuid.uuid4().hex}"
+    handles = [
+        _handle(
+            logical=f"s3://lifecycle-tests/{uuid.uuid4().hex}/{port}.parquet",
+            run_id=run_id, allocation_key=f"{run_id}:{port}")
+        for port in ("first", "second")
+    ]
+    for handle in handles:
+        _commit(handle)
+    pending = RunStatus(
+        run_id=run_id, status="running", target_node_id="branches", outputs=[
+            _run_output(node_id="branches", port_id=port, outcome="pending")
+            for port in ("first", "second")
+        ])
+    metadb.save_run_state(run_id, pending.model_dump())
+    done = RunStatus(
+        run_id=run_id, status="done", target_node_id="branches", outputs=[
+            _run_output(
+                handle["uri"], rows=3, node_id="branches", port_id=port)
+            for handle, port in zip(handles, ("first", "second"))
+        ])
+    doc = done.model_dump()
+    metadb.save_run_state(run_id, doc, publish_region=True)
+
+    assert metadb.object_result_run_state_receipt(
+        [handle["uri"] for handle in handles], run_id, doc)
+    assert not metadb.object_result_run_state_receipt(
+        [handles[0]["uri"]], run_id, doc)
+    changed = done.model_copy(deep=True)
+    changed.outputs[1].rows = 4
+    assert not metadb.object_result_run_state_receipt(
+        [handle["uri"] for handle in handles], run_id, changed.model_dump())
+
+    _retire_terminal_run_state(run_id)
+    for handle in handles:
+        metadb.quarantine_object_attempt(handle["uri"], "test cleanup")
 
 
 def test_subprocess_post_popen_setup_failure_reaps_before_discard(tmp_path, monkeypatch):
@@ -4524,7 +4626,11 @@ def test_subprocess_post_popen_setup_failure_reaps_before_discard(tmp_path, monk
 
     monkeypatch.setattr(subprocess_runner.subprocess, "Popen", lambda *args, **kwargs: Process())
     monkeypatch.setattr(subprocess_runner.threading, "Thread", BrokenThread)
-    monkeypatch.setattr(handoff, "allocate_attempt", lambda **_kwargs: {"uri": attempt_uri})
+    monkeypatch.setattr(handoff, "allocate_attempt", lambda **kwargs: {
+        "uri": attempt_uri, "logical_uri": kwargs["logical_uri"],
+        "attempt_id": "setup", "generation": 1,
+        "storage_namespace": "installation",
+    })
     monkeypatch.setattr(
         handoff, "discard_attempt",
         lambda uri: events.append("discard") if uri == attempt_uri else None)
@@ -4575,7 +4681,8 @@ def test_subprocess_orderly_shutdown_fences_watcher_before_reap_and_discard(tmp_
     runner._procs[run_id] = process
     runner._process_scopes[run_id] = OwnedProcessScope(
         process, owns_process_group=False)
-    runner._object_results[run_id] = {"uri": "s3://shutdown/out.attempt-owned"}
+    runner._object_results[run_id] = _object_result_owner(
+        "s3://shutdown/out.attempt-owned")
     monkeypatch.setattr(
         handoff, "discard_attempt", lambda _uri: events.append("discard"))
     runner._terminate_all()
@@ -4596,7 +4703,11 @@ def test_subprocess_run_unit_allocates_exact_object_attempt_before_spawn(
     allocations = []
     monkeypatch.setattr(
         handoff, "allocate_attempt",
-        lambda **kwargs: allocations.append(kwargs) or {"uri": attempt})
+        lambda **kwargs: allocations.append(kwargs) or {
+            "uri": attempt, "logical_uri": kwargs["logical_uri"],
+            "attempt_id": "region", "generation": 1,
+            "storage_namespace": "installation",
+        })
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), resolve_adapter=lambda _uri: object())
     spawned = {}
@@ -4604,7 +4715,7 @@ def test_subprocess_run_unit_allocates_exact_object_attempt_before_spawn(
     def spawn(status, job_extra, graph, target):
         spawned.update(status=status, job_extra=job_extra, graph=graph, target=target)
         if object_backed:
-            assert runner._object_results[status.run_id]["uri"] == attempt
+            assert runner._object_results[status.run_id]["results"][0]["uri"] == attempt
         return status
 
     monkeypatch.setattr(runner, "_spawn", spawn)
@@ -4701,9 +4812,10 @@ def test_subprocess_region_attempt_is_returned_without_run_state_ownership(
     runner.runs["unit"] = parent
     runner._published_statuses["unit"] = parent.model_copy(deep=True)
     runner._internal_runs.add("unit")
-    runner._object_results["unit"] = {
-        "uri": attempt, "cache_key": None, "run_state_owner": False,
-    }
+    runner._object_results["unit"] = _object_result_owner(
+        attempt, node_id="result", run_state_owner=False)
+    monkeypatch.setattr(
+        "hub.subprocess_runner._validate_object_result_commit", lambda *_args: None)
     runner.on_status = lambda _graph, status: persisted.append(status.model_copy(deep=True))
     runner._watch(
         "unit", FinishedProcess(), str(status_file), str(job_dir),
@@ -4758,9 +4870,8 @@ def test_subprocess_malformed_child_status_fails_generically_after_reap_and_clea
     runner._procs["run"] = process
     runner._process_scopes["run"] = OwnedProcessScope(
         process, owns_process_group=False)
-    runner._object_results["run"] = {
-        "uri": "s3://region-contract/out.attempt-parent", "cache_key": None,
-    }
+    runner._object_results["run"] = _object_result_owner(
+        "s3://region-contract/out.attempt-parent")
     runner._watch(
         "run", process, str(status_file), str(job_dir),
         Graph.model_validate({"id": "malformed", "version": 1,
@@ -5323,7 +5434,11 @@ def test_post_popen_setup_failure_retains_writer_when_reap_is_unproved(
 
     monkeypatch.setattr(subprocess_runner.subprocess, "Popen", lambda *_args, **_kwargs: Process())
     monkeypatch.setattr(subprocess_runner.threading, "Thread", BrokenThread)
-    monkeypatch.setattr(handoff, "allocate_attempt", lambda **_kwargs: {"uri": attempt})
+    monkeypatch.setattr(handoff, "allocate_attempt", lambda **kwargs: {
+        "uri": attempt, "logical_uri": kwargs["logical_uri"],
+        "attempt_id": "retained", "generation": 1,
+        "storage_namespace": "installation",
+    })
     monkeypatch.setattr(handoff, "discard_attempt", discarded.append)
     runner = SubprocessRunner(
         str(tmp_path), str(tmp_path), storage=Storage(),
@@ -5404,7 +5519,7 @@ def test_supervisor_reap_failure_retains_attempt_jobdir_and_process_tracking(
     runner.runs["run"] = RunStatus(run_id="run", status="running", per_node=[])
     runner._procs["run"] = Process()
     runner._cancel_files["run"] = str(job_dir / "cancel.requested")
-    runner._object_results["run"] = {"uri": attempt, "cache_key": None}
+    runner._object_results["run"] = _object_result_owner(attempt)
     runner._sink_contracts["run"] = {"write": {"name": "out"}}
     completed = []
     retries = []
@@ -5429,7 +5544,7 @@ def test_supervisor_reap_failure_retains_attempt_jobdir_and_process_tracking(
     assert completed == [] and retries == ["retry"]
     assert cleanup == []
     assert runner._procs.get("run") is not None
-    assert runner._object_results["run"]["uri"] == attempt
+    assert runner._object_results["run"]["results"][0]["uri"] == attempt
     assert "run" in runner._sink_contracts
     assert job_dir.is_dir()
     runner._procs.clear()
