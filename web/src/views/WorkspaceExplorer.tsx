@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
-import type { CatalogTable, WorkspaceMoveCanvasResult, WorkspaceResource } from '../types/api'
+import type { CatalogTable, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSourceStatus } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { CatalogDetail } from './CatalogView'
 
@@ -10,6 +10,11 @@ const PAGE_SIZE = 50
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
+const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
+const statusMessage = (status: WorkspaceSourceStatus) => status.error
+  ?? (status.completeness === 'unavailable' ? 'source is offline'
+    : status.completeness === 'unsupported' ? 'browse is not supported'
+      : status.completeness === 'partial' ? 'source returned partial results' : null)
 
 // The explorer deliberately consumes the bounded Workspace API rather than composing a canvas list
 // and catalog page in the browser. A resource URL is opaque and remains valid when its display name
@@ -28,13 +33,17 @@ export function WorkspaceExplorer() {
   const [items, setItems] = useState<WorkspaceResource[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(false)
+  const [completeness, setCompleteness] = useState<'complete' | 'page' | 'partial'>('complete')
+  const [sources, setSources] = useState<WorkspaceSourceStatus[]>([])
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const [selectedTable, setSelectedTable] = useState<CatalogTable | null>(null)
   const [selectedDataset, setSelectedDataset] = useState<WorkspaceResource | null>(null)
+  const [selectedSource, setSelectedSource] = useState<WorkspaceSourceStatus | null>(null)
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
+  const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [datasetAction, setDatasetAction] = useState<{ resource: WorkspaceResource; table: CatalogTable } | null>(null)
   const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
@@ -44,20 +53,36 @@ export function WorkspaceExplorer() {
   const [undoBusy, setUndoBusy] = useState(false)
   const [revision, setRevision] = useState(0)
   const request = useRef(0)
+  const loadedContainer = useRef<string | null>(null)
+  const selectionRequest = useRef<string | null>(null)
+  const selectionContainer = useRef<WorkspaceResource | null>(null)
 
   const load = useCallback(async (targetId: string, nextCursor?: string | null) => {
     const sequence = ++request.current
     const more = !!nextCursor
     if (more) { setLoadingMore(true); setLoadMoreError(null) }
     else {
-      setLoading(true); setError(null); setLoadMoreError(null); setItems([]); setCursor(null); setHasMore(false)
+      setLoading(true); setError(null); setLoadMoreError(null)
+      // Keep a resolved location visible while it refreshes. Provider refreshes may return an honest
+      // partial/offline page with no container; clearing here would hide the selected resource and
+      // its ancestors even though their stable identity has not changed.
+      if (targetId !== loadedContainer.current) { setItems([]); setCursor(null); setHasMore(false); setSources([]) }
     }
     try {
       const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
       if (sequence !== request.current) return
+      setCompleteness(page.completeness)
+      setSources(page.sources ?? [])
+      if (!page.container) {
+        const unavailable = page.sources?.map(statusMessage).find(Boolean)
+          ?? 'Workspace source is unavailable'
+        if (targetId !== loadedContainer.current) setError(unavailable)
+        return
+      }
       setContainerId(identity(page.container))
+      loadedContainer.current = identity(page.container)
       setContainer(page.container)
-      if (!more) setCrumbs((current) => current.length && current[current.length - 1].id === page.container.id ? current : [...current, page.container])
+      if (!more) setCrumbs((current) => current.length && current[current.length - 1].id === page.container!.id ? current : [...current, page.container!])
       setItems((current) => {
         const next = more ? current : []
         const seen = new Set(next.map((item) => item.id))
@@ -76,8 +101,15 @@ export function WorkspaceExplorer() {
   useEffect(() => {
     let cancelled = false
     const resolve = async () => {
-      setSelectedTable(null); setSelectedDataset(null); setSelectedDetached(null)
+      setResolutionError(null)
+      const refreshingSelection = selectionRequest.current === requestedResourceId
+      if (!refreshingSelection) {
+        selectionRequest.current = requestedResourceId
+        selectionContainer.current = null
+        setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
+      }
       if (!requestedResourceId) {
+        selectionContainer.current = null
         setCrumbs([])
         await load(LOCAL_ROOT_ID)
         return
@@ -85,18 +117,43 @@ export function WorkspaceExplorer() {
       try {
         const resolved = await api.workspaceResource(requestedResourceId)
         if (cancelled) return
-        const container = resolved.resource.kind === 'container'
+        if (!resolved.resource) {
+          setResolutionError(statusMessage(resolved.source) ?? 'Workspace resource is unavailable')
+          return
+        }
+        const resolvedContainer = resolved.resource.kind === 'container'
           ? resolved.resource
           : resolved.ancestors[resolved.ancestors.length - 1]
-        if (!container) throw new Error('Workspace resource has no local container')
-        setCrumbs(resolved.resource.kind === 'container'
+        if (!resolvedContainer) throw new Error('Workspace resource has no container')
+        const preserveNavigation = refreshingSelection && resolved.source.completeness !== 'complete'
+        const container = preserveNavigation ? selectionContainer.current ?? resolvedContainer : resolvedContainer
+        if (!preserveNavigation) selectionContainer.current = resolvedContainer
+        const resolvedCrumbs = resolved.resource.kind === 'container'
           ? [...resolved.ancestors, resolved.resource]
-          : resolved.ancestors)
+          : resolved.ancestors
+        if (resolved.source.completeness === 'complete' || !refreshingSelection) setCrumbs(resolvedCrumbs)
+        else setCrumbs((current) => current.length ? current : resolvedCrumbs)
         await load(identity(container))
-        if (cancelled || resolved.resource.kind !== 'dataset') return
-        if (resolved.resource.detached) { setSelectedDetached(resolved.resource); return }
+        if (cancelled) return
+        if (resolved.resource.kind !== 'dataset') {
+          setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
+          if (resolved.source.completeness !== 'complete') {
+            setResolutionError(statusMessage(resolved.source) ?? 'Workspace path is partial')
+          }
+          return
+        }
+        setSelectedDataset(resolved.resource)
+        setSelectedSource(resolved.source)
+        if (isExternal(resolved.resource)) {
+          setSelectedTable(null); setSelectedDetached(null)
+          if (resolved.source.completeness !== 'complete') {
+            setResolutionError(statusMessage(resolved.source) ?? 'Workspace path is partial')
+          }
+          return
+        }
+        if (resolved.resource.detached) { setSelectedTable(null); setSelectedDetached(resolved.resource); return }
         try {
-          setSelectedDataset(resolved.resource)
+          setSelectedTable(null); setSelectedDetached(null)
           setSelectedTable(await api.tableByRegistration(identity(resolved.resource)))
         }
         catch (caught) {
@@ -108,7 +165,7 @@ export function WorkspaceExplorer() {
           else { setError(errorMessage(caught)); setItems([]); setHasMore(false) }
         }
       } catch (caught) {
-        if (!cancelled) { setError(errorMessage(caught)); setItems([]); setHasMore(false) }
+        if (!cancelled) setResolutionError(errorMessage(caught))
       }
     }
     void resolve()
@@ -161,8 +218,9 @@ export function WorkspaceExplorer() {
         </div>
         <span className="flex-1" />
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
-          <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading}
-            title={container ? `Create in ${container.name}` : 'Load a Workspace destination first'}
+          <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading || isExternal(container)}
+            title={isExternal(container) ? 'Read-only external mounts do not support creating canvases'
+              : container ? `Create in ${container.name}` : 'Load a Workspace destination first'}
             className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New canvas here</button>
         </div>
         <button onClick={reload} disabled={loading || loadingMore} data-testid="workspace-reload" className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
@@ -176,6 +234,13 @@ export function WorkspaceExplorer() {
         <button onClick={() => setUndoMove(null)} aria-label="Dismiss move confirmation"><Icon name="close" size={13} /></button>
       </div>}
 
+      {(sources.some((source) => source.kind !== 'local') || completeness === 'partial')
+        && <SourceStatusBar sources={sources} completeness={completeness} />}
+      {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+        <span className="min-w-0 flex-1 truncate">This selection could not be fully refreshed: {resolutionError}</span>
+        <button onClick={reload} disabled={loading} className="shrink-0 font-semibold underline disabled:opacity-50">Retry</button>
+      </div>}
+
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
         {error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
@@ -187,13 +252,16 @@ export function WorkspaceExplorer() {
           {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
             {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more'}
           </button>}
-        </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>This local container is empty. Create a canvas here to get started.</span></div>}
+        </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{isExternal(container)
+          ? 'This read-only external location is empty.'
+          : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
       </div>
 
       {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
         onOpenTable={setSelectedTable} onFolder={() => pushToast('Dataset folders are not Workspace containers.', 'info')}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
+      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && container?.version != null && <NewCanvasDialog container={container} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
@@ -208,6 +276,26 @@ export function WorkspaceExplorer() {
         }} />}
     </div>
   )
+}
+
+function SourceStatusBar({ sources, completeness }: {
+  sources: WorkspaceSourceStatus[]; completeness: 'complete' | 'page' | 'partial'
+}) {
+  return <section aria-label="Workspace source status" className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-7 py-2 text-[11px] ${completeness === 'partial'
+    ? 'border-amber-300/50 bg-amber-50 text-amber-950 dark:bg-amber-950/30 dark:text-amber-100'
+    : 'border-border bg-muted/25 text-muted-foreground'}`}>
+    <span className="font-semibold">{completeness === 'partial' ? 'Some sources are incomplete' : 'Sources'}</span>
+    {sources.map((source) => {
+      const name = source.kind === 'local' ? 'Local'
+        : source.kind === 'provider' ? `Mount ${source.mountId ?? source.id}`
+          : 'Mount configuration'
+      const detail = source.provider ? ` · ${source.provider}` : ''
+      const message = statusMessage(source)
+      return <span key={source.id} title={message ?? undefined} className="min-w-0 max-w-full truncate">
+        {name}{detail} · <strong>{source.completeness}</strong>{message ? ` — ${message}` : ''}
+      </span>
+    })}
+  </section>
 }
 
 function NewCanvasDialog({ container, onClose, onCreated }: {
@@ -313,8 +401,10 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
     setLoading(true); setError(null)
     try {
       const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
+      if (!page.container) throw new Error(page.sources.map(statusMessage).find(Boolean) ?? 'Workspace destination is unavailable')
       setContainer(page.container)
-      setChildren((current) => nextCursor ? [...current, ...page.items.filter((item) => item.kind === 'container')] : page.items.filter((item) => item.kind === 'container'))
+      const localContainers = page.items.filter((item) => item.kind === 'container' && !isExternal(item))
+      setChildren((current) => nextCursor ? [...current, ...localContainers] : localContainers)
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
       if (!nextCursor) setPath(nextPath ?? [page.container])
     } catch (caught) { setError(errorMessage(caught)) }
@@ -362,15 +452,36 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
 function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? 'Container' : resource.kind === 'canvas' ? 'Canvas' : 'Dataset'
+  const source = isExternal(resource) ? `Mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}` : 'Local'
+  const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   return <div className="flex min-w-0 items-center rounded-lg border border-border bg-card hover:border-primary/40 hover:bg-accent">
-    <button type="button" onClick={onOpen} aria-label={`Open ${kind.toLowerCase()} ${resource.name}`}
+    <button type="button" onClick={onOpen} aria-label={openLabel}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="text-[11px] text-muted-foreground">{kind}{resource.detached ? ' · detached' : ''}</span></span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span></span>
       {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     {onMove && <button type="button" onClick={onMove} aria-label={`Move canvas ${resource.name}`}
       className="mr-2 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-semibold text-muted-foreground hover:text-foreground">Move</button>}
+  </div>
+}
+
+function ExternalDatasetDetail({ resource, source, onClose }: {
+  resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
+}) {
+  return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
+    <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
+      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
+      <div className="mt-5 grid gap-3 text-[12px]">
+        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Read-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
+        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Stable identity</div><div className="break-all font-mono text-[11px]">{resource.id}</div></div>
+        {resource.resourceId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Provider resource</div><div className="break-all font-mono text-[11px]">{resource.resourceId}</div></div>}
+        {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
+      </div>
+      <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
+        This mount is read-only. Create, move, delete, and dataset-use actions are unavailable, so browsing this resource never writes to the provider.
+      </div>
+    </div>
   </div>
 }
 
