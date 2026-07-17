@@ -409,7 +409,7 @@ def _remote_page(identity: str, *, limit: int, cursor: str | None,
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
     if mounted is None:
         cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="detached", error="catalog mount is not configured")
+            binding_id, state="provider_error", error="catalog mount is not configured")
         cached_mount = _MountedProvider(
             CatalogMount(id=mount_id, provider=cached["provider"], config={}),
             cached["containerId"],
@@ -420,14 +420,14 @@ def _remote_page(identity: str, *, limit: int, cursor: str | None,
             "nextCursor": None, "hasMore": False,
             "completeness": "partial",
             "sources": [_source_status(
-                source, "unavailable", "catalog mount is not configured", "detached")],
+                source, "unavailable", "catalog mount is not configured", "provider_error")],
         }
     if cached["provider"] != mounted.mount.provider:
         cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="detached", error="catalog mount provider changed")
+            binding_id, state="provider_error", error="catalog mount provider changed")
         status = _source_status(
             _Source("provider", mounted), "unavailable",
-            "catalog mount provider changed", "detached")
+            "catalog mount provider changed", "provider_error")
         return {"container": _binding_resource(cached, mounted), "items": [],
                 "nextCursor": None, "hasMore": False, "completeness": "partial",
                 "sources": [status]}
@@ -558,7 +558,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
     if mounted is None:
         cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="detached", error="catalog mount is not configured")
+            binding_id, state="provider_error", error="catalog mount is not configured")
         cached_mount = _MountedProvider(
             CatalogMount(id=mount_id, provider=cached["provider"], config={}),
             cached["containerId"],
@@ -569,7 +569,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     source = _Source("provider", mounted)
     if cached["provider"] != mounted.mount.provider:
         cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="detached", error="catalog mount provider changed")
+            binding_id, state="provider_error", error="catalog mount provider changed")
         return _cached_resolution(
             cached, mounted, source, uid=uid, completeness="unavailable",
             error="catalog mount provider changed")

@@ -469,10 +469,11 @@ def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
         if ancestor_partial["value"] else normal_ancestors(mount, resource_id)
     ))
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
-    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+    mount_config = json.dumps([{
         "id": mount_id, "provider": "fixture", "containerId": folder["id"],
         "config": {"credential": "must-not-be-cached"},
-    }]))
+    }])
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", mount_config)
 
     with TestClient(app) as client:
         page = client.get(f"/api/workspace/containers/{folder['id']}").json()
@@ -484,6 +485,19 @@ def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
         current = client.get(f"/api/workspace/resources/{stable_ref}")
         assert current.status_code == 200, current.text
         assert current.json()["resource"]["referenceState"] == "current"
+
+        # Operator configuration can disappear transiently. It must preserve the exact binding
+        # without terminally fencing it so Retry converges after the same mount returns.
+        monkeypatch.delenv("DP_CATALOG_MOUNTS")
+        unconfigured = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert unconfigured.status_code == 200, unconfigured.text
+        assert unconfigured.json()["resource"]["referenceState"] == "provider_error"
+        assert unconfigured.json()["resource"]["bindingId"] == binding_id
+        monkeypatch.setenv("DP_CATALOG_MOUNTS", mount_config)
+        restored = client.get(f"/api/workspace/resources/{stable_ref}")
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["resource"]["referenceState"] == "current"
+        assert restored.json()["resource"]["bindingId"] == binding_id
 
         ancestor_partial["value"] = True
         stale_path = client.get(f"/api/workspace/resources/{stable_ref}")
