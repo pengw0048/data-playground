@@ -61,9 +61,12 @@ test('the installed descriptor fixture survives registration, editing, reload, a
     has: page.getByText('Selected columns', { exact: true }),
   })
   await expect(contractNode).toBeVisible()
+  await contractNode.click()
   const [count, ratio] = await contractNode.getByRole('textbox').all()
   await count.fill('12abc')
   await expect(contractNode.getByRole('alert')).toContainText('complete safe integer')
+  await expect(contractNode.getByRole('button', { name: /complete safe integer/i }).first())
+    .toHaveAttribute('aria-disabled', 'true')
   await expect(page.getByTestId('autosave')).toHaveText(/saved/i)
   await count.fill('9')
   await count.blur()
