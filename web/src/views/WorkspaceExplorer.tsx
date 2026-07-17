@@ -319,14 +319,14 @@ function WorkspaceSearchResults({ query, onOpen }: {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const request = useRef(0)
 
   const load = useCallback(async (nextCursor?: string | null) => {
     const sequence = ++request.current
     const more = !!nextCursor
-    if (more) setLoadingMore(true)
-    else { setLoading(true); setGroups([]) }
-    setError(null)
+    if (more) { setLoadingMore(true); setLoadMoreError(null) }
+    else { setLoading(true); setGroups([]); setError(null); setLoadMoreError(null) }
     try {
       const page = await api.workspaceSearch(query, {
         limit: 25, cursor: nextCursor ?? undefined,
@@ -343,7 +343,10 @@ function WorkspaceSearchResults({ query, onOpen }: {
       setCursor(page.nextCursor ?? null)
       setHasMore(page.hasMore)
     } catch (caught) {
-      if (sequence === request.current) setError(errorMessage(caught))
+      if (sequence === request.current) {
+        if (more) setLoadMoreError(errorMessage(caught))
+        else setError(errorMessage(caught))
+      }
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
@@ -374,10 +377,13 @@ function WorkspaceSearchResults({ query, onOpen }: {
         ? 'No matches were returned by the available sources. This is not a complete empty result.'
         : 'No datasets, canvases, or containers match this query.'}
     </div>}
+    {loadMoreError && <div role="alert" className="mx-auto text-[12px] text-destructive">
+      Couldn't load more search results: {loadMoreError}
+    </div>}
     {hasMore && <button onClick={() => void load(cursor)} disabled={loadingMore}
       data-testid="workspace-search-load-more"
       className="mx-auto rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
-      {loadingMore ? 'Loading…' : 'Load more results'}
+      {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more results'}
     </button>}
   </div>
 }

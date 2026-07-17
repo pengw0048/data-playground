@@ -522,7 +522,10 @@ def _search_cursor_decode(cursor: str | None, *, query: str, fingerprint: str,
                 or not isinstance(state["active"], bool)
                 or state["cursor"] is not None and (
                     not isinstance(state["cursor"], str) or len(state["cursor"]) > 4096)
+                or state["active"] != (state["cursor"] is not None)
+                or state["active"] != (state["completeness"] == "page")
                 or state["completeness"] not in _SOURCE_STATES
+                or state["completeness"] == "pending"
                 or state["error"] is not None and (
                     not isinstance(state["error"], str) or len(state["error"]) > 512)
                 or state["freshness"] not in {"current", "stale", "unknown"}
@@ -626,6 +629,11 @@ def search(query: str, *, uid: str, limit: int = 25,
                 completeness, error, freshness, search_mode = (
                     "unavailable", provider_page, "unknown", "native")
                 next_cursor = None
+            elif len(provider_page.items) > limit:
+                completeness, error, freshness, search_mode = (
+                    "unavailable", "catalog provider exceeded the requested search limit",
+                    provider_page.freshness, "native")
+                next_cursor = None
             else:
                 seen: set[str] = set()
                 for item in provider_page.items:
@@ -641,9 +649,11 @@ def search(query: str, *, uid: str, limit: int = 25,
                 error = provider_page.reason
                 freshness = provider_page.freshness
                 search_mode = "unsupported" if provider_page.state == "unsupported" else "native"
-                if next_cursor is not None and not items:
+                if next_cursor is not None and (
+                        not items or next_cursor == previous["cursor"]):
                     completeness, error, next_cursor = (
                         "unavailable", "catalog provider returned a non-advancing search page", None)
+                    items = []
             status = _search_source_status(
                 source, completeness, error=error,
                 freshness=freshness, search_mode=search_mode)

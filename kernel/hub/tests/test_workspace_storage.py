@@ -312,6 +312,10 @@ class _WorkspaceFixtureProvider:
              if all(token in item.name.casefold() for token in tokens)),
             key=lambda item: (item.name.casefold(), item.kind, item.id),
         )
+        if mount.id == "f-overlimit":
+            return ProviderSearchPage(items=resources[:limit + 1])
+        if mount.id == "g-stuck":
+            return ProviderSearchPage(items=resources[:1], next_cursor="same")
         start = int(cursor or 0)
         items = resources[start:start + limit]
         if mount.id == "b-partial":
@@ -447,6 +451,8 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
         {"id": "c-first", "provider": "fixture"},
         {"id": "d-second", "provider": "fixture"},
         {"id": "e-unsupported", "provider": "fixture"},
+        {"id": "f-overlimit", "provider": "fixture"},
+        {"id": "g-stuck", "provider": "fixture"},
     ]))
 
     with TestClient(app) as client:
@@ -469,6 +475,9 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
         assert groups["mount:b-partial"]["source"]["completeness"] == "partial"
         assert groups["mount:e-unsupported"]["source"]["searchMode"] == "unsupported"
         assert groups["mount:e-unsupported"]["source"]["completeness"] == "unsupported"
+        assert groups["mount:f-overlimit"]["source"]["completeness"] == "unavailable"
+        assert groups["mount:f-overlimit"]["source"]["error"] == (
+            "catalog provider exceeded the requested search limit")
 
         found: list[dict] = [
             item for group in page["groups"] for item in group["items"]
@@ -489,6 +498,10 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
             "c-first", "d-second",
         }
         assert len({item["id"] for item in duplicates}) == len(duplicates)
+        final_groups = {group["source"]["id"]: group for group in document["groups"]}
+        assert final_groups["mount:g-stuck"]["source"]["completeness"] == "unavailable"
+        assert final_groups["mount:g-stuck"]["source"]["error"] == (
+            "catalog provider returned a non-advancing search page")
 
         mismatched = client.get("/api/workspace/search", params={
             "q": "different", "limit": 1, "cursor": page["nextCursor"],

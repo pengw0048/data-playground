@@ -84,6 +84,27 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 25, cursor: undefined })
   })
 
+  it('keeps completed search pages visible when loading the continuation fails', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValueOnce({
+      query: 'observations', completeness: 'page', hasMore: true, nextCursor: 'next',
+      groups: [{
+        source: { id: 'local', kind: 'local', completeness: 'page', freshness: 'current', searchMode: 'native' },
+        items: [DATASET],
+      }],
+    }).mockRejectedValueOnce(new Error('network unavailable'))
+    render(<WorkspaceExplorer />)
+
+    const result = await screen.findByRole('button', { name: 'Open dataset observations' })
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Couldn't load more search results: network unavailable",
+    )
+    expect(result).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Retry load more' })).toBeVisible()
+  })
+
   it('creates a canvas in the exact visible destination', async () => {
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'created-1', created: true, resource: CANVAS })
     render(<WorkspaceExplorer />)
