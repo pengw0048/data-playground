@@ -134,6 +134,10 @@ class SubprocessRunner:
     manages_source_leases = True
 
     @staticmethod
+    def supports_admitted_input_manifests() -> bool:
+        return True  # the parent validates and serializes the manifest before spawning the child
+
+    @staticmethod
     def supports_selected_destination_credentials() -> bool:
         return False  # the ephemeral child has ambient data identity only; it cannot resolve hub Creds
 

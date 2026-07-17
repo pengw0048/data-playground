@@ -236,6 +236,10 @@ def _local_start_context(monkeypatch):
             self.receipts: dict[str, RunStatus] = {}
 
         @staticmethod
+        def supports_admitted_input_manifests() -> bool:
+            return True
+
+        @staticmethod
         def estimate(*_args):
             return RunEstimate(rows=1, bytes=1, placement="local", needs_confirm=False)
 

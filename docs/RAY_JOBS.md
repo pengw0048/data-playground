@@ -9,6 +9,12 @@
   still in-memory, so Jobs mode deliberately does not claim placed child regions. Explicit Ray/GPU pins
   use whole-graph admission instead and therefore cannot silently fall back to local execution.
 
+Ray Jobs does not yet serialize or deliver the hub's admitted exact-revision input manifest. Until
+[#303](https://github.com/pengw0048/data-playground/issues/303) is implemented, a run carrying that
+manifest is rejected before run/attempt identity, envelope or result-artifact allocation, driver start,
+or Jobs API submission. It cannot independently reopen mutable source head under the durable v4
+contract.
+
 This is a durable lifecycle implementation, not a claim that the whole Ray backend or the example
 deployment is production-ready. The remaining scale, health, resilience, and operator gates are in
 [`RAY.md`](RAY.md). It operates within the trusted-workspace boundary in
