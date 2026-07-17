@@ -10599,6 +10599,23 @@ def test_grouped_chart_keeps_all_groups_while_interactive_view_is_capped(tmp_pat
     ).status_code == 404
 
 
+def test_export_resources_close_is_reentrant_safe():
+    import contextlib
+
+    from hub.routers.runs import _ExportResources
+
+    stack = contextlib.ExitStack()
+    resources = _ExportResources(stack)
+    callbacks = []
+    stack.callback(lambda: callbacks.append("closed"))
+    stack.callback(resources.close)
+
+    resources.close()
+
+    assert callbacks == ["closed"]
+    resources.close()
+
+
 def test_durable_output_falls_back_on_status_outage_but_not_programming_errors(monkeypatch):
     from fastapi import HTTPException
 
