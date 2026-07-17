@@ -374,6 +374,20 @@ def test_lance_append_admission_blocks_incompatible_schema_before_publication(
     assert set(os.listdir(os.path.join(table.uri, "data"))) == before
 
 
+def test_lance_append_unknown_schema_keeps_truthful_mode(lance_contract, monkeypatch):
+    _lance, deps, graph, _table = lance_contract
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "82888888-8888-4888-8888-888888888888")
+
+    assert admission.managed is True
+    assert admission.mode == "append"
+    assert admission.provider == "managed-local-lance"
+    assert admission.intent is None
+    assert admission.blocker is not None
+
+
 def test_lance_append_admission_rejects_stale_head_and_one_of_two_admissions(
         lance_contract):
     lance, deps, graph, table = lance_contract
@@ -412,6 +426,69 @@ def test_lance_append_requires_registration_and_in_process_runner(lance_contract
     assert missing.managed is False
     assert missing.mode == "append"
     assert missing.intent is None
+
+
+def test_controller_owned_lance_append_is_not_admitted(lance_contract):
+    _lance, deps, graph, table = lance_contract
+    calls = []
+
+    class Controller:
+        def plan_for_run(self, _graph, _target, *, sizes):
+            calls.append(sizes)
+            return [object(), object()]
+
+    deps.controller = Controller()
+    before_version = LanceAdapter().resolve_revision(table.uri)["revision_id"]
+    before_rows = LanceAdapter()._dataset(table.uri).count_rows()
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "86888888-8888-4888-8888-888888888888")
+
+    assert calls
+    assert admission.managed is False
+    assert admission.mode == "append"
+    assert admission.intent is None
+    assert LanceAdapter().resolve_revision(table.uri)["revision_id"] == before_version
+    assert LanceAdapter()._dataset(table.uri).count_rows() == before_rows
+
+
+def test_lance_append_dispatch_rejects_a_late_controller_owner(
+        lance_contract, monkeypatch):
+    _lance, deps, base_graph, table = lance_contract
+
+    class Controller:
+        def __init__(self):
+            self.plan_calls = 0
+            self.run_called = False
+
+        def plan_for_run(self, _graph, _target, *, sizes):
+            assert isinstance(sizes, dict)
+            self.plan_calls += 1
+            return [] if self.plan_calls == 1 else [object(), object()]
+
+        def run(self, *_args, **_kwargs):
+            self.run_called = True
+            pytest.fail("controller allocated work for a managed-local write")
+
+    controller = Controller()
+    deps.controller = controller
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes, "_require_destination_credential_preflight", lambda *_args: None)
+    before_version = LanceAdapter().resolve_revision(table.uri)["revision_id"]
+    before_rows = LanceAdapter()._dataset(table.uri).count_rows()
+
+    with pytest.raises(HTTPException, match="selected execution owner") as caught:
+        run_routes.start_run(
+            deps, base_graph.model_copy(deep=True), "write", "researcher", confirmed=True,
+            submission_id="86999999-9999-4999-8999-999999999999",
+        )
+
+    assert caught.value.status_code == 409
+    assert controller.plan_calls == 2
+    assert controller.run_called is False
+    assert LanceAdapter().resolve_revision(table.uri)["revision_id"] == before_version
+    assert LanceAdapter()._dataset(table.uri).count_rows() == before_rows
 
 
 def test_local_runner_consumes_lance_append_intent_and_recovers_exact_receipt(

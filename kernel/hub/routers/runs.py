@@ -221,6 +221,14 @@ def _write_admission_for_graph(
         # retain their provider-neutral sink contract and must not be labelled create/replace.
         runner = _route_by_capability(deps, pick_runner(plan, uid), graph, node_id)
         managed = _runner_supports_managed_local_write_intents(deps, runner)
+        controller = getattr(deps, "controller", None)
+        plan_for_run = getattr(controller, "plan_for_run", None)
+        if managed and callable(plan_for_run):
+            _rows, _byts, sizes = _cone_size(graph, node_id, deps)
+            try:
+                managed = not bool(plan_for_run(graph, node_id, sizes=sizes))
+            except Exception:
+                managed = False
     lance_binding = None
     lance_table = None
     if managed and lance_candidate:
@@ -261,7 +269,8 @@ def _write_admission_for_graph(
             node_id=node_id,
             managed=True,
             destination=logical_uri,
-            mode="replace" if supplied and supplied.mode == "replace" else "create",
+            mode=("append" if lance_candidate
+                  else "replace" if supplied and supplied.mode == "replace" else "create"),
             provider=("managed-local-lance" if lance_candidate else "managed-local-file"),
             partitions=partitions,
             blocker=("input schema is not available from bounded metadata; "
@@ -1645,9 +1654,14 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             runner, graph, output_target, deps)
     _require_destination_credential_preflight(deps, runner, plan, graph)
     rows, byts, sizes = _cone_size(graph, target_node_id, deps)
+    managed_write = bool(write_admission is not None and write_admission.managed)
     controller_regions = (_controller_regions_for_run(
-        deps, graph, target_node_id, output_target, sizes, multi_output=True)
-        if multi_output else None)
+        deps, graph, target_node_id, output_target, sizes, multi_output=multi_output)
+        if multi_output or managed_write else None)
+    if managed_write and controller_regions:
+        raise HTTPException(
+            409, "the selected execution owner cannot consume the managed-local write admission; "
+            "discard it and retry with an in-process local plan")
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
