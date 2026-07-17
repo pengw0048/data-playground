@@ -343,6 +343,15 @@ export interface RunOutput {
   sampleProvenance?: SampleProvenance | null
 }
 
+export interface RunInputManifestItem {
+  // Run history persists this deliberately minimal dict verbatim, so its inner keys remain snake_case.
+  node_id: string
+  dataset_id: string
+  revision_id: string
+  provider: string
+  resolved_at: string
+}
+
 export interface RunStatus {
   runId: string
   status: RunState

@@ -78,8 +78,15 @@ def _reservoir_source_total(graph: Graph, node_id: str, resolve_adapter) -> int 
     config = chain[0].data.get("config", {}) if isinstance(chain[0].data, dict) else {}
     uri = config.get("uri") if isinstance(config, dict) else None
     try:
-        count = getattr(resolve_adapter(uri), "metadata_count", None) if uri else None
-        value = count(uri) if callable(count) else None
+        adapter = resolve_adapter(uri) if uri else None
+        dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
+        if adapter is not None and isinstance(dataset_ref, dict):
+            detail = adapter.revision_detail(
+                uri, str(dataset_ref.get("revisionId") or ""), preview_limit=1)
+            value = detail.get("row_count")
+        else:
+            count = getattr(adapter, "metadata_count", None)
+            value = count(uri) if callable(count) else None
         return int(value) if value is not None else None
     except Exception:  # unknown metadata is a truthful state, not a preview error
         return None

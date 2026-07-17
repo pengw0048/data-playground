@@ -5,8 +5,9 @@ import { roleCanEdit, useStore } from '../../store/graph'
 import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
-import { api } from '../../api/client'
-import type { CatalogTable } from '../../types/api'
+import { api, KernelError } from '../../api/client'
+import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
+import type { DatasetRef } from '../../types/graph'
 
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
@@ -63,7 +64,7 @@ function Source({ id, data }: NodeComponentProps) {
   const pick = (t: CatalogTable) => {
     if (!canEdit) return
     rememberTables([t])  // warm the cache so the card resolves this immediately
-    updateConfig(id, { uri: t.uri, tableId: t.id })
+    updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined })
     rename(id, t.name)
     setOpen(false); setQ('')
   }
@@ -74,14 +75,14 @@ function Source({ id, data }: NodeComponentProps) {
     setOpen(false); setUploading(true)
     const t = await uploadDataset(f)  // uploads + refreshes catalog; toasts on failure
     setUploading(false)
-    if (t) { updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name) }
+    if (t) { updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined }); rename(id, t.name) }
   }
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
   const pickFile = async (uri: string) => {
     if (!canEdit) return
     const t = await api.registerFile(uri)
-    rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id }); rename(id, t.name)
+    rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined }); rename(id, t.name)
     setDialog(false); setOpen(false)
   }
 
@@ -166,10 +167,155 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       </Popover>
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
+      {table && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
+        canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)} onPick={(r) => pickFile(r.uri)} />}
     </NodeCard>
+  )
+}
+
+function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
+  nodeId: string
+  table: CatalogTable
+  selected?: DatasetRef
+  canEdit: boolean
+  onChange: (value: DatasetRef | undefined) => void
+}) {
+  const anchorRef = useRef<HTMLButtonElement>(null)
+  const historyGeneration = useRef(0)
+  const [open, setOpen] = useState(false)
+  const [request, setRequest] = useState(0)
+  const [availability, setAvailability] = useState<'checking' | 'available' | 'unavailable' | 'error'>('checking')
+  const [revisions, setRevisions] = useState<DatasetRevision[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [historyError, setHistoryError] = useState('')
+  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [detailState, setDetailState] = useState<'idle' | 'checking' | 'available' | 'unavailable'>('idle')
+
+  // #279 deliberately owns only the built-in Lance journey. Other exact-revision providers keep
+  // their Catalog history UI but do not gain a Source configuration surface here.
+  const lance = table.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance')
+  useEffect(() => {
+    const generation = ++historyGeneration.current
+    let live = true
+    setOpen(false); setRevisions([]); setCursor(null); setHasMore(false); setHistoryError('')
+    if (!lance) { setAvailability('unavailable'); return () => { live = false } }
+    setAvailability('checking')
+    api.datasetRevisions(table.id, { limit: 20 }).then((page) => {
+      if (!live || generation !== historyGeneration.current) return
+      setRevisions(page.items)
+      setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+      setAvailability('available')
+    }).catch((error) => {
+      if (!live || generation !== historyGeneration.current) return
+      if (error instanceof KernelError && (error.status === 410 || error.status === 501)) {
+        setAvailability('unavailable')
+      } else {
+        setHistoryError(error instanceof Error ? error.message : String(error))
+        setAvailability('error')
+      }
+    })
+    return () => { live = false }
+  }, [table.id, table.uri, lance, request])
+
+  useEffect(() => {
+    let live = true
+    setDetail(null)
+    if (!selected) { setDetailState('idle'); return () => { live = false } }
+    setDetailState('checking')
+    api.datasetRevision(selected.datasetId, selected.revisionId).then((next) => {
+      if (!live) return
+      setDetail(next); setDetailState('available')
+    }).catch(() => {
+      if (live) setDetailState('unavailable')
+    })
+    return () => { live = false }
+  }, [selected?.datasetId, selected?.revisionId])
+
+  const loadMore = async () => {
+    if (!cursor || loadingMore) return
+    const generation = ++historyGeneration.current
+    setLoadingMore(true); setHistoryError('')
+    try {
+      const page = await api.datasetRevisions(table.id, { limit: 20, cursor })
+      if (generation !== historyGeneration.current) return
+      setRevisions((current) => {
+        const seen = new Set(current.map((revision) => `${revision.datasetId}\u0000${revision.revisionId}`))
+        return [...current, ...page.items.filter((revision) => !seen.has(`${revision.datasetId}\u0000${revision.revisionId}`))]
+      })
+      setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
+    } catch (error) {
+      if (generation === historyGeneration.current) setHistoryError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (generation === historyGeneration.current) setLoadingMore(false)
+    }
+  }
+
+  const controlLabel = availability === 'checking' ? 'Checking revision history…'
+    : availability === 'unavailable' ? 'Revision pinning unavailable'
+      : selected ? `Change pinned revision ${selected.revisionId}` : 'Pin exact revision'
+
+  return (
+    <div className="mt-1.5" data-testid={`source-revision-${nodeId}`}>
+      <button ref={anchorRef} type="button" disabled={!canEdit || availability !== 'available'}
+        title={controlLabel} onClick={(event) => { event.stopPropagation(); setOpen((value) => !value) }}
+        className="flex w-full items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-left text-[10px] text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60">
+        <Icon name="clock" size={11} />
+        <span className="min-w-0 flex-1 truncate">{controlLabel}</span>
+        {availability === 'available' && <Icon name="chevronDown" size={10} />}
+      </button>
+      {availability === 'error' && (
+        <div role="alert" className="mt-1 text-[9.5px] text-destructive">
+          Couldn't load revision history: {historyError}{' '}
+          <button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button>
+        </div>
+      )}
+      {selected && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Resolving pinned revision {selected.revisionId}…</div>}
+      {selected && detailState === 'available' && detail && (
+        <div className="mt-1 break-all text-[9.5px] text-muted-foreground">
+          Pinned exact revision {detail.revisionId} · {detail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows
+        </div>
+      )}
+      {selected && detailState === 'unavailable' && (
+        <div role="alert" className="mt-1 text-[9.5px] text-destructive">
+          Pinned revision {selected.revisionId} is unavailable. Selection preserved; choose another revision or{' '}
+          <button type="button" disabled={!canEdit} className="font-semibold underline disabled:opacity-50" onClick={() => onChange(undefined)}>follow latest</button>.
+        </div>
+      )}
+      <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={280} maxHeight={300}>
+        <div className="px-2 py-1 text-[10px] text-muted-foreground">Select one retained Lance revision. The Source will never retarget it to latest.</div>
+        {selected && (
+          <button type="button" onClick={() => { onChange(undefined); setOpen(false) }}
+            className="w-full rounded-md px-2 py-1.5 text-left text-[11px] font-semibold text-primary hover:bg-accent">
+            Follow latest instead
+          </button>
+        )}
+        {revisions.length === 0 && <div className="px-2 py-2 text-[11px] text-muted-foreground">No retained revisions.</div>}
+        {revisions.map((revision, index) => {
+          const active = selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
+          return (
+            <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
+              aria-pressed={active} onClick={() => {
+                onChange({ datasetId: revision.datasetId, revisionId: revision.revisionId }); setOpen(false)
+              }} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`}>
+              <span className="dp-mono min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground">{revision.revisionId}</span>
+              {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest retained</span>}
+              <span className="shrink-0 text-[9px] text-muted-foreground">{revision.committedAt ? new Date(revision.committedAt).toLocaleString() : 'time unknown'}</span>
+            </button>
+          )
+        })}
+        {hasMore && (
+          <button type="button" disabled={loadingMore} onClick={() => void loadMore()}
+            className="w-full rounded-md px-2 py-1.5 text-center text-[10.5px] font-semibold text-primary hover:bg-accent disabled:opacity-50">
+            {loadingMore ? 'Loading…' : historyError ? 'Retry loading more' : 'Load more retained revisions'}
+          </button>
+        )}
+      </Popover>
+    </div>
   )
 }
 

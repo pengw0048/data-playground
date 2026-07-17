@@ -166,6 +166,12 @@ def resolve_config(node: GraphNode) -> dict:
                 for k in ("delimiter", "header") if str(cfg.get(k, "")).strip()}
         opts = {k: v for k, v in opts.items() if k != "header" or v in ("yes", "no")}  # header must be yes/no
         c = {"uri": cfg.get("uri")}
+        dataset_ref = cfg.get("datasetRef")
+        if isinstance(dataset_ref, dict):
+            c["datasetRef"] = {
+                "datasetId": dataset_ref.get("datasetId"),
+                "revisionId": dataset_ref.get("revisionId"),
+            }
         # Hub-only local-run admission evidence.  It is written only onto the private dispatch copy
         # after source resolution; accepting it here lets the default engine open that exact revision
         # without exposing a client-side Source configuration surface.

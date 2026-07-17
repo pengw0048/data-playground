@@ -21,7 +21,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import auth, compiler, destinations, metadb, placement
+from hub import auth, compiler, db, destinations, metadb, placement
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
@@ -103,12 +103,21 @@ def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list
         if binding is None or not isinstance(adapter, DatasetRevisionAdapter):
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
+        dataset_ref = cfg.get("datasetRef")
         try:
-            resolved = adapter.resolve_revision(uri)
-        except Exception as exc:  # a provider error is not permission to dispatch against head
+            if isinstance(dataset_ref, dict):
+                if (getattr(adapter, "name", None) != "lance"
+                        or str(binding["dataset_id"]) != str(dataset_ref.get("datasetId") or "")):
+                    raise ValueError("pinned dataset identity does not match the current registration")
+                revision_id = str(dataset_ref.get("revisionId") or "")
+                with db.base_guard():
+                    adapter.open_revision(uri, revision_id)
+            else:
+                resolved = adapter.resolve_revision(uri)
+                revision_id = str(resolved.get("revision_id") or "")
+        except Exception as exc:  # missing pins and provider errors never permit a fallback to head
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
-        revision_id = str(resolved.get("revision_id") or "")
         provider = str(getattr(adapter, "name", "") or "")
         if not revision_id or not provider:
             raise APIError(410, "local_run_input_revision_unavailable",

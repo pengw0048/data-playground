@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionDetail, DatasetRevisionPage, Facets,
   JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunOutput, RunStatus, SampleResult,
+  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult,
   WorkspaceBrowsePage, WorkspaceResourceResolution,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
@@ -401,13 +401,6 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
-export interface RunInputManifestItem {
-  node_id: string
-  dataset_id: string
-  revision_id: string
-  provider: string
-  resolved_at: string
-}
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }

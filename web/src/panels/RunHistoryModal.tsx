@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, type PerNodeStat, type RunInputManifestItem, type RunRecordDto } from '../api/client'
+import { api, type PerNodeStat, type RunRecordDto } from '../api/client'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
-import type { CatalogTable, DatasetRevisionDetail, RunOutput } from '../types/api'
+import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
