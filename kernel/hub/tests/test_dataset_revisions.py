@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import shutil
 import uuid
 
@@ -12,7 +13,9 @@ from fastapi.testclient import TestClient
 
 from hub.main import app
 from hub.models import CatalogTable, Graph
-from hub.plugins.adapters import LanceAdapter, RevisionProviderOffline
+from hub.plugins.adapters import (
+    LanceAdapter, RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable,
+)
 from hub.routers import catalog as catalog_router
 
 client = TestClient(app)
@@ -394,6 +397,46 @@ def test_exact_revision_normalizes_recoverable_provider_failures(
     response = client.get("/api/catalog/revisions/dataset/revision")
     assert response.status_code == status
     assert response.json() == {"detail": detail, "code": code, "retryable": retryable}
+
+
+@pytest.mark.parametrize(("wrapped", "expected"), [
+    (ValueError("LanceError(IO): Permission denied (os error 13)"), RevisionPermissionLost),
+    (ValueError("LanceError(IO): connection timed out"), RevisionProviderOffline),
+    (ValueError("LanceError(IO): corrupt transaction metadata"), RevisionUnavailable),
+])
+def test_lance_adapter_classifies_wrapped_provider_access_failures(
+        monkeypatch, wrapped, expected):
+    adapter = LanceAdapter()
+
+    def fail(*_args, **_kwargs):
+        raise wrapped
+
+    monkeypatch.setattr(adapter, "_dataset", fail)
+    with pytest.raises(expected) as caught:
+        adapter.revision_detail("wrapped.lance", "1", preview_limit=1)
+    assert caught.value.__cause__ is wrapped
+
+
+@pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0,
+                    reason="requires enforceable POSIX owner permissions")
+def test_inaccessible_lance_revision_maps_to_permission_lost_at_adapter_and_api(tmp_path):
+    uri, table = _register_lance(tmp_path)
+    revision = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
+    os.chmod(uri, 0)
+    try:
+        with pytest.raises(RevisionPermissionLost):
+            LanceAdapter().revision_detail(uri, revision["revisionId"], preview_limit=1)
+        response = client.get(
+            f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
+    finally:
+        os.chmod(uri, 0o700)
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": "dataset_revision_permission_lost",
+        "code": "permission_denied", "retryable": False,
+    }
 
 
 def test_pinned_source_preview_and_reload_keep_the_exact_revision_after_append(tmp_path):

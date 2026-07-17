@@ -11,9 +11,11 @@ carries its schema so wires are schema-aware.
 from __future__ import annotations
 
 import datetime
+import errno
 import glob
 import hashlib
 import os
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -49,11 +51,48 @@ class RevisionResolutionAmbiguous(RuntimeError):
     """A provider cannot prove one exact revision for the requested ordering boundary."""
 
 
+_OS_ERROR = re.compile(r"\bos error\s+(\d+)\b", re.IGNORECASE)
+_PERMISSION_ERRNOS = {errno.EACCES, errno.EPERM}
+_OFFLINE_ERRNOS = {
+    errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH,
+    errno.ENETDOWN, errno.ENETRESET, errno.ENETUNREACH, errno.ETIMEDOUT,
+}
+_PERMISSION_MARKERS = ("permission denied", "access denied", "operation not permitted")
+_OFFLINE_MARKERS = (
+    "connection refused", "connection reset", "connection timed out", "host is unreachable",
+    "network is down", "network is unreachable", "temporary failure in name resolution",
+)
+
+
+def _revision_error_chain(exc: BaseException):
+    """Yield one finite provider error chain, including wrappers that preserve only context."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _wrapped_os_error(error: BaseException) -> tuple[set[int], str]:
+    """Extract only standard OS evidence from wrappers such as pylance's plain ValueError."""
+    message = str(error).lower()
+    return {int(match) for match in _OS_ERROR.findall(message)}, message
+
+
 def _raise_revision_access_error(exc: Exception) -> None:
-    """Preserve the small public recovery taxonomy without guessing from provider prose."""
-    if isinstance(exc, PermissionError):
+    """Preserve the small public recovery taxonomy across provider exception wrappers."""
+    chain = list(_revision_error_chain(exc))
+    if any(isinstance(error, PermissionError) for error in chain):
         raise RevisionPermissionLost("revision_permission_lost") from exc
-    if isinstance(exc, (ConnectionError, TimeoutError)):
+    if any(isinstance(error, (ConnectionError, TimeoutError)) for error in chain):
+        raise RevisionProviderOffline("revision_provider_offline") from exc
+    evidence = [_wrapped_os_error(error) for error in chain]
+    if any(numbers & _PERMISSION_ERRNOS or any(marker in message for marker in _PERMISSION_MARKERS)
+           for numbers, message in evidence):
+        raise RevisionPermissionLost("revision_permission_lost") from exc
+    if any(numbers & _OFFLINE_ERRNOS or any(marker in message for marker in _OFFLINE_MARKERS)
+           for numbers, message in evidence):
         raise RevisionProviderOffline("revision_provider_offline") from exc
     raise RevisionUnavailable("revision_unavailable") from exc
 
