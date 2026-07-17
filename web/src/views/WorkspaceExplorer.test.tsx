@@ -244,4 +244,21 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Remote')
     expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('external.mount-folder', { limit: 50, cursor: undefined })
   })
+
+  it('allows an initially unavailable external deep link to retry instead of loading forever', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: null, ancestors: [],
+      source: { ...PROVIDER_COMPLETE, completeness: 'unavailable', error: 'provider offline' },
+    })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('provider offline')
+    expect(screen.queryByText('Loading Workspace…')).not.toBeInTheDocument()
+    expect(screen.getByText('This Workspace location is unavailable.')).toBeVisible()
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).toBeEnabled()
+    fireEvent.click(retry)
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
+  })
 })

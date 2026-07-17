@@ -119,6 +119,7 @@ export function WorkspaceExplorer() {
         if (cancelled) return
         if (!resolved.resource) {
           setResolutionError(statusMessage(resolved.source) ?? 'Workspace resource is unavailable')
+          setLoading(false)
           return
         }
         const resolvedContainer = resolved.resource.kind === 'container'
@@ -165,7 +166,10 @@ export function WorkspaceExplorer() {
           else { setError(errorMessage(caught)); setItems([]); setHasMore(false) }
         }
       } catch (caught) {
-        if (!cancelled) setResolutionError(errorMessage(caught))
+        if (!cancelled) {
+          setResolutionError(errorMessage(caught))
+          setLoading(false)
+        }
       }
     }
     void resolve()
@@ -252,9 +256,10 @@ export function WorkspaceExplorer() {
           {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
             {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more'}
           </button>}
-        </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{isExternal(container)
-          ? 'This read-only external location is empty.'
-          : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
+        </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
+          ? 'This Workspace location is unavailable.'
+          : isExternal(container) ? 'This read-only external location is empty.'
+            : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
       </div>
 
       {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
