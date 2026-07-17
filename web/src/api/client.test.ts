@@ -83,6 +83,60 @@ describe('run-scoped result access', () => {
   })
 })
 
+describe('inspection input manifests', () => {
+  it('carries the retained preview manifest through sampled and full profile requests', async () => {
+    setApiUser('binding-user')
+    const doc: CanvasDoc = {
+      id: 'binding-canvas', version: 1, name: 'binding', requirements: [],
+      nodes: [{
+        id: 'source', type: 'source', position: { x: 0, y: 0 },
+        data: { title: 'source', config: { uri: 'input.lance' }, status: 'draft' },
+      }],
+      edges: [],
+    }
+    const inputManifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '7', provider: 'lance',
+      resolved_at: '2026-07-16T00:00:00Z',
+    }]
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path) => {
+      if (path === '/api/run/preview') {
+        return new Response(JSON.stringify({
+          columns: [], rows: [], truncated: true, completeness: 'sample',
+          rowLimit: 2000, limitReason: 'preview-scan', limitScope: 'each-source',
+          notPreviewable: false, wire: 'dataset', inputManifest,
+        }), { status: 200 })
+      }
+      if (path === '/api/run/profile-estimate') {
+        return new Response(JSON.stringify({
+          rows: 1, bytes: 8, placement: 'local', needsConfirm: false,
+          targetPortId: 'out', planDigest: 'a'.repeat(64), inputManifest,
+        }), { status: 200 })
+      }
+      if (path === '/api/run/profile-job') {
+        return new Response(JSON.stringify({
+          runId: 'profile-1', status: 'queued', jobType: 'profile', targetNodeId: 'source',
+          targetPortId: 'out', rowsProcessed: 0, ms: 0, placement: 'local', perNode: [],
+          outputs: [], planDigest: 'a'.repeat(64), profileAttemptOrder: 1,
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        columns: [], rowCount: 0, sampled: true, completeness: 'sample',
+        notPreviewable: false, inputManifest,
+      }), { status: 200 })
+    })
+
+    await api.preview(doc, 'source', 50, 0, undefined, inputManifest)
+    await api.profile(doc, 'source', undefined, inputManifest)
+    await api.profileEstimate(doc, 'source', 'out', inputManifest)
+    await api.fullProfile(doc, 'source', 'out', 'a'.repeat(64), crypto.randomUUID(), true, inputManifest)
+
+    for (const path of ['/api/run/preview', '/api/run/profile', '/api/run/profile-estimate', '/api/run/profile-job']) {
+      const call = fetchMock.mock.calls.find(([observed]) => observed === path)
+      expect(JSON.parse(String(call?.[1]?.body)).inputManifest).toEqual(inputManifest)
+    }
+  })
+})
+
 describe('settings batch client', () => {
   it('sends the expected revision and dirty changes in one request', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({

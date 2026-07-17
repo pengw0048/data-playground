@@ -69,6 +69,8 @@ def test_manifest_is_ordered_secret_free_and_reopens_the_original_lance_head(tmp
     lance.write_dataset(pa.table({"value": [2]}), uri, mode="append")
     bound = runs._bind_local_run_manifest(graph, metadb.local_run_input_manifest(run_id) or [], deps)
     cfg = bound.nodes[0].data["config"]
+    assert cfg["_input_dataset_id"] == manifest[0]["dataset_id"]
+    assert cfg["_input_provider"] == manifest[0]["provider"]
     assert cfg["_input_revision_id"] == manifest[0]["revision_id"]
     with db.run_scope():
         assert LanceAdapter().open_revision(cfg["uri"], cfg["_input_revision_id"]).fetchall() == [(1,)]
@@ -116,6 +118,8 @@ def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(
     assert manifest[0]["revision_id"] == selected
     bound = runs._bind_local_run_manifest(graph, manifest, deps, "source")
     dispatch_config = bound.nodes[0].data["config"]
+    assert dispatch_config["_input_dataset_id"] == binding["dataset_id"]
+    assert dispatch_config["_input_provider"] == manifest[0]["provider"]
     assert dispatch_config["_input_revision_id"] == selected
     assert LanceAdapter().open_revision(uri, dispatch_config["_input_revision_id"]).fetchall() == [(1,)]
 

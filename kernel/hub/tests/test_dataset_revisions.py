@@ -27,6 +27,103 @@ def _register_lance(tmp_path) -> tuple[str, dict]:
     return uri, response.json()
 
 
+def _register_one_row_lance(tmp_path, stem: str) -> tuple[str, dict]:
+    lance = pytest.importorskip("lance")
+    name = f"{stem}-{uuid.uuid4().hex}"
+    uri = str(tmp_path / f"{name}.lance")
+    lance.write_dataset(pa.table({"id": [1], "value": [stem]}), uri)
+    response = client.post("/api/catalog/register", json={"uri": uri, "name": name})
+    assert response.status_code == 200, response.text
+    return uri, response.json()
+
+
+def test_inspectors_and_cache_identity_reuse_one_ordered_exact_input_set(tmp_path):
+    lance = pytest.importorskip("lance")
+    left_uri, _left = _register_one_row_lance(tmp_path, "binding-left")
+    right_uri, _right = _register_one_row_lance(tmp_path, "binding-right")
+    graph = {
+        "id": f"inspection-binding-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [
+            {"id": "left", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": left_uri}}},
+            {"id": "right", "type": "source", "position": {"x": 0, "y": 100},
+             "data": {"config": {"uri": right_uri}}},
+            {"id": "union", "type": "union", "position": {"x": 200, "y": 0},
+             "data": {"config": {"mode": "all", "align": "name"}}},
+        ],
+        "edges": [
+            {"id": "left-union", "source": "left", "target": "union",
+             "data": {"wire": "dataset"}},
+            {"id": "right-union", "source": "right", "target": "union",
+             "data": {"wire": "dataset"}},
+        ],
+    }
+    first_response = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "union",
+    })
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()["inputManifest"]
+    # The manifest uses the engine's stable upstream traversal order (not an unordered set).
+    assert [item["node_id"] for item in first] == ["right", "left"]
+    assert all("uri" not in item and "secret" not in str(item).lower() for item in first)
+
+    lance.write_dataset(pa.table({"id": [2], "value": ["binding-left-new"]}),
+                        left_uri, mode="append")
+    lance.write_dataset(pa.table({"id": [2], "value": ["binding-right-new"]}),
+                        right_uri, mode="append")
+
+    preview = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "union", "inputManifest": first,
+    })
+    assert preview.status_code == 200, preview.text
+    assert [row["id"] for row in preview.json()["rows"]] == [1, 1], preview.json()
+    assert preview.json()["inputManifest"] == first
+
+    sampled = client.post("/api/run/profile", json={
+        "graph": graph, "nodeId": "union", "inputManifest": first,
+    })
+    assert sampled.status_code == 200, sampled.text
+    assert sampled.json()["rowCount"] == 2
+    assert sampled.json()["inputManifest"] == first
+
+    schema = client.post("/api/graph/schema", json={
+        "graph": graph, "targetNodeId": "union", "inputManifest": first,
+    })
+    assert schema.status_code == 200, schema.text
+    assert set(schema.json()) == {"left", "right", "union"}
+
+    preflight = client.post("/api/run/profile-estimate", json={
+        "graph": graph, "nodeId": "union", "inputManifest": first,
+    })
+    identity = client.post("/api/run/profile-identity", json={
+        "graph": graph, "nodeId": "union", "inputManifest": first,
+    })
+    assert preflight.status_code == identity.status_code == 200
+    assert preflight.json()["rows"] == 2
+    assert preflight.json()["planDigest"] == identity.json()["planDigest"]
+    assert identity.json()["inputManifest"] == first
+
+    current = client.post("/api/run/preview", json={
+        "graph": graph, "nodeId": "union",
+    })
+    assert current.status_code == 200, current.text
+    assert [row["id"] for row in current.json()["rows"]] == [1, 2, 1, 2]
+    second = current.json()["inputManifest"]
+    assert [item["revision_id"] for item in second] != [
+        item["revision_id"] for item in first]
+
+    from hub.deps import get_deps
+    from hub.plan_key import plan_hash
+    from hub.routers import runs
+
+    deps = get_deps()
+    parsed = Graph.model_validate(graph)
+    old_graph = runs._bind_local_run_manifest(parsed, first, deps, "union")
+    new_graph = runs._bind_local_run_manifest(parsed, second, deps, "union")
+    assert plan_hash(old_graph, "union", deps.resolve_adapter) != plan_hash(
+        new_graph, "union", deps.resolve_adapter)
+
+
 def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     lance = pytest.importorskip("lance")
     uri, table = _register_lance(tmp_path)

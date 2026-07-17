@@ -430,6 +430,7 @@ const fmtNum = (n: number) => n.toLocaleString(undefined, { maximumFractionDigit
 // cancellable job: every row is covered, while distinct remains approximate.
 function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: string; multiOutput: boolean }) {
   const doc = useStore((s) => s.doc)
+  const preview = useStore((s) => s.previews[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const currentUserId = useStore((s) => s.currentUser?.id)
   const profileJob = useStore((s) => (
@@ -440,6 +441,10 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   const cancelFullProfile = useStore((s) => s.cancelFullProfile)
   const [full, setFull] = useState(false)
   const planIdentity = previewPlanIdentity(doc, nodeId, portId)
+  const inputManifest = preview && previewIsCurrent(preview, doc, nodeId)
+    ? preview.result?.inputManifest ?? undefined
+    : undefined
+  const inputManifestIdentity = JSON.stringify(inputManifest ?? null)
   const sampleRequestGeneration = useRef(0)
   const [sampleState, setSampleState] = useState<{
     planIdentity: string; loading: boolean; res?: ProfileResult; err?: string
@@ -449,7 +454,10 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
     const requestIdentity = previewPlanIdentity(requestDoc, nodeId, portId)
     const requestGeneration = ++sampleRequestGeneration.current
     setSampleState({ planIdentity: requestIdentity, loading: true })
-    api.profile(requestDoc, nodeId, portId)
+    const request = inputManifest
+      ? api.profile(requestDoc, nodeId, portId, inputManifest)
+      : api.profile(requestDoc, nodeId, portId)
+    request
       .then((res) => {
         if (sampleRequestGeneration.current !== requestGeneration
             || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity) return
@@ -464,7 +472,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   useEffect(() => {
     if (!full) loadSample()
     return () => { sampleRequestGeneration.current += 1 }
-  }, [nodeId, portId, full, planIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [nodeId, portId, full, planIdentity, inputManifestIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => setFull(false), [nodeId, portId, multiOutput])
   // Never paint a sample-profile response bound to another node or execution plan, even for the render
   // before the effect above starts its replacement request.

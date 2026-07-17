@@ -712,6 +712,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "targetNodeId": {
             "anyOf": [
               {
@@ -2564,6 +2581,23 @@
             ],
             "title": "Bytes"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "needsConfirm": {
             "title": "Needsconfirm",
             "type": "boolean"
@@ -2616,6 +2650,23 @@
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
@@ -2644,6 +2695,23 @@
       "ProfileIdentity": {
         "description": "Current server identity for recovery without re-running the size estimate.",
         "properties": {
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
+          },
           "planDigest": {
             "maxLength": 64,
             "minLength": 64,
@@ -2670,6 +2738,23 @@
         "properties": {
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "nodeId": {
             "title": "Nodeid",
@@ -2706,6 +2791,23 @@
           },
           "graph": {
             "$ref": "#/components/schemas/Graph"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "nodeId": {
             "title": "Nodeid",
@@ -2771,6 +2873,23 @@
             "default": false,
             "title": "Error",
             "type": "boolean"
+          },
+          "inputManifest": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inputmanifest"
           },
           "notPreviewable": {
             "default": false,

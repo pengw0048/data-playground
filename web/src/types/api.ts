@@ -298,6 +298,7 @@ export interface ProfileResult {
   sampled: boolean
   completeness: 'complete' | 'sample' | 'unknown'
   sampleProvenance?: SampleProvenance | null
+  inputManifest?: RunInputManifestItem[] | null
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
@@ -329,11 +330,13 @@ export interface RunEstimate {
 export interface ProfileEstimate extends RunEstimate {
   targetPortId: string
   planDigest: string
+  inputManifest?: RunInputManifestItem[] | null
 }
 
 export interface ProfileIdentity {
   targetPortId: string
   planDigest: string
+  inputManifest?: RunInputManifestItem[] | null
 }
 
 export type RunState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled'

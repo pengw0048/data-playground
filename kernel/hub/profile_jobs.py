@@ -40,7 +40,8 @@ class ProfileProcessRunner(SubprocessRunner):
     def run(self, graph: Graph, node_id: str, *, port_id: str | None = None,
             plan_digest: str,
             profile_attempt_order: int, run_id: str | None = None,
-            request_id: str | None = None) -> RunStatus:
+            request_id: str | None = None,
+            input_manifest: list[dict[str, str]] | None = None) -> RunStatus:
         from hub.graph import require_output_port
         # ProfileProcessRunner is directly callable from a kernel, so the router's check is not a
         # sufficient allocation boundary. Reject before reserving an identity, claiming source
@@ -52,6 +53,19 @@ class ProfileProcessRunner(SubprocessRunner):
                 "full profiles require POSIX process-group containment on this backend")
         if type(profile_attempt_order) is not int or profile_attempt_order <= 0:
             raise ValueError("profile attempt order must be a positive integer")
+        from hub.local_run_inputs import source_nodes, validate_manifest_graph
+        private_revisions = any(
+            isinstance(node.data, dict)
+            and isinstance(node.data.get("config"), dict)
+            and node.data["config"].get("_input_revision_id") is not None
+            for node in source_nodes(graph, node_id)
+        )
+        manifest = None
+        if input_manifest is not None:
+            manifest = validate_manifest_graph(
+                graph, node_id, input_manifest, require_bound_revisions=True)
+        elif private_revisions:
+            raise ValueError("full profile is missing its admitted input manifest")
         run_id = run_id or f"profile_{uuid.uuid4().hex[:10]}"
         identity = {
             "target_node_id": node_id,
@@ -60,6 +74,8 @@ class ProfileProcessRunner(SubprocessRunner):
             "profile_attempt_order": profile_attempt_order,
             "request_id": request_id,
         }
+        if manifest is not None:
+            identity["input_manifest"] = manifest
         status = RunStatus(
             run_id=run_id,
             status="queued",
@@ -94,13 +110,21 @@ class ProfileProcessRunner(SubprocessRunner):
             source_leases = self._claim_source_leases(graph, node_id, run_id)
             with self._lock:
                 self._source_leases[run_id] = source_leases
-            return self._spawn(status, {
+            job_extra = {
                 "jobKind": "profile",
                 "runId": run_id,
                 "managedSourceAttempts": source_leases["attempts"],
                 "managedLocalSources": source_leases["local_sources"],
                 "profilePortId": selected_port,
-            }, graph, node_id)
+            }
+            if manifest is not None:
+                job_extra["inputManifest"] = manifest
+                job_extra["inputManifestIdentity"] = {
+                    "runId": run_id,
+                    "canvasId": str(graph.id),
+                    "targetNodeId": node_id,
+                }
+            return self._spawn(status, job_extra, graph, node_id)
         except Exception as exc:
             # Once Popen succeeds without reap proof, the base supervisor retains the exact child, job
             # directory, and source ownership for retry/cancel/operator reconciliation.
@@ -301,12 +325,14 @@ class ProfileProcessRunner(SubprocessRunner):
     def _sanitize_child_status(self, run_id: str, observed: RunStatus) -> RunStatus:
         """Replace every control-plane identity supplied by the untrusted child."""
         observed = self._profile_identity(run_id, observed)
+        identity = self._profile_identities.get(run_id) or {}
         node_id = observed.target_node_id or ""
         if observed.status == "done":
             profile = observed.profile
             if profile is not None:
                 profile = profile.model_copy(update={
                     "target_port_id": observed.target_port_id,
+                    "input_manifest": identity.get("input_manifest"),
                 })
                 observed.profile = profile
             if (profile is None or profile.sampled or profile.error or profile.not_previewable

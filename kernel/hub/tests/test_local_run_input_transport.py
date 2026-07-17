@@ -91,6 +91,8 @@ def test_kernel_transport_reopens_the_admitted_lance_revision_after_head_move_an
             body, kernel_canvas=graph.id, deps=deps, metadata=metadb)
         assert carried == manifest
         config = reopened.nodes[0].data["config"]
+        assert config["_input_dataset_id"] == manifest[0]["dataset_id"]
+        assert config["_input_provider"] == manifest[0]["provider"]
         assert config["_input_revision_id"] == manifest[0]["revision_id"]
         with db.run_scope():
             assert LanceAdapter().open_revision(

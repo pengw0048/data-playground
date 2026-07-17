@@ -278,12 +278,17 @@ export const api = {
     req<SampleResult>('/run/preview', {
       method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest }),
     }),
-  profile: (doc: CanvasDoc, nodeId: string, portId?: string) =>
-    req<ProfileResult>('/run/profile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
+  profile: (doc: CanvasDoc, nodeId: string, portId?: string,
+    inputManifest?: RunInputManifestItem[]) =>
+    req<ProfileResult>('/run/profile', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+    }),
 
   // per-node, per-output-port columns (metadata only); null = untyped port
-  schema: (doc: CanvasDoc) =>
-    req<Record<string, Record<string, ColumnSchema[] | null>>>('/graph/schema', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+  schema: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[]) =>
+    req<Record<string, Record<string, ColumnSchema[] | null>>>('/graph/schema', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+    }),
   // per-node output-size estimate (rows + confidence) → the card "~N rows" hint; unknown → rows null
   graphSizes: (doc: CanvasDoc) =>
     req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
@@ -319,11 +324,17 @@ export const api = {
       method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
     }),
 
-  profileEstimate: (doc: CanvasDoc, nodeId: string, portId?: string) =>
-    req<ProfileEstimate>('/run/profile-estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
+  profileEstimate: (doc: CanvasDoc, nodeId: string, portId?: string,
+    inputManifest?: RunInputManifestItem[]) =>
+    req<ProfileEstimate>('/run/profile-estimate', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+    }),
 
-  profileIdentity: (doc: CanvasDoc, nodeId: string, portId?: string) =>
-    req<ProfileIdentity>('/run/profile-identity', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId }) }),
+  profileIdentity: (doc: CanvasDoc, nodeId: string, portId?: string,
+    inputManifest?: RunInputManifestItem[]) =>
+    req<ProfileIdentity>('/run/profile-identity', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+    }),
 
   run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string,
     inputManifest?: RunInputManifestItem[]) => {
@@ -342,9 +353,12 @@ export const api = {
     }
   },
 
-  fullProfile: (doc: CanvasDoc, nodeId: string, portId: string | undefined, planDigest: string, submissionId: string, confirmed = false) =>
+  fullProfile: (doc: CanvasDoc, nodeId: string, portId: string | undefined, planDigest: string,
+    submissionId: string, confirmed = false, inputManifest?: RunInputManifestItem[]) =>
     req<RunStatus>('/run/profile-job', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, planDigest, submissionId, confirmed }),
+      method: 'POST', body: JSON.stringify({
+        graph: toGraph(doc), nodeId, portId, planDigest, submissionId, confirmed, inputManifest,
+      }),
     }),
 
   runStatus: (runId: string) => req<RunStatus>(`/run/${runId}`),

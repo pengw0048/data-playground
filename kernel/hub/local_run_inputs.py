@@ -41,8 +41,11 @@ def validate_manifest_graph(graph, target_node_id: str | None, manifest: object,
         for node, item in zip(sources, admitted, strict=True):
             data = node.data if isinstance(node.data, dict) else {}
             config = data.get("config") if isinstance(data, dict) else None
-            if not isinstance(config, dict) or config.get("_input_revision_id") != item["revision_id"]:
-                raise LocalRunInputError("local run input manifest does not match bound source revisions")
+            if (not isinstance(config, dict)
+                    or config.get("_input_dataset_id") != item["dataset_id"]
+                    or config.get("_input_provider") != item["provider"]
+                    or config.get("_input_revision_id") != item["revision_id"]):
+                raise LocalRunInputError("local run input manifest does not match bound source identity")
     return admitted
 
 
@@ -84,5 +87,10 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             raise LocalRunInputError("local run input revision is unavailable") from exc
         config = node.data.setdefault("config", {})
         config["uri"] = uri
+        # Keep the complete manifest identity on the private dispatch copy. Revision ids are only
+        # provider-local and can restart after a dataset is unregistered/replaced at the same URI;
+        # cache/profile keys must therefore include dataset and provider identity as well.
+        config["_input_dataset_id"] = item["dataset_id"]
+        config["_input_provider"] = item["provider"]
         config["_input_revision_id"] = item["revision_id"]
     return bound

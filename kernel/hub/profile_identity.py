@@ -14,7 +14,7 @@ from hub import graph as graph_mod
 from hub.models import Graph
 
 
-_PROFILE_IDENTITY_SCHEMA = 2
+_PROFILE_IDENTITY_SCHEMA = 3
 
 
 def profile_plan_digest(graph: Graph, node_id: str, port_id: str, resolve_adapter) -> str:
@@ -68,10 +68,24 @@ def profile_plan_digest(graph: Graph, node_id: str, port_id: str, resolve_adapte
         edge["targetHandle"] or "", edge["wire"],
     ))
 
+    from hub.local_run_inputs import source_nodes
+
     fingerprints = []
-    for uri in sorted(graph_mod.execution_source_uris(graph, node_id)):
-        fingerprint = resolve_adapter(uri).fingerprint(uri)
-        fingerprints.append({"uri": uri, "fingerprint": str(fingerprint)})
+    for position, source in enumerate(source_nodes(graph, node_id)):
+        data = source.data if isinstance(source.data, dict) else {}
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        uri = str(config.get("uri") or "")
+        revision_id = config.get("_input_revision_id")
+        # A bound manifest must not consult mutable head again while minting its identity. The exact
+        # provider revision is already validated and reopened before this function runs.
+        fingerprint = (
+            f"revision:{revision_id}" if isinstance(revision_id, str) and revision_id
+            else str(resolve_adapter(uri).fingerprint(uri))
+        )
+        fingerprints.append({
+            "position": position, "nodeId": source.id, "uri": uri,
+            "fingerprint": fingerprint,
+        })
 
     canonical = {
         "schema": _PROFILE_IDENTITY_SCHEMA,
