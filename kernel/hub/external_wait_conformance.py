@@ -15,11 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from hub.external_wait import (
-    ExternalWaitDownloadEvidence,
-    ExternalWaitHandle,
-    ExternalWaitPollOutcome,
-    ExternalWaitSubmitRequest,
-    normalize_provider_kind,
+    ExternalWaitDownloadEvidence, ExternalWaitHandle, ExternalWaitPollOutcome,
+    ExternalWaitSubmitRequest, normalize_provider_kind,
 )
 
 
@@ -30,10 +27,8 @@ class _CheckFailed(Exception):
 
 
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="python -m hub.external_wait_conformance",
-        description="Verify one installed dataplay.plugins external-wait adapter.",
-    )
+    parser = argparse.ArgumentParser(prog="python -m hub.external_wait_conformance",
+                                     description="Verify one installed dataplay.plugins external-wait adapter.")
     parser.add_argument("plugin", help="installed dataplay.plugins entry-point name")
     parser.add_argument("--provider-kind", required=True, help="registered external-wait provider kind")
     return parser.parse_args(argv)
@@ -55,8 +50,7 @@ def _request(kind: str, scenario: str, suffix: str = "1") -> ExternalWaitSubmitR
     return ExternalWaitSubmitRequest(
         provider_kind=kind,
         idempotency_key=f"external-wait-conformance-{scenario}-{suffix}",
-        operation=f"conformance.{scenario}",
-        document_json='{"purpose":"installed-wheel-conformance"}',
+        operation=f"conformance.{scenario}", document_json='{"purpose":"installed-wheel-conformance"}',
     )
 
 
@@ -147,34 +141,44 @@ def _cancel(adapter, kind: str) -> None:
         raise _CheckFailed("cancel", "unstable_cancellation")
 
 
-def _verify_file(target: Path, root: Path, evidence: ExternalWaitDownloadEvidence) -> None:
+def _verify_file(target: Path, boundary, evidence: ExternalWaitDownloadEvidence) -> None:
+    root, trusted_root, trusted_info = boundary
     try:
+        current_root = root.lstat()
         resolved = target.resolve(strict=True)
         info = target.lstat()
-        inside = resolved.is_relative_to(root.resolve())
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        inside = resolved.is_relative_to(trusted_root)
     except OSError as exc:
         raise _CheckFailed("download", "invalid_target") from exc
-    if target.is_symlink() or not stat.S_ISREG(info.st_mode) or not inside:
+    if ((current_root.st_dev, current_root.st_ino) != (trusted_info.st_dev, trusted_info.st_ino)
+            or not stat.S_ISREG(info.st_mode) or not inside):
         raise _CheckFailed("download", "invalid_target")
-    if info.st_size != evidence.bytes_written or digest != evidence.sha256:
+    if info.st_size != evidence.bytes_written:
+        raise _CheckFailed("download", "evidence_mismatch")
+    try:
+        with target.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError as exc:
+        raise _CheckFailed("download", "invalid_target") from exc
+    if digest != evidence.sha256:
         raise _CheckFailed("download", "evidence_mismatch")
 
 
 def _download(adapter, handle: ExternalWaitHandle, root: Path) -> None:
+    boundary = (root, root.resolve(strict=True), root.lstat())
     target = root / "result.bin"
     try:
         first_raw = _safe_call(adapter.download, handle, target)
     except Exception as exc:  # noqa: BLE001
         raise _CheckFailed("download", "adapter_exception") from exc
     first = _validated(ExternalWaitDownloadEvidence, first_raw, "download", "invalid_evidence")
-    _verify_file(target, root, first)
+    _verify_file(target, boundary, first)
     try:
         replay_raw = _safe_call(adapter.download, handle, target)
     except Exception as exc:  # noqa: BLE001
         raise _CheckFailed("download", "adapter_exception") from exc
     replay = _validated(ExternalWaitDownloadEvidence, replay_raw, "download", "invalid_evidence")
-    _verify_file(target, root, replay)
+    _verify_file(target, boundary, replay)
     if replay != first:
         raise _CheckFailed("download", "idempotency_mismatch")
 

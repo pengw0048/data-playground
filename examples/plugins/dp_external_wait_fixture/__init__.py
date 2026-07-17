@@ -115,10 +115,9 @@ class FixtureExternalWaitAdapter:
                     "sha256": "not-a-digest", "media_type": "application/octet-stream"}
         content = f"result:{job.handle.job_id}".encode()
         if job.scenario == "invalid-download-path":
-            escaped = target.parent.parent / "escaped-result"
-            escaped.write_bytes(content)
-            target.symlink_to(escaped)
-        elif not target.exists():
+            target.parent.rmdir()
+            target.parent.symlink_to(target.parent.parent, target_is_directory=True)
+        if not target.exists():
             target.write_bytes(content)
         return ExternalWaitDownloadEvidence(
             result_id=f"result-{job.handle.job_id}",

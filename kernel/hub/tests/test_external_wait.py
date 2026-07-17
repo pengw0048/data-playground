@@ -15,6 +15,7 @@ from hub.external_wait import (
     ExternalWaitRetryHint,
     ExternalWaitSubmitRequest,
 )
+from hub.external_wait_conformance import _CheckFailed, _verify_file
 
 
 def _write_plugin(workspace: Path, name: str, body: str) -> None:
@@ -71,6 +72,26 @@ def test_adapter_returns_are_revalidated_even_for_constructed_models():
     malformed = ExternalWaitHandle.model_construct(provider_kind="fixture", job_id="x" * 257)
     with pytest.raises(ValidationError):
         ExternalWaitHandle.model_validate(malformed)
+
+
+def test_download_evidence_rejects_size_before_reading(monkeypatch, tmp_path):
+    root = tmp_path / "downloads"
+    root.mkdir()
+    target = root / "result.bin"
+    target.write_bytes(b"x")
+    boundary = (root, root.resolve(strict=True), root.lstat())
+    evidence = ExternalWaitDownloadEvidence(
+        result_id="result", bytes_written=2, sha256="0" * 64,
+        media_type="application/octet-stream",
+    )
+
+    def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("size mismatch must be rejected before reading the file")
+
+    monkeypatch.setattr(Path, "open", unexpected_read)
+    with pytest.raises(_CheckFailed) as caught:
+        _verify_file(target, boundary, evidence)
+    assert (caught.value.stage, caught.value.code) == ("download", "evidence_mismatch")
 
 
 def test_external_wait_registry_rejects_invalid_and_duplicate_kinds(tmp_path):
