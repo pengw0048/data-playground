@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
+import time
+import urllib.request
 from pathlib import Path
 
 
@@ -160,6 +163,126 @@ def test_external_wait_fixture_wheel_passes_sanitized_conformance(tmp_path):
     assert rejected.returncode == 1
     assert rejected.stderr.strip() == "activation: entry_point_inactive"
     assert secret not in rejected.stdout + rejected.stderr
+
+    workspace = tmp_path / "restart-workspace"
+    data_dir = workspace / "data"
+    workspace.mkdir()
+    data_dir.mkdir()
+    database_url = f"sqlite:///{workspace / 'metadata.db'}"
+    restart_env = clean_env | {
+        "DP_DATABASE_URL": database_url,
+        "DP_WORKSPACE": str(workspace),
+        "DP_DATA_DIR": str(data_dir),
+        "DP_LOG_LEVEL": "warning",
+    }
+    setup = r'''
+import json, os, uuid
+from hub import metadb
+
+metadb.init_db()
+canvas_id, submission = "external-restart", str(uuid.uuid4())
+graph = {"id": canvas_id, "version": 1, "nodes": [{
+    "id": "wait", "type": "external_wait_fixture",
+    "data": {"config": {"operation": "conformance.response-loss", "documentJson": "{}"}},
+}], "edges": []}
+with metadb.session() as session:
+    session.add(metadb.Canvas(
+        id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
+        name="External restart", doc=json.dumps(graph)))
+task, _ = metadb.submit_durable_external_wait_task(
+    uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, submission_id=submission,
+    target_node_id="wait", intent_sha256="a" * 64, graph_doc=graph,
+    provider_kind="fixture-local", operation="conformance.response-loss", document_json="{}")
+claim = metadb.claim_external_wait_transition(task["id"], "crashed-hub-owner")
+print(json.dumps({"task_id": task["id"], "attempt_id": claim["attempt_id"]}))
+'''
+    prepared = _run([str(python), "-c", setup], cwd=tmp_path, env=restart_env)
+    assert prepared.returncode == 0, prepared.stderr
+    expected = json.loads(prepared.stdout.strip().splitlines()[-1])
+
+    def start_hub(log_path: Path):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        log = log_path.open("w+")
+        process = subprocess.Popen(
+            [str(python), "-m", "hub.cli", "--host", "127.0.0.1", "--port", str(port),
+             "--workspace", str(workspace), "--data-dir", str(data_dir), "--no-open", "--no-seed"],
+            cwd=tmp_path, env=restart_env, text=True, stdout=log, stderr=subprocess.STDOUT)
+        base = f"http://127.0.0.1:{port}/api"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(base + "/livez", timeout=1) as response:
+                    if json.load(response)["ok"]:
+                        return process, log, base
+            except Exception:
+                if process.poll() is not None:
+                    break
+                time.sleep(.05)
+        log.flush()
+        raise AssertionError(log_path.read_text())
+
+    def get_json(base: str, path: str):
+        with urllib.request.urlopen(base + path, timeout=2) as response:
+            return json.load(response)
+
+    logs = []
+    first, first_log, first_base = start_hub(tmp_path / "hub-first.log")
+    logs.append(first_log)
+    try:
+        before = get_json(first_base, f"/jobs?run_id={expected['task_id']}")["items"][0]
+        assert before["status"] == "running"
+        assert [item["id"] for item in before["taskAttempts"]] == [expected["attempt_id"]]
+        assert before["externalWait"]["phase"] == "submitting"
+    finally:
+        first.terminate()
+        first.wait(timeout=10)
+        first_log.close()
+
+    second, second_log, second_base = start_hub(tmp_path / "hub-second.log")
+    logs.append(second_log)
+    try:
+        before_expiry = get_json(
+            second_base, f"/jobs?run_id={expected['task_id']}")["items"][0]
+        assert [item["id"] for item in before_expiry["taskAttempts"]] == [expected["attempt_id"]]
+        assert before_expiry["externalWait"]["phase"] == "submitting"
+        expire = r'''
+import datetime, os
+from hub import metadb
+metadb.init_db()
+with metadb.session() as session:
+    wait = session.get(metadb.DurableExternalWait, os.environ["TASK_ID"], with_for_update=True)
+    wait.lease_until = metadb._durable_task_db_now(session) - datetime.timedelta(seconds=1)
+'''
+        expired = _run(
+            [str(python), "-c", expire], cwd=tmp_path,
+            env=restart_env | {"TASK_ID": expected["task_id"]})
+        assert expired.returncode == 0, expired.stderr
+        deadline = time.monotonic() + 10
+        final = None
+        while time.monotonic() < deadline:
+            final = get_json(second_base, f"/jobs?run_id={expected['task_id']}")["items"][0]
+            if final["status"] in ("done", "failed", "cancelled"):
+                break
+            time.sleep(.05)
+        assert final is not None and final["status"] == "done", final
+        assert [item["id"] for item in final["taskAttempts"]] == [expected["attempt_id"]]
+        assert final["externalWait"]["phase"] == "provider_succeeded"
+        assert final["externalWait"]["attemptNumber"] == 1
+        assert final["outputs"] == [] and final["outputReceipt"] is None
+        encoded = json.dumps(final)
+        for sentinel in ("job_id", "checkpoint", "documentJson",
+                         "external-wait-secret-sentinel", "/private/configured/path"):
+            assert sentinel not in encoded
+    finally:
+        second.terminate()
+        second.wait(timeout=10)
+        second_log.close()
+    combined_logs = "".join(path.read_text() for path in (
+        tmp_path / "hub-first.log", tmp_path / "hub-second.log"))
+    assert "external-wait-secret-sentinel" not in combined_logs
+    assert "/private/configured/path" not in combined_logs
 
 
 def test_installed_descriptor_fixture_certifies_backend_api_and_execution(tmp_path):
