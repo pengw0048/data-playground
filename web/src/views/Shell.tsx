@@ -7,6 +7,7 @@ import { Icon, type IconName } from '../ui/Icon'
 import { SettingsModal } from '../panels/SettingsModal'
 import { ERDiagram } from './ERDiagram'
 import { WorkspaceExplorer } from './WorkspaceExplorer'
+import { JobsView } from './JobsView'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
@@ -33,6 +34,7 @@ export function Shell() {
       <Rail onSettings={openSettings} />
       <main style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'workspace' && <WorkspaceExplorer />}
+        {view === 'jobs' && <JobsView />}
         {view === 'transforms' && <TransformsContent />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
@@ -77,6 +79,7 @@ function Rail({ onSettings }: { onSettings: (trigger: HTMLElement) => void }) {
       </div>
       <div className="flex flex-col gap-0.5">
         {item('workspace', 'grid', 'Workspace')}
+        {item('jobs', 'clock', 'Jobs')}
         {item('transforms', 'fx', 'Transforms')}
         {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}

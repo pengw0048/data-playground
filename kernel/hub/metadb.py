@@ -11,6 +11,7 @@ seeded local user.
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
 import datetime
 import hashlib
@@ -27,7 +28,7 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, and_, create_engine, delete, exists, func, or_, select, update,
+    Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -3395,6 +3396,245 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                  "profile": json.loads(r.profile) if r.profile else None,
                  "perNode": json.loads(r.per_node) if r.per_node else None,
                  "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def _workspace_run_cursor_encode(created_at: datetime.datetime, identity: str) -> str:
+    stamp = created_at.isoformat()
+    raw = json.dumps([stamp, identity], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _workspace_run_cursor_decode(cursor: str | None) -> tuple[datetime.datetime, str] | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Jobs cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        value = json.loads(raw)
+        created_at = datetime.datetime.fromisoformat(value[0])
+        if created_at.tzinfo is None:
+            # SQLite returns timezone-aware columns as naive values; the metadata contract stores UTC.
+            created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+        identity = value[1]
+    except (ValueError, TypeError, IndexError, KeyError, binascii.Error, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Jobs cursor") from exc
+    if (not isinstance(identity, str) or not identity
+            or created_at.tzinfo is None or created_at.utcoffset() is None):
+        raise ValueError("invalid Jobs cursor")
+    return created_at, identity
+
+
+def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
+                       backend: str | None, backend_attempt: str | None,
+                       source: str) -> tuple[tuple[datetime.datetime, str], dict]:
+    """Normalize terminal history and live state without inventing another lifecycle."""
+    if source == "history":
+        outputs = json.loads(row.outputs)
+        input_manifest = json.loads(row.input_manifest) if row.input_manifest else None
+        profile = json.loads(row.profile) if row.profile else None
+        per_node = json.loads(row.per_node) if row.per_node else None
+        placement = str((state_doc or {}).get("placement") or ("distributed" if backend else "local"))
+        profile_attempt = (state_doc or {}).get("profile_attempt_order")
+        created_at = row.created_at or _now()
+        identity = f"h:{row.id}"
+        doc = {
+            "id": row.id, "runId": row.run_id, "requestId": row.request_id,
+            "jobType": row.job_type, "status": row.status,
+            "targetNodeId": row.target_node_id, "targetPortId": row.target_port_id,
+            "rows": row.rows, "ms": row.ms, "error": row.error,
+            "inputManifest": input_manifest, "outputs": outputs, "profile": profile,
+            "perNode": per_node, "createdAt": created_at.isoformat(),
+        }
+    else:
+        assert state_doc is not None
+        outputs = state_doc.get("outputs") or []
+        per_node = state_doc.get("per_node") or []
+        placement = str(state_doc.get("placement") or ("distributed" if backend else "local"))
+        profile_attempt = state_doc.get("profile_attempt_order")
+        created_at = row.created_at or row.updated_at or _now()
+        identity = f"s:{row.run_id}"
+        doc = {
+            "id": identity, "runId": row.run_id, "requestId": row.request_id,
+            "jobType": state_doc.get("job_type") or row.job_type or "run",
+            "status": row.status, "targetNodeId": state_doc.get("target_node_id") or row.target_node_id,
+            "targetPortId": state_doc.get("target_port_id") or row.target_port_id,
+            "rows": state_doc.get("total_rows"), "ms": state_doc.get("ms"),
+            "error": state_doc.get("error"), "inputManifest": None,
+            "outputs": outputs, "profile": state_doc.get("profile"),
+            "perNode": per_node or None, "createdAt": created_at.isoformat(),
+        }
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+        doc["createdAt"] = created_at.isoformat()
+    target = doc.get("targetNodeId")
+    node_label = next((str(item.get("label")) for item in (doc.get("perNode") or [])
+                       if isinstance(item, dict) and item.get("node_id") == target
+                       and item.get("label")), None)
+    backend_ref = (state_doc or {}).get("backend_ref") or {}
+    effective_backend = str(
+        backend or backend_ref.get("backend")
+        or (placement if state_doc is not None else "unknown"))
+    attempt = str(
+        backend_ref.get("attempt_id") or backend_attempt
+        or profile_attempt or doc.get("runId") or doc["id"])
+    doc.update({
+        "canvasId": row.canvas_id, "canvasName": canvas_name,
+        "nodeLabel": node_label, "backend": effective_backend,
+        "placement": placement, "attempt": attempt,
+    })
+    return (created_at, identity), doc
+
+
+def list_workspace_runs(
+        uid: str, *, limit: int = 50, cursor: str | None = None,
+        status: str | None = None, canvas_id: str | None = None,
+        node_id: str | None = None, run_id: str | None = None,
+        backend: str | None = None,
+        recorded_after: datetime.datetime | None = None,
+        recorded_before: datetime.datetime | None = None,
+        text: str | None = None) -> dict:
+    """Return one bounded keyset page across every canvas the caller can currently read."""
+    if limit < 1 or limit > 100:
+        raise ValueError("Jobs limit must be between 1 and 100")
+    decoded = _workspace_run_cursor_decode(cursor)
+    normalized_text = str(text or "").strip().lower()
+    fetch_limit = limit * 2 + 1  # terminal-state/history overlap is excluded, but retain merge headroom
+    candidates: list[tuple[tuple[datetime.datetime, str], dict]] = []
+    with session() as s:
+        # Keep visibility in the data query itself. A separate preflight list would open a revoke race
+        # where a formerly visible canvas could still contribute one Jobs page.
+        visible_canvas = or_(
+            Canvas.owner_id == str(uid),
+            Canvas.visibility.in_(("workspace", "workspace_view")),
+            exists().where(and_(
+                CanvasShare.canvas_id == Canvas.id,
+                CanvasShare.user_id == str(uid),
+            )),
+        )
+        if s.get_bind().dialect.name == "postgresql":
+            from sqlalchemy.dialects.postgresql import JSONB
+            state_json = cast(RunState.doc, JSONB)
+            state_placement = state_json.op("->>")("placement")
+            state_backend_ref = state_json.op("->")("backend_ref").op("->>")("backend")
+        else:
+            state_placement = func.json_extract(RunState.doc, "$.placement")
+            state_backend_ref = func.json_extract(RunState.doc, "$.backend_ref.backend")
+        effective_backend = func.coalesce(
+            RunBackendJob.backend, state_backend_ref, state_placement, literal("unknown"))
+        history_identity = literal("h:") + RunRecord.id
+        history_predicates = [visible_canvas]
+        if canvas_id:
+            history_predicates.append(RunRecord.canvas_id == canvas_id)
+        if run_id:
+            history_predicates.append(RunRecord.run_id == run_id)
+        if status:
+            history_predicates.append(RunRecord.status == status)
+        if node_id:
+            history_predicates.append(RunRecord.target_node_id == node_id)
+        if recorded_after:
+            history_predicates.append(RunRecord.created_at >= recorded_after)
+        if recorded_before:
+            history_predicates.append(RunRecord.created_at <= recorded_before)
+        if backend:
+            history_predicates.append(effective_backend == backend)
+        if normalized_text:
+            literal_text = normalized_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{literal_text}%"
+            history_predicates.append(or_(
+                func.lower(Canvas.name).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunRecord.target_node_id, "")).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunRecord.error, "")).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunRecord.run_id, "")).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunRecord.per_node, "")).like(pattern, escape="\\"),
+            ))
+        if decoded:
+            stamp, identity = decoded
+            history_predicates.append(or_(
+                RunRecord.created_at < stamp,
+                and_(RunRecord.created_at == stamp, history_identity < identity),
+            ))
+        history_rows = s.execute(
+            select(
+                RunRecord, Canvas.name, RunState.doc,
+                RunBackendJob.backend, RunBackendJob.attempt_id,
+            )
+            .join(Canvas, Canvas.id == RunRecord.canvas_id)
+            .outerjoin(RunState, and_(
+                RunState.run_id == RunRecord.run_id,
+                RunState.canvas_id == RunRecord.canvas_id,
+            ))
+            .outerjoin(RunBackendJob, RunBackendJob.run_id == RunRecord.run_id)
+            .where(*history_predicates)
+            .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
+        ).all()
+        for row, name, raw_state, backend_name, backend_attempt in history_rows:
+            state_doc = json.loads(raw_state) if raw_state else None
+            candidates.append(_workspace_run_doc(
+                row, canvas_name=name, state_doc=state_doc,
+                backend=backend_name, backend_attempt=backend_attempt, source="history"))
+
+        state_identity = literal("s:") + RunState.run_id
+        state_predicates = [
+            visible_canvas,
+            ~exists().where(and_(
+                RunRecord.canvas_id == RunState.canvas_id,
+                RunRecord.run_id == RunState.run_id,
+            )),
+        ]
+        if canvas_id:
+            state_predicates.append(RunState.canvas_id == canvas_id)
+        if run_id:
+            state_predicates.append(RunState.run_id == run_id)
+        if status:
+            state_predicates.append(RunState.status == status)
+        if node_id:
+            state_predicates.append(RunState.target_node_id == node_id)
+        if recorded_after:
+            state_predicates.append(RunState.created_at >= recorded_after)
+        if recorded_before:
+            state_predicates.append(RunState.created_at <= recorded_before)
+        if backend:
+            state_predicates.append(effective_backend == backend)
+        if normalized_text:
+            literal_text = normalized_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{literal_text}%"
+            state_predicates.append(or_(
+                func.lower(Canvas.name).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunState.target_node_id, "")).like(pattern, escape="\\"),
+                func.lower(func.coalesce(RunState.run_id, "")).like(pattern, escape="\\"),
+                func.lower(RunState.doc).like(pattern, escape="\\"),
+            ))
+        if decoded:
+            stamp, identity = decoded
+            state_predicates.append(or_(
+                RunState.created_at < stamp,
+                and_(RunState.created_at == stamp, state_identity < identity),
+            ))
+        state_rows = s.execute(
+            select(
+                RunState, Canvas.name,
+                RunBackendJob.backend, RunBackendJob.attempt_id,
+            )
+            .join(Canvas, Canvas.id == RunState.canvas_id)
+            .outerjoin(RunBackendJob, RunBackendJob.run_id == RunState.run_id)
+            .where(*state_predicates)
+            .order_by(RunState.created_at.desc(), RunState.run_id.desc()).limit(fetch_limit)
+        ).all()
+        for row, name, backend_name, backend_attempt in state_rows:
+            try:
+                state_doc = json.loads(row.doc)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("persisted run state is invalid") from exc
+            candidates.append(_workspace_run_doc(
+                row, canvas_name=name, state_doc=state_doc,
+                backend=backend_name, backend_attempt=backend_attempt, source="state"))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    page = candidates[:limit]
+    has_more = len(candidates) > limit
+    next_cursor = _workspace_run_cursor_encode(*page[-1][0]) if has_more and page else None
+    return {"items": [doc for _key, doc in page],
+            "nextCursor": next_cursor, "hasMore": has_more}
 
 
 def get_run_record_outputs(run_id: str) -> list[dict] | None:
