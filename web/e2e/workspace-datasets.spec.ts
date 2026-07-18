@@ -51,7 +51,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     const search = page.getByTestId('catalog-search')
     await search.fill(registeredName)
     await expect(page).toHaveURL(new RegExp(`scope=datasets.*dq=${registeredName}`))
-    await page.getByRole('button', { name: `Open table ${registeredName}` }).click()
+    await page.getByRole('button', { name: `Open dataset ${registeredName}` }).click()
     await expect(page.getByRole('dialog', { name: registeredName })).toBeVisible()
     await expect(page).toHaveURL(new RegExp(`#\\/workspace\\/dataset%3A${encodeURIComponent(registered.registrationId)}`))
     await page.getByTestId('detail-preview').click()
@@ -65,8 +65,8 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page.getByRole('dialog', { name: registeredName })).toBeVisible()
     await page.getByRole('button', { name: 'Close' }).click()
     await search.fill('issue497_')
-    await expect(page.getByRole('button', { name: `Open table ${registeredName}` })).toBeVisible()
-    await expect(page.getByRole('button', { name: `Open table ${uploaded.name}` })).toBeVisible()
+    await expect(page.getByRole('button', { name: `Open dataset ${registeredName}` })).toBeVisible()
+    await expect(page.getByRole('button', { name: `Open dataset ${uploaded.name}` })).toBeVisible()
 
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()
     await page.getByRole('checkbox', { name: `Select ${uploaded.name}` }).check()
@@ -108,8 +108,8 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByTestId('catalog-delete-selected').click()
     const result = page.getByTestId('catalog-unregister-result')
     await expect(result).toContainText('Best-effort unregister result')
-    await expect(result).toContainText(`${registeredName}: deleted`)
-    await expect(result.locator('span').filter({ hasText: ': deleted' })).toHaveCount(2)
+    await expect(result).toContainText(`${registeredName}: unregistered`)
+    await expect(result.locator('span').filter({ hasText: ': unregistered' })).toHaveCount(2)
   } finally {
     if (registered) {
       await page.request.delete(`/api/catalog/tables/${encodeURIComponent(registered.id)}`, { params: {

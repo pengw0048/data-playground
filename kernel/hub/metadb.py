@@ -14461,9 +14461,11 @@ def _catalog_current_logical_ownership(
 
 
 def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = None,
-                         expected_metadata_revision: str | None = None) -> None:
+                         expected_metadata_revision: str | None = None,
+                         report_result: bool = False) -> bool | None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
-    declared key/relationships)."""
+    declared key/relationships). ``report_result`` lets the versioned HTTP mutation distinguish a
+    committed removal from a concurrent miss without changing the legacy fire-and-forget contract."""
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         token = str(uri).rstrip("/")
@@ -14506,7 +14508,7 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
                     CatalogEntry.tbl_id == token, CatalogEntry.name == token,
                 )).order_by(CatalogEntry.uri).limit(1)).first()
             if entry_snapshot is None:
-                return
+                return False if report_result else None
             entry = s.get(CatalogEntry, entry_snapshot.uri, with_for_update=True)
             if entry is None or entry.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")
@@ -14548,6 +14550,7 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
             s.delete(entry)
         # Object governance/ref mutations above always precede the local registry lock.
         _drop_local_result_owner(s, "catalog_entry", current_uri)
+        return True if report_result else None
 
 
 def catalog_delete_prefix(uri_prefix: str) -> int:

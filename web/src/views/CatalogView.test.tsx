@@ -88,7 +88,12 @@ describe('CatalogView request and mutation truth', () => {
     render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
       onUseTables={onUseTables} onUploadDataset={store.uploadDataset} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Use table orders' }))
+    expect(await screen.findByText(/^1 dataset$/)).toBeInTheDocument()
+    expect(screen.queryByText(/^1 datasets$/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'All datasets' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search datasets')).toBeInTheDocument()
+    expect(screen.getByLabelText('Sort datasets')).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: 'Use dataset orders' }))
     expect(onUseTables).toHaveBeenCalledWith([TABLE])
     expect(store.addToCanvas).not.toHaveBeenCalled()
   })
@@ -304,21 +309,23 @@ describe('CatalogView selection, register modal, and rename', () => {
   })
   afterEach(() => cleanup())
 
-  it('multi-selects rows and batch-deletes them in one request', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+  it('multi-selects rows and batch-unregisters them without implying data deletion', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogView />)
     fireEvent.click(await screen.findByLabelText('Select orders'))
     fireEvent.click(screen.getByLabelText('Select customers'))
     expect(screen.getByText('2 selected')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Unregister' })).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('catalog-delete-selected'))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
     await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith([
       { id: 't1', expectedRegistrationId: 'registration-orders', expectedRevision: 'm1_orders' },
       { id: 't2', expectedRegistrationId: 'registration-customers', expectedRevision: 'm1_customers' },
     ]))
     const result = await screen.findByTestId('catalog-unregister-result')
     expect(result).toHaveTextContent('Best-effort unregister result')
-    expect(result).toHaveTextContent('orders: deleted')
-    expect(result).toHaveTextContent('customers: deleted')
+    expect(result).toHaveTextContent('orders: unregistered')
+    expect(result).toHaveTextContent('customers: unregistered')
   })
 
   it('registers a dataset through the modal with the full payload', async () => {

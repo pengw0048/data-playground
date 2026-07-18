@@ -762,16 +762,12 @@ class InMemoryCatalog:
                                expected_revision: str) -> bool:
         """Remove one exact current entry, or fail if its editable metadata changed."""
         with self._lock:
-            doc = metadb.catalog_get(id_or_name)
-            if doc is None:
-                return False
-            token = (id_or_name if metadb.object_attempt_is_managed(id_or_name)
-                     else doc["uri"])
-            metadb.catalog_delete_entry(
-                token, expected_registration_id=expected_registration_id,
-                expected_metadata_revision=expected_revision)
-            self._emb_dirty += 1
-        return True
+            removed = metadb.catalog_delete_entry(
+                id_or_name, expected_registration_id=expected_registration_id,
+                expected_metadata_revision=expected_revision, report_result=True)
+            if removed:
+                self._emb_dirty += 1
+            return bool(removed)
 
     # -- semantic search (opt-in via reg.add_embedder) -------------------- #
     def search_modes(self) -> list[str]:

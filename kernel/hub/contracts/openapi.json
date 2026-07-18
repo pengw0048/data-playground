@@ -5424,6 +5424,41 @@
         "title": "SettingsSnapshot",
         "type": "object"
       },
+      "UnregisterItemResult": {
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "deleted",
+              "missing",
+              "conflict",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "title": "UnregisterItemResult",
+        "type": "object"
+      },
       "UnregisterManyRequest": {
         "properties": {
           "targets": {
@@ -5440,6 +5475,35 @@
           "targets"
         ],
         "title": "UnregisterManyRequest",
+        "type": "object"
+      },
+      "UnregisterManyResult": {
+        "properties": {
+          "limit": {
+            "const": 50,
+            "default": 50,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "mode": {
+            "const": "best_effort",
+            "default": "best_effort",
+            "title": "Mode",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/UnregisterItemResult"
+            },
+            "maxItems": 50,
+            "title": "Results",
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "UnregisterManyResult",
         "type": "object"
       },
       "UnregisterTarget": {
@@ -10395,9 +10459,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Unregister Tables Api Catalog Tables Delete Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/UnregisterManyResult"
                 }
               }
             },

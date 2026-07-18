@@ -1,5 +1,4 @@
-"""Register-with-curation, friendly-name rename, and batch delete — the Tables-view mutations that
-back multi-select delete and the register modal / drawer rename."""
+"""Register-with-curation, friendly-name rename, and versioned unregister mutations."""
 
 from __future__ import annotations
 
@@ -141,3 +140,26 @@ def test_batch_unregister_isolates_and_sanitizes_provider_failures(tmp_path, mon
     ]
     assert client.get(f"/api/catalog/tables/{failed['id']}").status_code == 200
     unregister(failed["id"], failed["registrationId"], failed["metadataRevision"])
+
+
+def test_read_only_catalog_subclass_does_not_inherit_local_unregister(tmp_path, monkeypatch):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    class ReadOnlyExternal(InMemoryCatalog):
+        folders_mutable = False
+
+    deps = get_deps()
+    monkeypatch.setattr(
+        deps, "catalog", ReadOnlyExternal(str(tmp_path / "external"), deps.resolve_adapter))
+
+    capabilities = client.get("/api/kernel").json()["capabilities"]
+    assert "catalog.cas_unregister" not in capabilities
+    single = client.delete("/api/catalog/tables/not-local", params={
+        "expected_registration_id": "external-registration",
+        "expected_revision": "m1_external",
+    })
+    batch = client.post("/api/catalog/tables/delete", json={"targets": [{
+        "id": "not-local", "expectedRegistrationId": "external-registration",
+        "expectedRevision": "m1_external",
+    }]})
+    assert single.status_code == batch.status_code == 501

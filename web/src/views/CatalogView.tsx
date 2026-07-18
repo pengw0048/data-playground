@@ -22,7 +22,7 @@ const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
 /**
  * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
- * CatalogView keeps the legacy current-canvas adapter below, while Workspace can supply an explicit
+ * The standalone adapter below can still supply the current Canvas, while Workspace supplies an explicit
  * target in #497 without copying its query, paging, selection, or curation behavior.
  */
 export interface CatalogDiscoveryProps {
@@ -71,7 +71,7 @@ export function CatalogView() {
 }
 
 export function CatalogDiscovery({
-  sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Tables',
+  sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
   queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
@@ -268,8 +268,9 @@ export function CatalogDiscovery({
       return
     }
     if (!window.confirm(
-      `Remove ${targets.length} dataset${targets.length === 1 ? '' : 's'}? `
-      + 'This is best effort: each item is version-checked and the result may be partial.',
+      `Unregister ${targets.length} dataset${targets.length === 1 ? '' : 's'}? `
+      + 'This removes catalog registrations, not underlying data. '
+      + 'The operation is best effort: each item is version-checked and the result may be partial.',
     )) return
     try {
       const result = await api.unregisterTables(targets)
@@ -283,7 +284,7 @@ export function CatalogDiscovery({
       }, {})
       const failures = (counts.conflict ?? 0) + (counts.failed ?? 0)
       pushToast(
-        `Unregister result: ${counts.deleted ?? 0} removed, ${counts.missing ?? 0} already gone`
+        `Unregister result: ${counts.deleted ?? 0} unregistered, ${counts.missing ?? 0} already gone`
         + (failures ? `, ${failures} need review` : ''),
         failures ? 'info' : 'success',
       )
@@ -305,7 +306,7 @@ export function CatalogDiscovery({
       {/* header: title + register / upload */}
       <div className="flex items-center gap-3 px-7 pb-3 pt-5">
         <h1 className="text-[20px] font-bold text-foreground">{title}</h1>
-        <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} datasets</span>
+        <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} {total === 1 ? 'dataset' : 'datasets'}</span>
         <span className="flex-1" />
         <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset by path / uri"
           className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background">
@@ -324,7 +325,7 @@ export function CatalogDiscovery({
         <div className="relative flex-1">
           <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"><Icon name="search" size={13} /></span>
           <input value={rawQ} onChange={(e) => setRawQ(e.target.value)} data-testid="catalog-search"
-            placeholder="Search by name, folder, description, or column…" aria-label="Search tables"
+            placeholder="Search by name, folder, description, or column…" aria-label="Search datasets"
             className="w-full rounded-lg border border-border bg-card py-1.5 pl-8 pr-3 text-[13px] outline-none focus:border-primary" />
         </div>
         {q && facets.semanticAvailable && (
@@ -340,7 +341,7 @@ export function CatalogDiscovery({
           const [nextSort, nextOrder] = e.target.value.split(':')
           commitQuery({ ...query, sort: nextSort as Sort, order: nextOrder as 'asc' | 'desc' })
         }}
-          disabled={semantic} aria-label="Sort tables"
+          disabled={semantic} aria-label="Sort datasets"
           className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
           <option value="name:asc">Name A–Z</option>
           <option value="name:desc">Name Z–A</option>
@@ -376,7 +377,7 @@ export function CatalogDiscovery({
           <button onClick={() => void deleteSelected()} data-testid="catalog-delete-selected"
             disabled={!catalogSource?.capabilities?.includes('catalog.cas_unregister')}
             className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-destructive hover:bg-accent">
-            <Icon name="trash" size={11} /> Delete
+            <Icon name="trash" size={11} /> Unregister
           </button>
           <button onClick={clearSelection} className="rounded-md px-2 py-1 text-muted-foreground hover:text-foreground">Clear</button>
           <span className="flex-1" />
@@ -396,7 +397,7 @@ export function CatalogDiscovery({
         </div>
         <div className="mt-1 flex max-h-20 flex-wrap gap-x-3 gap-y-0.5 overflow-y-auto">
           {unregisterResult.response.results.map((item) => <span key={item.id} title={item.detail ?? undefined} className={item.status === 'deleted' || item.status === 'missing' ? '' : 'text-destructive'}>
-            {unregisterResult.names[item.id] ?? item.id}: {item.status}{item.detail ? ` — ${item.detail}` : ''}
+            {unregisterResult.names[item.id] ?? item.id}: {item.status === 'deleted' ? 'unregistered' : item.status}{item.detail ? ` — ${item.detail}` : ''}
           </span>)}
         </div>
       </div>}
@@ -555,7 +556,7 @@ function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse,
         <input type="checkbox" checked={selected} onChange={onToggleSelect} aria-label={`Select ${t.name}`}
           className="h-3.5 w-3.5 cursor-pointer accent-primary" />
       </label>
-      <button type="button" onClick={onOpen} aria-label={`Open table ${t.name}`}
+      <button type="button" onClick={onOpen} aria-label={`Open dataset ${t.name}`}
         className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-lg border-0 bg-transparent pl-1 pr-3 text-left text-inherit">
         <Icon name="db" size={16} style={{ color: color.text3 }} />
         <div className="min-w-0 flex-1">
@@ -578,7 +579,7 @@ function TableRow({ t, selected, selectionActive, onToggleSelect, onOpen, onUse,
           Folder
         </button>
       )}
-      <button type="button" onClick={onUse} aria-label={`Use table ${t.name}`}
+      <button type="button" onClick={onUse} aria-label={`Use dataset ${t.name}`}
         className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold text-primary opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100">
         <Icon name="plus" size={12} /> Use
       </button>
@@ -649,7 +650,7 @@ function FolderTree({ selected, onSelect, onCreated, onRenamed, onDeleted, revis
       <div className="mb-0.5 flex items-center gap-1">
         <button onClick={() => onSelect('')}
           className={`flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-left hover:bg-accent ${!selected ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground'}`}>
-          <Icon name="db" size={13} /> All tables
+          <Icon name="db" size={13} /> All datasets
         </button>
         {mutable && (
           <button onClick={() => void create()} data-testid="folder-new" aria-label="New folder" title="New folder"

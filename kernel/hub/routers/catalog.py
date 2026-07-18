@@ -621,9 +621,12 @@ def unregister_table(
     expected_revision: str = Query(..., min_length=1, max_length=128),
 ) -> dict:
     """Remove one exact dataset only while its editable metadata still matches the caller's read."""
-    unregister = getattr(get_deps().catalog, "unregister_if_revision", None)
-    if not callable(unregister):
+    from hub.plugins.catalog import InMemoryCatalog
+
+    cat = get_deps().catalog
+    if type(cat) is not InMemoryCatalog:
         raise HTTPException(501, "catalog provider does not support versioned unregister")
+    unregister = cat.unregister_if_revision
     try:
         removed = unregister(table_id, expected_registration_id, expected_revision)
     except metadb.CatalogMetadataConflict as exc:
@@ -645,17 +648,31 @@ class UnregisterManyRequest(BaseModel):
     targets: list[UnregisterTarget] = Field(min_length=1, max_length=50)
 
 
-@router.post("/catalog/tables/delete")
-def unregister_tables(req: UnregisterManyRequest) -> dict:
+class UnregisterItemResult(BaseModel):
+    id: str
+    status: Literal["deleted", "missing", "conflict", "failed"]
+    detail: str | None = None
+
+
+class UnregisterManyResult(BaseModel):
+    mode: Literal["best_effort"] = "best_effort"
+    limit: Literal[50] = 50
+    results: list[UnregisterItemResult] = Field(max_length=50)
+
+
+@router.post("/catalog/tables/delete", response_model=UnregisterManyResult)
+def unregister_tables(req: UnregisterManyRequest) -> UnregisterManyResult:
     """Best-effort, bounded removal with one metadata CAS precondition per dataset.
 
     Results are deliberately per-item: one stale or concurrently busy dataset never hides which
     other removals committed. Providers without revision-aware unregister remain read-only here.
     """
+    from hub.plugins.catalog import InMemoryCatalog
+
     cat = get_deps().catalog
-    unregister = getattr(cat, "unregister_if_revision", None)
-    if not callable(unregister):
+    if type(cat) is not InMemoryCatalog:
         raise HTTPException(501, "catalog provider does not support versioned unregister")
+    unregister = cat.unregister_if_revision
     ids = [target.id for target in req.targets]
     if len(ids) != len(set(ids)):
         raise HTTPException(422, "unregister batch contains a duplicate dataset")
@@ -676,7 +693,9 @@ def unregister_tables(req: UnregisterManyRequest) -> dict:
                 "id": target.id, "status": "failed",
                 "detail": "dataset could not be removed; reload and retry",
             })
-    return {"mode": "best_effort", "limit": 50, "results": results}
+    return UnregisterManyResult.model_validate({
+        "mode": "best_effort", "limit": 50, "results": results,
+    })
 
 
 class JoinSuggestRequest(BaseModel):
