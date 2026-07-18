@@ -113,11 +113,11 @@ test.describe('Data Playground canvas', () => {
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
   })
 
-  test('node finder searches, adds with Enter, and keeps category browsing available', async ({ page }) => {
+  test('operation search is explicit about adding and keeps category browsing available', async ({ page }) => {
     await fresh(page)
-    await page.getByRole('button', { name: 'Find node', exact: true }).click()
-    const finder = page.getByRole('dialog', { name: 'Find a node' })
-    const search = finder.getByRole('textbox', { name: 'Search nodes' })
+    await page.getByRole('button', { name: 'Add operation', exact: true }).click()
+    const finder = page.getByRole('dialog', { name: 'Add an operation' })
+    const search = finder.getByRole('textbox', { name: 'Search operations' })
     await expect(search).toBeFocused()
     await search.fill('descriptor_contract')
     await expect(finder.getByRole('option', { name: /descriptor_contract/i }).first()).toContainText('Plugin · dp-descriptor-contract')
@@ -128,6 +128,38 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
+  })
+
+  test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {
+    const canvasId = `node-locator-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Existing node locator', version: 1,
+      nodes: [
+        { id: 'duplicate-near', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'Duplicate', status: 'stale', config: {} } },
+        { id: 'duplicate-off-screen', type: 'filter', position: { x: 8000, y: 6000 }, data: { title: 'Duplicate', status: 'failed', config: {}, disabled: true } },
+      ], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const viewport = page.locator('.react-flow__viewport')
+    const beforeViewport = await viewport.getAttribute('style')
+
+    await page.getByRole('button', { name: 'Locate existing node', exact: true }).click()
+    const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
+    const search = locator.getByRole('textbox', { name: 'Search existing nodes' })
+    await search.fill('duplicate-off-screen')
+    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('failed · disabled')
+    await search.press('Enter')
+
+    await expect(locator).toBeHidden()
+    const selected = page.locator('.react-flow__node[data-id="duplicate-off-screen"]')
+    await expect(selected).toBeVisible()
+    await expect(selected).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('Duplicate')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect.poll(() => viewport.getAttribute('style')).not.toBe(beforeViewport)
   })
 
   test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {

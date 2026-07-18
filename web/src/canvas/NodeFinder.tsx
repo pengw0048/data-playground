@@ -32,7 +32,7 @@ function haystack(spec: NodeSpec): string[] {
   ].map(normalized)
 }
 
-/** Stable finder ordering: title/kind matches lead secondary metadata matches; a connection
+/** Stable operation-search ordering: title/kind matches lead secondary metadata matches; a connection
  * context promotes compatible specs but keeps every registered operation discoverable. */
 export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType): FinderResult[] {
   const q = normalized(query)
@@ -89,11 +89,11 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
 
   return createPortal(
     <div className="dp-modal-overlay fixed inset-0 z-[70] grid place-items-start bg-black/20 pt-[12vh]" onMouseDown={onClose}>
-      <section role="dialog" aria-modal="true" aria-label="Find a node" className="w-[min(620px,calc(100vw-32px))] overflow-hidden rounded-xl border border-border bg-popover shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
+      <section role="dialog" aria-modal="true" aria-label="Add an operation" className="w-[min(620px,calc(100vw-32px))] overflow-hidden rounded-xl border border-border bg-popover shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
           <Icon name="search" size={16} style={{ color: color.text3 }} />
           <input ref={input} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown}
-            aria-label="Search nodes" placeholder="Search operations, ports, categories…"
+            aria-label="Search operations" placeholder="Search operations, ports, categories…"
             className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground" />
           {wire && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">accepts {wire}</span>}
           <kbd className="text-[10px] text-muted-foreground">Esc</kbd>
@@ -114,7 +114,7 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
           {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching node.</div>}
           {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
         </div>
-        <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to add</div>
+        <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to add operation</div>
       </section>
     </div>,
     document.body,

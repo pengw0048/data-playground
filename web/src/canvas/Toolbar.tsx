@@ -6,7 +6,9 @@ import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
+import type { CanvasNode } from '../types/graph'
 import { NodeFinder } from './NodeFinder'
+import { ExistingNodeLocator } from './ExistingNodeLocator'
 import { cn } from '@/lib/utils'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
@@ -18,13 +20,16 @@ const CATEGORY_LABEL: Record<Category, string> = {
 
 // Bottom toolbar — auto-populated from the node registry, grouped by category (FR-C2a).
 export function Toolbar() {
-  const { screenToFlowPosition } = useReactFlow()
+  const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
+  const doc = useStore((s) => s.doc)
   const addNode = useStore((s) => s.addNode)
+  const select = useStore((s) => s.select)
   const setAgentOpen = useStore((s) => s.setAgentOpen)
   const agentOpen = useStore((s) => s.agentOpen)
   const canvasRole = useStore((s) => s.canvasRole)
   const [open, setOpen] = useState<Category | null>(null)
-  const [finderOpen, setFinderOpen] = useState(false)
+  const [operationFinderOpen, setOperationFinderOpen] = useState(false)
+  const [locatorOpen, setLocatorOpen] = useState(false)
 
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
@@ -34,7 +39,16 @@ export function Toolbar() {
     const pos = freePosition(useStore.getState().doc.nodes, { x: c.x - 116, y: c.y - 40 })
     addNode(kind, pos)
     setOpen(null)
-    setFinderOpen(false)
+    setOperationFinderOpen(false)
+  }
+
+  const locate = (id: string) => {
+    const node = useStore.getState().doc.nodes.find((candidate) => candidate.id === id)
+    if (!node) return
+    select(id)
+    const position = absolutePosition(useStore.getState().doc.nodes, node)
+    setCenter(position.x + 116, position.y + 72, { zoom: Math.max(0.8, Math.min(getZoom(), 1.3)), duration: 350 })
+    setLocatorOpen(false)
   }
 
   if (!roleCanEdit(canvasRole)) {
@@ -62,8 +76,15 @@ export function Toolbar() {
 
         <div className="mx-1 h-[22px] w-px bg-border" />
 
-        <Tooltip label="Find node">
-          <button aria-label="Find node" onClick={() => { setOpen(null); setFinderOpen(true) }}
+        <Tooltip label="Add operation">
+          <button aria-label="Add operation" onClick={() => { setOpen(null); setLocatorOpen(false); setOperationFinderOpen(true) }}
+            className="grid h-[34px] w-[38px] place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+            <Icon name="plus" size={16} />
+          </button>
+        </Tooltip>
+
+        <Tooltip label="Locate existing node">
+          <button aria-label="Locate existing node" onClick={() => { setOpen(null); setOperationFinderOpen(false); setLocatorOpen(true) }}
             className="grid h-[34px] w-[38px] place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
             <Icon name="search" size={16} />
           </button>
@@ -78,9 +99,27 @@ export function Toolbar() {
           <Icon name="sparkle" size={14} /> Agent
         </button>
       </div>
-      {finderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setFinderOpen(false)} />}
+      {operationFinderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setOperationFinderOpen(false)} />}
+      {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </div>
   )
+}
+
+function absolutePosition(nodes: CanvasNode[], node: CanvasNode): { x: number; y: number } {
+  const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
+  const seen = new Set<string>()
+  let current = node
+  let x = current.position.x
+  let y = current.position.y
+  while (current.parentId && !seen.has(current.parentId)) {
+    seen.add(current.parentId)
+    const parent = byId.get(current.parentId)
+    if (!parent) break
+    x += parent.position.x
+    y += parent.position.y
+    current = parent
+  }
+  return { x, y }
 }
 
 function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {

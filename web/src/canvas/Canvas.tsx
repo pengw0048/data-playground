@@ -167,9 +167,9 @@ export function Canvas() {
           // a section is a sized container; its contained nodes render inside it (parentId), clamped
           ...(n.type === 'section' ? { style: { width: SECTION_W, height: SECTION_H } } : {}),
           ...(n.parentId ? { parentId: n.parentId } : {}), // no extent:'parent' so a child can be dragged back out to detach
-          // React Flow owns `selected` while it drives selection (click/shift/box); preserve it
-          // across rebuilds so a mid-drag rubber-band isn't reset. New nodes seed from the store.
-          selected: p ? p.selected : sel.has(n.id),
+          // The store is the selection source of truth. This also keeps a programmatic selection
+          // (for example, locating an off-screen node) visibly selected in React Flow.
+          selected: sel.has(n.id),
           ...(p ? { measured: p.measured, width: p.width, height: p.height } : {}),
         }
       })
