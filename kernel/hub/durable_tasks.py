@@ -155,6 +155,8 @@ def recover(deps) -> None:
     recover_linear_checkpoints(deps)
     from hub.bounded_fanout_tasks import recover as recover_bounded_fanout
     recover_bounded_fanout(deps)
+    from hub.distribution_report_tasks import recover as recover_distribution_reports
+    recover_distribution_reports()
 
 
 def recovery_loop(deps, stop: threading.Event) -> None:
@@ -202,4 +204,7 @@ def retry(task_id: str, retry_request_id: str, deps) -> dict:
     elif task["task_kind"] == "bounded_fanout_write":
         from hub.bounded_fanout_tasks import dispatch as dispatch_fanout
         dispatch_fanout(task_id, deps)
+    elif task["task_kind"] == "distribution_report":
+        from hub.distribution_report_tasks import dispatch as dispatch_report
+        dispatch_report(task_id)
     return task

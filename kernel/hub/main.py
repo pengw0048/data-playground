@@ -48,7 +48,7 @@ from hub.api_errors import (
     api_error_response,
     classify_http_error,
 )
-from hub.routers import catalog, dataset_views, runs, workspace
+from hub.routers import catalog, dataset_views, distribution_reports, runs, workspace
 from hub.routers.runs import _status_or_lost
 from hub.security import current_user
 
@@ -407,6 +407,9 @@ app.include_router(workspace.public_router, prefix="/api", responses=API_ERROR_R
 _GATE = [Depends(current_user)]
 app.include_router(catalog.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 app.include_router(dataset_views.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
+app.include_router(
+    distribution_reports.router, prefix="/api", dependencies=_GATE,
+    responses=API_ERROR_RESPONSES)
 app.include_router(runs.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 

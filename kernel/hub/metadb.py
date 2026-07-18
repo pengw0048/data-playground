@@ -4317,6 +4317,8 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "durable_task_attempts_exhausted",
         "distribution_report_snapshot_invalid",
         "distribution_report_computation_failed",
+        "distribution_report_revision_unavailable",
+        "distribution_report_deadline",
     }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
@@ -5102,11 +5104,10 @@ def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None
                 if task is not None else None)
 
 
-def durable_task_auth(task_id: str) -> tuple[str, str] | None:
+def durable_task_auth(task_id: str) -> tuple[str, str | None] | None:
     with session() as s:
         row = s.execute(select(DurableTask.owner_id, DurableTask.canvas_id).where(
-            DurableTask.id == str(task_id),
-            DurableTask.canvas_id.is_not(None))).one_or_none()
+            DurableTask.id == str(task_id))).one_or_none()
         return tuple(row) if row is not None else None
 
 
@@ -7892,6 +7893,117 @@ def list_workspace_runs(
                 **({"checkpoint": checkpoint_view} if checkpoint_view is not None else {}),
                 **({"boundedFanout": fanout_view} if fanout_view is not None else {}),
             }))
+
+        # DatasetView reports are owner-scoped and deliberately have no Canvas. Project them through
+        # their own bounded query so the existing Canvas authorization join cannot fabricate one.
+        if not canvas_id and not node_id and (backend is None or backend == "local"):
+            report_identity = literal("d:") + DurableTask.id
+            report_predicates = [
+                DurableTask.owner_id == str(uid),
+                DurableTask.task_kind == "distribution_report",
+            ]
+            if run_id:
+                report_predicates.append(DurableTask.id == run_id)
+            if status:
+                report_predicates.append(DurableTask.status == status)
+            if recorded_after:
+                report_predicates.append(DurableTask.created_at >= recorded_after)
+            if recorded_before:
+                report_predicates.append(DurableTask.created_at <= recorded_before)
+            if normalized_text:
+                literal_text = normalized_text.replace(
+                    "\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                pattern = f"%{literal_text}%"
+                report_predicates.append(or_(
+                    func.lower(DurableTask.id).like(pattern, escape="\\"),
+                    func.lower(DistributionReportEnvelope.report_id).like(
+                        pattern, escape="\\"),
+                    func.lower(DistributionReportEnvelope.dataset_view_id).like(
+                        pattern, escape="\\"),
+                    func.lower(DistributionReportEnvelope.view_snapshot_doc).like(
+                        pattern, escape="\\"),
+                ))
+            if decoded:
+                stamp, identity = decoded
+                report_predicates.append(or_(
+                    DurableTask.created_at < stamp,
+                    and_(DurableTask.created_at == stamp, report_identity < identity),
+                ))
+            report_rows = s.execute(select(
+                DurableTask, DistributionReportEnvelope,
+            ).join(
+                DistributionReportEnvelope,
+                DistributionReportEnvelope.task_id == DurableTask.id,
+            ).where(*report_predicates).order_by(
+                DurableTask.created_at.desc(), DurableTask.id.desc(),
+            ).limit(fetch_limit)).all()
+            from hub.distribution_reports import DistributionReportDocumentV1
+            from hub.models import DatasetViewDefinitionV1
+            for task, envelope in report_rows:
+                task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
+                attempts = task_doc["attempts"]
+                latest = attempts[-1] if attempts else {
+                    "id": "missing", "attempt_number": task.retry_count + 1,
+                    "status": "failed", "progress": None, "error": task.error,
+                    "started_at": None, "completed_at": task.completed_at,
+                    "updated_at": task.updated_at,
+                }
+                view = DatasetViewDefinitionV1.model_validate_json(envelope.view_snapshot_doc)
+                report = (DistributionReportDocumentV1.model_validate_json(envelope.report_doc)
+                          if envelope.report_doc is not None else None)
+                coverage = (next(
+                    section for section in report.sections
+                    if section.kind == "coverage_schema") if report is not None else None)
+                created_at = task.created_at or _now()
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+                can_retry = (
+                    task.status in ("failed", "cancelled")
+                    and latest["attempt_number"] < task.max_attempts)
+                candidates.append(((created_at, f"d:{task.id}"), {
+                    "id": f"d:{task.id}", "runId": task.id, "requestId": None,
+                    "jobType": "distribution_report", "status": task.status,
+                    "targetNodeId": None, "targetPortId": None,
+                    "rows": report.measured_rows if report is not None else None,
+                    "ms": None, "progress": _workspace_progress(task.progress),
+                    "error": task.error, "inputManifest": None,
+                    "executionManifestSha256": None,
+                    "executionManifestReconstructable": False,
+                    "outputs": [], "profile": None, "perNode": None,
+                    "createdAt": created_at.isoformat(),
+                    "updatedAt": _workspace_utc_iso(task.updated_at),
+                    "canvasId": None, "canvasName": None,
+                    "nodeLabel": view.name, "backend": "local", "placement": "local",
+                    "attempt": latest["id"], "taskId": task.id,
+                    "taskAttempts": [{
+                        "id": item["id"], "attemptNumber": item["attempt_number"],
+                        "executionManifestSha256": None,
+                        "executionManifestReconstructable": False,
+                        "status": item["status"],
+                        "progress": _workspace_progress(item["progress"]),
+                        "error": item["error"],
+                        "startedAt": item["started_at"].isoformat()
+                        if item["started_at"] else None,
+                        "completedAt": item["completed_at"].isoformat()
+                        if item["completed_at"] else None,
+                        "updatedAt": _workspace_utc_iso(item["updated_at"]),
+                    } for item in attempts],
+                    "cancelRequested": task.cancel_requested,
+                    "canRetry": can_retry,
+                    "canCancel": task.status in ("queued", "running"),
+                    "writeIntent": None, "outputReceipt": None,
+                    "externalWait": None,
+                    "distributionReport": {
+                        "reportId": envelope.report_id,
+                        "datasetViewId": envelope.dataset_view_id,
+                        "computationVersion": envelope.computation_version,
+                        "measuredRows": report.measured_rows if report is not None else None,
+                        "complete": report.complete if report is not None else None,
+                        "reportedColumnCount": (
+                            coverage.reported_column_count if coverage is not None else None),
+                        "deepLink": f"/distribution-reports/{envelope.report_id}",
+                    },
+                }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]
     has_more = len(candidates) > limit
