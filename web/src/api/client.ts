@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  CanvasTransformReference, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
@@ -344,6 +344,13 @@ export const api = {
     req<PipelineImport>('/pipelines/import', {
       method: 'POST', body: JSON.stringify({ config, params }), signal: options?.signal,
     }),
+
+  nativeCanvasExport: (canvasId: string) =>
+    req<Record<string, unknown>>(`/canvas/${encodeURIComponent(canvasId)}/native-export`),
+  validateNativeCanvasImport: (body: { filename: string; importId: string; envelope: Record<string, unknown> }, options?: { signal?: AbortSignal }) =>
+    req<NativeCanvasValidation>('/canvas/native-import/validate', { method: 'POST', body: JSON.stringify(body), signal: options?.signal }),
+  importNativeCanvas: (body: { filename: string; importId: string; envelope: Record<string, unknown>; validationDigest: string; confirmWarnings: boolean }, options?: { signal?: AbortSignal }) =>
+    req<{ ok: boolean; id: string; created: boolean; replayed: boolean }>('/canvas/native-import', { method: 'POST', body: JSON.stringify(body), signal: options?.signal }),
 
   compile: (doc: CanvasDoc, targetNodeId?: string, parameterBindings?: CanvasParameterBinding[]) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }) }),

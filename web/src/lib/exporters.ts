@@ -101,8 +101,36 @@ export async function exportNode(id: string) {
   )
 }
 
-// Export the whole canvas as a portable JSON document (NFR-7).
-export function exportCanvas() {
-  const { doc } = useStore.getState()
-  download(`${doc.name || doc.id}.canvas.json`, JSON.stringify(doc, null, 2))
+// Export through the server so the file has a versioned native envelope and cannot leak local run
+// history or credential-bearing configuration from a raw client snapshot.
+export async function exportCanvas() {
+  const current = useStore.getState()
+  const currentDraft = current.localDrafts.find((draft) => draft.draftId === current.currentDraftId)
+  if (!current.kernelUp) {
+    current.pushToast('Native Canvas export is unavailable offline. Reconnect and wait for the Canvas to finish saving.', 'info')
+    return
+  }
+  if (current.currentDraftId) {
+    current.pushToast(
+      currentDraft?.syncState === 'syncing'
+        ? 'Wait for the local Canvas draft to finish syncing before exporting.'
+        : 'Resolve or retry the local Canvas draft and wait for it to sync before exporting.',
+      'info',
+    )
+    return
+  }
+  if (!current.saved) {
+    current.pushToast('Wait for the Canvas to finish saving before exporting.', 'info')
+    return
+  }
+  try {
+    const envelope = await api.nativeCanvasExport(current.doc.id)
+    const base = (current.doc.name || current.doc.id).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '') || 'canvas'
+    // Keep the downloaded representation within the same 2 MiB bound the server validated. Pretty
+    // whitespace could otherwise make a canonical, valid envelope impossible to import again.
+    download(`${base}.dp-canvas.json`, JSON.stringify(envelope))
+    current.pushToast('Exported native Canvas document.', 'success')
+  } catch (error) {
+    current.pushToast(error instanceof Error ? error.message : 'Native Canvas export failed.', 'error')
+  }
 }

@@ -21,6 +21,8 @@ import { crdtUndoActive } from '../collab/undo'
 import { resolvedTheme, toggleTheme } from '../theme/mode'
 import { KernelBadge } from './KernelBadge'
 import { CanvasDraftMenu } from './LocalDrafts'
+import { exportCanvas } from '../lib/exporters'
+import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -41,6 +43,7 @@ export function TopBar() {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
@@ -76,7 +79,7 @@ export function TopBar() {
   return (
     <>
       <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
+        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined)} className={cn('ml-0.5 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
@@ -105,6 +108,7 @@ export function TopBar() {
       {versionsOpen && <VersionHistoryModal onClose={() => setVersionsOpen(false)} />}
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
       {importOpen && <ImportPipelineModal onClose={() => setImportOpen(false)} />}
+      {nativeImportOpen && <NativeCanvasImportModal onClose={() => setNativeImportOpen(false)} />}
     </>
   )
 }
@@ -130,9 +134,10 @@ function PeerAvatars() {
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
-function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void }) {
+function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void }) {
   const setView = useStore((s) => s.setView)
   const newFile = useStore((s) => s.newFile)
+  const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
@@ -145,9 +150,11 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport }: { onS
       <DropdownMenuContent align="start" className="w-[210px]">
         <DropdownMenuItem onSelect={() => setView('workspace')}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
+        <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
+        <DropdownMenuItem data-testid="import-native-canvas" onSelect={() => setTimeout(onNativeImport)}><Icon name="import" size={14} /> Import native Canvas…</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
-        <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>
+        {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>

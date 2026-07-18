@@ -167,6 +167,7 @@ jobs:
           hub/tests/test_run_identity.py
           hub/tests/test_object_lifecycle.py
           hub/tests/test_workspace_storage.py
+          hub/tests/test_native_canvas.py
       - name: Verify promoted Transform versions on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60

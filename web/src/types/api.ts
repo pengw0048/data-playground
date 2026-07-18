@@ -26,6 +26,27 @@ export interface KernelInfo {
   backends: BackendInfo[]
 }
 
+export interface NativeCanvasDiagnostic {
+  code: string
+  severity: 'error' | 'warning'
+  message: string
+  path?: string
+}
+
+export interface NativeCanvasValidation {
+  name: string
+  nodeCount: number
+  edgeCount: number
+  requirements: string[]
+  parameters: unknown[]
+  diagnostics: NativeCanvasDiagnostic[]
+  canImport: boolean
+  requiresConfirmation: boolean
+  // Issued by validation and bound to the exact envelope. Import must return it so a
+  // confirmation cannot be replayed against a file that was never checked.
+  validationDigest: string
+}
+
 export interface RelationCacheStats {
   entries: number
   bytes: number

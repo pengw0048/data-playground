@@ -3499,6 +3499,274 @@
         "title": "MkdirRequest",
         "type": "object"
       },
+      "NativeCanvasDataReference": {
+        "additionalProperties": false,
+        "properties": {
+          "intent": {
+            "additionalProperties": true,
+            "title": "Intent",
+            "type": "object"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "intent"
+        ],
+        "title": "NativeCanvasDataReference",
+        "type": "object"
+      },
+      "NativeCanvasDescriptorSnapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "core": {
+            "additionalProperties": true,
+            "title": "Core",
+            "type": "object"
+          },
+          "nodes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "plugins": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Plugins",
+            "type": "array"
+          }
+        },
+        "required": [
+          "core",
+          "nodes",
+          "plugins"
+        ],
+        "title": "NativeCanvasDescriptorSnapshot",
+        "type": "object"
+      },
+      "NativeCanvasDiagnosticResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "severity": {
+            "enum": [
+              "error",
+              "warning"
+            ],
+            "title": "Severity",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "message"
+        ],
+        "title": "NativeCanvasDiagnosticResponse",
+        "type": "object"
+      },
+      "NativeCanvasEnvelopeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "canvas": {
+            "additionalProperties": true,
+            "title": "Canvas",
+            "type": "object"
+          },
+          "dataReferences": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCanvasDataReference"
+            },
+            "title": "Datareferences",
+            "type": "array"
+          },
+          "descriptors": {
+            "$ref": "#/components/schemas/NativeCanvasDescriptorSnapshot"
+          },
+          "format": {
+            "const": "dataplay.native-canvas",
+            "title": "Format",
+            "type": "string"
+          },
+          "libraryProcessors": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCanvasLibraryProcessor"
+            },
+            "title": "Libraryprocessors",
+            "type": "array"
+          },
+          "version": {
+            "const": 1,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "format",
+          "version",
+          "canvas",
+          "descriptors",
+          "dataReferences",
+          "libraryProcessors"
+        ],
+        "title": "NativeCanvasEnvelopeResponse",
+        "type": "object"
+      },
+      "NativeCanvasImportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "ok": {
+            "const": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "replayed": {
+            "title": "Replayed",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "id",
+          "created",
+          "replayed"
+        ],
+        "title": "NativeCanvasImportResponse",
+        "type": "object"
+      },
+      "NativeCanvasLibraryProcessor": {
+        "additionalProperties": false,
+        "properties": {
+          "descriptor": {
+            "additionalProperties": true,
+            "title": "Descriptor",
+            "type": "object"
+          },
+          "nodeId": {
+            "title": "Nodeid",
+            "type": "string"
+          },
+          "processor": {
+            "title": "Processor",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "nodeId",
+          "processor",
+          "version",
+          "descriptor"
+        ],
+        "title": "NativeCanvasLibraryProcessor",
+        "type": "object"
+      },
+      "NativeCanvasValidationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "canImport": {
+            "title": "Canimport",
+            "type": "boolean"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCanvasDiagnosticResponse"
+            },
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "edgeCount": {
+            "minimum": 0.0,
+            "title": "Edgecount",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "nodeCount": {
+            "minimum": 0.0,
+            "title": "Nodecount",
+            "type": "integer"
+          },
+          "parameters": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Parameters",
+            "type": "array"
+          },
+          "requirements": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirements",
+            "type": "array"
+          },
+          "requiresConfirmation": {
+            "title": "Requiresconfirmation",
+            "type": "boolean"
+          },
+          "validationDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Validationdigest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "nodeCount",
+          "edgeCount",
+          "requirements",
+          "parameters",
+          "diagnostics",
+          "canImport",
+          "requiresConfirmation",
+          "validationDigest"
+        ],
+        "title": "NativeCanvasValidationResponse",
+        "type": "object"
+      },
       "ParameterBinding": {
         "additionalProperties": false,
         "properties": {
@@ -8993,6 +9261,495 @@
         "summary": "Create Canvas"
       }
     },
+    "/api/canvas/native-import": {
+      "post": {
+        "description": "Atomically create one new owner Canvas, with a deterministic replay identity per import UUID.",
+        "operationId": "import_native_canvas_api_canvas_native_import_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$defs": {
+                  "NativeCanvasDataReference": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "intent": {
+                        "additionalProperties": true,
+                        "title": "Intent",
+                        "type": "object"
+                      },
+                      "nodeId": {
+                        "title": "Nodeid",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "nodeId",
+                      "intent"
+                    ],
+                    "title": "NativeCanvasDataReference",
+                    "type": "object"
+                  },
+                  "NativeCanvasDescriptorSnapshot": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "core": {
+                        "additionalProperties": true,
+                        "title": "Core",
+                        "type": "object"
+                      },
+                      "nodes": {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "title": "Nodes",
+                        "type": "array"
+                      },
+                      "plugins": {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "title": "Plugins",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "core",
+                      "nodes",
+                      "plugins"
+                    ],
+                    "title": "NativeCanvasDescriptorSnapshot",
+                    "type": "object"
+                  },
+                  "NativeCanvasEnvelopeResponse": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "canvas": {
+                        "additionalProperties": true,
+                        "title": "Canvas",
+                        "type": "object"
+                      },
+                      "dataReferences": {
+                        "items": {
+                          "$ref": "#/$defs/NativeCanvasDataReference"
+                        },
+                        "title": "Datareferences",
+                        "type": "array"
+                      },
+                      "descriptors": {
+                        "$ref": "#/$defs/NativeCanvasDescriptorSnapshot"
+                      },
+                      "format": {
+                        "const": "dataplay.native-canvas",
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "libraryProcessors": {
+                        "items": {
+                          "$ref": "#/$defs/NativeCanvasLibraryProcessor"
+                        },
+                        "title": "Libraryprocessors",
+                        "type": "array"
+                      },
+                      "version": {
+                        "const": 1,
+                        "title": "Version",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "version",
+                      "canvas",
+                      "descriptors",
+                      "dataReferences",
+                      "libraryProcessors"
+                    ],
+                    "title": "NativeCanvasEnvelopeResponse",
+                    "type": "object"
+                  },
+                  "NativeCanvasLibraryProcessor": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "descriptor": {
+                        "additionalProperties": true,
+                        "title": "Descriptor",
+                        "type": "object"
+                      },
+                      "nodeId": {
+                        "title": "Nodeid",
+                        "type": "string"
+                      },
+                      "processor": {
+                        "title": "Processor",
+                        "type": "string"
+                      },
+                      "version": {
+                        "title": "Version",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "nodeId",
+                      "processor",
+                      "version",
+                      "descriptor"
+                    ],
+                    "title": "NativeCanvasLibraryProcessor",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "confirmWarnings": {
+                    "title": "Confirmwarnings",
+                    "type": "boolean"
+                  },
+                  "envelope": {
+                    "$ref": "#/$defs/NativeCanvasEnvelopeResponse"
+                  },
+                  "filename": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "title": "Filename",
+                    "type": "string"
+                  },
+                  "importId": {
+                    "format": "uuid",
+                    "title": "Importid",
+                    "type": "string"
+                  },
+                  "validationDigest": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "pattern": "^[0-9a-f]{64}$",
+                    "title": "Validationdigest",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "filename",
+                  "importId",
+                  "envelope",
+                  "validationDigest",
+                  "confirmWarnings"
+                ],
+                "title": "NativeCanvasImportRequestSchema",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeCanvasImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Import Native Canvas"
+      }
+    },
+    "/api/canvas/native-import/validate": {
+      "post": {
+        "description": "Parse and diagnose a selected native file without creating a Canvas.",
+        "operationId": "validate_native_canvas_import_api_canvas_native_import_validate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$defs": {
+                  "NativeCanvasDataReference": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "intent": {
+                        "additionalProperties": true,
+                        "title": "Intent",
+                        "type": "object"
+                      },
+                      "nodeId": {
+                        "title": "Nodeid",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "nodeId",
+                      "intent"
+                    ],
+                    "title": "NativeCanvasDataReference",
+                    "type": "object"
+                  },
+                  "NativeCanvasDescriptorSnapshot": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "core": {
+                        "additionalProperties": true,
+                        "title": "Core",
+                        "type": "object"
+                      },
+                      "nodes": {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "title": "Nodes",
+                        "type": "array"
+                      },
+                      "plugins": {
+                        "items": {
+                          "additionalProperties": true,
+                          "type": "object"
+                        },
+                        "title": "Plugins",
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "core",
+                      "nodes",
+                      "plugins"
+                    ],
+                    "title": "NativeCanvasDescriptorSnapshot",
+                    "type": "object"
+                  },
+                  "NativeCanvasEnvelopeResponse": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "canvas": {
+                        "additionalProperties": true,
+                        "title": "Canvas",
+                        "type": "object"
+                      },
+                      "dataReferences": {
+                        "items": {
+                          "$ref": "#/$defs/NativeCanvasDataReference"
+                        },
+                        "title": "Datareferences",
+                        "type": "array"
+                      },
+                      "descriptors": {
+                        "$ref": "#/$defs/NativeCanvasDescriptorSnapshot"
+                      },
+                      "format": {
+                        "const": "dataplay.native-canvas",
+                        "title": "Format",
+                        "type": "string"
+                      },
+                      "libraryProcessors": {
+                        "items": {
+                          "$ref": "#/$defs/NativeCanvasLibraryProcessor"
+                        },
+                        "title": "Libraryprocessors",
+                        "type": "array"
+                      },
+                      "version": {
+                        "const": 1,
+                        "title": "Version",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "format",
+                      "version",
+                      "canvas",
+                      "descriptors",
+                      "dataReferences",
+                      "libraryProcessors"
+                    ],
+                    "title": "NativeCanvasEnvelopeResponse",
+                    "type": "object"
+                  },
+                  "NativeCanvasLibraryProcessor": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "descriptor": {
+                        "additionalProperties": true,
+                        "title": "Descriptor",
+                        "type": "object"
+                      },
+                      "nodeId": {
+                        "title": "Nodeid",
+                        "type": "string"
+                      },
+                      "processor": {
+                        "title": "Processor",
+                        "type": "string"
+                      },
+                      "version": {
+                        "title": "Version",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "nodeId",
+                      "processor",
+                      "version",
+                      "descriptor"
+                    ],
+                    "title": "NativeCanvasLibraryProcessor",
+                    "type": "object"
+                  }
+                },
+                "additionalProperties": false,
+                "properties": {
+                  "envelope": {
+                    "$ref": "#/$defs/NativeCanvasEnvelopeResponse"
+                  },
+                  "filename": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "title": "Filename",
+                    "type": "string"
+                  },
+                  "importId": {
+                    "format": "uuid",
+                    "title": "Importid",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "filename",
+                  "importId",
+                  "envelope"
+                ],
+                "title": "NativeCanvasValidateRequestSchema",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeCanvasValidationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Validate Native Canvas Import"
+      }
+    },
     "/api/canvas/{canvas_id}": {
       "delete": {
         "operationId": "delete_canvas_api_canvas__canvas_id__delete",
@@ -9519,6 +10276,88 @@
           }
         },
         "summary": "Canvas Kernel Restart"
+      }
+    },
+    "/api/canvas/{canvas_id}/native-export": {
+      "get": {
+        "description": "Download a readable, bounded native Canvas document.  Viewers may export what they can read.",
+        "operationId": "export_native_canvas_api_canvas__canvas_id__native_export_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeCanvasEnvelopeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Export Native Canvas"
       }
     },
     "/api/canvas/{canvas_id}/profile-jobs": {

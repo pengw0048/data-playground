@@ -8,6 +8,7 @@ import re
 import secrets
 from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from hub.deps import CORE_API_VERSION
 from hub.models import Graph, WriteIntent
@@ -25,22 +26,72 @@ _SENSITIVE_KEY = re.compile(
     r"credential|credentials|authorization|cookie)(?:$|[_-])",
     re.IGNORECASE,
 )
+_URI_CREDENTIAL_KEYS = frozenset({
+    "api_key", "apikey", "password", "passwd", "secret", "client_secret",
+    "clientsecret", "credential", "credentials", "authorization", "sig",
+})
+_URI_CREDENTIAL_SUFFIXES = ("token", "signature", "credential", "credentials")
+
+
+def _is_uri_credential_key(raw_key: str) -> bool:
+    """Recognize standard credential query keys with linear-time string operations."""
+    normalized = raw_key.casefold().replace("-", "_")
+    return (
+        normalized in _URI_CREDENTIAL_KEYS
+        or normalized.endswith(_URI_CREDENTIAL_SUFFIXES)
+    )
 
 
 class ExecutionManifestError(ValueError):
     """The submitted definition cannot cross the durable manifest boundary."""
 
 
-def _core_version() -> str:
+def core_package_version() -> str:
     try:
         return package_version("data-playground")
     except PackageNotFoundError:
         return "0.1.0"
 
 
-def _assert_secret_free(value: Any, path: tuple[str, ...] = ()) -> None:
-    from hub.secrets import is_secret_ref
+def assert_secret_free(
+    value: Any,
+    path: tuple[str, ...] = (),
+    *,
+    allow_secret_refs: bool = True,
+) -> None:
+    """Reject material credentials at the shared durable/export boundary."""
+    from hub.secrets import is_registered_secret_ref, is_secret_ref
 
+    if isinstance(value, str):
+        if not allow_secret_refs and is_registered_secret_ref(value):
+            raise ExecutionManifestError(
+                "execution manifest cannot retain a SecretRef at "
+                f"{'.'.join(path)}")
+        if "://" in value or value.startswith(("file:", "git+", "ssh:")):
+            try:
+                parsed = urlsplit(value)
+                # Accessing ``port`` also rejects malformed bracketed authorities deterministically.
+                _ = parsed.port
+            except ValueError as exc:
+                raise ExecutionManifestError(
+                    f"execution manifest contains an invalid URI at {'.'.join(path)}") from exc
+            if parsed.username is not None or parsed.password is not None:
+                raise ExecutionManifestError(
+                    "execution manifest cannot retain URI credentials at "
+                    f"{'.'.join(path)}")
+            query_parts = [parsed.query]
+            if parsed.fragment:
+                # OAuth-style credentials commonly live directly in the fragment. Router fragments
+                # may put their query after ``?``, so inspect that portion as query data too.
+                query_parts.append(parsed.fragment.split("?", 1)[-1])
+            if any(
+                raw_value not in (None, "") and _is_uri_credential_key(raw_key)
+                for part in query_parts
+                for raw_key, raw_value in parse_qsl(part, keep_blank_values=True)
+            ):
+                raise ExecutionManifestError(
+                    "execution manifest cannot retain URI credential material at "
+                    f"{'.'.join(path)}")
     if isinstance(value, dict):
         for raw_key, child in value.items():
             key = str(raw_key)
@@ -62,16 +113,19 @@ def _assert_secret_free(value: Any, path: tuple[str, ...] = ()) -> None:
                     raise ExecutionManifestError(
                         "execution manifest cannot retain sensitive field "
                         f"{'.'.join((*path, key))}")
-            _assert_secret_free(child, (*path, key))
+            assert_secret_free(
+                child, (*path, key), allow_secret_refs=allow_secret_refs)
             if key == "documentJson" and isinstance(child, str):
                 try:
                     document = json.loads(child)
                 except (TypeError, ValueError):
                     continue
-                _assert_secret_free(document, (*path, key))
+                assert_secret_free(
+                    document, (*path, key), allow_secret_refs=allow_secret_refs)
     elif isinstance(value, list):
         for index, child in enumerate(value):
-            _assert_secret_free(child, (*path, str(index)))
+            assert_secret_free(
+                child, (*path, str(index)), allow_secret_refs=allow_secret_refs)
 
 
 def _canonical_graph(
@@ -156,7 +210,8 @@ def _canonical_inputs(items: list[dict[str, str]] | None) -> list[dict[str, str]
     return result
 
 
-def _descriptor_snapshot(graph: Graph, deps) -> dict[str, Any]:
+def descriptor_snapshot(graph: Graph, deps) -> dict[str, Any]:
+    """Return the one canonical core/node/plugin compatibility identity."""
     from hub.nodespecs import BUILTIN_NODE_SPECS
 
     builtin = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
@@ -207,7 +262,7 @@ def _descriptor_snapshot(graph: Graph, deps) -> dict[str, Any]:
             "source": str(entry.get("source") or "unknown"),
         })
     return {
-        "core": {"apiVersion": CORE_API_VERSION, "packageVersion": _core_version()},
+        "core": {"apiVersion": CORE_API_VERSION, "packageVersion": core_package_version()},
         "nodes": nodes,
         "plugins": plugins,
     }
@@ -246,11 +301,11 @@ def build_execution_manifest(
             write_intent.model_dump(by_alias=True, mode="json")
             if write_intent is not None else None
         ),
-        "descriptors": _descriptor_snapshot(graph, deps),
+        "descriptors": descriptor_snapshot(graph, deps),
     }
     if graph._parameter_bindings:
         doc["parameters"] = graph._parameter_bindings
-    _assert_secret_free(doc)
+    assert_secret_free(doc)
     payload = json.dumps(
         doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     )
@@ -292,7 +347,7 @@ def validate_execution_manifest(sha256: str, payload: str) -> dict[str, Any]:
             if canonical_item["name"] in names:
                 raise ExecutionManifestError("execution manifest parameters are invalid")
             names.add(canonical_item["name"])
-    _assert_secret_free(doc)
+    assert_secret_free(doc)
     observed = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     if not secrets.compare_digest(observed, sha256):
         raise ExecutionManifestError("execution manifest digest does not match its document")

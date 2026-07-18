@@ -2762,6 +2762,10 @@ class WorkspaceTransformUnavailable(RuntimeError):
     """An exact Transform disappeared between admission and the atomic write."""
 
 
+class NativeCanvasImportConflict(RuntimeError):
+    """One owner/import UUID is already bound to different normalized import intent."""
+
+
 class WorkspaceNameConflict(ValueError):
     """A sibling container already owns the requested display name."""
 
@@ -3077,6 +3081,53 @@ def _workspace_ensure_root_placement_in_session(
         raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
     s.execute(dialect_insert(WorkspacePlacement).values(**values).on_conflict_do_nothing(
         index_elements=[WorkspacePlacement.target_kind, WorkspacePlacement.target_id]))
+
+
+def import_native_canvas(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str) -> bool:
+    """Insert one exact native import or verify an equivalent concurrent/retry winner."""
+    if re.fullmatch(r"[0-9a-f]{64}", str(intent_digest)) is None:
+        raise ValueError("native Canvas intent digest is invalid")
+    stored_doc = {
+        **doc,
+        "_nativeImport": {"intentDigest": str(intent_digest)},
+    }
+    canonical_doc = json.dumps(
+        stored_doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    values = {
+        "id": str(canvas_id), "owner_id": str(uid),
+        "name": str(doc.get("name") or "untitled"), "version": 1,
+        "doc": canonical_doc,
+    }
+    with session() as s:
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+            raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+        inserted = s.scalar(dialect_insert(Canvas).values(**values).on_conflict_do_nothing(
+            index_elements=[Canvas.id]).returning(Canvas.id))
+        if inserted is None:
+            existing = s.get(Canvas, str(canvas_id), with_for_update=True)
+            if existing is None:  # pragma: no cover - winner is visible after conflict handling
+                raise RuntimeError("native Canvas import conflict winner is unavailable")
+            try:
+                existing_doc = json.loads(existing.doc)
+            except (TypeError, ValueError) as exc:
+                raise NativeCanvasImportConflict(
+                    "native Canvas import id is already bound to invalid content") from exc
+            if (existing.owner_id != str(uid) or existing.version != 1
+                    or existing.name != values["name"] or existing_doc != stored_doc):
+                raise NativeCanvasImportConflict(
+                    "native Canvas import id is already bound to different import intent")
+            return False
+        sync_local_result_owner(s, "canvas", str(canvas_id), stored_doc)
+        _replace_promoted_transform_refs(s, "canvas", str(canvas_id), stored_doc)
+        _workspace_ensure_root_placement_in_session(
+            s, target_kind="canvas", target_id=str(canvas_id), name=values["name"])
+        return True
 
 
 def _workspace_follow_target_name_in_session(

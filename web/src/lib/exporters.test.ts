@@ -1,9 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const apiMocks = vi.hoisted(() => ({ preview: vi.fn() }))
+const apiMocks = vi.hoisted(() => ({ preview: vi.fn(), nativeCanvasExport: vi.fn() }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
-    get: (_target, property) => property === 'preview' ? apiMocks.preview : vi.fn(async () => ({})),
+    get: (_target, property) => property === 'preview'
+      ? apiMocks.preview
+      : property === 'nativeCanvasExport'
+        ? apiMocks.nativeCanvasExport
+        : vi.fn(async () => ({})),
   }),
   KernelError: class KernelError extends Error {
     status: number
@@ -12,7 +16,7 @@ vi.mock('../api/client', () => ({
   setApiUser: vi.fn(),
 }))
 
-import { exportNode } from './exporters'
+import { exportCanvas, exportNode } from './exporters'
 import { previewPlanIdentity, useStore, type PreviewState } from '../store/graph'
 import type { CanvasDoc, CanvasNode } from '../types/graph'
 import type { SampleResult } from '../types/api'
@@ -55,6 +59,7 @@ describe('node sample export freshness', () => {
 
   beforeEach(() => {
     apiMocks.preview.mockReset()
+    apiMocks.nativeCanvasExport.mockReset()
     downloads = []
     blobs = []
     Object.defineProperty(URL, 'createObjectURL', {
@@ -68,6 +73,7 @@ describe('node sample export freshness', () => {
     })
     useStore.setState({
       doc: pipeline(), previews: {}, toasts: [], selectedId: null, selectedIds: [], canvasRole: 'owner',
+      kernelUp: true, saved: true, currentDraftId: null, localDrafts: [],
     })
   })
 
@@ -220,5 +226,38 @@ describe('node sample export freshness', () => {
     await third
     expect(downloads).toHaveLength(4)
     expect(useStore.getState().toasts.filter((toast) => /Exported preview sample/.test(toast.msg))).toHaveLength(2)
+  })
+
+  it('downloads a compact native envelope that stays within the server import bound', async () => {
+    const envelope = { schemaVersion: 1, canvas: { name: 'test', nodes: [], edges: [] } }
+    apiMocks.nativeCanvasExport.mockResolvedValue(envelope)
+
+    await exportCanvas()
+
+    expect(apiMocks.nativeCanvasExport).toHaveBeenCalledWith('canvas')
+    expect(downloads).toEqual(['test.dp-canvas.json'])
+    expect(await blobs[0].text()).toBe(JSON.stringify(envelope))
+    expect(await blobs[0].text()).not.toContain('\n')
+  })
+
+  it.each([
+    ['offline', { kernelUp: false }, /reconnect/i],
+    ['still saving', { saved: false }, /finish saving/i],
+    ['syncing a local draft', {
+      currentDraftId: 'canvas',
+      localDrafts: [{ draftId: 'canvas', syncState: 'syncing' }],
+    }, /finish syncing/i],
+    ['a local draft needing attention', {
+      currentDraftId: 'canvas',
+      localDrafts: [{ draftId: 'canvas', syncState: 'error' }],
+    }, /resolve or retry/i],
+  ])('does not export a stale server snapshot while %s', async (_label, patch, message) => {
+    useStore.setState(patch as never)
+
+    await exportCanvas()
+
+    expect(apiMocks.nativeCanvasExport).not.toHaveBeenCalled()
+    expect(downloads).toEqual([])
+    expect(useStore.getState().toasts.at(-1)?.msg).toMatch(message)
   })
 })
