@@ -37,6 +37,13 @@ async function fresh(page: Page) {
   await expect(page.locator('.react-flow__node')).toHaveCount(0)
 }
 
+async function enablePipelineImporter(page: Page) {
+  await page.route('**/api/kernel', (route) => route.fulfill({ json: {
+    mode: 'local', backend: 'e2e', warm: false, version: 'test', adapters: [], runners: [], processors: [],
+    capabilities: ['pipeline-importer'], capabilityViews: [], backends: [],
+  } }))
+}
+
 // Workspace is bounded. Follow load-more pages before selecting a named dataset.
 async function openWorkspaceDataset(page: Page, name: string) {
   await (await workspaceResource(page, 'dataset', name)).click()
@@ -412,7 +419,29 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(0) // a new file is a fresh canvas
   })
 
+  test('native Canvas upload validates and creates a separate Canvas while the optional foreign importer stays hidden', async ({ page }) => {
+    await fresh(page)
+    const original = await page.evaluate(() => location.hash)
+    const canvasId = decodeURIComponent(original.split('/').pop()!)
+    const exported = await page.request.get(`/api/canvas/${canvasId}/native-export`)
+    expect(exported.ok()).toBe(true)
+    const envelope = await exported.json()
+
+    await page.getByTestId('app-menu').click()
+    await expect(page.getByTestId('import-pipeline')).toHaveCount(0)
+    await page.getByTestId('import-native-canvas').click()
+    await page.locator('input[type="file"]').setInputFiles({
+      name: 'round-trip.dp-canvas.json', mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(envelope)),
+    })
+    await expect(page.getByText(/0 nodes · 0 connections/)).toBeVisible()
+    await page.getByRole('button', { name: 'Import as new Canvas' }).click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
+    await expect(page.getByRole('heading', { name: 'Import native Canvas' })).toBeHidden()
+  })
+
   test('pipeline import lands a returned graph on its newly created canvas', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     const previous = await page.evaluate(() => location.hash)
     await page.route('**/api/pipelines/import', (route) => route.fulfill({
@@ -437,6 +466,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('a rejected import destination preserves the active canvas', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     const current = await page.evaluate(() => location.hash)
@@ -467,6 +497,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('navigation cancels a pending pipeline importer without creating or navigating to a canvas', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     let destinationPosts = 0
@@ -517,6 +548,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('an import destination ID collision never activates or deletes the existing canvas', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     const current = await page.evaluate(() => location.hash)
@@ -568,6 +600,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('Cancel during destination creation cleans up a committed remote draft and preserves the canvas', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     const current = await page.evaluate(() => location.hash)
@@ -625,6 +658,7 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('Cancel retains a recoverable remote draft when the create response is lost', async ({ page }) => {
+    await enablePipelineImporter(page)
     await fresh(page)
     await addNode(page, 'Shape', 'filter')
     const current = await page.evaluate(() => location.hash)

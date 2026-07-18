@@ -25,6 +25,7 @@ dependencies = [
     "pyarrow>=17",
     "polars>=1.9",
     "pydantic>=2.9",
+    "packaging>=24",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "filelock>=3.16",

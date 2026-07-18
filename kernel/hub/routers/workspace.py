@@ -10,7 +10,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
-from typing import Callable, Hashable, Literal, TypeVar
+from typing import Any, Callable, Hashable, Literal, TypeVar
+from uuid import UUID
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Path, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -19,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
-from hub import auth, auth_admission, metadb, workspace_providers
+from hub import auth, auth_admission, metadb, native_canvas, workspace_providers
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
 from hub.deps import get_deps
 from hub.models import (
@@ -44,6 +45,7 @@ from hub.security import RequestIdentity, current_identity, current_user
 router = APIRouter()
 public_router = APIRouter()
 _T = TypeVar("_T")
+_NativeBodyT = TypeVar("_NativeBodyT", bound="NativeCanvasValidateBody")
 MAX_AUTH_USER_ID_BYTES = 128
 MAX_AUTH_USER_PROFILE_FIELD_BYTES = 1024
 MAX_SETTING_KEY_BYTES = 512
@@ -434,6 +436,123 @@ class WorkspaceMoveCanvasBody(_StrictAuthBody):
     expected_version: int = Field(ge=1)
 
 
+class NativeCanvasValidateBody(_StrictAuthBody):
+    filename: str = Field(min_length=1, max_length=256)
+    import_id: UUID = Field(alias="importId", strict=False)
+    envelope: dict[str, Any]
+
+
+class NativeCanvasImportBody(NativeCanvasValidateBody):
+    validation_digest: str = Field(
+        alias="validationDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirm_warnings: bool = Field(alias="confirmWarnings")
+
+
+class NativeCanvasDescriptorSnapshot(_StrictAuthBody):
+    core: dict[str, Any]
+    nodes: list[dict[str, Any]]
+    plugins: list[dict[str, Any]]
+
+
+class NativeCanvasDataReference(_StrictAuthBody):
+    node_id: str = Field(alias="nodeId")
+    intent: dict[str, Any]
+
+
+class NativeCanvasLibraryProcessor(_StrictAuthBody):
+    node_id: str = Field(alias="nodeId")
+    processor: str
+    version: str
+    descriptor: dict[str, Any]
+
+
+class NativeCanvasEnvelopeResponse(_StrictAuthBody):
+    format: Literal["dataplay.native-canvas"]
+    version: Literal[1]
+    canvas: dict[str, Any]
+    descriptors: NativeCanvasDescriptorSnapshot
+    data_references: list[NativeCanvasDataReference] = Field(alias="dataReferences")
+    library_processors: list[NativeCanvasLibraryProcessor] = Field(alias="libraryProcessors")
+
+
+class NativeCanvasValidateRequestSchema(_StrictAuthBody):
+    filename: str = Field(min_length=1, max_length=256)
+    import_id: UUID = Field(alias="importId", strict=False)
+    envelope: NativeCanvasEnvelopeResponse
+
+
+class NativeCanvasImportRequestSchema(NativeCanvasValidateRequestSchema):
+    validation_digest: str = Field(
+        alias="validationDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirm_warnings: bool = Field(alias="confirmWarnings")
+
+
+class NativeCanvasDiagnosticResponse(_StrictAuthBody):
+    code: str
+    severity: Literal["error", "warning"]
+    message: str
+    path: str | None = None
+
+
+class NativeCanvasValidationResponse(_StrictAuthBody):
+    name: str
+    node_count: int = Field(alias="nodeCount", ge=0)
+    edge_count: int = Field(alias="edgeCount", ge=0)
+    requirements: list[str]
+    parameters: list[dict[str, Any]]
+    diagnostics: list[NativeCanvasDiagnosticResponse]
+    can_import: bool = Field(alias="canImport")
+    requires_confirmation: bool = Field(alias="requiresConfirmation")
+    validation_digest: str = Field(
+        alias="validationDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class NativeCanvasImportResponse(_StrictAuthBody):
+    ok: Literal[True]
+    id: str
+    created: bool
+    replayed: bool
+
+
+def _native_request_openapi(model: type[BaseModel]) -> dict[str, Any]:
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": model.model_json_schema()}},
+        },
+    }
+
+
+def _native_import_body(
+        raw: bytes, model: type[_NativeBodyT]) -> _NativeBodyT:
+    # JSON is decoded only after this cap.  The envelope cap below is separate so wrapper fields
+    # cannot use the import endpoint as an oversized generic JSON ingress.
+    if len(raw) > native_canvas.MAX_REQUEST_BYTES:
+        raise APIError(413, "native Canvas file exceeds the 2 MiB limit",
+                       code=APIErrorCode.PAYLOAD_TOO_LARGE, retryable=False)
+    try:
+        value = json.loads(raw)
+        body = model.model_validate(value)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise APIError(422, "native Canvas request is invalid",
+                       code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
+    if native_canvas.canonical_size(body.envelope) > native_canvas.MAX_BYTES:
+        raise APIError(413, "native Canvas file exceeds the 2 MiB limit",
+                       code=APIErrorCode.PAYLOAD_TOO_LARGE, retryable=False)
+    return body
+
+
+def _native_parse(
+        body: NativeCanvasValidateBody, uid: str,
+) -> tuple[dict, list[native_canvas.Diagnostic]]:
+    try:
+        parsed = native_canvas.parse_envelope(body.envelope, filename=body.filename)
+    except native_canvas.NativeCanvasError as exc:
+        raise APIError(422, str(exc), code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
+    deps = get_deps()
+    return parsed, native_canvas.diagnostics(parsed, deps, uid)
+
+
 def _workspace_action_error(exc: Exception) -> None:
     if isinstance(exc, KeyError):
         raise HTTPException(404, str(exc)) from exc
@@ -693,6 +812,79 @@ def move_workspace_canvas(placement_id: str, body: WorkspaceMoveCanvasBody,
 @router.get("/canvas")
 def list_canvases(uid: str = Depends(current_user)) -> list[dict]:
     return metadb.list_canvases_for(uid)  # owned + shared + workspace-visible
+
+
+@router.get(
+    "/canvas/{canvas_id}/native-export",
+    response_model=NativeCanvasEnvelopeResponse,
+)
+def export_native_canvas(canvas_id: str, uid: str = Depends(current_user)) -> JSONResponse:
+    """Download a readable, bounded native Canvas document.  Viewers may export what they can read."""
+    if metadb.canvas_role(canvas_id, uid) is None:
+        raise APIError(404, f"canvas '{canvas_id}' not found", code=APIErrorCode.CANVAS_NOT_FOUND,
+                       retryable=False)
+    with metadb.session() as s:
+        row = s.get(metadb.Canvas, canvas_id)
+        if row is None:  # role was revoked/deleted after the first check
+            raise APIError(404, f"canvas '{canvas_id}' not found", code=APIErrorCode.CANVAS_NOT_FOUND,
+                           retryable=False)
+        try:
+            envelope = native_canvas.export_envelope(json.loads(row.doc), get_deps())
+        except native_canvas.NativeCanvasError as exc:
+            raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+    filename = native_canvas.filename_for(str(envelope["canvas"]["name"]))
+    return JSONResponse(
+        content=envelope,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/canvas/native-import/validate",
+    response_model=NativeCanvasValidationResponse,
+    openapi_extra=_native_request_openapi(NativeCanvasValidateRequestSchema),
+)
+async def validate_native_canvas_import(request: Request,
+                                        uid: str = Depends(current_user)) -> dict:
+    """Parse and diagnose a selected native file without creating a Canvas."""
+    body = _native_import_body(await request.body(), NativeCanvasValidateBody)
+    parsed, diagnostics = _native_parse(body, uid)
+    return native_canvas.summary(parsed, diagnostics)
+
+
+@router.post(
+    "/canvas/native-import",
+    response_model=NativeCanvasImportResponse,
+    openapi_extra=_native_request_openapi(NativeCanvasImportRequestSchema),
+)
+async def import_native_canvas(request: Request, uid: str = Depends(current_user)) -> dict:
+    """Atomically create one new owner Canvas, with a deterministic replay identity per import UUID."""
+    body = _native_import_body(await request.body(), NativeCanvasImportBody)
+    parsed, diagnostics = _native_parse(body, uid)
+    if not native_canvas.validation_digest_matches(
+            body.validation_digest, parsed, diagnostics):
+        raise APIError(
+            409, "native Canvas validation digest does not match; validate this exact file again",
+            code=APIErrorCode.CONFLICT, retryable=False)
+    if any(item.severity == "error" for item in diagnostics):
+        raise APIError(409, "native Canvas has blocking compatibility diagnostics; validate and fix them first",
+                       code=APIErrorCode.CONFLICT, retryable=False)
+    if any(item.severity == "warning" for item in diagnostics) and not body.confirm_warnings:
+        raise APIError(409, "native Canvas has warnings; confirm them before creating a new Canvas",
+                       code=APIErrorCode.CONFLICT, retryable=False)
+    canvas_id = native_canvas.import_canvas_id(uid, str(body.import_id))
+    doc = {**parsed["canvas"], "id": canvas_id, "version": 1}
+    try:
+        metadb.require_promoted_transform_use(uid, doc)
+    except PermissionError as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+    try:
+        created = metadb.import_native_canvas(
+            uid=uid, canvas_id=canvas_id, doc=doc,
+            intent_digest=native_canvas.import_intent_digest(parsed))
+    except metadb.NativeCanvasImportConflict as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+    return {"ok": True, "id": canvas_id, "created": created, "replayed": not created}
 
 
 def _validate_canvas_execution_contract(doc: dict) -> None:
