@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from hub import metadb
 from hub.main import app
-from hub.plugins.adapters import DuckDBAdapter
+from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import dataset_views as dataset_view_routes
 from hub.storage import LocalStorage
@@ -93,6 +93,13 @@ def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_pat
         assert definition["sampleProvenance"] is None
         assert len(definition["semanticSha256"]) == len(definition["definitionSha256"]) == 64
         view_id = definition["id"]
+        capabilities = client.get(
+            f"/api/catalog/tables/{_table['id']}/revisions/capabilities")
+        assert capabilities.status_code == 200
+        assert capabilities.json()["datasetViewSave"] is True
+        assert dataset_view_routes.supports_dataset_view_source(uri, LanceAdapter()) is True
+        assert dataset_view_routes.supports_dataset_view_source(
+            "s3://example/remote.lance", LanceAdapter()) is False
 
         # Moving the provider head cannot change an exact DatasetView replay.
         lance.write_dataset(
@@ -204,6 +211,24 @@ def test_reservoir_is_deterministic_and_invalid_draft_does_not_claim_submission(
         })
         assert changed_population.status_code == 201
         assert changed_population.json()["semanticSha256"] != definition["semanticSha256"]
+
+        maximum_seed = client.post("/api/dataset-views", json={
+            **request,
+            "submissionId": uuid.uuid4().hex,
+            "sampling": {"kind": "reservoir", "size": 10, "seed": 2_147_483_647},
+        })
+        assert maximum_seed.status_code == 201, maximum_seed.text
+        assert client.post(
+            f"/api/dataset-views/{maximum_seed.json()['id']}/preview").status_code == 200
+        rejected_submission = uuid.uuid4().hex
+        above_maximum = client.post("/api/dataset-views", json={
+            **request,
+            "submissionId": rejected_submission,
+            "sampling": {"kind": "reservoir", "size": 10, "seed": 2_147_483_648},
+        })
+        assert above_maximum.status_code == 422
+        assert metadb.dataset_view_submission(
+            metadb.DEFAULT_USER_ID, rejected_submission) is None
 
 
 def test_core_revision_hold_is_installed_and_released_with_view(
@@ -353,3 +378,10 @@ def test_concurrent_same_submission_has_one_atomic_winner(tmp_path):
             metadb.WorkspacePlacement.target_kind == "dataset_view",
             metadb.WorkspacePlacement.target_id == results[0][0]["id"],
         )))) == 1
+
+
+def test_dataset_view_openapi_documents_create_and_replay_responses():
+    responses = app.openapi()["paths"]["/api/dataset-views"]["post"]["responses"]
+    expected = {"$ref": "#/components/schemas/DatasetViewDefinitionV1"}
+    assert responses["200"]["content"]["application/json"]["schema"] == expected
+    assert responses["201"]["content"]["application/json"]["schema"] == expected

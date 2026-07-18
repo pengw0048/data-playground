@@ -36,6 +36,7 @@ from hub.plugins.adapters import (
     revision_adapter_for_uri,
 )
 from hub.plugins.importer import ImporterNotConfigured
+from hub.routers.dataset_views import supports_dataset_view_source
 from hub.sampling import provenance_for_dataset
 from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
@@ -389,7 +390,11 @@ def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> Da
                            retention_owner=getattr(adapter, "retention_owner", "provider"))
 
 
-def _revision_capabilities(adapter: DatasetRevisionAdapter) -> DatasetRevisionCapabilities:
+def _revision_capabilities(
+    adapter: DatasetRevisionAdapter,
+    *,
+    dataset_view_save: bool = False,
+) -> DatasetRevisionCapabilities:
     advertised = set(getattr(adapter, "revision_selectors", ()))
     selectors = [selector for selector in ("exact", "latest", "as_of")
                  if selector in advertised]
@@ -402,6 +407,7 @@ def _revision_capabilities(adapter: DatasetRevisionAdapter) -> DatasetRevisionCa
     return DatasetRevisionCapabilities(
         selectors=selectors, as_of_ordering=ordering if "as_of" in selectors else None,
         timezone=timezone if "as_of" in selectors else None,
+        dataset_view_save=dataset_view_save,
     )
 
 
@@ -477,7 +483,11 @@ def resolve_dataset_revision(table_id: str,
 def dataset_revision_capabilities(table_id: str) -> DatasetRevisionCapabilities:
     """Expose only provider-declared revision selectors and portable ordering semantics."""
     table, _binding = _revision_binding_for_table(table_id)
-    return _revision_capabilities(_revision_adapter(table.uri))
+    adapter = _revision_adapter(table.uri)
+    return _revision_capabilities(
+        adapter,
+        dataset_view_save=supports_dataset_view_source(table.uri, adapter),
+    )
 
 
 @router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionDetail)

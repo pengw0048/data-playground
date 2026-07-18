@@ -899,6 +899,11 @@
             ],
             "title": "Asofordering"
           },
+          "datasetViewSave": {
+            "default": false,
+            "title": "Datasetviewsave",
+            "type": "boolean"
+          },
           "selectors": {
             "items": {
               "enum": [
@@ -1531,7 +1536,7 @@
             "type": "string"
           },
           "seed": {
-            "maximum": 9007199254740991.0,
+            "maximum": 2147483647.0,
             "minimum": 0.0,
             "title": "Seed",
             "type": "integer"
@@ -13091,6 +13096,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetViewDefinitionV1"
+                }
+              }
+            },
+            "description": "Identical submission replayed from its immutable definition."
+          },
           "201": {
             "content": {
               "application/json": {

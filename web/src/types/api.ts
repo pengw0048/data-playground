@@ -92,6 +92,7 @@ export interface DatasetRevisionCapabilities {
   selectors: Array<'exact' | 'latest' | 'as_of'>
   asOfOrdering?: 'latest_committed_at_at_or_before' | null
   timezone?: 'UTC' | null
+  datasetViewSave: boolean
 }
 
 export interface DatasetRevisionSummary {

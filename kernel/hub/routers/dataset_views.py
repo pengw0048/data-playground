@@ -55,6 +55,20 @@ class _DatasetViewUnsupported(ValueError):
     pass
 
 
+def supports_dataset_view_source(uri: str, adapter: object) -> bool:
+    """Return the exact server-owned capability advertised by the Catalog UI."""
+    try:
+        local = paths.local_path(uri)
+    except ValueError:
+        return False
+    return (
+        local is not None
+        and isinstance(adapter, DatasetRevisionAdapter)
+        and "exact" in set(getattr(adapter, "revision_selectors", ()))
+        and getattr(adapter, "retention_owner", "provider") in {"core", "provider"}
+    )
+
+
 def _canonical_sha256(value: object) -> str:
     payload = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -108,12 +122,11 @@ def _open_exact(ref: ExactDatasetRef, *, operation: str) -> Iterator[_ExactSourc
     if binding is None or binding["dataset_id"] != ref.dataset_id:
         raise RevisionUnavailable("revision_unavailable")
     uri = str(binding["uri"])
-    if paths.local_path(uri) is None:
-        raise _DatasetViewUnsupported(
-            "DatasetViews currently support registered local revision providers only")
     adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
-    if not isinstance(adapter, DatasetRevisionAdapter):
-        raise _DatasetViewUnsupported("the source does not provide exact revision reads")
+    if not supports_dataset_view_source(uri, adapter):
+        raise _DatasetViewUnsupported(
+            "DatasetViews currently support advertised local exact revision providers only")
+    assert isinstance(adapter, DatasetRevisionAdapter)
     retention_owner = str(getattr(adapter, "retention_owner", "provider"))
     if retention_owner not in {"core", "provider"}:
         raise _DatasetViewUnsupported("the source does not declare a durable revision owner")
@@ -237,7 +250,17 @@ def _map_dataset_view_error(exc: Exception) -> APIError:
     raise exc
 
 
-@router.post("/dataset-views", response_model=DatasetViewDefinitionV1, status_code=201)
+@router.post(
+    "/dataset-views",
+    response_model=DatasetViewDefinitionV1,
+    status_code=201,
+    responses={
+        200: {
+            "model": DatasetViewDefinitionV1,
+            "description": "Identical submission replayed from its immutable definition.",
+        },
+    },
+)
 def create_dataset_view(
     request: DatasetViewCreateRequest,
     response: Response,

@@ -181,6 +181,7 @@ def test_lance_as_of_resolution_is_inclusive_bounded_and_advertised(tmp_path):
     assert capabilities.json() == {
         "selectors": ["exact", "latest", "as_of"],
         "asOfOrdering": "latest_committed_at_at_or_before", "timezone": "UTC",
+        "datasetViewSave": True,
     }
 
     boundary = client.get(

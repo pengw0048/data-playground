@@ -9,6 +9,7 @@ import type {
 import { Icon } from '../ui/Icon'
 
 const PAGE_SIZE = 20
+const MAX_RESERVOIR_SEED = 2_147_483_647
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const statusOf = (error: unknown) => error instanceof KernelError ? error.status
   : typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined
@@ -51,17 +52,23 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
   const [detailError, setDetailError] = useState<string | null>(null)
   const [parentError, setParentError] = useState<string | null>(null)
   const [saveDetail, setSaveDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [canSaveView, setCanSaveView] = useState(false)
   const historyRequest = useRef(0)
   const detailRequest = useRef(0)
 
   const loadFirst = useCallback(async () => {
     const request = ++historyRequest.current
-    setAvailability('checking'); setHistoryError(null); setLoadMoreError(null)
+    setAvailability('checking'); setHistoryError(null); setLoadMoreError(null); setCanSaveView(false)
+    const capabilities = api.datasetRevisionCapabilities(table.id).catch(() => null)
     try {
       const page = await api.datasetRevisions(table.id, { limit: PAGE_SIZE })
       if (request !== historyRequest.current) return
       setItems(page.items); setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
       setAvailability('supported')
+      const advertised = await capabilities
+      if (request === historyRequest.current) {
+        setCanSaveView(advertised?.datasetViewSave === true)
+      }
     } catch (error) {
       if (request !== historyRequest.current) return
       const status = statusOf(error)
@@ -152,7 +159,7 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
       {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
-        onSave={setSaveDetail} />}
+        canSave={canSaveView} onSave={setSaveDetail} />}
     </>}
     {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
   </section>
@@ -164,9 +171,10 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
   </div>
 }
 
-function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, onSave }: {
+function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
+  canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
@@ -181,10 +189,10 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
       <div className="text-[9.5px] text-muted-foreground">Dataset {detail.datasetId} · {timestamp(detail.committedAt)} · retained by {detail.retentionOwner}</div>
       <div className="text-[9.5px] text-muted-foreground">Parent {detail.parentRevisionId ?? 'not evidenced'} · producer {detail.producerOperation ?? 'not provided'}</div>
       </div>
-      <button type="button" onClick={() => onSave(detail)}
+      {canSave && <button type="button" onClick={() => onSave(detail)}
         className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
         Save view
-      </button>
+      </button>}
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
@@ -252,6 +260,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
 }) {
   const pushToast = useStore((state) => state.pushToast)
   const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
+  const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
   const columns = detail.preview.columns.map((column) => column.name)
   const [name, setName] = useState(`${table.name} view`)
   const [selected, setSelected] = useState(columns)
@@ -277,8 +286,8 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
     const sampleSeed = Number(seed)
     if (!normalizedName || !selected.length || busy) return
     if (sampling === 'reservoir' && (!Number.isInteger(sampleSize) || sampleSize < 1 || sampleSize > 100_000
-      || !Number.isSafeInteger(sampleSeed) || sampleSeed < 0)) {
-      setError('Reservoir size must be 1–100,000 and seed must be a non-negative safe integer.')
+      || !Number.isInteger(sampleSeed) || sampleSeed < 0 || sampleSeed > MAX_RESERVOIR_SEED)) {
+      setError('Reservoir size must be 1–100,000 and seed must be between 0 and 2,147,483,647.')
       return
     }
     const fingerprint = JSON.stringify({
@@ -312,6 +321,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
       submission.current = { fingerprint: '', id: '' }
       pushToast(`Saved “${created.name}” beside its source in Workspace`, 'success')
       onClose()
+      switchWorkspaceScope('all')
       setWorkspaceResource(`dataset_view:${created.id}`)
     } catch (caught) {
       if (request === generation.current) setError(errorMessage(caught))
@@ -357,7 +367,7 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
               <span className="min-w-0 flex-1"><strong>Deterministic reservoir</strong><span className="block text-[10px] text-muted-foreground">Saving scans the complete filtered local revision to establish evidence. Each preview replays that full scan; the rows are not materialized.</span>
                 {sampling === 'reservoir' && <span className="mt-2 grid grid-cols-2 gap-2">
                   <label className="grid gap-1 text-[10px] text-muted-foreground">Rows<input aria-label="Reservoir rows" type="number" min="1" max="100000" value={size} onChange={(event) => setSize(event.target.value)} className="dp-input text-foreground" /></label>
-                  <label className="grid gap-1 text-[10px] text-muted-foreground">Seed<input aria-label="Reservoir seed" type="number" min="0" value={seed} onChange={(event) => setSeed(event.target.value)} className="dp-input text-foreground" /></label>
+                  <label className="grid gap-1 text-[10px] text-muted-foreground">Seed<input aria-label="Reservoir seed" type="number" min="0" max={MAX_RESERVOIR_SEED} value={seed} onChange={(event) => setSeed(event.target.value)} className="dp-input text-foreground" /></label>
                 </span>}
               </span></label>
           </fieldset>

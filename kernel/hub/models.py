@@ -231,6 +231,7 @@ class DatasetRevisionCapabilities(Wire):
     selectors: list[Literal["exact", "latest", "as_of"]]
     as_of_ordering: Literal["latest_committed_at_at_or_before"] | None = None
     timezone: Literal["UTC"] | None = None
+    dataset_view_save: bool = False
 
 
 class DatasetRevisionSummary(Wire):
@@ -844,7 +845,8 @@ class DatasetViewReservoirSampling(Wire):
 
     kind: Literal["reservoir"] = "reservoir"
     size: int = Field(ge=1, le=100_000)
-    seed: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    # DuckDB 1.5.x parses the reservoir seed as a signed 32-bit integer.
+    seed: int = Field(ge=0, le=2_147_483_647)
 
 
 DatasetViewSampling = Annotated[

@@ -2,8 +2,14 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from '../types/api'
 
-const mocks = vi.hoisted(() => ({ datasetRevisions: vi.fn(), datasetRevision: vi.fn(), createDatasetView: vi.fn() }))
-const store = vi.hoisted(() => ({ pushToast: vi.fn(), setWorkspaceResource: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
+  createDatasetView: vi.fn(),
+}))
+const store = vi.hoisted(() => ({
+  pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
+  workspaceScope: 'datasets' as 'all' | 'datasets', workspaceResourceId: 'dataset:table-1' as string | null,
+}))
 vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
@@ -14,6 +20,7 @@ vi.mock('../api/client', () => ({
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
 import { KernelError } from '../api/client'
+import { parseHash, routeHash } from '../router'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 
 const TABLE: CatalogTable = { id: 'table-1', name: 'orders', uri: 'lance:///orders', columns: [] }
@@ -38,9 +45,9 @@ const VIEW: DatasetViewDefinition = {
   placement: { containerId: 'workspace-local-root', placementId: 'placement-view-1', sourceRegistrationId: 'table-1' },
   selectedColumns: ['amount'],
   predicate: null,
-  sampling: { kind: 'reservoir', size: 1000, seed: 42 },
+  sampling: { kind: 'reservoir', size: 1000, seed: 2_147_483_647 },
   sampleProvenance: {
-    strategy: 'reservoir', seed: 42, requestedRows: 1000, scannedRows: 2, returnedRows: 2,
+    strategy: 'reservoir', seed: 2_147_483_647, requestedRows: 1000, scannedRows: 2, returnedRows: 2,
     totalRows: 2, datasetIdentity: 'dataset-stable', datasetRevision: 'rev-2', identity: 'sample-identity', limitations: [],
   },
   retentionOwner: 'provider',
@@ -50,8 +57,22 @@ const VIEW: DatasetViewDefinition = {
 }
 
 describe('DatasetRevisionHistory', () => {
-  beforeEach(() => { vi.clearAllMocks() })
-  afterEach(() => cleanup())
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null, datasetViewSave: true,
+    })
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:table-1'
+    store.switchWorkspaceScope.mockImplementation((scope: 'all' | 'datasets') => {
+      store.workspaceScope = scope
+      store.workspaceResourceId = null
+    })
+    store.setWorkspaceResource.mockImplementation((resourceId: string | null) => {
+      store.workspaceResourceId = resourceId
+    })
+  })
+  afterEach(() => { cleanup(); window.location.hash = '' })
 
   it('hides the entry point when the provider lacks the capability', async () => {
     mocks.datasetRevisions.mockRejectedValue(new KernelError(501, 'history unavailable'))
@@ -125,6 +146,19 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
   })
 
+  it('hides Save view when the server does not advertise local exact DatasetView support', async () => {
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null, datasetViewSave: false,
+    })
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-2')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-2'))
+    render(<DatasetRevisionHistory table={TABLE} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-2' }))
+    expect(await screen.findByText('Exact revision rev-2')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save view' })).toBeNull()
+  })
+
   it('keeps an in-flight exact save visible and reuses its submission identity on retry', async () => {
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-2')], nextCursor: null, hasMore: false })
     mocks.datasetRevision.mockResolvedValue(detail('rev-2'))
@@ -137,6 +171,7 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Save view' }))
     const dialog = await screen.findByRole('dialog', { name: 'Save exact revision as view' })
     fireEvent.click(within(dialog).getByRole('radio', { name: /Deterministic reservoir/ }))
+    fireEvent.change(within(dialog).getByLabelText('Reservoir seed'), { target: { value: '2147483647' } })
     expect(dialog).toHaveTextContent('Each preview replays that full scan; the rows are not materialized.')
     fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
 
@@ -155,9 +190,38 @@ describe('DatasetRevisionHistory', () => {
       name: 'orders view',
       datasetRef: { kind: 'exact', datasetId: 'dataset-stable', revisionId: 'rev-2' },
       selectedColumns: ['amount'],
-      sampling: { kind: 'reservoir', size: 1000, seed: 42 },
+      sampling: { kind: 'reservoir', size: 1000, seed: 2_147_483_647 },
     })
     await waitFor(() => expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset_view:view-1'))
+    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all')
+    expect(store.switchWorkspaceScope.mock.invocationCallOrder[0])
+      .toBeLessThan(store.setWorkspaceResource.mock.invocationCallOrder[0])
+    expect(store.workspaceScope).toBe('all')
+    expect(store.workspaceResourceId).toBe('dataset_view:view-1')
+    window.location.hash = routeHash(
+      'workspace', undefined, store.workspaceResourceId ?? undefined, undefined, undefined,
+      undefined, undefined, store.workspaceScope,
+    )
+    expect(parseHash()).toEqual({ view: 'workspace', workspaceResourceId: 'dataset_view:view-1' })
+    expect(window.location.hash).not.toContain('scope=datasets')
     expect(store.pushToast).toHaveBeenCalledWith('Saved “orders view” beside its source in Workspace', 'success')
+  })
+
+  it('rejects a reservoir seed above the DuckDB signed 32-bit contract', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-2')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-2'))
+    render(<DatasetRevisionHistory table={TABLE} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-2' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Save view' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Save exact revision as view' })
+    fireEvent.click(within(dialog).getByRole('radio', { name: /Deterministic reservoir/ }))
+    fireEvent.change(within(dialog).getByLabelText('Reservoir seed'), { target: { value: '2147483648' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(
+      'seed must be between 0 and 2,147,483,647',
+    )
+    expect(mocks.createDatasetView).not.toHaveBeenCalled()
   })
 })
