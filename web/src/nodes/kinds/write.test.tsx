@@ -53,6 +53,28 @@ describe('Write card — typed local mode truth', () => {
     expect(screen.queryByRole('option', { name: /create \/ replace/ })).not.toBeInTheDocument()
   })
 
+  it.each(['estimating', 'confirm', 'drift', 'running'] as const)(
+    'does not mint a competing admission while run intent is %s', async (phase) => {
+      const Write = getComponent('write')!
+      const data = useStore.getState().doc.nodes[0].data
+      render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
+
+      expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
+      await act(async () => {
+        useStore.setState({
+          runs: { write: {
+            phase, writeAdmission: undefined, writeSubmissionId: undefined,
+            writeAdmissionFingerprint: undefined,
+          } },
+        } as any)
+        await Promise.resolve()
+      })
+
+      expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
+      expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+    },
+  )
+
   it('re-admits after terminal cleanup without reusing the completed submission or polling', async () => {
     const doc = useStore.getState().doc
     const data = doc.nodes[0].data
