@@ -54,6 +54,8 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0021_manifest_output_owners", "0020_execution_manifests"),
+        ("0020_execution_manifests", "0019_exact_local_inputs"),
         ("0019_exact_local_inputs", "0018_bounded_fanout_write"),
         ("0018_bounded_fanout_write", "0017_linear_checkpoint_inbox"),
         ("0017_linear_checkpoint_inbox", "0016_bounded_fanout_plan"),
@@ -74,8 +76,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0019_exact_local_inputs"]
-    assert metadb.expected_schema_head() == "0019_exact_local_inputs"
+    assert scripts.get_heads() == ["0021_manifest_output_owners"]
+    assert metadb.expected_schema_head() == "0021_manifest_output_owners"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -144,6 +146,12 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0019_exact_local_inputs.py": (
             "624acded9fe082851227f5822d9343b371f91a6814424b77f74e2ec3ded56d35"
+        ),
+        "0020_execution_manifests.py": (
+            "3d4bf47d829ca8d1f1c4c6f3f41a0199e3d718a66f064a03c6e7be3f68e2ad22"
+        ),
+        "0021_manifest_output_owners.py": (
+            "07fbf7ebe8ff9434037a4450e563f97ce62f3efb9bb287787d6b927627deb887"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

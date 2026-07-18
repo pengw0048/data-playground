@@ -2536,6 +2536,20 @@
             ],
             "title": "Destinationversion"
           },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
+          },
           "factKey": {
             "maxLength": 512,
             "minLength": 1,
@@ -4208,6 +4222,25 @@
               }
             ],
             "title": "Error"
+          },
+          "executionManifestReconstructable": {
+            "default": false,
+            "title": "Executionmanifestreconstructable",
+            "type": "boolean"
+          },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
           },
           "id": {
             "title": "Id",
@@ -5980,6 +6013,25 @@
             ],
             "title": "Error"
           },
+          "executionManifestReconstructable": {
+            "default": false,
+            "title": "Executionmanifestreconstructable",
+            "type": "boolean"
+          },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
+          },
           "externalWait": {
             "anyOf": [
               {
@@ -6859,6 +6911,20 @@
             "default": true,
             "title": "Durable",
             "type": "boolean"
+          },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
           },
           "head": {
             "$ref": "#/components/schemas/DatasetRevision"

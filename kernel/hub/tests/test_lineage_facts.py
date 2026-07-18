@@ -96,7 +96,8 @@ def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
     assert set(fact) == {
         "id", "fact_key", "publication_key", "source_key", "source_uri", "source_version",
         "destination_key", "destination_uri", "destination_version",
-        "run_id", "attempt_id", "producer", "producer_version", "step_id",
+        "run_id", "execution_manifest_sha256", "attempt_id", "producer",
+        "producer_version", "step_id",
         "provenance", "field_mappings", "created_at",
     }
     assert isinstance(fact["id"], int) and fact["id"] > after_id

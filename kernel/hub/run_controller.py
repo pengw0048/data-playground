@@ -314,6 +314,14 @@ class RunController:
         status = RunStatus(run_id=run_id, status="queued", placement="distributed", per_node=per,
                            target_node_id=target, request_id=request_id,
                            outputs=[expected_output] if expected_output is not None else [])
+        # A graph-backed admission carrying an ExecutionManifest must make its first durable RunState
+        # reference before any region thread can allocate work. Later progress persistence remains
+        # best-effort through _emit; this one admission write is deliberately fail-closed.
+        if getattr(graph, "_execution_manifest_sha256", None) is not None:
+            if self.on_status is None:
+                raise RuntimeError(
+                    "distributed graph execution has no durable status callback")
+            self.on_status(graph, status)
         with self._lock:
             self.runs[run_id] = status
             self._published_statuses[run_id] = RunStatus.model_validate(status.model_dump())
