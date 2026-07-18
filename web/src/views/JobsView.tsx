@@ -160,6 +160,15 @@ export function JobsView() {
     next.delete('run'); next.delete('output')
     setJobsQuery(next.toString())
   }
+  const selectCanvas = (value: string) => {
+    const next = new URLSearchParams(params)
+    if (value) next.set('canvas', value); else next.delete('canvas')
+    // A node identity is scoped to its canvas. Do not leave an invisible stale node filter
+    // behind when choosing a different canvas (or returning to all accessible canvases).
+    next.delete('node')
+    next.delete('run'); next.delete('output')
+    setJobsQuery(next.toString())
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -177,7 +186,7 @@ export function JobsView() {
           <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             {STATUSES.map((value) => <option key={value} value={value}>{value || 'All states'}</option>)}
           </select></label>
-        <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={(value) => update('canvas', value)} />
+        <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Node
           <select aria-label="Filter jobs by node" value={nodeChoiceValue(params.get('canvas'), params.get('node'))} onChange={(event) => selectNode(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             <option value="">All nodes on loaded Jobs</option>

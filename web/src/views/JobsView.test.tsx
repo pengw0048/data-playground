@@ -99,6 +99,12 @@ describe('JobsView', () => {
       canvasId: 'canvas-2', nodeId: 'publish', limit: 50,
     }))
 
+    fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: 'canvas-1', nodeId: undefined, limit: 50,
+    })))
+
     fireEvent.change(screen.getByLabelText('Filter jobs by backend'), { target: { value: 'ray' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toContain('backend=ray'))
   })
