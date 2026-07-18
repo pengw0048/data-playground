@@ -374,14 +374,20 @@ def test_fresh_task_retries_one_lost_snapshot_mapping(tmp_path, monkeypatch):
 
 
 def _exercise_concurrent_ordinary_task_admission(tmp_path, monkeypatch):
-    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    deps, graph, source, uid = _ordinary_task_context(tmp_path)
     submission = str(uuid.uuid4())
     barrier = threading.Barrier(2)
     snapshot = local_run_inputs.snapshot_local_file_input
+    candidates: list[dict[str, str]] = []
+    candidate_lock = threading.Lock()
 
     def concurrent_snapshot(**kwargs):
         barrier.wait(timeout=5)
-        return snapshot(**kwargs)
+        result = snapshot(**kwargs)
+        if result[1] is not None:
+            with candidate_lock:
+                candidates.append(result[1])
+        return result
 
     monkeypatch.setattr(local_run_inputs, "snapshot_local_file_input", concurrent_snapshot)
     monkeypatch.setattr(durable_tasks, "dispatch", lambda *_args: None)
@@ -393,17 +399,30 @@ def _exercise_concurrent_ordinary_task_admission(tmp_path, monkeypatch):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         statuses = list(pool.map(submit, range(2)))
-    assert len({status.run_id for status in statuses}) == 1
+    assert statuses[0].model_dump() == statuses[1].model_dump()
     task = metadb.durable_task(statuses[0].run_id)
     assert task is not None and len(task["attempts"]) == 1
     with metadb.session() as session:
-        assert session.scalar(select(func.count()).select_from(
-            metadb.LocalResultReference).where(
-                metadb.LocalResultReference.owner_kind == "durable_task",
-                metadb.LocalResultReference.owner_key == task["id"])) == 1
+        refs = list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "durable_task",
+            metadb.LocalResultReference.owner_key == task["id"])))
+        assert len(refs) == 1
+        ref = refs[0]
+        artifact = session.get(metadb.LocalResultArtifact, ref.uri)
+        assert artifact is not None and artifact.state == "ready"
+        assert (artifact.writer_run_id, artifact.writer_token) == (None, None)
+        assert set(session.scalars(select(metadb.LocalResultArtifact.uri).where(
+            metadb.LocalResultArtifact.uri.in_({
+                candidate["artifact_uri"] for candidate in candidates
+            })))) == {ref.uri}
+    source.unlink()
+    assert pq.read_table(ref.uri)["value"].to_pylist() == [1, 2]
     assert metadb.request_durable_task_cancel(task["id"]) is not None
     assert metadb.claim_durable_task(task["id"], "cancel-concurrent") is None
     metadb.delete_canvas_cascade(str(graph.id))
+    assert _task_input_ref(task["id"]) is None
+    deps.storage.prune_results(limit=20)
+    assert metadb.local_file_input_revision_for_artifact(ref.uri) is None
     deps.storage.close()
 
 

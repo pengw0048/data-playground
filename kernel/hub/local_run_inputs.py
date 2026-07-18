@@ -167,8 +167,9 @@ def snapshot_local_file_input(
             if metadb.local_file_input_revision_artifact(dataset_id, revision_id) is not None:
                 abort(artifact_uri, writer_id)
                 return revision_id, None
-            relation = adapter.scan_local_snapshot(snapshot_path, uri, options=options)
-            adapter.write(artifact_uri, relation, mode="overwrite")
+            with db.base_guard():
+                relation = adapter.scan_local_snapshot(snapshot_path, uri, options=options)
+                adapter.write(artifact_uri, relation, mode="overwrite")
             commit(artifact_uri, writer_id)
     except LocalRunInputError:
         abort(artifact_uri, writer_id)
