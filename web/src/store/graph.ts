@@ -62,6 +62,10 @@ let _fileListGeneration = 0       // stale same-user list responses cannot overw
 let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
+// True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
+// still refreshes the browser cache, but must not PUT that presentation-only normalization back into
+// the authoritative canvas or create a misleading Version history snapshot.
+let _settlingLoadedDoc = false
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -2247,7 +2251,7 @@ export const useStore = create<Store>((set, get) => ({
           const doc = JSON.parse(saved) as CanvasDoc
           if (doc?.nodes) {
             const role = cachedRole(get().currentUser?.id, doc.id)
-            set({ doc, canvasRole: role, agentOpen: false })
+            get().loadDoc(doc, role)
           }
         }
       } catch { /* ignore corrupt state */ }
@@ -2537,19 +2541,27 @@ export const useStore = create<Store>((set, get) => ({
 
   loadDoc: (doc, role = get().canvasRole) => {
     _cfgEdit = { id: '', t: 0 }
-    const d = doc
+    // A canvas document is not execution authority. A queued/running badge saved in a snapshot can
+    // outlive its run, so settle it before the document is ever rendered. reattachRuns below may
+    // immediately replace these with the live run's authoritative per-node states.
+    const d = settleAnimatingDoc(doc)
     const agentLog = d.id === get().doc.id ? get().agentLog : []
-    set({
-      doc: d,
-      canvasRole: role,
-      accessDenied: false,
-      saved: true,
-      agentOpen: roleCanEdit(role) ? get().agentOpen : false,
-      // Agent requests are independent. A record from another canvas must never be displayed as
-      // context for this one (or suggest that it will be sent with a future request).
-      agentLog,
-      previews: {}, previewBindings: readPreviewBindings(get().currentUser?.id, d), runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
-    })
+    _settlingLoadedDoc = d !== doc
+    try {
+      set({
+        doc: d,
+        canvasRole: role,
+        accessDenied: false,
+        saved: true,
+        agentOpen: roleCanEdit(role) ? get().agentOpen : false,
+        // Agent requests are independent. A record from another canvas must never be displayed as
+        // context for this one (or suggest that it will be sent with a future request).
+        agentLog,
+        previews: {}, previewBindings: readPreviewBindings(get().currentUser?.id, d), runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+      })
+    } finally {
+      _settlingLoadedDoc = false
+    }
     reattachRuns(get, set, d.id)  // a run that outlived a hub restart on its kernel keeps animating here
     void get().ensureCanvasTables(d)  // warm the working set for this canvas's source nodes (on demand)
   },
@@ -2636,6 +2648,7 @@ useStore.subscribe((s) => {
   _cacheTimer = setTimeout(() => {
     try { localStorage.setItem(LS_KEY, JSON.stringify(useStore.getState().doc)) } catch { /* quota */ }
   }, 400)
+  if (_settlingLoadedDoc) return
   // a peer's edit was merged into our doc (via the CRDT) — the editing peer PUTs it, so we must NOT also
   // PUT it. Without this guard, N co-editors each write the whole doc on every edit (N-way amplification).
   // Local edits + local undo/redo (collabApply.remote === false) still PUT. (Cache above is unconditional.)
@@ -2747,14 +2760,22 @@ function cleanRunError(raw?: string | null): string {
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
 // a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
 // giving up because the kernel became unreachable. Without it an intermediate node animates forever.
+function settleAnimatingDoc(doc: CanvasDoc): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((n) => {
+    if (n.data.status === 'running' || n.data.status === 'queued') {
+      changed = true
+      return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
+    }
+    return n
+  })
+  return changed ? { ...doc, nodes } : doc
+}
+
 function settleAnimatingNodes(set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void) {
   set((s) => {
-    let changed = false
-    const nodes = s.doc.nodes.map((n) => {
-      if (n.data.status === 'running' || n.data.status === 'queued') { changed = true; return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } } }
-      return n
-    })
-    return changed ? { doc: { ...s.doc, nodes } } : {}
+    const doc = settleAnimatingDoc(s.doc)
+    return doc === s.doc ? {} : { doc }
   })
 }
 
@@ -2999,6 +3020,15 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
         return { runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }
       })
+      // active-runs is already the backend's current per-node execution authority. Apply it now
+      // rather than waiting for the first poll, so a real reattached run replaces the settled
+      // snapshot state without a stale visual gap.
+      if (current()) {
+        const targetReported = st.perNode?.some((item) => item.nodeId === nodeId)
+        applyPerNodeStatus(set, targetReported ? st.perNode : [
+          ...(st.perNode ?? []), { nodeId, status: st.status },
+        ])
+      }
       if (current()) pollRun(get, set, nodeId, st.runId, reattachGeneration)
     }
   }).catch(() => { /* profile projection may still recover; leave current state untouched */ })
