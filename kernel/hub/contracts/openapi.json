@@ -1536,12 +1536,17 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "updatedAt": {
+            "title": "Updatedat",
+            "type": "string"
           }
         },
         "required": [
           "id",
           "attemptNumber",
-          "status"
+          "status",
+          "updatedAt"
         ],
         "title": "DurableTaskAttemptView",
         "type": "object"
@@ -6087,6 +6092,19 @@
               }
             ]
           },
+          "progress": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
           "requestId": {
             "anyOf": [
               {
@@ -6174,6 +6192,17 @@
               }
             ],
             "title": "Taskid"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
           },
           "writeIntent": {
             "anyOf": [

@@ -143,6 +143,8 @@ def test_happy_path_materialize_publish_and_jobs(tmp_path):
     assert job["checkpoint"]["phase"] == "terminal"
     assert job["checkpoint"]["resumeEligible"] is False
     assert job["checkpoint"]["clientKey"] == f"checkpoint:{task_id}"
+    assert job["updatedAt"].endswith("+00:00")
+    assert job["taskAttempts"][-1]["updatedAt"].endswith("+00:00")
     assert job["canRetry"] is False
     assert "uri" not in (job["checkpoint"] or {})
     receipt = observed["output_receipt"]

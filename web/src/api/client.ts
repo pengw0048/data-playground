@@ -502,7 +502,7 @@ export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
 export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
-export interface DurableTaskAttemptDto { id: string; attemptNumber: number; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'fenced'; progress?: number | null; error?: string | null; startedAt?: string | null; completedAt?: string | null }
+export interface DurableTaskAttemptDto { id: string; attemptNumber: number; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'fenced'; progress?: number | null; error?: string | null; startedAt?: string | null; completedAt?: string | null; updatedAt: string }
 export interface ExternalWaitJobDto { providerKind: string; phase: 'unsubmitted' | 'submitting' | 'accepted' | 'running' | 'provider_succeeded' | 'downloading' | 'downloaded' | 'publishing' | 'published' | 'provider_failed' | 'provider_cancelled' | 'finalization_failed' | 'cancelled_before_submit' | 'cancelled_after_success'; attemptNumber: number; cancelRequested: boolean; canRetry: boolean; diagnosticCode?: string | null }
 export interface CheckpointJobDto {
   phase: 'pending' | 'materializing' | 'committed' | 'publishing' | 'terminal'
@@ -526,7 +526,7 @@ export interface BoundedFanoutJobDto {
   gather: 'pending' | 'running' | 'committed'
   diagnosticCode?: string | null
 }
-export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null }
+export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {

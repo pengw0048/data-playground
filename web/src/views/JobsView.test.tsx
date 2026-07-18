@@ -45,6 +45,8 @@ describe('JobsView', () => {
     expect(screen.queryByText('destination unavailable')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
+    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
+    expect(screen.getByText('Last durable update:').closest('div')).toHaveTextContent('Last durable update: Unavailable')
     expect(screen.getByRole('link', { name: 'Open canvas' })).toHaveAttribute('href', '#/canvas/canvas-1')
     expect(screen.getByRole('link', { name: 'Open node' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-1')
     expect(useStore.getState().jobsQuery).toContain('run=run-1')
@@ -152,8 +154,9 @@ describe('JobsView', () => {
   it('shows exact durable task state and requests cancellation from Jobs', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'task-1', taskId: 'task-1', status: 'running', error: null,
+      progress: 0.5, updatedAt: '2026-07-16T12:00:30Z',
       inputManifest: [{ node_id: 'source', dataset_id: 'dataset-1', revision_id: 'revision-7', provider: 'lance', resolved_at: '2026-07-16T12:00:00Z' }],
-      taskAttempts: [{ id: 'attempt-1', attemptNumber: 1, status: 'running', progress: 0.5, error: null, startedAt: '2026-07-16T12:00:00Z', completedAt: null }],
+      taskAttempts: [{ id: 'attempt-1', attemptNumber: 1, status: 'running', progress: 0.5, error: null, startedAt: '2026-07-16T12:00:00Z', completedAt: null, updatedAt: '2026-07-16T12:00:30Z' }],
       cancelRequested: false, canRetry: false,
       writeIntent: { mode: 'replace', destination: { name: 'durable', logicalUri: 'managed://durable', provider: 'managed-local-file' }, expectedHead: { revisionId: 'head-6' } },
     })], hasMore: false, nextCursor: null })
@@ -163,7 +166,9 @@ describe('JobsView', () => {
     }))
 
     expect(screen.getByText(/dataset-1@revision-7/)).toBeVisible()
-    expect(screen.getByText(/#1 running/)).toBeVisible()
+    expect(screen.getByText(/#1 running/).closest('li')).toHaveTextContent('Progress 50%')
+    expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: 50%')
+    expect(screen.getByText('Last durable update:').closest('div')).not.toHaveTextContent('Unavailable')
     expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
@@ -172,13 +177,18 @@ describe('JobsView', () => {
   it('reuses one retry action id after an ambiguous request failure', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'task-2', taskId: 'task-2', status: 'failed', canRetry: true,
-      taskAttempts: [{ id: 'attempt-1', attemptNumber: 1, status: 'failed', progress: null, error: 'worker lost', startedAt: null, completedAt: '2026-07-16T12:01:00Z' }],
+      taskAttempts: [
+        { id: 'attempt-1', attemptNumber: 1, status: 'fenced', progress: null, error: 'worker lost', startedAt: null, completedAt: '2026-07-16T12:01:00Z', updatedAt: '2026-07-16T12:01:00Z' },
+        { id: 'attempt-2', attemptNumber: 2, status: 'failed', progress: null, error: 'worker lost', startedAt: null, completedAt: '2026-07-16T12:02:00Z', updatedAt: '2026-07-16T12:02:00Z' },
+      ],
     })], hasMore: false, nextCursor: null })
     mocks.retryRun.mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce(undefined)
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run task-2 in Alpha research', expanded: false,
     }))
+    expect(screen.getByText(/#1 fenced/).closest('li')).toHaveTextContent('Progress Unavailable')
+    expect(screen.getByText(/#2 failed/).closest('li')).toHaveTextContent('Progress Unavailable')
     fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
     expect(await screen.findByText(/Job action failed: response lost/)).toBeVisible()
     const actionId = mocks.retryRun.mock.calls[0][1]
@@ -206,7 +216,32 @@ describe('JobsView', () => {
       name: 'Open run fan-1 in Alpha research', expanded: false,
     }))
     const fanout = screen.getByText('Fan-out:').closest('div')
-    expect(fanout).toHaveTextContent('Fan-out: running partitions · 2/4 partitions')
+    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Fan-out · running partitions')
+    expect(fanout).toHaveTextContent('Fan-out: 2/4 partitions · checkpoint reused · gather pending')
     expect(screen.queryByText(/unitId|planDigest|range/i)).not.toBeInTheDocument()
+  })
+
+  it('renders existing external-wait and checkpoint phases without inventing a generic phase', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [
+      job({
+        id: 'external-history', runId: 'external-1', taskId: 'external-1', status: 'running',
+        externalWait: { providerKind: 'fixture-local', phase: 'downloading', attemptNumber: 2, cancelRequested: false, canRetry: false },
+        taskAttempts: [{ id: 'external-attempt', attemptNumber: 2, status: 'running', progress: null, updatedAt: '2026-07-16T12:03:00Z' }],
+      }),
+      job({
+        id: 'checkpoint-history', runId: 'checkpoint-1', taskId: 'checkpoint-1', status: 'running',
+        checkpoint: { phase: 'materializing', checkpointNodeId: 'checkpoint', outputPortId: 'out', resumeEligible: false, clientKey: 'checkpoint:checkpoint-1' },
+        taskAttempts: [{ id: 'checkpoint-attempt', attemptNumber: 1, status: 'running', progress: null, updatedAt: '2026-07-16T12:04:00Z' }],
+      }),
+    ], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run external-1 in Alpha research', expanded: false }))
+    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: External wait · downloading')
+    expect(screen.getByText('External provider:').closest('div')).toHaveTextContent('fixture-local · provider attempt #2')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open run checkpoint-1 in Alpha research', expanded: false }))
+    expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Checkpoint · materializing')
+    expect(screen.getByText('Checkpoint:').closest('div')).toHaveTextContent('checkpoint:out')
   })
 })

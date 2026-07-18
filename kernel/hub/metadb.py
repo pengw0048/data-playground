@@ -4043,10 +4043,22 @@ def submit_durable_external_wait_task(
         return _durable_task_doc(s, task), True
 
 
-def _durable_task_doc(s, task: DurableTask, *, include_admission: bool = True) -> dict:
+def _durable_task_doc(
+        s, task: DurableTask, *, include_admission: bool = True,
+        include_attempt_updates: bool = False) -> dict:
     attempts = list(s.scalars(select(DurableTaskAttempt).where(
         DurableTaskAttempt.task_id == task.id,
     ).order_by(DurableTaskAttempt.attempt_number)))
+
+    def attempt_updated_at(attempt: DurableTaskAttempt) -> datetime.datetime:
+        timestamps = [item for item in (
+            attempt.created_at, attempt.started_at, attempt.heartbeat_at,
+            attempt.cancel_requested_at, attempt.completed_at,
+        ) if item is not None]
+        return max(timestamps, key=lambda item: (
+            item if item.tzinfo is not None
+            else item.replace(tzinfo=datetime.timezone.utc)
+        ).timestamp())
     doc = {
         "id": task.id, "owner_id": task.owner_id, "canvas_id": task.canvas_id,
         "submission_id": task.submission_id, "target_node_id": task.target_node_id,
@@ -4065,6 +4077,7 @@ def _durable_task_doc(s, task: DurableTask, *, include_admission: bool = True) -
             "lease_until": item.lease_until, "heartbeat_at": item.heartbeat_at,
             "progress": item.progress, "error": item.error,
             "started_at": item.started_at, "completed_at": item.completed_at,
+            **({"updated_at": attempt_updated_at(item)} if include_attempt_updates else {}),
             "output_receipt": json.loads(item.output_receipt) if item.output_receipt else None,
         } for item in attempts],
     }
@@ -5545,8 +5558,26 @@ def _workspace_run_cursor_decode(cursor: str | None) -> tuple[datetime.datetime,
     return created_at, identity
 
 
+def _workspace_utc_iso(value: datetime.datetime | None) -> str | None:
+    """Serialize one metadata timestamp without letting SQLite-naive UTC become browser-local."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc).isoformat()
+
+
+def _workspace_progress(value) -> float | None:
+    """Keep malformed legacy status documents from turning one Jobs page into a 500."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) and 0 <= result <= 1 else None
+
+
 def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
                        backend: str | None, backend_attempt: str | None,
+                       state_updated_at: datetime.datetime | None,
                        source: str) -> tuple[tuple[datetime.datetime, str], dict]:
     """Normalize terminal history and live state without inventing another lifecycle."""
     if source == "history":
@@ -5563,8 +5594,10 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
             "jobType": row.job_type, "status": row.status,
             "targetNodeId": row.target_node_id, "targetPortId": row.target_port_id,
             "rows": row.rows, "ms": row.ms, "error": row.error,
+            "progress": _workspace_progress((state_doc or {}).get("progress")),
             "inputManifest": input_manifest, "outputs": outputs, "profile": profile,
             "perNode": per_node, "createdAt": created_at.isoformat(),
+            "updatedAt": _workspace_utc_iso(state_updated_at),
         }
     else:
         assert state_doc is not None
@@ -5580,9 +5613,11 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
             "status": row.status, "targetNodeId": state_doc.get("target_node_id") or row.target_node_id,
             "targetPortId": state_doc.get("target_port_id") or row.target_port_id,
             "rows": state_doc.get("total_rows"), "ms": state_doc.get("ms"),
+            "progress": _workspace_progress(state_doc.get("progress")),
             "error": state_doc.get("error"), "inputManifest": None,
             "outputs": outputs, "profile": state_doc.get("profile"),
             "perNode": per_node or None, "createdAt": created_at.isoformat(),
+            "updatedAt": _workspace_utc_iso(state_updated_at),
         }
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=datetime.timezone.utc)
@@ -5820,7 +5855,7 @@ def list_workspace_runs(
             ))
         history_rows = s.execute(
             select(
-                RunRecord, Canvas.name, RunState.doc,
+                RunRecord, Canvas.name, RunState.doc, RunState.updated_at,
                 RunBackendJob.backend, RunBackendJob.attempt_id,
             )
             .join(Canvas, Canvas.id == RunRecord.canvas_id)
@@ -5832,11 +5867,12 @@ def list_workspace_runs(
             .where(*history_predicates)
             .order_by(RunRecord.created_at.desc(), RunRecord.id.desc()).limit(fetch_limit)
         ).all()
-        for row, name, raw_state, backend_name, backend_attempt in history_rows:
+        for row, name, raw_state, state_updated_at, backend_name, backend_attempt in history_rows:
             state_doc = json.loads(raw_state) if raw_state else None
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
-                backend=backend_name, backend_attempt=backend_attempt, source="history"))
+                backend=backend_name, backend_attempt=backend_attempt,
+                state_updated_at=state_updated_at, source="history"))
 
         state_identity = literal("s:") + RunState.run_id
         state_predicates = [
@@ -5892,7 +5928,8 @@ def list_workspace_runs(
                 raise RuntimeError("persisted run state is invalid") from exc
             candidates.append(_workspace_run_doc(
                 row, canvas_name=name, state_doc=state_doc,
-                backend=backend_name, backend_attempt=backend_attempt, source="state"))
+                backend=backend_name, backend_attempt=backend_attempt,
+                state_updated_at=row.updated_at, source="state"))
 
         task_identity = literal("t:") + DurableTask.id
         task_predicates = [
@@ -5941,7 +5978,7 @@ def list_workspace_runs(
             )).all()
         } if task_rows else {}
         for task, name, canvas_owner_id, canvas_visibility in task_rows:
-            task_doc = _durable_task_doc(s, task)
+            task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
             status_doc = task_doc["status_doc"]
             created_at = task.created_at or _now()
             if created_at.tzinfo is None:
@@ -5965,6 +6002,7 @@ def list_workspace_runs(
                 can_mutate and task.status in ("failed", "cancelled")
                 and latest["attempt_number"] < task.max_attempts)
             can_cancel = can_mutate and task.status in ("queued", "running")
+
             checkpoint_view = None
             fanout_view = None
             if task.task_kind == "linear_checkpoint_write":
@@ -5986,18 +6024,21 @@ def list_workspace_runs(
                 "jobType": "run", "status": task.status,
                 "targetNodeId": task.target_node_id, "targetPortId": None,
                 "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
+                "progress": _workspace_progress(task.progress),
                 "error": task.error, "inputManifest": task_doc["input_manifest"],
                 "outputs": outputs, "profile": None,
                 "perNode": per_node or None, "createdAt": created_at.isoformat(),
+                "updatedAt": _workspace_utc_iso(task.updated_at),
                 "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
                 "backend": "local", "placement": "local", "attempt": latest["id"],
                 "taskId": task.id,
                 "taskAttempts": [{
                     "id": item["id"], "attemptNumber": item["attempt_number"],
-                    "status": item["status"], "progress": item["progress"],
+                    "status": item["status"], "progress": _workspace_progress(item["progress"]),
                     "error": item["error"],
                     "startedAt": item["started_at"].isoformat() if item["started_at"] else None,
                     "completedAt": item["completed_at"].isoformat() if item["completed_at"] else None,
+                    "updatedAt": _workspace_utc_iso(item["updated_at"]),
                 } for item in attempts],
                 "cancelRequested": task.cancel_requested,
                 "canRetry": can_retry,

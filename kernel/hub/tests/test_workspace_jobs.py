@@ -29,10 +29,13 @@ def _identity() -> tuple[str, str]:
     return uid, suffix
 
 
-def _live(canvas_id: str, run_id: str, status: str = "running") -> None:
+def _live(
+        canvas_id: str, run_id: str, status: str = "running",
+        *, progress: float | None = None,
+        updated_at: datetime.datetime | None = None) -> None:
     doc = RunStatus(
         run_id=run_id, status=status, target_node_id="live-node",
-        placement="distributed", per_node=[],
+        placement="distributed", per_node=[], progress=progress,
     ).model_dump()
     doc["outputs"] = [{
         "node_id": "live-node", "port_id": "out", "port_label": "Result",
@@ -43,6 +46,7 @@ def _live(canvas_id: str, run_id: str, status: str = "running") -> None:
             run_id=run_id, canvas_id=canvas_id, status=status,
             doc=json.dumps(doc), created_by="test", auth_canvas_id=canvas_id,
             target_node_id="live-node",
+            updated_at=updated_at or datetime.datetime.now(datetime.timezone.utc),
         ))
 
 
@@ -104,6 +108,102 @@ def test_workspace_jobs_keep_the_durable_backend_attempt_after_live_state_prunin
 
     assert page["items"][0]["backend"] == "ray-jobs"
     assert page["items"][0]["attempt"] == f"attempt-{suffix}"
+
+
+def test_workspace_jobs_project_only_owned_progress_and_canonical_update_times():
+    uid, suffix = _identity()
+    canvas_id = f"jobs-a-{suffix}"
+    live_id = f"progress-{suffix}"
+    terminal_id = f"terminal-{suffix}"
+    fixed = datetime.datetime(2026, 7, 18, 12, 34, 56)
+    _live(canvas_id, live_id, progress=0.375, updated_at=fixed)
+    assert metadb.record_run(canvas_id, None, "run", "failed", run_id=terminal_id)
+
+    page = WorkspaceRunPage.model_validate(metadb.list_workspace_runs(uid))
+    by_run = {item.run_id: item for item in page.items}
+    assert by_run[live_id].progress == 0.375
+    assert by_run[live_id].updated_at == "2026-07-18T12:34:56+00:00"
+    assert by_run[terminal_id].progress is None
+    assert by_run[terminal_id].updated_at is None
+
+    with metadb.session() as session:
+        live = session.get(metadb.RunState, live_id)
+        malformed = json.loads(live.doc)
+        malformed["progress"] = "nearly done"
+        live.doc = json.dumps(malformed)
+    malformed_page = WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(uid, run_id=live_id))
+    assert malformed_page.items[0].progress is None
+
+
+def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions():
+    uid, suffix = _identity()
+    viewer = f"jobs-viewer-{suffix}"
+    canvas_id = f"jobs-a-{suffix}"
+    submission = str(uuid.uuid4())
+    task_id = metadb.local_run_submission_id(uid, canvas_id, submission)
+    key = f"write:{task_id}"
+    graph = {
+        "id": canvas_id, "version": 1,
+        "nodes": [{"id": "write", "type": "write", "data": {
+            "title": "result", "config": {"filename": "result.parquet"},
+        }}], "edges": [],
+    }
+    intent = {
+        "destination": {
+            "logicalUri": f"/tmp/{suffix}/result.parquet", "name": "result",
+            "provider": "managed-local-file",
+        },
+        "mode": "create", "expectedSchema": [], "idempotencyKey": key,
+        "partitions": [], "provenance": {"publication": {
+            "idempotencyKey": key, "runId": task_id,
+            "producer": canvas_id, "producerVersion": 1,
+            "stepId": "write", "provenance": "run", "fieldMappings": [],
+        }, "parents": []},
+    }
+    task, _ = metadb.submit_durable_local_write_task(
+        uid=uid, canvas_id=canvas_id, submission_id=submission,
+        target_node_id="write", intent_sha256="a" * 64,
+        graph_doc=graph, input_manifest=[], write_intent=intent,
+    )
+    first = metadb.claim_durable_task(task["id"], "first-owner")["attempts"][-1]
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTaskAttempt, first["id"])
+        row.lease_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    second = metadb.claim_durable_task(task["id"], "second-owner")["attempts"][-1]
+    status = RunStatus(
+        run_id=task["id"], status="running", target_node_id="write", progress=0.625)
+    assert metadb.update_durable_task_status(
+        task["id"], second["id"], second["owner_token"], status.model_dump())
+    metadb.request_durable_task_cancel(task["id"])
+
+    first_update = datetime.datetime(2026, 7, 18, 12, 0, 0)
+    second_update = datetime.datetime(2026, 7, 18, 12, 5, 0)
+    with metadb.session() as session:
+        session.add(metadb.User(id=viewer, name="Jobs viewer"))
+        session.add(metadb.CanvasShare(canvas_id=canvas_id, user_id=viewer, role="viewer"))
+        task_row = session.get(metadb.DurableTask, task["id"])
+        task_row.updated_at = second_update
+        first_row = session.get(metadb.DurableTaskAttempt, first["id"])
+        first_row.completed_at = first_update
+        second_row = session.get(metadb.DurableTaskAttempt, second["id"])
+        second_row.cancel_requested_at = second_update
+
+    owner_item = WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(uid, run_id=task["id"])).items[0]
+    assert owner_item.progress == 0.625
+    assert owner_item.updated_at == "2026-07-18T12:05:00+00:00"
+    assert owner_item.cancel_requested is True
+    assert [attempt.status for attempt in owner_item.task_attempts] == ["fenced", "running"]
+    assert owner_item.task_attempts[0].updated_at == "2026-07-18T12:00:00+00:00"
+    assert owner_item.task_attempts[1].progress == 0.625
+    assert owner_item.task_attempts[1].updated_at == "2026-07-18T12:05:00+00:00"
+
+    viewer_item = WorkspaceRunPage.model_validate(
+        metadb.list_workspace_runs(viewer, run_id=task["id"])).items[0]
+    assert viewer_item.progress == owner_item.progress
+    assert viewer_item.updated_at == owner_item.updated_at
+    assert viewer_item.can_cancel is False and viewer_item.can_retry is False
 
 
 def test_workspace_jobs_route_enforces_visibility_and_rejects_bad_cursor():

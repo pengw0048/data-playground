@@ -36,6 +36,20 @@ const localDate = (value: string | null) => {
 const isoDate = (value: string) => value ? new Date(value).toISOString() : ''
 const outputKey = (nodeId: string, portId: string) => `${nodeId}:${portId}`
 const jobKey = (job: WorkspaceJobDto) => job.runId ?? job.id
+const readable = (value: string) => value.replaceAll('_', ' ')
+const progressLabel = (progress: number | null | undefined) => (
+  progress == null ? 'Unavailable' : `${Math.round(progress * 100)}%`
+)
+const updateLabel = (updatedAt: string | null | undefined) => (
+  updatedAt ? new Date(updatedAt).toLocaleString() : 'Unavailable'
+)
+
+function jobPhase(item: WorkspaceJobDto): string | null {
+  if (item.externalWait) return `External wait · ${readable(item.externalWait.phase)}`
+  if (item.checkpoint) return `Checkpoint · ${readable(item.checkpoint.phase)}`
+  if (item.boundedFanout) return `Fan-out · ${readable(item.boundedFanout.stage)}`
+  return null
+}
 
 export function JobsView() {
   const jobsQuery = useStore((state) => state.jobsQuery)
@@ -293,11 +307,12 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const rows = item.rows ?? item.profile?.rowCount ?? null
+  const phase = jobPhase(item)
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${item.canvasName}`}
       className="grid w-full grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
-      <span className="flex items-center gap-1.5"><span style={{ color: token.color }}>{token.glyph}</span><Badge variant="secondary" className="capitalize">{item.status}</Badge></span>
+      <span className="flex flex-wrap items-center gap-1.5"><span style={{ color: token.color }}>{token.glyph}</span><Badge variant="secondary" className="capitalize">{item.status}</Badge>{item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}</span>
       <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{item.canvasName}</span><span className="block truncate text-muted-foreground">{item.nodeLabel || item.targetNodeId || 'Whole canvas'}</span></span>
       <span className="min-w-0"><span className="block truncate font-mono text-[10.5px] text-muted-foreground" title={item.attempt}>{item.attempt}</span><span>{committed.length ? `${committed.length} retained output${committed.length === 1 ? '' : 's'}` : rows != null ? `${rows.toLocaleString()} rows` : 'No retained output'}</span></span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
@@ -305,7 +320,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       <span className="text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
     </button>
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
-      <div className="grid gap-1"><div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>Attempt:</strong> <span className="font-mono">{item.attempt}</span></div>{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
+      <div className="grid gap-1"><div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
       <div className="flex flex-wrap content-start gap-2">
         <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>
         {item.targetNodeId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
@@ -314,12 +329,12 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
       </div>
       {item.taskId && <div className="grid gap-2 sm:col-span-2">
-        {item.externalWait && <div><strong>External wait:</strong> {item.externalWait.providerKind} · {item.externalWait.phase.replaceAll('_', ' ')} · attempt #{item.externalWait.attemptNumber}</div>}
-        {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.phase} · {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
-        {item.boundedFanout && <div><strong>Fan-out:</strong> {item.boundedFanout.stage.replaceAll('_', ' ')} · {item.boundedFanout.completedPartitions}/{item.boundedFanout.partitionCount ?? '—'} partitions{item.boundedFanout.failedPartitions ? ` · ${item.boundedFanout.failedPartitions} failed` : ''}{item.boundedFanout.diagnosticCode ? ` · ${item.boundedFanout.diagnosticCode}` : ''}</div>}
+        {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}
+        {item.externalWait && <div><strong>External provider:</strong> {item.externalWait.providerKind} · provider attempt #{item.externalWait.attemptNumber}</div>}
+        {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
+        {item.boundedFanout && <div><strong>Fan-out:</strong> {item.boundedFanout.completedPartitions}/{item.boundedFanout.partitionCount ?? '—'} partitions{item.boundedFanout.failedPartitions ? ` · ${item.boundedFanout.failedPartitions} failed` : ''} · checkpoint {item.boundedFanout.checkpoint} · gather {item.boundedFanout.gather}{item.boundedFanout.diagnosticCode ? ` · ${item.boundedFanout.diagnosticCode}` : ''}</div>}
         <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
         {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
-        {item.taskAttempts?.length ? <div><strong>Attempts:</strong> {item.taskAttempts.map((attempt) => `#${attempt.attemptNumber} ${attempt.status}`).join(' · ')}</div> : null}
         {item.outputReceipt && <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{item.outputReceipt.datasetId}</span> · revision <span className="font-mono">{item.outputReceipt.revisionId}</span> · {item.outputReceipt.rows.toLocaleString()} rows · {item.outputReceipt.bytes.toLocaleString()} bytes</div>}
         {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent w-fit" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
       </div>}

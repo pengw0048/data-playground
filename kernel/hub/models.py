@@ -1323,6 +1323,7 @@ class DurableTaskAttemptView(Wire):
     error: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    updated_at: str
 
 
 class DurableExternalWaitView(Wire):
@@ -1411,12 +1412,14 @@ class WorkspaceRunRecord(Wire):
     target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
     rows: int | None = Field(default=None, ge=0)
     ms: int | None = Field(default=None, ge=0)
+    progress: float | None = Field(default=None, ge=0, le=1)
     error: str | None = None
     input_manifest: list[dict[str, str]] | None = None
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     profile: ProfileResult | None = None
     per_node: list[PerNodeStatus] | None = None
     created_at: str | None = None
+    updated_at: str | None = None
     canvas_id: str
     canvas_name: str
     node_label: str | None = None
