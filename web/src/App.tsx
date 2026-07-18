@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { Canvas } from './canvas/Canvas'
 import { TopBar } from './canvas/TopBar'
@@ -9,6 +9,7 @@ import { CodeFullscreen } from './panels/CodeFullscreen'
 import { Shell } from './views/Shell'
 import { Login } from './views/Login'
 import { Toaster } from './ui/Toaster'
+import { Button } from '@/components/ui/button'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { api } from './api/client'
 import { useStore } from './store/graph'
@@ -17,21 +18,86 @@ import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { useCollapsibleRegion } from './layoutPreferences'
 
+type AuthState =
+  | { kind: 'checking' }
+  | { kind: 'local' }
+  | { kind: 'authenticated'; userId: string }
+  | { kind: 'login' }
+  | { kind: 'unavailable'; attempts: number; diagnostic: string }
+
+const AUTH_BOOTSTRAP_ATTEMPTS = 3
+const AUTH_RETRY_DELAY_MS = 250
+
+function isAuthStatus(value: unknown): value is { authEnabled: boolean; userId: string | null } {
+  if (!value || typeof value !== 'object') return false
+  const status = value as Record<string, unknown>
+  return typeof status.authEnabled === 'boolean' && (typeof status.userId === 'string' || status.userId === null)
+}
+
+function authDiagnostic(error: unknown) {
+  if (error instanceof Error && error.message) return error.message
+  return 'The auth status response is incompatible with this app version.'
+}
+
+function AuthBootstrapUnavailable({ state, onRetry }: {
+  state: Extract<AuthState, { kind: 'unavailable' }>
+  onRetry: () => void
+}) {
+  return (
+    <main className="absolute inset-0 grid place-items-center bg-background p-6">
+      <section className="w-full max-w-md rounded-lg border border-border bg-card p-6 shadow-lg" aria-labelledby="auth-bootstrap-title">
+        <h1 id="auth-bootstrap-title" className="text-base font-semibold text-foreground">Connection unavailable</h1>
+        <p role="alert" className="mt-2 text-sm leading-6 text-muted-foreground">
+          Data Playground could not confirm whether this server uses local or signed-in access. Local Canvas drafts remain in this browser, but server identity, permissions, and Canvas state are unknown.
+        </p>
+        <p className="mt-3 text-xs text-muted-foreground">Checked {state.attempts} times. Last attempt: {state.diagnostic}</p>
+        <Button className="mt-5" onClick={onRetry}>Retry connection</Button>
+      </section>
+    </main>
+  )
+}
+
 export default function App() {
   const bootstrap = useStore((s) => s.bootstrap)
   const view = useStore((s) => s.view)
-  // gate on auth: null = checking; then either the login screen (auth on, no session) or the app.
-  const [auth, setAuth] = useState<{ authEnabled: boolean; userId: string | null } | null>(null)
+  // Gate on an explicit auth outcome. An unavailable request is not evidence that this is local mode.
+  const [auth, setAuth] = useState<AuthState>({ kind: 'checking' })
   const [booted, setBooted] = useState(false)
   const [inspectorCollapsed, setInspectorCollapsed] = useCollapsibleRegion('inspector')
+  const requestGeneration = useRef(0)
+
+  const checkAuth = useCallback(async () => {
+    const generation = ++requestGeneration.current
+    setAuth({ kind: 'checking' })
+    let diagnostic = 'Auth status is unavailable.'
+    for (let attempt = 1; attempt <= AUTH_BOOTSTRAP_ATTEMPTS; attempt += 1) {
+      try {
+        const status: unknown = await api.authStatus()
+        if (!isAuthStatus(status)) throw new Error('The auth status response is incompatible with this app version.')
+        if (generation !== requestGeneration.current) return
+        useStore.getState().setAuthEnabled(status.authEnabled)
+        setAuth(!status.authEnabled ? { kind: 'local' }
+          : status.userId ? { kind: 'authenticated', userId: status.userId } : { kind: 'login' })
+        return
+      } catch (error) {
+        diagnostic = authDiagnostic(error)
+        if (attempt < AUTH_BOOTSTRAP_ATTEMPTS) {
+          await new Promise((resolve) => window.setTimeout(resolve, AUTH_RETRY_DELAY_MS))
+          if (generation !== requestGeneration.current) return
+        }
+      }
+    }
+    if (generation === requestGeneration.current) {
+      setAuth({ kind: 'unavailable', attempts: AUTH_BOOTSTRAP_ATTEMPTS, diagnostic })
+    }
+  }, [])
 
   useEffect(() => {
-    api.authStatus()
-      .then((a) => { setAuth(a); useStore.getState().setAuthEnabled(a.authEnabled) })
-      .catch(() => setAuth({ authEnabled: false, userId: 'local' }))
-  }, [])
+    void checkAuth()
+    return () => { requestGeneration.current += 1 }
+  }, [checkAuth])
   useEffect(() => {
-    if (auth && (!auth.authEnabled || auth.userId) && !booted) {
+    if ((auth.kind === 'local' || auth.kind === 'authenticated') && !booted) {
       setBooted(true)
       bootstrap().then(() => {
         initRouter(useStore)  // wire URL ↔ state once the initial canvas is settled
@@ -41,8 +107,9 @@ export default function App() {
     }
   }, [auth, booted, bootstrap])
 
-  if (!auth) return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
-  if (auth.authEnabled && !auth.userId) return <Login onLoggedIn={(uid) => setAuth({ authEnabled: true, userId: uid })} />
+  if (auth.kind === 'checking') return <div style={{ position: 'absolute', inset: 0 }} />  // brief splash while checking auth
+  if (auth.kind === 'unavailable') return <AuthBootstrapUnavailable state={auth} onRetry={() => void checkAuth()} />
+  if (auth.kind === 'login') return <Login onLoggedIn={(userId) => setAuth({ kind: 'authenticated', userId })} />
 
   return (
     <TooltipProvider delayDuration={300}>
