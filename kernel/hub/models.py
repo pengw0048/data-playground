@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import (
     UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter,
-    field_validator, model_validator,
+    field_validator, model_serializer, model_validator,
 )
 from pydantic.alias_generators import to_camel
 
@@ -1424,6 +1424,14 @@ class WorkspaceRunRecord(Wire):
                 output.outcome == "pending" for output in self.outputs):
             raise ValueError("terminal workspace runs cannot retain pending outputs")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_null_checkpoint(self, handler):
+        # checkpoint is a linear-checkpoint-task projection; never emit it as null on other runs.
+        data = handler(self)
+        if self.checkpoint is None:
+            data.pop("checkpoint", None)
+        return data
 
 
 class WorkspaceRunPage(Wire):

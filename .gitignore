@@ -44,6 +44,7 @@ kernel/_web/
 
 # kernel e2e/pytest artifacts
 kernel/test-results/
+kernel/__result_*.lock
 
 kernel/data/canvases/
 

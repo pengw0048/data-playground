@@ -1734,10 +1734,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         from hub.external_wait_tasks import recover
         recover(deps)
         return RunStatus.model_validate(task["status_doc"]), None
-    linear_shape = _linear_checkpoint_shape(graph, target_node_id)
+    # checkpoint:true routes to a durable task only with a submissionId, else it stays the in-run region-split marker.
+    linear_shape = (
+        _linear_checkpoint_shape(graph, target_node_id) if submission_id is not None else None)
     if linear_shape is not None:
-        if submission_id is None:
-            raise HTTPException(409, "linear checkpoint tasks require a submissionId")
         _source, select, write = linear_shape
         graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
         _reject_invalid(graph, deps, target_node_id)
