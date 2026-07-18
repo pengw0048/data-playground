@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import (
     UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter,
-    field_validator, model_validator,
+    field_validator, model_serializer, model_validator,
 )
 from pydantic.alias_generators import to_camel
 
@@ -1340,6 +1340,22 @@ class DurableExternalWaitView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableCheckpointView(Wire):
+    """Sanitized, path-free checkpoint projection for Workspace Jobs."""
+
+    phase: Literal["pending", "materializing", "committed", "publishing", "terminal"]
+    checkpoint_node_id: str = Field(min_length=1, max_length=256)
+    output_port_id: str = Field(min_length=1, max_length=128)
+    committed_at: str | None = None
+    rows: int | None = Field(default=None, ge=0)
+    bytes: int | None = Field(default=None, ge=0)
+    content_digest: str | None = Field(default=None, max_length=64)
+    resume_eligible: bool = False
+    retry_label: str | None = Field(default=None, max_length=64)
+    client_key: str = Field(min_length=1, max_length=128)
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
@@ -1347,7 +1363,7 @@ class DurableTaskInboxItemView(Wire):
     task_id: str
     canvas_id: str
     canvas_name: str | None = None
-    task_kind: Literal["managed_local_write", "external_wait"]
+    task_kind: Literal["managed_local_write", "external_wait", "linear_checkpoint_write"]
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)
     terminal_at: datetime.datetime
@@ -1393,9 +1409,11 @@ class WorkspaceRunRecord(Wire):
     task_attempts: list[DurableTaskAttemptView] = Field(default_factory=list, max_length=16)
     cancel_requested: bool = False
     can_retry: bool = False
+    can_cancel: bool = False
     write_intent: WriteIntent | None = None
     output_receipt: WriteReceipt | None = None
     external_wait: DurableExternalWaitView | None = None
+    checkpoint: DurableCheckpointView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
@@ -1406,6 +1424,14 @@ class WorkspaceRunRecord(Wire):
                 output.outcome == "pending" for output in self.outputs):
             raise ValueError("terminal workspace runs cannot retain pending outputs")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_null_checkpoint(self, handler):
+        # checkpoint is a linear-checkpoint-task projection; never emit it as null on other runs.
+        data = handler(self)
+        if self.checkpoint is None:
+            data.pop("checkpoint", None)
+        return data
 
 
 class WorkspaceRunPage(Wire):

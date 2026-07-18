@@ -389,7 +389,7 @@ class DurableTaskInboxItem(Base):
     __table_args__ = (
         UniqueConstraint("task_id", "task_attempt_id", name="uq_durable_task_inbox_attempt"),
         CheckConstraint(
-            "task_kind IN ('managed_local_write','external_wait')",
+            "task_kind IN ('managed_local_write','external_wait','linear_checkpoint_write')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "outcome IN ('completed','failed','cancelled')",
@@ -3440,7 +3440,9 @@ _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
-_INBOX_PRODUCER_KINDS = frozenset({"managed_local_write", "external_wait"})
+_INBOX_PRODUCER_KINDS = frozenset({
+    "managed_local_write", "external_wait", "linear_checkpoint_write",
+})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -3466,10 +3468,15 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "external_wait_publication_invalid",
         "external_wait_publication_failed",
     }),
+    "linear_checkpoint_write": frozenset({
+        "durable_task_attempts_exhausted",
+        "checkpoint_invalid",
+    }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
     "managed_local_write": "managed_local_write_failed",
     "external_wait": "external_wait_failed",
+    "linear_checkpoint_write": "linear_checkpoint_write_failed",
 }
 
 
@@ -4053,8 +4060,6 @@ def _durable_task_doc(s, task: DurableTask, *, include_admission: bool = True) -
 def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None:
     with session() as s:
         task = s.get(DurableTask, str(task_id))
-        if task is not None and task.task_kind == "linear_checkpoint_write":
-            return None
         return (_durable_task_doc(s, task, include_admission=include_admission)
                 if task is not None else None)
 
@@ -4062,8 +4067,7 @@ def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None
 def durable_task_auth(task_id: str) -> tuple[str, str] | None:
     with session() as s:
         row = s.execute(select(DurableTask.owner_id, DurableTask.canvas_id).where(
-            DurableTask.id == str(task_id),
-            DurableTask.task_kind != "linear_checkpoint_write")).one_or_none()
+            DurableTask.id == str(task_id))).one_or_none()
         return tuple(row) if row is not None else None
 
 
@@ -4150,7 +4154,7 @@ def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
 
 
 def claim_linear_checkpoint_task(task_id: str, owner_token: str) -> dict | None:
-    """Internal-only claimant; the generic recovery scanner never returns this kind."""
+    """Claim one linear-checkpoint Task under its dedicated recovery/worker path."""
     return _claim_durable_task_kind(task_id, owner_token, "linear_checkpoint_write")
 
 
@@ -4785,7 +4789,7 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
 
 
 def recoverable_durable_task_ids(limit: int = 100) -> list[str]:
-    """Return queued or expired running tasks; live leased owners are left untouched."""
+    """Return queued or expired running managed-local tasks; live leased owners are left untouched."""
     with session() as s:
         now = _durable_task_db_now(s)
         latest_attempt = select(
@@ -4799,6 +4803,29 @@ def recoverable_durable_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "managed_local_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_linear_checkpoint_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired running linear-checkpoint tasks for the dedicated two-phase worker."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "linear_checkpoint_write",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -5373,6 +5400,72 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
     return (created_at, identity), doc
 
 
+def _sanitized_checkpoint_jobs_view(
+        task: DurableTask, checkpoint: DurableCheckpoint, status_doc: dict,
+        *, can_retry: bool) -> dict:
+    """Project one path-free checkpoint Jobs surface from SQL-authoritative state."""
+    progress = status_doc.get("progress")
+    try:
+        progress_value = float(progress) if progress is not None else None
+    except (TypeError, ValueError):
+        progress_value = None
+    if task.status in _TERMINAL_RUN:
+        phase = "terminal"
+    elif checkpoint.phase == "committed":
+        phase = "publishing" if progress_value is not None and progress_value >= 0.6 else "committed"
+    elif checkpoint.phase == "reserved" or task.status == "running":
+        phase = "materializing"
+    else:
+        phase = "pending"
+    resume_eligible = bool(
+        checkpoint.phase == "committed"
+        and checkpoint.content_sha256
+        and checkpoint.committed_bytes
+        and task.status in ("queued", "running", "failed", "cancelled"))
+    digest = checkpoint.content_sha256
+    abbreviated = (f"{digest[:12]}…{digest[-8:]}" if isinstance(digest, str) and len(digest) == 64
+                   else None)
+    diagnosis = None
+    error = task.error or status_doc.get("error")
+    if isinstance(error, str) and "checkpoint_invalid" in error:
+        diagnosis = "checkpoint_invalid"
+    return {
+        "phase": phase,
+        "checkpointNodeId": checkpoint.checkpoint_node_id,
+        "outputPortId": checkpoint.output_port_id,
+        "committedAt": (checkpoint.committed_at.isoformat()
+                        if checkpoint.committed_at is not None else None),
+        "rows": checkpoint.committed_rows,
+        "bytes": checkpoint.committed_bytes,
+        "contentDigest": abbreviated,
+        "resumeEligible": resume_eligible,
+        "retryLabel": ("Retry from checkpoint" if can_retry and resume_eligible else None),
+        "clientKey": f"checkpoint:{task.id}",
+        "diagnosticCode": diagnosis,
+    }
+
+
+def resolve_checkpoint_full_result(task_id: str) -> dict | None:
+    """Resolve an opaque checkpoint client key to the committed artifact under authorization."""
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        checkpoint = s.get(DurableCheckpoint, str(task_id))
+        if (task is None or checkpoint is None
+                or task.task_kind != "linear_checkpoint_write"
+                or checkpoint.phase != "committed"
+                or checkpoint.candidate_uri is None):
+            return None
+        return {
+            "task_id": task.id,
+            "owner_id": task.owner_id,
+            "canvas_id": task.canvas_id,
+            "node_id": checkpoint.checkpoint_node_id,
+            "port_id": checkpoint.output_port_id,
+            "uri": checkpoint.candidate_uri,
+            "rows": checkpoint.committed_rows,
+        }
+
+
 def list_workspace_runs(
         uid: str, *, limit: int = 50, cursor: str | None = None,
         status: str | None = None, canvas_id: str | None = None,
@@ -5518,7 +5611,7 @@ def list_workspace_runs(
                 backend=backend_name, backend_attempt=backend_attempt, source="state"))
 
         task_identity = literal("t:") + DurableTask.id
-        task_predicates = [visible_canvas, DurableTask.task_kind != "linear_checkpoint_write"]
+        task_predicates = [visible_canvas]
         if canvas_id:
             task_predicates.append(DurableTask.canvas_id == canvas_id)
         if run_id:
@@ -5549,11 +5642,18 @@ def list_workspace_runs(
                 DurableTask.created_at < stamp,
                 and_(DurableTask.created_at == stamp, task_identity < identity),
             ))
-        task_rows = s.execute(select(DurableTask, Canvas.name).join(
+        task_rows = s.execute(select(DurableTask, Canvas.name, Canvas.owner_id, Canvas.visibility).join(
             Canvas, Canvas.id == DurableTask.canvas_id,
         ).where(*task_predicates).order_by(
             DurableTask.created_at.desc(), DurableTask.id.desc()).limit(fetch_limit)).all()
-        for task, name in task_rows:
+        share_roles = {
+            row.canvas_id: row.role
+            for row in s.execute(select(CanvasShare.canvas_id, CanvasShare.role).where(
+                CanvasShare.user_id == str(uid),
+                CanvasShare.canvas_id.in_([task.canvas_id for task, *_rest in task_rows] or ["__none__"]),
+            )).all()
+        } if task_rows else {}
+        for task, name, canvas_owner_id, canvas_visibility in task_rows:
             task_doc = _durable_task_doc(s, task)
             status_doc = task_doc["status_doc"]
             created_at = task.created_at or _now()
@@ -5569,13 +5669,32 @@ def list_workspace_runs(
             node_label = next((str(item.get("label")) for item in per_node
                                if item.get("node_id") == task.target_node_id
                                and item.get("label")), None)
+            from types import SimpleNamespace
+            role = _effective_canvas_role(
+                SimpleNamespace(owner_id=canvas_owner_id, visibility=canvas_visibility),
+                str(uid), share_roles.get(task.canvas_id))
+            can_mutate = role in ("owner", "editor")
+            can_retry = (
+                can_mutate and task.status in ("failed", "cancelled")
+                and latest["attempt_number"] < task.max_attempts)
+            can_cancel = can_mutate and task.status in ("queued", "running")
+            checkpoint_view = None
+            if task.task_kind == "linear_checkpoint_write":
+                checkpoint = s.get(DurableCheckpoint, task.id)
+                if checkpoint is not None:
+                    checkpoint_view = _sanitized_checkpoint_jobs_view(
+                        task, checkpoint, status_doc, can_retry=can_retry)
+            # Final outputs stay reserved for the Write receipt; never surface checkpoint URIs.
+            outputs = status_doc.get("outputs") or []
+            if task.task_kind == "linear_checkpoint_write" and task.status != "done":
+                outputs = []
             candidates.append(((created_at, f"t:{task.id}"), {
                 "id": f"t:{task.id}", "runId": task.id, "requestId": None,
                 "jobType": "run", "status": task.status,
                 "targetNodeId": task.target_node_id, "targetPortId": None,
                 "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
                 "error": task.error, "inputManifest": task_doc["input_manifest"],
-                "outputs": status_doc.get("outputs") or [], "profile": None,
+                "outputs": outputs, "profile": None,
                 "perNode": per_node or None, "createdAt": created_at.isoformat(),
                 "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
                 "backend": "local", "placement": "local", "attempt": latest["id"],
@@ -5588,8 +5707,8 @@ def list_workspace_runs(
                     "completedAt": item["completed_at"].isoformat() if item["completed_at"] else None,
                 } for item in attempts],
                 "cancelRequested": task.cancel_requested,
-                "canRetry": task.status in ("failed", "cancelled")
-                    and latest["attempt_number"] < task.max_attempts,
+                "canRetry": can_retry,
+                "canCancel": can_cancel,
                 "writeIntent": task_doc["write_intent"],
                 "outputReceipt": task_doc["output_receipt"],
                 "externalWait": ({
@@ -5600,10 +5719,10 @@ def list_workspace_runs(
                     "pollCount": task_doc["external_wait"]["poll_count"],
                     "attemptNumber": latest["attempt_number"],
                     "cancelRequested": task.cancel_requested,
-                    "canRetry": task.status in ("failed", "cancelled")
-                        and latest["attempt_number"] < task.max_attempts,
+                    "canRetry": can_retry,
                     "diagnosticCode": task_doc["external_wait"]["diagnostic_code"],
                 } if task.task_kind == "external_wait" and "external_wait" in task_doc else None),
+                **({"checkpoint": checkpoint_view} if checkpoint_view is not None else {}),
             }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]

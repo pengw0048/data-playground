@@ -107,11 +107,13 @@ def test_complete_admission_replays_canonically_and_is_product_hidden():
     assert first["graph_doc"]["nodes"] and first["write_intent"]["destination"]
     assert first["final_target_node_id"] == "final"
     assert first["checkpoint_node_id"] == "checkpoint"
-    assert metadb.durable_task(first["task_id"]) is None
-    assert metadb.durable_task_auth(first["task_id"]) is None
+    # Product readers now surface this kind (#414); the generic managed-local claim path still excludes it.
+    assert metadb.durable_task(first["task_id"]) is not None
+    assert metadb.durable_task_auth(first["task_id"]) == (values["uid"], values["canvas_id"])
     assert metadb.claim_durable_task(first["task_id"], "generic-worker") is None
     assert first["task_id"] not in metadb.recoverable_durable_task_ids()
-    assert metadb.list_workspace_runs(values["uid"], run_id=first["task_id"])["items"] == []
+    assert first["task_id"] in metadb.recoverable_linear_checkpoint_task_ids()
+    assert metadb.list_workspace_runs(values["uid"], run_id=first["task_id"])["items"]
 
     changes = [
         {"final_target_node_id": "checkpoint"}, {"checkpoint_node_id": "final"},

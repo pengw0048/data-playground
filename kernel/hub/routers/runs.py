@@ -139,6 +139,50 @@ def _external_wait_request(deps, graph, target_node_id: str | None):
         raise HTTPException(409, "external-wait node configuration is invalid") from exc
 
 
+def _node_config(node) -> dict:
+    data = node.data if isinstance(node.data, dict) else {}
+    cfg = data.get("config", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _linear_checkpoint_shape(graph, target_node_id: str | None):
+    """Return (source, select, write) for the exact three-node route, else None.
+
+    Any checkpoint flag on a non-matching shape is rejected before allocation.
+    """
+    checkpoint_nodes = [
+        node for node in graph.nodes if _node_config(node).get("checkpoint") is True]
+    if not checkpoint_nodes:
+        return None
+    by_id = {node.id: node for node in graph.nodes}
+    write = by_id.get(target_node_id)
+    if (len(graph.nodes) != 3 or len(graph.edges) != 2 or write is None or write.type != "write"
+            or len(checkpoint_nodes) != 1):
+        raise HTTPException(
+            409, "linear checkpoint tasks require exactly Source -> Select(checkpoint) -> Write")
+    select = checkpoint_nodes[0]
+    if select.type != "select":
+        raise HTTPException(409, "linear checkpoint requires checkpoint:true on the Select node")
+    edges = list(graph.edges)
+    select_in = next((edge for edge in edges if edge.target == select.id), None)
+    write_in = next((edge for edge in edges if edge.target == write.id), None)
+    if (select_in is None or write_in is None or write_in.source != select.id
+            or select_in.source_handle not in (None, "out")
+            or select_in.target_handle not in (None, "in")
+            or write_in.source_handle not in (None, "out")
+            or write_in.target_handle not in (None, "in")):
+        raise HTTPException(
+            409, "linear checkpoint tasks require source:out -> select:in and select:out -> write:in")
+    source = by_id.get(select_in.source)
+    if source is None or source.type != "source":
+        raise HTTPException(409, "linear checkpoint tasks require exactly one built-in Source")
+    other_ids = {node.id for node in graph.nodes} - {source.id, select.id, write.id}
+    if other_ids:
+        raise HTTPException(409, "linear checkpoint tasks reject extra nodes")
+    # Reject unsupported Write modes and Select extras early via later admission; keep shape only here.
+    return source, select, write
+
+
 def _local_run_source_nodes(graph, target_node_id: str | None):
     """Return execution-cone Sources in graph order; duplicate node ids are rejected upstream."""
     cone = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
@@ -283,12 +327,23 @@ def _write_admission_for_graph(
             partitions=partitions,
         )
     try:
-        schemas = ({node_id: declared_schema(next(
-            candidate for candidate in graph.nodes if candidate.id != node_id))}
-            if direct_local else schema_for_graph(
+        if direct_local:
+            # Prefer an explicit declared upstream schema (external-wait fixtures). Fall back to the
+            # graph schema so Source -> Select(checkpoint) -> Write can still admit create/replace.
+            upstream = next(
+                (candidate for candidate in graph.nodes if candidate.id != node_id), None)
+            schema = declared_schema(upstream) if upstream is not None else None
+            if schema is None:
+                schemas = schema_for_graph(
+                    graph, deps.resolve_adapter, deps.registry,
+                    getattr(deps, "node_builders", {}), getattr(deps, "node_specs", {}),
+                    storage=deps.storage)
+                schema = schemas.get(node_id)
+        else:
+            schemas = schema_for_graph(
                 graph, deps.resolve_adapter, deps.registry, getattr(deps, "node_builders", {}),
-                getattr(deps, "node_specs", {}), storage=deps.storage))
-        schema = schemas.get(node_id)
+                getattr(deps, "node_specs", {}), storage=deps.storage)
+            schema = schemas.get(node_id)
     except ManagedSourceReadError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception:
@@ -1679,6 +1734,64 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         from hub.external_wait_tasks import recover
         recover(deps)
         return RunStatus.model_validate(task["status_doc"]), None
+    # checkpoint:true routes to a durable task only with a submissionId, else it stays the in-run region-split marker.
+    linear_shape = (
+        _linear_checkpoint_shape(graph, target_node_id) if submission_id is not None else None)
+    if linear_shape is not None:
+        _source, select, write = linear_shape
+        graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+        _reject_invalid(graph, deps, target_node_id)
+        if input_manifest is not None:
+            graph = _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
+        _reject_invalid(graph, deps, target_node_id)
+        admission = _write_admission_for_graph(
+            deps, graph, str(write.id), uid, str(submission_id),
+            supplied=write_intent, direct_local=True)
+        if (not admission.managed or admission.intent is None
+                or admission.intent.mode not in ("create", "replace")
+                or admission.intent.destination.provider != "managed-local-file"
+                or admission.intent.partitions):
+            raise HTTPException(
+                409, admission.blocker or "linear checkpoint Write is not managed-local create/replace")
+        operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
+        if not operational_canvas or not metadb.canvas_exists(operational_canvas):
+            raise HTTPException(409, "linear checkpoint tasks require a saved canvas")
+        frozen = graph.model_copy(deep=True)
+        _inject_write_intent(frozen, write.id, admission.intent)
+        manifest = (input_manifest if input_manifest is not None
+                    else _resolve_local_run_manifest(frozen, write.id, deps))
+        if len(manifest) != 1:
+            raise HTTPException(409, "linear checkpoint tasks require exactly one Source revision")
+        # Wall-clock resolved_at must not fork the durable identity across response-loss replays.
+        stable_manifest = [{
+            **item, "resolved_at": "1970-01-01T00:00:00+00:00",
+        } for item in manifest]
+        intent_sha256 = _local_run_intent_sha256(
+            intent_graph, write.id, input_manifest, admission.intent)
+        from hub.linear_checkpoint_tasks import checkpoint_identity, graph_prefix_sha256
+        task_id = metadb.durable_task_submission_id(
+            uid, operational_canvas, str(submission_id))
+        port_id = "out"
+        manifest_payload = json.dumps(stable_manifest, sort_keys=True, separators=(",", ":"))
+        try:
+            task, _created = metadb.submit_linear_checkpoint_task(
+                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                final_target_node_id=str(write.id),
+                checkpoint_id=checkpoint_identity(task_id, select.id, port_id),
+                checkpoint_node_id=str(select.id), output_port_id=port_id,
+                task_intent_sha256=intent_sha256,
+                graph_prefix_sha256=graph_prefix_sha256(frozen, select.id),
+                input_manifest_sha256=hashlib.sha256(manifest_payload.encode()).hexdigest(),
+                graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+                input_manifest=stable_manifest,
+                write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
+        except metadb.DurableTaskSubmissionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        from hub.linear_checkpoint_tasks import dispatch as dispatch_linear
+        dispatch_linear(task["task_id"], deps)
+        status = metadb.durable_task(task["task_id"], include_admission=False)
+        assert status is not None
+        return RunStatus.model_validate(status["status_doc"]), None
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
     if input_manifest is not None:
@@ -2078,12 +2191,38 @@ def _durable_run_outputs(run_id: str) -> list[RunOutput]:
 
 def _durable_run_output(run_id: str, node_id: str, port_id: str) -> RunOutput:
     """Resolve one output by logical run/port identity."""
-    outputs = _durable_run_outputs(run_id)
+    # Opaque checkpoint client key from Jobs never carries a storage URI; resolve via SQL + auth.
+    if str(node_id).startswith("checkpoint:"):
+        task_id = str(node_id).split(":", 1)[1]
+        if task_id != str(run_id):
+            raise HTTPException(404, "run output not found")
+        resolved = metadb.resolve_checkpoint_full_result(run_id)
+        if resolved is None:
+            raise HTTPException(404, "run output not found")
+        return RunOutput(
+            node_id=resolved["node_id"], port_id=resolved["port_id"],
+            wire="dataset", publication_kind="result", outcome="committed",
+            uri=resolved["uri"], rows=resolved["rows"],
+        )
+    outputs: list[RunOutput] = []
+    try:
+        outputs = _durable_run_outputs(run_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
     output = next((candidate for candidate in outputs
                    if candidate.node_id == node_id and candidate.port_id == port_id), None)
-    if output is None:
-        raise HTTPException(404, "run output not found")
-    return output
+    if output is not None:
+        return output
+    resolved = metadb.resolve_checkpoint_full_result(run_id)
+    if (resolved is not None and node_id == resolved["node_id"]
+            and port_id == resolved["port_id"]):
+        return RunOutput(
+            node_id=resolved["node_id"], port_id=resolved["port_id"],
+            wire="dataset", publication_kind="result", outcome="committed",
+            uri=resolved["uri"], rows=resolved["rows"],
+        )
+    raise HTTPException(404, "run output not found")
 
 
 def _committed_run_output(

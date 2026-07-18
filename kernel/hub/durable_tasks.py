@@ -1,7 +1,8 @@
-"""Bounded durable ownership and shared recovery for the two certified Task kinds.
+"""Bounded durable ownership and shared recovery for certified Task kinds.
 
-This is deliberately not a scheduler. Local Write work uses one isolated LocalRunner; the same bounded
-scanner also dispatches due external-wait transitions while SQL owns identity and terminal truth.
+Local Write work uses one isolated LocalRunner; external waits and the exact
+linear-checkpoint two-phase worker share the same bounded scanner while SQL owns
+identity and terminal truth.
 """
 
 from __future__ import annotations
@@ -150,10 +151,12 @@ def recover(deps) -> None:
         dispatch(task_id, deps)
     from hub.external_wait_tasks import recover as recover_external_waits
     recover_external_waits(deps)
+    from hub.linear_checkpoint_tasks import recover as recover_linear_checkpoints
+    recover_linear_checkpoints(deps)
 
 
 def recovery_loop(deps, stop: threading.Event) -> None:
-    """Rescan the two bounded Task kinds; this remains the sole durable recovery scanner."""
+    """Rescan the bounded Task kinds; this remains the sole durable recovery scanner."""
     while not stop.is_set():
         try:
             recover(deps)
@@ -181,6 +184,9 @@ def request_cancel(task_id: str) -> dict | None:
             active[0].cancel(str(task_id))
         except KeyError:
             pass
+    if task.get("task_kind") == "linear_checkpoint_write":
+        from hub.linear_checkpoint_tasks import request_cancel as cancel_linear
+        cancel_linear(task_id)
     return task
 
 
@@ -188,4 +194,7 @@ def retry(task_id: str, retry_request_id: str, deps) -> dict:
     task = metadb.retry_durable_task(task_id, retry_request_id)
     if task["task_kind"] == "managed_local_write":
         dispatch(task_id, deps)
+    elif task["task_kind"] == "linear_checkpoint_write":
+        from hub.linear_checkpoint_tasks import dispatch as dispatch_linear
+        dispatch_linear(task_id, deps)
     return task

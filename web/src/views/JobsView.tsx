@@ -117,8 +117,13 @@ export function JobsView() {
     setJobsQuery(next.toString())
   }
   const selected = items.find((item) => jobKey(item) === params.get('run'))
+  const outputParam = params.get('output')
   const selectedOutput = selected?.outputs.find((output) =>
-    outputKey(output.nodeId, output.portId) === params.get('output'))
+    outputKey(output.nodeId, output.portId) === outputParam)
+  const checkpointOutput = (
+    selected?.checkpoint
+    && outputParam === outputKey(selected.checkpoint.clientKey, selected.checkpoint.outputPortId)
+  ) ? selected.checkpoint : null
   const act = async (item: WorkspaceJobDto, action: 'cancel' | 'retry') => {
     const runId = item.runId ?? item.id
     setActing(`${runId}:${action}`); setActionError('')
@@ -183,6 +188,12 @@ export function JobsView() {
           <FullResult uri={selectedOutput.uri} total={selectedOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={selectedOutput.nodeId} portId={selectedOutput.portId} publicationKind={selectedOutput.publicationKind} name={selectedOutput.table ?? selectedOutput.portLabel ?? selectedOutput.portId} />
         </aside>
       )}
+      {selected && checkpointOutput && (
+        <aside aria-label="Retained checkpoint" className="max-h-[45vh] overflow-auto border-t border-border bg-card">
+          <div className="flex items-center border-b border-border px-4 py-2 text-[12px] font-semibold">Retained checkpoint · {checkpointOutput.checkpointNodeId}<span className="flex-1" /><button aria-label="Close retained checkpoint" onClick={() => selectRun(selected.runId ?? selected.id)}><Icon name="close" size={14} /></button></div>
+          <FullResult uri={checkpointOutput.clientKey} total={checkpointOutput.rows ?? null} runId={selected.runId ?? undefined} nodeId={checkpointOutput.clientKey} portId={checkpointOutput.outputPortId} publicationKind="result" name={checkpointOutput.checkpointNodeId} />
+        </aside>
+      )}
     </div>
   )
 }
@@ -214,15 +225,17 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>
         {item.targetNodeId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
-        {item.taskId && (item.status === 'queued' || item.status === 'running') && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
-        {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>Retry task</Button>}
+        {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
+        {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
       </div>
       {item.taskId && <div className="grid gap-2 sm:col-span-2">
         {item.externalWait && <div><strong>External wait:</strong> {item.externalWait.providerKind} · {item.externalWait.phase.replaceAll('_', ' ')} · attempt #{item.externalWait.attemptNumber}</div>}
+        {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.phase} · {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
         <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
         {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
         {item.taskAttempts?.length ? <div><strong>Attempts:</strong> {item.taskAttempts.map((attempt) => `#${attempt.attemptNumber} ${attempt.status}`).join(' · ')}</div> : null}
         {item.outputReceipt && <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{item.outputReceipt.datasetId}</span> · revision <span className="font-mono">{item.outputReceipt.revisionId}</span> · {item.outputReceipt.rows.toLocaleString()} rows · {item.outputReceipt.bytes.toLocaleString()} bytes</div>}
+        {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent w-fit" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
       </div>}
     </div>}
   </article>
