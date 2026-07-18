@@ -944,20 +944,36 @@ test.describe('Data Playground canvas', () => {
     }
     const created = await page.request.post('/api/canvas', { data: persisted })
     expect(created.ok()).toBe(true)
-    let saves = 0
+    // Capture this exact transient document in Version history so the post-bootstrap restore path is
+    // exercised too. The in-memory settlement must not be PUT back as a new authoritative document.
+    const snapshotted = await page.request.put(`/api/canvas/${canvasId}`, { data: persisted })
+    expect(snapshotted.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    const queued = page.locator('.react-flow__node', { hasText: 'Persisted queued' })
+    const running = page.locator('.react-flow__node', { hasText: 'Persisted running' })
+    await expect(queued.locator('[title="stale"]')).toBeVisible()
+    await expect(running.locator('[title="stale"]')).toBeVisible()
+    await expect(page.locator('.dp-running-glyph')).toHaveCount(0)
+    await page.waitForTimeout(900) // isolate any bootstrap debounce before observing the restore
+    const beforeRestore = await page.request.get(`/api/canvas/${canvasId}`)
+    expect((await beforeRestore.json()).nodes.map((node: { data: { status: string } }) => node.data.status)).toEqual([
+      'queued', 'running',
+    ])
+
+    const saves: string[] = []
     await page.route(`**/api/canvas/${canvasId}`, async (route) => {
-      if (route.request().method() === 'PUT') saves += 1
+      if (route.request().method() === 'PUT') saves.push(route.request().postData() ?? '')
       await route.continue()
     })
     try {
-      await page.goto(`/#/canvas/${canvasId}`)
-      const queued = page.locator('.react-flow__node', { hasText: 'Persisted queued' })
-      const running = page.locator('.react-flow__node', { hasText: 'Persisted running' })
+      await page.getByTestId('app-menu').click()
+      await page.getByText('Version history').click()
+      await page.getByRole('button', { name: 'Restore' }).first().click()
       await expect(queued.locator('[title="stale"]')).toBeVisible()
       await expect(running.locator('[title="stale"]')).toBeVisible()
       await expect(page.locator('.dp-running-glyph')).toHaveCount(0)
       await page.waitForTimeout(900) // longer than the local autosave debounce
-      expect(saves).toBe(0)
+      expect(saves).toEqual([])
       const stored = await page.request.get(`/api/canvas/${canvasId}`)
       expect((await stored.json()).nodes.map((node: { data: { status: string } }) => node.data.status)).toEqual([
         'queued', 'running',

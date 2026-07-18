@@ -182,7 +182,8 @@ describe('graph store — core authority ops', () => {
     finishActive([{
       runId: 'live-recovered-run', status: 'running', jobType: 'run', targetNodeId: 'target',
       rowsProcessed: 1, ms: 10, placement: 'local', outputs: [],
-      perNode: [{ nodeId: 'source', status: 'queued' }, { nodeId: 'target', status: 'running' }],
+      // Durable recovery may know the target + overall status before a target per-node entry exists.
+      perNode: [{ nodeId: 'source', status: 'queued' }],
     }])
 
     await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
