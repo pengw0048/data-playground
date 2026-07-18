@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import time
@@ -9,11 +10,12 @@ import uuid
 
 import pytest
 import pyarrow as pa
+from sqlalchemy import select
 
 from hub import linear_checkpoint_tasks as lct
 from hub import metadb
 from hub.deps import Deps
-from hub.models import Graph
+from hub.models import Graph, WriteIntent
 from hub.routers.runs import _linear_checkpoint_shape, start_run
 
 
@@ -237,3 +239,72 @@ def test_checkpoint_invalid_error_surfaces_as_jobs_diagnostic():
     unrelated = SimpleNamespace(id="t2", status="failed", error="RuntimeError: disk full")
     other = metadb._sanitized_checkpoint_jobs_view(unrelated, checkpoint, {}, can_retry=False)
     assert other["diagnosticCode"] is None
+
+
+def _await_status(task_id, statuses=("done", "failed", "cancelled"), timeout=30):
+    deadline = time.time() + timeout
+    observed = None
+    while time.time() < deadline:
+        observed = metadb.durable_task(task_id)
+        if observed and observed["status"] in statuses:
+            return observed
+        time.sleep(0.05)
+    return observed
+
+
+def _run_then_orphan_after_publish(tmp_path, deps):
+    """Run the task to done, then reset the DB to the crash-after-publish window: task running,
+    latest attempt running with an expired lease, receipt/revision already durable."""
+    uid, canvas_id = f"u-{uuid.uuid4().hex}", f"c-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=uid, name="R"))
+        session.flush()
+        session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="R"))
+    graph = _canvas_graph(tmp_path, canvas_id, deps)
+    with metadb.session() as session:
+        session.get(metadb.Canvas, canvas_id).doc = json.dumps(
+            graph.model_dump(by_alias=True, mode="json"))
+    status, _ = start_run(
+        deps, graph, "write", uid, confirmed=True, submission_id=str(uuid.uuid4()))
+    task_id = status.run_id
+    assert _await_status(task_id)["status"] == "done"
+    intent_doc = WriteIntent.model_validate(
+        metadb.durable_task(task_id)["write_intent"]).model_dump(by_alias=True, mode="json")
+    head = metadb.catalog_managed_local_write_head(intent_doc["destination"]["logicalUri"])
+    with metadb.session() as s:
+        task = s.get(metadb.DurableTask, task_id)
+        task.status, task.completed_at, task.output_receipt = "running", None, None
+        attempt = s.scalars(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == task_id).order_by(
+            metadb.DurableTaskAttempt.attempt_number.desc())).first()
+        attempt.status, attempt.completed_at = "running", None
+        attempt.lease_until = metadb._now() - datetime.timedelta(seconds=300)
+    return task_id, intent_doc, head
+
+
+def test_cancel_after_landed_publish_reconciles_done(tmp_path):
+    deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
+    task_id, intent_doc, head = _run_then_orphan_after_publish(tmp_path, deps)
+    metadb.request_durable_task_cancel(task_id)
+    lct.recover(deps)
+    assert _await_status(task_id)["status"] == "done"
+    assert metadb.catalog_managed_local_write_receipt(intent_doc) is not None
+    assert metadb.catalog_managed_local_write_head(
+        intent_doc["destination"]["logicalUri"])["revision_id"] == head["revision_id"]
+    deps.storage.close()
+
+
+def test_exhausted_recovery_after_landed_publish_reconciles_done(tmp_path):
+    deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
+    task_id, intent_doc, _ = _run_then_orphan_after_publish(tmp_path, deps)
+    with metadb.session() as s:
+        task = s.get(metadb.DurableTask, task_id)
+        latest = s.scalars(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == task_id).order_by(
+            metadb.DurableTaskAttempt.attempt_number.desc())).first()
+        latest.attempt_number = task.max_attempts
+    lct.recover(deps)
+    final = _await_status(task_id)
+    assert final["status"] == "done" and final["error"] is None
+    assert metadb.catalog_managed_local_write_receipt(intent_doc) is not None
+    deps.storage.close()
