@@ -11,6 +11,9 @@ const failedJob = {
 test('filters, deep-links, and preserves a partial Jobs page at the supported viewport @ux-smoke', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 768 })
   let continuationAttempts = 0
+  await page.route('**/api/canvas', async (route) => {
+    await route.fulfill({ json: [{ id: 'canvas-jobs', name: 'Climate analysis', version: 1, role: 'viewer' }] })
+  })
   await page.route('**/api/jobs?*', async (route) => {
     const cursor = new URL(route.request().url()).searchParams.get('cursor')
     if (cursor) {
@@ -30,7 +33,16 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
 
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await expect(page.getByText('Climate analysis')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
+  await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('canvas-jobs')
+  await expect(page).toHaveURL(/canvas=canvas-jobs/)
+  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption(JSON.stringify(['canvas-jobs', 'publish']))
+  await expect(page).toHaveURL(/canvas=canvas-jobs&node=publish/)
+  await page.getByLabel('Filter jobs by backend', { exact: true }).selectOption('local')
+  await expect(page).toHaveURL(/backend=local/)
+  await page.getByLabel('Filter jobs by node', { exact: true }).selectOption('')
+  await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('')
+  await page.getByLabel('Filter jobs by backend', { exact: true }).selectOption('')
   await page.getByLabel('Filter jobs by status').selectOption('failed')
   await expect(page).toHaveURL(/#\/jobs\?status=failed/)
 
@@ -47,7 +59,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
 
   await page.getByRole('button', { name: 'Load more' }).click()
   await expect(page.getByText(/Couldn’t load more Jobs/)).toBeVisible()
-  await expect(page.getByText('Climate analysis')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
   await page.getByRole('button', { name: 'Retry load more' }).click()
   await expect(page.getByText('run-older')).toBeVisible()
 })
