@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { InboxView, mergeMonotonic } from './InboxView'
@@ -68,6 +68,42 @@ describe('InboxView', () => {
     expect(screen.queryByText(/secret|traceback|boom/i)).toBeNull()
     expect(screen.getByRole('button', { name: 'Open job' })).toBeDisabled()
     expect(screen.getByText('Canvas unavailable')).toBeInTheDocument()
+  })
+
+  it('labels every declared task kind for each terminal outcome and diagnoses unknown runtime kinds', async () => {
+    const kinds = [
+      ['managed_local_write', 'Managed local write'],
+      ['external_wait', 'External wait'],
+      ['linear_checkpoint_write', 'Checkpointed write'],
+      ['bounded_fanout_write', 'Bounded fan-out write'],
+    ] as const
+    const outcomes = ['completed', 'failed', 'cancelled'] as const
+    const rows = kinds.flatMap(([taskKind, label]) => outcomes.map((outcome) => item({
+      id: `${taskKind}-${outcome}`,
+      taskKind,
+      outcome,
+      diagnosticCode: outcome === 'failed' ? `${taskKind}_failed` : null,
+    })))
+    rows.push(item({
+      id: 'future-kind',
+      taskKind: 'future_task_kind' as never,
+      outcome: 'completed',
+    }))
+    mocks.inboxList.mockResolvedValue({ items: rows, hasMore: false, nextCursor: null })
+
+    render(<InboxView />)
+    await screen.findByTestId('inbox-item-future-kind')
+
+    for (const [taskKind, label] of kinds) {
+      for (const outcome of outcomes) {
+        const row = within(screen.getByTestId(`inbox-item-${taskKind}-${outcome}`))
+        expect(row.getByText(label)).toBeInTheDocument()
+        expect(row.getByText(outcome === 'completed' ? 'Completed' : outcome === 'failed'
+          ? `${taskKind} failed`.replace(/_/g, ' ')
+          : 'Cancelled')).toBeInTheDocument()
+      }
+    }
+    expect(within(screen.getByTestId('inbox-item-future-kind')).getByText('Unknown task type: future_task_kind')).toBeInTheDocument()
   })
 
   it('keeps a locally read item read when a stale list response arrives', async () => {
