@@ -20,6 +20,16 @@ describe('node finder', () => {
     expect(portSummary(specs[0])).toBe('in metric · out dataset')
   })
 
+  it('uses case-normalized code-point ordering for title and kind ties', () => {
+    const specs = [
+      node({ kind: 'beta', title: 'Same' }),
+      node({ kind: 'alpha', title: 'same' }),
+      node({ kind: 'umlaut', title: 'Älpha' }),
+      node({ kind: 'zeta', title: 'Zulu' }),
+    ]
+    expect(findNodeSpecs(specs, '').map((result) => result.spec.kind)).toEqual(['alpha', 'beta', 'zeta', 'umlaut'])
+  })
+
   it('adds the highlighted result with Enter and closes with Escape', () => {
     const onPick = vi.fn()
     const onClose = vi.fn()
@@ -31,5 +41,12 @@ describe('node finder', () => {
     expect(onPick).toHaveBeenCalledWith('filter')
     fireEvent.keyDown(search, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders only the first 100 results while reporting a truncated full search', () => {
+    const specs = Array.from({ length: 101 }, (_, index) => node({ kind: `plugin-${index}`, title: `Plugin ${index}` }))
+    render(<NodeFinder specs={specs} onPick={vi.fn()} onClose={vi.fn()} />)
+    expect(screen.getAllByRole('option')).toHaveLength(100)
+    expect(screen.getByText('Showing first 100 of 101')).toBeVisible()
   })
 })

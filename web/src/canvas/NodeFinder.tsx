@@ -5,9 +5,21 @@ import { color, kindAccent, type WireType } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 
 type FinderResult = { spec: NodeSpec; compatible: boolean; match: number }
+const MAX_RENDERED_RESULTS = 100
 
 function normalized(value: string): string {
-  return value.trim().toLocaleLowerCase()
+  return value.trim().toLowerCase()
+}
+
+/** Compare Unicode code points directly, rather than inheriting the browser's locale collation. */
+function codePointCompare(left: string, right: string): number {
+  const a = Array.from(left)
+  const b = Array.from(right)
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    const delta = a[index].codePointAt(0)! - b[index].codePointAt(0)!
+    if (delta) return delta
+  }
+  return a.length - b.length
 }
 
 function haystack(spec: NodeSpec): string[] {
@@ -38,8 +50,8 @@ export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType)
   }).sort((a, b) => (
     Number(b.compatible) - Number(a.compatible)
     || a.match - b.match
-    || a.spec.title.localeCompare(b.spec.title)
-    || a.spec.kind.localeCompare(b.spec.kind)
+    || codePointCompare(normalized(a.spec.title), normalized(b.spec.title))
+    || codePointCompare(normalized(a.spec.kind), normalized(b.spec.kind))
   ))
 }
 
@@ -60,6 +72,9 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
   const [active, setActive] = useState(0)
   const input = useRef<HTMLInputElement>(null)
   const results = useMemo(() => findNodeSpecs(specs, query, wire), [specs, query, wire])
+  // Search and rank the complete effective registry. Rendering remains bounded for large plugin packs.
+  const shownResults = results.slice(0, MAX_RENDERED_RESULTS)
+  const truncated = results.length > shownResults.length
 
   useEffect(() => { input.current?.focus() }, [])
   useEffect(() => { setActive(0) }, [query, wire])
@@ -67,9 +82,9 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
   const choose = (result?: FinderResult) => { if (result) onPick(result.spec.kind) }
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Escape') { event.preventDefault(); onClose(); return }
-    if (event.key === 'ArrowDown') { event.preventDefault(); setActive((index) => Math.min(index + 1, results.length - 1)); return }
+    if (event.key === 'ArrowDown') { event.preventDefault(); setActive((index) => Math.min(index + 1, shownResults.length - 1)); return }
     if (event.key === 'ArrowUp') { event.preventDefault(); setActive((index) => Math.max(index - 1, 0)); return }
-    if (event.key === 'Enter') { event.preventDefault(); choose(results[active]) }
+    if (event.key === 'Enter') { event.preventDefault(); choose(shownResults[active]) }
   }
 
   return createPortal(
@@ -84,7 +99,7 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
           <kbd className="text-[10px] text-muted-foreground">Esc</kbd>
         </div>
         <div role="listbox" aria-label="Matching nodes" className="max-h-[min(480px,66vh)] overflow-y-auto p-1.5">
-          {results.map((result, index) => (
+          {shownResults.map((result, index) => (
             <button key={result.spec.kind} role="option" aria-selected={index === active} onMouseEnter={() => setActive(index)} onClick={() => choose(result)}
               className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${index === active ? 'bg-accent' : 'hover:bg-accent/60'}`}>
               <span className="mt-0.5 h-8 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[result.spec.kind] ?? color.text3 }} />
@@ -97,6 +112,7 @@ export function NodeFinder({ specs, wire, onPick, onClose }: {
             </button>
           ))}
           {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching node.</div>}
+          {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
         </div>
         <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to add</div>
       </section>
