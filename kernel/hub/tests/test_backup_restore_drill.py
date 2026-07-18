@@ -24,10 +24,12 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
 from hub import bounded_fanout, external_wait_tasks, handoff, linear_checkpoint, metadb
+from hub.execution_manifest import build_execution_manifest
 from hub.external_wait import ExternalWaitCheckpoint, ExternalWaitPollOutcome
 from hub.local_run_inputs import finalize_local_file_candidates, snapshot_local_file_input
 from hub.models import (
     CatalogTable,
+    Graph,
     RunOutput,
     RunStatus,
     WriteIntent,
@@ -38,7 +40,7 @@ from hub.plugins.adapters import (
 )
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
-from hub.tests.task_manifest_helpers import with_task_manifest
+from hub.tests.task_manifest_helpers import task_manifest_deps, with_task_manifest
 
 
 def _switch_db(url: str) -> None:
@@ -77,6 +79,59 @@ def _tree_fingerprint(root: Path) -> dict[str, str]:
         if path.is_file():
             out[str(path.relative_to(root))] = _file_sha256(path)
     return out
+
+
+def _check_execution_manifest_owner(
+        mismatches: list[dict[str, object]], *, subject: str,
+        actual_sha256: str | None, expected_sha256: str, expected_document: dict) -> None:
+    """Classify one restored owner and resolve it through the validating manifest read path."""
+    if actual_sha256 is None:
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_owner_pruned",
+            "expected": expected_sha256,
+            "actual": None,
+        })
+        return
+    if actual_sha256 != expected_sha256:
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_reference_mismatch",
+            "expected": expected_sha256,
+            "actual": actual_sha256,
+        })
+        return
+    try:
+        restored = metadb.execution_manifest(actual_sha256)
+    except Exception as exc:  # noqa: BLE001 - classify corrupt backup evidence precisely
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_document_corrupt",
+            "expected": expected_sha256,
+            "actual": f"{type(exc).__name__}: {exc}",
+        })
+        return
+    if restored is None:
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_document_missing",
+            "expected": expected_sha256,
+            "actual": None,
+        })
+        return
+    if restored["document"] != expected_document:
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_document_mismatch",
+            "expected": expected_document,
+            "actual": restored["document"],
+        })
+
+
+def _execution_manifest_expectation(sha256: str) -> dict:
+    stored = metadb.execution_manifest(sha256)
+    assert stored is not None
+    return {"sha256": sha256, "document": stored["document"]}
 
 
 @contextmanager
@@ -620,6 +675,8 @@ def _seed_durable_tasks(
         "managed": {
             "task_id": managed["id"],
             "attempt_id": managed_attempt["id"],
+            "manifest": _execution_manifest_expectation(
+                managed["execution_manifest_sha256"]),
             "input_manifest": managed["input_manifest"],
             "input_artifact_uri": ordinary_input["artifact_uri"],
             "receipt": managed_receipt,
@@ -627,11 +684,17 @@ def _seed_durable_tasks(
         "checkpoint": {
             "task_id": checkpoint["admission"]["task_id"],
             "attempt_id": checkpoint["attempt"]["id"],
+            "manifest": _execution_manifest_expectation(
+                metadb.durable_task(
+                    checkpoint["admission"]["task_id"])["execution_manifest_sha256"]),
             "receipt": checkpoint_receipt,
         },
         "fanout": {
             "task_id": fanout["admission"]["task_id"],
             "attempt_id": fanout["attempt"]["id"],
+            "manifest": _execution_manifest_expectation(
+                metadb.durable_task(
+                    fanout["admission"]["task_id"])["execution_manifest_sha256"]),
             "plan_digest": plan["plan_digest"],
             "unit_count": len(plan["units"]),
             "old_unit_attempt_id": gather_claim["attempt_id"],
@@ -641,6 +704,8 @@ def _seed_durable_tasks(
         "external": {
             "task_id": external["id"],
             "attempt_id": poll_claim["attempt_id"],
+            "manifest": _execution_manifest_expectation(
+                external["execution_manifest_sha256"]),
             "handle": handle,
             "checkpoint": checkpoint_doc,
         },
@@ -761,16 +826,26 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         provider_root / "unavailable.lance", "provider-unavailable", 505)
 
     exact_refs = [core_original, provider_available, provider_unavailable]
+    ordinary_submission_id = str(uuid.uuid4())
+    ordinary_run_id = metadb.local_run_submission_id(
+        metadb.DEFAULT_USER_ID, canvas_id, ordinary_submission_id)
+    ordinary_output_uri = str(data_dir / "ordinary-manifest-output.parquet")
+    ordinary_write_intent = _task_write_intent(
+        ordinary_run_id, canvas_id, ordinary_output_uri)
+    ordinary_write_intent["provenance"]["parents"] = [parent_uri]
     canvas_doc = {
         "id": canvas_id,
+        "version": 1,
         "nodes": [
             _exact_source_node("core", core_original),
             _exact_source_node("provider-available", provider_available),
             _exact_source_node("provider-unavailable", provider_unavailable),
             {"id": "ordinary", "type": "source", "position": {"x": 0, "y": 0},
              "data": {"config": {"uri": ordinary_input["source_uri"]}}},
+            {"id": "write", "type": "write", "data": {
+                "config": {"filename": "ordinary-manifest-output.parquet"}}},
         ],
-        "edges": [],
+        "edges": [{"id": "ordinary-write", "source": "ordinary", "target": "write"}],
     }
     with metadb.session() as session:
         canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
@@ -793,17 +868,36 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
             ("ordinary", "local-file-snapshot", ordinary_input),
         )
     ]
+    ordinary_manifest_sha256, ordinary_manifest_doc = build_execution_manifest(
+        Graph.model_validate(canvas_doc),
+        target_node_id="write",
+        target_port_id=None,
+        input_manifest=admitted_manifest,
+        write_intent=WriteIntent.model_validate(ordinary_write_intent),
+        deps=task_manifest_deps(Graph.model_validate(canvas_doc)),
+    )
     run_id, created = metadb.admit_local_run_inputs(
         uid=metadb.DEFAULT_USER_ID,
         canvas_id=canvas_id,
-        submission_id=str(uuid.uuid4()),
-        target_node_id="core",
-        intent_sha256=hashlib.sha256(b"backup-restore-revision-drill").hexdigest(),
+        submission_id=ordinary_submission_id,
+        target_node_id="write",
+        intent_sha256=ordinary_manifest_sha256,
         manifest=admitted_manifest,
+        execution_manifest_sha256=ordinary_manifest_sha256,
+        execution_manifest_doc=ordinary_manifest_doc,
         local_file_candidates=[ordinary_candidate],
     )
-    assert created is True
+    assert created is True and run_id == ordinary_run_id
     finalize_local_file_candidates(storage, [ordinary_candidate], run_id)
+    from hub.local_writes import write_managed_local_file
+
+    ordinary_receipt = write_managed_local_file(
+        storage=storage,
+        catalog=revision_catalog,
+        intent=WriteIntent.model_validate(ordinary_write_intent),
+        write_artifact=lambda uri: pq.write_table(pa.table({"value": [707]}), uri),
+    )
+    assert ordinary_receipt.execution_manifest_sha256 == ordinary_manifest_sha256
     artifact_uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
     Path(artifact_uri).write_bytes(b"drill-local-result-bytes")
     storage.commit_result(artifact_uri, run_id)
@@ -827,10 +921,20 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
             "outputs": [run_output],
         },
         canvas_id=canvas_id,
+        execution_manifest_sha256=ordinary_manifest_sha256,
+        execution_manifest_doc=ordinary_manifest_doc,
     )
     assert storage.release_result(artifact_uri, run_id) is True
     metadb.record_run(
         canvas_id, "n1", "run", "done", rows=1, outputs=[run_output], run_id=run_id)
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
+        assert canvas is not None
+        edited_canvas_doc = json.loads(canvas.doc)
+        next(node for node in edited_canvas_doc["nodes"] if node["id"] == "write")[
+            "data"]["config"]["filename"] = "edited-after-manifest.parquet"
+        canvas.doc = json.dumps(edited_canvas_doc)
+        metadb.sync_local_result_owner(session, "canvas", canvas_id, edited_canvas_doc)
     artifact_rel = str(Path(artifact_uri).resolve().relative_to(Path(storage.root).resolve()))
 
     object_store_cred = metadb.cred_upsert(
@@ -882,6 +986,10 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "lineage_publication_key": lineage_publication_key,
         "lineage_receipt": lineage_receipt,
         "run_id": run_id,
+        "ordinary_execution_manifest": {
+            **_execution_manifest_expectation(ordinary_manifest_sha256),
+            "receipt_revision_id": ordinary_receipt.revision_id,
+        },
         "admitted_manifest": admitted_manifest,
         "exact_refs": exact_refs,
         "core_original": core_original,
@@ -909,7 +1017,7 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         canvas = session.get(metadb.Canvas, info["canvas_id"])
         assert canvas is not None and canvas.name == "backup-restore-drill"
         assert [node["id"] for node in json.loads(canvas.doc)["nodes"]] == [
-            "core", "provider-available", "provider-unavailable", "ordinary",
+            "core", "provider-available", "provider-unavailable", "ordinary", "write",
         ]
         runs = list(session.scalars(
             select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == info["canvas_id"])))
@@ -1175,6 +1283,143 @@ def _assert_revision_recovery(
             "dataset_id": info["core_original"]["dataset_id"],
             "revision_id": info["core_original"]["revision_id"],
             "tombstone_dataset_id": info["tombstone"]["dataset_id"],
+        }, sort_keys=True),
+        flush=True,
+    )
+
+
+def _assert_execution_manifest_recovery(info: dict) -> None:
+    """Prove every retained run/task owner resolves to its exact canonical document."""
+    mismatches: list[dict[str, object]] = []
+    owners: list[tuple[str, str | None, dict]] = []
+    ordinary = info["ordinary_execution_manifest"]
+    durable = info["durable_tasks"]
+    live_canvas_diverged = False
+
+    with metadb.session() as session:
+        canvas = session.get(metadb.Canvas, info["canvas_id"])
+        admission = session.get(metadb.RunInputAdmission, info["run_id"])
+        state = session.get(metadb.RunState, info["run_id"])
+        history = session.scalar(select(metadb.RunRecord).where(
+            metadb.RunRecord.run_id == info["run_id"],
+            metadb.RunRecord.canvas_id == info["canvas_id"],
+        ))
+        revision = session.get(
+            metadb.ManagedLocalFileRevision, ordinary["receipt_revision_id"])
+        lineage = session.scalar(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.run_id == info["run_id"]))
+        owners.extend([
+            ("ordinary admission", admission.execution_manifest_sha256 if admission else None,
+             ordinary),
+            ("ordinary run state", state.execution_manifest_sha256 if state else None, ordinary),
+            ("ordinary run history",
+             history.execution_manifest_sha256 if history else None, ordinary),
+            ("ordinary write receipt row",
+             revision.execution_manifest_sha256 if revision else None, ordinary),
+            ("ordinary lineage fact",
+             lineage.execution_manifest_sha256 if lineage else None, ordinary),
+        ])
+        if canvas is not None:
+            live_write = next(
+                node for node in json.loads(canvas.doc)["nodes"] if node["id"] == "write")
+            manifest_write = next(
+                node for node in ordinary["document"]["graph"]["nodes"]
+                if node["id"] == "write")
+            live_canvas_diverged = live_write["data"] != manifest_write["data"]
+        if not live_canvas_diverged:
+            mismatches.append({
+                "subject": "ordinary live Canvas divergence fixture",
+                "code": "execution_manifest_mutable_substitution_not_tested",
+                "expected": "live Canvas differs from retained manifest",
+                "actual": "missing or unchanged live Canvas",
+            })
+        try:
+            receipt_doc = json.loads(revision.write_receipt_doc) if (
+                revision is not None and revision.write_receipt_doc) else None
+        except (TypeError, ValueError) as exc:
+            mismatches.append({
+                "subject": "ordinary embedded write receipt",
+                "code": "execution_manifest_reference_corrupt",
+                "expected": ordinary["sha256"],
+                "actual": f"{type(exc).__name__}: {exc}",
+            })
+        else:
+            owners.append((
+                "ordinary embedded write receipt",
+                receipt_doc.get("executionManifestSha256")
+                if isinstance(receipt_doc, dict) else None,
+                ordinary,
+            ))
+
+        for label, expected in durable.items():
+            if label not in ("managed", "checkpoint", "fanout", "external"):
+                continue
+            manifest = expected["manifest"]
+            task = session.get(metadb.DurableTask, expected["task_id"])
+            attempt = session.get(metadb.DurableTaskAttempt, expected["attempt_id"])
+            owners.extend([
+                (f"{label} durable task",
+                 task.execution_manifest_sha256 if task else None, manifest),
+                (f"{label} durable attempt",
+                 attempt.execution_manifest_sha256 if attempt else None, manifest),
+            ])
+            if label == "external":
+                continue
+            inbox = session.scalar(select(metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.task_id == expected["task_id"]))
+            receipt_revision = session.scalar(select(metadb.ManagedLocalFileRevision).where(
+                metadb.ManagedLocalFileRevision.run_id == expected["task_id"]))
+            owners.extend([
+                (f"{label} Inbox item",
+                 inbox.execution_manifest_sha256 if inbox else None, manifest),
+                (f"{label} write receipt row",
+                 receipt_revision.execution_manifest_sha256 if receipt_revision else None,
+                 manifest),
+            ])
+
+    for label, expected in durable.items():
+        if label not in ("managed", "checkpoint", "fanout", "external"):
+            continue
+        task = metadb.durable_task(expected["task_id"])
+        manifest = expected["manifest"]
+        jobs = metadb.list_workspace_runs(
+            metadb.DEFAULT_USER_ID, run_id=expected["task_id"])["items"]
+        owners.append((
+            f"{label} Jobs projection",
+            jobs[0].get("executionManifestSha256") if jobs else None,
+            manifest,
+        ))
+        if label != "external":
+            owners.append((
+                f"{label} embedded write receipt",
+                task["output_receipt"].get("executionManifestSha256")
+                if task and task.get("output_receipt") else None,
+                manifest,
+            ))
+
+    for subject, actual_sha256, expected in owners:
+        _check_execution_manifest_owner(
+            mismatches,
+            subject=subject,
+            actual_sha256=actual_sha256,
+            expected_sha256=expected["sha256"],
+            expected_document=expected["document"],
+        )
+    if mismatches:
+        pytest.fail(
+            "BACKUP_RESTORE_EXECUTION_MANIFEST_MISMATCH: "
+            + json.dumps(mismatches, sort_keys=True, default=str)
+        )
+    print(
+        "BACKUP_RESTORE_EXECUTION_MANIFEST_EVIDENCE: "
+        + json.dumps({
+            "ordinary": ordinary["sha256"],
+            "durable": {
+                label: durable[label]["manifest"]["sha256"]
+                for label in ("managed", "checkpoint", "fanout", "external")
+            },
+            "owners": len(owners),
+            "live_canvas_diverged": live_canvas_diverged,
         }, sort_keys=True),
         flush=True,
     )
@@ -1521,6 +1766,46 @@ def _reset_database(url: str) -> None:
     engine.dispose()
 
 
+def test_execution_manifest_restore_mismatch_classification(monkeypatch):
+    expected_sha256 = "a" * 64
+    expected_document = {"schemaVersion": 1}
+    mismatches: list[dict[str, object]] = []
+
+    monkeypatch.setattr(metadb, "execution_manifest", lambda _sha256: None)
+    _check_execution_manifest_owner(
+        mismatches,
+        subject="pruned owner",
+        actual_sha256=None,
+        expected_sha256=expected_sha256,
+        expected_document=expected_document,
+    )
+    _check_execution_manifest_owner(
+        mismatches,
+        subject="missing document",
+        actual_sha256=expected_sha256,
+        expected_sha256=expected_sha256,
+        expected_document=expected_document,
+    )
+
+    def corrupt(_sha256):
+        raise ValueError("digest does not match document")
+
+    monkeypatch.setattr(metadb, "execution_manifest", corrupt)
+    _check_execution_manifest_owner(
+        mismatches,
+        subject="corrupt document",
+        actual_sha256=expected_sha256,
+        expected_sha256=expected_sha256,
+        expected_document=expected_document,
+    )
+
+    assert [item["code"] for item in mismatches] == [
+        "execution_manifest_owner_pruned",
+        "execution_manifest_document_missing",
+        "execution_manifest_document_corrupt",
+    ]
+
+
 def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
     """Profile A drill: SQLite + local files fixture backup into an isolated namespace."""
     from hub.settings import settings
@@ -1598,6 +1883,7 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
+                    _assert_execution_manifest_recovery(info)
                     _assert_durable_task_recovery(
                         info, outputs_root=restore_ws / "outputs")
                     _assert_isolation_applied(info, replacement, provider)
@@ -1666,12 +1952,15 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         source_row_counts = {}
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
+                          metadb.RunState, metadb.ExecutionManifest,
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.LocalResultReference,
                           metadb.LocalFileInputRevision,
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
-                          metadb.RunInputAdmission, metadb.ObjectAttempt):
+                          metadb.RunInputAdmission, metadb.DurableTask,
+                          metadb.DurableTaskAttempt, metadb.DurableTaskInboxItem,
+                          metadb.ObjectAttempt):
                 source_row_counts[model.__tablename__] = session.scalar(
                     select(func.count()).select_from(model))
         source_outputs_fp = _tree_fingerprint(source_outputs)
@@ -1741,6 +2030,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
+                    _assert_execution_manifest_recovery(info)
                     _assert_durable_task_recovery(
                         info, outputs_root=restore_ws / "outputs")
                     _assert_isolation_applied(info, replacement, provider)
@@ -1756,12 +2046,15 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         metadb.init_db()
         with metadb.session() as session:
             for model in (metadb.Canvas, metadb.CatalogEntry, metadb.RunRecord,
+                          metadb.RunState, metadb.ExecutionManifest,
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.LocalResultReference,
                           metadb.LocalFileInputRevision,
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
-                          metadb.RunInputAdmission, metadb.ObjectAttempt):
+                          metadb.RunInputAdmission, metadb.DurableTask,
+                          metadb.DurableTaskAttempt, metadb.DurableTaskInboxItem,
+                          metadb.ObjectAttempt):
                 assert session.scalar(select(func.count()).select_from(model)) == \
                     source_row_counts[model.__tablename__]
             assert _lineage_receipt_identity(
