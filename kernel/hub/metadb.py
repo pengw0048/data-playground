@@ -371,6 +371,35 @@ class DurableExternalWait(Base):
     )
 
 
+class DurableTaskInboxItem(Base):
+    """One owner-scoped terminal outcome for a certified durable TaskAttempt."""
+    __tablename__ = "durable_task_inbox_items"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    task_id: Mapped[str] = mapped_column(String, ForeignKey("durable_tasks.id"), nullable=False)
+    task_attempt_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_task_attempts.id"), nullable=False)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False)
+    task_kind: Mapped[str] = mapped_column(String, nullable=False)
+    outcome: Mapped[str] = mapped_column(String, nullable=False)
+    diagnostic_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    terminal_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    read_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("task_id", "task_attempt_id", name="uq_durable_task_inbox_attempt"),
+        CheckConstraint(
+            "task_kind IN ('managed_local_write','external_wait')",
+            name="ck_durable_task_inbox_kind"),
+        CheckConstraint(
+            "outcome IN ('completed','failed','cancelled')",
+            name="ck_durable_task_inbox_outcome"),
+        Index("ix_durable_task_inbox_owner_created", "owner_id", "created_at", "id"),
+        Index("ix_durable_task_inbox_owner_unread", "owner_id", "read_at"),
+        Index("ix_durable_task_inbox_task_id", "task_id"),
+    )
+
+
 class DurableCheckpoint(Base):
     """Minimal DB-only admission and candidate binding for one hidden checkpoint."""
     __tablename__ = "durable_checkpoints"
@@ -3411,6 +3440,178 @@ _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
+_INBOX_PRODUCER_KINDS = frozenset({"managed_local_write", "external_wait"})
+_INBOX_TASK_STATUS_TO_OUTCOME = {
+    "done": "completed", "failed": "failed", "cancelled": "cancelled",
+}
+_INBOX_DIAGNOSTIC_ALLOWLIST = {
+    "managed_local_write": frozenset({
+        "durable_task_attempts_exhausted",
+    }),
+    "external_wait": frozenset({
+        "external_wait_deadline",
+        "external_wait_poll_budget",
+        "external_wait_evidence_invalid",
+        "adapter_return_invalid",
+        "phase_regressed",
+        "checkpoint_regressed",
+        "provider_failed",
+        "adapter_unavailable",
+        "adapter_transition_timeout",
+        "adapter_transient_failure",
+        "external_wait_stage_busy",
+        "external_wait_download_invalid",
+        "external_wait_download_failed",
+        "external_wait_destination_stale",
+        "external_wait_publication_invalid",
+        "external_wait_publication_failed",
+    }),
+}
+_INBOX_DIAGNOSTIC_FALLBACK = {
+    "managed_local_write": "managed_local_write_failed",
+    "external_wait": "external_wait_failed",
+}
+
+
+def _canonical_inbox_diagnostic(
+        task_kind: str, diagnostic_code: str | None, outcome: str) -> str | None:
+    """Map a caller diagnostic onto the bounded per-kind allowlist; never invent codes from text."""
+    if outcome == "completed" or diagnostic_code is None:
+        return None
+    code = str(diagnostic_code)
+    allowed = _INBOX_DIAGNOSTIC_ALLOWLIST.get(task_kind, frozenset())
+    if code in allowed:
+        return code
+    return _INBOX_DIAGNOSTIC_FALLBACK.get(task_kind)
+
+
+def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
+    def _stamp(value: datetime.datetime | None) -> datetime.datetime | None:
+        if value is None:
+            return None
+        return (value.replace(tzinfo=datetime.timezone.utc)
+                if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+
+    return {
+        "id": item.id,
+        "owner_id": item.owner_id,
+        "task_id": item.task_id,
+        "task_attempt_id": item.task_attempt_id,
+        "canvas_id": item.canvas_id,
+        "task_kind": item.task_kind,
+        "outcome": item.outcome,
+        "diagnostic_code": item.diagnostic_code,
+        "terminal_at": _stamp(item.terminal_at),
+        "created_at": _stamp(item.created_at),
+        "read_at": _stamp(item.read_at),
+    }
+
+
+def _emit_durable_task_inbox_item(
+        s, *, task: DurableTask, attempt: DurableTaskAttempt, task_status: str,
+        diagnostic_code: str | None = None,
+        now: datetime.datetime | None = None) -> dict | None:
+    """Insert exactly one owner-scoped Inbox item for a terminal certified attempt.
+
+    Must run inside the same SQL transaction that terminalizes Task/Attempt. Idempotent on
+    ``(task_id, task_attempt_id)``; a later different outcome for the same attempt is rejected.
+    """
+    if task.task_kind not in _INBOX_PRODUCER_KINDS:
+        return None
+    outcome = _INBOX_TASK_STATUS_TO_OUTCOME.get(task_status)
+    if outcome is None:
+        raise ValueError("inbox emission requires a terminal durable task status")
+    if attempt.task_id != task.id:
+        raise ValueError("inbox attempt does not belong to the durable task")
+    existing = s.scalar(select(DurableTaskInboxItem).where(
+        DurableTaskInboxItem.task_id == task.id,
+        DurableTaskInboxItem.task_attempt_id == attempt.id,
+    ).limit(1))
+    if existing is not None:
+        if (existing.owner_id != task.owner_id or existing.task_kind != task.task_kind
+                or existing.outcome != outcome or existing.canvas_id != task.canvas_id):
+            raise ValueError("later inbox outcome for the same attempt is rejected")
+        return _durable_task_inbox_doc(existing)
+    stamp = now or _durable_task_db_now(s)
+    code = _canonical_inbox_diagnostic(task.task_kind, diagnostic_code, outcome)
+    item_id = uuid.uuid4().hex
+    values = {
+        "id": item_id, "owner_id": task.owner_id, "task_id": task.id,
+        "task_attempt_id": attempt.id, "canvas_id": task.canvas_id,
+        "task_kind": task.task_kind, "outcome": outcome, "diagnostic_code": code,
+        "terminal_at": stamp, "created_at": stamp, "read_at": None,
+    }
+    if s.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    s.execute(dialect_insert(DurableTaskInboxItem).values(**values).on_conflict_do_nothing(
+        index_elements=["task_id", "task_attempt_id"]))
+    row = s.scalar(select(DurableTaskInboxItem).where(
+        DurableTaskInboxItem.task_id == task.id,
+        DurableTaskInboxItem.task_attempt_id == attempt.id,
+    ).limit(1))
+    if row is None:
+        raise RuntimeError("durable task inbox emission failed to persist")
+    if (row.owner_id != task.owner_id or row.task_kind != task.task_kind
+            or row.outcome != outcome or row.canvas_id != task.canvas_id):
+        raise ValueError("later inbox outcome for the same attempt is rejected")
+    return _durable_task_inbox_doc(row)
+
+
+def list_durable_task_inbox_items(
+        owner_id: str, *, limit: int = 50, before_created_at: datetime.datetime | None = None,
+        before_id: str | None = None) -> dict:
+    """Bounded owner-scoped Inbox page for #417 reuse. Every query includes the owner predicate."""
+    owner_id = str(owner_id)
+    limit = max(1, min(int(limit), 200))
+    with session() as s:
+        predicates = [DurableTaskInboxItem.owner_id == owner_id]
+        if before_created_at is not None and before_id is not None:
+            stamp = before_created_at
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+            predicates.append(or_(
+                DurableTaskInboxItem.created_at < stamp,
+                and_(DurableTaskInboxItem.created_at == stamp,
+                     DurableTaskInboxItem.id < str(before_id)),
+            ))
+        rows = list(s.scalars(select(DurableTaskInboxItem).where(*predicates).order_by(
+            DurableTaskInboxItem.created_at.desc(), DurableTaskInboxItem.id.desc(),
+        ).limit(limit + 1)))
+        page = rows[:limit]
+        return {
+            "items": [_durable_task_inbox_doc(row) for row in page],
+            "has_more": len(rows) > limit,
+        }
+
+
+def count_durable_task_inbox_unread(owner_id: str) -> int:
+    with session() as s:
+        return int(s.scalar(select(func.count()).select_from(DurableTaskInboxItem).where(
+            DurableTaskInboxItem.owner_id == str(owner_id),
+            DurableTaskInboxItem.read_at.is_(None),
+        )) or 0)
+
+
+def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | None:
+    """Idempotent owner-scoped mark-read using DB time; replay returns the original timestamp."""
+    owner_id, item_id = str(owner_id), str(item_id)
+    with session() as s:
+        item = s.get(DurableTaskInboxItem, item_id, with_for_update=True)
+        if item is None or item.owner_id != owner_id:
+            return None
+        if item.read_at is None:
+            item.read_at = _durable_task_db_now(s)
+        return _durable_task_inbox_doc(item)
+
+
+def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
+    with session() as s:
+        item = s.get(DurableTaskInboxItem, str(item_id))
+        if item is None or item.owner_id != str(owner_id):
+            return None
+        return _durable_task_inbox_doc(item)
 
 
 def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> str:
@@ -3831,6 +4032,9 @@ def _claim_durable_task_kind(
                 failed = _task_status_doc(task.id, task.target_node_id, "failed")
                 failed["error"] = task.error
                 task.status_doc = json.dumps(failed, default=str)
+                _emit_durable_task_inbox_item(
+                    s, task=task, attempt=attempt, task_status="failed",
+                    diagnostic_code="durable_task_attempts_exhausted", now=now)
                 return None
             task.retry_count = attempt.attempt_number
             attempt = DurableTaskAttempt(
@@ -3846,6 +4050,8 @@ def _claim_durable_task_kind(
             task.completed_at = now
             task.status_doc = json.dumps(
                 _task_status_doc(task.id, task.target_node_id, "cancelled"), default=str)
+            _emit_durable_task_inbox_item(
+                s, task=task, attempt=attempt, task_status="cancelled", now=now)
             return None
         attempt.status = "running"
         attempt.owner_token = str(owner_token)
@@ -3950,7 +4156,14 @@ def finish_durable_task_attempt(
         if task is None or attempt is None:
             return False
         if task.status in _TERMINAL_RUN:
-            return task.status == status.status and task.status_doc == payload
+            ok = task.status == status.status and task.status_doc == payload
+            # Same-attempt response-loss replay reconciles the existing item. A superseded /
+            # fenced caller that happens to carry an identical task-level status_doc must not
+            # mint a second Inbox row under a different attempt id.
+            if ok and attempt.task_id == task.id and attempt.status == status.status:
+                _emit_durable_task_inbox_item(
+                    s, task=task, attempt=attempt, task_status=status.status)
+            return ok
         now = _durable_task_db_now(s)
         lease = attempt.lease_until
         if lease is not None and lease.tzinfo is None:
@@ -3971,6 +4184,8 @@ def finish_durable_task_attempt(
         task.output_receipt = receipt_payload
         task.completed_at = now
         task.updated_at = now
+        _emit_durable_task_inbox_item(
+            s, task=task, attempt=attempt, task_status=status.status, now=now)
         return True
 
 
@@ -4013,6 +4228,9 @@ def _external_wait_terminal(
     if error:
         status["error"] = error
     task.status_doc = json.dumps(status, default=str)
+    _emit_durable_task_inbox_item(
+        s, task=task, attempt=attempt, task_status=task_status,
+        diagnostic_code=code, now=now)
 
 
 def due_external_wait_task_ids(limit: int = 100) -> list[str]:
@@ -4052,7 +4270,14 @@ def fail_corrupt_external_wait_tasks(limit: int = 100) -> None:
                     or (attempt is not None and wait is not None)):
                 continue
             now = _durable_task_db_now(s)
-            if attempt is not None:
+            if attempt is None:
+                attempt = DurableTaskAttempt(
+                    id=uuid.uuid4().hex, task_id=task.id, attempt_number=1,
+                    status="failed", error="external wait evidence invalid",
+                    completed_at=now, created_at=now)
+                s.add(attempt)
+                s.flush()
+            else:
                 attempt.status = "failed"
                 attempt.error = "external wait evidence invalid"
                 attempt.completed_at = now
@@ -4067,6 +4292,9 @@ def fail_corrupt_external_wait_tasks(limit: int = 100) -> None:
             status = _task_status_doc(task.id, task.target_node_id, "failed")
             status["error"] = task.error
             task.status_doc = json.dumps(status, default=str)
+            _emit_durable_task_inbox_item(
+                s, task=task, attempt=attempt, task_status="failed",
+                diagnostic_code="external_wait_evidence_invalid", now=now)
 
 
 def expire_external_wait_deadlines(limit: int = 100) -> None:
@@ -4387,6 +4615,8 @@ def finish_external_wait_publication(
         wait.stage_dev = wait.stage_ino = None
         wait.download_evidence = None
         wait.updated_at = now
+        _emit_durable_task_inbox_item(
+            s, task=task, attempt=attempt, task_status="done", now=now)
         return True
 
 
@@ -4841,6 +5071,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         durable_waits = list(s.scalars(select(DurableExternalWait).where(
             DurableExternalWait.task_id.in_([task.id for task in durable_tasks]),
         ).order_by(DurableExternalWait.task_id).with_for_update())) if durable_tasks else []
+        durable_inbox = list(s.scalars(select(DurableTaskInboxItem).where(
+            DurableTaskInboxItem.task_id.in_([task.id for task in durable_tasks]),
+        ).order_by(DurableTaskInboxItem.task_id, DurableTaskInboxItem.id).with_for_update())
+        ) if durable_tasks else []
         versions = list(s.scalars(select(CanvasVersion).where(
             CanvasVersion.canvas_id == canvas_id
         ).order_by(CanvasVersion.id).with_for_update()))
@@ -4865,6 +5099,11 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(admission)
         for wait in durable_waits:
             s.delete(wait)
+        for item in durable_inbox:
+            s.delete(item)
+        if durable_inbox:
+            # Inbox rows FK to attempts; drop them before attempt deletion on Postgres.
+            s.flush()
         if durable_checkpoints:
             # Terminal hidden checkpoints must release their durable owner / retire their candidate
             # under the registry lock before the rows vanish, or a committed artifact would stay
