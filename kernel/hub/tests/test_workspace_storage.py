@@ -597,9 +597,14 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
     monkeypatch.setattr(provider, "search", controlled_search)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     bounded = workspace_providers.bounded_search
+
+    def search_with_controlled_timeout(provider_arg, mount, *args, **kwargs):
+        timeout = 0.001 if mount.id == "a-slow" else 1.0
+        return bounded(provider_arg, mount, *args, **kwargs, timeout=timeout)
+
     monkeypatch.setattr(
         workspace_providers, "bounded_search",
-        lambda *args, **kwargs: bounded(*args, **kwargs, timeout=0.001),
+        search_with_controlled_timeout,
     )
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
         {"id": "a-slow", "provider": "fixture"},
