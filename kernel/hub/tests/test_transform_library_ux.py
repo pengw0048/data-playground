@@ -146,11 +146,17 @@ def test_library_cursor_keeps_its_exact_version_boundary_when_latest_title_moves
         f"/api/processors/{first['id']}/versions/{first['version']}",
         headers=_headers(uid))
     assert deleted.status_code == 200
-    page_two = client.get("/api/transform-library", headers=_headers(uid), params={
-        "source": "promoted", "limit": 1, "cursor": cursor,
-    })
-    assert page_two.status_code == 200, page_two.text
-    assert page_two.json()["items"][0]["id"] == middle["id"]
+    seen = [first["id"]]
+    while cursor:
+        response = client.get("/api/transform-library", headers=_headers(uid), params={
+            "source": "promoted", "limit": 1, "cursor": cursor,
+        })
+        assert response.status_code == 200, response.text
+        page = response.json()
+        seen.extend(item["id"] for item in page["items"])
+        cursor = page["nextCursor"]
+    assert seen == [first["id"], middle["id"]]
+    assert len(seen) == len(set(seen))
 
 
 def test_exact_target_actions_are_atomic_role_checked_and_canvas_scoped() -> None:

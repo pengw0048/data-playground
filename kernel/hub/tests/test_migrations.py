@@ -167,7 +167,7 @@ def test_committed_migration_revisions_are_immutable():
             "ecf98726b68f39faa2ebd4fd08f45798baa6d60446d844805f9ddaab9884767a"
         ),
         "0025_transform_library_keys.py": (
-            "c6a7ced025450ee632e52b45cdbce54d646d20f58da0cbda95e6294770ec4f43"
+            "e8cec95b871d07febaf9762c94f66c1bacb5a812b3064314e5926c70523861cc"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
@@ -202,46 +202,75 @@ def test_transform_library_keys_backfill_and_round_trip_from_0024(tmp_path):
                 "(:first_id, 1, :first_digest, 'Ä robot', 'First', 'Robotics', 'map', "
                 "'def fn(row): return row', '[]', '[]', '[]', "
                 "'transform-migration-owner', CURRENT_TIMESTAMP), "
-                "(:second_id, 1, :second_digest, 'Ö robot', 'Second', 'Robotics', 'map', "
+                "(:first_id, 2, :moved_digest, 'ZZZ robot', 'First moved', 'Robotics', 'map', "
+                "'def fn(row): return row', '[]', '[]', '[]', "
+                "'transform-migration-owner', CURRENT_TIMESTAMP), "
+                "(:second_id, 2, :second_digest, 'Ö robot', 'Second', 'Robotics', 'map', "
                 "'def fn(row): return row', '[]', '[]', '[]', "
                 "'transform-migration-owner', CURRENT_TIMESTAMP)"
             ), {
                 "first_id": first_id, "second_id": second_id,
                 "first_digest": "a" * 64, "second_digest": "b" * 64,
+                "moved_digest": "c" * 64,
             })
 
         with metadb.engine().connect() as connection:
             command.upgrade(metadb._alembic_cfg(connection), "head")
-            rows = connection.execute(sa.text(
-                "SELECT transform_id, library_sort_key, library_search_text, "
-                "library_category_key, library_mode_key "
-                "FROM promoted_transform_versions ORDER BY library_sort_key"
+            identities = connection.execute(sa.text(
+                "SELECT id, library_sort_key FROM promoted_transforms ORDER BY library_sort_key"
             )).mappings().all()
-            assert [row["transform_id"] for row in rows] == [first_id, second_id]
-            assert rows[0]["library_sort_key"] == "ä robot".encode("utf-8").hex()
+            assert [row["id"] for row in identities] == [first_id, second_id]
+            assert identities[0]["library_sort_key"] == "ä robot".encode("utf-8").hex()
+            assert identities[1]["library_sort_key"] == "ö robot".encode("utf-8").hex()
+            rows = connection.execute(sa.text(
+                "SELECT transform_id, version, library_search_text, "
+                "library_category_key, library_mode_key "
+                "FROM promoted_transform_versions ORDER BY transform_id, version"
+            )).mappings().all()
+            assert [(row["transform_id"], row["version"]) for row in rows] == [
+                (first_id, 1), (first_id, 2), (second_id, 2),
+            ]
             assert rows[0]["library_search_text"] == (
                 f"ä robot\nfirst\nrobotics\nmap\n{first_id}")
             assert rows[0]["library_category_key"] == "robotics"
             assert rows[0]["library_mode_key"] == "map"
             assert all(all(row[key] for key in (
-                "library_sort_key", "library_search_text",
-                "library_category_key", "library_mode_key",
+                "library_search_text", "library_category_key", "library_mode_key",
             )) for row in rows)
-
-            command.downgrade(metadb._alembic_cfg(connection), "0024_promoted_transforms")
             assert "library_sort_key" not in {
                 column["name"]
                 for column in inspect(connection).get_columns("promoted_transform_versions")
             }
+
+        page = metadb.promoted_transform_library_page(
+            "transform-migration-owner", limit=10)
+        assert [(row["id"], row["version"], row["title"]) for row in page] == [
+            (first_id, "v2", "ZZZ robot"),
+            (second_id, "v2", "Ö robot"),
+        ]
+
+        with metadb.engine().connect() as connection:
+            command.downgrade(metadb._alembic_cfg(connection), "0024_promoted_transforms")
+            assert "library_sort_key" not in {
+                column["name"]
+                for column in inspect(connection).get_columns("promoted_transforms")
+            }
             assert connection.execute(sa.text(
-                "SELECT transform_id, title FROM promoted_transform_versions "
-                "ORDER BY transform_id"
-            )).all() == [(first_id, "Ä robot"), (second_id, "Ö robot")]
+                "SELECT transform_id, version, title FROM promoted_transform_versions "
+                "ORDER BY transform_id, version"
+            )).all() == [
+                (first_id, 1, "Ä robot"),
+                (first_id, 2, "ZZZ robot"),
+                (second_id, 2, "Ö robot"),
+            ]
             command.upgrade(metadb._alembic_cfg(connection), "head")
             assert connection.execute(sa.text(
                 "SELECT count(*) FROM promoted_transform_versions "
-                "WHERE library_sort_key IS NOT NULL AND library_search_text IS NOT NULL "
+                "WHERE library_search_text IS NOT NULL "
                 "AND library_category_key IS NOT NULL AND library_mode_key IS NOT NULL"
+            )).scalar_one() == 3
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM promoted_transforms WHERE library_sort_key IS NOT NULL"
             )).scalar_one() == 2
 
 

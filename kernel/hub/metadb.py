@@ -320,6 +320,7 @@ class PromotedTransform(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     key: Mapped[str] = mapped_column(String(256), nullable=False)
+    library_sort_key: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
@@ -335,7 +336,6 @@ class PromotedTransformVersion(Base):
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     semantic_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
-    library_sort_key: Mapped[str] = mapped_column(Text, nullable=False)
     library_search_text: Mapped[str] = mapped_column(Text, nullable=False)
     library_category_key: Mapped[str] = mapped_column(Text, nullable=False)
     library_mode_key: Mapped[str] = mapped_column(Text, nullable=False)
@@ -5730,7 +5730,9 @@ def promote_transform(
     with session() as s:
         dialect = s.get_bind().dialect.name
         values = {
-            "id": transform_id, "owner_id": owner_id, "key": key, "created_at": _now(),
+            "id": transform_id, "owner_id": owner_id, "key": key,
+            "library_sort_key": transform_library_sort_key(definition["title"]),
+            "created_at": _now(),
         }
         if dialect == "postgresql":
             from sqlalchemy.dialects.postgresql import insert as dialect_insert
@@ -5763,7 +5765,6 @@ def promote_transform(
             version=next_version,
             semantic_digest=semantic_digest,
             title=definition["title"],
-            library_sort_key=transform_library_sort_key(definition["title"]),
             library_search_text=transform_library_search_text(
                 definition["title"], definition["blurb"], definition["category"],
                 definition["mode"], transform_id),
@@ -5814,7 +5815,7 @@ def promoted_transform_library_page(
         PromotedTransformVersion.version,
         PromotedTransformVersion.semantic_digest,
         PromotedTransformVersion.title,
-        PromotedTransformVersion.library_sort_key,
+        PromotedTransform.library_sort_key,
         PromotedTransformVersion.library_search_text,
         PromotedTransformVersion.library_category_key,
         PromotedTransformVersion.library_mode_key,
@@ -5923,7 +5924,7 @@ def promoted_transform_library_cursor_key(
         row = s.get(PromotedTransformVersion, (str(transform_id), number))
         if identity is None or identity.owner_id != str(owner_id) or row is None:
             return None
-        return row.library_sort_key
+        return identity.library_sort_key
 
 
 def canvas_transform_references(uid: str, canvas_id: str) -> list[dict]:
