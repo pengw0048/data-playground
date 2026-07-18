@@ -121,15 +121,15 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.queryByText(/Couldn't open file/i)).toBeNull()
   })
 
-  it('pins one bounded Lance revision and invalidates downstream state', async () => {
+  it('pins one bounded managed-local Parquet revision and invalidates downstream state', async () => {
     const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
-      title: 'orders', status: 'latest', config: { uri: '/data/orders.lance', tableId: 't1' },
+      title: 'orders', status: 'latest', config: { uri: '/data/orders.parquet', tableId: 't1' },
     } }
     const target = { id: 'out', type: 'write', position: { x: 100, y: 0 }, data: {
       title: 'output', status: 'latest', config: {},
     } }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.lance' }],
+    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.parquet' }],
       doc: { id: 'c', name: 'test', version: 1, nodes: [source, target], edges: [{ id: 'e', source: 's1', target: 'out' }] } } as any)
     mocks.datasetRevisions.mockResolvedValue({ items: [
       { datasetId: 'dataset-1', revisionId: '2', committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' },
@@ -146,6 +146,21 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
     expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
+  })
+
+  it('does not request history or offer exact pinning when the provider omits exact capability', async () => {
+    const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
+      title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, nodes: [source], edges: [] } } as any)
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: ['latest'], asOfOrdering: null, timezone: null,
+    })
+    render1(source.data)
+
+    expect(await screen.findByRole('button', { name: 'Revision selection unavailable' })).toBeDisabled()
+    expect(mocks.datasetRevisions).not.toHaveBeenCalled()
   })
 
   it('preserves an unavailable pinned selection with a recoverable explanation', async () => {
