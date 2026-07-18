@@ -281,7 +281,11 @@ function TransformDetail({ detail, selected, requestedMissing, onSelectVersion, 
 }
 
 function SchemaDiff({ label, diff }: { label: string; diff: SchemaCompatibility | null }) {
-  const changes = diff?.fields.filter((field) => field.kind !== 'unchanged') ?? []
+  const changes = diff?.fields.flatMap((field) => {
+    if (field.kind !== 'unchanged') return [field]
+    if (field.status === 'compatible' && field.reason === 'logical type is unchanged') return []
+    return [{ ...field, kind: 'changed' as const }]
+  }) ?? []
   return <div className="rounded-md border border-border bg-background p-2 text-[10.5px]">
     <div className="flex items-center justify-between gap-2"><strong>{label} schema</strong><span className="font-semibold">{diff?.status ?? 'unknown'}</span></div>
     {!changes.length && <p className="mt-1 text-muted-foreground">No field changes.</p>}

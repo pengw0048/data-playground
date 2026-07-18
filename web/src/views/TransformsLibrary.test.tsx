@@ -190,6 +190,53 @@ describe('TransformsLibrary', () => {
     }))
   })
 
+  it('renders a same-name type change instead of claiming there are no field changes', async () => {
+    store.transformVersion = 'v2'
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: 'tr_exact', provenance: 'promoted', requestedVersion: 'v2',
+      versions: [entry('v2'), {
+        ...entry('v1'),
+        inputSchema: [{ ...schema[0], type: 'bigint' }],
+      }],
+    })
+    mocks.getCanvas.mockResolvedValue(targetDoc())
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByText('logical type narrows from bigint to int')).toBeVisible()
+    expect(screen.getByText('changed · breaking')).toBeVisible()
+    expect(screen.getAllByText('No field changes.')).toHaveLength(1)
+  })
+
+  it('renders same-name nullability changes and unknown nullability evidence', async () => {
+    store.transformVersion = 'v2'
+    store.transformUpgradeCanvasId = 'target'
+    store.transformUpgradeNodeId = 'node-1'
+    mocks.transformLibraryDetail.mockResolvedValue({
+      id: 'tr_exact', provenance: 'promoted', requestedVersion: 'v2',
+      versions: [{
+        ...entry('v2'),
+        inputSchema: [{ ...schema[0], nullable: undefined }],
+        outputSchema: [{ ...schema[0], nullable: false }],
+      }, {
+        ...entry('v1'),
+        inputSchema: [{ ...schema[0], nullable: true }],
+        outputSchema: [{ ...schema[0], nullable: true }],
+      }],
+    })
+    mocks.getCanvas.mockResolvedValue(targetDoc())
+
+    render(<TransformsLibrary />)
+
+    expect(await screen.findByText(/nullability is not proven on both versions/)).toBeVisible()
+    expect(screen.getByText(/field became non-nullable/)).toBeVisible()
+    expect(screen.getByText('changed · unknown')).toBeVisible()
+    expect(screen.getByText('changed · breaking')).toBeVisible()
+    expect(screen.queryByText('No field changes.')).not.toBeInTheDocument()
+  })
+
   it('keeps a committed upgrade non-retryable when its Canvas cannot be opened', async () => {
     store.transformVersion = 'v2'
     store.transformUpgradeCanvasId = 'target'
