@@ -183,6 +183,47 @@ test.describe('Data Playground canvas', () => {
     await page.unroute(`**/api/canvas/${canvasId}`)
   })
 
+  test('ReactFlow click, shift, and rubber-band selections stay synchronized with Inspector', async ({ page }) => {
+    const canvasId = `selection-sync-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Selection sync', version: 1,
+      nodes: [
+        { id: 'select-a', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'First', status: 'draft', config: {} } },
+        { id: 'select-b', type: 'filter', position: { x: 420, y: 80 }, data: { title: 'Second', status: 'draft', config: {} } },
+      ], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const first = page.locator('.react-flow__node[data-id="select-a"]')
+    const second = page.locator('.react-flow__node[data-id="select-b"]')
+
+    await first.click()
+    await expect(first).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector').getByRole('textbox', { name: 'Node title' })).toHaveValue('First')
+    await second.click({ modifiers: ['Shift'] })
+    await expect(first).toHaveClass(/selected/)
+    await expect(second).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
+
+    const pane = page.locator('.react-flow__pane')
+    await pane.click({ position: { x: 5, y: 5 } })
+    await expect(first).not.toHaveClass(/selected/)
+    await expect(second).not.toHaveClass(/selected/)
+    const firstBox = await boxOf(first)
+    const secondBox = await boxOf(second)
+    await page.mouse.move(firstBox.x - 12, firstBox.y - 12)
+    await page.mouse.down()
+    await page.mouse.move(firstBox.x + firstBox.width + 12, firstBox.y + firstBox.height + 12, { steps: 5 })
+    await expect(first).toHaveClass(/selected/) // selection has already reconciled through the store mid-drag
+    await expect(second).not.toHaveClass(/selected/)
+    await page.mouse.move(secondBox.x + secondBox.width + 12, secondBox.y + secondBox.height + 12, { steps: 5 })
+    await page.mouse.up()
+    await expect(first).toHaveClass(/selected/)
+    await expect(second).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
+  })
+
   test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {
     await page.emulateMedia({ colorScheme: 'light' })  // deterministic default (no OS 'dark' bleed-through)
     await page.goto('/')
