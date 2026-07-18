@@ -44,6 +44,11 @@ def _reset_fanout_state():
     """Isolate the global 4-slot pool + plans/units between tests so the suite is safe on a shared
     (PostgreSQL) database, not only a fresh per-module SQLite file."""
     yield
+    with bft._active_lock:
+        active = [state[1] for state in bft._active.values() if state[1].is_alive()]
+    deadline = time.time() + 5.0
+    for thread in active:
+        thread.join(timeout=max(0.0, deadline - time.time()))
     from sqlalchemy import delete, update
 
     from hub import bounded_fanout as fanout
@@ -56,6 +61,13 @@ def _reset_fanout_state():
         s.execute(delete(metadb.LocalResultReference).where(
             metadb.LocalResultReference.owner_kind.in_(
                 (fanout.CHILD_OWNER, fanout.GATHER_OWNER))))
+    with bft._active_lock:
+        remaining = {
+            task_id: state[1].name
+            for task_id, state in bft._active.items()
+            if state[1].is_alive()
+        }
+    assert remaining == {}, f"bounded fan-out workers outlived their test: {remaining}"
 
 
 def _source_table(rows: int) -> pa.Table:
@@ -98,6 +110,11 @@ def _await_status(task_id, statuses=("done", "failed", "cancelled"), timeout=60)
     while time.time() < deadline:
         observed = metadb.durable_task(task_id)
         if observed and observed["status"] in statuses:
+            with bft._active_lock:
+                active = bft._active.get(str(task_id))
+            if active is not None:
+                active[1].join(timeout=max(0.0, deadline - time.time()))
+                assert not active[1].is_alive(), f"fan-out worker did not exit: {task_id}"
             return observed
         time.sleep(0.1)
     return observed
@@ -292,6 +309,7 @@ def test_same_semantic_replay_idempotent(tmp_path):
     second, _ = start_run(deps, graph.model_copy(deep=True), "write", uid,
                           confirmed=True, submission_id=submission)
     assert first.run_id == second.run_id
+    assert _await_status(first.run_id)["status"] == "done"
     deps.storage.close()
 
 
@@ -304,8 +322,8 @@ def test_changed_semantics_conflict(tmp_path):
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Conflict"))
     deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
     graph = _canvas_graph(tmp_path, canvas_id, deps, rows=2)
-    start_run(deps, graph.model_copy(deep=True), "write", uid,
-              confirmed=True, submission_id=submission)
+    status, _ = start_run(deps, graph.model_copy(deep=True), "write", uid,
+                          confirmed=True, submission_id=submission)
     changed = graph.model_copy(deep=True)
     identity = next(node for node in changed.nodes if node.id == "identity")
     identity.data["config"]["select"] = "value"
@@ -313,6 +331,7 @@ def test_changed_semantics_conflict(tmp_path):
         start_run(deps, changed, "write", uid, confirmed=True, submission_id=submission)
     # Shape rejection (409) before or as submission conflict
     assert exc.value.status_code == 409
+    assert _await_status(status.run_id)["status"] == "done"
     deps.storage.close()
 
 
@@ -333,18 +352,19 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Once"))
     deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
     graph = _canvas_graph(tmp_path, canvas_id, deps, rows=3)
-    counts = {"prefix": 0}
+    counts: dict[str, int] = {}
     original = bft._materialize_prefix
 
-    def counted(*args, **kwargs):
-        counts["prefix"] += 1
-        return original(*args, **kwargs)
+    def counted(worker_deps, claimed, attempt_id, owner_token, candidate):
+        counted_task_id = str(claimed["id"])
+        counts[counted_task_id] = counts.get(counted_task_id, 0) + 1
+        return original(worker_deps, claimed, attempt_id, owner_token, candidate)
 
     monkeypatch.setattr(bft, "_materialize_prefix", counted)
     status, _ = start_run(deps, graph, "write", uid, confirmed=True, submission_id=submission)
     task_id = status.run_id
     assert _await_status(task_id)["status"] == "done"
-    assert counts["prefix"] == 1
+    assert counts.get(task_id) == 1
 
     with metadb.session() as session:
         task = session.get(metadb.DurableTask, task_id)
@@ -362,7 +382,7 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
     observed = metadb.durable_task(task_id)
     assert observed is not None
     assert [attempt["status"] for attempt in observed["attempts"]] == ["failed", "done"]
-    assert counts["prefix"] == 1
+    assert counts.get(task_id) == 1
     assert observed["status"] == "done"
     deps.storage.close()
 
