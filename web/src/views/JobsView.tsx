@@ -148,6 +148,10 @@ export function JobsView() {
   }
   const nodeChoices = useMemo(() => currentPageNodeChoices(items), [items])
   const backendChoices = useMemo(() => [...new Set(items.map((item) => item.backend).filter(Boolean))], [items])
+  const selectedNodeChoice = nodeChoiceValue(params.get('canvas'), params.get('node'))
+  const listedNode = nodeChoices.some((choice) => choice.value === selectedNodeChoice)
+  const backend = params.get('backend') ?? ''
+  const listedBackend = backendChoices.includes(backend)
   const selectNode = (value: string) => {
     if (!value) {
       update('node', '')
@@ -188,13 +192,15 @@ export function JobsView() {
           </select></label>
         <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Node
-          <select aria-label="Filter jobs by node" value={nodeChoiceValue(params.get('canvas'), params.get('node'))} onChange={(event) => selectNode(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+          <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             <option value="">All nodes on loaded Jobs</option>
+            {!listedNode && selectedNodeChoice && <option value={selectedNodeChoice}>Exact node ID: {params.get('node')}</option>}
             {nodeChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
           </select></label>
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Backend
-          <select aria-label="Filter jobs by backend" value={params.get('backend') ?? ''} onChange={(event) => update('backend', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+          <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             <option value="">All backends on loaded Jobs</option>
+            {!listedBackend && backend && <option value={backend}>Exact backend ID: {backend}</option>}
             {backendChoices.map((backend) => <option key={backend} value={backend}>{backend}</option>)}
           </select></label>
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">From

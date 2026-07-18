@@ -114,6 +114,10 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Exact node ID: exact-node' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
+    expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
     fireEvent.click(screen.getByText('Advanced exact IDs'))
     expect(screen.getByLabelText('Filter jobs by canvas id (exact)')).toHaveValue('not-accessible')
     expect(screen.getByLabelText('Filter jobs by node id (exact)')).toHaveValue('exact-node')
