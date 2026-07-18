@@ -83,7 +83,8 @@ def _tree_fingerprint(root: Path) -> dict[str, str]:
 
 def _check_execution_manifest_owner(
         mismatches: list[dict[str, object]], *, subject: str,
-        actual_sha256: str | None, expected_sha256: str, expected_document: dict) -> None:
+        actual_sha256: str | None, expected_sha256: str,
+        expected_schema_version: int, expected_document: dict) -> None:
     """Classify one restored owner and resolve it through the validating manifest read path."""
     if actual_sha256 is None:
         mismatches.append({
@@ -119,6 +120,14 @@ def _check_execution_manifest_owner(
             "actual": None,
         })
         return
+    if restored["schema_version"] != expected_schema_version:
+        mismatches.append({
+            "subject": subject,
+            "code": "execution_manifest_document_corrupt",
+            "expected": expected_schema_version,
+            "actual": restored["schema_version"],
+        })
+        return
     if restored["document"] != expected_document:
         mismatches.append({
             "subject": subject,
@@ -131,7 +140,11 @@ def _check_execution_manifest_owner(
 def _execution_manifest_expectation(sha256: str) -> dict:
     stored = metadb.execution_manifest(sha256)
     assert stored is not None
-    return {"sha256": sha256, "document": stored["document"]}
+    return {
+        "sha256": sha256,
+        "schema_version": stored["schema_version"],
+        "document": stored["document"],
+    }
 
 
 @contextmanager
@@ -903,7 +916,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     storage.commit_result(artifact_uri, run_id)
     metadb.bind_run_owner(run_id, metadb.DEFAULT_USER_ID, canvas_id)
     run_output = RunOutput(
-        node_id="n1",
+        node_id="write",
         port_id="out",
         wire="dataset",
         publication_kind="result",
@@ -916,7 +929,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         {
             "run_id": run_id,
             "status": "done",
-            "target_node_id": "n1",
+            "target_node_id": "write",
             "total_rows": 1,
             "outputs": [run_output],
         },
@@ -926,7 +939,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     )
     assert storage.release_result(artifact_uri, run_id) is True
     metadb.record_run(
-        canvas_id, "n1", "run", "done", rows=1, outputs=[run_output], run_id=run_id)
+        canvas_id, "write", "run", "done", rows=1, outputs=[run_output], run_id=run_id)
     with metadb.session() as session:
         canvas = session.get(metadb.Canvas, canvas_id, with_for_update=True)
         assert canvas is not None
@@ -1023,6 +1036,7 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
             select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == info["canvas_id"])))
         assert any(
             row.run_id == info["run_id"]
+            and row.target_node_id == "write"
             and json.loads(row.outputs)[0]["uri"] == info["artifact_uri"]
             and json.loads(row.input_manifest) == info["admitted_manifest"]
             for row in runs
@@ -1030,6 +1044,7 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         state = session.get(metadb.RunState, info["run_id"])
         assert state is not None and state.status == "done"
         state_doc = json.loads(state.doc)
+        assert state_doc["target_node_id"] == "write"
         assert state_doc["outputs"][0]["uri"] == info["artifact_uri"]
         assert not ({"output_uri", "output_table"} & state_doc.keys())
         artifact = session.get(metadb.LocalResultArtifact, info["artifact_uri"])
@@ -1403,6 +1418,7 @@ def _assert_execution_manifest_recovery(info: dict) -> None:
             subject=subject,
             actual_sha256=actual_sha256,
             expected_sha256=expected["sha256"],
+            expected_schema_version=expected["schema_version"],
             expected_document=expected["document"],
         )
     if mismatches:
@@ -1768,6 +1784,7 @@ def _reset_database(url: str) -> None:
 
 def test_execution_manifest_restore_mismatch_classification(monkeypatch):
     expected_sha256 = "a" * 64
+    expected_schema_version = 1
     expected_document = {"schemaVersion": 1}
     mismatches: list[dict[str, object]] = []
 
@@ -1777,6 +1794,7 @@ def test_execution_manifest_restore_mismatch_classification(monkeypatch):
         subject="pruned owner",
         actual_sha256=None,
         expected_sha256=expected_sha256,
+        expected_schema_version=expected_schema_version,
         expected_document=expected_document,
     )
     _check_execution_manifest_owner(
@@ -1784,6 +1802,7 @@ def test_execution_manifest_restore_mismatch_classification(monkeypatch):
         subject="missing document",
         actual_sha256=expected_sha256,
         expected_sha256=expected_sha256,
+        expected_schema_version=expected_schema_version,
         expected_document=expected_document,
     )
 
@@ -1796,12 +1815,28 @@ def test_execution_manifest_restore_mismatch_classification(monkeypatch):
         subject="corrupt document",
         actual_sha256=expected_sha256,
         expected_sha256=expected_sha256,
+        expected_schema_version=expected_schema_version,
+        expected_document=expected_document,
+    )
+
+    monkeypatch.setattr(metadb, "execution_manifest", lambda _sha256: {
+        "sha256": expected_sha256,
+        "schema_version": 2,
+        "document": expected_document,
+    })
+    _check_execution_manifest_owner(
+        mismatches,
+        subject="wrong schema version",
+        actual_sha256=expected_sha256,
+        expected_sha256=expected_sha256,
+        expected_schema_version=expected_schema_version,
         expected_document=expected_document,
     )
 
     assert [item["code"] for item in mismatches] == [
         "execution_manifest_owner_pruned",
         "execution_manifest_document_missing",
+        "execution_manifest_document_corrupt",
         "execution_manifest_document_corrupt",
     ]
 
