@@ -72,6 +72,7 @@ export function JobsView() {
   const [refreshError, setRefreshError] = useState('')
   const [loadMoreError, setLoadMoreError] = useState('')
   const [loadedMore, setLoadedMore] = useState(false)
+  const [hasActiveFirstPage, setHasActiveFirstPage] = useState(false)
   const [lastSuccessfulRefresh, setLastSuccessfulRefresh] = useState<number | null>(null)
   const [actionError, setActionError] = useState('')
   const [acting, setActing] = useState('')
@@ -93,7 +94,11 @@ export function JobsView() {
     else {
       setLoading(true); setError(''); setRefreshError(''); setLoadMoreError('')
       if (mode === 'initial') {
-        setItems([]); setCursor(null); setHasMore(false); setLoadedMore(false); setLastSuccessfulRefresh(null)
+        setItems([]); setCursor(null); setHasMore(false); setLoadedMore(false); setHasActiveFirstPage(false); setLastSuccessfulRefresh(null)
+        deepLinkRequest.current = ''
+      } else {
+        // A selected run may have been injected from its direct link rather than the first page.
+        // Recheck it after replacing the page so Refresh preserves that explicit selection.
         deepLinkRequest.current = ''
       }
     }
@@ -103,6 +108,7 @@ export function JobsView() {
       if (!nextCursor) {
         setError('')
         setRefreshError('')
+        setHasActiveFirstPage(page.items.some((item) => item.status === 'queued' || item.status === 'running'))
         setLastSuccessfulRefresh(Date.now())
         setLoadedMore(false)
       }
@@ -135,10 +141,10 @@ export function JobsView() {
     return () => { live = false }
   }, [filterKey, items, loading, params])
   useEffect(() => {
-    if (loadedMore || !items.some((item) => item.status === 'queued' || item.status === 'running')) return
+    if (loadedMore || !hasActiveFirstPage) return
     const timer = window.setInterval(() => { if (!loading && !loadingMore) void load(undefined, 'refresh') }, 5000)
     return () => window.clearInterval(timer)
-  }, [items, load, loadedMore, loading, loadingMore])
+  }, [hasActiveFirstPage, load, loadedMore, loading, loadingMore])
 
   const update = (name: string, value: string) => {
     const next = new URLSearchParams(params)
@@ -203,7 +209,6 @@ export function JobsView() {
     next.delete('run'); next.delete('output')
     setJobsQuery(next.toString())
   }
-  const hasActiveJobs = items.some((item) => item.status === 'queued' || item.status === 'running')
   const freshness = lastSuccessfulRefresh == null
     ? null
     : refreshError
@@ -212,7 +217,7 @@ export function JobsView() {
         : `Refresh failed; showing the last successful first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
       : loadedMore
         ? `Automatic refresh paused after loading more. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
-        : hasActiveJobs
+        : hasActiveFirstPage
           ? `Live first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
           : `Snapshot; no active Jobs. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
 

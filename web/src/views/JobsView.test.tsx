@@ -161,6 +161,25 @@ describe('JobsView', () => {
     expect(await screen.findByText(/Snapshot; no active Jobs\. Last successful refresh:/)).toBeVisible()
   })
 
+  it('does not treat an active direct-link result as an active first page', async () => {
+    vi.useFakeTimers()
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ id: 'first-page', runId: 'first-page', status: 'done', error: null })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [job({ id: 'direct-run', runId: 'direct-run', status: 'running', error: null })], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'run=direct-run' } as never)
+    try {
+      render(<JobsView />)
+      await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+      expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
+      expect(screen.getByText(/Snapshot; no active Jobs\. Last successful refresh:/)).toBeVisible()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('pauses automatic refresh only after Load more succeeds', async () => {
     mocks.workspaceJobs
       .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: true, nextCursor: 'next-page' })
@@ -186,6 +205,22 @@ describe('JobsView', () => {
     expect(screen.queryByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).not.toBeInTheDocument()
     expect(screen.getByText(/Live first page\. Last successful refresh:/)).toBeVisible()
     expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: undefined, limit: 50 }))
+  })
+
+  it('retains an explicitly selected direct-link result across manual refresh', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ id: 'first-page', runId: 'first-page', error: null })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [job({ id: 'direct-run', runId: 'direct-run', error: null })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [job({ id: 'refreshed-page', runId: 'refreshed-page', error: null })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [job({ id: 'direct-run', runId: 'direct-run', error: null })], hasMore: false, nextCursor: null })
+    useStore.setState({ jobsQuery: 'run=direct-run' } as never)
+    render(<JobsView />)
+    await screen.findByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenCalledTimes(4))
+    expect(screen.getByRole('button', { name: 'Open run direct-run in Alpha research', expanded: true })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Open run refreshed-page in Alpha research', expanded: false })).toBeVisible()
   })
 
   it('keeps the last successful first page visible after refresh failure', async () => {
