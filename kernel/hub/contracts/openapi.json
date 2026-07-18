@@ -1186,6 +1186,124 @@
         "title": "DriverStep",
         "type": "object"
       },
+      "DurableCheckpointView": {
+        "description": "Sanitized, path-free checkpoint projection for Workspace Jobs.",
+        "properties": {
+          "bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytes"
+          },
+          "checkpointNodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Checkpointnodeid",
+            "type": "string"
+          },
+          "clientKey": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Clientkey",
+            "type": "string"
+          },
+          "committedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committedat"
+          },
+          "contentDigest": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentdigest"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "outputPortId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Outputportid",
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "pending",
+              "materializing",
+              "committed",
+              "publishing",
+              "terminal"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "resumeEligible": {
+            "default": false,
+            "title": "Resumeeligible",
+            "type": "boolean"
+          },
+          "retryLabel": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retrylabel"
+          },
+          "rows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows"
+          }
+        },
+        "required": [
+          "phase",
+          "checkpointNodeId",
+          "outputPortId",
+          "clientKey"
+        ],
+        "title": "DurableCheckpointView",
+        "type": "object"
+      },
       "DurableExternalWaitView": {
         "properties": {
           "attemptNumber": {
@@ -5573,6 +5691,11 @@
             "title": "Backend",
             "type": "string"
           },
+          "canCancel": {
+            "default": false,
+            "title": "Cancancel",
+            "type": "boolean"
+          },
           "canRetry": {
             "default": false,
             "title": "Canretry",
@@ -5590,6 +5713,16 @@
           "canvasName": {
             "title": "Canvasname",
             "type": "string"
+          },
+          "checkpoint": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableCheckpointView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "createdAt": {
             "anyOf": [

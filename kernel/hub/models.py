@@ -1340,6 +1340,22 @@ class DurableExternalWaitView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableCheckpointView(Wire):
+    """Sanitized, path-free checkpoint projection for Workspace Jobs."""
+
+    phase: Literal["pending", "materializing", "committed", "publishing", "terminal"]
+    checkpoint_node_id: str = Field(min_length=1, max_length=256)
+    output_port_id: str = Field(min_length=1, max_length=128)
+    committed_at: str | None = None
+    rows: int | None = Field(default=None, ge=0)
+    bytes: int | None = Field(default=None, ge=0)
+    content_digest: str | None = Field(default=None, max_length=64)
+    resume_eligible: bool = False
+    retry_label: str | None = Field(default=None, max_length=64)
+    client_key: str = Field(min_length=1, max_length=128)
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+
+
 class WorkspaceRunRecord(Wire):
     """One visible run in the workspace-wide, read-only Jobs projection."""
 
@@ -1368,9 +1384,11 @@ class WorkspaceRunRecord(Wire):
     task_attempts: list[DurableTaskAttemptView] = Field(default_factory=list, max_length=16)
     cancel_requested: bool = False
     can_retry: bool = False
+    can_cancel: bool = False
     write_intent: WriteIntent | None = None
     output_receipt: WriteReceipt | None = None
     external_wait: DurableExternalWaitView | None = None
+    checkpoint: DurableCheckpointView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
