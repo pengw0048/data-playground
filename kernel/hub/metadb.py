@@ -422,10 +422,13 @@ class DurableTask(Base):
     __tablename__ = "durable_tasks"
     id: Mapped[str] = mapped_column(String, primary_key=True)
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
-    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False, index=True)
+    canvas_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("canvases.id"), nullable=True, index=True)
+    dataset_view_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("dataset_views.id"), nullable=True, index=True)
     submission_id: Mapped[str] = mapped_column(String, nullable=False)
     intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    target_node_id: Mapped[str] = mapped_column(String, nullable=False)
+    target_node_id: Mapped[str | None] = mapped_column(String, nullable=True)
     task_kind: Mapped[str] = mapped_column(
         String, nullable=False, default="managed_local_write", server_default="managed_local_write")
     execution_manifest_sha256: Mapped[str | None] = mapped_column(
@@ -453,8 +456,19 @@ class DurableTask(Base):
         UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
-            "'linear_checkpoint_write','bounded_fanout_write')",
+            "'linear_checkpoint_write','bounded_fanout_write','distribution_report')",
             name="ck_durable_task_kind"),
+        CheckConstraint(
+            "(task_kind = 'distribution_report' AND canvas_id IS NULL "
+            "AND target_node_id IS NULL AND dataset_view_id IS NOT NULL "
+            "AND execution_manifest_sha256 IS NULL AND graph_doc IS NULL "
+            "AND input_manifest IS NULL AND write_intent IS NULL) OR "
+            "(task_kind <> 'distribution_report' AND canvas_id IS NOT NULL "
+            "AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
+            name="ck_durable_task_subject"),
+        UniqueConstraint(
+            "owner_id", "dataset_view_id", "submission_id",
+            name="uq_distribution_report_submission"),
         CheckConstraint("backend_kind = 'local'", name="ck_durable_task_backend"),
         CheckConstraint("status IN ('queued','running','done','failed','cancelled')", name="ck_durable_task_status"),
         CheckConstraint("retry_count >= 0 AND max_attempts >= 1 AND retry_count < max_attempts", name="ck_durable_task_retry_bounds"),
@@ -532,7 +546,10 @@ class DurableTaskInboxItem(Base):
     task_id: Mapped[str] = mapped_column(String, ForeignKey("durable_tasks.id"), nullable=False)
     task_attempt_id: Mapped[str] = mapped_column(
         String, ForeignKey("durable_task_attempts.id"), nullable=False)
-    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False)
+    canvas_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("canvases.id"), nullable=True)
+    dataset_view_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("dataset_views.id"), nullable=True, index=True)
     task_kind: Mapped[str] = mapped_column(String, nullable=False)
     execution_manifest_sha256: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True)
@@ -545,14 +562,53 @@ class DurableTaskInboxItem(Base):
         UniqueConstraint("task_id", "task_attempt_id", name="uq_durable_task_inbox_attempt"),
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
-            "'linear_checkpoint_write','bounded_fanout_write')",
+            "'linear_checkpoint_write','bounded_fanout_write','distribution_report')",
             name="ck_durable_task_inbox_kind"),
+        CheckConstraint(
+            "(task_kind = 'distribution_report' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NOT NULL) OR "
+            "(task_kind <> 'distribution_report' AND canvas_id IS NOT NULL "
+            "AND dataset_view_id IS NULL)",
+            name="ck_durable_task_inbox_subject"),
         CheckConstraint(
             "outcome IN ('completed','failed','cancelled')",
             name="ck_durable_task_inbox_outcome"),
         Index("ix_durable_task_inbox_owner_created", "owner_id", "created_at", "id"),
         Index("ix_durable_task_inbox_owner_unread", "owner_id", "read_at"),
         Index("ix_durable_task_inbox_task_id", "task_id"),
+    )
+
+
+class DistributionReportEnvelope(Base):
+    """Immutable DatasetView report admission plus its nullable terminal document."""
+
+    __tablename__ = "distribution_report_envelopes"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    report_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    dataset_view_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("dataset_views.id"), nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    view_definition_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    view_snapshot_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    computation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_retention_owner: Mapped[str] = mapped_column(String(16), nullable=False)
+    report_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint(
+            "length(intent_sha256) = 64", name="ck_distribution_report_intent_sha256"),
+        CheckConstraint(
+            "length(view_definition_sha256) = 64",
+            name="ck_distribution_report_view_sha256"),
+        CheckConstraint(
+            "revision_retention_owner = 'core'",
+            name="ck_distribution_report_retention_owner"),
+        Index("ix_distribution_reports_dataset_view", "dataset_view_id", "created_at"),
     )
 
 
@@ -4165,12 +4221,14 @@ _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
 _CHECKPOINT_PARENT_KINDS = frozenset({"linear_checkpoint_write", "bounded_fanout_write"})
-# #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection.
-_JOBS_HIDDEN_TASK_KINDS: frozenset[str] = frozenset()
+# #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. The hidden
+# distribution-report lifecycle has no Jobs projection until its own product surface exists.
+_JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
-    "bounded_fanout_write",
+    "bounded_fanout_write", "distribution_report",
 })
+_INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -4204,12 +4262,18 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "durable_task_attempts_exhausted",
         "checkpoint_invalid",
     }),
+    "distribution_report": frozenset({
+        "durable_task_attempts_exhausted",
+        "distribution_report_snapshot_invalid",
+        "distribution_report_computation_failed",
+    }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
     "managed_local_write": "managed_local_write_failed",
     "external_wait": "external_wait_failed",
     "linear_checkpoint_write": "linear_checkpoint_write_failed",
     "bounded_fanout_write": "bounded_fanout_write_failed",
+    "distribution_report": "distribution_report_failed",
 }
 
 
@@ -4242,6 +4306,7 @@ def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
         "task_id": item.task_id,
         "task_attempt_id": item.task_attempt_id,
         "canvas_id": item.canvas_id,
+        "dataset_view_id": item.dataset_view_id,
         "task_kind": item.task_kind,
         "execution_manifest_sha256": item.execution_manifest_sha256,
         "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
@@ -4307,7 +4372,7 @@ def _inbox_authorized_canvas_names(s, uid: str, canvas_ids: set[str]) -> dict[st
 def _inbox_public_doc(
         item: DurableTaskInboxItem, *, authorized_names: dict[str, str]) -> dict:
     """Owner-scoped Inbox wire shape for #417 — no raw docs, tokens, or route URLs."""
-    canvas_name = authorized_names.get(item.canvas_id)
+    canvas_name = authorized_names.get(item.canvas_id) if item.canvas_id is not None else None
     return {
         "id": item.id,
         "task_id": item.task_id,
@@ -4348,6 +4413,7 @@ def _emit_durable_task_inbox_item(
     if existing is not None:
         if (existing.owner_id != task.owner_id or existing.task_kind != task.task_kind
                 or existing.outcome != outcome or existing.canvas_id != task.canvas_id
+                or existing.dataset_view_id != task.dataset_view_id
                 or existing.execution_manifest_sha256 != task.execution_manifest_sha256):
             raise ValueError("later inbox outcome for the same attempt is rejected")
         return _durable_task_inbox_doc(existing)
@@ -4357,6 +4423,7 @@ def _emit_durable_task_inbox_item(
     values = {
         "id": item_id, "owner_id": task.owner_id, "task_id": task.id,
         "task_attempt_id": attempt.id, "canvas_id": task.canvas_id,
+        "dataset_view_id": task.dataset_view_id,
         "task_kind": task.task_kind,
         "execution_manifest_sha256": task.execution_manifest_sha256,
         "outcome": outcome, "diagnostic_code": code,
@@ -4376,6 +4443,7 @@ def _emit_durable_task_inbox_item(
         raise RuntimeError("durable task inbox emission failed to persist")
     if (row.owner_id != task.owner_id or row.task_kind != task.task_kind
             or row.outcome != outcome or row.canvas_id != task.canvas_id
+            or row.dataset_view_id != task.dataset_view_id
             or row.execution_manifest_sha256 != task.execution_manifest_sha256):
         raise ValueError("later inbox outcome for the same attempt is rejected")
     return _durable_task_inbox_doc(row)
@@ -4390,7 +4458,10 @@ def list_durable_task_inbox_items(
     filter_name = "unread" if unread_only else "all"
     decoded = _inbox_cursor_decode(cursor, filter_name)
     with session() as s:
-        predicates = [DurableTaskInboxItem.owner_id == owner_id]
+        predicates = [
+            DurableTaskInboxItem.owner_id == owner_id,
+            DurableTaskInboxItem.task_kind.notin_(_INBOX_HIDDEN_TASK_KINDS),
+        ]
         if unread_only:
             predicates.append(DurableTaskInboxItem.read_at.is_(None))
         if decoded is not None:
@@ -4405,7 +4476,7 @@ def list_durable_task_inbox_items(
         ).limit(limit + 1)))
         page = rows[:limit]
         authorized = _inbox_authorized_canvas_names(
-            s, owner_id, {row.canvas_id for row in page})
+            s, owner_id, {row.canvas_id for row in page if row.canvas_id is not None})
         items = [_inbox_public_doc(row, authorized_names=authorized) for row in page]
         has_more = len(rows) > limit
         next_cursor = (
@@ -4418,6 +4489,7 @@ def count_durable_task_inbox_unread(owner_id: str) -> int:
     with session() as s:
         return int(s.scalar(select(func.count()).select_from(DurableTaskInboxItem).where(
             DurableTaskInboxItem.owner_id == str(owner_id),
+            DurableTaskInboxItem.task_kind.notin_(_INBOX_HIDDEN_TASK_KINDS),
             DurableTaskInboxItem.read_at.is_(None),
         )) or 0)
 
@@ -4427,20 +4499,24 @@ def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | Non
     owner_id, item_id = str(owner_id), str(item_id)
     with session() as s:
         item = s.get(DurableTaskInboxItem, item_id, with_for_update=True)
-        if item is None or item.owner_id != owner_id:
+        if (item is None or item.owner_id != owner_id
+                or item.task_kind in _INBOX_HIDDEN_TASK_KINDS):
             return None
         if item.read_at is None:
             item.read_at = _durable_task_db_now(s)
-        authorized = _inbox_authorized_canvas_names(s, owner_id, {item.canvas_id})
+        authorized = _inbox_authorized_canvas_names(
+            s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
         return _inbox_public_doc(item, authorized_names=authorized)
 
 
 def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
     with session() as s:
         item = s.get(DurableTaskInboxItem, str(item_id))
-        if item is None or item.owner_id != str(owner_id):
+        if (item is None or item.owner_id != str(owner_id)
+                or item.task_kind in _INBOX_HIDDEN_TASK_KINDS):
             return None
-        authorized = _inbox_authorized_canvas_names(s, owner_id, {item.canvas_id})
+        authorized = _inbox_authorized_canvas_names(
+            s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
         return _inbox_public_doc(item, authorized_names=authorized)
 
 
@@ -4466,6 +4542,8 @@ def _durable_task_db_now(s) -> datetime.datetime:
 
 def _durable_task_admission(s, task: DurableTask) -> dict:
     """Load one Task's immutable definition from its canonical manifest or legacy frozen columns."""
+    if task.task_kind == "distribution_report":
+        return {}
     if task.execution_manifest_sha256 is not None:
         from hub.execution_manifest import execution_manifest_admission
 
@@ -4908,10 +4986,12 @@ def submit_durable_external_wait_task(
 
 def _durable_task_doc(
         s, task: DurableTask, *, include_admission: bool = True,
-        include_attempt_updates: bool = False) -> dict:
-    attempts = list(s.scalars(select(DurableTaskAttempt).where(
-        DurableTaskAttempt.task_id == task.id,
-    ).order_by(DurableTaskAttempt.attempt_number)))
+        include_attempt_updates: bool = False,
+        attempts: list[DurableTaskAttempt] | None = None) -> dict:
+    if attempts is None:
+        attempts = list(s.scalars(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task.id,
+        ).order_by(DurableTaskAttempt.attempt_number)))
     if any(item.execution_manifest_sha256 != task.execution_manifest_sha256 for item in attempts):
         raise RuntimeError("durable Task and Attempt manifest owners disagree")
 
@@ -4926,6 +5006,7 @@ def _durable_task_doc(
         ).timestamp())
     doc = {
         "id": task.id, "owner_id": task.owner_id, "canvas_id": task.canvas_id,
+        "dataset_view_id": task.dataset_view_id,
         "submission_id": task.submission_id, "target_node_id": task.target_node_id,
         "task_kind": task.task_kind, "intent_sha256": task.intent_sha256,
         "execution_manifest_sha256": task.execution_manifest_sha256,
@@ -4973,7 +5054,8 @@ def durable_task(task_id: str, *, include_admission: bool = True) -> dict | None
 def durable_task_auth(task_id: str) -> tuple[str, str] | None:
     with session() as s:
         row = s.execute(select(DurableTask.owner_id, DurableTask.canvas_id).where(
-            DurableTask.id == str(task_id))).one_or_none()
+            DurableTask.id == str(task_id),
+            DurableTask.canvas_id.is_not(None))).one_or_none()
         return tuple(row) if row is not None else None
 
 
@@ -4981,13 +5063,22 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
     """Lock one Task before making an ownership/action decision on SQLite or Postgres."""
     task_id = str(task_id)
     if s.get_bind().dialect.name == "sqlite":
-        # SQLite ignores SELECT ... FOR UPDATE. The canvas is a stable parent row for the lifetime of
-        # its Task; acquire the single writer lock before reading Task/action replay state.
-        canvas_id = s.scalar(select(DurableTask.canvas_id).where(DurableTask.id == task_id))
-        if canvas_id is None:
+        # SQLite ignores SELECT ... FOR UPDATE. Acquire its stable explicit subject row before
+        # reading Task/action replay state; distribution reports never fabricate a Canvas subject.
+        subject = s.execute(select(
+            DurableTask.canvas_id, DurableTask.dataset_view_id,
+        ).where(DurableTask.id == task_id)).one_or_none()
+        if subject is None:
             return None
-        locked = s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
-            updated_at=Canvas.updated_at))
+        canvas_id, dataset_view_id = subject
+        if canvas_id is not None:
+            locked = s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+                updated_at=Canvas.updated_at))
+        elif dataset_view_id is not None:
+            locked = s.execute(update(DatasetView).where(
+                DatasetView.id == dataset_view_id).values(created_at=DatasetView.created_at))
+        else:
+            return None
         if locked.rowcount != 1:
             return None
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
@@ -5039,6 +5130,15 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     return True
 
 
+def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.datetime) -> None:
+    if task.task_kind != "distribution_report":
+        return
+    report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
+    if report is None:
+        raise RuntimeError("distribution report envelope is unavailable")
+    report.updated_at = report.completed_at = now
+
+
 def _claim_durable_task_kind(
         task_id: str, owner_token: str, task_kind: str) -> dict | None:
     """Claim queued work or fence one expired owner and create the next bounded attempt."""
@@ -5071,6 +5171,7 @@ def _claim_durable_task_kind(
                 failed = _task_status_doc(task.id, task.target_node_id, "failed")
                 failed["error"] = task.error
                 task.status_doc = json.dumps(failed, default=str)
+                _terminalize_hidden_task_envelope(s, task, now)
                 _emit_durable_task_inbox_item(
                     s, task=task, attempt=attempt, task_status="failed",
                     diagnostic_code="durable_task_attempts_exhausted", now=now)
@@ -5093,6 +5194,7 @@ def _claim_durable_task_kind(
             task.completed_at = now
             task.status_doc = json.dumps(
                 _task_status_doc(task.id, task.target_node_id, "cancelled"), default=str)
+            _terminalize_hidden_task_envelope(s, task, now)
             _emit_durable_task_inbox_item(
                 s, task=task, attempt=attempt, task_status="cancelled", now=now)
             return None
@@ -5755,6 +5857,13 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
             wait.diagnostic_code = None
             wait.owner_token = wait.lease_until = None
             wait.updated_at = now
+        elif task.task_kind == "distribution_report":
+            report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
+            if report is None:
+                raise RuntimeError("distribution report envelope is unavailable")
+            report.report_doc = None
+            report.completed_at = None
+            report.updated_at = now
         s.flush()
         return _durable_task_doc(s, task)
 
@@ -9941,7 +10050,8 @@ _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
-    "dataset_view", "durable_task", "profile_job", "run_input_admission", "run_record", "run_state",
+    "dataset_view", "distribution_report", "durable_task", "profile_job",
+    "run_input_admission", "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
@@ -10019,7 +10129,9 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     elif owner_kind in ("canvas", "canvas_version"):
         for value in values:
             candidates.update(_canvas_local_result_candidates(value))
-    elif owner_kind in ("dataset_view", "durable_task", "profile_job", "run_input_admission"):
+    elif owner_kind in (
+            "dataset_view", "distribution_report", "durable_task", "profile_job",
+            "run_input_admission"):
         pass
     else:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
@@ -10138,7 +10250,7 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
     if owner_kind in ("canvas", "canvas_version"):
         for value in values:
             identities.update(_canvas_revision_identities(value))
-    elif owner_kind == "dataset_view":
+    elif owner_kind in ("dataset_view", "distribution_report"):
         for value in values:
             identities.update(_dataset_view_revision_identities(value))
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
