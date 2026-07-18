@@ -260,6 +260,23 @@ def _local_run_source_nodes(graph, target_node_id: str | None):
     return [node for node in cone if node.type == "source"]
 
 
+def _source_supports_automatic_local_admission(node, deps) -> bool:
+    """Keep no-submission auto-admission to exact providers and supported single local files."""
+    data = node.data if isinstance(node.data, dict) else {}
+    config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    uri = str(config.get("uri") or "")
+    if not uri or metadb.catalog_revision_binding_for_uri(uri) is None:
+        return False
+    try:
+        scan_adapter = deps.resolve_adapter(uri)
+        revision_adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
+        from hub.local_run_inputs import supports_local_file_snapshot
+        return (isinstance(revision_adapter, DatasetRevisionAdapter)
+                or supports_local_file_snapshot(uri, scan_adapter))
+    except Exception:
+        return False
+
+
 def _resolve_local_run_manifest(
         graph, target_node_id: str | None, deps, *, materialize_local_files: bool = False,
         local_file_candidates: list[dict[str, str]] | None = None,
@@ -2035,16 +2052,12 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
 
     transport_requires_admission = isinstance(runner, (KernelBackend, SubprocessRunner))
     local_sources = _local_run_source_nodes(graph, target_node_id)
-    registered_local_sources = bool(local_sources) and all(
-        isinstance(node.data, dict)
-        and isinstance(node.data.get("config"), dict)
-        and metadb.catalog_revision_binding_for_uri(str(
-            node.data["config"].get("uri") or "")) is not None
-        for node in local_sources
-    )
+    auto_admittable_local_sources = bool(local_sources) and all(
+        _source_supports_automatic_local_admission(node, deps)
+        for node in local_sources)
     local_runner_admission = bool(
         runner is deps.runner
-        and (submission_id is not None or registered_local_sources))
+        and (submission_id is not None or auto_admittable_local_sources))
     built_in_local_transport = transport_requires_admission or local_runner_admission
     if built_in_local_transport and not controller_regions and submission_id is None:
         submission_id = str(uuid.uuid4())
@@ -2057,9 +2070,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     prebound_local_run_id: str | None = None
     if local_admission:
         assert submission_id is not None
-        operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
-        if operational_canvas is None:
-            raise RuntimeError("local run admission requires a persisted canvas")
+        graph_canvas = (str(getattr(graph, "id", "") or "") or None)
+        operational_canvas = auth_canvas or (
+            graph_canvas if graph_canvas is not None and metadb.canvas_exists(graph_canvas) else None)
+        if isinstance(runner, KernelBackend) and operational_canvas is None:
+            raise HTTPException(409, "kernel runs require a saved canvas")
         prebound_local_run_id = metadb.local_run_submission_id(
             uid, operational_canvas, str(submission_id))
         candidates: list[dict[str, str]] = []
@@ -2090,6 +2105,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             # A newly spawned kernel runs boot recovery before serving. Start it only after admission and
             # exact reopen, but before the queued dispatch claim exists; otherwise that boot recovery can
             # correctly mistake the still-unstamped queued row for a dead prior-hub run.
+            assert operational_canvas is not None
             runner._ensure_kernel(operational_canvas)
         claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
             run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,

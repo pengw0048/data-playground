@@ -16,10 +16,27 @@ from hub.plugins.adapters import DuckDBAdapter, revision_adapter_for_uri
 
 _MANIFEST_FIELDS = {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
 LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
+_LOCAL_FILE_INPUT_EXTENSIONS = (
+    ".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson",
+    ".arrow", ".feather", ".ipc",
+)
 
 
 class LocalRunInputError(RuntimeError):
     """The admitted local-run input contract is malformed, stale, or unavailable."""
+
+
+def supports_local_file_snapshot(uri: str, adapter) -> bool:
+    """Whether automatic exact admission can snapshot this one ordinary local Source."""
+    from hub import paths
+
+    path = paths.checked_local_path(uri)
+    return bool(
+        isinstance(adapter, DuckDBAdapter)
+        and path is not None
+        and os.path.isfile(path)
+        and path.lower().endswith(_LOCAL_FILE_INPUT_EXTENSIONS)
+    )
 
 
 def _source_options(config: dict) -> dict[str, str]:
@@ -256,7 +273,7 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
                 item["dataset_id"], item["revision_id"])
             if artifact_uri is None:
                 raise LocalRunInputError("local run input revision is unavailable")
-            uri = artifact_uri
+            revision_uri = artifact_uri
         elif (source_binding is None
                 or str(source_binding["dataset_id"]) != item["dataset_id"]
                 or (selected_identity is not None and selected_identity != (
@@ -270,8 +287,9 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             if binding is None:
                 raise LocalRunInputError("local run input revision is unavailable")
             uri = str(binding["uri"])
+            revision_uri = uri
         try:
-            adapter = revision_adapter_for_uri(uri, resolve_adapter)
+            adapter = revision_adapter_for_uri(revision_uri, resolve_adapter)
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         if (not isinstance(adapter, DatasetRevisionAdapter)
@@ -279,11 +297,12 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             raise LocalRunInputError("local run input revision is unavailable")
         try:
             with db.base_guard():
-                adapter.open_revision(uri, item["revision_id"])
+                adapter.open_revision(revision_uri, item["revision_id"])
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         config = node.data.setdefault("config", {})
-        config["uri"] = uri
+        if item["provider"] != LOCAL_FILE_INPUT_PROVIDER:
+            config["uri"] = uri
         # Keep the complete manifest identity on the private dispatch copy. Revision ids are only
         # provider-local and can restart after a dataset is unregistered/replaced at the same URI;
         # cache/profile keys must therefore include dataset and provider identity as well.

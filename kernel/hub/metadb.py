@@ -4949,39 +4949,46 @@ def _admit_local_file_input_revisions(
         raise ValueError("local file input candidates are invalid")
     candidate_by_identity = {
         (item["dataset_id"], item["revision_id"]): item for item in candidates}
-    required = [
+    required = sorted({
         (item["dataset_id"], item["revision_id"])
-        for item in manifest if item["provider"] == _LOCAL_FILE_INPUT_PROVIDER]
+        for item in manifest if item["provider"] == _LOCAL_FILE_INPUT_PROVIDER})
     if any(identity not in required for identity in candidate_by_identity):
         raise ValueError("local file input candidate is absent from the manifest")
+    if not required:
+        return
+    # Reclaim takes the lifecycle registry before changing an artifact or removing its mapping.
+    # Serialize mapping adoption under the same lock so readmission cannot deadlock with delete by
+    # taking the mapping first, and can replace a stale mapping whose old artifact is already deleting.
+    _lock_local_result_registry(s)
     for dataset_id, revision_id in required:
         candidate = candidate_by_identity.get((dataset_id, revision_id))
+        candidate_artifact = None
         if candidate is not None:
-            artifact = s.get(LocalResultArtifact, candidate["artifact_uri"], with_for_update=True)
-            if artifact is None or artifact.state != "ready":
+            candidate_artifact = s.get(
+                LocalResultArtifact, candidate["artifact_uri"], with_for_update=True)
+            if candidate_artifact is None or candidate_artifact.state != "ready":
                 raise RuntimeError("local file input candidate is not an immutable ready artifact")
-            values = {
-                "dataset_id": dataset_id,
-                "revision_id": revision_id,
-                "artifact_uri": candidate["artifact_uri"],
-                "created_at": _db_now(s),
-            }
-            if s.get_bind().dialect.name == "postgresql":
-                from sqlalchemy.dialects.postgresql import insert as dialect_insert
-            else:
-                from sqlalchemy.dialects.sqlite import insert as dialect_insert
-            s.execute(dialect_insert(LocalFileInputRevision).values(
-                **values,
-            ).on_conflict_do_nothing(
-                index_elements=[
-                    LocalFileInputRevision.dataset_id,
-                    LocalFileInputRevision.revision_id,
-                ]))
         binding = s.get(
             LocalFileInputRevision,
             {"dataset_id": dataset_id, "revision_id": revision_id},
             with_for_update=True,
         )
+        if binding is None and candidate_artifact is not None:
+            binding = LocalFileInputRevision(
+                dataset_id=dataset_id,
+                revision_id=revision_id,
+                artifact_uri=candidate_artifact.uri,
+                created_at=_db_now(s),
+            )
+            s.add(binding)
+            s.flush()
+        elif binding is not None and candidate_artifact is not None:
+            current_artifact = s.get(
+                LocalResultArtifact, binding.artifact_uri, with_for_update=True)
+            if current_artifact is None or current_artifact.state == "deleting":
+                binding.artifact_uri = candidate_artifact.uri
+                binding.created_at = _db_now(s)
+                s.flush()
         if binding is None:
             raise RuntimeError("local file input revision is unavailable")
         registration = s.scalars(select(CatalogEntry).where(
@@ -5041,12 +5048,16 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
 
 
 def local_file_input_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
-    """Return the immutable artifact for one content-identified ordinary local input."""
+    """Return one reusable ready artifact for a content-identified ordinary local input."""
     with session() as s:
-        row = s.get(LocalFileInputRevision, {
-            "dataset_id": str(dataset_id), "revision_id": str(revision_id),
-        })
-        return row.artifact_uri if row is not None else None
+        return s.scalar(select(LocalFileInputRevision.artifact_uri).join(
+            LocalResultArtifact,
+            LocalResultArtifact.uri == LocalFileInputRevision.artifact_uri,
+        ).where(
+            LocalFileInputRevision.dataset_id == str(dataset_id),
+            LocalFileInputRevision.revision_id == str(revision_id),
+            LocalResultArtifact.state == "ready",
+        ).limit(1))
 
 
 def local_file_input_revision_for_artifact(uri: str) -> dict | None:
@@ -5114,10 +5125,10 @@ def claim_local_run_dispatch(*, run_id: str, uid: str, auth_canvas_id: str | Non
     with session() as s:
         admission_hint = s.execute(select(RunInputAdmission.canvas_id).where(
             RunInputAdmission.run_id == str(run_id)
-        )).scalar_one_or_none()
+        )).one_or_none()
         if admission_hint is None:
             raise RuntimeError("local run admission was not persisted")
-        _lock_authorized_run_canvas(s, admission_hint)
+        _lock_authorized_run_canvas(s, admission_hint[0])
         row = s.get(RunInputAdmission, str(run_id), with_for_update=True)
         if row is None:
             raise RuntimeError("local run admission was deleted before dispatch")
@@ -5154,10 +5165,10 @@ def fail_claimed_local_run_dispatch(run_id: str, error: str) -> dict:
     with session() as s:
         admission_hint = s.execute(select(RunInputAdmission.canvas_id).where(
             RunInputAdmission.run_id == str(run_id)
-        )).scalar_one_or_none()
+        )).one_or_none()
         if admission_hint is None:
             raise RuntimeError("local run admission was not persisted")
-        _lock_authorized_run_canvas(s, admission_hint)
+        _lock_authorized_run_canvas(s, admission_hint[0])
         admission = s.get(RunInputAdmission, str(run_id), with_for_update=True)
         state = s.get(RunState, str(run_id), with_for_update=True)
         if admission is None or admission.dispatched_at is None or state is None:

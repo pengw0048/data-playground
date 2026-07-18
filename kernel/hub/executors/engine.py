@@ -634,13 +634,14 @@ class BuildEngine:
             revision_id = cfg.get("_input_revision_id")
             if revision_id is not None:
                 exact_artifact = self.graph._input_artifact_uris.get(str(node.id))
-                if exact_artifact == uri:
+                if (exact_artifact is not None
+                        and cfg.get("_input_artifact_uri") == exact_artifact):
                     # Metadata-isolated local children cannot query the provider ledger. The parent
                     # already reopened this revision, serialized its physical artifact, and retained
                     # a read fence; subrun restores this private sidecar only after validating the
                     # admitted manifest and parent attestation. Read that exact artifact directly.
                     try:
-                        return adapter.scan(uri)
+                        return self.resolve_adapter(exact_artifact).scan(exact_artifact)
                     except Exception as exc:
                         raise NotPreviewable(
                             node, "persisted input revision is unavailable") from exc
