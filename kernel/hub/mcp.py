@@ -188,14 +188,28 @@ class Playground:
 
     def _preview_doc(
             self, doc: dict, node_id: str, limit: int,
-            port_id: str | None = None) -> dict:
+            port_id: str | None = None, raw_bindings: object = None) -> dict:
         """Preview a node over a bounded sample of the CURRENT doc, in-process. Resolves source refs on
         a throwaway model copy so a `source` may name a catalog table; never mutates the stored doc."""
         from hub import graph as gmod
         from hub.executors.preview import preview_node
-        from hub.models import Graph
+        from hub.models import Graph, ParameterBinding
         d = self.deps
         graph = Graph.model_validate(doc)
+        if raw_bindings is None:
+            raw_bindings = []
+        if not isinstance(raw_bindings, list):
+            raise ToolError("parameterBindings must be an array of {name, value} objects")
+        try:
+            parameter_bindings = [ParameterBinding.model_validate(item) for item in raw_bindings]
+        except ValueError as exc:
+            raise ToolError("parameterBindings must contain only {name, value} objects") from exc
+        from hub.run_parameters import ParameterResolutionError, resolve_graph_parameters
+        try:
+            graph, _canonical = resolve_graph_parameters(
+                graph, parameter_bindings, node_id, d)
+        except ParameterResolutionError as exc:
+            raise ToolError(str(exc)) from exc
         gmod.resolve_source_refs(graph, d.catalog.resolve_ref)
         res = preview_node(
             graph, node_id, limit, d.resolve_adapter, d.registry, d.node_builders, d.node_specs,
@@ -371,7 +385,8 @@ class Playground:
         doc = self._get_doc(canvas_id)
         if not graph_ops.find_node(doc, node_id):
             raise ToolError(f"node '{node_id}' not found on canvas '{canvas_id}'")
-        return self._preview_doc(doc, node_id, self._limit(args, 10), port_id)
+        return self._preview_doc(
+            doc, node_id, self._limit(args, 10), port_id, args.get("parameterBindings"))
 
     def validate_canvas(self, args: dict) -> dict:
         canvas_id = self._req(args, "canvasId")
@@ -390,16 +405,27 @@ class Playground:
         the poll timeout returns timedOut:true with its runId — poll run_status / cancel_run."""
         from fastapi import HTTPException as HTTPExc
 
-        from hub.models import Graph
+        from hub.models import Graph, ParameterBinding
         from hub.routers.runs import RunNeedsConfirm, start_run
         canvas_id = self._req(args, "canvasId")
         doc = self._get_doc(canvas_id)
         graph = Graph.model_validate(doc)
+        raw_bindings = args.get("parameterBindings")
+        if raw_bindings is None:
+            raw_bindings = []
+        if not isinstance(raw_bindings, list):
+            raise ToolError("parameterBindings must be an array of {name, value} objects")
+        try:
+            parameter_bindings = [ParameterBinding.model_validate(item) for item in raw_bindings]
+        except ValueError as exc:
+            raise ToolError("parameterBindings must contain only {name, value} objects") from exc
         target = args.get("nodeId") or self._sole_sink(doc)
         if not graph_ops.find_node(doc, target):
             raise ToolError(f"node '{target}' not found on canvas '{canvas_id}'")
         try:
-            status, _owner = start_run(self.deps, graph, target, self.user_id, bool(args.get("confirm")))
+            status, _owner = start_run(
+                self.deps, graph, target, self.user_id, bool(args.get("confirm")),
+                parameter_bindings=parameter_bindings)
         except RunNeedsConfirm as e:
             est = e.estimate
             return {"needsConfirm": True, "targetNodeId": target, "estRows": est.rows,
@@ -696,7 +722,13 @@ def _tool_specs(pg: Playground) -> list[dict]:
                         "each-source limit does not mean these are the first N full-result rows.",
          "inputSchema": _schema({**canvas, "nodeId": _STR,
                                  "portId": {**_STR, "description": "required for a multi-output node"},
-                                 "limit": {**_INT, "description": "max rows (default 10)"}},
+                                 "limit": {**_INT, "description": "max rows (default 10)"},
+                                 "parameterBindings": {
+                                     "type": "array", "maxItems": 128,
+                                     "items": {"type": "object", "additionalProperties": False,
+                                               "properties": {"name": _STR, "value": {}},
+                                               "required": ["name", "value"]},
+                                 }},
                                 ["canvasId", "nodeId"])},
         {"name": "validate_canvas", "handler": pg.validate_canvas,
          "description": "Static checks without running: typed-wire errors + per-join measured "
@@ -709,7 +741,13 @@ def _tool_specs(pg: Playground) -> list[dict]:
                         "needsConfirm:true unless you pass confirm:true. A run still going after the poll "
                         "timeout returns timedOut:true + runId — then poll run_status / cancel_run.",
          "inputSchema": _schema({**canvas, "nodeId": {**_STR, "description": "the node to run to (a sink)"},
-                                 "confirm": {"type": "boolean"}}, ["canvasId"])},
+                                 "confirm": {"type": "boolean"},
+                                 "parameterBindings": {
+                                     "type": "array", "maxItems": 128,
+                                     "items": {"type": "object", "additionalProperties": False,
+                                               "properties": {"name": _STR, "value": {}},
+                                               "required": ["name", "value"]},
+                                 }}, ["canvasId"])},
         {"name": "run_status", "handler": pg.run_status,
          "description": "Poll a run (by the runId from run_canvas) — follow a run that returned "
                         "timedOut:true to completion. Returns the same shape as run_canvas.",

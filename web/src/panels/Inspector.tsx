@@ -473,17 +473,18 @@ const CARD_TONE: Record<string, string> = {
 // non-1:1 join gets a fan-out warning (the result lands at the finer grain — rows multiply).
 function JoinHints({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
+  const parameterBindings = useStore((s) => s.runs[nodeId]?.parameterBindings)
   const updateConfig = useStore((s) => s.updateConfig)
   const [analysis, setAnalysis] = useState<JoinAnalysis | null>(null)
   const [loading, setLoading] = useState(true)  // first analysis is pending → show 'Analyzing…', not 'no matches'
   // re-analyze when the graph shape or any node's config changes (debounced); positions don't matter
   const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
-    doc.nodes.map((n) => [n.id, n.type, n.data.config])])
+    doc.nodes.map((n) => [n.id, n.type, n.data.config]), parameterBindings ?? []])
   useEffect(() => {
     let off = false
     const t = setTimeout(() => {
       setLoading(true)
-      api.joinAnalysis(doc, nodeId)
+      api.joinAnalysis(doc, nodeId, parameterBindings)
         .then((a) => { if (!off) setAnalysis(a) })
         .catch(() => { if (!off) setAnalysis(null) })
         .finally(() => { if (!off) setLoading(false) })
@@ -534,15 +535,16 @@ function JoinHints({ nodeId }: { nodeId: string }) {
 type PlanRegion = { id: string; outputNode: string; backend: string; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean; available?: string; preflight?: string[] }
 function RunPlan({ nodeId }: { nodeId: string }) {
   const doc = useStore((s) => s.doc)
+  const parameterBindings = useStore((s) => s.runs[nodeId]?.parameterBindings)
   const kernelUp = useStore((s) => s.kernelUp)
   const [regions, setRegions] = useState<PlanRegion[] | null>(null)
   const sig = JSON.stringify([doc.edges.map((e) => [e.source, e.target, e.targetHandle]),
-    doc.nodes.map((n) => [n.id, n.type, n.data.config])])
+    doc.nodes.map((n) => [n.id, n.type, n.data.config]), parameterBindings ?? []])
   useEffect(() => {
     if (!kernelUp) { setRegions(null); return }
     let off = false
     const t = setTimeout(() => {
-      api.plan(doc, nodeId).then((p) => { if (!off) setRegions(p.regions ?? []) }).catch(() => { if (!off) setRegions(null) })
+      api.plan(doc, nodeId, parameterBindings).then((p) => { if (!off) setRegions(p.regions ?? []) }).catch(() => { if (!off) setRegions(null) })
     }, 350)
     return () => { off = true; clearTimeout(t) }
     // eslint-disable-next-line react-hooks/exhaustive-deps

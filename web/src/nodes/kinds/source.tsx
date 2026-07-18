@@ -7,7 +7,7 @@ import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
-import { datasetRefIdentity, type DatasetRef } from '../../types/graph'
+import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
 type ExactRevisionState = 'idle' | 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
 
@@ -57,8 +57,12 @@ function Source({ id, data }: NodeComponentProps) {
   const ref = String(data.config.uri ?? '')
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
   const providerDataset = !!data.config.providerResourceRef
-  const providerRevision = providerDataset && data.config.datasetRef
-    ? datasetRefIdentity(data.config.datasetRef).revisionId : undefined
+  const datasetRef = data.config.datasetRef
+  const datasetParameter = isParameterRef(datasetRef) ? datasetRef : null
+  const canvasParameters = useStore((s) => s.doc.parameters)
+  const datasetParameters = (canvasParameters ?? []).filter((item) => item.type === 'dataset')
+  const providerRevision = providerDataset && datasetRef && !isParameterRef(datasetRef)
+    ? datasetRefIdentity(datasetRef).revisionId : undefined
   const providerRevisionLabel = providerRevision && providerRevision.length > 24
     ? `${providerRevision.slice(0, 12)}…${providerRevision.slice(-8)}` : providerRevision
 
@@ -202,7 +206,14 @@ function Source({ id, data }: NodeComponentProps) {
       {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
         Pinned provider revision {providerRevisionLabel}
       </div>}
-      {!providerDataset && (table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
+      {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
+        disabled={!canEdit} onChange={(event) => updateConfig(id, {
+          datasetRef: event.target.value ? { parameterRef: event.target.value } : undefined,
+        })} className="mt-1.5 w-full rounded-md border border-border bg-background px-2 py-1 text-[10.5px]">
+        <option value="">Pinned/current dataset</option>
+        {datasetParameters.map((item) => <option key={item.name} value={item.name}>Parameter: {item.label || item.name}</option>)}
+      </select>}
+      {!datasetParameter && !providerDataset && (table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef as DatasetRef | undefined}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />

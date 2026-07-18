@@ -29,6 +29,7 @@ from hub.models import (
     DurableTaskInboxPage,
     DurableTaskInboxUnreadCount,
     ExecutionManifestDetail,
+    Graph,
     RunHistoryRecord,
     RunStatus,
     WorkspaceRunPage,
@@ -694,8 +695,19 @@ def list_canvases(uid: str = Depends(current_user)) -> list[dict]:
     return metadb.list_canvases_for(uid)  # owned + shared + workspace-visible
 
 
+def _validate_canvas_execution_contract(doc: dict) -> None:
+    try:
+        Graph.model_validate(doc)
+    except ValueError as exc:
+        raise APIError(
+            422, "canvas has an invalid execution contract",
+            code=APIErrorCode.VALIDATION_ERROR, retryable=False,
+        ) from exc
+
+
 @router.post("/canvas")
 def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
+    _validate_canvas_execution_contract(doc)
     try:
         metadb.require_promoted_transform_use(uid, doc)
     except PermissionError as exc:
@@ -753,6 +765,7 @@ def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 def put_canvas(canvas_id: str, doc: dict,
                expected_version: int | None = Query(None, alias="expectedVersion", ge=1),
                uid: str = Depends(current_user)) -> dict:
+    _validate_canvas_execution_contract({**doc, "id": canvas_id})
     role = metadb.canvas_role(canvas_id, uid)  # None if the canvas doesn't exist yet
     try:
         metadb.require_promoted_transform_use(

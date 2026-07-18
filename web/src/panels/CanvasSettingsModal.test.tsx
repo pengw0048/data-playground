@@ -5,10 +5,11 @@ const mocks = vi.hoisted(() => ({
   getShares: vi.fn(),
   addShare: vi.fn(),
   state: {
-    doc: { id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'] },
+    doc: { id: 'canvas-1', name: 'Revenue canvas', requirements: ['pandas'], parameters: [] as any[] },
     canvasRole: 'owner' as 'owner' | 'editor' | 'viewer' | null,
     renameFile: vi.fn(),
     setRequirements: vi.fn(),
+    setParameters: vi.fn(),
   },
 }))
 
@@ -30,6 +31,7 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     mocks.state.canvasRole = 'owner'
     mocks.getShares.mockResolvedValue({ visibility: 'private', shares: [] })
     mocks.addShare.mockResolvedValue({ ok: true })
+    mocks.state.doc.parameters = []
   })
 
   it('renders workspace_view accurately and disables document fields for a viewer', async () => {
@@ -62,5 +64,35 @@ describe('CanvasSettingsModal — sharing and read-only truth', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     await waitFor(() => expect(workspace).toHaveAttribute('aria-pressed', 'true'))
     expect(mocks.addShare).toHaveBeenNthCalledWith(2, 'canvas-1', { visibility: 'workspace' })
+  })
+
+  it('keeps invalid declaration edits local and validates dates and SecretRefs strictly', async () => {
+    render(<CanvasSettingsModal onClose={vi.fn()} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Add parameter' }))
+    expect(mocks.state.setParameters).toHaveBeenCalledTimes(1)
+
+    const name = screen.getByLabelText('Parameter name')
+    fireEvent.change(name, { target: { value: '1bad' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('Names start with a letter')
+    expect(mocks.state.setParameters).toHaveBeenCalledTimes(1)
+
+    fireEvent.change(name, { target: { value: 'public_value' } })
+    fireEvent.click(screen.getByLabelText('public_value type'))
+    fireEvent.change(screen.getByLabelText('public_value type'), { target: { value: 'date' } })
+    fireEvent.click(screen.getByLabelText('Required'))
+    fireEvent.click(screen.getByLabelText('Default'))
+    fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: '2026-02-30' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('real YYYY-MM-DD')
+
+    fireEvent.change(screen.getByLabelText('public_value type'), { target: { value: 'string' } })
+    fireEvent.click(screen.getByLabelText('Required'))
+    fireEvent.click(screen.getByLabelText('Default'))
+    fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'env:PRIVATE' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+    fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 'FILE:/private/token' } })
+    expect(screen.getByRole('alert')).toHaveTextContent('SecretRef')
+
+    fireEvent.change(screen.getByLabelText('public_value default'), { target: { value: 's3://public-bucket/key' } })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 })

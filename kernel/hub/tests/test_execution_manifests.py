@@ -237,6 +237,88 @@ def test_manifest_replay_compares_graph_without_re_resolving_retained_inputs():
     )
 
 
+def test_typed_parameter_bindings_enter_manifest_identity_and_replay():
+    graph = _graph()
+    graph.parameters = [{
+        "name": "threshold", "type": "integer", "required": True,
+        "constraints": {"minimum": 0, "maximum": 100},
+    }]
+    graph._parameter_bindings = [{
+        "name": "threshold", "type": "integer", "value": 10,
+        "declaration": {
+            "name": "threshold", "type": "integer", "required": True,
+            "constraints": {"minimum": 0.0, "maximum": 100.0},
+        },
+    }]
+    first, payload = _build(graph)
+    assert validate_execution_manifest(first, payload)["parameters"] == graph._parameter_bindings
+    assert execution_manifest_accepts_graph_replay(
+        first, payload, graph, target_node_id="filter", target_port_id=None)
+
+    graph._parameter_bindings[0]["value"] = 11
+    second, _payload = _build(graph)
+    assert second != first
+    assert not execution_manifest_accepts_graph_replay(
+        first, payload, graph, target_node_id="filter", target_port_id=None)
+
+    graph.parameters = [{"name": "input", "type": "dataset", "required": True}]
+    graph._parameter_bindings = [{
+        "name": "input", "type": "dataset",
+        "value": {"kind": "latest", "datasetId": "dataset-1", "resolvedRevisionId": "r1"},
+        "declaration": {"name": "input", "type": "dataset", "required": True},
+    }]
+    latest_digest, latest_payload = _build(graph)
+    graph._parameter_bindings[0]["value"]["resolvedRevisionId"] = "r2"
+    assert execution_manifest_accepts_graph_replay(
+        latest_digest, latest_payload, graph, target_node_id="filter", target_port_id=None)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda item: item["declaration"].update({"constraints": {"minimum": 11}}),
+    lambda item: item.update({"value": "10"}),
+    lambda item: item["declaration"].update({"label": "display-only"}),
+])
+def test_manifest_rejects_forged_digest_with_noncanonical_parameter_binding(mutate):
+    graph = _graph()
+    graph.parameters = [{
+        "name": "threshold", "type": "integer", "required": True,
+        "constraints": {"minimum": 0, "maximum": 100},
+    }]
+    graph._parameter_bindings = [{
+        "name": "threshold", "type": "integer", "value": 10,
+        "declaration": {
+            "name": "threshold", "type": "integer", "required": True,
+            "constraints": {"minimum": 0.0, "maximum": 100.0},
+        },
+    }]
+    _digest, payload = _build(graph)
+    doc = json.loads(payload)
+    mutate(doc["parameters"][0])
+    forged_payload = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    import hashlib
+    forged_digest = hashlib.sha256(forged_payload.encode()).hexdigest()
+    with pytest.raises(ExecutionManifestError, match="parameters are invalid"):
+        validate_execution_manifest(forged_digest, forged_payload)
+
+
+def test_manifest_rejects_invalid_latest_parameter_resolution_even_with_matching_digest():
+    graph = _graph()
+    graph.parameters = [{"name": "input", "type": "dataset", "required": True}]
+    graph._parameter_bindings = [{
+        "name": "input", "type": "dataset",
+        "value": {"kind": "latest", "datasetId": "dataset-1", "resolvedRevisionId": "r1"},
+        "declaration": {"name": "input", "type": "dataset", "required": True},
+    }]
+    _digest, payload = _build(graph)
+    doc = json.loads(payload)
+    doc["parameters"][0]["value"]["resolvedRevisionId"] = ""
+    forged_payload = json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    import hashlib
+    forged_digest = hashlib.sha256(forged_payload.encode()).hexdigest()
+    with pytest.raises(ExecutionManifestError, match="parameters are invalid"):
+        validate_execution_manifest(forged_digest, forged_payload)
+
+
 @pytest.mark.parametrize("change", ["config", "disabled", "target", "port", "input", "write"])
 def test_execution_changes_produce_distinct_semantic_digests(change: str):
     baseline, _ = _build()
@@ -353,7 +435,13 @@ def _admit(canvas_id: str, submission_id: str, digest: str, payload: str) -> str
 def test_response_loss_replay_adopts_only_the_original_manifest():
     _canvas("manifest-canvas")
     submission_id = str(uuid.uuid4())
-    digest, payload = _build()
+    graph = _graph()
+    graph.parameters = [{"name": "threshold", "type": "integer", "required": True}]
+    graph._parameter_bindings = [{
+        "name": "threshold", "type": "integer", "value": 10,
+        "declaration": {"name": "threshold", "type": "integer", "required": True},
+    }]
+    digest, payload = _build(graph)
     run_id = _admit("manifest-canvas", submission_id, digest, payload)
 
     replayed_id, created = metadb.admit_local_run_inputs(
@@ -363,7 +451,8 @@ def test_response_loss_replay_adopts_only_the_original_manifest():
     )
     assert (replayed_id, created) == (run_id, False)
 
-    changed_digest, changed_payload = _build(target="source")
+    graph._parameter_bindings[0]["value"] = 11
+    changed_digest, changed_payload = _build(graph)
     with pytest.raises(RuntimeError, match="does not match its persisted admission"):
         metadb.admit_local_run_inputs(
             uid="local", canvas_id="manifest-canvas", submission_id=submission_id,

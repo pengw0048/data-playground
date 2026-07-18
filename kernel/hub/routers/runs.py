@@ -5,6 +5,7 @@ the execution routes (and where a run writes). Split out of main.py; all authed 
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime
 import hashlib
 import json
@@ -50,6 +51,7 @@ from hub.run_outputs import (
     UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
     require_single_run_output,
 )
+from hub.run_parameters import ParameterResolutionError, resolve_graph_parameters
 from hub.security import current_user
 from hub.settings import settings
 from hub.storage import ManagedSourceReadError, source_read_scope
@@ -103,6 +105,33 @@ _EXPORT_MEDIA_TYPES = {
 }
 
 
+def _resolve_parameters(
+        graph: Graph, bindings, target: str | None, deps, *, freeze_latest: bool = True) -> Graph:
+    try:
+        resolved, _canonical = resolve_graph_parameters(
+            graph, bindings, target, deps, freeze_latest=freeze_latest)
+        return resolved
+    except ParameterResolutionError as exc:
+        raise APIError(
+            422, str(exc), code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
+
+
+def _target_execution_graph(graph: Graph, target: str | None) -> Graph:
+    """Restrict one internal inspection pass to its Section-aware execution cone."""
+    if target is None:
+        return graph
+    scoped = graph.model_copy(deep=True)
+    all_nodes = list(scoped.nodes)
+    roots = graph_mod.upstream_chain(scoped, target)
+    selected = {node.id for node in graph_mod.execution_nodes(scoped, roots)}
+    scoped.nodes = [node for node in all_nodes if node.id in selected]
+    scoped.edges = [
+        edge for edge in scoped.edges
+        if edge.source in selected and edge.target in selected
+    ]
+    return scoped
+
+
 def _admitted_execution_manifest(*args, **kwargs) -> tuple[str, str]:
     try:
         return build_execution_manifest(*args, **kwargs)
@@ -135,14 +164,11 @@ def _resume_durable_task(deps, task: dict) -> RunStatus:
     return RunStatus.model_validate(current["status_doc"])
 
 
-def _adopt_manifest_durable_task(
-        deps, task: dict, graph, target_node_id: str | None,
+def _validate_retained_manifest_replay(
+        sha256: str, graph, target_node_id: str | None,
         input_manifest: list[dict[str, str]] | None,
-        write_intent: WriteIntent | None) -> RunStatus:
-    """Validate response-loss replay from retained semantics before any mutable admission work."""
-    sha256 = task.get("execution_manifest_sha256")
-    if not isinstance(sha256, str):
-        raise RuntimeError("durable task has no execution manifest")
+        write_intent: WriteIntent | None) -> tuple[dict, str]:
+    """Compare one canonical retry intent with retained exact admission without mutable reads."""
     retained = metadb.execution_manifest(sha256)
     if retained is None:
         raise RuntimeError("durable task execution manifest is unavailable")
@@ -153,7 +179,7 @@ def _adopt_manifest_durable_task(
                 sha256, payload, graph,
                 target_node_id=target_node_id, target_port_id=None):
             raise metadb.DurableTaskSubmissionConflict(
-                "durable task submission is bound to a different execution manifest")
+                "submission is bound to a different execution manifest")
         admission = execution_manifest_admission(sha256, payload)
     except ExecutionManifestError as exc:
         raise RuntimeError("durable task execution manifest is invalid") from exc
@@ -165,11 +191,27 @@ def _adopt_manifest_durable_task(
         for item in input_manifest or []]
     if input_manifest is not None and supplied_inputs != retained_inputs:
         raise metadb.DurableTaskSubmissionConflict(
-            "durable task submission is bound to different admitted inputs")
-    retained_write = WriteIntent.model_validate(admission["write_intent"])
+            "submission is bound to different admitted inputs")
+    retained_write = (
+        WriteIntent.model_validate(admission["write_intent"])
+        if admission["write_intent"] is not None else None
+    )
     if write_intent is not None and write_intent != retained_write:
         raise metadb.DurableTaskSubmissionConflict(
-            "durable task submission is bound to a different write intent")
+            "submission is bound to a different write intent")
+    return admission, payload
+
+
+def _adopt_manifest_durable_task(
+        deps, task: dict, graph, target_node_id: str | None,
+        input_manifest: list[dict[str, str]] | None,
+        write_intent: WriteIntent | None) -> RunStatus:
+    """Validate response-loss replay from retained semantics before any mutable admission work."""
+    sha256 = task.get("execution_manifest_sha256")
+    if not isinstance(sha256, str):
+        raise RuntimeError("durable task has no execution manifest")
+    _admission, _payload = _validate_retained_manifest_replay(
+        sha256, graph, target_node_id, input_manifest, write_intent)
 
     return _resume_durable_task(deps, task)
 
@@ -902,7 +944,7 @@ def write_admission(
     """Certify one default-local Write card without creating or mutating an artifact."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
-    graph = req.graph.model_copy(deep=True)
+    graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
     if req.input_manifest is not None:
         graph = _bind_local_run_manifest(graph, req.input_manifest, deps, req.node_id)
@@ -1211,18 +1253,20 @@ def _require_admitted_input_manifest_transport(
 def compile_graph(req: CompileRequest, uid: str = Depends(current_user)) -> CompilePlan:
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
-    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    invalid = _invalid_graph(req.graph, deps, req.target_node_id)
+    graph = _resolve_parameters(req.graph, req.parameter_bindings, req.target_node_id, deps)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    invalid = _invalid_graph(graph, deps, req.target_node_id)
     if invalid:
         error, acyclic = invalid
         return CompilePlan(target_node_id=req.target_node_id, steps=[], acyclic=acyclic, error=error)
-    return compiler.compile_plan(req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
+    return compiler.compile_plan(graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
 
 
 @router.post("/run/preview", response_model=SampleResult)
 def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
     manifest: list[dict[str, str]] | None = None
@@ -1288,6 +1332,8 @@ def input_drift(req: InputDriftRequest, uid: str = Depends(current_user)) -> Inp
     """Report moved Source heads and #125 compatibility without replacing preview inputs."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.target_node_id)
     return _input_drift(req.graph, req.target_node_id, req.input_manifest, deps)
@@ -1302,6 +1348,7 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     """
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(req.graph, deps, req.node_id)
     graph, manifest = _inspection_manifest_graph(
@@ -1390,6 +1437,7 @@ def estimate_full_profile(req: ProfileEstimateRequest,
 
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
     port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
@@ -1416,6 +1464,7 @@ def current_profile_identity(req: ProfileIdentityRequest,
     """Mint the current profile identity for stale-safe canvas reopen recovery."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
     graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
     _reject_invalid(req.graph, deps, req.node_id)
     port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
@@ -1497,6 +1546,8 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                 raise HTTPException(403, f"canvas '{cid}' requires owner or editor to start a full profile")
             auth_canvas = cid
         deps = get_deps()
+        req.graph = _resolve_parameters(
+            req.graph, req.parameter_bindings, req.node_id, deps)
         operational_canvas = str(getattr(req.graph, "id", None) or "canvas")
         submission_id = str(req.submission_id)
         port_id = _inspection_port(req.graph, req.node_id, req.port_id, deps)
@@ -1750,14 +1801,17 @@ def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     """Per-node, per-output-port metadata columns for editor inspection and suggestions."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
-    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
-    _reject_invalid(req.graph, deps, req.target_node_id)
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     if req.input_manifest is not None and req.target_node_id is None:
         raise HTTPException(400, "schema inputManifest requires targetNodeId")
-    graph = req.graph
+    _reject_invalid(req.graph, deps, req.target_node_id)
+    graph = _target_execution_graph(req.graph, req.target_node_id)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    _reject_invalid(graph, deps, req.target_node_id)
     if req.input_manifest is not None:
         graph, _manifest = _inspection_manifest_graph(
-            req.graph, req.target_node_id, req.input_manifest, deps)
+            graph, req.target_node_id, req.input_manifest, deps)
         _reject_invalid(graph, deps, req.target_node_id)
     try:
         return schema_for_graph_ports(graph, deps.resolve_adapter, deps.registry,
@@ -1773,11 +1827,15 @@ def graph_estimate(req: CompileRequest, uid: str = Depends(current_user)) -> dic
     _require_graph_read_access(req.graph, uid)
     from hub.estimate import estimate_sizes
     deps = get_deps()
-    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     _reject_invalid(req.graph, deps, req.target_node_id)
+    graph = _target_execution_graph(req.graph, req.target_node_id)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+    _reject_invalid(graph, deps, req.target_node_id)
     try:
         sizes = estimate_sizes(
-            req.graph, deps.resolve_adapter, actuals=_actuals_for(req.graph, deps),
+            graph, deps.resolve_adapter, actuals=_actuals_for(graph, deps),
             storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
@@ -1794,17 +1852,21 @@ def graph_plan(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
     splits it. Never 500s."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     _reject_invalid(req.graph, deps, req.target_node_id)
+    graph = _target_execution_graph(req.graph, req.target_node_id)
+    _reject_invalid(graph, deps, req.target_node_id)
     if not req.target_node_id:
         return {"regions": []}
-    graph_mod.resolve_source_refs(req.graph, deps.catalog.resolve_ref)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
     try:
-        regions = deps.controller.plan_summary(req.graph, req.target_node_id)
+        regions = deps.controller.plan_summary(graph, req.target_node_id)
         plan = compiler.compile_plan(
-            req.graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
+            graph, req.target_node_id, deps.registry, deps.node_specs, deps.node_ir)
         runner = _route_by_capability(
-            deps, deps.pick_runner(plan, uid), req.graph, req.target_node_id)
-        warning = _destination_credential_preflight(deps, runner, plan, req.graph)
+            deps, deps.pick_runner(plan, uid), graph, req.target_node_id)
+        warning = _destination_credential_preflight(deps, runner, plan, graph)
         if warning is not None and regions:
             region = regions[-1]
             region["preflight"] = [*(region.get("preflight") or []), warning]
@@ -1822,14 +1884,19 @@ def join_analysis(req: CompileRequest, uid: str = Depends(current_user)) -> Join
     _require_graph_read_access(req.graph, uid)
     from hub import relationships as rel
     deps = get_deps()
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     _reject_invalid(req.graph, deps, req.target_node_id)
+    graph = _target_execution_graph(req.graph, req.target_node_id)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+    _reject_invalid(graph, deps, req.target_node_id)
     if not req.target_node_id:
         return JoinAnalysis(note="no join node selected")
     try:
-        cols = schema_for_graph(req.graph, deps.resolve_adapter, deps.registry,
+        cols = schema_for_graph(graph, deps.resolve_adapter, deps.registry,
                                 deps.node_builders, deps.node_specs, storage=deps.storage)
         return rel.analyze_join(
-            req.graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter,
+            graph, req.target_node_id, cols, deps.catalog, deps.resolve_adapter,
             storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
@@ -2053,6 +2120,8 @@ def _require_destination_credential_preflight(deps, runner, plan, graph) -> None
 def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunEstimate:
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
+    req.graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.target_node_id, deps)
     if _external_wait_request(deps, req.graph, req.target_node_id) is not None:
         if req.input_manifest is not None:
             raise HTTPException(409, "external-wait tasks do not accept input manifests")
@@ -2096,7 +2165,8 @@ class RunNeedsConfirm(Exception):
 def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool = False,
               submission_id: str | None = None,
               input_manifest: list[dict[str, str]] | None = None,
-              write_intent: WriteIntent | None = None):
+              write_intent: WriteIntent | None = None,
+              parameter_bindings=None):
     """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
     agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
     refs, rejects an invalid/cyclic graph (HTTPException), sizes + gates the run (RunNeedsConfirm), then
@@ -2117,19 +2187,89 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         # Open mode still has selected dev-user ownership. Keep ad-hoc execution, but do not let it
         # bypass promoted Transform ownership or an already-retained shared-Canvas capability.
         _require_graph_read_access(graph, uid)
-    # Capture caller intent before catalog references are resolved or private exact-revision bindings are
-    # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
-    # browser-supplied id remains stable across response-loss retries.
-    intent_graph = graph.model_copy(deep=True)
-    target = next((node for node in graph.nodes if node.id == target_node_id), None)
-    if write_intent is not None and (target is None or target.type != "write"):
+    bindings = parameter_bindings or []
+    submitted_target = next((node for node in graph.nodes if node.id == target_node_id), None)
+    if write_intent is not None and (submitted_target is None or submitted_target.type != "write"):
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
+    graph_canvas = str(getattr(graph, "id", "") or "") or None
+    operational_canvas = auth_canvas or (
+        graph_canvas if graph_canvas is not None and metadb.canvas_exists(graph_canvas) else None)
+
+    # Response-loss replay compares canonical typed intent before resolving a mutable latest head. A
+    # retained manifest already owns the exact revision; asking its provider again would turn an
+    # idempotent retry into a new availability dependency. Fresh submissions still take the normal
+    # resolver path below and freeze latest before any allocation.
+    replay_graph: Graph | None = None
+
+    def canonical_replay_graph() -> Graph:
+        nonlocal replay_graph
+        if replay_graph is None:
+            replay_graph = _resolve_parameters(
+                graph, bindings, target_node_id, deps, freeze_latest=False)
+        return replay_graph
+
+    retained_local_admission: dict | None = None
+    retained_local_manifest: dict | None = None
+    retained_local_execution_doc: str | None = None
+    if submission_id is not None:
+        if operational_canvas is not None:
+            task_id = metadb.durable_task_submission_id(
+                uid, operational_canvas, submission_id)
+            existing_task = metadb.durable_task(task_id)
+            if (existing_task is not None
+                    and existing_task.get("execution_manifest_sha256") is not None):
+                try:
+                    status = _adopt_manifest_durable_task(
+                        deps, existing_task, canonical_replay_graph(), target_node_id,
+                        input_manifest, write_intent)
+                except metadb.DurableTaskSubmissionConflict as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                return status, None
+
+        local_run_id = metadb.local_run_submission_id(
+            uid, operational_canvas, submission_id)
+        retained_local_admission = metadb.local_run_input_admission(local_run_id)
+        retained_sha256 = (
+            retained_local_admission.get("execution_manifest_sha256")
+            if retained_local_admission is not None else None)
+        if isinstance(retained_sha256, str):
+            try:
+                retained_local_manifest, retained_local_execution_doc = (
+                    _validate_retained_manifest_replay(
+                        retained_sha256, canonical_replay_graph(), target_node_id,
+                        input_manifest, write_intent)
+                )
+            except metadb.DurableTaskSubmissionConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+            current = metadb.get_run_state(local_run_id)
+            if current is not None:
+                return RunStatus.model_validate(current), _runner_for(
+                    local_run_id, deps=deps)
+
+    if retained_local_manifest is None:
+        graph = _resolve_parameters(graph, bindings, target_node_id, deps)
+        intent_graph = graph.model_copy(deep=True)
+    else:
+        graph = canonical_replay_graph()
+        graph._parameter_bindings = copy.deepcopy(
+            retained_local_manifest.get("parameters") or [])
+        intent_graph = graph.model_copy(deep=True)
+        if input_manifest is None:
+            assert retained_local_admission is not None
+            input_manifest = list(retained_local_admission["manifest"])
+        if write_intent is None and retained_local_manifest.get("write_intent") is not None:
+            write_intent = WriteIntent.model_validate(
+                retained_local_manifest["write_intent"])
+
+    # Capture caller intent before catalog references are resolved or private exact-revision bindings are
+    # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
+    # browser-supplied id remains stable across response-loss retries.
+    target = next((node for node in graph.nodes if node.id == target_node_id), None)
     # A response-loss retry adopts its already-frozen Task before touching a Source, destination, or
     # schema. Canonical rows compare the retained manifest; pre-0022 rows keep their original digest
     # and frozen triple without being silently upgraded or reinterpreted.
-    operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
     if (submission_id is not None and target is not None and target.type == "write"
             and operational_canvas is not None and metadb.canvas_exists(operational_canvas)):
         task_id = metadb.durable_task_submission_id(uid, operational_canvas, submission_id)
@@ -2499,8 +2639,24 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             raise HTTPException(409, "kernel runs require a saved canvas")
         prebound_local_run_id = metadb.local_run_submission_id(
             uid, operational_canvas, str(submission_id))
-        prior_manifest = metadb.local_run_input_manifest(prebound_local_run_id)
-        for admission_attempt in range(2):
+        retained_sha256 = (
+            retained_local_admission.get("execution_manifest_sha256")
+            if retained_local_admission is not None else None)
+        reuse_retained = bool(
+            retained_local_admission is not None
+            and retained_local_admission.get("run_id") == prebound_local_run_id
+            and isinstance(retained_sha256, str)
+            and retained_local_execution_doc is not None
+        )
+        # A retry already compared with retained exact admission reuses its original bytes instead
+        # of re-hashing deliberately unresolved latest intent under the same submission id.
+        persisted = (list(retained_local_admission["manifest"])
+                     if reuse_retained and retained_local_admission is not None else None)
+        execution_sha256 = retained_sha256 if reuse_retained else None
+        execution_doc = retained_local_execution_doc if reuse_retained else None
+        prior_manifest = (None if reuse_retained
+                          else metadb.local_run_input_manifest(prebound_local_run_id))
+        for admission_attempt in (() if reuse_retained else range(2)):
             candidates: list[dict[str, str]] = []
             try:
                 manifest = (input_manifest if input_manifest is not None
@@ -2541,8 +2697,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 if candidates:
                     finalize_local_file_candidates(
                         deps.storage, candidates, prebound_local_run_id)
-        persisted = metadb.local_run_input_manifest(prebound_local_run_id)
         if persisted is None:
+            persisted = metadb.local_run_input_manifest(prebound_local_run_id)
+        if persisted is None or execution_sha256 is None or execution_doc is None:
             raise RuntimeError("local run admission was not persisted")
         dispatch_manifest = persisted
         graph._execution_manifest_sha256 = execution_sha256
@@ -2554,12 +2711,26 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             # correctly mistake the still-unstamped queued row for a dead prior-hub run.
             assert operational_canvas is not None
             runner._ensure_kernel(operational_canvas)
-        claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
-            run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
-            request_id=request_id,
-        )
+        # Install the selected owner before the durable dispatch claim becomes visible. A concurrent
+        # response-loss replay can observe that claim immediately; without this ordering it would route
+        # the same run through the fallback runner until the first call returned from dispatch.
+        prior_owner = deps.run_index.get(prebound_local_run_id)
+        if prior_owner is None:
+            deps.run_index[prebound_local_run_id] = runner
+        try:
+            claimed_status, should_dispatch = metadb.claim_local_run_dispatch(
+                run_id=prebound_local_run_id, uid=uid, auth_canvas_id=auth_canvas,
+                request_id=request_id,
+            )
+        except BaseException:
+            if prior_owner is None and deps.run_index.get(prebound_local_run_id) is runner:
+                deps.run_index.pop(prebound_local_run_id, None)
+            raise
         if not should_dispatch:
-            return RunStatus(**claimed_status), deps.runner
+            if prior_owner is None and deps.run_index.get(prebound_local_run_id) is runner:
+                deps.run_index.pop(prebound_local_run_id, None)
+            return RunStatus(**claimed_status), _runner_for(
+                prebound_local_run_id, deps=deps)
     if graph._execution_manifest_sha256 is None:
         execution_sha256, execution_doc = _admitted_execution_manifest(
             intent_graph,
@@ -2659,6 +2830,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 except KeyError:
                     metadb.fail_claimed_local_run_dispatch(
                         prebound_local_run_id, f"{type(exc).__name__}: {exc}")
+                    if deps.run_index.get(prebound_local_run_id) is runner:
+                        deps.run_index.pop(prebound_local_run_id, None)
                     raise exc from None
             if prebound_local_run_id is not None and status.run_id != prebound_local_run_id:
                 raise RuntimeError("local execution backend did not preserve its admitted run id")
@@ -2695,6 +2868,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             str(req.submission_id) if req.submission_id is not None else None,
             req.input_manifest,
             req.write_intent,
+            req.parameter_bindings,
         )
     except RunNeedsConfirm:
         raise HTTPException(409, "run needs confirmation (large or unknown size — a full pass)")
@@ -3202,10 +3376,15 @@ def preflight_run_result_export(
     return Response(status_code=200, media_type=media_type, headers=headers)
 
 
-def _runner_for(run_id: str, *, fallback: bool = True):
+def _runner_for(run_id: str, *, fallback: bool = True, deps=None):
     """Resolve an in-process owner, including a durable backend reconstructed after restart."""
-    deps = get_deps()
+    deps = deps or get_deps()
     owner = deps.run_index.get(run_id)
+    if owner is None and metadb.run_kernel_id(run_id) is not None:
+        kernel_backend = getattr(deps, "kernel_backend", lambda: None)()
+        if kernel_backend is not None:
+            owner = kernel_backend
+            deps.run_index[run_id] = owner
     if owner is None:
         binding = metadb.backend_job(run_id)
         if binding:

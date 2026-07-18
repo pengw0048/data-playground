@@ -5165,20 +5165,22 @@ def test_cli_does_not_trust_an_eager_plugin_cancel_status():
 
 
 def test_headless_run_canvas_params(tmp_path):
-    # ARC7 canvas parameters: ${NAME} tokens in a canvas's configs are bound per run via --param (cron/CI);
-    # an UNBOUND token must fail loudly, not run against the literal "${src}" path.
+    # Typed declarations and structural refs use the same server resolver as HTTP/MCP; the removed
+    # ${NAME} text substitution is not retained as a second interpretation path.
     import pytest
 
-    from hub.cli import _apply_params, _headless_run, _load_canvas_graph
+    from hub.cli import _headless_run
     from hub.deps import get_deps
     p = _seq_parquet(tmp_path)
     doc = {"id": "param_canvas", "name": "pc", "version": 1,
-           "nodes": [N("src", "source", {"uri": "${src}"}), N("wr", "write", {"name": "param_out"})],
+           "parameters": [{"name": "src", "type": "string", "required": True}],
+           "nodes": [N("src", "source", {"uri": {"parameterRef": "src"}}),
+                     N("wr", "write", {"name": "param_out"})],
            "edges": [E("src", "wr")]}
     client.put("/api/canvas/param_canvas", json=doc)
 
-    # bound: ${src} → the real parquet path → runs to done + materializes the output
-    code = _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={"src": p})
+    code = _headless_run(
+        get_deps(), "param_canvas", None, 30.0, as_json=False, params=[f"src={p}"])
     assert code == 0
     assert any(t["name"] == "param_out" for t in client.get(
         "/api/catalog/tables", params={"q": "param_out"}
@@ -5186,38 +5188,180 @@ def test_headless_run_canvas_params(tmp_path):
 
     # unbound: no --param → loud failure BEFORE the run (not a run against a literal "${src}" path)
     with pytest.raises(SystemExit) as ei:
-        _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params={})
-    assert "unbound canvas parameter" in str(ei.value) and "src" in str(ei.value)
+        _headless_run(get_deps(), "param_canvas", None, 30.0, as_json=False, params=[])
+    assert "required parameter 'src'" in str(ei.value)
 
-    # _apply_params substitutes within config; a bound token is replaced verbatim, title left untouched
-    g, _ = _load_canvas_graph("param_canvas")
-    _apply_params(g, {"src": "/data/x.parquet"})
-    assert g.nodes[0].data["config"]["uri"] == "/data/x.parquet"
-
-    # M1: a token whose name has a '-'/'.' still binds (regex is [^}]+), and is NEVER left as a silent
-    # literal — an unbound one of these errors just like a plain name (the review's silent-hole fix)
-    doc2 = {"id": "pc2", "name": "pc2", "version": 1,
-            "nodes": [N("src", "source", {"uri": "d/${my-date}/x"})], "edges": []}
-    client.put("/api/canvas/pc2", json=doc2)
-    g2, _ = _load_canvas_graph("pc2")
-    _apply_params(g2, {"my-date": "2026-07-12"})
-    assert g2.nodes[0].data["config"]["uri"] == "d/2026-07-12/x"
-    with pytest.raises(SystemExit) as ei2:
-        _apply_params(_load_canvas_graph("pc2")[0], {})  # unbound hyphen token must fail loudly
-    assert "my-date" in str(ei2.value)
-
-    # m2: targeting one node must NOT require params from an UNRELATED branch. Branch A (src_a→wr_a) needs
-    # no param; branch B has an unbound ${dev}. Running --node wr_a substitutes/checks only A's cone.
+    # Targeting A does not require the declared ref used only by branch B.
     doc3 = {"id": "pc3", "name": "pc3", "version": 1,
+            "parameters": [{"name": "dev", "type": "string", "required": True}],
             "nodes": [N("src_a", "source", {"uri": p}), N("wr_a", "write", {"name": "pc3_a"}),
-                      N("src_b", "source", {"uri": "${dev}"}), N("wr_b", "write", {"name": "pc3_b"})],
+                      N("src_b", "source", {"uri": {"parameterRef": "dev"}}),
+                      N("wr_b", "write", {"name": "pc3_b"})],
             "edges": [E("src_a", "wr_a"), E("src_b", "wr_b")]}
     client.put("/api/canvas/pc3", json=doc3)
-    ga, _ = _load_canvas_graph("pc3")
-    _apply_params(ga, {}, node="wr_a")  # only wr_a's cone (src_a, wr_a) — the unbound ${dev} in B is not in scope
-    # (no SystemExit) — and the whole-canvas view WOULD flag it:
-    with pytest.raises(SystemExit):
-        _apply_params(_load_canvas_graph("pc3")[0], {})
+    assert _headless_run(
+        get_deps(), "pc3", "wr_a", 30.0, as_json=False, params=[]) == 0
+
+
+@pytest.mark.parametrize("declaration", [
+    {"name": "value", "type": "string", "required": True, "default": "x"},
+    {"name": "value", "type": "date", "default": "2026-02-30"},
+    {"name": "value", "type": "integer", "default": 2,
+     "constraints": {"minimum": 3}},
+    {"name": "value", "type": "dataset",
+     "default": {"kind": "latest", "datasetId": "env:PRIVATE_DATASET"}},
+])
+def test_canvas_save_rejects_invalid_parameter_contract_without_overwrite(declaration):
+    import uuid
+
+    cid = f"invalid_parameter_contract_{uuid.uuid4().hex}"
+    valid = {"id": cid, "name": "valid", "version": 1, "nodes": [], "edges": []}
+    assert client.put(f"/api/canvas/{cid}", json=valid).status_code == 200
+    invalid = {**valid, "name": "must-not-persist", "parameters": [declaration]}
+    assert client.put(f"/api/canvas/{cid}", json=invalid).status_code == 422
+    assert client.get(f"/api/canvas/{cid}").json()["name"] == "valid"
+    invalid["id"] = f"new_{cid}"
+    assert client.post("/api/canvas", json=invalid).status_code == 422
+
+
+def test_all_execution_http_surfaces_resolve_the_same_parameter_contract():
+    import uuid
+
+    graph = {
+        "id": f"parameter_surface_{uuid.uuid4().hex}", "version": 1,
+        "parameters": [{"name": "source_uri", "type": "string", "required": True}],
+        "nodes": [N("source", "source", {"uri": {"parameterRef": "source_uri"}})],
+        "edges": [],
+    }
+    requests = [
+        ("/api/graph/compile", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/graph/schema", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/graph/estimate", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/graph/plan", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/graph/join-analysis", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/run/preview", {"graph": graph, "nodeId": "source"}),
+        ("/api/run/profile", {"graph": graph, "nodeId": "source"}),
+        ("/api/run/profile-estimate", {"graph": graph, "nodeId": "source"}),
+        ("/api/run/profile-identity", {"graph": graph, "nodeId": "source"}),
+        ("/api/run/estimate", {"graph": graph, "targetNodeId": "source"}),
+        ("/api/run/input-drift", {
+            "graph": graph, "targetNodeId": "source", "inputManifest": [],
+        }),
+        ("/api/run/write-admission", {
+            "graph": graph, "nodeId": "source", "submissionId": str(uuid.uuid4()),
+        }),
+        ("/api/run/profile-job", {
+            "graph": graph, "nodeId": "source", "planDigest": "a" * 64,
+            "submissionId": str(uuid.uuid4()), "confirmed": True,
+        }),
+        ("/api/run", {"graph": graph, "targetNodeId": "source"}),
+    ]
+    for path, body in requests:
+        response = client.post(path, json=body)
+        assert response.status_code == 422, (path, response.text)
+        assert "required parameter 'source_uri'" in response.text
+
+
+def test_graph_inspection_routes_accept_and_apply_typed_parameter_bindings(tmp_path):
+    source = _seq_parquet(tmp_path)
+    graph = {
+        "id": "parameterized_inspection_routes", "version": 1,
+        "parameters": [{"name": "source_uri", "type": "string", "required": True}],
+        "nodes": [N("source", "source", {"uri": {"parameterRef": "source_uri"}})],
+        "edges": [],
+    }
+    binding = [{"name": "source_uri", "value": source}]
+    for path in (
+        "/api/graph/schema", "/api/graph/estimate", "/api/graph/plan",
+        "/api/graph/join-analysis",
+    ):
+        response = client.post(path, json={
+            "graph": graph, "targetNodeId": "source", "parameterBindings": binding,
+        })
+        assert response.status_code == 200, (path, response.status_code, response.text)
+
+
+def test_targeted_graph_inspection_routes_ignore_an_unbound_sibling_branch(tmp_path):
+    source = _seq_parquet(tmp_path)
+    graph = {
+        "id": "parameterized_inspection_cone", "version": 1,
+        "parameters": [{"name": "other", "type": "string", "required": True}],
+        "nodes": [
+            N("a", "source", {"uri": source}),
+            N("b", "source", {"uri": {"parameterRef": "other"}}),
+        ],
+        "edges": [],
+    }
+    results = {}
+    for path in (
+        "/api/graph/schema", "/api/graph/estimate", "/api/graph/plan",
+        "/api/graph/join-analysis",
+    ):
+        response = client.post(path, json={"graph": graph, "targetNodeId": "a"})
+        assert response.status_code == 200, (path, response.status_code, response.text)
+        results[path] = response.json()
+    assert "a" in results["/api/graph/schema"] and "b" not in results["/api/graph/schema"]
+    assert "a" in results["/api/graph/estimate"] and "b" not in results["/api/graph/estimate"]
+
+
+def test_targeted_graph_inspection_cone_keeps_section_children(tmp_path):
+    source = _seq_parquet(tmp_path)
+    graph = {
+        "id": "parameterized_section_inspection_cone", "version": 1,
+        "parameters": [{"name": "other", "type": "string", "required": True}],
+        "nodes": [
+            N("section", "section", {}),
+            {**N("child", "source", {"uri": source}), "parentId": "section"},
+            N("unused", "source", {"uri": {"parameterRef": "other"}}),
+        ],
+        "edges": [],
+    }
+    results = {}
+    for path in (
+        "/api/graph/schema", "/api/graph/estimate", "/api/graph/plan",
+        "/api/graph/join-analysis",
+    ):
+        response = client.post(path, json={"graph": graph, "targetNodeId": "section"})
+        assert response.status_code == 200, (path, response.status_code, response.text)
+        results[path] = response.json()
+    assert {"section", "child"} <= set(results["/api/graph/schema"])
+    assert "unused" not in results["/api/graph/schema"]
+    assert {"section", "child"} <= set(results["/api/graph/estimate"])
+    assert "unused" not in results["/api/graph/estimate"]
+
+
+def test_headless_json_parameter_failures_have_a_stable_machine_envelope(capsys):
+    import json
+
+    from hub.cli import _headless_run
+    from hub.deps import get_deps
+
+    cid = "cli_json_parameter_errors"
+    client.put(f"/api/canvas/{cid}", json={
+        "id": cid, "name": cid, "version": 1,
+        "parameters": [{"name": "count", "type": "integer", "required": True}],
+        "nodes": [N("source", "source", {"uri": "events"}),
+                  N("filter", "filter", {"limit": {"parameterRef": "count"}})],
+        "edges": [E("source", "filter")],
+    })
+    assert _headless_run(
+        get_deps(), cid, "filter", 30.0, as_json=True, params=["count=bad"]) == 2
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed == {
+        "status": "failed",
+        "error": {
+            "code": "validation_error",
+            "detail": "parameter 'count' must be a safe integer",
+            "retryable": False,
+        },
+    }
+
+    assert _headless_run(
+        get_deps(), cid, "filter", 30.0, as_json=True, params=[]) == 2
+    resolved = json.loads(capsys.readouterr().out)
+    assert resolved["status"] == "failed"
+    assert resolved["error"]["code"] == "validation_error"
+    assert "required parameter 'count'" in resolved["error"]["detail"]
 
 
 def test_coordination_tables_pruned_to_cap(monkeypatch):

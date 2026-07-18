@@ -248,7 +248,8 @@ def build_execution_manifest(
         ),
         "descriptors": _descriptor_snapshot(graph, deps),
     }
-    # ``parameters`` is intentionally absent until #477 admits typed bindings.
+    if graph._parameter_bindings:
+        doc["parameters"] = graph._parameter_bindings
     _assert_secret_free(doc)
     payload = json.dumps(
         doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -274,6 +275,23 @@ def validate_execution_manifest(sha256: str, payload: str) -> dict[str, Any]:
         raise ExecutionManifestError("persisted execution manifest is not canonical")
     if doc.get("schemaVersion") != SCHEMA_VERSION:
         raise ExecutionManifestError("execution manifest schema version is unsupported")
+    parameters = doc.get("parameters")
+    if parameters is not None:
+        if not isinstance(parameters, list) or len(parameters) > 128:
+            raise ExecutionManifestError("execution manifest parameters are invalid")
+        from hub.run_parameters import (
+            ParameterResolutionError, validate_canonical_parameter_binding,
+        )
+        names: set[str] = set()
+        for item in parameters:
+            try:
+                canonical_item = validate_canonical_parameter_binding(item)
+            except ParameterResolutionError as exc:
+                raise ExecutionManifestError(
+                    "execution manifest parameters are invalid") from exc
+            if canonical_item["name"] in names:
+                raise ExecutionManifestError("execution manifest parameters are invalid")
+            names.add(canonical_item["name"])
     _assert_secret_free(doc)
     observed = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     if not secrets.compare_digest(observed, sha256):
@@ -360,6 +378,7 @@ def execution_manifest_admission(sha256: str, payload: str) -> dict[str, Any]:
         "write_intent": write_intent,
         "target_node_id": node_id,
         "target_port_id": port_id,
+        "parameters": doc.get("parameters"),
     }
 
 
@@ -393,9 +412,28 @@ def execution_manifest_accepts_graph_replay(
             "revision_id": item["revisionId"],
             "provider": item["provider"],
         })
+    def parameter_intent(value):
+        if not isinstance(value, list):
+            return value
+        result = []
+        for item in value:
+            if not isinstance(item, dict):
+                return value
+            copied = dict(item)
+            binding = copied.get("value")
+            if isinstance(binding, dict) and binding.get("kind") == "latest":
+                copied["value"] = {
+                    key: child for key, child in binding.items()
+                    if key != "resolvedRevisionId"
+                }
+            result.append(copied)
+        return result
+
     return bool(
         doc.get("graph") == _canonical_graph(graph, source_inputs)
         and doc.get("target") == {
             "nodeId": target_node_id, "portId": target_port_id,
         }
+        and parameter_intent(doc.get("parameters"))
+        == parameter_intent(graph._parameter_bindings or None)
     )
