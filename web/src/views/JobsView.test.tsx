@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  workspaceJobs: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
+  workspaceJobs: vi.fn(), executionManifest: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
@@ -22,6 +22,7 @@ describe('JobsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.workspaceJobs.mockResolvedValue({ items: [job()], hasMore: false, nextCursor: null })
+    mocks.executionManifest.mockResolvedValue({ availability: 'not_recorded', document: null })
     mocks.cancelRun.mockResolvedValue(undefined)
     mocks.retryRun.mockResolvedValue(undefined)
     mocks.listCanvases.mockResolvedValue([])
@@ -270,6 +271,35 @@ describe('JobsView', () => {
     expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
+  })
+
+  it('loads the selected durable task manifest through its current Canvas subject', async () => {
+    const digest = 'b'.repeat(64)
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      id: 't:task-manifest', runId: 'task-manifest', taskId: 'task-manifest', error: null,
+      executionManifestSha256: digest, executionManifestSchemaVersion: 1,
+      executionManifestAvailability: 'available', executionManifestReconstructable: true,
+    })], hasMore: false, nextCursor: null })
+    mocks.executionManifest.mockResolvedValue({
+      sha256: digest, schemaVersion: 1, availability: 'available', document: {
+        schemaVersion: 1,
+        graph: { nodes: [], edges: [], requirements: [] },
+        target: { nodeId: 'write-1', portId: null },
+        admittedInputs: [], writeIntent: null,
+        descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
+      },
+    })
+    render(<JobsView />)
+
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open run task-manifest in Alpha research', expanded: false,
+    }))
+    expect(mocks.executionManifest).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: /Execution manifest/ }))
+
+    expect(await screen.findByText('Submitted graph')).toBeVisible()
+    expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+    expect(mocks.executionManifest).toHaveBeenCalledWith('canvas-1', 't:task-manifest')
   })
 
   it('reuses one retry action id after an ambiguous request failure', async () => {

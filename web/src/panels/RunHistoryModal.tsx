@@ -6,6 +6,7 @@ import { Icon } from '../ui/Icon'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
 import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
@@ -64,6 +65,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
+                  <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r} />
                   {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}

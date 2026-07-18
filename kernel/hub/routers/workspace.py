@@ -12,7 +12,7 @@ import datetime
 import json
 from typing import Callable, Hashable, Literal, TypeVar
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Path, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -26,6 +26,7 @@ from hub.models import (
     DurableTaskInboxItemView,
     DurableTaskInboxPage,
     DurableTaskInboxUnreadCount,
+    ExecutionManifestDetail,
     RunHistoryRecord,
     RunStatus,
     WorkspaceRunPage,
@@ -744,6 +745,22 @@ def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunHis
     if metadb.canvas_role(canvas_id, uid) is None:  # same authz as the other canvas endpoints
         raise HTTPException(404, "not found")
     return [RunHistoryRecord.model_validate(record) for record in metadb.list_runs(canvas_id)]
+
+
+@router.get(
+    "/canvas/{canvas_id}/runs/{subject_id}/manifest",
+    response_model=ExecutionManifestDetail,
+)
+def execution_manifest_detail(
+        canvas_id: str = Path(min_length=1, max_length=512),
+        subject_id: str = Path(min_length=1, max_length=1024),
+        uid: str = Depends(current_user)) -> ExecutionManifestDetail:
+    """Inspect one immutable History/Jobs manifest under current Canvas visibility."""
+    detail = metadb.execution_manifest_detail_for_subject(uid, canvas_id, subject_id)
+    if detail is None:
+        # Match the existing Canvas/run read boundary: revoked and unknown Canvases are not enumerable.
+        raise HTTPException(404, "not found")
+    return ExecutionManifestDetail.model_validate(detail)
 
 
 @router.get("/jobs", response_model=WorkspaceRunPage)

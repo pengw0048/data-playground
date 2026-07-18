@@ -1832,6 +1832,65 @@
         "title": "ExactDatasetRef",
         "type": "object"
       },
+      "ExecutionManifestDetail": {
+        "description": "One subject-authorized immutable execution-manifest read.",
+        "properties": {
+          "availability": {
+            "enum": [
+              "available",
+              "pruned",
+              "not_recorded",
+              "unavailable",
+              "corrupt"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "document": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Document"
+          },
+          "schemaVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schemaversion"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          }
+        },
+        "required": [
+          "availability"
+        ],
+        "title": "ExecutionManifestDetail",
+        "type": "object"
+      },
       "FacetValue": {
         "properties": {
           "count": {
@@ -4272,10 +4331,34 @@
             ],
             "title": "Error"
           },
+          "executionManifestAvailability": {
+            "default": "not_recorded",
+            "enum": [
+              "available",
+              "pruned",
+              "not_recorded",
+              "unavailable",
+              "corrupt"
+            ],
+            "title": "Executionmanifestavailability",
+            "type": "string"
+          },
           "executionManifestReconstructable": {
             "default": false,
             "title": "Executionmanifestreconstructable",
             "type": "boolean"
+          },
+          "executionManifestSchemaVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestschemaversion"
           },
           "executionManifestSha256": {
             "anyOf": [
@@ -6159,10 +6242,34 @@
             ],
             "title": "Error"
           },
+          "executionManifestAvailability": {
+            "default": "not_recorded",
+            "enum": [
+              "available",
+              "pruned",
+              "not_recorded",
+              "unavailable",
+              "corrupt"
+            ],
+            "title": "Executionmanifestavailability",
+            "type": "string"
+          },
           "executionManifestReconstructable": {
             "default": false,
             "title": "Executionmanifestreconstructable",
             "type": "boolean"
+          },
+          "executionManifestSchemaVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestschemaversion"
           },
           "executionManifestSha256": {
             "anyOf": [
@@ -8499,6 +8606,101 @@
           }
         },
         "summary": "Canvas Runs"
+      }
+    },
+    "/api/canvas/{canvas_id}/runs/{subject_id}/manifest": {
+      "get": {
+        "description": "Inspect one immutable History/Jobs manifest under current Canvas visibility.",
+        "operationId": "execution_manifest_detail_api_canvas__canvas_id__runs__subject_id__manifest_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "title": "Subject Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionManifestDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Execution Manifest Detail"
       }
     },
     "/api/canvas/{canvas_id}/share": {

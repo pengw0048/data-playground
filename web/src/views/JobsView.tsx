@@ -6,6 +6,7 @@ import { status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { FullResult } from '../panels/DataPanel'
 import { fmtMs } from '../panels/RunHistoryModal'
+import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 
@@ -361,6 +362,9 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
+      </div>
+      <div className="sm:col-span-2">
+        <ExecutionManifestDetail canvasId={item.canvasId} subjectId={item.id} summary={item} />
       </div>
       {item.taskId && <div className="grid gap-2 sm:col-span-2">
         {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}

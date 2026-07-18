@@ -1023,6 +1023,41 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText(/No runs yet/)).toBeVisible()
   })
 
+  test('run history lazily inspects the retained execution manifest @ux-smoke', async ({ page }) => {
+    await fresh(page)
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const digest = 'c'.repeat(64)
+    await page.route(`**/api/canvas/${canvasId}/runs`, async (route) => {
+      await route.fulfill({ json: [{
+        id: 'history-manifest', runId: 'run-manifest', jobType: 'run', status: 'failed',
+        targetNodeId: 'source', outputs: [],
+        executionManifestSha256: digest, executionManifestSchemaVersion: 1,
+        executionManifestAvailability: 'available', executionManifestReconstructable: true,
+      }] })
+    })
+    await page.route(`**/api/canvas/${canvasId}/runs/history-manifest/manifest`, async (route) => {
+      await route.fulfill({ json: {
+        sha256: digest, schemaVersion: 1, availability: 'available',
+        document: {
+          schemaVersion: 1,
+          graph: { nodes: [{ id: 'source', type: 'source', data: { config: {} } }], edges: [], requirements: [] },
+          target: { nodeId: 'source', portId: null },
+          admittedInputs: [{ nodeId: 'source', datasetId: 'events', revisionId: 'revision-1', provider: 'local' }],
+          writeIntent: null,
+          descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
+        },
+      } })
+    })
+
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Run history', { exact: true }).click()
+    await page.getByRole('button', { name: /Execution manifest/ }).click()
+
+    await expect(page.getByText('Submitted graph')).toBeVisible()
+    await expect(page.getByText(/events@revision-1/)).toBeVisible()
+    await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+  })
+
   test('identity lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {
     await page.goto('/')
     // the canvas top-right no longer carries an account avatar (identity/logout belong on the shell)

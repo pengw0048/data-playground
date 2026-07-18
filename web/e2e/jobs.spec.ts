@@ -5,6 +5,8 @@ const failedJob = {
   canvasId: 'canvas-jobs', canvasName: 'Climate analysis', targetNodeId: 'publish',
   nodeLabel: 'Publish results', backend: 'local', placement: 'local', attempt: 'run-failed',
   rows: null, ms: 1200, error: 'destination unavailable', outputs: [],
+  executionManifestSha256: 'a'.repeat(64), executionManifestSchemaVersion: 1,
+  executionManifestAvailability: 'available', executionManifestReconstructable: true,
   createdAt: '2026-07-16T12:00:00Z',
 }
 
@@ -30,6 +32,18 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
     }
     await route.fulfill({ json: { items: [failedJob], nextCursor: 'opaque-next', hasMore: true } })
   })
+  await page.route('**/api/canvas/canvas-jobs/runs/history-failed/manifest', async (route) => {
+    await route.fulfill({ json: {
+      sha256: 'a'.repeat(64), schemaVersion: 1, availability: 'available',
+      document: {
+        schemaVersion: 1,
+        graph: { nodes: [{ id: 'publish', type: 'write', data: { config: {} } }], edges: [], requirements: [] },
+        target: { nodeId: 'publish', portId: null }, admittedInputs: [],
+        writeIntent: { mode: 'create', destination: { name: 'results' } },
+        descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
+      },
+    } })
+  })
 
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
@@ -51,6 +65,9 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByRole('link', { name: 'Open node' })).toHaveAttribute(
     'href', '#/canvas/canvas-jobs?node=publish')
   await expect(page).toHaveURL(/run=run-failed/)
+  await page.getByRole('button', { name: /Execution manifest/ }).click()
+  await expect(page.getByText('Submitted graph')).toBeVisible()
+  await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
   await page.goBack()
   await expect(page).toHaveURL(/#\/jobs\?status=failed$/)
   await page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false }).click()
