@@ -146,6 +146,32 @@ def test_exact_route_rejects_non_matching_shapes():
     assert exc.value.status_code == 409
 
 
+def test_route_rejects_disabled_or_bypassed_nodes():
+    def _graph(flag_node: str, flag: str) -> Graph:
+        nodes = {
+            "source": {"id": "source", "type": "source", "data": {"config": {"uri": "/x"}}},
+            "checkpoint": {"id": "checkpoint", "type": "select", "data": {
+                "config": {"select": "*", "checkpoint": True}}},
+            "identity": {"id": "identity", "type": "select", "data": {"config": {"select": "*"}}},
+            "write": {"id": "write", "type": "write", "data": {"config": {"filename": "o.parquet"}}},
+        }
+        nodes[flag_node]["data"][flag] = True
+        return Graph.model_validate({
+            "id": "g", "version": 1, "nodes": list(nodes.values()),
+            "edges": [
+                {"id": "e1", "source": "source", "target": "checkpoint"},
+                {"id": "e2", "source": "checkpoint", "target": "identity"},
+                {"id": "e3", "source": "identity", "target": "write"},
+            ],
+        })
+
+    for flag_node, flag in (("identity", "bypassed"), ("source", "disabled"),
+                            ("checkpoint", "bypassed"), ("write", "disabled")):
+        with pytest.raises(HTTPException) as exc:
+            _bounded_fanout_write_shape(_graph(flag_node, flag), "write")
+        assert exc.value.status_code == 409
+
+
 @pytest.mark.parametrize("rows", [0, 1, 3, 5])
 def test_happy_path_rows_match_select_star(tmp_path, rows):
     uid, canvas_id = f"fan-user-{uuid.uuid4().hex}", f"fan-canvas-{uuid.uuid4().hex}"

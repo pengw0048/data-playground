@@ -15,9 +15,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-OPERATION_ID = "identity_projection_v1"
-
-
 def validate_identity_select_config(cfg: dict) -> None:
     """Accept only exact ``{\"select\": \"*\"}``; reject extras and non-star selects."""
     if not isinstance(cfg, dict) or cfg != {"select": "*"}:
