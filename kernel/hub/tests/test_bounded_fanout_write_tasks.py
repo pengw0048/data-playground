@@ -38,6 +38,25 @@ def _metadata_schema(tmp_path_factory):
         metadb._engine, metadb._Session = original_engine, original_session
 
 
+@pytest.fixture(autouse=True)
+def _reset_fanout_state():
+    """Isolate the global 4-slot pool + plans/units between tests so the suite is safe on a shared
+    (PostgreSQL) database, not only a fresh per-module SQLite file."""
+    yield
+    from sqlalchemy import delete, update
+
+    from hub import bounded_fanout as fanout
+    with metadb.session() as s:
+        s.execute(update(fanout.BoundedFanoutSlot).values(
+            holder_attempt_id=None, claim_token=None, lease_until=None))
+        s.execute(delete(fanout.BoundedFanoutUnitAttempt))
+        s.execute(delete(fanout.BoundedFanoutUnit))
+        s.execute(delete(fanout.BoundedFanoutPlan))
+        s.execute(delete(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind.in_(
+                (fanout.CHILD_OWNER, fanout.GATHER_OWNER))))
+
+
 def _source_table(rows: int) -> pa.Table:
     return pa.table({
         "value": pa.array(list(range(rows)), pa.int64()),
