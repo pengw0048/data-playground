@@ -1201,6 +1201,355 @@
         "title": "DatasetRevisionSummary",
         "type": "object"
       },
+      "DatasetViewAllSampling": {
+        "additionalProperties": false,
+        "description": "Keep every row in the exact filtered population.",
+        "properties": {
+          "kind": {
+            "const": "all",
+            "default": "all",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "title": "DatasetViewAllSampling",
+        "type": "object"
+      },
+      "DatasetViewCreateRequest": {
+        "additionalProperties": false,
+        "description": "Immutable DatasetView intent. Workspace placement is derived by the server.",
+        "properties": {
+          "datasetRef": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "maxLength": 65536,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "sampling": {
+            "default": {
+              "kind": "all"
+            },
+            "discriminator": {
+              "mapping": {
+                "all": "#/components/schemas/DatasetViewAllSampling",
+                "reservoir": "#/components/schemas/DatasetViewReservoirSampling"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DatasetViewAllSampling"
+              },
+              {
+                "$ref": "#/components/schemas/DatasetViewReservoirSampling"
+              }
+            ],
+            "title": "Sampling"
+          },
+          "selectedColumns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Selectedcolumns",
+            "type": "array"
+          },
+          "submissionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "submissionId",
+          "name",
+          "datasetRef",
+          "selectedColumns"
+        ],
+        "title": "DatasetViewCreateRequest",
+        "type": "object"
+      },
+      "DatasetViewDefinitionV1": {
+        "additionalProperties": false,
+        "description": "The complete immutable, schema-versioned definition of one reusable DatasetView.",
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "creatorId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Creatorid",
+            "type": "string"
+          },
+          "datasetRef": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "definitionSha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Definitionsha256",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "placement": {
+            "$ref": "#/components/schemas/DatasetViewPlacement"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Predicate"
+          },
+          "retentionOwner": {
+            "enum": [
+              "provider",
+              "core"
+            ],
+            "title": "Retentionowner",
+            "type": "string"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sampling": {
+            "discriminator": {
+              "mapping": {
+                "all": "#/components/schemas/DatasetViewAllSampling",
+                "reservoir": "#/components/schemas/DatasetViewReservoirSampling"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DatasetViewAllSampling"
+              },
+              {
+                "$ref": "#/components/schemas/DatasetViewReservoirSampling"
+              }
+            ],
+            "title": "Sampling"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "selectedColumns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Selectedcolumns",
+            "type": "array"
+          },
+          "semanticSha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Semanticsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "creatorId",
+          "name",
+          "datasetRef",
+          "placement",
+          "selectedColumns",
+          "sampling",
+          "retentionOwner",
+          "createdAt",
+          "semanticSha256",
+          "definitionSha256"
+        ],
+        "title": "DatasetViewDefinitionV1",
+        "type": "object"
+      },
+      "DatasetViewDeleteResult": {
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "deleted"
+        ],
+        "title": "DatasetViewDeleteResult",
+        "type": "object"
+      },
+      "DatasetViewPlacement": {
+        "additionalProperties": false,
+        "description": "Stable Workspace location selected atomically beside the source registration.",
+        "properties": {
+          "containerId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Containerid",
+            "type": "string"
+          },
+          "placementId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Placementid",
+            "type": "string"
+          },
+          "sourceRegistrationId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourceregistrationid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "containerId",
+          "placementId",
+          "sourceRegistrationId"
+        ],
+        "title": "DatasetViewPlacement",
+        "type": "object"
+      },
+      "DatasetViewPreview": {
+        "description": "One bounded replay of an immutable DatasetView definition.",
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 500,
+            "title": "Columns",
+            "type": "array"
+          },
+          "hasMore": {
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "rowCount": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rowcount"
+          },
+          "rowLimit": {
+            "const": 100,
+            "default": 100,
+            "title": "Rowlimit",
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "maxItems": 100,
+            "title": "Rows",
+            "type": "array"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "hasMore"
+        ],
+        "title": "DatasetViewPreview",
+        "type": "object"
+      },
+      "DatasetViewReservoirSampling": {
+        "additionalProperties": false,
+        "description": "One deterministic reservoir over the exact filtered population.",
+        "properties": {
+          "kind": {
+            "const": "reservoir",
+            "default": "reservoir",
+            "title": "Kind",
+            "type": "string"
+          },
+          "seed": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Seed",
+            "type": "integer"
+          },
+          "size": {
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "size",
+          "seed"
+        ],
+        "title": "DatasetViewReservoirSampling",
+        "type": "object"
+      },
       "DeclareKeyRequest": {
         "properties": {
           "columns": {
@@ -6503,7 +6852,8 @@
             "enum": [
               "container",
               "canvas",
-              "dataset"
+              "dataset",
+              "dataset_view"
             ],
             "title": "Kind",
             "type": "string"
@@ -12690,6 +13040,331 @@
           }
         },
         "summary": "Data Sample"
+      }
+    },
+    "/api/dataset-views": {
+      "post": {
+        "description": "Create or replay one immutable exact-revision view and its Workspace placement.",
+        "operationId": "create_dataset_view_api_dataset_views_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DatasetViewCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetViewDefinitionV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Create Dataset View"
+      }
+    },
+    "/api/dataset-views/{view_id}": {
+      "delete": {
+        "operationId": "delete_dataset_view_api_dataset_views__view_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetViewDeleteResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Delete Dataset View"
+      },
+      "get": {
+        "operationId": "get_dataset_view_api_dataset_views__view_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetViewDefinitionV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Get Dataset View"
+      }
+    },
+    "/api/dataset-views/{view_id}/preview": {
+      "post": {
+        "description": "Replay the immutable exact definition and return at most 100 rows.",
+        "operationId": "preview_dataset_view_api_dataset_views__view_id__preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetViewPreview"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preview Dataset View"
       }
     },
     "/api/destinations": {

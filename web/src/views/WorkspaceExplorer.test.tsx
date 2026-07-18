@@ -1,9 +1,11 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { DatasetViewDefinition } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tableByRegistration: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
+  datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
@@ -46,6 +48,14 @@ const ROOT = { id: 'container:workspace-local-root', kind: 'container' as const,
 const FOLDER = { id: 'container:folder-1', kind: 'container' as const, name: 'Research', parentId: ROOT.id, version: 1, detached: false }
 const DATASET = { id: 'dataset:dataset-1', kind: 'dataset' as const, name: 'observations', parentId: FOLDER.id, placementId: 'dataset-placement', version: 1, detached: false }
 const CANVAS = { id: 'canvas:canvas-1', kind: 'canvas' as const, name: 'Analysis', parentId: ROOT.id, placementId: 'canvas-placement', version: 3, detached: false }
+const DATASET_VIEW = { id: 'dataset_view:view-1', kind: 'dataset_view' as const, name: 'robot interactions', parentId: FOLDER.id, placementId: 'view-placement', version: 1, detached: false }
+const VIEW_DEFINITION: DatasetViewDefinition = {
+  schemaVersion: 1, id: 'view-1', creatorId: 'local', name: 'robot interactions',
+  datasetRef: { kind: 'exact', datasetId: 'dataset-stable', revisionId: 'rev-7', lastKnown: { committedAt: '2026-07-17T12:00:00Z' } },
+  placement: { containerId: 'folder-1', placementId: 'view-placement', sourceRegistrationId: 'dataset-1' },
+  selectedColumns: ['frame_id'], predicate: null, sampling: { kind: 'all' }, sampleProvenance: null,
+  retentionOwner: 'provider', createdAt: '2026-07-18T12:00:00Z', semanticSha256: 'a'.repeat(64), definitionSha256: 'b'.repeat(64),
+}
 const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder' }
 const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset' }
 const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mountId: 'warehouse', provider: 'fixture', completeness: 'complete' as const, error: null }
@@ -64,6 +74,11 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
+    mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
+    mocks.previewDatasetView.mockResolvedValue({
+      columns: [{ fieldId: 'frame_id', name: 'frame_id', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
+      rows: [{ frame_id: 9 }], rowCount: 1, hasMore: false, rowLimit: 100, sampleProvenance: null,
+    })
   })
   afterEach(() => cleanup())
 
@@ -75,6 +90,27 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByTestId('catalog-detail')).toHaveTextContent('observations')
     expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
+  })
+
+  it('resolves a stable DatasetView URL beside its Catalog source and replays its exact revision', async () => {
+    store.workspaceResourceId = DATASET_VIEW.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: DATASET_VIEW, ancestors: [ROOT, FOLDER],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: FOLDER, items: [DATASET_VIEW], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'robot interactions' })
+    expect(detail).toHaveTextContent('revision:rev-7')
+    expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
+    expect(screen.getByRole('button', { name: 'Open datasetview robot interactions' }).parentElement)
+      .toHaveTextContent('DatasetView · Local exact view')
+    expect(mocks.datasetView).toHaveBeenCalledWith('view-1')
+    expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1')
   })
 
   it('continues a bounded page only when the user requests more', async () => {

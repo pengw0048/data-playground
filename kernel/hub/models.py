@@ -679,7 +679,7 @@ class CatalogBrowse(Wire):
 class WorkspaceResource(Wire):
     """One Workspace child addressed by an opaque, path-independent reference."""
     id: str
-    kind: Literal["container", "canvas", "dataset"]
+    kind: Literal["container", "canvas", "dataset", "dataset_view"]
     name: str
     parent_id: str | None = None
     placement_id: str | None = None
@@ -827,6 +827,124 @@ class SampleProvenance(Wire):
     dataset_revision: str | None = None
     identity: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     limitations: list[str] = Field(default_factory=list)
+
+
+class DatasetViewAllSampling(Wire):
+    """Keep every row in the exact filtered population."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["all"] = "all"
+
+
+class DatasetViewReservoirSampling(Wire):
+    """One deterministic reservoir over the exact filtered population."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["reservoir"] = "reservoir"
+    size: int = Field(ge=1, le=100_000)
+    seed: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+
+
+DatasetViewSampling = Annotated[
+    DatasetViewAllSampling | DatasetViewReservoirSampling,
+    Field(discriminator="kind"),
+]
+
+
+class DatasetViewCreateRequest(Wire):
+    """Immutable DatasetView intent. Workspace placement is derived by the server."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    submission_id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+    dataset_ref: ExactDatasetRef
+    selected_columns: list[str] = Field(min_length=1, max_length=500)
+    predicate: str | None = Field(default=None, max_length=65_536)
+    sampling: DatasetViewSampling = DatasetViewAllSampling()
+
+    @model_validator(mode="after")
+    def validate_intent(self) -> "DatasetViewCreateRequest":
+        if self.submission_id != self.submission_id.strip():
+            raise ValueError("DatasetView submission id cannot contain surrounding whitespace")
+        if self.name != self.name.strip() or "\x00" in self.name:
+            raise ValueError("DatasetView name must be trimmed and cannot contain NUL")
+        columns = [column.strip() for column in self.selected_columns]
+        if any(not column or "\x00" in column for column in columns):
+            raise ValueError("DatasetView columns must be non-blank and cannot contain NUL")
+        if len(set(columns)) != len(columns):
+            raise ValueError("DatasetView columns must be unique")
+        self.selected_columns = columns
+        if self.predicate is not None:
+            predicate = self.predicate.strip()
+            self.predicate = predicate or None
+        return self
+
+
+class DatasetViewPlacement(Wire):
+    """Stable Workspace location selected atomically beside the source registration."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    container_id: str = Field(min_length=1, max_length=512)
+    placement_id: str = Field(min_length=1, max_length=512)
+    source_registration_id: str = Field(min_length=1, max_length=512)
+
+
+class DatasetViewDefinitionV1(Wire):
+    """The complete immutable, schema-versioned definition of one reusable DatasetView."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    id: str = Field(min_length=1, max_length=32)
+    creator_id: str = Field(min_length=1, max_length=512)
+    name: str = Field(min_length=1, max_length=256)
+    dataset_ref: ExactDatasetRef
+    placement: DatasetViewPlacement
+    selected_columns: list[str] = Field(min_length=1, max_length=500)
+    predicate: str | None = None
+    sampling: DatasetViewSampling
+    sample_provenance: SampleProvenance | None = None
+    retention_owner: Literal["provider", "core"]
+    created_at: datetime.datetime
+    semantic_sha256: PlanDigest
+    definition_sha256: PlanDigest
+
+    @model_validator(mode="after")
+    def validate_sampling_evidence(self) -> "DatasetViewDefinitionV1":
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("DatasetView createdAt must be timezone-aware")
+        if self.sampling.kind == "all":
+            if self.sample_provenance is not None:
+                raise ValueError("an all-rows DatasetView cannot carry sample provenance")
+            return self
+        evidence = self.sample_provenance
+        if (evidence is None or evidence.strategy != "reservoir"
+                or evidence.seed != self.sampling.seed
+                or evidence.requested_rows != self.sampling.size
+                or evidence.dataset_identity != self.dataset_ref.dataset_id
+                or evidence.dataset_revision != self.dataset_ref.revision_id):
+            raise ValueError("DatasetView reservoir provenance does not match its immutable definition")
+        return self
+
+
+class DatasetViewPreview(Wire):
+    """One bounded replay of an immutable DatasetView definition."""
+
+    columns: list[ColumnSchema] = Field(default_factory=list, max_length=500)
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    row_count: int | None = Field(default=None, ge=0)
+    has_more: bool
+    row_limit: Literal[100] = 100
+    sample_provenance: SampleProvenance | None = None
+
+
+class DatasetViewDeleteResult(Wire):
+    ok: bool = True
+    deleted: bool
 
 
 class SampleResult(Wire):

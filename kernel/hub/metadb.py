@@ -134,7 +134,7 @@ class WorkspaceContainer(Base):
 
 
 class WorkspacePlacement(Base):
-    """Canonical local placement of one canvas or registered built-in dataset."""
+    """Canonical local placement of one canvas, dataset, or immutable DatasetView."""
     __tablename__ = "workspace_placements"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uid)
     container_id: Mapped[str] = mapped_column(
@@ -146,9 +146,35 @@ class WorkspacePlacement(Base):
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
     __table_args__ = (
         UniqueConstraint("target_kind", "target_id", name="uq_workspace_placement_target"),
-        CheckConstraint("target_kind IN ('canvas', 'dataset')", name="ck_workspace_placement_kind"),
+        CheckConstraint(
+            "target_kind IN ('canvas', 'dataset', 'dataset_view')",
+            name="ck_workspace_placement_kind"),
         CheckConstraint("ordinal >= 0", name="ck_workspace_placement_ordinal"),
         CheckConstraint("version >= 1", name="ck_workspace_placement_version"),
+    )
+
+
+class DatasetView(Base):
+    """One owner-scoped immutable DatasetView plus a retained submission tombstone."""
+
+    __tablename__ = "dataset_views"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    submission_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "submission_id", name="uq_dataset_view_owner_submission"),
+        Index("ix_dataset_views_owner_deleted", "owner_id", "deleted_at", "created_at"),
+        CheckConstraint("length(request_sha256) = 64", name="ck_dataset_view_request_sha256"),
+        CheckConstraint(
+            "length(definition_sha256) = 64", name="ck_dataset_view_definition_sha256"),
     )
 
 
@@ -2684,6 +2710,14 @@ class WorkspaceNameConflict(ValueError):
     """A sibling container already owns the requested display name."""
 
 
+class DatasetViewSubmissionConflict(RuntimeError):
+    """A DatasetView submission id was reused for a different immutable intent."""
+
+
+class DatasetViewGone(RuntimeError):
+    """A retained DatasetView tombstone forbids replay or exact access."""
+
+
 def _workspace_name(name: str) -> str:
     normalized = str(name).strip()
     if not normalized:
@@ -3042,13 +3076,16 @@ def workspace_create_placement(container_id: str, *, target_kind: str, target_id
 def workspace_update_placement(placement_id: str, *, expected_version: int,
                                container_id: str | None = None, name: str | None = None,
                                ordinal: int | None = None) -> dict:
-    """CAS-update only a placement's local presentation; target identity is intentionally immutable."""
+    """CAS-update a canvas placement; other local resource kinds own their placement lifecycle."""
     with _workspace_write_session() as s:
         row = _workspace_placement_locked(s, placement_id)
         if row.version != expected_version:
             _workspace_version_conflict("placement", placement_id, expected_version)
         if row.target_kind == "dataset":
             raise ValueError("built-in datasets are placed by the Catalog")
+        if row.target_kind != "canvas":
+            raise ValueError(
+                "immutable DatasetView placements are managed by their DatasetView")
         target_container = container_id if container_id is not None else row.container_id
         _workspace_writable_destination_locked(s, target_container)
         target_name = _workspace_name(name) if name is not None else row.name
@@ -3393,17 +3430,167 @@ def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_versio
 
 
 def workspace_delete_placement(placement_id: str, *, expected_version: int) -> None:
-    """CAS-delete a canonical placement without deleting or rewriting its target."""
+    """CAS-delete a canvas placement without deleting or rewriting its target."""
     with _workspace_write_session() as s:
         row = _workspace_placement_locked(s, placement_id)
         if row.version != expected_version:
             _workspace_version_conflict("placement", placement_id, expected_version)
+        if row.target_kind == "dataset":
+            raise ValueError("built-in datasets are placed by the Catalog")
+        if row.target_kind != "canvas":
+            raise ValueError(
+                "immutable DatasetView placements are managed by their DatasetView")
         removed = s.execute(delete(WorkspacePlacement).where(
             WorkspacePlacement.id == placement_id,
             WorkspacePlacement.version == expected_version,
         ).execution_options(synchronize_session=False))
         if removed.rowcount != 1:
             _workspace_version_conflict("placement", placement_id, expected_version)
+
+
+def _dataset_view_row_doc(row: DatasetView) -> dict:
+    try:
+        definition = json.loads(row.definition_doc)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - committed rows are server-authored
+        raise RuntimeError("DatasetView definition is corrupt") from exc
+    if not isinstance(definition, dict):  # pragma: no cover - committed rows are server-authored
+        raise RuntimeError("DatasetView definition is corrupt")
+    return {
+        "definition": definition,
+        "deleted": row.deleted_at is not None,
+        "deletedAt": row.deleted_at,
+    }
+
+
+def dataset_view_submission(uid: str, submission_id: str) -> dict | None:
+    """Read one owner-scoped idempotency record, including its terminal tombstone."""
+    with session() as s:
+        row = s.scalar(select(DatasetView).where(
+            DatasetView.owner_id == uid,
+            DatasetView.submission_id == str(submission_id),
+        ).limit(1))
+        if row is None:
+            return None
+        result = _dataset_view_row_doc(row)
+        result["requestSha256"] = row.request_sha256
+        return result
+
+
+def dataset_view_get(uid: str, view_id: str) -> dict | None:
+    """Read one DatasetView without revealing another owner's identity or tombstone."""
+    with session() as s:
+        row = s.get(DatasetView, str(view_id))
+        if row is None or row.owner_id != uid:
+            return None
+        return _dataset_view_row_doc(row)
+
+
+def _dataset_view_source_placement_in_session(s, dataset_id: str):
+    managed = s.get(CatalogLogicalDataset, str(dataset_id))
+    entry = (s.get(CatalogEntry, managed.current_uri)
+             if managed is not None and managed.current_uri else None)
+    if entry is None:
+        entry = s.scalar(select(CatalogEntry).where(
+            CatalogEntry.registration_id == str(dataset_id)).limit(1))
+    if entry is None:
+        raise KeyError("DatasetView source registration is unavailable")
+    placement = s.scalar(select(WorkspacePlacement).where(
+        WorkspacePlacement.target_kind == "dataset",
+        WorkspacePlacement.target_id == entry.registration_id,
+    ).limit(1).with_for_update())
+    if placement is None:
+        raise KeyError("DatasetView source Workspace placement is unavailable")
+    return entry, placement
+
+
+def dataset_view_source_workspace(dataset_id: str) -> dict:
+    """Resolve the current Catalog-overlay container used for server-owned placement."""
+    with session() as s:
+        entry, placement = _dataset_view_source_placement_in_session(s, dataset_id)
+        return {
+            "sourceRegistrationId": entry.registration_id,
+            "sourcePlacementId": placement.id,
+            "containerId": placement.container_id,
+            "ordinal": placement.ordinal,
+        }
+
+
+def dataset_view_create(
+    *, uid: str, view_id: str, placement_id: str, submission_id: str,
+    request_sha256: str, definition_sha256: str, definition_doc: str,
+    source_dataset_id: str, source_registration_id: str, expected_container_id: str,
+) -> tuple[dict, bool]:
+    """Atomically persist definition, placement, replay fence, and core revision hold."""
+    if len(definition_doc.encode("utf-8")) > 1_048_576:
+        raise ValueError("DatasetView definition exceeds the persisted size limit")
+    with _workspace_write_session() as s:
+        entry, source = _dataset_view_source_placement_in_session(s, source_dataset_id)
+        if (entry.registration_id != source_registration_id
+                or source.container_id != expected_container_id):
+            raise WorkspaceVersionConflict("DatasetView source placement changed; retry the request")
+        _workspace_writable_destination_locked(s, source.container_id)
+
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+            raise RuntimeError("unsupported metadata database dialect")
+        s.execute(dialect_insert(DatasetView).values(
+            id=view_id,
+            owner_id=uid,
+            submission_id=submission_id,
+            request_sha256=request_sha256,
+            definition_sha256=definition_sha256,
+            definition_doc=definition_doc,
+            created_at=_now(),
+        ).on_conflict_do_nothing())
+        row = s.scalar(select(DatasetView).where(
+            DatasetView.owner_id == uid,
+            DatasetView.submission_id == submission_id,
+        ).limit(1).with_for_update())
+        if row is None:  # pragma: no cover - only a random primary-key collision can reach this
+            raise RuntimeError("DatasetView identity allocation collided")
+        if row.id != view_id:
+            if row.request_sha256 != request_sha256:
+                raise DatasetViewSubmissionConflict(
+                    "DatasetView submission id belongs to a different request")
+            if row.deleted_at is not None:
+                raise DatasetViewGone("DatasetView submission was deleted")
+            return _dataset_view_row_doc(row)["definition"], False
+
+        document = json.loads(definition_doc)
+        placement = WorkspacePlacement(
+            id=placement_id,
+            container_id=source.container_id,
+            target_kind="dataset_view",
+            target_id=view_id,
+            name=_workspace_name(document["name"]),
+            ordinal=source.ordinal,
+            version=1,
+        )
+        s.add(placement)
+        s.flush()
+        sync_local_result_owner(s, "dataset_view", view_id, definition_doc)
+        return document, True
+
+
+def dataset_view_delete(uid: str, view_id: str) -> bool | None:
+    """Atomically tombstone a DatasetView and release its Workspace and revision holds."""
+    with _workspace_write_session() as s:
+        row = s.get(DatasetView, str(view_id), with_for_update=True)
+        if row is None or row.owner_id != uid:
+            return None
+        if row.deleted_at is not None:
+            return False
+        s.execute(delete(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "dataset_view",
+            WorkspacePlacement.target_id == row.id,
+        ).execution_options(synchronize_session=False))
+        _drop_local_result_owner(s, "dataset_view", row.id)
+        row.deleted_at = _now()
+        return True
 
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
@@ -3430,7 +3617,7 @@ def _workspace_cursor_decode(cursor: str | None) -> tuple[int, int, str, str] | 
         raise ValueError("invalid Workspace cursor") from exc
     if (isinstance(ordinal, bool) or not isinstance(ordinal, int)
             or ordinal < 0 or ordinal >= 2**63
-            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2)
+            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2, 3)
             or not isinstance(name, str) or not name
             or not isinstance(identity, str) or not identity):
         raise ValueError("invalid Workspace cursor")
@@ -3464,7 +3651,7 @@ def _workspace_search_cursor_decode(
         raise ValueError("invalid Workspace search cursor") from exc
     if (version != _WORKSPACE_SEARCH_CURSOR_VERSION or bound_query != query
             or not isinstance(name, str)
-            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2)
+            or isinstance(rank, bool) or not isinstance(rank, int) or rank not in (0, 1, 2, 3)
             or not isinstance(identity, str) or not identity):
         raise ValueError("invalid Workspace search cursor")
     return name, rank, identity
@@ -3741,6 +3928,14 @@ def _workspace_canvas_exists_clause():
     return exists(select(Canvas.id).where(Canvas.id == WorkspacePlacement.target_id))
 
 
+def _workspace_dataset_view_visible_clause(uid: str):
+    return exists(select(DatasetView.id).where(
+        DatasetView.id == WorkspacePlacement.target_id,
+        DatasetView.owner_id == uid,
+        DatasetView.deleted_at.is_(None),
+    ))
+
+
 def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
                      cursor: str | None = None) -> dict:
     """Read one bounded mixed local Workspace page without calling a catalog provider."""
@@ -3767,6 +3962,8 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
         dataset_after = _workspace_after(
             WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 2, decoded)
+        view_after = _workspace_after(
+            WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 3, decoded)
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
@@ -3785,7 +3982,17 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             _workspace_name_order(WorkspacePlacement.name),
             WorkspacePlacement.id,
         ).limit(limit + 1)))
-        placements = [*canvas_placements, *dataset_placements]
+        view_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.container_id == container_id,
+            WorkspacePlacement.target_kind == "dataset_view",
+            _workspace_dataset_view_visible_clause(uid),
+            *([view_after] if view_after is not None else []),
+        ).order_by(
+            WorkspacePlacement.ordinal,
+            _workspace_name_order(WorkspacePlacement.name),
+            WorkspacePlacement.id,
+        ).limit(limit + 1)))
+        placements = [*canvas_placements, *dataset_placements, *view_placements]
         dataset_ids = [row.target_id for row in placements if row.target_kind == "dataset"]
         canvas_ids = [row.target_id for row in placements if row.target_kind == "canvas"]
         live_datasets = set(s.scalars(select(CatalogEntry.registration_id).where(
@@ -3796,8 +4003,9 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         for row in containers:
             rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(row)))
         for row in placements:
-            rank = 1 if row.target_kind == "canvas" else 2
-            live = row.target_id in (live_canvases if row.target_kind == "canvas" else live_datasets)
+            rank = {"canvas": 1, "dataset": 2, "dataset_view": 3}[row.target_kind]
+            live = (row.target_id in live_canvases if row.target_kind == "canvas" else
+                    row.target_id in live_datasets if row.target_kind == "dataset" else True)
             rows.append(((row.ordinal, rank, row.name, row.id),
                          _workspace_placement_resource(row, detached=not live)))
         rows.sort(key=lambda row: row[0])
@@ -3837,6 +4045,8 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             WorkspacePlacement.name, WorkspacePlacement.target_id, 1, decoded)
         dataset_after = _workspace_search_after(
             WorkspacePlacement.name, WorkspacePlacement.target_id, 2, decoded)
+        view_after = _workspace_search_after(
+            WorkspacePlacement.name, WorkspacePlacement.target_id, 3, decoded)
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "canvas",
             _workspace_canvas_visible_clause(uid),
@@ -3850,6 +4060,15 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             WorkspacePlacement.target_kind == "dataset",
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([dataset_after] if dataset_after is not None else []),
+        ).order_by(
+            _workspace_name_order(func.lower(WorkspacePlacement.name)),
+            WorkspacePlacement.target_id,
+        ).limit(limit + 1)))
+        view_placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.target_kind == "dataset_view",
+            _workspace_dataset_view_visible_clause(uid),
+            _workspace_search_matches(WorkspacePlacement.name, tokens),
+            *([view_after] if view_after is not None else []),
         ).order_by(
             _workspace_name_order(func.lower(WorkspacePlacement.name)),
             WorkspacePlacement.target_id,
@@ -3872,6 +4091,11 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             ((row.name.lower(), 2, row.target_id),
              _workspace_placement_resource(row, detached=row.target_id not in live_datasets))
             for row in dataset_placements
+        )
+        rows.extend(
+            ((row.name.lower(), 3, row.target_id),
+             _workspace_placement_resource(row, detached=False))
+            for row in view_placements
         )
         rows.sort(key=lambda row: row[0])
         page = rows[:limit]
@@ -3907,7 +4131,7 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
         kind, identity = resource_id.split(":", 1)
     except ValueError as exc:
         raise KeyError("invalid Workspace resource reference") from exc
-    if kind not in {"container", "canvas", "dataset"} or not identity:
+    if kind not in {"container", "canvas", "dataset", "dataset_view"} or not identity:
         raise KeyError("invalid Workspace resource reference")
     with session() as s:
         if kind == "container":
@@ -3922,8 +4146,15 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "canvas" and s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
-        live = (s.get(Canvas, identity) is not None if kind == "canvas" else
-                s.scalar(select(CatalogEntry.uri).where(CatalogEntry.registration_id == identity)) is not None)
+        if kind == "dataset_view":
+            view = s.get(DatasetView, identity)
+            if view is None or view.owner_id != uid or view.deleted_at is not None:
+                raise KeyError(f"Workspace resource '{resource_id}' not found")
+            live = True
+        else:
+            live = (s.get(Canvas, identity) is not None if kind == "canvas" else
+                    s.scalar(select(CatalogEntry.uri).where(
+                        CatalogEntry.registration_id == identity)) is not None)
         return {"resource": _workspace_placement_resource(placement, detached=not live),
                 "ancestors": _workspace_ancestors(s, placement.container_id)}
 
@@ -9710,7 +9941,7 @@ _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
-    "durable_task", "profile_job", "run_input_admission", "run_record", "run_state",
+    "dataset_view", "durable_task", "profile_job", "run_input_admission", "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
@@ -9788,7 +10019,7 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     elif owner_kind in ("canvas", "canvas_version"):
         for value in values:
             candidates.update(_canvas_local_result_candidates(value))
-    elif owner_kind in ("durable_task", "profile_job", "run_input_admission"):
+    elif owner_kind in ("dataset_view", "durable_task", "profile_job", "run_input_admission"):
         pass
     else:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
@@ -9883,11 +10114,33 @@ def _canvas_revision_identities(value: object) -> set[tuple[str, str]]:
     return identities
 
 
+def _dataset_view_revision_identities(value: object) -> set[tuple[str, str]]:
+    """Extract only core-retained exact revisions from one immutable DatasetView definition."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return set()
+    if not isinstance(value, dict) or value.get("retentionOwner") != "core":
+        return set()
+    ref = value.get("datasetRef")
+    if not isinstance(ref, dict) or ref.get("kind") != "exact":
+        return set()
+    dataset_id = ref.get("datasetId")
+    revision_id = ref.get("revisionId")
+    if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
+        return {(dataset_id, revision_id)}
+    return set()
+
+
 def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if owner_kind in ("canvas", "canvas_version"):
         for value in values:
             identities.update(_canvas_revision_identities(value))
+    elif owner_kind == "dataset_view":
+        for value in values:
+            identities.update(_dataset_view_revision_identities(value))
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))

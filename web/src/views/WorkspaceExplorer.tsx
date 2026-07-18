@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
-  CatalogTable, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
+  CatalogTable, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
   WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
@@ -11,6 +11,7 @@ import {
   type CatalogDiscoveryQueryState,
 } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
+import { DatasetViewDetail } from './DatasetViewDetail'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
@@ -89,6 +90,7 @@ function WorkspaceMixedExplorer() {
   const [error, setError] = useState<string | null>(null)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const [selectedTable, setSelectedTable] = useState<CatalogTable | null>(null)
+  const [selectedView, setSelectedView] = useState<DatasetViewDefinition | null>(null)
   const [selectedDataset, setSelectedDataset] = useState<WorkspaceResource | null>(null)
   const [selectedSource, setSelectedSource] = useState<WorkspaceSourceStatus | null>(null)
   const [selectedProviderResource, setSelectedProviderResource] = useState<WorkspaceResource | null>(null)
@@ -161,7 +163,7 @@ function WorkspaceMixedExplorer() {
       if (!refreshingSelection) {
         selectionRequest.current = requestedResourceId
         selectionContainer.current = null
-        setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null); setSelectedProviderResource(null)
+        setSelectedTable(null); setSelectedView(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null); setSelectedProviderResource(null)
       }
       if (!requestedResourceId) {
         selectionContainer.current = null
@@ -198,6 +200,17 @@ function WorkspaceMixedExplorer() {
           setLoading(false)
         } else await load(identity(container))
         if (cancelled) return
+        if (resolved.resource.kind === 'dataset_view') {
+          setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
+          try {
+            const view = await api.datasetView(identity(resolved.resource))
+            if (!cancelled) setSelectedView(view)
+          } catch (caught) {
+            if (!cancelled) setResolutionError(errorMessage(caught))
+          }
+          return
+        }
+        setSelectedView(null)
         if (resolved.resource.kind !== 'dataset') {
           setSelectedTable(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null)
           if (resolved.source.completeness !== 'complete') {
@@ -289,7 +302,7 @@ function WorkspaceMixedExplorer() {
           setWorkspaceSearchQuery(searchDraft)
         }} className="flex min-w-[220px] max-w-sm flex-1 items-center gap-1 rounded-md border border-border bg-card px-2">
           <Icon name="search" size={13} />
-          <input aria-label="Search datasets, canvases, and containers" value={searchDraft}
+          <input aria-label="Search views, datasets, canvases, and containers" value={searchDraft}
             onChange={(event) => setSearchDraft(event.target.value)} placeholder="Search Workspace"
             className="min-w-0 flex-1 bg-transparent py-1.5 text-[12px] outline-none" />
           {searchDraft && <button type="button" aria-label="Clear Workspace search" onClick={() => {
@@ -343,6 +356,11 @@ function WorkspaceMixedExplorer() {
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
         onOpenTable={setSelectedTable} onFolder={() => pushToast('Dataset folders are not Workspace containers.', 'info')}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
+      {selectedView && <DatasetViewDetail definition={selectedView} onClose={closeDetail} onDeleted={() => {
+        setSelectedView(null)
+        pushToast('DatasetView deleted', 'success')
+        setWorkspaceResource(`container:${containerId}`)
+      }} />}
       {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} onUse={() => setProviderDatasetAction(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && container?.version != null && <NewCanvasDialog container={container} onClose={() => setCreateOpen(false)}
@@ -525,7 +543,7 @@ function WorkspaceSearchResults({ query, onOpen }: {
     {!resultCount && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[13px] text-muted-foreground">
       {completeness === 'partial'
         ? 'No matches were returned by the available sources. This is not a complete empty result.'
-        : 'No datasets, canvases, or containers match this query.'}
+        : 'No views, datasets, canvases, or containers match this query.'}
     </div>}
     {loadMoreError && <div role="alert" className="mx-auto text-[12px] text-destructive">
       Couldn't load more search results: {loadMoreError}
@@ -748,11 +766,12 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
 }
 
 function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
-  const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
-  const kind = resource.kind === 'container' ? (isCatalogFolder(resource) ? 'Catalog folder' : 'Container') : resource.kind === 'canvas' ? 'Canvas' : 'Dataset'
+  const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
+  const kind = resource.kind === 'container' ? (isCatalogFolder(resource) ? 'Catalog folder' : 'Container') : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
     : isCatalogFolder(resource) ? 'Local Catalog projection'
       : resource.kind === 'dataset' ? 'Local Catalog'
+        : resource.kind === 'dataset_view' ? 'Local exact view'
         : resource.kind === 'canvas' ? 'Local overlay'
           : 'Local container'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`

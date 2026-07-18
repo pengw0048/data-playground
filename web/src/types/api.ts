@@ -115,6 +115,45 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   preview: DatasetRevisionPreview
 }
 
+export type DatasetViewSampling =
+  | { kind: 'all' }
+  | { kind: 'reservoir'; size: number; seed: number }
+
+export interface DatasetViewCreateRequest {
+  submissionId: string
+  name: string
+  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string; lastKnown?: { committedAt?: string | null } | null }
+  selectedColumns: string[]
+  predicate?: string | null
+  sampling: DatasetViewSampling
+}
+
+export interface DatasetViewDefinition {
+  schemaVersion: 1
+  id: string
+  creatorId: string
+  name: string
+  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string; lastKnown?: { committedAt?: string | null } | null }
+  placement: { containerId: string; placementId: string; sourceRegistrationId: string }
+  selectedColumns: string[]
+  predicate?: string | null
+  sampling: DatasetViewSampling
+  sampleProvenance?: SampleProvenance | null
+  retentionOwner: 'provider' | 'core'
+  createdAt: string
+  semanticSha256: string
+  definitionSha256: string
+}
+
+export interface DatasetViewPreview {
+  columns: ColumnSchema[]
+  rows: Record<string, unknown>[]
+  rowCount?: number | null
+  hasMore: boolean
+  rowLimit: 100
+  sampleProvenance?: SampleProvenance | null
+}
+
 export type SchemaCompatibilityStatus = 'compatible' | 'breaking' | 'unknown'
 export interface SchemaFieldCompatibility {
   kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'
@@ -155,7 +194,7 @@ export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: Fac
 export interface FolderNode { name: string; path: string; tableCount: number }
 export interface CatalogFolder { path: string }
 export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
-export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset'
+export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset' | 'dataset_view'
 export interface WorkspaceResource {
   id: string
   kind: WorkspaceResourceKind

@@ -1,8 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { CatalogTable, DatasetRevisionDetail } from '../types/api'
+import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from '../types/api'
 
-const mocks = vi.hoisted(() => ({ datasetRevisions: vi.fn(), datasetRevision: vi.fn() }))
+const mocks = vi.hoisted(() => ({ datasetRevisions: vi.fn(), datasetRevision: vi.fn(), createDatasetView: vi.fn() }))
+const store = vi.hoisted(() => ({ pushToast: vi.fn(), setWorkspaceResource: vi.fn() }))
 vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
@@ -10,6 +11,7 @@ vi.mock('../api/client', () => ({
     constructor(status: number, message: string) { super(message); this.status = status }
   },
 }))
+vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
 import { KernelError } from '../api/client'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
@@ -27,6 +29,25 @@ const detail = (revisionId: string, overrides: Partial<DatasetRevisionDetail> = 
   },
   ...overrides,
 })
+const VIEW: DatasetViewDefinition = {
+  schemaVersion: 1,
+  id: 'view-1',
+  creatorId: 'local',
+  name: 'orders view',
+  datasetRef: { kind: 'exact', datasetId: 'dataset-stable', revisionId: 'rev-2', lastKnown: { committedAt: '2026-07-16T12:00:00Z' } },
+  placement: { containerId: 'workspace-local-root', placementId: 'placement-view-1', sourceRegistrationId: 'table-1' },
+  selectedColumns: ['amount'],
+  predicate: null,
+  sampling: { kind: 'reservoir', size: 1000, seed: 42 },
+  sampleProvenance: {
+    strategy: 'reservoir', seed: 42, requestedRows: 1000, scannedRows: 2, returnedRows: 2,
+    totalRows: 2, datasetIdentity: 'dataset-stable', datasetRevision: 'rev-2', identity: 'sample-identity', limitations: [],
+  },
+  retentionOwner: 'provider',
+  createdAt: '2026-07-18T12:00:00Z',
+  semanticSha256: 'a'.repeat(64),
+  definitionSha256: 'b'.repeat(64),
+}
 
 describe('DatasetRevisionHistory', () => {
   beforeEach(() => { vi.clearAllMocks() })
@@ -102,5 +123,41 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-old' }))
     expect(await screen.findByText(/no longer retained.*did not substitute latest/i)).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an in-flight exact save visible and reuses its submission identity on retry', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-2')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-2'))
+    let rejectFirst!: (reason: Error) => void
+    const firstAttempt = new Promise<DatasetViewDefinition>((_resolve, reject) => { rejectFirst = reject })
+    mocks.createDatasetView.mockReturnValueOnce(firstAttempt).mockResolvedValueOnce(VIEW)
+    render(<DatasetRevisionHistory table={TABLE} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-2' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Save view' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Save exact revision as view' })
+    fireEvent.click(within(dialog).getByRole('radio', { name: /Deterministic reservoir/ }))
+    expect(dialog).toHaveTextContent('Each preview replays that full scan; the rows are not materialized.')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+
+    await waitFor(() => expect(mocks.createDatasetView).toHaveBeenCalledTimes(1))
+    const firstRequest = mocks.createDatasetView.mock.calls[0][0]
+    expect(within(dialog).getByRole('button', { name: 'Close save view dialog' })).toBeDisabled()
+    fireEvent.click(dialog.parentElement!)
+    expect(screen.getByRole('dialog', { name: 'Save exact revision as view' })).toBeVisible()
+
+    rejectFirst(new Error('connection reset'))
+    expect(await screen.findByRole('alert')).toHaveTextContent("Couldn't save this view: connection reset")
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save view' }))
+    await waitFor(() => expect(mocks.createDatasetView).toHaveBeenCalledTimes(2))
+    expect(mocks.createDatasetView.mock.calls[1][0].submissionId).toBe(firstRequest.submissionId)
+    expect(firstRequest).toMatchObject({
+      name: 'orders view',
+      datasetRef: { kind: 'exact', datasetId: 'dataset-stable', revisionId: 'rev-2' },
+      selectedColumns: ['amount'],
+      sampling: { kind: 'reservoir', size: 1000, seed: 42 },
+    })
+    await waitFor(() => expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset_view:view-1'))
+    expect(store.pushToast).toHaveBeenCalledWith('Saved “orders view” beside its source in Workspace', 'success')
   })
 })

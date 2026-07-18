@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, KernelError } from '../api/client'
 import { compareSchemas } from '../lib/schemaCompatibility'
+import { useStore } from '../store/graph'
 import type {
-  CatalogTable, DatasetRevision, DatasetRevisionDetail, DatasetRevisionSummary,
+  CatalogTable, DatasetRevision, DatasetRevisionDetail, DatasetRevisionSummary, DatasetViewDefinition,
   SchemaCompatibilityStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
@@ -49,6 +50,7 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
   const [parentError, setParentError] = useState<string | null>(null)
+  const [saveDetail, setSaveDetail] = useState<DatasetRevisionDetail | null>(null)
   const historyRequest = useRef(0)
   const detailRequest = useRef(0)
 
@@ -149,8 +151,10 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
       </div>}
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
       {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
-        error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)} />}
+        error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
+        onSave={setSaveDetail} />}
     </>}
+    {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
   </section>
 }
 
@@ -160,9 +164,10 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
   </div>
 }
 
-function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry }: {
+function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, onSave }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
+  onSave: (detail: DatasetRevisionDetail) => void
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
@@ -170,10 +175,16 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
   const compatibility = parent ? compareSchemas(parent.preview.columns, detail.preview.columns) : null
   const notableFields = compatibility?.fields.filter((field) => field.kind !== 'unchanged' || field.status !== 'compatible') ?? []
   return <div className="flex flex-col gap-2 border-t border-border pt-2" data-testid="revision-detail">
-    <div>
+    <div className="flex items-start gap-2">
+      <div className="min-w-0 flex-1">
       <div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">Exact revision {detail.revisionId}</div>
       <div className="text-[9.5px] text-muted-foreground">Dataset {detail.datasetId} · {timestamp(detail.committedAt)} · retained by {detail.retentionOwner}</div>
       <div className="text-[9.5px] text-muted-foreground">Parent {detail.parentRevisionId ?? 'not evidenced'} · producer {detail.producerOperation ?? 'not provided'}</div>
+      </div>
+      <button type="button" onClick={() => onSave(detail)}
+        className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
+        Save view
+      </button>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
@@ -235,3 +246,129 @@ function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
 }
 
 const cell = (value: unknown) => value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
+
+function SaveDatasetViewDialog({ table, detail, onClose }: {
+  table: CatalogTable; detail: DatasetRevisionDetail; onClose: () => void
+}) {
+  const pushToast = useStore((state) => state.pushToast)
+  const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
+  const columns = detail.preview.columns.map((column) => column.name)
+  const [name, setName] = useState(`${table.name} view`)
+  const [selected, setSelected] = useState(columns)
+  const [predicate, setPredicate] = useState('')
+  const [sampling, setSampling] = useState<'all' | 'reservoir'>('all')
+  const [size, setSize] = useState('1000')
+  const [seed, setSeed] = useState('42')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submission = useRef({ fingerprint: '', id: '' })
+  const generation = useRef(0)
+
+  useEffect(() => () => { generation.current += 1 }, [])
+
+  const toggle = (column: string) => setSelected((current) => current.includes(column)
+    ? current.filter((item) => item !== column)
+    : columns.filter((item) => item === column || current.includes(item)))
+
+  const submit = async () => {
+    const normalizedName = name.trim()
+    const normalizedPredicate = predicate.trim() || null
+    const sampleSize = Number(size)
+    const sampleSeed = Number(seed)
+    if (!normalizedName || !selected.length || busy) return
+    if (sampling === 'reservoir' && (!Number.isInteger(sampleSize) || sampleSize < 1 || sampleSize > 100_000
+      || !Number.isSafeInteger(sampleSeed) || sampleSeed < 0)) {
+      setError('Reservoir size must be 1–100,000 and seed must be a non-negative safe integer.')
+      return
+    }
+    const fingerprint = JSON.stringify({
+      name: normalizedName,
+      datasetId: detail.datasetId,
+      revisionId: detail.revisionId,
+      selected,
+      predicate: normalizedPredicate,
+      sampling: sampling === 'all' ? { kind: 'all' } : { kind: 'reservoir', size: sampleSize, seed: sampleSeed },
+    })
+    if (submission.current.fingerprint !== fingerprint) {
+      submission.current = { fingerprint, id: crypto.randomUUID() }
+    }
+    const request = ++generation.current
+    setBusy(true); setError(null)
+    try {
+      const created: DatasetViewDefinition = await api.createDatasetView({
+        submissionId: submission.current.id,
+        name: normalizedName,
+        datasetRef: {
+          kind: 'exact', datasetId: detail.datasetId, revisionId: detail.revisionId,
+          lastKnown: detail.committedAt ? { committedAt: detail.committedAt } : null,
+        },
+        selectedColumns: selected,
+        predicate: normalizedPredicate,
+        sampling: sampling === 'all'
+          ? { kind: 'all' }
+          : { kind: 'reservoir', size: sampleSize, seed: sampleSeed },
+      })
+      if (request !== generation.current) return
+      submission.current = { fingerprint: '', id: '' }
+      pushToast(`Saved “${created.name}” beside its source in Workspace`, 'success')
+      onClose()
+      setWorkspaceResource(`dataset_view:${created.id}`)
+    } catch (caught) {
+      if (request === generation.current) setError(errorMessage(caught))
+    } finally {
+      if (request === generation.current) setBusy(false)
+    }
+  }
+
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
+    <div role="dialog" aria-modal="true" aria-label="Save exact revision as view" aria-busy={busy}
+      className="flex max-h-[90vh] w-[560px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
+      onClick={(event) => event.stopPropagation()}>
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Save exact revision as view</h2>
+          <p className="truncate text-[10.5px] text-muted-foreground">{table.name} · revision {detail.revisionId}</p></div>
+        <button onClick={onClose} disabled={busy} aria-label="Close save view dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
+      </div>
+      <div className="min-h-0 overflow-y-auto pr-1">
+        <div className="grid gap-3">
+          <label className="grid gap-1 text-[11px] font-semibold text-foreground">Name
+            <input value={name} disabled={busy} onChange={(event) => setName(event.target.value)} className="dp-input font-normal" />
+          </label>
+          <fieldset disabled={busy} className="grid gap-1.5">
+            <legend className="text-[11px] font-semibold text-foreground">Columns in view</legend>
+            <div className="grid max-h-36 grid-cols-2 gap-x-3 gap-y-1 overflow-y-auto rounded-md border border-border p-2">
+              {columns.map((column) => <label key={column} className="flex min-w-0 items-center gap-1.5 text-[10.5px] text-foreground">
+                <input type="checkbox" checked={selected.includes(column)} onChange={() => toggle(column)} />
+                <span className="truncate" title={column}>{column}</span>
+              </label>)}
+            </div>
+            <span className="text-[10px] text-muted-foreground">Output order follows the exact revision schema. Choose at least one column.</span>
+          </fieldset>
+          <label className="grid gap-1 text-[11px] font-semibold text-foreground">Row predicate <span className="font-normal text-muted-foreground">(optional DuckDB expression)</span>
+            <textarea value={predicate} disabled={busy} rows={3} onChange={(event) => setPredicate(event.target.value)}
+              placeholder={"status = 'ready' AND score >= 0.8"} className="dp-input resize-y font-mono font-normal" />
+            <span className="text-[10px] font-normal text-muted-foreground">Evaluated against the exact source before columns are projected.</span>
+          </label>
+          <fieldset disabled={busy} className="grid gap-2">
+            <legend className="text-[11px] font-semibold text-foreground">Rows</legend>
+            <label className="flex items-start gap-2 rounded-md border border-border p-2 text-[11px]"><input type="radio" name="view-sampling" checked={sampling === 'all'} onChange={() => setSampling('all')} />
+              <span><strong>All matching rows</strong><span className="block text-[10px] text-muted-foreground">The definition stays lazy; previews remain bounded to 100 rows.</span></span></label>
+            <label className="flex items-start gap-2 rounded-md border border-border p-2 text-[11px]"><input type="radio" name="view-sampling" checked={sampling === 'reservoir'} onChange={() => setSampling('reservoir')} />
+              <span className="min-w-0 flex-1"><strong>Deterministic reservoir</strong><span className="block text-[10px] text-muted-foreground">Saving scans the complete filtered local revision to establish evidence. Each preview replays that full scan; the rows are not materialized.</span>
+                {sampling === 'reservoir' && <span className="mt-2 grid grid-cols-2 gap-2">
+                  <label className="grid gap-1 text-[10px] text-muted-foreground">Rows<input aria-label="Reservoir rows" type="number" min="1" max="100000" value={size} onChange={(event) => setSize(event.target.value)} className="dp-input text-foreground" /></label>
+                  <label className="grid gap-1 text-[10px] text-muted-foreground">Seed<input aria-label="Reservoir seed" type="number" min="0" value={seed} onChange={(event) => setSeed(event.target.value)} className="dp-input text-foreground" /></label>
+                </span>}
+              </span></label>
+          </fieldset>
+        </div>
+      </div>
+      {error && <div role="alert" className="text-[11px] text-destructive">Couldn't save this view: {error}</div>}
+      <div className="flex justify-end gap-2">
+        <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+        <button onClick={() => void submit()} disabled={busy || !name.trim() || !selected.length}
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Saving exact view…' : 'Save view'}</button>
+      </div>
+    </div>
+  </div>
+}
