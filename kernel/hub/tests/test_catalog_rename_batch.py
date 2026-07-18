@@ -68,7 +68,7 @@ def test_batch_delete_is_bounded_versioned_and_reports_each_result(tmp_path):
     assert body["mode"] == "best_effort" and body["limit"] == 50
     assert body["results"] == [
         {"id": a["id"], "status": "conflict", "detail": "catalog metadata changed; reload before removing this dataset"},
-        {"id": b["id"], "status": "deleted", "detail": None},
+        {"id": b["id"], "status": "unregistered", "detail": None},
         {"id": "does-not-exist", "status": "missing", "detail": "dataset was already unregistered"},
     ]
     assert client.get(f"/api/catalog/tables/{a['id']}").status_code == 200
@@ -136,7 +136,7 @@ def test_batch_unregister_isolates_and_sanitizes_provider_failures(tmp_path, mon
     assert response.json()["results"] == [
         {"id": failed["id"], "status": "failed",
          "detail": "dataset could not be removed; reload and retry"},
-        {"id": healthy["id"], "status": "deleted", "detail": None},
+        {"id": healthy["id"], "status": "unregistered", "detail": None},
     ]
     assert client.get(f"/api/catalog/tables/{failed['id']}").status_code == 200
     unregister(failed["id"], failed["registrationId"], failed["metadataRevision"])

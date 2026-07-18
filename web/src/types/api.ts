@@ -229,7 +229,7 @@ export interface WorkspaceAddDatasetResult {
 export interface CatalogUnregisterResult {
   mode: 'best_effort'
   limit: number
-  results: { id: string; status: 'deleted' | 'missing' | 'conflict' | 'failed'; detail?: string | null }[]
+  results: { id: string; status: 'unregistered' | 'missing' | 'conflict' | 'failed'; detail?: string | null }[]
 }
 export interface WorkspaceMoveCanvasResult {
   ok: boolean

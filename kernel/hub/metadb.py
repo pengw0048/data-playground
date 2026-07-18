@@ -14472,6 +14472,7 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
         attempt_identity = s.get(ObjectAttempt, token)
         logical_id = attempt_identity.logical_id if attempt_identity is not None else None
         logical_snapshot = None
+        entry_snapshot = None
         if logical_id is None:
             logical_snapshot = s.get(CatalogLogicalDataset, token)
             if logical_snapshot is None:
@@ -14481,10 +14482,22 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
                     CatalogLogicalDataset.current_uri == token,
                 )).limit(1)).first()
             logical_id = logical_snapshot.logical_id if logical_snapshot is not None else None
+        if logical_id is None:
+            # Resolve the public table id/name alias before choosing the managed or unmanaged branch.
+            # Keep this read in the same transaction as the logical/entry locks and CAS below: a
+            # separate catalog GET would let unregister/re-register rebind the alias between calls.
+            entry_snapshot = s.get(CatalogEntry, token)
+            if entry_snapshot is None:
+                entry_snapshot = s.scalars(select(CatalogEntry).where(or_(
+                    CatalogEntry.tbl_id == token, CatalogEntry.name == token,
+                )).order_by(CatalogEntry.uri).limit(1)).first()
+            logical_id = entry_snapshot.logical_id if entry_snapshot is not None else None
         logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True) \
             if logical_id else None
         if logical is not None:
             if logical.state != "active" or not logical.current_uri:
+                if report_result and logical.state == "unregistered" and not logical.current_uri:
+                    return False
                 raise RuntimeError("catalog governance target is inactive")
             if (attempt_identity is not None
                     and attempt_identity.catalog_epoch != logical.catalog_epoch):
@@ -14502,11 +14515,6 @@ def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = Non
             ownership = _catalog_current_logical_ownership(
                 s, logical, validate_managed_local=False)
         else:
-            entry_snapshot = s.get(CatalogEntry, token)
-            if entry_snapshot is None:
-                entry_snapshot = s.scalars(select(CatalogEntry).where(or_(
-                    CatalogEntry.tbl_id == token, CatalogEntry.name == token,
-                )).order_by(CatalogEntry.uri).limit(1)).first()
             if entry_snapshot is None:
                 return False if report_result else None
             entry = s.get(CatalogEntry, entry_snapshot.uri, with_for_update=True)

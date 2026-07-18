@@ -613,7 +613,9 @@ def test_managed_local_prefix_and_batch_unregister_preserve_revision_retention(
 
     assert response.status_code == 200, response.text
     assert {(item["id"], item["status"]) for item in response.json()["results"]} == {
-        (third_table.id, "deleted"), (fourth_table.id, "deleted"), ("missing", "missing"),
+        (third_table.id, "unregistered"),
+        (fourth_table.id, "unregistered"),
+        ("missing", "missing"),
     }
     with metadb.session() as session:
         for artifact, published in ((third_artifact, third), (fourth_artifact, fourth)):

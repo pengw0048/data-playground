@@ -296,8 +296,8 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.unregisterTables.mockResolvedValue({
       mode: 'best_effort', limit: 50,
       results: [
-        { id: 't1', status: 'deleted', detail: null },
-        { id: 't2', status: 'deleted', detail: null },
+        { id: 't1', status: 'unregistered', detail: null },
+        { id: 't2', status: 'unregistered', detail: null },
       ],
     })
     mocks.registerDataset.mockResolvedValue(TABLE)

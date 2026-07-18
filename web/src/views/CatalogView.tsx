@@ -284,7 +284,7 @@ export function CatalogDiscovery({
       }, {})
       const failures = (counts.conflict ?? 0) + (counts.failed ?? 0)
       pushToast(
-        `Unregister result: ${counts.deleted ?? 0} unregistered, ${counts.missing ?? 0} already gone`
+        `Unregister result: ${counts.unregistered ?? 0} unregistered, ${counts.missing ?? 0} already gone`
         + (failures ? `, ${failures} need review` : ''),
         failures ? 'info' : 'success',
       )
@@ -396,8 +396,8 @@ export function CatalogDiscovery({
           <button onClick={() => setUnregisterResult(null)} className="ml-auto font-semibold underline">Dismiss</button>
         </div>
         <div className="mt-1 flex max-h-20 flex-wrap gap-x-3 gap-y-0.5 overflow-y-auto">
-          {unregisterResult.response.results.map((item) => <span key={item.id} title={item.detail ?? undefined} className={item.status === 'deleted' || item.status === 'missing' ? '' : 'text-destructive'}>
-            {unregisterResult.names[item.id] ?? item.id}: {item.status === 'deleted' ? 'unregistered' : item.status}{item.detail ? ` — ${item.detail}` : ''}
+          {unregisterResult.response.results.map((item) => <span key={item.id} title={item.detail ?? undefined} className={item.status === 'unregistered' || item.status === 'missing' ? '' : 'text-destructive'}>
+            {unregisterResult.names[item.id] ?? item.id}: {item.status}{item.detail ? ` — ${item.detail}` : ''}
           </span>)}
         </div>
       </div>}

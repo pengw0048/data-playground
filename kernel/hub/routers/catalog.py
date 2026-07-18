@@ -650,7 +650,7 @@ class UnregisterManyRequest(BaseModel):
 
 class UnregisterItemResult(BaseModel):
     id: str
-    status: Literal["deleted", "missing", "conflict", "failed"]
+    status: Literal["unregistered", "missing", "conflict", "failed"]
     detail: str | None = None
 
 
@@ -683,7 +683,7 @@ def unregister_tables(req: UnregisterManyRequest) -> UnregisterManyResult:
                 target.id, target.expected_registration_id, target.expected_revision)
             results.append({
                 "id": target.id,
-                "status": "deleted" if removed else "missing",
+                "status": "unregistered" if removed else "missing",
                 "detail": None if removed else "dataset was already unregistered",
             })
         except metadb.CatalogMetadataConflict as exc:

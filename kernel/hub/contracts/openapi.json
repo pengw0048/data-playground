@@ -5443,7 +5443,7 @@
           },
           "status": {
             "enum": [
-              "deleted",
+              "unregistered",
               "missing",
               "conflict",
               "failed"
