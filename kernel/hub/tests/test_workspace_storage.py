@@ -527,7 +527,17 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             params={"limit": 50},
         ).json()
         provider_resource = next(
-            item for item in root["items"] if item.get("mountId") == "provider-use")
+            (item for item in root["items"] if item.get("mountId") == "provider-use"), None)
+        cursor = root["nextCursor"]
+        while provider_resource is None and cursor is not None:
+            page = client.get(
+                f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
+                params={"limit": 50, "cursor": cursor},
+            ).json()
+            provider_resource = next(
+                (item for item in page["items"] if item.get("mountId") == "provider-use"), None)
+            cursor = page["nextCursor"]
+        assert provider_resource is not None
         created = client.post("/api/workspace/canvases", json={
             "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
             "expectedContainerVersion": root["container"]["version"],
