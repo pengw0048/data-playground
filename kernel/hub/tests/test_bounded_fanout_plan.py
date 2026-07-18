@@ -165,6 +165,13 @@ def test_claim_heartbeat_finish_pause_expiry_and_max_four_slots(tmp_path):
         parent_attempt_id=ctx["attempt_id"], owner_token=ctx["owner"])
     assert replacement["attempt_id"] != second["attempt_id"]
     assert replacement["claim_token"] != second["claim_token"]
+    assert fanout.heartbeat_attempt(
+        attempt_id=second["attempt_id"], claim_token=second["claim_token"],
+        owner_token=ctx["owner"]) is False
+    with pytest.raises(RuntimeError, match="stale or fenced"):
+        fanout.fail_attempt(
+            attempt_id=second["attempt_id"], claim_token=second["claim_token"],
+            owner_token=ctx["owner"])
 
     again = fanout.claim_unit(
         parent_task_id=ctx["task_id"], unit_id=second["unit_id"],

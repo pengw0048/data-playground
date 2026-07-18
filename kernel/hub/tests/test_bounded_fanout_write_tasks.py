@@ -317,13 +317,14 @@ def test_changed_semantics_conflict(tmp_path):
 
 
 def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
-    # This is a post-commit replay test, not a short-lease stress test. Own both
-    # leases here so unrelated three-shard CI contention cannot turn the initial
-    # healthy run into a recovery run before this test injects its retry.
     from hub import bounded_fanout as fanout
 
-    monkeypatch.setattr(metadb, "_DURABLE_TASK_LEASE_SECONDS", 60 * 60)
-    monkeypatch.setattr(fanout, "_LEASE_S", 60 * 60)
+    # Keep the production lease lengths and execution path, but own time and worker
+    # coordination so CI scheduling cannot inject an unrelated recovery attempt.
+    controlled_now = metadb._now()
+    monkeypatch.setattr(metadb, "_durable_task_db_now", lambda _session: controlled_now)
+    monkeypatch.setattr(fanout, "_durable_task_db_now", lambda _session: controlled_now)
+    monkeypatch.setattr(bft, "dispatch", lambda task_id, deps: bft._worker(task_id, deps))
     uid, canvas_id = f"once-user-{uuid.uuid4().hex}", f"once-canvas-{uuid.uuid4().hex}"
     submission = str(uuid.uuid4())
     with metadb.session() as session:
@@ -358,14 +359,11 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
         attempt.completed_at = metadb._now()
     from hub.durable_tasks import retry
     retry(task_id, str(uuid.uuid4()), deps)
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        observed = metadb.durable_task(task_id)
-        if observed and observed["status"] == "done" and len(observed["attempts"]) >= 2:
-            break
-        time.sleep(0.1)
+    observed = metadb.durable_task(task_id)
+    assert observed is not None
+    assert [attempt["status"] for attempt in observed["attempts"]] == ["failed", "done"]
     assert counts["prefix"] == 1
-    assert metadb.durable_task(task_id)["status"] == "done"
+    assert observed["status"] == "done"
     deps.storage.close()
 
 
