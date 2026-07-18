@@ -218,6 +218,8 @@ test.describe('Data Playground canvas', () => {
   test('an online Canvas edit inside the autosave debounce survives tab reload as a local draft', async ({ page }) => {
     await fresh(page)
     const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
+    await waitForCollabRoom(page, canvasId)
     const name = `Close recovery ${Date.now()}`
     let unloadPuts = 0
     const canvasUrl = `**/api/canvas/${canvasId}`
