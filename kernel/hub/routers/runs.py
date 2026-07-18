@@ -1068,10 +1068,16 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
     the endpoint does not become a canvas-enumeration oracle. Open single-user mode keeps supporting
     ad-hoc graphs. This is an identity check only: pinning the payload to a saved revision is separate.
     """
-    if not auth.auth_enabled():
-        return None, None
     cid = graph.get("id") if isinstance(graph, dict) else getattr(graph, "id", None)
     cid = str(cid or "")
+    if not auth.auth_enabled():
+        retained_canvas = cid if cid and metadb.canvas_role(cid, uid) is not None else None
+        try:
+            metadb.require_promoted_transform_use(
+                uid, graph, canvas_id=retained_canvas)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        return None, None
     role = metadb.canvas_role(cid, uid) if cid else None
     if role is None:
         raise APIError(
@@ -1080,6 +1086,10 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
             code=APIErrorCode.CANVAS_NOT_FOUND,
             retryable=False,
         )
+    try:
+        metadb.require_promoted_transform_use(uid, graph, canvas_id=cid)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
     return cid, role
 
 
@@ -2103,6 +2113,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if role not in _RUN_MUTATE_ROLES:
             raise HTTPException(403, f"canvas '{cid}' requires owner or editor to run")
         auth_canvas = cid  # a real writable canvas → all collaborators may observe this run
+    else:
+        # Open mode still has selected dev-user ownership. Keep ad-hoc execution, but do not let it
+        # bypass promoted Transform ownership or an already-retained shared-Canvas capability.
+        _require_graph_read_access(graph, uid)
     # Capture caller intent before catalog references are resolved or private exact-revision bindings are
     # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
     # browser-supplied id remains stable across response-loss retries.

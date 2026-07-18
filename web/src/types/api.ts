@@ -371,10 +371,16 @@ export interface ProcessorDescriptor {
   mode: string
   category: string
   inputColumns: string[]
+  inputSchema: ColumnSchema[]
   outputSchema: ColumnSchema[]
+  requirements: string[]
   paramsSchema: Record<string, any>
   previewable: boolean
   blurb: string
+  provenance: 'plugin' | 'promoted'
+  creatorId?: string | null
+  createdAt?: string | null
+  semanticDigest?: string | null
 }
 
 export type Placement = 'local' | 'distributed'

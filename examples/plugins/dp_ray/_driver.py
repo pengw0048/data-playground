@@ -146,7 +146,7 @@ def main() -> None:
         initialize_ephemeral_metadata(metadata_dir)
         from hub.deps import set_workspace
         from hub.ir import lower_to_ir
-        from hub.models import Graph
+        from hub.workload_env import restore_workload_graph
 
         deps = set_workspace(
             job["workspace"], job["data_dir"], maintain_storage=False
@@ -157,7 +157,8 @@ def main() -> None:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         runner = mod.RayRunner(deps)
-        graph, target = Graph(**job["graph"]), job["target"]
+        target = job["target"]
+        graph = restore_workload_graph(job["graph"], target)
         ir = lower_to_ir(graph, target, deps.node_specs, deps.node_ir)
         ray_opts = mod._ray_opts(job.get("requires"))  # region resource need → per-Ray-task placement
         prog = _progress_writer(status_file)

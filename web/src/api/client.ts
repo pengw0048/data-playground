@@ -292,7 +292,8 @@ export const api = {
   processors: () => req<ProcessorDescriptor[]>('/processors'),
   promote: (body: {
     id: string; title: string; mode: string; code: string
-    inputColumns: string[]; outputSchema: ColumnSchema[]; blurb?: string
+    inputColumns: string[]; inputSchema?: ColumnSchema[]; outputSchema: ColumnSchema[]
+    requirements: string[]; category?: string; blurb?: string
   }) => req<ProcessorDescriptor>('/processors/promote', { method: 'POST', body: JSON.stringify(body) }),
 
   importPipeline: (config: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }) =>

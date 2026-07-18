@@ -609,6 +609,10 @@ def list_canvases(uid: str = Depends(current_user)) -> list[dict]:
 
 @router.post("/canvas")
 def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
+    try:
+        metadb.require_promoted_transform_use(uid, doc)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
     with metadb.session() as s:
         # honor the client's id so the canvas exists under it immediately (no orphan row, and
         # sharing/opening works without waiting for the first autosave to PUT it).
@@ -639,6 +643,7 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
             # deliberately disabled inside that lock so every ownership path has one global order.
             s.flush()
             metadb.sync_local_result_owner(s, "canvas", cid, doc)
+            metadb._replace_promoted_transform_refs(s, "canvas", cid, doc)
         metadb._workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=cid, name=values["name"])
         return {"ok": True, "id": cid, "created": created}
@@ -662,6 +667,11 @@ def put_canvas(canvas_id: str, doc: dict,
                expected_version: int | None = Query(None, alias="expectedVersion", ge=1),
                uid: str = Depends(current_user)) -> dict:
     role = metadb.canvas_role(canvas_id, uid)  # None if the canvas doesn't exist yet
+    try:
+        metadb.require_promoted_transform_use(
+            uid, doc, canvas_id=canvas_id if role is not None else None)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         previous_name = c.name if c is not None else None
@@ -693,6 +703,8 @@ def put_canvas(canvas_id: str, doc: dict,
         c.doc = doc_json
         s.flush()  # settle a newly-created owner row before the local-result registry lock
         metadb.sync_local_result_owner(s, "canvas", canvas_id, persisted_doc)
+        metadb._replace_promoted_transform_refs(
+            s, "canvas", canvas_id, persisted_doc)
         metadb._workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=canvas_id, name=c.name)
         if previous_name is not None:
@@ -733,7 +745,10 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
             s, c, c.doc, c.version, author_id=uid, label="before restore")
         c.doc = doc
         c.version = (c.version or 1) + 1
-        metadb.sync_local_result_owner(s, "canvas", canvas_id, json.loads(doc))
+        restored_doc = json.loads(doc)
+        metadb.sync_local_result_owner(s, "canvas", canvas_id, restored_doc)
+        metadb._replace_promoted_transform_refs(
+            s, "canvas", canvas_id, restored_doc)
     return {"ok": True, "id": canvas_id, "doc": json.loads(doc)}
 
 

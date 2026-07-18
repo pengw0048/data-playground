@@ -10989,10 +10989,9 @@ def test_source_node_accepts_catalog_name():
         assert not r.get("error") and not r.get("notPreviewable") and r["rows"], (ref, r)
 
 
-def test_library_transform_falls_back_to_kept_code():
-    # F9: a promoted library node whose processor is gone (in-memory promote lost on restart) still
-    # runs — the node keeps its original code and the engine falls back to it, so the user's code is
-    # never destroyed (was: NotPreviewable "processor not registered", code already nulled = data loss).
+def test_library_transform_never_falls_back_from_an_unavailable_exact_version():
+    # A library reference is exact. Even a stale document that still carries its former ad-hoc code
+    # must fail diagnostically instead of silently executing different persistence semantics.
     graph = {"id": "c", "version": 1, "nodes": [
         N("src", "source", {"uri": _uri("events")}),
         {"id": "t", "type": "transform", "position": {"x": 0, "y": 0}, "data": {"config": {
@@ -11000,8 +10999,8 @@ def test_library_transform_falls_back_to_kept_code():
             "code": "def fn(row):\n    row['flagged'] = True\n    return row"}}},
     ], "edges": [E("src", "t")]}
     r = client.post("/api/run/preview", json={"graph": graph, "nodeId": "t", "k": 5}).json()
-    assert not r.get("notPreviewable"), r
-    assert r["rows"] and all(row.get("flagged") is True for row in r["rows"])
+    assert r.get("notPreviewable") is True, r
+    assert "exact version 'v1' is unavailable" in r["reason"]
 
 
 def test_example_plugin_loads_and_runs(tmp_path):

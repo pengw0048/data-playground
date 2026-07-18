@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import glob
+import json
 import os
 import re
 import tempfile
@@ -16,12 +17,12 @@ import uuid
 from typing import Any, Literal
 from urllib.parse import unquote
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import db, graph as g, metadb
+from hub import db, graph as g, metadb, sandbox
 from hub.api_errors import APIError, APIErrorCode
 from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
 from hub.deps import get_deps
@@ -59,11 +60,14 @@ from hub.models import (
     LineageResult,
     PipelineImport,
     ProcessorDescriptor,
+    ProcessorMode,
+    MAX_CODE_LEN,
     Relationship,
     SchemaCompatibility,
     SampleRequest,
     SampleResult,
 )
+from hub.security import current_user
 
 
 def _csv(v: str | None) -> list[str]:
@@ -1069,25 +1073,64 @@ def import_pipeline(req: ImportRequest) -> PipelineImport:
 # Processors (library picker + promote)
 # --------------------------------------------------------------------------- #
 @router.get("/processors", response_model=list[ProcessorDescriptor])
-def list_processors() -> list[ProcessorDescriptor]:
-    return get_deps().registry.list()
+def list_processors(uid: str = Depends(current_user)) -> list[ProcessorDescriptor]:
+    return get_deps().registry.list(uid)
 
 
 class PromoteRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-    id: str
-    title: str
-    mode: str = "map"
-    code: str
-    input_columns: list[str] = []
-    output_schema: list[ColumnSchema] = []
-    blurb: str = ""
+    id: str = Field(min_length=1, max_length=256)
+    title: str = Field(min_length=1, max_length=256)
+    mode: ProcessorMode = "map"
+    code: str = Field(min_length=1, max_length=MAX_CODE_LEN)
+    input_columns: list[str] = Field(default_factory=list, max_length=512)
+    input_schema: list[ColumnSchema] = Field(default_factory=list, max_length=512)
+    output_schema: list[ColumnSchema] = Field(default_factory=list, max_length=512)
+    requirements: list[str] = Field(default_factory=list, max_length=128)
+    category: str = Field(default="compute", min_length=1, max_length=128)
+    blurb: str = Field(default="", max_length=2000)
 
 
 @router.post("/processors/promote", response_model=ProcessorDescriptor)
-def promote_processor(req: PromoteRequest) -> ProcessorDescriptor:
-    p = get_deps().registry.promote(
-        id=req.id, title=req.title, mode=req.mode, code=req.code,
-        input_columns=req.input_columns, output_schema=req.output_schema, blurb=req.blurb,
-    )
+def promote_processor(
+        req: PromoteRequest, uid: str = Depends(current_user)) -> ProcessorDescriptor:
+    if any(value != value.strip() for value in (req.id, req.title, req.category)):
+        raise HTTPException(422, "promoted Transform identity and metadata must be canonical strings")
+    if any(not value or value != value.strip() or len(value) > 512
+           for value in [*req.input_columns, *req.requirements]):
+        raise HTTPException(422, "input columns and requirements must be bounded canonical strings")
+    schema_doc = [
+        field.model_dump(by_alias=True, mode="json")
+        for field in [*req.input_schema, *req.output_schema]
+    ]
+    if len(json.dumps(schema_doc, ensure_ascii=True).encode("utf-8")) > 1_000_000:
+        raise HTTPException(422, "promoted Transform schemas exceed the durable metadata limit")
+    if (req.input_schema and req.input_columns
+            and req.input_columns != [field.name for field in req.input_schema]):
+        raise HTTPException(422, "inputColumns must match inputSchema when both are supplied")
+    input_schema = req.input_schema or [
+        ColumnSchema(name=name, type="unknown") for name in req.input_columns
+    ]
+    try:
+        p = get_deps().registry.promote(
+            owner_id=uid, id=req.id, title=req.title, mode=req.mode, code=req.code,
+            input_schema=input_schema, output_schema=req.output_schema,
+            requirements=req.requirements, category=req.category, blurb=req.blurb,
+        )
+    except sandbox.SandboxError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return p.descriptor()
+
+
+@router.delete("/processors/{processor_id}/versions/{version}")
+def delete_processor_version(
+        processor_id: str, version: str,
+        uid: str = Depends(current_user)) -> dict:
+    try:
+        return metadb.delete_promoted_transform_version(uid, processor_id, version)
+    except KeyError as exc:
+        raise HTTPException(404, "promoted Transform version not found") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc

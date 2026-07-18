@@ -280,7 +280,6 @@ def main() -> int:
         initialize_ephemeral_metadata(os.path.dirname(status_file))
         from hub import compiler
         from hub.deps import set_workspace
-        from hub.models import Graph
         deps = set_workspace(
             job["workspace"], job["dataDir"], maintain_storage=False)
         _validate_local_source_locks(job, deps.storage)
@@ -370,7 +369,8 @@ def main() -> int:
         deps.runner.forced_sink_targets = (
             dict(job.get("sinkTargets") or {}) if "sinkTargets" in job else None)
         deps.runner.forced_sink_attempts = dict(job.get("sinkAttempts") or {})
-        graph = Graph(**job["graph"])
+        from hub.workload_env import restore_workload_graph
+        graph = restore_workload_graph(job["graph"], job.get("target"))
         _validate_admitted_input_manifest(job, graph)
         # The parent serialized this private binding into the one-shot job graph. Restore it only after
         # validating the admitted manifest; the attestation check below then requires the same exact

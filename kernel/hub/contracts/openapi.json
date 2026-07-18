@@ -3477,6 +3477,29 @@
             "title": "Category",
             "type": "string"
           },
+          "createdAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdat"
+          },
+          "creatorId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Creatorid"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -3487,6 +3510,14 @@
               "type": "string"
             },
             "title": "Inputcolumns",
+            "type": "array"
+          },
+          "inputSchema": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Inputschema",
             "type": "array"
           },
           "mode": {
@@ -3520,6 +3551,34 @@
             "default": true,
             "title": "Previewable",
             "type": "boolean"
+          },
+          "provenance": {
+            "default": "plugin",
+            "enum": [
+              "plugin",
+              "promoted"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "requirements": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirements",
+            "type": "array"
+          },
+          "semanticDigest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semanticdigest"
           },
           "title": {
             "title": "Title",
@@ -3934,39 +3993,78 @@
         "properties": {
           "blurb": {
             "default": "",
+            "maxLength": 2000,
             "title": "Blurb",
             "type": "string"
           },
+          "category": {
+            "default": "compute",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Category",
+            "type": "string"
+          },
           "code": {
+            "maxLength": 200000,
+            "minLength": 1,
             "title": "Code",
             "type": "string"
           },
           "id": {
+            "maxLength": 256,
+            "minLength": 1,
             "title": "Id",
             "type": "string"
           },
           "inputColumns": {
-            "default": [],
             "items": {
               "type": "string"
             },
+            "maxItems": 512,
             "title": "Inputcolumns",
+            "type": "array"
+          },
+          "inputSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 512,
+            "title": "Inputschema",
             "type": "array"
           },
           "mode": {
             "default": "map",
+            "enum": [
+              "map",
+              "map_batches",
+              "filter",
+              "flat_map",
+              "flat_map_generator",
+              "callable",
+              "aggregate"
+            ],
             "title": "Mode",
             "type": "string"
           },
           "outputSchema": {
-            "default": [],
             "items": {
               "$ref": "#/components/schemas/ColumnSchema"
             },
+            "maxItems": 512,
             "title": "Outputschema",
             "type": "array"
           },
+          "requirements": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Requirements",
+            "type": "array"
+          },
           "title": {
+            "maxLength": 256,
+            "minLength": 1,
             "title": "Title",
             "type": "string"
           }
@@ -13885,6 +13983,98 @@
           }
         },
         "summary": "Promote Processor"
+      }
+    },
+    "/api/processors/{processor_id}/versions/{version}": {
+      "delete": {
+        "operationId": "delete_processor_version_api_processors__processor_id__versions__version__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "processor_id",
+            "required": true,
+            "schema": {
+              "title": "Processor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "version",
+            "required": true,
+            "schema": {
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Processor Version Api Processors  Processor Id  Versions  Version  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Delete Processor Version"
       }
     },
     "/api/readyz": {

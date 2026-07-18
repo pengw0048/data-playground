@@ -41,10 +41,12 @@ class PoolRunner(SubprocessRunner):
     name = "local-pool"
 
     def __init__(self, workspace: str, data_dir: str, workers_cfg: list[dict], node_specs=None,
-                 catalog=None, storage=None, resolve_adapter=None, node_builders=None):
+                 catalog=None, storage=None, resolve_adapter=None, node_builders=None,
+                 registry=None):
         super().__init__(
             workspace, data_dir, catalog=catalog, storage=storage,
-            resolve_adapter=resolve_adapter, node_builders=node_builders)
+            resolve_adapter=resolve_adapter, node_builders=node_builders,
+            registry=registry)
         self.node_specs = node_specs if node_specs is not None else {}
         self._capacity: dict[str, ResourceSpec] = {}
         for w in workers_cfg:

@@ -10,8 +10,12 @@ currently owns its lease, heartbeat, and run-state writes.
 from __future__ import annotations
 
 import os
+import json
+import re
 from collections.abc import Mapping
 from typing import Any
+
+from hub.models import Graph
 
 # Process/runtime plumbing required to execute the same interpreter and native data libraries. These
 # are paths and behavior flags, not application/provider credentials.
@@ -68,6 +72,9 @@ _DATA_CREDENTIAL_ENV = frozenset({
 })
 
 EPHEMERAL_OBJECT_STORE_CRED_ID = "ephemeral-workload-object-store"
+_PROMOTED_SIDECAR_KEY = "_promotedTransformDefinitions"
+_MAX_PROMOTED_SIDECAR_DEFINITIONS = 512
+_MAX_PROMOTED_SIDECAR_BYTES = 8 * 1024 * 1024
 
 
 def _derived_auth_mode(src: Mapping[str, str], env: dict[str, str]) -> None:
@@ -209,7 +216,177 @@ def data_plane_object_store_config(source: Mapping[str, str] | None = None,
     return cfg
 
 
-def prepare_workload_graph(graph: Any) -> dict:
+def _reachable_promoted_transform_nodes(
+        graph: Graph, target: str | None) -> dict[str, tuple[str, str]]:
+    """Return node -> canonical exact promoted ref for the dispatched upstream cone."""
+    from hub import graph as graph_mod
+    from hub.promoted_transforms import (
+        PROMOTED_TRANSFORM_ID, promoted_transform_version_number)
+
+    nodes = (graph_mod.upstream_chain(graph, target)
+             if target is not None else graph_mod.topo_order(graph))
+    result: dict[str, tuple[str, str]] = {}
+    for node in nodes:
+        data = node.data if isinstance(node.data, dict) else {}
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        transform_id, version = config.get("processor"), config.get("version")
+        if (node.type == "transform" and config.get("source") == "library"
+                and isinstance(transform_id, str)
+                and PROMOTED_TRANSFORM_ID.fullmatch(transform_id)
+                and promoted_transform_version_number(version) is not None):
+            result[node.id] = (transform_id, str(version))
+    return result
+
+
+def _promoted_definition_snapshot(proc: Any) -> dict:
+    from hub.promoted_transforms import promoted_transform_definition
+
+    if proc.provenance != "promoted" or not isinstance(proc.code, str):
+        raise RuntimeError("workload promoted Transform definition is unavailable")
+    digest, definition = promoted_transform_definition(
+        title=proc.title, blurb=proc.blurb, category=proc.category, mode=proc.mode,
+        code=proc.code, input_schema=proc.input_schema, output_schema=proc.output_schema,
+        requirements=proc.requirements)
+    if digest != proc.semantic_digest:
+        raise RuntimeError("workload promoted Transform semantic digest is invalid")
+    return {
+        "id": proc.id,
+        "version": proc.version,
+        "semanticDigest": digest,
+        **definition,
+    }
+
+
+def _attach_promoted_transform_definitions(
+        payload: dict, graph: Graph, target: str | None, registry: Any | None) -> None:
+    """Attach a bounded parent-resolved execution snapshot to this private workload copy."""
+    # This top-level key is not part of Graph and cannot be accepted from the public wire model. Still
+    # remove it explicitly before rebuilding the parent-owned snapshot so no caller-provided private
+    # material can hitchhike if a dict-like graph is ever admitted at this seam.
+    payload.pop(_PROMOTED_SIDECAR_KEY, None)
+    refs = sorted(set(_reachable_promoted_transform_nodes(graph, target).values()))
+    if not refs:
+        return
+    if registry is None:
+        raise RuntimeError("promoted Transform workload dispatch requires the parent registry")
+    if len(refs) > _MAX_PROMOTED_SIDECAR_DEFINITIONS:
+        raise RuntimeError(
+            f"a workload may reference at most {_MAX_PROMOTED_SIDECAR_DEFINITIONS} "
+            "promoted Transform definitions")
+    definitions: list[dict] = []
+    encoded_bytes = 2  # surrounding JSON array brackets
+    for transform_id, version in refs:
+        definition = _promoted_definition_snapshot(registry.get(transform_id, version))
+        encoded_bytes += len(json.dumps(
+            definition, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True).encode("utf-8")) + bool(definitions)
+        if encoded_bytes > _MAX_PROMOTED_SIDECAR_BYTES:
+            raise RuntimeError(
+                "promoted Transform workload definitions exceed the 8 MiB transport limit")
+        definitions.append(definition)
+    payload[_PROMOTED_SIDECAR_KEY] = definitions
+
+
+def restore_workload_graph(
+        payload: Any, target: str | None = None) -> Graph:
+    """Validate a private promoted-definition sidecar and restore only the worker's graph copy.
+
+    The returned Graph contains ordinary ad-hoc code for the one-shot execution engine, but the parent
+    Graph, persisted Canvas, execution manifest, run state, and history remain exact ``id + version``
+    references. There is no latest-version or inline-code fallback: every restored body is hash-checked
+    against the complete immutable definition attached by the trusted parent.
+    """
+    from hub.promoted_transforms import (
+        PROMOTED_TRANSFORM_ID, promoted_transform_definition,
+        promoted_transform_version_number)
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("workload graph is malformed")
+    graph_doc = dict(payload)
+    raw_definitions = graph_doc.pop(_PROMOTED_SIDECAR_KEY, None)
+    graph = Graph.model_validate(graph_doc)
+    node_refs = _reachable_promoted_transform_nodes(graph, target)
+    expected_refs = set(node_refs.values())
+    if not expected_refs:
+        if raw_definitions not in (None, []):
+            raise RuntimeError("workload promoted Transform definitions do not match the graph")
+        return graph
+    if not isinstance(raw_definitions, list):
+        raise RuntimeError("workload promoted Transform definitions are missing")
+    if len(raw_definitions) > _MAX_PROMOTED_SIDECAR_DEFINITIONS:
+        raise RuntimeError("workload promoted Transform definition count exceeds the limit")
+    encoded = json.dumps(
+        raw_definitions, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if len(encoded.encode("utf-8")) > _MAX_PROMOTED_SIDECAR_BYTES:
+        raise RuntimeError("workload promoted Transform definitions exceed the transport limit")
+
+    required_fields = {
+        "id", "version", "semanticDigest", "title", "blurb", "category", "mode", "code",
+        "inputSchema", "outputSchema", "requirements",
+    }
+    definitions: dict[tuple[str, str], dict] = {}
+    for raw in raw_definitions:
+        if not isinstance(raw, dict) or set(raw) != required_fields:
+            raise RuntimeError("workload promoted Transform definition is malformed")
+        transform_id, version = raw.get("id"), raw.get("version")
+        if (not isinstance(transform_id, str)
+                or PROMOTED_TRANSFORM_ID.fullmatch(transform_id) is None
+                or promoted_transform_version_number(version) is None):
+            raise RuntimeError("workload promoted Transform identity is invalid")
+        ref = (transform_id, str(version))
+        if ref in definitions:
+            raise RuntimeError("workload promoted Transform definition is duplicated")
+        try:
+            digest, definition = promoted_transform_definition(
+                title=raw["title"], blurb=raw["blurb"], category=raw["category"],
+                mode=raw["mode"], code=raw["code"], input_schema=raw["inputSchema"],
+                output_schema=raw["outputSchema"], requirements=raw["requirements"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("workload promoted Transform definition is malformed") from exc
+        if (not isinstance(raw["semanticDigest"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", raw["semanticDigest"]) is None
+                or digest != raw["semanticDigest"]):
+            raise RuntimeError("workload promoted Transform semantic digest is invalid")
+        definitions[ref] = {**definition, "semanticDigest": digest}
+    if set(definitions) != expected_refs:
+        raise RuntimeError("workload promoted Transform definitions do not match the graph")
+
+    declared_requirements = set(graph.requirements)
+    by_id = {node.id: node for node in graph.nodes}
+    for node_id, ref in node_refs.items():
+        definition = definitions[ref]
+        missing = sorted(set(definition["requirements"]) - declared_requirements)
+        if missing:
+            raise RuntimeError(
+                f"promoted Transform {ref[0]}@{ref[1]} requires Canvas dependencies: "
+                + ", ".join(missing))
+        node = by_id[node_id]
+        data = node.data if isinstance(node.data, dict) else {}
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        # Rewrite only this disposable worker copy. Removing the library markers is deliberate: the
+        # ordinary code path cannot accidentally query latest metadata or fall back to stale client code.
+        config.pop("source", None)
+        config.pop("processor", None)
+        config.pop("version", None)
+        config["mode"] = definition["mode"]
+        config["code"] = definition["code"]
+        config["outputSchema"] = definition["outputSchema"]
+        data["config"] = config
+        node.data = data
+    return graph
+
+
+def public_workload_graph(payload: Any) -> Graph:
+    """Rebuild the public exact-reference Graph from a private workload transport document."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("workload graph is malformed")
+    graph_doc = dict(payload)
+    graph_doc.pop(_PROMOTED_SIDECAR_KEY, None)
+    return Graph.model_validate(graph_doc)
+
+
+def prepare_workload_graph(
+        graph: Any, target: str | None = None, registry: Any | None = None) -> dict:
     """Serialize a graph for a worker that cannot read hub metadata.
 
     Named schema contracts are control-plane references. Resolve them in the hub before dispatch and
@@ -217,6 +394,8 @@ def prepare_workload_graph(graph: Any) -> dict:
     worker the metadata identity. Missing references stay unresolved and therefore still fail closed in
     the worker instead of silently disabling enforcement.
     """
+    if not isinstance(graph, Graph):
+        graph = Graph.model_validate(graph)
     payload = graph.model_dump()
     from hub import metadb
 
@@ -229,4 +408,5 @@ def prepare_workload_graph(graph: Any) -> dict:
         contract = metadb.get_schema_contract(str(schema["ref"]), schema.get("version"))
         if contract and contract.get("columns"):
             config["outputSchema"] = contract["columns"]
+    _attach_promoted_transform_definitions(payload, graph, target, registry)
     return payload

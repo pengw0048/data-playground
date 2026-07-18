@@ -150,8 +150,14 @@ def resolve_config(node: GraphNode) -> dict:
         if cfg.get("source") == "library":  # keep 'source' even without a processor, so the engine's
             c["source"] = "library"          # library branch still runs (and errors honestly if unconfigured)
             if cfg.get("processor"):
-                c |= {"processor": cfg.get("processor"), "params": cfg.get("params", {})}
-        if cfg.get("code"):  # keep the code too — it's the portable, self-contained operator
+                c |= {
+                    "processor": cfg.get("processor"),
+                    "version": cfg.get("version"),
+                    "params": cfg.get("params", {}),
+                }
+        if cfg.get("code") and cfg.get("source") != "library":
+            # Inline code is the ad-hoc representation only. A library node resolves its exact durable
+            # version and must never retain or execute a hidden fallback body.
             c["code"] = cfg["code"]
         # A schema-changing Ray UDF can produce zero rows, at which point Ray 2.56 drops every output
         # block and its schema. Carry the portable contract so a distributed backend can publish a typed
