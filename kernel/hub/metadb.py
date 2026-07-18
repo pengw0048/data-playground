@@ -3750,8 +3750,11 @@ def _durable_task_db_now(s) -> datetime.datetime:
 def submit_durable_local_write_task(
         *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
         intent_sha256: str, graph_doc: dict, input_manifest: list[dict[str, str]],
-        write_intent: dict) -> tuple[dict, bool]:
+        write_intent: dict,
+        local_file_candidates: list[dict[str, str]] | None = None,
+        ) -> tuple[dict, bool]:
     """Persist a task and its first attempt atomically, adopting an identical replay."""
+    from hub.local_run_inputs import validate_manifest
     from hub.models import Graph, WriteIntent
 
     uid, canvas_id, target_node_id = str(uid), str(canvas_id), str(target_node_id)
@@ -3762,8 +3765,7 @@ def submit_durable_local_write_task(
     intent = WriteIntent.model_validate(write_intent)
     if intent.mode not in ("create", "replace"):
         raise ValueError("durable local tasks support only create or replace writes")
-    if not isinstance(input_manifest, list):
-        raise ValueError("durable task input manifest must be a list")
+    input_manifest = validate_manifest(input_manifest)
     graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
     manifest_payload = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
     intent_payload = json.dumps(
@@ -3805,6 +3807,9 @@ def submit_durable_local_write_task(
             status="queued", created_at=now,
         ))
         s.flush()
+        _admit_local_file_input_revisions(
+            s, input_manifest, list(local_file_candidates or []))
+        sync_local_result_owner(s, "durable_task", task_id, input_manifest)
         return _durable_task_doc(s, task), True
 
 
@@ -5419,6 +5424,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             ProfileJobLatest.target_node_id, ProfileJobLatest.plan_digest,
         ).with_for_update()))
         local_owners: list[tuple[str, str]] = [("canvas", canvas_id)]
+        local_owners.extend(("durable_task", task.id) for task in durable_tasks)
         for sh in shares:
             s.delete(sh)
         for admission in admissions:
@@ -8240,7 +8246,7 @@ _OBJECT_ATTEMPT_KINDS = ("region", "sink")
 _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
-    "profile_job", "run_input_admission", "run_record", "run_state",
+    "durable_task", "profile_job", "run_input_admission", "run_record", "run_state",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
@@ -8318,7 +8324,7 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
     elif owner_kind in ("canvas", "canvas_version"):
         for value in values:
             candidates.update(_canvas_local_result_candidates(value))
-    elif owner_kind in ("profile_job", "run_input_admission"):
+    elif owner_kind in ("durable_task", "profile_job", "run_input_admission"):
         pass
     else:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
@@ -8426,7 +8432,8 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
 
 def _local_result_input_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
-    if owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
+    if owner_kind in (
+            "durable_task", "profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_local_file_input_identities(value))
     return sorted(identities)
@@ -8540,7 +8547,7 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
             if (owner_kind not in ("run_state", "managed_file_revision")
                     or (owner_kind == "run_state" and str(owner_key) != artifact.writer_run_id)) \
                     and not (
-                        owner_kind == "run_input_admission"
+                        owner_kind in ("durable_task", "run_input_admission")
                         and artifact.uri in input_artifact_uris
                     ):
                 # Only the exact writer's RunState transaction may establish the primary ref and clear
@@ -8549,6 +8556,11 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
                     "managed local result must be published by its exact writer run first")
         s.add(LocalResultReference(
             uri=artifact.uri, owner_kind=owner_kind, owner_key=str(owner_key)))
+        if owner_kind == "durable_task" and artifact.uri in input_artifact_uris:
+            # Task visibility is also recovery eligibility. Publish its exact ref and release the DB
+            # writer authority in this transaction so a recovery scan can never claim a Task whose
+            # snapshot is still provisional. The process-local guard closes idempotently after commit.
+            artifact.writer_run_id = artifact.writer_token = None
 
 
 def _linear_checkpoint_generation(

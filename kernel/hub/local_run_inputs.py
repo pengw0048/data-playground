@@ -187,16 +187,10 @@ def snapshot_local_file_input(
     }
 
 
-def finalize_local_file_candidates(
-        storage, candidates: list[dict[str, str]], run_id: str) -> None:
-    """Release winning snapshot writers or abort candidates excluded by the durable admission."""
-    if not candidates:
-        return
-    try:
-        admitted = metadb.local_run_input_manifest(run_id)
-    except Exception:
-        # Unknown DB outcome: retain each exact writer fence for retry/dead-writer reconciliation.
-        return
+def _finalize_local_file_candidates(
+        storage, candidates: list[dict[str, str]], admitted: list[dict[str, str]] | None,
+        ) -> None:
+    """Release winning snapshot writers or abort candidates excluded by one admission."""
     admitted_ids = {
         (item["dataset_id"], item["revision_id"])
         for item in admitted or [] if item.get("provider") == LOCAL_FILE_INPUT_PROVIDER}
@@ -213,6 +207,35 @@ def finalize_local_file_candidates(
                     "local file input admission is missing its durable artifact owner")
         else:
             storage.abort_result(candidate["artifact_uri"], writer_id)
+
+
+def finalize_local_file_candidates(
+        storage, candidates: list[dict[str, str]], run_id: str) -> None:
+    """Finalize candidates against one ordinary local-run admission."""
+    if not candidates:
+        return
+    try:
+        admitted = metadb.local_run_input_manifest(run_id)
+    except Exception:
+        # Unknown DB outcome: retain each exact writer fence for retry/dead-writer reconciliation.
+        return
+    _finalize_local_file_candidates(storage, candidates, admitted)
+
+
+def finalize_durable_task_local_file_candidates(
+        storage, candidates: list[dict[str, str]], task_id: str) -> None:
+    """Finalize candidates against the persisted Task after a known or uncertain commit."""
+    if not candidates:
+        return
+    try:
+        task = metadb.durable_task(task_id)
+        admitted = (
+            task["input_manifest"]
+            if task is not None and task.get("task_kind") == "managed_local_write" else None)
+    except Exception:
+        # Unknown DB outcome: retain each exact writer fence for retry/dead-writer reconciliation.
+        return
+    _finalize_local_file_candidates(storage, candidates, admitted)
 
 
 def validate_manifest(value: object) -> list[dict[str, str]]:
