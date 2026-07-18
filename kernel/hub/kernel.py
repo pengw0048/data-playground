@@ -218,7 +218,10 @@ def _admitted_kernel_graph(body: RunBody, *, kernel_canvas: str, deps, metadata)
     if graph.id != kernel_canvas:
         raise LocalRunInputError("kernel graph does not match its canvas")
     validate_manifest_graph(graph, body.target, manifest, require_bound_revisions=False)
-    graph = bind_manifest(graph, body.target, manifest, deps.resolve_adapter)
+    graph = bind_manifest(
+        graph, body.target, manifest, deps.resolve_adapter,
+        allow_prebound_provider=True,
+    )
     validate_manifest_graph(graph, body.target, manifest, require_bound_revisions=True)
     return graph, manifest
 

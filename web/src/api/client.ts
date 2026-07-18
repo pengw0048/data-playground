@@ -220,11 +220,11 @@ export const api = {
     if (params?.limit) search.set('limit', String(params.limit))
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },
-  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[] }) =>
+  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[]; providerDatasetRefs?: string[] }) =>
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),
     }),
-  workspaceAddDatasets: (canvasId: string, body: { datasetIds: string[]; expectedCanvasVersion: number }) =>
+  workspaceAddDatasets: (canvasId: string, body: { datasetIds?: string[]; providerDatasetRefs?: string[]; expectedCanvasVersion: number }) =>
     req<WorkspaceAddDatasetResult>(`/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`, {
       method: 'POST', body: JSON.stringify(body),
     }),

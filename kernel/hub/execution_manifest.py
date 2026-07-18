@@ -105,6 +105,8 @@ def _canonical_graph(
             config.pop("uri", None)
             config.pop("_inputArtifactUri", None)
             config.pop("_input_artifact_uri", None)
+            config.pop("_input_provider_uri", None)
+            config.pop("_input_provider_preview_uri", None)
             config["datasetRef"] = {
                 "kind": "exact",
                 "datasetId": input_ref["dataset_id"],

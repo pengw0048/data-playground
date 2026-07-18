@@ -583,27 +583,46 @@ class BuildEngine:
             uri = cfg.get("uri")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            provider_preview_uri = cfg.get("_input_provider_preview_uri")
+            provider_inspection = (
+                isinstance(uri, str) and uri.startswith("workspace-provider://")
+                and isinstance(provider_preview_uri, str) and bool(provider_preview_uri)
+            )
+            if provider_inspection:
+                uri = provider_preview_uri
+            provider_dispatch_uri = cfg.get("_input_provider_uri")
+            if (cfg.get("_input_revision_id") is not None
+                    and isinstance(provider_dispatch_uri, str) and provider_dispatch_uri):
+                uri = provider_dispatch_uri
             from hub import paths
-            paths.ensure_local_uri_allowed(uri)  # multi-user: a source can't read an arbitrary local file
+            try:
+                # multi-user: a source can't read an arbitrary local file
+                paths.ensure_local_uri_allowed(uri)
+                adapter = self.resolve_adapter(uri)
+            except Exception as exc:
+                if provider_inspection:
+                    raise NotPreviewable(node, "provider dataset inspection failed") from exc
+                raise
             # CSV parse overrides (delimiter/header), already normalized + nested under 'options' by the
             # resolver — passed only when set, so an adapter whose scan() predates the kwarg keeps working
             extra = {"options": cfg["options"]} if cfg.get("options") else {}
-            adapter = self.resolve_adapter(uri)
             dataset_ref = cfg.get("datasetRef")
             if isinstance(dataset_ref, dict):
                 # A persisted Source pin is path-independent. Re-resolve the current catalog binding
                 # before every interactive read so unregister/re-register at the same URI cannot
                 # retarget an old reference to a numerically identical provider version.
-                from hub import metadb
+                from hub import metadb, workspace_providers
                 binding = metadb.catalog_revision_binding_for_uri(uri)
+                provider_dataset_id = workspace_providers.provider_dataset_identity(uri)
                 revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
                 try:
                     dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                 except ValueError as exc:
                     raise NotPreviewable(node, "selected revision reference is invalid") from exc
                 open_revision = getattr(revision_adapter, "open_revision", None)
-                if (binding is None
-                        or str(binding.get("dataset_id") or "") != dataset_id
+                if ((provider_dataset_id is None and binding is None)
+                        or (provider_dataset_id if provider_dataset_id is not None
+                            else str(binding.get("dataset_id") or "")) != dataset_id
                         or not callable(open_revision)):
                     raise NotPreviewable(node, "selected revision is unavailable; choose another revision or follow latest")
                 try:
@@ -619,7 +638,12 @@ class BuildEngine:
                     raise NotPreviewable(
                         node, "selected revision is unavailable; choose another revision or follow latest") from exc
             if self.schema_only:
-                return adapter.scan(uri, limit=0, **extra)  # metadata only — never materialize
+                try:
+                    return adapter.scan(uri, limit=0, **extra)  # metadata only — never materialize
+                except Exception as exc:
+                    if provider_inspection:
+                        raise NotPreviewable(node, "provider dataset inspection failed") from exc
+                    raise
             if self.pushdown and node.id != self._output_node:
                 cols, pred = self._source_pushdown(node)  # prune at the source for adapters that can
                 if cols:
@@ -663,12 +687,22 @@ class BuildEngine:
                 try:
                     rel = preview_scan(uri, limit=self.sample_k, **extra)
                 except BoundedPreviewUnsupported as exc:
-                    raise NotPreviewable(node, str(exc)) from exc
+                    reason = "provider dataset inspection failed" if provider_inspection else str(exc)
+                    raise NotPreviewable(node, reason) from exc
+                except Exception as exc:
+                    if provider_inspection:
+                        raise NotPreviewable(node, "provider dataset inspection failed") from exc
+                    raise
                 # Keep a relation-level cap as defence in depth; the source-level capability is the
                 # actual hard-bound contract and may not be replaced by this outer LIMIT.
                 rel = rel.limit(self.sample_k)
             else:
-                rel = adapter.scan(uri, **extra)
+                try:
+                    rel = adapter.scan(uri, **extra)
+                except Exception as exc:
+                    if provider_inspection:
+                        raise NotPreviewable(node, "provider dataset inspection failed") from exc
+                    raise
             return rel
 
         inputs = self._inputs(node)

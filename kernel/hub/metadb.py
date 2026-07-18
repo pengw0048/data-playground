@@ -3037,12 +3037,14 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
 
 def workspace_create_canvas_action(*, uid: str, container_id: str,
                                    expected_container_version: int, name: str,
-                                   dataset_ids: list[str] | None = None) -> dict:
+                                   dataset_ids: list[str] | None = None,
+                                   provider_sources: list[dict] | None = None) -> dict:
     """Atomically create one canvas at an exact local container with a bounded dataset selection."""
     canvas_name = _workspace_name(name)
     with _workspace_write_session() as s:
         container = _workspace_container_at_version(s, container_id, expected_container_version)
-        sources = _workspace_dataset_sources_in_session(s, dataset_ids or [])
+        sources = [*_workspace_dataset_sources_in_session(s, dataset_ids or []),
+                   *(provider_sources or [])]
         nodes: list[dict] = []
         _workspace_place_sources(nodes, sources)
         canvas_id = _uid()
@@ -3065,7 +3067,8 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
 
 
 def workspace_add_datasets_action(*, uid: str, canvas_id: str,
-                                  expected_canvas_version: int, dataset_ids: list[str]) -> dict:
+                                  expected_canvas_version: int, dataset_ids: list[str],
+                                  provider_sources: list[dict] | None = None) -> dict:
     """Atomically append bounded sources resolved from exact registration identities."""
     with _workspace_write_session() as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
@@ -3076,7 +3079,8 @@ def workspace_add_datasets_action(*, uid: str, canvas_id: str,
         if canvas.version != expected_canvas_version:
             raise WorkspaceVersionConflict(
                 f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
-        sources = _workspace_dataset_sources_in_session(s, dataset_ids)
+        sources = [*_workspace_dataset_sources_in_session(s, dataset_ids),
+                   *(provider_sources or [])]
         try:
             doc = json.loads(canvas.doc)
         except (TypeError, ValueError) as exc:

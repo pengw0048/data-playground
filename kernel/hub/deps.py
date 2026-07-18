@@ -635,6 +635,19 @@ class Deps:
         self._refresh_plugin_status(entry)
 
     def resolve_adapter(self, uri: str):
+        from hub import workspace_providers
+
+        if workspace_providers.is_provider_dataset_uri(uri):
+            return workspace_providers.provider_dataset_adapter(
+                uri, self.resolve_physical_adapter)
+        return self._resolve_registered_adapter(uri)
+
+    def resolve_physical_adapter(self, uri: str):
+        """Resolve an installed physical adapter without interpreting a Workspace binding URI."""
+        return self._resolve_registered_adapter(uri)
+
+    def _resolve_registered_adapter(self, uri: str):
+        """Resolve only installed DatasetAdapters, without re-entering provider binding lookup."""
         for a in self.adapters:
             try:
                 if a.matches(uri):

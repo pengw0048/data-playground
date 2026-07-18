@@ -390,11 +390,26 @@ class WorkspaceCreateCanvasBody(_StrictAuthBody):
     expected_container_version: int = Field(ge=1)
     name: str = "untitled"
     dataset_ids: list[str] = Field(default_factory=list, max_length=50)
+    provider_dataset_refs: list[str] = Field(default_factory=list, max_length=1)
+
+    @model_validator(mode="after")
+    def _bounded_dataset_selection(self) -> "WorkspaceCreateCanvasBody":
+        if len(self.dataset_ids) + len(self.provider_dataset_refs) > 50:
+            raise ValueError("dataset selection is limited to 50 sources")
+        return self
 
 
 class WorkspaceAddDatasetBody(_StrictAuthBody):
-    dataset_ids: list[str] = Field(min_length=1, max_length=50)
+    dataset_ids: list[str] = Field(default_factory=list, max_length=50)
+    provider_dataset_refs: list[str] = Field(default_factory=list, max_length=1)
     expected_canvas_version: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _bounded_dataset_selection(self) -> "WorkspaceAddDatasetBody":
+        count = len(self.dataset_ids) + len(self.provider_dataset_refs)
+        if count < 1 or count > 50:
+            raise ValueError("dataset selection must contain between 1 and 50 sources")
+        return self
 
 
 class WorkspaceMoveCanvasBody(_StrictAuthBody):
@@ -413,6 +428,36 @@ def _workspace_action_error(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(422, str(exc)) from exc
     raise exc
+
+
+def _provider_dataset_sources(refs: list[str], uid: str) -> list[dict]:
+    if len(refs) != len(set(refs)):
+        raise ValueError("provider dataset selection contains a duplicate identity")
+    from hub.deps import get_deps
+    deps = get_deps()
+    return [workspace_providers.provider_dataset_source(
+        ref, uid=uid, resolve_physical=deps.resolve_physical_adapter)
+        for ref in refs]
+
+
+def _provider_dataset_action_error(exc: Exception) -> None:
+    if isinstance(exc, workspace_providers.ProviderDatasetGone):
+        raise APIError(
+            410, "provider dataset was deleted; relink it explicitly",
+            code=APIErrorCode.RESOURCE_GONE, retryable=False,
+        ) from exc
+    if isinstance(exc, workspace_providers.ProviderDatasetOffline):
+        raise APIError(
+            503, "provider dataset is offline",
+            code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
+        ) from exc
+    if isinstance(exc, workspace_providers.ProviderDatasetUnavailable):
+        raise APIError(
+            409, ("provider dataset binding is unavailable; install or restore a compatible "
+                  "provider and dataset adapter"),
+            code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
+        ) from exc
+    _workspace_action_error(exc)
 
 
 @router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
@@ -502,12 +547,15 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
                             uid: str = Depends(current_user)) -> dict:
     """Create at one exact local destination; an optional dataset is resolved by stable identity."""
     try:
+        provider_sources = _provider_dataset_sources(body.provider_dataset_refs, uid)
         return metadb.workspace_create_canvas_action(
             uid=uid, container_id=body.container_id,
             expected_container_version=body.expected_container_version,
-            name=body.name, dataset_ids=body.dataset_ids)
-    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
-        _workspace_action_error(exc)
+            name=body.name, dataset_ids=body.dataset_ids,
+            provider_sources=provider_sources)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        _provider_dataset_action_error(exc)
 
 
 @router.post("/workspace/canvases/{canvas_id}/datasets")
@@ -515,6 +563,12 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
                                           uid: str = Depends(current_user)) -> dict:
     """Add one exact local dataset to one explicitly named editable canvas."""
     from hub.main import _broadcast_external_edit, _idle_collab_room_edit
+    try:
+        provider_sources = await run_in_threadpool(
+            _provider_dataset_sources, body.provider_dataset_refs, uid)
+    except (KeyError, PermissionError, ValueError,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        _provider_dataset_action_error(exc)
     async with _idle_collab_room_edit(canvas_id) as idle:
         if not idle:
             raise HTTPException(
@@ -526,7 +580,7 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
                 metadb.workspace_add_datasets_action,
                 uid=uid, canvas_id=canvas_id,
                 expected_canvas_version=body.expected_canvas_version,
-                dataset_ids=body.dataset_ids)
+                dataset_ids=body.dataset_ids, provider_sources=provider_sources)
         except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
             _workspace_action_error(exc)
     # This is an out-of-band document edit, like MCP. Nudge any currently open collab room to refetch

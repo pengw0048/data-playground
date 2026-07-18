@@ -98,7 +98,11 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
   })
 
   it('does not change the source until a browsed file has been registered successfully', async () => {
-    const oldConfig = { uri: 'mem://orders', tableId: 't1' }
+    const oldConfig = {
+      uri: 'workspace-provider://binding', tableId: 't1',
+      providerResourceRef: 'dataset:external.binding', providerMountId: 'mount-a',
+      providerName: 'fixture', providerReadMode: 'exact' as const,
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({
       doc: { id: 'c', name: 'test', version: 1, nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data: { title: 'orders source', status: 'draft', config: oldConfig } }], edges: [] },
@@ -117,6 +121,10 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     fireEvent.click(screen.getByText('new.csv'))
     await waitFor(() => expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({ uri: 'file:///data/new.csv', tableId: 't2' }))
+    expect(useStore.getState().doc.nodes[0].data.config).toMatchObject({
+      providerResourceRef: undefined, providerMountId: undefined,
+      providerName: undefined, providerReadMode: undefined,
+    })
     expect(useStore.getState().doc.nodes[0].data.title).toBe('new')
     expect(screen.queryByText(/Couldn't open file/i)).toBeNull()
   })

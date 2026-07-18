@@ -329,20 +329,31 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Mount warehouse · fixture · unavailable — deadline exceeded')
   })
 
-  it('opens external dataset detail without catalog lookup or provider writes', async () => {
+  it('uses an external dataset by stable reference without catalog lookup or provider writes', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.files = [{ id: 'target-canvas', name: 'Exact target', version: 9, role: 'editor' }]
+    mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'target-canvas', version: 10 })
     mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     expect(detail).toHaveTextContent('Read-only mount warehouse · fixture')
-    expect(detail).toHaveTextContent('Create, move, delete, and dataset-use actions are unavailable')
+    expect(detail).toHaveTextContent('Using the dataset creates only a local Source; it never writes to the provider')
     expect(screen.getByRole('button', { name: 'New canvas here' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'New canvas here' })).toHaveAttribute('title', 'Read-only external mounts do not support creating canvases')
+    fireEvent.click(screen.getByRole('button', { name: 'Use in canvas' }))
+    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
+      'Only the stable provider identity and display metadata are stored locally',
+    )
+    fireEvent.click(screen.getByRole('button', { name: /^Add to canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
+      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
+    }))
+    expect(store.openFile).toHaveBeenCalledWith('target-canvas')
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
-    expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
   })
 
