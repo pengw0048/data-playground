@@ -144,11 +144,11 @@ test('browses and opens one exact retained dataset revision without drifting to 
   await expect(page.getByTestId('dataset-revision-history')).toBeVisible()
 })
 
-test('pins a Source revision, persists it across reload, and keeps the control in the supported viewport @ux-smoke', async ({ page }) => {
+test('pins a managed-local Parquet Source revision, persists it across reload, and keeps the control in the supported viewport @ux-smoke', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 768 })
   const canvasId = `source-pin-${Date.now()}`
   const table = {
-    id: 'pin-table', name: 'Pinned Lance source', uri: '/mock/pinned-source.lance',
+    id: 'pin-table', name: 'Pinned managed-local Parquet source', uri: '/mock/pinned-source.parquet',
     rowCount: 2, version: 'v2', columns: [{ name: 'value', type: 'bigint', capabilities: [] }],
   }
   const created = await page.request.post('/api/canvas', { data: {

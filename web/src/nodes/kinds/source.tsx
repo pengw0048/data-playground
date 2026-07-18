@@ -212,35 +212,33 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const [detailState, setDetailState] = useState<ExactRevisionState>('idle')
   const [detailRequest, setDetailRequest] = useState(0)
   const [capabilitiesChecking, setCapabilitiesChecking] = useState(true)
+  const [exactAvailable, setExactAvailable] = useState(false)
   const [asOfAvailable, setAsOfAvailable] = useState(false)
   const [asOfLocal, setAsOfLocal] = useState('')
   const [asOfResolving, setAsOfResolving] = useState(false)
   const [asOfError, setAsOfError] = useState('')
 
-  // #279 deliberately owns only the built-in Lance journey. Other exact-revision providers keep
-  // their Catalog history UI but do not gain a Source configuration surface here.
-  const lance = table?.uri.split(/[?#]/, 1)[0].replace(/\/$/, '').toLowerCase().endsWith('.lance') ?? false
   useEffect(() => {
     const generation = ++historyGeneration.current
     let live = true
     setOpen(false); setRevisions([]); setCursor(null); setHasMore(false); setHistoryError('')
-    setAsOfError(''); setAsOfAvailable(false); setAsOfResolving(false); setCapabilitiesChecking(true)
+    setAsOfError(''); setExactAvailable(false); setAsOfAvailable(false); setAsOfResolving(false); setCapabilitiesChecking(true)
     if (!table) {
       setAvailability('unavailable'); setCapabilitiesChecking(false)
       return () => { live = false }
     }
+    setAvailability('checking')
     api.datasetRevisionCapabilities(table.id).then((capabilities) => {
       if (!live || generation !== historyGeneration.current) return
+      const exact = capabilities.selectors.includes('exact')
+      setExactAvailable(exact)
       setAsOfAvailable(capabilities.selectors.includes('as_of')
         && capabilities.asOfOrdering === 'latest_committed_at_at_or_before'
         && capabilities.timezone === 'UTC')
-    }).catch(() => {
-      if (live && generation === historyGeneration.current) setAsOfAvailable(false)
-    }).finally(() => {
-      if (live && generation === historyGeneration.current) setCapabilitiesChecking(false)
-    })
-    if (lance) {
-      setAvailability('checking')
+      if (!exact) {
+        setAvailability('unavailable')
+        return
+      }
       api.datasetRevisions(table.id, { limit: 20 }).then((page) => {
         if (!live || generation !== historyGeneration.current) return
         setRevisions(page.items)
@@ -255,11 +253,15 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           setAvailability('error')
         }
       })
-    } else {
-      setAvailability('unavailable')
-    }
+    }).catch(() => {
+      if (live && generation === historyGeneration.current) {
+        setExactAvailable(false); setAsOfAvailable(false); setAvailability('unavailable')
+      }
+    }).finally(() => {
+      if (live && generation === historyGeneration.current) setCapabilitiesChecking(false)
+    })
     return () => { live = false }
-  }, [table?.id, table?.uri, lance, request])
+  }, [table?.id, table?.uri, request])
 
   useEffect(() => {
     let live = true
@@ -333,7 +335,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const staleLastKnown = lastKnownAt
     ? <> Last known provider commit {new Date(lastKnownAt).toLocaleString()} <span className="font-semibold">(stale)</span>.</>
     : null
-  const controlAvailable = availability === 'available' || asOfAvailable
+  const controlAvailable = (exactAvailable && availability === 'available') || asOfAvailable
   const registrationReplaced = selectedExact != null && revisions.length > 0
     && revisions.every((revision) => revision.datasetId !== selectedExact.datasetId)
   const checking = availability === 'checking' || capabilitiesChecking
