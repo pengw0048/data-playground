@@ -324,7 +324,7 @@ export function ERDiagram() {
         {showHelp && (
           <div className="rounded-md border border-border bg-muted/40 p-2 text-[10.5px] leading-relaxed">
             Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to
-            re-focus the graph on it. Declare a primary key from a dataset detail drawer in Workspace.
+            re-focus the graph on it. Open a dataset from Workspace, then declare a primary key in its detail drawer.
           </div>
         )}
 

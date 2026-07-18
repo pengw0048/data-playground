@@ -103,6 +103,15 @@ describe('ERDiagram request truth', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Declare' })).toBeEnabled())
   })
 
+  it('explains the current Workspace route for declaring a primary key', async () => {
+    render(<ERDiagram />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'How this works' }))
+
+    expect(await screen.findByText(/Open a dataset from Workspace, then declare a primary key in its detail drawer/)).toBeVisible()
+    expect(screen.queryByText(/Tables.*detail drawer/i)).toBeNull()
+  })
+
   it('uses the canonical lineage root when a focused physical generation advances', async () => {
     const currentOrders = { ...ORDERS, name: 'orders-current', uri: 'mem://orders-current' }
     store.erFocusUri = ORDERS.uri
