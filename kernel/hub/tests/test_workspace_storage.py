@@ -16,7 +16,7 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, event, select
 
-from hub import main as hub_main, metadb, workspace_providers
+from hub import db, main as hub_main, metadb, workspace_providers
 from hub.catalog_provider import (
     CatalogResource,
     ProviderAncestors,
@@ -687,10 +687,15 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert mutable_preview.status_code == 200, mutable_preview.text
         assert mutable_preview.json()["rows"] == [{"value": 1}]
 
+        decoded_private_path = "/private/provider-decoded-secret.csv"
+
         class _PathEchoingAdapter(DuckDBAdapter):
             def preview_scan(self, uri, columns=None, limit=2000, options=None):
-                del columns, limit, options
-                raise RuntimeError(f"cannot read private provider path {uri}")
+                del uri, columns, limit, options
+                # DuckDB materializes this only after Source lowering has returned. The route boundary
+                # must still keep a provider-owned decoded path out of the API error envelope.
+                return db.conn().sql(
+                    f"select error('{decoded_private_path}') as provider_failure")
 
         monkeypatch.setattr(deps, "chosen_backend", lambda _uid=None: "local-out-of-core")
         path_echoing_adapter = _PathEchoingAdapter()
@@ -705,17 +710,20 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert direct_preview_failure.status_code == 200, direct_preview_failure.text
         assert direct_preview_failure.json()["reason"] == "provider dataset inspection failed"
         assert str(path) not in direct_preview_failure.text
+        assert decoded_private_path not in direct_preview_failure.text
         direct_profile_failure = client.post("/api/run/profile", json={
             "graph": mutable_graph, "nodeId": mutable_source["id"],
         })
         assert direct_profile_failure.status_code == 200, direct_profile_failure.text
         assert direct_profile_failure.json()["reason"] == "provider dataset inspection failed"
         assert str(path) not in direct_profile_failure.text
+        assert decoded_private_path not in direct_profile_failure.text
         monkeypatch.setattr(deps, "resolve_adapter", normal_resolve_adapter)
 
         class _KernelPreview:
             echo_path = False
             transport_error: str | None = None
+            not_previewable_reason: str | None = None
 
             def _child_resolve(self, uri):
                 if uri == str(path):
@@ -739,6 +747,12 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             def profile(self, private_graph, node_id, *, full, port_id):
                 if self.transport_error is not None:
                     raise RuntimeError(self.transport_error)
+                if self.not_previewable_reason is not None:
+                    return {
+                        "not_previewable": True,
+                        "reason": self.not_previewable_reason,
+                        "target_port_id": port_id,
+                    }
                 assert full is False
                 assert private_graph.nodes[0].data["config"]["_input_provider_preview_uri"] == str(path)
                 return profile_node(
@@ -778,13 +792,14 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert kernel_profile_failure.status_code == 200, kernel_profile_failure.text
         assert kernel_profile_failure.json()["reason"] == "provider dataset inspection failed"
         assert str(path) not in kernel_profile_failure.text
-        kernel_preview_backend.transport_error = "downstream column is missing"
+        kernel_preview_backend.transport_error = None
+        kernel_preview_backend.not_previewable_reason = "downstream node is not previewable"
         downstream_failure = client.post("/api/run/profile", json={
             "graph": mutable_graph, "nodeId": mutable_source["id"],
         })
         assert downstream_failure.status_code == 200, downstream_failure.text
-        assert "downstream column is missing" in downstream_failure.json()["reason"]
-        kernel_preview_backend.transport_error = None
+        assert downstream_failure.json()["reason"] == "downstream node is not previewable"
+        kernel_preview_backend.not_previewable_reason = None
 
         preallocations = 0
         original_preallocate = metadb.preallocate_or_adopt_profile_run_owner

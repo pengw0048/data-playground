@@ -832,7 +832,21 @@ def _provider_inspection_graph(graph, target_node_id: str | None, deps):
         ) from exc
 
 
-def _provider_inspection_failure_reason(graph, reason: str) -> str:
+def _has_private_provider_inspection(graph) -> bool:
+    return any(
+        isinstance(node.data.get("config"), dict)
+        and bool(node.data["config"].get("_input_provider_preview_uri"))
+        for node in graph.nodes
+    )
+
+
+def _provider_inspection_failure_reason(
+        graph, reason: str, *, runtime_error: bool = False) -> str:
+    if runtime_error and _has_private_provider_inspection(graph):
+        # Adapter relations may defer physical I/O until DuckDB materializes them, after the Source
+        # lowering frame has returned. At that boundary an arbitrary runtime error cannot be attributed
+        # safely to the Source or a downstream node, so never echo provider-owned physical details.
+        return "provider dataset inspection failed"
     for node in graph.nodes:
         config = node.data.get("config") if isinstance(node.data, dict) else None
         physical_uri = (
@@ -1238,18 +1252,24 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
             result.input_manifest = manifest
             if result.error or result.not_previewable:
                 result.reason = _provider_inspection_failure_reason(
-                    preview_graph, result.reason or "provider dataset inspection failed")
+                    preview_graph, result.reason or "provider dataset inspection failed",
+                    runtime_error=result.error,
+                )
             return result
         except Exception as e:  # noqa: BLE001 — kernel unreachable / spawn timeout → a clean error, not a raw 500
             return SampleResult(error=True, reason=_provider_inspection_failure_reason(
-                preview_graph, f"kernel unavailable: {type(e).__name__}: {e}"))
+                preview_graph, f"kernel unavailable: {type(e).__name__}: {e}",
+                runtime_error=True,
+            ))
     result = preview_node(preview_graph, req.node_id, k,
                           deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
                           offset=max(0, req.offset), storage=deps.storage, port_id=port_id)
     result.input_manifest = manifest
     if result.error or result.not_previewable:
         result.reason = _provider_inspection_failure_reason(
-            preview_graph, result.reason or "provider dataset inspection failed")
+            preview_graph, result.reason or "provider dataset inspection failed",
+            runtime_error=result.error,
+        )
     return result
 
 
@@ -1286,7 +1306,9 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
                 graph, req.node_id, full=False, port_id=port_id))
         except Exception as e:  # noqa: BLE001 — kernel unreachable → a clean error, not a raw 500
             result = ProfileResult(error=True, reason=_provider_inspection_failure_reason(
-                graph, f"kernel unavailable: {type(e).__name__}: {e}"))
+                graph, f"kernel unavailable: {type(e).__name__}: {e}",
+                runtime_error=True,
+            ))
     else:
         result = profile_node(graph, req.node_id, deps.resolve_adapter, deps.registry,
                               deps.node_builders, deps.node_specs, full=False,
@@ -1294,7 +1316,9 @@ def run_profile(req: PreviewRequest, uid: str = Depends(current_user)) -> Profil
     result.input_manifest = manifest
     if result.error or result.not_previewable:
         result.reason = _provider_inspection_failure_reason(
-            graph, result.reason or "provider dataset inspection failed")
+            graph, result.reason or "provider dataset inspection failed",
+            runtime_error=result.error,
+        )
     return result
 
 
