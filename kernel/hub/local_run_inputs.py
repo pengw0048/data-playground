@@ -269,6 +269,11 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
         except ValueError as exc:
             raise LocalRunInputError("local run input manifest does not match the graph") from exc
         if item["provider"] == LOCAL_FILE_INPUT_PROVIDER:
+            if (source_binding is None
+                    or str(source_binding["dataset_id"]) != item["dataset_id"]
+                    or (selected_identity is not None and selected_identity != (
+                        item["dataset_id"], item["revision_id"]))):
+                raise LocalRunInputError("local run input manifest does not match the graph")
             artifact_uri = metadb.local_file_input_revision_artifact(
                 item["dataset_id"], item["revision_id"])
             if artifact_uri is None:

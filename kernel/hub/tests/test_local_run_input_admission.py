@@ -483,6 +483,31 @@ def test_caller_manifest_cannot_retarget_a_source_to_another_dataset(tmp_path):
     assert getattr(exc.value, "detail", None) == "local_run_input_manifest_does_not_match_graph"
 
 
+def test_caller_local_file_manifest_cannot_retarget_another_registered_source(tmp_path):
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)
+    first = tmp_path / "retarget-first.parquet"
+    second = tmp_path / "retarget-second.parquet"
+    _write_ordinary_source(first, [1])
+    _write_ordinary_source(second, [2])
+    catalog._add(name="retarget-first", uri=str(first), strict_probe=True)
+    catalog._add(name="retarget-second", uri=str(second), strict_probe=True)
+    first_graph, deps, _first_manifest, _first_run, _first_artifact = _admit_ordinary_source(
+        source=first, canvas_id="retarget-first", storage=storage,
+        adapter=adapter, intent="6" * 64)
+    _second_graph, _deps, second_manifest, _second_run, _second_artifact = (
+        _admit_ordinary_source(
+            source=second, canvas_id="retarget-second", storage=storage,
+            adapter=adapter, intent="7" * 64))
+
+    with pytest.raises(APIError) as exc:
+        runs._bind_local_run_manifest(first_graph, second_manifest, deps, "source")
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "local_run_input_manifest_does_not_match_graph"
+
+
 def test_pinned_source_admission_uses_selected_revision_instead_of_current_head(tmp_path):
     lance = pytest.importorskip("lance")
     uri = str(tmp_path / "pinned-input.lance")
