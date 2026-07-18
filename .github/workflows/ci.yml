@@ -175,6 +175,10 @@ jobs:
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_dataset_views.py
+      - name: Verify DatasetView distribution reports on PostgreSQL
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_distribution_reports.py
       - name: Verify typed local write contracts on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
