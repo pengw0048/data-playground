@@ -174,7 +174,8 @@ jobs:
       - name: Verify exact ordinary local input admission on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
-          hub/tests/test_local_run_input_admission.py -k postgres
+          hub/tests/test_local_run_input_admission.py
+          hub/tests/test_durable_local_write_tasks.py -k postgres
       - name: Verify managed local Lance append contracts on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60

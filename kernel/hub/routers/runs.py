@@ -1820,6 +1820,31 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
+    # A response-loss retry adopts its already-frozen managed-local Task before touching a Source,
+    # destination, or schema. The semantic digest still rejects a changed graph or supplied intent;
+    # only the mutable physical Source is deliberately absent from this replay path.
+    operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
+    if (submission_id is not None and target is not None and target.type == "write"
+            and operational_canvas is not None and metadb.canvas_exists(operational_canvas)):
+        task_id = metadb.durable_task_submission_id(uid, operational_canvas, submission_id)
+        existing_task = metadb.durable_task(task_id)
+        if existing_task is not None and existing_task["task_kind"] == "managed_local_write":
+            frozen_intent = WriteIntent.model_validate(existing_task["write_intent"])
+            if write_intent is not None and write_intent != frozen_intent:
+                raise metadb.DurableTaskSubmissionConflict(
+                    "durable task submission does not match its frozen admission")
+            replay_sha256 = _local_run_intent_sha256(
+                intent_graph, target_node_id, input_manifest, frozen_intent)
+            task, _created = metadb.submit_durable_local_write_task(
+                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                target_node_id=str(target_node_id), intent_sha256=replay_sha256,
+                graph_doc=existing_task["graph_doc"],
+                input_manifest=existing_task["input_manifest"],
+                write_intent=existing_task["write_intent"],
+            )
+            from hub.durable_tasks import dispatch
+            dispatch(task["id"], deps)
+            return RunStatus.model_validate(task["status_doc"]), None
     external_request = _external_wait_request(deps, graph, target_node_id)
     if external_request is not None:
         if input_manifest is not None or submission_id is None:
@@ -1967,6 +1992,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         return RunStatus.model_validate(status["status_doc"]), None
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
     _reject_invalid(graph, deps, target_node_id)
+    # Keep the durable graph on logical Source URIs. A supplied exact manifest binds private
+    # _input_* execution fields below; those belong only on the schema/plan/worker copy and must never
+    # cross into Task, Jobs, receipt, or lineage persistence.
+    durable_graph = graph.model_copy(deep=True)
     if input_manifest is not None:
         # Bind before validation/compile/estimate so schema checks and execution see the same exact
         # population as the preview, even if latest moved after the preview was rendered.
@@ -1982,6 +2011,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 raise HTTPException(409, write_admission.blocker or "write admission failed")
             effective_write_intent = write_admission.intent
             _inject_write_intent(graph, target_node_id, write_admission.intent)
+            _inject_write_intent(durable_graph, target_node_id, write_admission.intent)
     intent_sha256 = _local_run_intent_sha256(
         intent_graph, target_node_id, input_manifest, effective_write_intent)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
@@ -2023,15 +2053,48 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if operational_canvas is None or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "durable managed-local writes require a saved canvas")
         assert submission_id is not None
-        manifest = (input_manifest if input_manifest is not None
-                    else _resolve_local_run_manifest(graph, target_node_id, deps))
-        task, _created = metadb.submit_durable_local_write_task(
-            uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-            target_node_id=str(target_node_id), intent_sha256=intent_sha256,
-            graph_doc=graph.model_dump(by_alias=True, mode="json"),
-            input_manifest=manifest,
-            write_intent=effective_write_intent.model_dump(by_alias=True, mode="json"),
-        )
+        task_id = metadb.durable_task_submission_id(
+            uid, operational_canvas, str(submission_id))
+        prior = metadb.durable_task(task_id)
+        prior_manifest = (
+            prior["input_manifest"]
+            if prior is not None and prior.get("task_kind") == "managed_local_write" else None)
+        for admission_attempt in range(2):
+            candidates: list[dict[str, str]] = []
+            try:
+                manifest = (input_manifest if input_manifest is not None
+                            else prior_manifest if prior_manifest is not None
+                            else _resolve_local_run_manifest(
+                                graph, target_node_id, deps,
+                                materialize_local_files=True,
+                                local_file_candidates=candidates,
+                            ))
+                task, _created = metadb.submit_durable_local_write_task(
+                    uid=uid, canvas_id=operational_canvas,
+                    submission_id=str(submission_id),
+                    target_node_id=str(target_node_id), intent_sha256=intent_sha256,
+                    graph_doc=durable_graph.model_dump(by_alias=True, mode="json"),
+                    input_manifest=manifest,
+                    write_intent=effective_write_intent.model_dump(
+                        by_alias=True, mode="json"),
+                    local_file_candidates=candidates,
+                )
+                break
+            except metadb.LocalFileInputAdmissionRetry as exc:
+                if (input_manifest is not None or prior_manifest is not None
+                        or admission_attempt > 0):
+                    raise APIError(
+                        409, "ordinary local input changed during exact admission; retry",
+                        code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
+                        retryable=True,
+                    ) from exc
+            finally:
+                from hub.local_run_inputs import (
+                    finalize_durable_task_local_file_candidates,
+                )
+                if candidates:
+                    finalize_durable_task_local_file_candidates(
+                        deps.storage, candidates, task_id)
         from hub.durable_tasks import dispatch
         dispatch(task["id"], deps)
         return RunStatus.model_validate(task["status_doc"]), None
