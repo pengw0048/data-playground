@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import threading
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,20 @@ def _uid() -> str:
 
 def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def transform_library_text(value: object) -> str:
+    """Canonical Unicode text used by every Transform library search boundary."""
+    return unicodedata.normalize("NFKC", str(value)).casefold()
+
+
+def transform_library_sort_key(title: object) -> str:
+    """Return an ASCII key whose byte ordering is identical on SQLite and PostgreSQL."""
+    return transform_library_text(title).encode("utf-8").hex()
+
+
+def transform_library_search_text(*values: object) -> str:
+    return "\n".join(transform_library_text(value) for value in values)
 
 
 class Base(DeclarativeBase):
@@ -305,6 +320,7 @@ class PromotedTransform(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
     key: Mapped[str] = mapped_column(String(256), nullable=False)
+    library_sort_key: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
@@ -320,6 +336,9 @@ class PromotedTransformVersion(Base):
     version: Mapped[int] = mapped_column(Integer, primary_key=True)
     semantic_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
+    library_search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    library_category_key: Mapped[str] = mapped_column(Text, nullable=False)
+    library_mode_key: Mapped[str] = mapped_column(Text, nullable=False)
     blurb: Mapped[str] = mapped_column(String(2000), nullable=False, default="", server_default="")
     category: Mapped[str] = mapped_column(String(128), nullable=False)
     mode: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -2653,6 +2672,14 @@ class WorkspaceVersionConflict(RuntimeError):
     """A Workspace edit was based on a stale container or placement version."""
 
 
+class WorkspaceTransformCompatibilityConflict(RuntimeError):
+    """An exact Transform upgrade lacks compatible schema evidence."""
+
+
+class WorkspaceTransformUnavailable(RuntimeError):
+    """An exact Transform disappeared between admission and the atomic write."""
+
+
 class WorkspaceNameConflict(ValueError):
     """A sibling container already owns the requested display name."""
 
@@ -3101,16 +3128,96 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
         nodes.append(source)
 
 
+def _workspace_transform_node_in_session(
+        s, *, uid: str, transform: dict, canvas_id: str | None = None) -> dict:
+    processor = str(transform.get("id", ""))
+    version = str(transform.get("version", ""))
+    title = str(transform.get("title", ""))
+    mode = str(transform.get("mode", ""))
+    if not processor or not version or not title or not mode:
+        raise ValueError("an exact Transform descriptor is required")
+    if processor.startswith("tr_"):
+        number = _promoted_transform_version_number(version)
+        row = s.get(
+            PromotedTransformVersion, (processor, number), with_for_update=True) if number else None
+        if row is None or row.deleted_at is not None:
+            raise WorkspaceTransformUnavailable(
+                f"Transform {processor}@{version} is unavailable")
+        identity = s.get(PromotedTransform, processor)
+        if identity is None:
+            raise RuntimeError("promoted Transform version has no logical identity")
+        permitted = identity.owner_id == str(uid)
+        if not permitted and canvas_id is not None:
+            permitted = s.get(PromotedTransformVersionRef, (
+                "canvas", str(canvas_id), processor, int(number))) is not None
+        if not permitted:
+            raise PermissionError(f"Transform {processor}@{version} is not available to this user")
+        title, mode = row.title, row.mode
+    return {
+        "id": f"transform_{_uid()}",
+        "type": "transform",
+        "position": {"x": 160, "y": 160},
+        "data": {
+            "title": title,
+            "status": "draft",
+            "config": {
+                "source": "library", "processor": processor,
+                "version": version, "mode": mode,
+            },
+        },
+    }
+
+
+def _workspace_invalidate_downstream(doc: dict, node_id: str) -> None:
+    nodes = doc.get("nodes", [])
+    by_id = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
+    downstream = {str(node_id)}
+    # A transform contained by a Section contributes to the Section's execution identity. Mirror the
+    # existing Canvas semantics narrowly here: invalidate its ancestor Sections and their edge
+    # descendants, without changing unrelated containment behavior.
+    parent = by_id.get(str(node_id), {}).get("parentId")
+    while isinstance(parent, str) and parent and parent not in downstream:
+        downstream.add(parent)
+        parent = by_id.get(parent, {}).get("parentId")
+    changed = True
+    edges = doc.get("edges", [])
+    while changed:
+        changed = False
+        for edge in edges if isinstance(edges, list) else []:
+            if not isinstance(edge, dict):
+                continue
+            source, target = str(edge.get("source", "")), str(edge.get("target", ""))
+            if source in downstream and target and target not in downstream:
+                downstream.add(target)
+                changed = True
+    for node in nodes:
+        if not isinstance(node, dict) or str(node.get("id", "")) not in downstream:
+            continue
+        data = node.get("data")
+        if not isinstance(data, dict):
+            continue
+        if str(node.get("id", "")) == str(node_id):
+            data["status"] = "draft" if data.get("status") == "draft" else "stale"
+        elif data.get("status") == "latest":
+            data["status"] = "stale"
+
+
 def workspace_create_canvas_action(*, uid: str, container_id: str,
                                    expected_container_version: int, name: str,
                                    dataset_ids: list[str] | None = None,
-                                   provider_sources: list[dict] | None = None) -> dict:
+                                   provider_sources: list[dict] | None = None,
+                                   transform: dict | None = None) -> dict:
     """Atomically create one canvas at an exact local container with a bounded dataset selection."""
     canvas_name = _workspace_name(name)
     with _workspace_write_session() as s:
         container = _workspace_container_at_version(s, container_id, expected_container_version)
         sources = [*_workspace_dataset_sources_in_session(s, dataset_ids or []),
                    *(provider_sources or [])]
+        if transform is not None:
+            if sources:
+                raise ValueError("a Transform target cannot include dataset sources")
+            sources.append(_workspace_transform_node_in_session(
+                s, uid=uid, transform=transform))
         nodes: list[dict] = []
         _workspace_place_sources(nodes, sources)
         canvas_id = _uid()
@@ -3129,6 +3236,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         return {
             "ok": True, "id": canvas_id, "created": True,
+            "nodeId": nodes[0]["id"] if transform is not None else None,
             "resource": _workspace_placement_resource(placement, detached=False),
         }
 
@@ -3165,6 +3273,86 @@ def workspace_add_datasets_action(*, uid: str, canvas_id: str,
         sync_local_result_owner(s, "canvas", canvas_id, doc)
         _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         return {"ok": True, "id": canvas_id, "version": canvas.version, "doc": doc}
+
+
+def workspace_add_transform_action(
+        *, uid: str, canvas_id: str, expected_canvas_version: int,
+        transform: dict, replace_node_id: str | None = None) -> dict:
+    """Atomically add or explicitly upgrade one exact library Transform reference."""
+    with _workspace_write_session() as s:
+        canvas = s.get(Canvas, str(canvas_id), with_for_update=True)
+        if canvas is None:
+            raise KeyError(f"canvas '{canvas_id}' not found")
+        if _workspace_canvas_role_in_session(s, canvas, str(uid)) not in ("owner", "editor"):
+            raise PermissionError("you don't have edit access to this canvas")
+        if canvas.version != expected_canvas_version:
+            raise WorkspaceVersionConflict(
+                f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
+        try:
+            doc = json.loads(canvas.doc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"canvas '{canvas_id}' has invalid content") from exc
+        nodes = doc.get("nodes")
+        if not isinstance(nodes, list):
+            raise ValueError(f"canvas '{canvas_id}' has invalid content")
+        candidate = _workspace_transform_node_in_session(
+            s, uid=uid, transform=transform, canvas_id=str(canvas_id))
+        label = "before Workspace Transform add"
+        node_id = candidate["id"]
+        if replace_node_id is None:
+            _workspace_place_sources(nodes, [candidate])
+        else:
+            existing = next((node for node in nodes
+                             if isinstance(node, dict)
+                             and str(node.get("id")) == str(replace_node_id)), None)
+            data = existing.get("data") if isinstance(existing, dict) else None
+            cfg = data.get("config") if isinstance(data, dict) else None
+            if (not isinstance(existing, dict) or existing.get("type") != "transform"
+                    or not isinstance(cfg, dict) or cfg.get("source") != "library"):
+                raise ValueError("the selected node is not a library Transform")
+            if cfg.get("processor") != candidate["data"]["config"]["processor"]:
+                raise ValueError("a Transform upgrade must keep the same identity")
+            if cfg.get("version") == candidate["data"]["config"]["version"]:
+                raise ValueError("the selected node already uses this exact Transform version")
+            processor = str(cfg.get("processor", ""))
+            if not processor.startswith("tr_"):
+                raise WorkspaceTransformCompatibilityConflict(
+                    "plugin Transform upgrades require compatible metadata for both exact versions")
+            old_number = _promoted_transform_version_number(cfg.get("version"))
+            new_number = _promoted_transform_version_number(
+                candidate["data"]["config"]["version"])
+            old_row = s.get(PromotedTransformVersion, (processor, old_number)) if old_number else None
+            new_row = s.get(PromotedTransformVersion, (processor, new_number)) if new_number else None
+            if (old_row is None or old_row.deleted_at is not None
+                    or new_row is None or new_row.deleted_at is not None):
+                raise WorkspaceTransformCompatibilityConflict(
+                    "both exact Transform versions must be active before upgrade")
+            input_compatibility = diff_columns(
+                json.loads(old_row.input_schema), json.loads(new_row.input_schema))
+            output_compatibility = diff_columns(
+                json.loads(old_row.output_schema), json.loads(new_row.output_schema))
+            if (input_compatibility.status != "compatible"
+                    or output_compatibility.status != "compatible"):
+                raise WorkspaceTransformCompatibilityConflict(
+                    "Transform upgrade requires compatible input and output schemas; "
+                    f"input is {input_compatibility.status}, output is {output_compatibility.status}")
+            cfg.update(candidate["data"]["config"])
+            cfg.pop("code", None)
+            data["title"] = candidate["data"]["title"]
+            node_id = str(replace_node_id)
+            _workspace_invalidate_downstream(doc, node_id)
+            label = "before exact Transform version upgrade"
+        _snapshot_canvas_in_session(
+            s, canvas, canvas.doc, canvas.version, author_id=uid, label=label)
+        canvas.version += 1
+        doc["version"] = canvas.version
+        canvas.doc = json.dumps(doc)
+        sync_local_result_owner(s, "canvas", str(canvas_id), doc)
+        _replace_promoted_transform_refs(s, "canvas", str(canvas_id), doc)
+        return {
+            "ok": True, "id": str(canvas_id), "version": canvas.version,
+            "nodeId": node_id, "doc": doc,
+        }
 
 
 def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_version: int,
@@ -5542,7 +5730,9 @@ def promote_transform(
     with session() as s:
         dialect = s.get_bind().dialect.name
         values = {
-            "id": transform_id, "owner_id": owner_id, "key": key, "created_at": _now(),
+            "id": transform_id, "owner_id": owner_id, "key": key,
+            "library_sort_key": transform_library_sort_key(definition["title"]),
+            "created_at": _now(),
         }
         if dialect == "postgresql":
             from sqlalchemy.dialects.postgresql import insert as dialect_insert
@@ -5575,6 +5765,11 @@ def promote_transform(
             version=next_version,
             semantic_digest=semantic_digest,
             title=definition["title"],
+            library_search_text=transform_library_search_text(
+                definition["title"], definition["blurb"], definition["category"],
+                definition["mode"], transform_id),
+            library_category_key=transform_library_text(definition["category"]),
+            library_mode_key=transform_library_text(definition["mode"]),
             blurb=definition["blurb"],
             category=definition["category"],
             mode=definition["mode"],
@@ -5607,6 +5802,177 @@ def list_promoted_transforms(owner_id: str) -> list[dict]:
         for row in rows:
             latest.setdefault(row.transform_id, row)
         return [_promoted_transform_version_doc(row) for row in latest.values()]
+
+
+def promoted_transform_library_page(
+        owner_id: str, *, q: str = "", mode: str = "", category: str = "",
+        after_sort_key: str | None = None, after_id: str | None = None,
+        limit: int = 26) -> list[dict]:
+    """Return a stable bounded keyset page, selecting newest active or newest tombstone per identity."""
+    bounded_limit = max(1, min(int(limit), 101))
+    ranked = select(
+        PromotedTransformVersion.transform_id.label("id"),
+        PromotedTransformVersion.version,
+        PromotedTransformVersion.semantic_digest,
+        PromotedTransformVersion.title,
+        PromotedTransform.library_sort_key,
+        PromotedTransformVersion.library_search_text,
+        PromotedTransformVersion.library_category_key,
+        PromotedTransformVersion.library_mode_key,
+        PromotedTransformVersion.blurb,
+        PromotedTransformVersion.category,
+        PromotedTransformVersion.mode,
+        PromotedTransformVersion.input_schema,
+        PromotedTransformVersion.output_schema,
+        PromotedTransformVersion.requirements,
+        PromotedTransformVersion.creator_id,
+        PromotedTransformVersion.created_at,
+        PromotedTransformVersion.deleted_at,
+        func.row_number().over(
+            partition_by=PromotedTransformVersion.transform_id,
+            order_by=(
+                PromotedTransformVersion.deleted_at.is_not(None).asc(),
+                PromotedTransformVersion.version.desc(),
+            ),
+        ).label("selected_rank"),
+        func.count().over(
+            partition_by=PromotedTransformVersion.transform_id,
+        ).label("version_count"),
+    ).join(
+        PromotedTransform,
+        PromotedTransform.id == PromotedTransformVersion.transform_id,
+    ).where(PromotedTransform.owner_id == str(owner_id)).subquery()
+    sort_key = ranked.c.library_sort_key
+    statement = select(ranked).where(ranked.c.selected_rank == 1)
+    query = transform_library_text(q.strip())
+    if query:
+        statement = statement.where(
+            ranked.c.library_search_text.contains(query, autoescape=True))
+    if mode:
+        statement = statement.where(
+            ranked.c.library_mode_key == transform_library_text(mode.strip()))
+    if category:
+        statement = statement.where(
+            ranked.c.library_category_key == transform_library_text(category.strip()))
+    if after_sort_key is not None and after_id is not None:
+        statement = statement.where(or_(
+            sort_key > after_sort_key,
+            and_(sort_key == after_sort_key, ranked.c.id > after_id),
+        ))
+    statement = statement.order_by(sort_key, ranked.c.id).limit(bounded_limit)
+    with session() as s:
+        result: list[dict] = []
+        for row in s.execute(statement).mappings():
+            created_at = row["created_at"]
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+            result.append({
+                "id": row["id"], "version": f"v{row['version']}",
+                "title": row["title"], "blurb": row["blurb"],
+                "library_sort_key": row["library_sort_key"],
+                "category": row["category"], "mode": row["mode"],
+                "input_schema": json.loads(row["input_schema"]),
+                "output_schema": json.loads(row["output_schema"]),
+                "requirements": json.loads(row["requirements"]),
+                "creator_id": row["creator_id"], "created_at": created_at,
+                "semantic_digest": row["semantic_digest"],
+                "deleted_at": row["deleted_at"],
+                "version_count": int(row["version_count"]),
+            })
+        return result
+
+
+def promoted_transform_library_detail(owner_id: str, transform_id: str) -> list[dict]:
+    """Return every immutable version plus bounded retention counts for one owned identity."""
+    with session() as s:
+        identity = s.get(PromotedTransform, str(transform_id))
+        if identity is None or identity.owner_id != str(owner_id):
+            raise KeyError("promoted Transform not found")
+        rows = list(s.scalars(select(PromotedTransformVersion).where(
+            PromotedTransformVersion.transform_id == str(transform_id),
+        ).order_by(PromotedTransformVersion.version.desc())))
+        counts: dict[int, dict[str, int]] = {}
+        for version, kind, count in s.execute(select(
+            PromotedTransformVersionRef.version,
+            PromotedTransformVersionRef.owner_kind,
+            func.count(),
+        ).where(
+            PromotedTransformVersionRef.transform_id == str(transform_id),
+        ).group_by(
+            PromotedTransformVersionRef.version,
+            PromotedTransformVersionRef.owner_kind,
+        )):
+            counts.setdefault(int(version), {})[str(kind)] = int(count)
+        total = len(rows)
+        result: list[dict] = []
+        for row in rows:
+            doc = _promoted_transform_version_doc(row)
+            doc["version_count"] = total
+            doc["retention"] = counts.get(row.version, {})
+            result.append(doc)
+        return result
+
+
+def promoted_transform_library_cursor_key(
+        owner_id: str, transform_id: str, version: str) -> str | None:
+    """Resolve the immutable ordered key behind one exact promoted-version cursor."""
+    number = _promoted_transform_version_number(version)
+    if number is None:
+        return None
+    with session() as s:
+        identity = s.get(PromotedTransform, str(transform_id))
+        row = s.get(PromotedTransformVersion, (str(transform_id), number))
+        if identity is None or identity.owner_id != str(owner_id) or row is None:
+            return None
+        return identity.library_sort_key
+
+
+def canvas_transform_references(uid: str, canvas_id: str) -> list[dict]:
+    """Resolve only the exact library refs already present in one readable Canvas."""
+    with session() as s:
+        canvas = s.get(Canvas, str(canvas_id))
+        if canvas is None:
+            raise KeyError(f"canvas '{canvas_id}' not found")
+        if _workspace_canvas_role_in_session(s, canvas, str(uid)) is None:
+            raise PermissionError("you don't have read access to this canvas")
+        try:
+            doc = json.loads(canvas.doc)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"canvas '{canvas_id}' has invalid content") from exc
+        refs: dict[tuple[str, str], list[str]] = {}
+        for node in doc.get("nodes", []):
+            if not isinstance(node, dict):
+                continue
+            data = node.get("data")
+            cfg = data.get("config") if isinstance(data, dict) else None
+            if not isinstance(cfg, dict) or cfg.get("source") != "library":
+                continue
+            processor, version = cfg.get("processor"), cfg.get("version")
+            if isinstance(processor, str) and isinstance(version, str):
+                refs.setdefault((processor, version), []).append(str(node.get("id", "")))
+        result: list[dict] = []
+        retained = {(str(pid), f"v{int(version)}") for pid, version in s.execute(select(
+            PromotedTransformVersionRef.transform_id,
+            PromotedTransformVersionRef.version,
+        ).where(
+            PromotedTransformVersionRef.owner_kind == "canvas",
+            PromotedTransformVersionRef.owner_key == str(canvas_id),
+        ))}
+        for (processor, version), node_ids in sorted(refs.items()):
+            item = {"id": processor, "version": version, "node_ids": node_ids}
+            if processor.startswith("tr_"):
+                number = _promoted_transform_version_number(version)
+                row = s.get(PromotedTransformVersion, (processor, number)) if number else None
+                identity = s.get(PromotedTransform, processor) if row is not None else None
+                visible = identity is not None and (
+                    identity.owner_id == str(uid) or (processor, version) in retained)
+                if visible and row is not None:
+                    item["descriptor"] = _promoted_transform_version_doc(row)
+                    item["availability"] = "deleted" if row.deleted_at is not None else "active"
+                else:
+                    item["availability"] = "missing"
+            result.append(item)
+        return result
 
 
 def _promoted_transform_version_number(version) -> int | None:

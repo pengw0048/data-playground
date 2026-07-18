@@ -114,6 +114,52 @@
         "title": "BrowseRequest",
         "type": "object"
       },
+      "CanvasTransformReference": {
+        "properties": {
+          "availability": {
+            "enum": [
+              "active",
+              "deleted",
+              "missing"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "descriptor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProcessorDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "nodeIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Nodeids",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "nodeIds",
+          "availability"
+        ],
+        "title": "CanvasTransformReference",
+        "type": "object"
+      },
       "CapabilityView": {
         "description": "A plugin capability that contributes a VIEWER TAB, declaratively. `viewer.kind` names a generic\nrenderer the SPA ships (e.g. 'grid' = media/image grid, 'json' = pretty-printed cell) — so a plugin\nadds a viewer tab (for columns it tags via its detector) with NO frontend code, the same way a\nNodeSpec renders a node card. See kernel/hub/plugins/capabilities.py + web/src/nodes/capabilities.",
         "properties": {
@@ -5643,6 +5689,269 @@
         "title": "SettingsSnapshot",
         "type": "object"
       },
+      "TransformLibraryDetail": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "provenance": {
+            "enum": [
+              "plugin",
+              "promoted"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "requestedVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requestedversion"
+          },
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/TransformLibraryEntry"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "provenance",
+          "versions"
+        ],
+        "title": "TransformLibraryDetail",
+        "type": "object"
+      },
+      "TransformLibraryEntry": {
+        "description": "Public metadata for one exact Transform version; executable code is never exposed.",
+        "properties": {
+          "availability": {
+            "default": "active",
+            "enum": [
+              "active",
+              "deleted",
+              "missing"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "blurb": {
+            "default": "",
+            "title": "Blurb",
+            "type": "string"
+          },
+          "category": {
+            "default": "processor",
+            "title": "Category",
+            "type": "string"
+          },
+          "createdAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdat"
+          },
+          "creatorId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Creatorid"
+          },
+          "deletedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deletedat"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "inputColumns": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Inputcolumns",
+            "type": "array"
+          },
+          "inputSchema": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Inputschema",
+            "type": "array"
+          },
+          "mode": {
+            "enum": [
+              "map",
+              "map_batches",
+              "filter",
+              "flat_map",
+              "flat_map_generator",
+              "callable",
+              "aggregate"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "outputSchema": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Outputschema",
+            "type": "array"
+          },
+          "paramsSchema": {
+            "additionalProperties": true,
+            "default": {},
+            "title": "Paramsschema",
+            "type": "object"
+          },
+          "previewable": {
+            "default": true,
+            "title": "Previewable",
+            "type": "boolean"
+          },
+          "provenance": {
+            "default": "plugin",
+            "enum": [
+              "plugin",
+              "promoted"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "requirements": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirements",
+            "type": "array"
+          },
+          "retention": {
+            "$ref": "#/components/schemas/TransformRetention",
+            "default": {
+              "canvas": 0,
+              "canvasVersion": 0,
+              "executionManifest": 0
+            }
+          },
+          "semanticDigest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semanticdigest"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          },
+          "versionCount": {
+            "default": 1,
+            "title": "Versioncount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "title",
+          "mode"
+        ],
+        "title": "TransformLibraryEntry",
+        "type": "object"
+      },
+      "TransformLibraryPage": {
+        "properties": {
+          "hasMore": {
+            "default": false,
+            "title": "Hasmore",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TransformLibraryEntry"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextcursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "TransformLibraryPage",
+        "type": "object"
+      },
+      "TransformRetention": {
+        "properties": {
+          "canvas": {
+            "default": 0,
+            "title": "Canvas",
+            "type": "integer"
+          },
+          "canvasVersion": {
+            "default": 0,
+            "title": "Canvasversion",
+            "type": "integer"
+          },
+          "executionManifest": {
+            "default": 0,
+            "title": "Executionmanifest",
+            "type": "integer"
+          }
+        },
+        "title": "TransformRetention",
+        "type": "object"
+      },
       "UnregisterItemResult": {
         "properties": {
           "detail": {
@@ -5891,6 +6200,48 @@
         "title": "WorkspaceAddDatasetBody",
         "type": "object"
       },
+      "WorkspaceAddTransformBody": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedCanvasVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcanvasversion",
+            "type": "integer"
+          },
+          "replaceNodeId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replacenodeid"
+          },
+          "transformId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Transformid",
+            "type": "string"
+          },
+          "transformVersion": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Transformversion",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transformId",
+          "transformVersion",
+          "expectedCanvasVersion"
+        ],
+        "title": "WorkspaceAddTransformBody",
+        "type": "object"
+      },
       "WorkspaceBrowsePage": {
         "properties": {
           "completeness": {
@@ -5984,6 +6335,32 @@
             "maxItems": 1,
             "title": "Providerdatasetrefs",
             "type": "array"
+          },
+          "transformId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transformid"
+          },
+          "transformVersion": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transformversion"
           }
         },
         "required": [
@@ -9120,6 +9497,92 @@
           }
         },
         "summary": "Get Shares"
+      }
+    },
+    "/api/canvas/{canvas_id}/transform-references": {
+      "get": {
+        "description": "Return safe exact metadata only for library refs already present in a readable Canvas.",
+        "operationId": "list_canvas_transform_references_api_canvas__canvas_id__transform_references_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CanvasTransformReference"
+                  },
+                  "title": "Response List Canvas Transform References Api Canvas  Canvas Id  Transform References Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "List Canvas Transform References"
       }
     },
     "/api/canvas/{canvas_id}/versions": {
@@ -16162,6 +16625,255 @@
         "summary": "Put Settings Batch"
       }
     },
+    "/api/transform-library": {
+      "get": {
+        "description": "Browse a bounded, exact-version Transform library without exposing executable code.",
+        "operationId": "browse_transform_library_api_transform_library_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 256,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "enum": [
+                "all",
+                "promoted",
+                "plugin"
+              ],
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 64,
+              "title": "Mode",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 128,
+              "title": "Category",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransformLibraryPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Browse Transform Library"
+      }
+    },
+    "/api/transform-library/{processor_id}": {
+      "get": {
+        "description": "Inspect immutable versions; promoted identities remain owner-scoped.",
+        "operationId": "transform_library_detail_api_transform_library__processor_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "processor_id",
+            "required": true,
+            "schema": {
+              "title": "Processor Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransformLibraryDetail"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Transform Library Detail"
+      }
+    },
     "/api/users": {
       "get": {
         "operationId": "list_users_api_users_get",
@@ -16504,6 +17216,100 @@
           }
         },
         "summary": "Add Workspace Dataset To Canvas"
+      }
+    },
+    "/api/workspace/canvases/{canvas_id}/transforms": {
+      "post": {
+        "description": "Atomically add or explicitly upgrade one exact Transform in one selected editable Canvas.",
+        "operationId": "add_workspace_transform_to_canvas_api_workspace_canvases__canvas_id__transforms_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceAddTransformBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Add Workspace Transform To Canvas Api Workspace Canvases  Canvas Id  Transforms Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Add Workspace Transform To Canvas"
       }
     },
     "/api/workspace/containers/{container_id}": {

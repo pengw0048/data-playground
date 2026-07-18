@@ -1629,6 +1629,45 @@ class ProcessorDescriptor(Wire):
     semantic_digest: str | None = None
 
 
+TransformAvailability = Literal["active", "deleted", "missing"]
+
+
+class TransformRetention(Wire):
+    canvas: int = 0
+    canvas_version: int = 0
+    execution_manifest: int = 0
+
+
+class TransformLibraryEntry(ProcessorDescriptor):
+    """Public metadata for one exact Transform version; executable code is never exposed."""
+
+    availability: TransformAvailability = "active"
+    deleted_at: datetime.datetime | None = None
+    version_count: int = 1
+    retention: TransformRetention = TransformRetention()
+
+
+class TransformLibraryPage(Wire):
+    items: list[TransformLibraryEntry]
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class TransformLibraryDetail(Wire):
+    id: str
+    provenance: Literal["plugin", "promoted"]
+    requested_version: str | None = None
+    versions: list[TransformLibraryEntry]
+
+
+class CanvasTransformReference(Wire):
+    id: str
+    version: str
+    node_ids: list[str]
+    availability: TransformAvailability
+    descriptor: ProcessorDescriptor | None = None
+
+
 # --------------------------------------------------------------------------- #
 # Canvas graph
 # --------------------------------------------------------------------------- #

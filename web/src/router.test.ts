@@ -58,4 +58,16 @@ describe('Workspace routes', () => {
     window.location.hash = routeHash('canvas', 'canvas-1', undefined, undefined, undefined, 'write-1')
     expect(parseHash()).toEqual({ view: 'canvas', canvasId: 'canvas-1', nodeId: 'write-1' })
   })
+
+  it('round-trips an exact Transform upgrade context without mixing it into filters', () => {
+    window.location.hash = routeHash(
+      'transforms', undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, 'tr_exact', 'v2', 'q=robot&source=promoted', 'canvas-1', 'node-1',
+    )
+    expect(parseHash()).toEqual({
+      view: 'transforms', transformId: 'tr_exact', transformVersion: 'v2',
+      transformCanvasId: 'canvas-1', transformNodeId: 'node-1',
+      transformQuery: 'q=robot&source=promoted',
+    })
+  })
 })

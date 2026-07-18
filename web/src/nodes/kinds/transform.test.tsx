@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -50,6 +50,21 @@ describe('Transform exact processor labels', () => {
     expect(screen.getAllByText(`${PROCESSOR_ID}@v1`).length).toBeGreaterThan(0)
     expect(screen.queryByText('Latest version')).not.toBeInTheDocument()
     expect(screen.queryByText('select processor')).not.toBeInTheDocument()
+  })
+
+  it('opens a visible exact Canvas/node upgrade context only from Manage', () => {
+    const Transform = getComponent('transform')!
+    render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={node.id} data={node.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /Manage/ }))
+    expect(useStore.getState()).toMatchObject({
+      view: 'transforms', transformResourceId: PROCESSOR_ID, transformVersion: 'v1',
+      transformUpgradeCanvasId: 'canvas', transformUpgradeNodeId: 'transform',
+    })
   })
 
   it('shows an unlisted shared exact ref in the fullscreen read-only label', async () => {

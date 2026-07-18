@@ -9,6 +9,7 @@ import { ERDiagram } from './ERDiagram'
 import { WorkspaceExplorer } from './WorkspaceExplorer'
 import { JobsView } from './JobsView'
 import { InboxView } from './InboxView'
+import { TransformsLibrary } from './TransformsLibrary'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
@@ -44,7 +45,7 @@ export function Shell() {
         {view === 'workspace' && <WorkspaceExplorer />}
         {view === 'jobs' && <JobsView />}
         {view === 'inbox' && <InboxView onUnreadChange={refreshUnread} />}
-        {view === 'transforms' && <TransformsContent />}
+        {view === 'transforms' && <TransformsLibrary />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
       {settingsOpen && <SettingsModal onClose={closeSettings} />}
@@ -284,32 +285,6 @@ function FilesContent() {
             ))}
           </>
         )}
-      </div>
-    </>
-  )
-}
-
-function TransformsContent() {
-  const processors = useStore((s) => s.processors)
-  const addToCanvas = useStore((s) => s.addToCanvas)
-  return (
-    <>
-      <ViewHeader title="Transforms" />
-      <div style={{ padding: '4px 28px 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-        {processors.map((p) => (
-          <button key={p.id} onClick={() => addToCanvas('transform', { source: 'library', processor: p.id, version: p.version, mode: p.mode }, p.title || p.id)} title="Add to the canvas"
-            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', border: `1px solid ${color.border}`, borderRadius: 10, background: 'hsl(var(--card))', cursor: 'pointer', textAlign: 'left' }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = 'hsl(var(--accent))')} onMouseLeave={(e) => (e.currentTarget.style.background = 'hsl(var(--card))')}>
-            <Icon name="fx" size={16} style={{ color: color.text3 }} />
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: color.ink }}>{p.title || p.id}</div>
-              <div style={{ fontSize: 11, color: color.text3 }}>{p.category}</div>
-            </div>
-            {p.mode && <span style={{ fontSize: 10.5, color: color.text3, background: 'hsl(var(--muted))', padding: '2px 7px', borderRadius: radius.chip }}>{p.mode}</span>}
-            <span style={{ fontSize: 11, color: color.focus, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 4 }}><Icon name="plus" size={12} /> Use</span>
-          </button>
-        ))}
-        {processors.length === 0 && <div style={{ color: color.text3, fontSize: 13, padding: 20, lineHeight: 1.6 }}>No transform processors yet. Write an ad-hoc code node on a canvas and “Promote to library” to add one here.</div>}
       </div>
     </>
   )

@@ -21,7 +21,9 @@ from sqlalchemy import select as _sa_select
 
 from hub import auth, auth_admission, metadb, workspace_providers
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
+from hub.deps import get_deps
 from hub.models import (
+    CanvasTransformReference,
     CredUpsert,
     DurableTaskInboxItemView,
     DurableTaskInboxPage,
@@ -391,11 +393,17 @@ class WorkspaceCreateCanvasBody(_StrictAuthBody):
     name: str = "untitled"
     dataset_ids: list[str] = Field(default_factory=list, max_length=50)
     provider_dataset_refs: list[str] = Field(default_factory=list, max_length=1)
+    transform_id: str | None = Field(default=None, min_length=1, max_length=256)
+    transform_version: str | None = Field(default=None, min_length=1, max_length=64)
 
     @model_validator(mode="after")
     def _bounded_dataset_selection(self) -> "WorkspaceCreateCanvasBody":
         if len(self.dataset_ids) + len(self.provider_dataset_refs) > 50:
             raise ValueError("dataset selection is limited to 50 sources")
+        if (self.transform_id is None) != (self.transform_version is None):
+            raise ValueError("Transform id and version must be supplied together")
+        if self.transform_id is not None and (self.dataset_ids or self.provider_dataset_refs):
+            raise ValueError("a new Canvas may start with datasets or one Transform, not both")
         return self
 
 
@@ -412,6 +420,13 @@ class WorkspaceAddDatasetBody(_StrictAuthBody):
         return self
 
 
+class WorkspaceAddTransformBody(_StrictAuthBody):
+    transform_id: str = Field(min_length=1, max_length=256)
+    transform_version: str = Field(min_length=1, max_length=64)
+    expected_canvas_version: int = Field(ge=1)
+    replace_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
 class WorkspaceMoveCanvasBody(_StrictAuthBody):
     container_id: str
     expected_container_version: int = Field(ge=1)
@@ -424,6 +439,8 @@ def _workspace_action_error(exc: Exception) -> None:
     if isinstance(exc, PermissionError):
         raise HTTPException(403, str(exc)) from exc
     if isinstance(exc, metadb.WorkspaceVersionConflict):
+        raise HTTPException(409, str(exc)) from exc
+    if isinstance(exc, metadb.WorkspaceTransformCompatibilityConflict):
         raise HTTPException(409, str(exc)) from exc
     if isinstance(exc, ValueError):
         raise HTTPException(422, str(exc)) from exc
@@ -458,6 +475,14 @@ def _provider_dataset_action_error(exc: Exception) -> None:
             code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
         ) from exc
     _workspace_action_error(exc)
+
+
+def _exact_transform_descriptor(processor_id: str, version: str) -> dict:
+    try:
+        return get_deps().registry.get(processor_id, version).descriptor().model_dump(mode="python")
+    except KeyError as exc:
+        raise HTTPException(
+            409, f"Transform {processor_id}@{version} is unavailable") from exc
 
 
 @router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
@@ -548,11 +573,17 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
     """Create at one exact local destination; an optional dataset is resolved by stable identity."""
     try:
         provider_sources = _provider_dataset_sources(body.provider_dataset_refs, uid)
+        transform = (_exact_transform_descriptor(body.transform_id, body.transform_version)
+                     if body.transform_id is not None and body.transform_version is not None else None)
         return metadb.workspace_create_canvas_action(
             uid=uid, container_id=body.container_id,
             expected_container_version=body.expected_container_version,
             name=body.name, dataset_ids=body.dataset_ids,
-            provider_sources=provider_sources)
+            provider_sources=provider_sources, transform=transform)
+    except HTTPException:
+        raise
+    except metadb.WorkspaceTransformUnavailable as exc:
+        raise HTTPException(409, str(exc)) from exc
     except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError,
             workspace_providers.ProviderDatasetUnavailable) as exc:
         _provider_dataset_action_error(exc)
@@ -587,6 +618,62 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
     # the committed snapshot so a stale tab cannot later autosave over the appended source.
     await _broadcast_external_edit(canvas_id)
     return result
+
+
+@router.post("/workspace/canvases/{canvas_id}/transforms")
+async def add_workspace_transform_to_canvas(
+        canvas_id: str, body: WorkspaceAddTransformBody,
+        uid: str = Depends(current_user)) -> dict:
+    """Atomically add or explicitly upgrade one exact Transform in one selected editable Canvas."""
+    from hub.main import _broadcast_external_edit, _idle_collab_room_edit
+
+    transform = _exact_transform_descriptor(body.transform_id, body.transform_version)
+    async with _idle_collab_room_edit(canvas_id) as idle:
+        if not idle:
+            raise HTTPException(
+                409,
+                "target canvas is currently open; close active editors and retry so their unsaved work is not replaced",
+            )
+        try:
+            result = await run_in_threadpool(
+                metadb.workspace_add_transform_action,
+                uid=uid, canvas_id=canvas_id,
+                expected_canvas_version=body.expected_canvas_version,
+                transform=transform, replace_node_id=body.replace_node_id)
+        except metadb.WorkspaceTransformUnavailable as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except (KeyError, PermissionError, metadb.WorkspaceVersionConflict,
+                metadb.WorkspaceTransformCompatibilityConflict, ValueError) as exc:
+            _workspace_action_error(exc)
+    await _broadcast_external_edit(canvas_id)
+    return result
+
+
+@router.get(
+    "/canvas/{canvas_id}/transform-references",
+    response_model=list[CanvasTransformReference],
+)
+def list_canvas_transform_references(
+        canvas_id: str, uid: str = Depends(current_user)) -> list[dict]:
+    """Return safe exact metadata only for library refs already present in a readable Canvas."""
+    try:
+        items = metadb.canvas_transform_references(uid, canvas_id)
+    except (KeyError, PermissionError, ValueError) as exc:
+        _workspace_action_error(exc)
+    for item in items:
+        if item.get("descriptor") is not None:
+            descriptor = item["descriptor"]
+            descriptor["provenance"] = "promoted"
+            continue
+        if str(item["id"]).startswith("tr_"):
+            continue
+        try:
+            item["descriptor"] = get_deps().registry.get(
+                str(item["id"]), str(item["version"])).descriptor().model_dump(mode="python")
+            item["availability"] = "active"
+        except KeyError:
+            item["availability"] = "missing"
+    return items
 
 
 @router.put("/workspace/placements/{placement_id}/canvas")
