@@ -449,8 +449,12 @@ export const api = {
     req<{ ok: boolean; id: string; created: boolean }>('/canvas', {
       method: 'POST', body: JSON.stringify(doc),
     }),
-  saveCanvas: (doc: CanvasDoc, keepalive = false) =>  // keepalive: let the PUT survive a tab-close flush
-    req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
+  saveCanvas: (doc: CanvasDoc, keepalive = false, expectedVersion?: number) => {  // keepalive: let the PUT survive a tab-close flush
+    const query = expectedVersion == null ? '' : `?expectedVersion=${encodeURIComponent(expectedVersion)}`
+    return req<{ ok: boolean; id: string; version: number }>(`/canvas/${doc.id}${query}`, {
+      method: 'PUT', body: JSON.stringify(doc), keepalive,
+    })
+  },
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
   workspaceJobs: (params: WorkspaceJobsQuery = {}) => {

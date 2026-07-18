@@ -24,6 +24,7 @@ vi.mock('./nodes/capabilities', () => ({ syncPluginCapabilities: mocks.syncPlugi
 
 import App from './App'
 import { api, KernelError } from './api/client'
+import { LOCAL_MODE_CACHE_KEY } from './localIdentity'
 import { useStore } from './store/graph'
 
 describe('App auth bootstrap', () => {
@@ -110,5 +111,17 @@ describe('App auth bootstrap', () => {
     await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
     expect(screen.getByTestId('canvas')).toBeVisible()
     expect(status).toHaveBeenCalledTimes(4)
+  })
+
+  it('recovers confirmed local mode drafts while the hub is unavailable on reload', async () => {
+    localStorage.setItem(LOCAL_MODE_CACHE_KEY, '1')
+    const status = vi.spyOn(api, 'authStatus').mockRejectedValue(new TypeError('hub unavailable'))
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(status).toHaveBeenCalledTimes(3)
   })
 })
