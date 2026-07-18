@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0022_task_manifests", "0021_manifest_output_owners"),
         ("0021_manifest_output_owners", "0020_execution_manifests"),
         ("0020_execution_manifests", "0019_exact_local_inputs"),
         ("0019_exact_local_inputs", "0018_bounded_fanout_write"),
@@ -76,8 +77,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0021_manifest_output_owners"]
-    assert metadb.expected_schema_head() == "0021_manifest_output_owners"
+    assert scripts.get_heads() == ["0022_task_manifests"]
+    assert metadb.expected_schema_head() == "0022_task_manifests"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -153,6 +154,9 @@ def test_committed_migration_revisions_are_immutable():
         "0021_manifest_output_owners.py": (
             "07fbf7ebe8ff9434037a4450e563f97ce62f3efb9bb287787d6b927627deb887"
         ),
+        "0022_task_manifests.py": (
+            "105d5d314c0ab1a9faf250a6993a9608cf92d2c6a90ad495782f837425fe324f"
+        ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
 
@@ -163,6 +167,52 @@ def test_committed_migration_revisions_are_immutable():
         assert hashlib.sha256(revision_paths[name].read_bytes()).hexdigest() == expected_hash, (
             "committed migration revisions are immutable; add a forward migration instead"
         )
+
+
+def test_task_manifest_upgrade_preserves_legacy_frozen_admission(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'legacy-task-manifest.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0021_manifest_output_owners")
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO users (id, name, is_admin, created_at) "
+                "VALUES ('legacy-task-owner', 'Legacy owner', 0, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO canvases "
+                "(id, owner_id, name, version, doc, visibility, created_at, updated_at) VALUES "
+                "('legacy-task-canvas', 'legacy-task-owner', 'Legacy canvas', 1, '{}', "
+                "'private', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO durable_tasks "
+                "(id, owner_id, canvas_id, submission_id, intent_sha256, target_node_id, "
+                "task_kind, backend_kind, graph_doc, input_manifest, write_intent, status, "
+                "status_doc, created_at, updated_at) VALUES "
+                "('legacy-task', 'legacy-task-owner', 'legacy-task-canvas', 'submission', "
+                ":digest, 'write', 'managed_local_write', 'local', :graph, '[]', :intent, "
+                "'queued', :status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"), {
+                    "digest": "a" * 64,
+                    "graph": '{"id":"legacy-task-canvas","version":1,"nodes":[],"edges":[]}',
+                    "intent": '{"legacy":true}',
+                    "status": '{"run_id":"legacy-task","status":"queued"}',
+                })
+            connection.execute(sa.text(
+                "INSERT INTO durable_task_attempts "
+                "(id, task_id, attempt_number, status, created_at) VALUES "
+                "('legacy-attempt', 'legacy-task', 1, 'queued', CURRENT_TIMESTAMP)"))
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            task = connection.execute(sa.text(
+                "SELECT execution_manifest_sha256, graph_doc, input_manifest, write_intent "
+                "FROM durable_tasks WHERE id = 'legacy-task'")).mappings().one()
+            attempt_sha = connection.execute(sa.text(
+                "SELECT execution_manifest_sha256 FROM durable_task_attempts "
+                "WHERE id = 'legacy-attempt'")).scalar_one()
+
+        assert task["execution_manifest_sha256"] is None
+        assert task["graph_doc"] is not None
+        assert task["input_manifest"] == "[]"
+        assert task["write_intent"] == '{"legacy":true}'
+        assert attempt_sha is None
 
 
 def test_linear_checkpoint_downgrade_rejects_retained_hidden_rows(tmp_path):
@@ -187,8 +237,10 @@ def test_linear_checkpoint_downgrade_rejects_retained_hidden_rows(tmp_path):
                     metadb._alembic_cfg(connection), "0011_external_wait_publication")
         assert metadb._current_schema_heads() == ("0012_linear_checkpoint_admission",)
 
-        with metadb.session() as session:
-            session.delete(session.get(metadb.DurableTask, "checkpoint-task"))
+        # Runtime metadata has newer manifest columns that are intentionally absent at revision 0012.
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "DELETE FROM durable_tasks WHERE id = 'checkpoint-task'"))
         with metadb.engine().connect() as connection:
             command.downgrade(
                 metadb._alembic_cfg(connection), "0011_external_wait_publication")

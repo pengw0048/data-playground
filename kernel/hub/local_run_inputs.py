@@ -292,6 +292,14 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
                                  if isinstance(dataset_ref, dict) else None)
         except ValueError as exc:
             raise LocalRunInputError("local run input manifest does not match the graph") from exc
+        # Canonical ExecutionManifest graphs intentionally replace provider paths with one exact
+        # DatasetRef. Reopen its current registered URI only to reach the already-admitted revision;
+        # the dataset/revision/provider tuple below remains the authority and prevents rebinding.
+        if not source_uri and selected_identity == (item["dataset_id"], item["revision_id"]):
+            binding = metadb.catalog_revision_binding(item["dataset_id"])
+            if binding is not None:
+                source_uri = str(binding["uri"])
+                source_binding = metadb.catalog_revision_binding_for_uri(source_uri)
         if item["provider"] == LOCAL_FILE_INPUT_PROVIDER:
             if (source_binding is None
                     or str(source_binding["dataset_id"]) != item["dataset_id"]
@@ -330,8 +338,14 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         config = node.data.setdefault("config", {})
-        if item["provider"] != LOCAL_FILE_INPUT_PROVIDER:
-            config["uri"] = uri
+        # The exact DatasetRef is the canonical persisted identity. Once it has been checked against
+        # the manifest above, the private dispatch fields below are the execution binding; leaving
+        # the ref in place would make Source planning consult the mutable catalog again.
+        config.pop("datasetRef", None)
+        # Source planning still requires a logical URI even when execution will open the retained
+        # local snapshot below. This is a private dispatch copy, so restoring the catalog URI does
+        # not weaken or leak into the canonical manifest identity.
+        config["uri"] = source_uri if item["provider"] == LOCAL_FILE_INPUT_PROVIDER else uri
         # Keep the complete manifest identity on the private dispatch copy. Revision ids are only
         # provider-local and can restart after a dataset is unregistered/replaced at the same URI;
         # cache/profile keys must therefore include dataset and provider identity as well.

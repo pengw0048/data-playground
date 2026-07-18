@@ -179,7 +179,9 @@ def test_external_wait_fixture_wheel_passes_sanitized_conformance(tmp_path):
 import json, os, uuid
 from pathlib import Path
 from hub import metadb
-from hub.models import LineagePublication, WriteDestination, WriteIntent, WriteProvenance
+from hub.deps import Deps
+from hub.execution_manifest import build_execution_manifest
+from hub.models import Graph, LineagePublication, WriteDestination, WriteIntent, WriteProvenance
 
 metadb.init_db()
 canvas_id, submission = "external-restart", str(uuid.uuid4())
@@ -210,11 +212,17 @@ with metadb.session() as session:
     session.add(metadb.Canvas(
         id=canvas_id, owner_id=metadb.DEFAULT_USER_ID,
         name="External restart", doc=json.dumps(graph)))
+deps = Deps(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"], maintain_storage=False)
+manifest_sha256, manifest_doc = build_execution_manifest(
+    Graph.model_validate(graph), target_node_id="write", target_port_id=None,
+    input_manifest=[], write_intent=intent, deps=deps)
 task, _ = metadb.submit_durable_external_wait_task(
     uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, submission_id=submission,
-    target_node_id="write", intent_sha256="a" * 64, graph_doc=graph,
+    target_node_id="write", intent_sha256=manifest_sha256, graph_doc=graph,
     provider_kind="fixture-local", operation="conformance.response-loss", document_json="{}",
-    write_intent=intent.model_dump(by_alias=True, mode="json"))
+    write_intent=intent.model_dump(by_alias=True, mode="json"),
+    execution_manifest_sha256=manifest_sha256, execution_manifest_doc=manifest_doc)
+deps.storage.close()
 claim = metadb.claim_external_wait_transition(task["id"], "crashed-hub-owner")
 print(json.dumps({
     "task_id": task["id"], "attempt_id": claim["attempt_id"],

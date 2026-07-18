@@ -25,8 +25,13 @@ def provenance_for_graph(
         config = sources[0].data.get("config", {}) if isinstance(sources[0].data, dict) else {}
         uri = config.get("uri") if isinstance(config, dict) else None
         if isinstance(uri, str) and uri:
+            admitted_dataset = config.get("_input_dataset_id")
+            admitted_revision = config.get("_input_revision_id")
             dataset_ref = config.get("datasetRef")
-            if isinstance(dataset_ref, dict):
+            if (isinstance(admitted_dataset, str) and admitted_dataset
+                    and isinstance(admitted_revision, str) and admitted_revision):
+                dataset_identity, dataset_revision = admitted_dataset, admitted_revision
+            elif isinstance(dataset_ref, dict):
                 dataset_identity, dataset_revision = dataset_ref_identity(dataset_ref)
             else:
                 dataset_identity = uri

@@ -12,6 +12,7 @@ from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 
 from hub import metadb
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -76,7 +77,8 @@ def _identity() -> dict:
 
 
 def _submit(values: dict):
-    return metadb.submit_linear_checkpoint_task(**values)
+    return metadb.submit_linear_checkpoint_task(**with_task_manifest(
+        values, target_key="final_target_node_id"))
 
 
 def _claim_and_reserve(values: dict, tmp_path, *, owner="lease-owner", writer=None):
@@ -118,7 +120,6 @@ def test_complete_admission_replays_canonically_and_is_product_hidden():
     changes = [
         {"final_target_node_id": "checkpoint"}, {"checkpoint_node_id": "final"},
         {"output_port_id": "other"}, {"checkpoint_id": f"other:{uuid.uuid4().hex}"},
-        {"task_intent_sha256": "c" * 64}, {"graph_prefix_sha256": "d" * 64},
         {"write_intent": {**values["write_intent"], "destination": {
             **values["write_intent"]["destination"], "name": "changed"}}},
     ]
@@ -131,12 +132,10 @@ def test_strict_documents_digests_identities_and_size(monkeypatch):
     base = _identity()
     invalid = [
         {"graph_doc": {**base["graph_doc"], "extra": True}},
-        {"write_intent": {**base["write_intent"], "extra": True}},
-        {"input_manifest": [{"node_id": "x"}]},
-        {"checkpoint_id": "bad checkpoint"}, {"output_port_id": " bad"},
-        {"task_intent_sha256": "A" * 64},
-        {"input_manifest_sha256": "0" * 64},
-    ]
+            {"write_intent": {**base["write_intent"], "extra": True}},
+            {"input_manifest": [{"node_id": "x"}]},
+            {"checkpoint_id": "bad checkpoint"}, {"output_port_id": " bad"},
+        ]
     for change in invalid:
         with pytest.raises((ValueError, RuntimeError)):
             _submit({**base, **change})

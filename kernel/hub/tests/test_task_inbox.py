@@ -18,6 +18,7 @@ from hub.models import (
     WritePublicationIdentity,
     WriteReceipt,
 )
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -71,10 +72,10 @@ def _submit_local(uid: str, canvas_id: str):
             "fieldMappings": [],
         }, "parents": []},
     }
-    task, created = metadb.submit_durable_local_write_task(
+    task, created = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write", intent_sha256="a" * 64,
-        graph_doc=graph, input_manifest=[], write_intent=intent)
+        graph_doc=graph, input_manifest=[], write_intent=intent)))
     assert created is True
     return task
 
@@ -133,6 +134,13 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     done_items = _inbox_for(uid, done_task["id"])
     assert len(done_items) == 1
     assert done_items[0]["outcome"] == "completed"
+    assert done_items[0]["execution_manifest_sha256"] == done_task[
+        "execution_manifest_sha256"]
+    assert done_task["attempts"][0]["execution_manifest_sha256"] == done_task[
+        "execution_manifest_sha256"]
+    finished = metadb.durable_task(done_task["id"])
+    assert finished["output_receipt"]["executionManifestSha256"] == done_task[
+        "execution_manifest_sha256"]
     assert _inbox_attempt_id(uid, done_task["id"]) == attempt["id"]
     assert done_items[0]["diagnostic_code"] is None
 
@@ -145,6 +153,8 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
         failed_task["id"], attempt["id"], "owner-fail", failed.model_dump())
     failed_items = _inbox_for(uid, failed_task["id"])
     assert len(failed_items) == 1 and failed_items[0]["outcome"] == "failed"
+    assert failed_items[0]["execution_manifest_sha256"] == failed_task[
+        "execution_manifest_sha256"]
     # Raw exception text must not become a diagnostic code.
     assert failed_items[0]["diagnostic_code"] is None
 
@@ -153,6 +163,8 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     assert metadb.claim_durable_task(cancel_task["id"], "owner-cancel") is None
     cancel_items = _inbox_for(uid, cancel_task["id"])
     assert len(cancel_items) == 1 and cancel_items[0]["outcome"] == "cancelled"
+    assert cancel_items[0]["execution_manifest_sha256"] == cancel_task[
+        "execution_manifest_sha256"]
 
 
 def test_stale_owner_and_progress_emit_nothing():
@@ -182,6 +194,8 @@ def test_superseded_attempt_replay_does_not_duplicate_completed_inbox():
         row.lease_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
     second = metadb.claim_durable_task(task["id"], "owner-2")["attempts"][-1]
     assert first["id"] != second["id"]
+    assert first["execution_manifest_sha256"] == second[
+        "execution_manifest_sha256"] == task["execution_manifest_sha256"]
     key = task["write_intent"]["idempotencyKey"]
     done = _done_status(task["id"], key)
     assert metadb.finish_durable_task_attempt(task["id"], second["id"], "owner-2", done)
@@ -268,10 +282,10 @@ def test_external_wait_terminals_and_corrupt_recovery_emit():
     ], "edges": [{"id": "wait-write", "source": "wait", "target": "write",
                   "sourceHandle": "out", "targetHandle": "in"}]}
 
-    deadline_task, _ = metadb.submit_durable_external_wait_task(
+    deadline_task, _ = metadb.submit_durable_external_wait_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission, target_node_id="write",
         intent_sha256="a" * 64, graph_doc=graph, provider_kind="fixture-local",
-        operation="conformance.success", document_json="{}", write_intent=intent)
+        operation="conformance.success", document_json="{}", write_intent=intent)))
     with metadb.session() as session:
         wait = session.get(metadb.DurableExternalWait, deadline_task["id"], with_for_update=True)
         wait.deadline_at = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
@@ -280,16 +294,18 @@ def test_external_wait_terminals_and_corrupt_recovery_emit():
     assert len(items) == 1
     assert items[0]["outcome"] == "failed"
     assert items[0]["diagnostic_code"] == "external_wait_deadline"
+    assert items[0]["execution_manifest_sha256"] == deadline_task[
+        "execution_manifest_sha256"]
 
     cancel_submission = str(uuid.uuid4())
     cancel_intent = {**intent, "idempotencyKey": f"external-wait-test:{cancel_submission}"}
     cancel_intent["provenance"] = {"publication": {
         "idempotencyKey": cancel_intent["idempotencyKey"], "provenance": "manual",
     }, "parents": []}
-    cancel_task, _ = metadb.submit_durable_external_wait_task(
+    cancel_task, _ = metadb.submit_durable_external_wait_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=cancel_submission, target_node_id="write",
         intent_sha256="b" * 64, graph_doc=graph, provider_kind="fixture-local",
-        operation="conformance.success", document_json="{}", write_intent=cancel_intent)
+        operation="conformance.success", document_json="{}", write_intent=cancel_intent)))
     metadb.request_durable_task_cancel(cancel_task["id"])
     assert metadb.claim_external_wait_transition(cancel_task["id"], "cancel") is None
     items = _inbox_for(uid, cancel_task["id"])
@@ -300,10 +316,10 @@ def test_external_wait_terminals_and_corrupt_recovery_emit():
     missing_intent["provenance"] = {"publication": {
         "idempotencyKey": missing_intent["idempotencyKey"], "provenance": "manual",
     }, "parents": []}
-    missing_task, _ = metadb.submit_durable_external_wait_task(
+    missing_task, _ = metadb.submit_durable_external_wait_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=missing_submission, target_node_id="write",
         intent_sha256="c" * 64, graph_doc=graph, provider_kind="fixture-local",
-        operation="conformance.success", document_json="{}", write_intent=missing_intent)
+        operation="conformance.success", document_json="{}", write_intent=missing_intent)))
     with metadb.session() as session:
         attempt = session.scalar(metadb.select(metadb.DurableTaskAttempt).where(
             metadb.DurableTaskAttempt.task_id == missing_task["id"]))

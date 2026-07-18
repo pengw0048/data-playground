@@ -1330,6 +1330,8 @@ class RunHistoryRecord(Wire):
 class DurableTaskAttemptView(Wire):
     id: str
     attempt_number: int = Field(ge=1)
+    execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_reconstructable: bool = False
     status: Literal["queued", "running", "done", "failed", "cancelled", "fenced"]
     progress: float | None = Field(default=None, ge=0, le=1)
     error: str | None = None
@@ -1395,11 +1397,20 @@ class DurableTaskInboxItemView(Wire):
         "managed_local_write", "external_wait", "linear_checkpoint_write",
         "bounded_fanout_write",
     ]
+    execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_reconstructable: bool = False
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)
     terminal_at: datetime.datetime
     read_at: datetime.datetime | None = None
     job_available: bool
+
+    @model_validator(mode="after")
+    def _manifest_identity_matches_reconstructability(self) -> "DurableTaskInboxItemView":
+        if self.execution_manifest_reconstructable != (
+                self.execution_manifest_sha256 is not None):
+            raise ValueError("Inbox reconstructability must match its manifest identity")
+        return self
 
 
 class DurableTaskInboxPage(Wire):

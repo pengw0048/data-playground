@@ -308,11 +308,15 @@ class DurableTask(Base):
     target_node_id: Mapped[str] = mapped_column(String, nullable=False)
     task_kind: Mapped[str] = mapped_column(
         String, nullable=False, default="managed_local_write", server_default="managed_local_write")
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     backend_kind: Mapped[str] = mapped_column(
         String, nullable=False, default="local", server_default="local")
-    graph_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    input_manifest: Mapped[str] = mapped_column(Text, nullable=False)
-    write_intent: Mapped[str] = mapped_column(Text, nullable=False)
+    # Pre-0022 rows recover from this frozen triple. New rows leave it null and reopen the one
+    # canonical ExecutionManifest instead; the forward migration never rewrites historical meaning.
+    graph_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_manifest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    write_intent: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String, nullable=False, default="queued", server_default="queued", index=True)
     status_doc: Mapped[str] = mapped_column(Text, nullable=False)
@@ -344,6 +348,8 @@ class DurableTaskAttempt(Base):
     task_id: Mapped[str] = mapped_column(String, ForeignKey("durable_tasks.id"), nullable=False, index=True)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     retry_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(
         String, nullable=False, default="queued", server_default="queued")
     owner_token: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -408,6 +414,8 @@ class DurableTaskInboxItem(Base):
         String, ForeignKey("durable_task_attempts.id"), nullable=False)
     canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False)
     task_kind: Mapped[str] = mapped_column(String, nullable=False)
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     outcome: Mapped[str] = mapped_column(String, nullable=False)
     diagnostic_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     terminal_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -3611,6 +3619,8 @@ def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
         "task_attempt_id": item.task_attempt_id,
         "canvas_id": item.canvas_id,
         "task_kind": item.task_kind,
+        "execution_manifest_sha256": item.execution_manifest_sha256,
+        "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
         "outcome": item.outcome,
         "diagnostic_code": item.diagnostic_code,
         "terminal_at": _inbox_stamp(item.terminal_at),
@@ -3680,6 +3690,8 @@ def _inbox_public_doc(
         "canvas_id": item.canvas_id,
         "canvas_name": canvas_name,
         "task_kind": item.task_kind,
+        "execution_manifest_sha256": item.execution_manifest_sha256,
+        "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
         "outcome": item.outcome,
         "diagnostic_code": item.diagnostic_code,
         "terminal_at": _inbox_stamp(item.terminal_at),
@@ -3711,7 +3723,8 @@ def _emit_durable_task_inbox_item(
     ).limit(1))
     if existing is not None:
         if (existing.owner_id != task.owner_id or existing.task_kind != task.task_kind
-                or existing.outcome != outcome or existing.canvas_id != task.canvas_id):
+                or existing.outcome != outcome or existing.canvas_id != task.canvas_id
+                or existing.execution_manifest_sha256 != task.execution_manifest_sha256):
             raise ValueError("later inbox outcome for the same attempt is rejected")
         return _durable_task_inbox_doc(existing)
     stamp = now or _durable_task_db_now(s)
@@ -3720,7 +3733,9 @@ def _emit_durable_task_inbox_item(
     values = {
         "id": item_id, "owner_id": task.owner_id, "task_id": task.id,
         "task_attempt_id": attempt.id, "canvas_id": task.canvas_id,
-        "task_kind": task.task_kind, "outcome": outcome, "diagnostic_code": code,
+        "task_kind": task.task_kind,
+        "execution_manifest_sha256": task.execution_manifest_sha256,
+        "outcome": outcome, "diagnostic_code": code,
         "terminal_at": stamp, "created_at": stamp, "read_at": None,
     }
     if s.get_bind().dialect.name == "postgresql":
@@ -3736,7 +3751,8 @@ def _emit_durable_task_inbox_item(
     if row is None:
         raise RuntimeError("durable task inbox emission failed to persist")
     if (row.owner_id != task.owner_id or row.task_kind != task.task_kind
-            or row.outcome != outcome or row.canvas_id != task.canvas_id):
+            or row.outcome != outcome or row.canvas_id != task.canvas_id
+            or row.execution_manifest_sha256 != task.execution_manifest_sha256):
         raise ValueError("later inbox outcome for the same attempt is rejected")
     return _durable_task_inbox_doc(row)
 
@@ -3824,10 +3840,82 @@ def _durable_task_db_now(s) -> datetime.datetime:
             if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
 
 
+def _durable_task_admission(s, task: DurableTask) -> dict:
+    """Load one Task's immutable definition from its canonical manifest or legacy frozen columns."""
+    if task.execution_manifest_sha256 is not None:
+        from hub.execution_manifest import execution_manifest_admission
+
+        manifest = s.get(ExecutionManifest, task.execution_manifest_sha256)
+        if manifest is None:
+            raise RuntimeError("durable task execution manifest is unavailable")
+        try:
+            admission = execution_manifest_admission(manifest.sha256, manifest.semantic_doc)
+        except ValueError as exc:
+            raise RuntimeError("durable task execution manifest is invalid") from exc
+        if (admission["target_node_id"] != task.target_node_id
+                or admission["target_port_id"] is not None
+                or admission["write_intent"] is None):
+            raise RuntimeError("durable task execution manifest changed its admission")
+        return admission
+    if task.graph_doc is None or task.input_manifest is None or task.write_intent is None:
+        raise RuntimeError("legacy durable task frozen admission is incomplete")
+    try:
+        return {
+            "graph_doc": json.loads(task.graph_doc),
+            "input_manifest": json.loads(task.input_manifest),
+            "write_intent": json.loads(task.write_intent),
+            "target_node_id": task.target_node_id,
+            "target_port_id": None,
+        }
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("legacy durable task frozen admission is invalid") from exc
+
+
+def _persist_durable_task_manifest(
+        s, sha256: str, semantic_doc: str, *, target_node_id: str,
+        graph_doc: dict, input_manifest: list[dict[str, str]], write_intent: dict) -> dict:
+    """Persist and reopen the one canonical definition before creating Task ownership rows."""
+    from hub.execution_manifest import (
+        execution_manifest_accepts_graph_replay,
+        execution_manifest_admission,
+    )
+    from hub.local_run_inputs import validate_manifest
+    from hub.models import Graph, WriteIntent
+
+    supplied_graph = Graph.model_validate(graph_doc)
+    supplied_inputs = validate_manifest(input_manifest)
+    supplied_write = WriteIntent.model_validate(write_intent)
+    if not execution_manifest_accepts_graph_replay(
+            str(sha256), str(semantic_doc), supplied_graph,
+            target_node_id=str(target_node_id), target_port_id=None):
+        raise ValueError("durable task execution manifest does not match its graph")
+    _persist_execution_manifest(s, str(sha256), str(semantic_doc))
+    manifest = s.get(ExecutionManifest, str(sha256))
+    if manifest is None:  # pragma: no cover - persistence helper guarantees the row
+        raise RuntimeError("durable task execution manifest was not persisted")
+    admission = execution_manifest_admission(manifest.sha256, manifest.semantic_doc)
+    if (admission["target_node_id"] != str(target_node_id)
+            or admission["target_port_id"] is not None
+            or admission["write_intent"] is None):
+        raise ValueError("durable task execution manifest does not match its target")
+    retained_inputs = [{key: item[key] for key in (
+        "node_id", "dataset_id", "revision_id", "provider")}
+        for item in admission["input_manifest"]]
+    requested_inputs = [{key: item[key] for key in (
+        "node_id", "dataset_id", "revision_id", "provider")}
+        for item in supplied_inputs]
+    if retained_inputs != requested_inputs:
+        raise ValueError("durable task execution manifest does not match its inputs")
+    if WriteIntent.model_validate(admission["write_intent"]) != supplied_write:
+        raise ValueError("durable task execution manifest does not match its write intent")
+    return admission
+
+
 def submit_durable_local_write_task(
         *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
         intent_sha256: str, graph_doc: dict, input_manifest: list[dict[str, str]],
-        write_intent: dict,
+        write_intent: dict, execution_manifest_sha256: str,
+        execution_manifest_doc: str,
         local_file_candidates: list[dict[str, str]] | None = None,
         ) -> tuple[dict, bool]:
     """Persist a task and its first attempt atomically, adopting an identical replay."""
@@ -3838,6 +3926,9 @@ def submit_durable_local_write_task(
     intent_sha256 = str(intent_sha256).lower()
     if not re.fullmatch(r"[0-9a-f]{64}", intent_sha256):
         raise ValueError("durable task requires a SHA-256 semantic admission identity")
+    execution_manifest_sha256 = str(execution_manifest_sha256).lower()
+    if intent_sha256 != execution_manifest_sha256:
+        raise ValueError("durable task semantic identity must be its execution manifest")
     graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
     intent = WriteIntent.model_validate(write_intent)
     if intent.mode not in ("create", "replace"):
@@ -3865,22 +3956,36 @@ def submit_durable_local_write_task(
             if (existing.owner_id != uid or existing.canvas_id != canvas_id
                     or existing.submission_id != str(submission_id).lower()
                     or existing.target_node_id != target_node_id
-                    or existing.intent_sha256 != intent_sha256):
+                    or (existing.execution_manifest_sha256 is not None
+                        and (existing.execution_manifest_sha256 != execution_manifest_sha256
+                             or existing.intent_sha256 != execution_manifest_sha256))
+                    or (existing.execution_manifest_sha256 is None
+                        and existing.intent_sha256 != intent_sha256)):
                 raise DurableTaskSubmissionConflict(
                     "durable task submission does not match its frozen admission")
+            if existing.execution_manifest_sha256 is not None:
+                _persist_execution_manifest(
+                    s, execution_manifest_sha256, str(execution_manifest_doc))
             return _durable_task_doc(s, existing), False
+        admission = _persist_durable_task_manifest(
+            s, execution_manifest_sha256, execution_manifest_doc,
+            target_node_id=target_node_id, graph_doc=graph_doc,
+            input_manifest=input_manifest, write_intent=write_intent)
+        input_manifest = admission["input_manifest"]
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
-            submission_id=str(submission_id).lower(), intent_sha256=intent_sha256,
+            submission_id=str(submission_id).lower(), intent_sha256=execution_manifest_sha256,
             target_node_id=target_node_id,
             task_kind="managed_local_write",
-            backend_kind="local", graph_doc=graph_payload,
-            input_manifest=manifest_payload, write_intent=intent_payload,
+            execution_manifest_sha256=execution_manifest_sha256,
+            backend_kind="local", graph_doc=None,
+            input_manifest=None, write_intent=None,
             status="queued", status_doc=status_doc, created_at=now, updated_at=now,
         )
         s.add(task)
         s.add(DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            execution_manifest_sha256=execution_manifest_sha256,
             status="queued", created_at=now,
         ))
         s.flush()
@@ -3932,18 +4037,21 @@ def _linear_checkpoint_admission_doc(
         DurableTaskAttempt.task_id == task.id,
         DurableTaskAttempt.attempt_number == 1))
     try:
-        graph_doc = json.loads(task.graph_doc)
-        input_manifest = json.loads(task.input_manifest)
-        write_intent = json.loads(task.write_intent)
+        admission = _durable_task_admission(s, task)
+        graph_doc = admission["graph_doc"]
+        input_manifest = admission["input_manifest"]
+        write_intent = admission["write_intent"]
         canonical = _linear_checkpoint_payloads(
             graph_doc, input_manifest, write_intent, task.target_node_id,
             checkpoint.checkpoint_node_id, checkpoint.output_port_id)
     except Exception as exc:
         raise DurableTaskSubmissionConflict("checkpoint admission is invalid") from exc
+    legacy_payloads = (task.graph_doc, task.input_manifest, task.write_intent)
     if (first is None or checkpoint.task_id != task.id
-            or canonical[:3] != (task.graph_doc, task.input_manifest, task.write_intent)
+            or first.execution_manifest_sha256 != task.execution_manifest_sha256
+            or (task.execution_manifest_sha256 is None and canonical[:3] != legacy_payloads)
             or checkpoint.task_intent_sha256 != task.intent_sha256
-            or hashlib.sha256(task.input_manifest.encode()).hexdigest()
+            or hashlib.sha256(canonical[1].encode()).hexdigest()
             != checkpoint.input_manifest_sha256):
         raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
     return {
@@ -3969,8 +4077,11 @@ def submit_linear_checkpoint_task(
         output_port_id: str, task_intent_sha256: str, graph_prefix_sha256: str,
         input_manifest_sha256: str, graph_doc: dict,
         input_manifest: list[dict[str, str]], write_intent: dict,
+        execution_manifest_sha256: str, execution_manifest_doc: str,
         task_kind: str = "linear_checkpoint_write") -> tuple[dict, bool]:
     """Atomically persist one complete hidden Task, first Attempt, and checkpoint."""
+    from hub.models import Graph
+
     if task_kind not in _CHECKPOINT_PARENT_KINDS:
         raise ValueError("checkpoint parent task_kind is not supported")
     graph, manifest, intent, final_id, node_id, port_id = _linear_checkpoint_payloads(
@@ -3981,14 +4092,15 @@ def submit_linear_checkpoint_task(
         task_intent_sha256, graph_prefix_sha256, input_manifest_sha256)))
     if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests):
         raise ValueError("checkpoint admission requires canonical SHA-256 digests")
+    execution_manifest_sha256 = str(execution_manifest_sha256).lower()
+    if digests[0] != execution_manifest_sha256:
+        raise ValueError("checkpoint semantic identity must be its execution manifest")
     if hashlib.sha256(manifest.encode()).hexdigest() != digests[2]:
         raise ValueError("checkpoint input-manifest digest does not match its document")
     uid, canvas_id = str(uid), str(canvas_id)
     normalized_submission = str(submission_id).lower()
     _linear_checkpoint_identity(normalized_submission, "submission", 256)
     task_id = durable_task_submission_id(uid, canvas_id, normalized_submission)
-    frozen = (uid, canvas_id, normalized_submission, final_id, digests[0],
-              graph, manifest, intent, checkpoint_id, node_id, port_id, *digests)
     with session() as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
@@ -4001,15 +4113,28 @@ def submit_linear_checkpoint_task(
         if task is not None or checkpoint is not None:
             if task is None or checkpoint is None:
                 raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
-            actual = (
+            common = (
                 task.owner_id, task.canvas_id, task.submission_id, task.target_node_id,
-                task.intent_sha256, task.graph_doc, task.input_manifest, task.write_intent,
                 checkpoint.checkpoint_id, checkpoint.checkpoint_node_id,
                 checkpoint.output_port_id, checkpoint.task_intent_sha256,
                 checkpoint.graph_prefix_sha256, checkpoint.input_manifest_sha256)
-            if task.task_kind != task_kind or actual != frozen:
+            expected_common = (
+                uid, canvas_id, normalized_submission, final_id,
+                checkpoint_id, node_id, port_id, *digests)
+            legacy_matches = (
+                task.intent_sha256, task.graph_doc, task.input_manifest, task.write_intent,
+            ) == (digests[0], graph, manifest, intent)
+            manifest_matches = (
+                task.execution_manifest_sha256 == execution_manifest_sha256
+                and task.intent_sha256 == execution_manifest_sha256)
+            if (task.task_kind != task_kind or common != expected_common
+                    or not (manifest_matches if task.execution_manifest_sha256 is not None
+                            else legacy_matches)):
                 raise DurableTaskSubmissionConflict(
                     "checkpoint submission does not match its frozen admission")
+            if task.execution_manifest_sha256 is not None:
+                _persist_execution_manifest(
+                    s, execution_manifest_sha256, str(execution_manifest_doc))
             _lock_local_result_registry(s)
             _linear_checkpoint_candidate_doc(s, task, checkpoint)
             return _linear_checkpoint_admission_doc(s, task, checkpoint), False
@@ -4019,16 +4144,32 @@ def submit_linear_checkpoint_task(
                     LocalResultArtifact.writer_run_id == task_id).limit(1)) is not None):
             raise DurableTaskSubmissionConflict("checkpoint identity has conflicting state")
         now = _durable_task_db_now(s)
+        admission = _persist_durable_task_manifest(
+            s, execution_manifest_sha256, execution_manifest_doc,
+            target_node_id=final_id, graph_doc=graph_doc,
+            input_manifest=input_manifest, write_intent=write_intent)
+        graph, manifest, intent, final_id, node_id, port_id = _linear_checkpoint_payloads(
+            admission["graph_doc"], admission["input_manifest"], admission["write_intent"],
+            final_id, node_id, port_id)
+        from hub.linear_checkpoint_tasks import graph_prefix_sha256 as canonical_prefix_sha256
+        canonical_prefix = canonical_prefix_sha256(
+            Graph.model_validate(admission["graph_doc"]), node_id)
+        if canonical_prefix != digests[1]:
+            raise ValueError("checkpoint graph-prefix digest does not match its manifest")
+        if hashlib.sha256(manifest.encode()).hexdigest() != digests[2]:
+            raise ValueError("checkpoint input-manifest digest does not match its manifest")
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
-            submission_id=normalized_submission, intent_sha256=digests[0],
+            submission_id=normalized_submission, intent_sha256=execution_manifest_sha256,
             target_node_id=final_id, task_kind=task_kind,
-            backend_kind="local", graph_doc=graph, input_manifest=manifest,
-            write_intent=intent, status="queued",
+            execution_manifest_sha256=execution_manifest_sha256,
+            backend_kind="local", graph_doc=None, input_manifest=None,
+            write_intent=None, status="queued",
             status_doc=json.dumps(_task_status_doc(task_id, final_id), default=str),
             created_at=now, updated_at=now)
         attempt = DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            execution_manifest_sha256=execution_manifest_sha256,
             status="queued", created_at=now)
         checkpoint = DurableCheckpoint(
             task_id=task_id, checkpoint_id=checkpoint_id,
@@ -4067,7 +4208,9 @@ def _external_wait_key(task_id: str, attempt_number: int) -> str:
 def submit_durable_external_wait_task(
         *, uid: str, canvas_id: str, submission_id: str, target_node_id: str,
         intent_sha256: str, graph_doc: dict, provider_kind: str,
-        operation: str, document_json: str, write_intent: dict) -> tuple[dict, bool]:
+        operation: str, document_json: str, write_intent: dict,
+        execution_manifest_sha256: str,
+        execution_manifest_doc: str) -> tuple[dict, bool]:
     from hub.external_wait import ExternalWaitSubmitRequest
     from hub.models import Graph
 
@@ -4079,11 +4222,12 @@ def submit_durable_external_wait_task(
     graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
     request_payload = request.model_dump_json(by_alias=False)
     from hub.models import WriteIntent
-    intent_payload = json.dumps(
-        WriteIntent.model_validate(write_intent).model_dump(by_alias=True, mode="json"),
-        sort_keys=True, separators=(",", ":"))
+    WriteIntent.model_validate(write_intent)
     if not re.fullmatch(r"[0-9a-f]{64}", str(intent_sha256)):
         raise ValueError("durable task requires a SHA-256 semantic admission identity")
+    execution_manifest_sha256 = str(execution_manifest_sha256).lower()
+    if str(intent_sha256).lower() != execution_manifest_sha256:
+        raise ValueError("durable task semantic identity must be its execution manifest")
     if len(graph_payload.encode()) > _DURABLE_TASK_DOC_MAX_BYTES:
         raise ValueError("durable task immutable admission exceeds the bounded limit")
     status_doc = json.dumps(_task_status_doc(task_id, target_node_id), default=str)
@@ -4101,18 +4245,31 @@ def submit_durable_external_wait_task(
                     or existing.canvas_id != canvas_id
                     or existing.submission_id != str(submission_id).lower()
                     or existing.target_node_id != target_node_id
-                    or existing.intent_sha256 != intent_sha256):
+                    or (existing.execution_manifest_sha256 is not None
+                        and (existing.execution_manifest_sha256 != execution_manifest_sha256
+                             or existing.intent_sha256 != execution_manifest_sha256))
+                    or (existing.execution_manifest_sha256 is None
+                        and existing.intent_sha256 != intent_sha256)):
                 raise DurableTaskSubmissionConflict(
                     "durable task submission does not match its frozen admission")
+            if existing.execution_manifest_sha256 is not None:
+                _persist_execution_manifest(
+                    s, execution_manifest_sha256, str(execution_manifest_doc))
             return _durable_task_doc(s, existing), False
+        _persist_durable_task_manifest(
+            s, execution_manifest_sha256, execution_manifest_doc,
+            target_node_id=target_node_id, graph_doc=graph_doc,
+            input_manifest=[], write_intent=write_intent)
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
-            submission_id=str(submission_id).lower(), intent_sha256=intent_sha256,
+            submission_id=str(submission_id).lower(), intent_sha256=execution_manifest_sha256,
             target_node_id=target_node_id, task_kind="external_wait", backend_kind="local",
-            graph_doc=graph_payload, input_manifest="[]", write_intent=intent_payload,
+            execution_manifest_sha256=execution_manifest_sha256,
+            graph_doc=None, input_manifest=None, write_intent=None,
             status="queued", status_doc=status_doc, created_at=now, updated_at=now)
         attempt = DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            execution_manifest_sha256=execution_manifest_sha256,
             status="queued", created_at=now)
         s.add(task)
         s.flush()
@@ -4131,6 +4288,8 @@ def _durable_task_doc(
     attempts = list(s.scalars(select(DurableTaskAttempt).where(
         DurableTaskAttempt.task_id == task.id,
     ).order_by(DurableTaskAttempt.attempt_number)))
+    if any(item.execution_manifest_sha256 != task.execution_manifest_sha256 for item in attempts):
+        raise RuntimeError("durable Task and Attempt manifest owners disagree")
 
     def attempt_updated_at(attempt: DurableTaskAttempt) -> datetime.datetime:
         timestamps = [item for item in (
@@ -4144,7 +4303,9 @@ def _durable_task_doc(
     doc = {
         "id": task.id, "owner_id": task.owner_id, "canvas_id": task.canvas_id,
         "submission_id": task.submission_id, "target_node_id": task.target_node_id,
-        "task_kind": task.task_kind,
+        "task_kind": task.task_kind, "intent_sha256": task.intent_sha256,
+        "execution_manifest_sha256": task.execution_manifest_sha256,
+        "execution_manifest_reconstructable": task.execution_manifest_sha256 is not None,
         "backend_kind": task.backend_kind, "status": task.status,
         "status_doc": json.loads(task.status_doc), "progress": task.progress,
         "cancel_requested": task.cancel_requested, "retry_count": task.retry_count,
@@ -4155,6 +4316,8 @@ def _durable_task_doc(
         "completed_at": task.completed_at,
         "attempts": [{
             "id": item.id, "attempt_number": item.attempt_number,
+            "execution_manifest_sha256": item.execution_manifest_sha256,
+            "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
             "status": item.status, "owner_token": item.owner_token,
             "lease_until": item.lease_until, "heartbeat_at": item.heartbeat_at,
             "progress": item.progress, "error": item.error,
@@ -4164,11 +4327,7 @@ def _durable_task_doc(
         } for item in attempts],
     }
     if include_admission:
-        doc.update({
-            "graph_doc": json.loads(task.graph_doc),
-            "input_manifest": json.loads(task.input_manifest),
-            "write_intent": json.loads(task.write_intent),
-        })
+        doc.update(_durable_task_admission(s, task))
     wait = s.get(DurableExternalWait, task.id)
     if wait is not None:
         doc["external_wait"] = {
@@ -4210,15 +4369,25 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
 
 
+def _durable_task_write_receipt(task: DurableTask, receipt):
+    """Bind receipt evidence to the Task's canonical definition without upgrading legacy rows."""
+    retained = receipt.execution_manifest_sha256
+    if retained is not None and retained != task.execution_manifest_sha256:
+        raise ValueError("durable task WriteReceipt changed its execution manifest")
+    if task.execution_manifest_sha256 is not None and retained is None:
+        receipt = receipt.model_copy(update={
+            "execution_manifest_sha256": task.execution_manifest_sha256})
+    return receipt
+
+
 def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     """Reconcile a write-bearing task to done when its receipt already landed, so dead-owner
     recovery, cancel, or attempt exhaustion never misreports a committed write as failed/cancelled."""
-    if not task.write_intent:
-        return False
     from hub.models import RunOutput, RunStatus, WriteReceipt
     try:
+        admission = _durable_task_admission(s, task)
         intent, _payload, canonical = _canonical_managed_local_write_intent(
-            json.loads(task.write_intent))
+            admission["write_intent"])
         prior = _managed_local_write_receipt_in_session(s, intent.idempotency_key, canonical)
         if prior is None:
             prior = _managed_local_lance_write_receipt_in_session(
@@ -4227,7 +4396,7 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
         return False
     if prior is None:
         return False
-    receipt = WriteReceipt.model_validate(prior)
+    receipt = _durable_task_write_receipt(task, WriteReceipt.model_validate(prior))
     output = RunOutput(
         node_id=task.target_node_id, port_id="out", wire="dataset",
         publication_kind="catalog", outcome="committed", uri=receipt.publication.artifact_uri,
@@ -4285,7 +4454,9 @@ def _claim_durable_task_kind(
             task.retry_count = attempt.attempt_number
             attempt = DurableTaskAttempt(
                 id=uuid.uuid4().hex, task_id=task.id,
-                attempt_number=attempt.attempt_number + 1, status="queued", created_at=now)
+                attempt_number=attempt.attempt_number + 1,
+                execution_manifest_sha256=task.execution_manifest_sha256,
+                status="queued", created_at=now)
             s.add(attempt)
             s.flush()
         if task.cancel_requested:
@@ -4390,24 +4561,29 @@ def update_durable_task_status(
 
 def finish_durable_task_attempt(
         task_id: str, attempt_id: str, owner_token: str, status_doc: dict) -> bool:
-    from hub.models import RunStatus
+    from hub.models import RunStatus, WriteReceipt
     status = RunStatus.model_validate(status_doc)
     if status.status not in _TERMINAL_RUN or status.run_id != str(task_id):
         raise ValueError("durable task completion requires its terminal task status")
-    receipt = None
+    receipt: WriteReceipt | None = None
     if status.status == "done":
         receipts = [output.write_receipt for output in status.outputs
                     if output.outcome == "committed" and output.write_receipt is not None]
         if len(status.outputs) != 1 or len(receipts) != 1:
             raise ValueError("successful durable write task requires one exact WriteReceipt")
-        receipt = receipts[0].model_dump(by_alias=True, mode="json")
-    payload = json.dumps(status.model_dump(), default=str)
-    receipt_payload = json.dumps(receipt, sort_keys=True) if receipt is not None else None
+        receipt = receipts[0]
     with session() as s:
         task = s.get(DurableTask, str(task_id), with_for_update=True)
         attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
         if task is None or attempt is None:
             return False
+        if receipt is not None:
+            receipt = _durable_task_write_receipt(task, receipt)
+            status.outputs[0].write_receipt = receipt
+        payload = json.dumps(status.model_dump(), default=str)
+        receipt_payload = (
+            json.dumps(receipt.model_dump(by_alias=True, mode="json"), sort_keys=True)
+            if receipt is not None else None)
         if task.status in _TERMINAL_RUN:
             ok = task.status == status.status and task.status_doc == payload
             # Same-attempt response-loss replay reconciles the existing item. A superseded /
@@ -4526,6 +4702,7 @@ def fail_corrupt_external_wait_tasks(limit: int = 100) -> None:
             if attempt is None:
                 attempt = DurableTaskAttempt(
                     id=uuid.uuid4().hex, task_id=task.id, attempt_number=1,
+                    execution_manifest_sha256=task.execution_manifest_sha256,
                     status="failed", error="external wait evidence invalid",
                     completed_at=now, created_at=now)
                 s.add(attempt)
@@ -4647,7 +4824,7 @@ def claim_external_wait_transition(task_id: str, owner_token: str) -> dict | Non
                 "stage_dev": wait.stage_dev, "stage_ino": wait.stage_ino,
                 "download_evidence": (json.loads(wait.download_evidence)
                                       if wait.download_evidence else None),
-                "write_intent": json.loads(task.write_intent),
+                "write_intent": _durable_task_admission(s, task)["write_intent"],
                 "cancel_requested": task.cancel_requested,
             }
         except (TypeError, ValueError):
@@ -4846,7 +5023,8 @@ def finish_external_wait_publication(
                 or wait.owner_token != str(owner_token) or lease is None
                 or lease.replace(tzinfo=lease.tzinfo or datetime.timezone.utc) <= now):
             return False
-        intent = WriteIntent.model_validate_json(task.write_intent)
+        intent = WriteIntent.model_validate(_durable_task_admission(s, task)["write_intent"])
+        receipt = _durable_task_write_receipt(task, receipt)
         if (receipt.publication.idempotency_key != intent.idempotency_key
                 or receipt.publication.logical_uri != intent.destination.logical_uri):
             raise RuntimeError("external-wait publication receipt changed its frozen intent")
@@ -4921,6 +5099,7 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
         number = last.attempt_number + 1
         s.add(DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task.id, attempt_number=number,
+            execution_manifest_sha256=task.execution_manifest_sha256,
             retry_request_id=retry_request_id, status="queued", created_at=now))
         task.status = "queued"
         task.cancel_requested = False
@@ -5166,6 +5345,12 @@ def _execution_manifest_sha256_for_run_in_session(
             ManagedLocalFileRevision.run_id == str(run_id)),
         select(ManagedLocalLanceWriteReceipt.execution_manifest_sha256).where(
             ManagedLocalLanceWriteReceipt.run_id == str(run_id)),
+        select(DurableTask.execution_manifest_sha256).where(
+            DurableTask.id == str(run_id)),
+        select(DurableTaskAttempt.execution_manifest_sha256).where(
+            DurableTaskAttempt.task_id == str(run_id)),
+        select(DurableTaskInboxItem.execution_manifest_sha256).where(
+            DurableTaskInboxItem.task_id == str(run_id)),
     ]
     if lock:
         queries = [query.with_for_update() for query in queries]
@@ -5211,6 +5396,9 @@ def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> 
             CatalogLineageFact.execution_manifest_sha256,
             ManagedLocalFileRevision.execution_manifest_sha256,
             ManagedLocalLanceWriteReceipt.execution_manifest_sha256,
+            DurableTask.execution_manifest_sha256,
+            DurableTaskAttempt.execution_manifest_sha256,
+            DurableTaskInboxItem.execution_manifest_sha256,
         ))
         if not referenced:
             s.delete(row)
@@ -5657,7 +5845,10 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         ).order_by(RunTerminalFence.run_id).with_for_update()))
         execution_manifest_identities = {
             row.execution_manifest_sha256
-            for row in [*runs, *admissions, *run_states]
+            for row in [
+                *runs, *admissions, *run_states,
+                *durable_tasks, *durable_attempts, *durable_inbox,
+            ]
         }
         profile_retention = s.get(ProfileJobRetention, canvas_id, with_for_update=True)
         profile_latest = list(s.scalars(select(ProfileJobLatest).where(
@@ -6283,6 +6474,8 @@ def list_workspace_runs(
                 "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
                 "progress": _workspace_progress(task.progress),
                 "error": task.error, "inputManifest": task_doc["input_manifest"],
+                "executionManifestSha256": task.execution_manifest_sha256,
+                "executionManifestReconstructable": task.execution_manifest_sha256 is not None,
                 "outputs": outputs, "profile": None,
                 "perNode": per_node or None, "createdAt": created_at.isoformat(),
                 "updatedAt": _workspace_utc_iso(task.updated_at),
@@ -6291,6 +6484,9 @@ def list_workspace_runs(
                 "taskId": task.id,
                 "taskAttempts": [{
                     "id": item["id"], "attemptNumber": item["attempt_number"],
+                    "executionManifestSha256": item["execution_manifest_sha256"],
+                    "executionManifestReconstructable": (
+                        item["execution_manifest_sha256"] is not None),
                     "status": item["status"], "progress": _workspace_progress(item["progress"]),
                     "error": item["error"],
                     "startedAt": item["started_at"].isoformat() if item["started_at"] else None,

@@ -24,6 +24,7 @@ from hub.models import LineagePublication
 from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
+from hub.tests.task_manifest_helpers import task_manifest_deps, with_task_manifest
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,7 +71,7 @@ def _write_intent(identity) -> WriteIntent:
     )
 
 
-def _submit(identity, *, operation="conformance.success", digest="a" * 64):
+def _submit(identity, *, operation="conformance.success"):
     uid, canvas, submission = identity
     intent = _write_intent(identity)
     graph = {"id": canvas, "version": 1, "nodes": [
@@ -87,11 +88,11 @@ def _submit(identity, *, operation="conformance.success", digest="a" * 64):
         "id": "wait-write", "source": "wait", "target": "write",
         "sourceHandle": "out", "targetHandle": "in",
     }]}
-    return metadb.submit_durable_external_wait_task(
+    return metadb.submit_durable_external_wait_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas, submission_id=submission, target_node_id="write",
-        intent_sha256=digest, graph_doc=graph, provider_kind="fixture-local",
+        intent_sha256="a" * 64, graph_doc=graph, provider_kind="fixture-local",
         operation=operation, document_json="{}",
-        write_intent=intent.model_dump(by_alias=True, mode="json"))
+        write_intent=intent.model_dump(by_alias=True, mode="json"))))
 
 
 def _make_due(task_id: str) -> None:
@@ -535,7 +536,7 @@ def test_replay_conflict_cancel_retry_and_cleanup(identity):
     replay, created = _submit(identity)
     assert created is False and replay["id"] == task["id"]
     with pytest.raises(metadb.DurableTaskSubmissionConflict):
-        _submit(identity, digest="b" * 64)
+        _submit(identity, operation="conformance.changed")
 
     claim = metadb.claim_external_wait_transition(task["id"], "submit")
     assert metadb.commit_external_wait_transition(
@@ -928,6 +929,9 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(
     deps = SimpleNamespace(
         external_wait_nodes={"external_wait_fixture": "fixture-local"},
         _external_wait_adapter=lambda kind: adapter if kind == "fixture-local" else None)
+    manifest_deps = task_manifest_deps(graph)
+    deps.node_specs = manifest_deps.node_specs
+    deps.plugins = manifest_deps.plugins
     admission = SimpleNamespace(
         managed=True, intent=_write_intent(identity), blocker=None)
     monkeypatch.setattr(runs, "_write_admission_for_graph", lambda *_args, **_kwargs: admission)
@@ -951,7 +955,8 @@ def test_exact_route_admission_and_persistence_failure_submit_nothing(
     blocked_adapter = Counting()
     blocked_deps = SimpleNamespace(
         external_wait_nodes=deps.external_wait_nodes,
-        _external_wait_adapter=lambda kind: blocked_adapter if kind == "fixture-local" else None)
+        _external_wait_adapter=lambda kind: blocked_adapter if kind == "fixture-local" else None,
+        node_specs=deps.node_specs, plugins=deps.plugins)
     with pytest.raises(HTTPException) as exc:
         runs.start_run(blocked_deps, graph, "write", uid, submission_id=str(uuid.uuid4()),
                        input_manifest=[])

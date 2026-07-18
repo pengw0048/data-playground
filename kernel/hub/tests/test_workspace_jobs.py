@@ -7,6 +7,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from hub import metadb
+from hub.tests.task_manifest_helpers import with_task_manifest
 from hub.main import app
 from hub.models import RunStatus, WorkspaceRunPage
 
@@ -161,11 +162,11 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
             "stepId": "write", "provenance": "run", "fieldMappings": [],
         }, "parents": []},
     }
-    task, _ = metadb.submit_durable_local_write_task(
+    task, _ = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write", intent_sha256="a" * 64,
         graph_doc=graph, input_manifest=[], write_intent=intent,
-    )
+    )))
     first = metadb.claim_durable_task(task["id"], "first-owner")["attempts"][-1]
     with metadb.session() as session:
         row = session.get(metadb.DurableTaskAttempt, first["id"])
@@ -177,27 +178,31 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
         task["id"], second["id"], second["owner_token"], status.model_dump())
     metadb.request_durable_task_cancel(task["id"])
 
-    first_update = datetime.datetime(2026, 7, 18, 12, 0, 0)
-    second_update = datetime.datetime(2026, 7, 18, 12, 5, 0)
     with metadb.session() as session:
         session.add(metadb.User(id=viewer, name="Jobs viewer"))
         session.add(metadb.CanvasShare(canvas_id=canvas_id, user_id=viewer, role="viewer"))
         task_row = session.get(metadb.DurableTask, task["id"])
-        task_row.updated_at = second_update
         first_row = session.get(metadb.DurableTaskAttempt, first["id"])
-        first_row.completed_at = first_update
         second_row = session.get(metadb.DurableTaskAttempt, second["id"])
+        base_time = max(task_row.created_at, first_row.created_at, second_row.created_at)
+        first_update = base_time + datetime.timedelta(minutes=1)
+        second_update = base_time + datetime.timedelta(minutes=2)
+        task_row.updated_at = second_update
+        first_row.completed_at = first_update
         second_row.cancel_requested_at = second_update
+
+    first_update_iso = first_update.replace(tzinfo=datetime.timezone.utc).isoformat()
+    second_update_iso = second_update.replace(tzinfo=datetime.timezone.utc).isoformat()
 
     owner_item = WorkspaceRunPage.model_validate(
         metadb.list_workspace_runs(uid, run_id=task["id"])).items[0]
     assert owner_item.progress == 0.625
-    assert owner_item.updated_at == "2026-07-18T12:05:00+00:00"
+    assert owner_item.updated_at == second_update_iso
     assert owner_item.cancel_requested is True
     assert [attempt.status for attempt in owner_item.task_attempts] == ["fenced", "running"]
-    assert owner_item.task_attempts[0].updated_at == "2026-07-18T12:00:00+00:00"
+    assert owner_item.task_attempts[0].updated_at == first_update_iso
     assert owner_item.task_attempts[1].progress == 0.625
-    assert owner_item.task_attempts[1].updated_at == "2026-07-18T12:05:00+00:00"
+    assert owner_item.task_attempts[1].updated_at == second_update_iso
 
     viewer_item = WorkspaceRunPage.model_validate(
         metadb.list_workspace_runs(viewer, run_id=task["id"])).items[0]

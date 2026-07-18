@@ -63,6 +63,12 @@ def _assert_secret_free(value: Any, path: tuple[str, ...] = ()) -> None:
                         "execution manifest cannot retain sensitive field "
                         f"{'.'.join((*path, key))}")
             _assert_secret_free(child, (*path, key))
+            if key == "documentJson" and isinstance(child, str):
+                try:
+                    document = json.loads(child)
+                except (TypeError, ValueError):
+                    continue
+                _assert_secret_free(document, (*path, key))
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _assert_secret_free(child, (*path, str(index)))
@@ -265,6 +271,88 @@ def validate_execution_manifest(sha256: str, payload: str) -> dict[str, Any]:
     if not secrets.compare_digest(observed, sha256):
         raise ExecutionManifestError("execution manifest digest does not match its document")
     return doc
+
+
+def execution_manifest_admission(sha256: str, payload: str) -> dict[str, Any]:
+    """Reopen the executable admission encoded by one canonical manifest.
+
+    The canonical graph deliberately omits editor identity, positions, and edge IDs. Deterministic
+    private values rebuild them, except a managed Write's provenance restores the producer identity
+    needed by its execution fence. Admission timestamps are non-semantic and use one fixed value.
+    """
+    doc = validate_execution_manifest(sha256, payload)
+    graph_doc = doc.get("graph")
+    target = doc.get("target")
+    admitted = doc.get("admittedInputs")
+    if (not isinstance(graph_doc, dict)
+            or set(graph_doc) != {"nodes", "edges", "requirements"}
+            or not isinstance(graph_doc.get("nodes"), list)
+            or not isinstance(graph_doc.get("edges"), list)
+            or not isinstance(graph_doc.get("requirements"), list)
+            or not isinstance(target, dict)
+            or set(target) != {"nodeId", "portId"}
+            or not isinstance(admitted, list)):
+        raise ExecutionManifestError("execution manifest admission is invalid")
+    edges: list[dict[str, Any]] = []
+    for index, edge in enumerate(graph_doc["edges"]):
+        if not isinstance(edge, dict):
+            raise ExecutionManifestError("execution manifest graph edge is invalid")
+        edges.append({"id": f"manifest-edge-{index}", **edge})
+    raw_write_intent = doc.get("writeIntent")
+    publication = (
+        raw_write_intent.get("provenance", {}).get("publication", {})
+        if isinstance(raw_write_intent, dict) else {})
+    graph_id = publication.get("producer") or f"execution-manifest-{sha256[:32]}"
+    graph_version = publication.get("producerVersion") or 1
+    try:
+        graph = Graph.model_validate({
+            "id": graph_id,
+            "version": graph_version,
+            "nodes": graph_doc["nodes"],
+            "edges": edges,
+            "requirements": graph_doc["requirements"],
+        })
+    except ValueError as exc:
+        raise ExecutionManifestError("execution manifest graph is invalid") from exc
+
+    inputs: list[dict[str, str]] = []
+    for item in admitted:
+        if not isinstance(item, dict) or set(item) != {
+            "nodeId", "datasetId", "revisionId", "provider",
+        } or any(not isinstance(value, str) or not value for value in item.values()):
+            raise ExecutionManifestError("execution manifest admitted inputs are invalid")
+        inputs.append({
+            "node_id": item["nodeId"],
+            "dataset_id": item["datasetId"],
+            "revision_id": item["revisionId"],
+            "provider": item["provider"],
+            "resolved_at": "1970-01-01T00:00:00+00:00",
+        })
+    try:
+        write_intent = (
+            WriteIntent.model_validate(raw_write_intent).model_dump(by_alias=True, mode="json")
+            if raw_write_intent is not None else None
+        )
+    except ValueError as exc:
+        raise ExecutionManifestError("execution manifest write intent is invalid") from exc
+    node_id, port_id = target.get("nodeId"), target.get("portId")
+    if (node_id is not None and not isinstance(node_id, str)) or (
+            port_id is not None and not isinstance(port_id, str)):
+        raise ExecutionManifestError("execution manifest target is invalid")
+    if write_intent is not None and node_id is not None:
+        target_node = next((node for node in graph.nodes if node.id == node_id), None)
+        if target_node is None:
+            raise ExecutionManifestError("execution manifest target is absent from its graph")
+        config = dict(target_node.data.get("config") or {})
+        config["_admittedWriteIntent"] = write_intent
+        target_node.data["config"] = config
+    return {
+        "graph_doc": graph.model_dump(by_alias=True, mode="json"),
+        "input_manifest": inputs,
+        "write_intent": write_intent,
+        "target_node_id": node_id,
+        "target_port_id": port_id,
+    }
 
 
 def execution_manifest_accepts_graph_replay(
