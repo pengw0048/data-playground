@@ -145,6 +145,11 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     const viewport = page.locator('.react-flow__viewport')
     const beforeViewport = await viewport.getAttribute('style')
+    const saves: string[] = []
+    await page.route(`**/api/canvas/${canvasId}`, async (route) => {
+      if (route.request().method() === 'PUT') saves.push(route.request().postData() ?? '')
+      await route.continue()
+    })
 
     await page.getByRole('button', { name: 'Locate existing node', exact: true }).click()
     const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
@@ -160,6 +165,22 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('inspector')).toContainText('Duplicate')
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await expect.poll(() => viewport.getAttribute('style')).not.toBe(beforeViewport)
+    await expect.poll(async () => {
+      const nodeBox = await selected.boundingBox()
+      const canvasBox = await page.locator('.react-flow').boundingBox()
+      return !!nodeBox && !!canvasBox
+        && nodeBox.x >= canvasBox.x && nodeBox.y >= canvasBox.y
+        && nodeBox.x + nodeBox.width <= canvasBox.x + canvasBox.width
+        && nodeBox.y + nodeBox.height <= canvasBox.y + canvasBox.height
+    }).toBe(true)
+    await page.waitForTimeout(700) // longer than autosave debounce: locating must remain presentation-only
+    expect(saves).toEqual([])
+    const stored = await page.request.get(`/api/canvas/${canvasId}`)
+    expect((await stored.json()).nodes).toEqual([
+      { id: 'duplicate-near', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'Duplicate', status: 'stale', config: {} } },
+      { id: 'duplicate-off-screen', type: 'filter', position: { x: 8000, y: 6000 }, data: { title: 'Duplicate', status: 'failed', config: {}, disabled: true } },
+    ])
+    await page.unroute(`**/api/canvas/${canvasId}`)
   })
 
   test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {

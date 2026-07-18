@@ -17,10 +17,10 @@ describe('existing node locator', () => {
       node({ id: 'section-1', type: 'section', data: { title: 'Driver', status: 'draft', config: { outputs: ['published'] } } }),
     ]
 
-    expect(findExistingNodes(nodes, 'duplicate').map((result) => result.node.id)).toEqual(['filter-1', 'filter-2'])
-    expect(findExistingNodes(nodes, 'metric-stable-id').map((result) => result.node.id)).toEqual(['metric-stable-id'])
-    expect(findExistingNodes(nodes, 'failed').map((result) => result.node.id)).toEqual(['filter-2'])
-    expect(findExistingNodes(nodes, 'published').map((result) => result.node.id)).toEqual(['section-1'])
+    expect(findExistingNodes(nodes, 'duplicate').results.map((result) => result.node.id)).toEqual(['filter-1', 'filter-2'])
+    expect(findExistingNodes(nodes, 'metric-stable-id').results.map((result) => result.node.id)).toEqual(['metric-stable-id'])
+    expect(findExistingNodes(nodes, 'failed').results.map((result) => result.node.id)).toEqual(['filter-2'])
+    expect(findExistingNodes(nodes, 'published').results.map((result) => result.node.id)).toEqual(['section-1'])
   })
 
   it('chooses an existing node without exposing an add operation path', () => {
@@ -39,8 +39,15 @@ describe('existing node locator', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
   })
 
-  it('renders only the first 100 existing-node results while keeping the full search bounded', () => {
-    const nodes = Array.from({ length: 101 }, (_, index) => node({ id: `node-${index}`, data: { title: `Node ${index}`, status: 'draft', config: {} } }))
+  it('retains and renders only the best 100 results while still reporting the full match count', () => {
+    const nodes = [
+      ...Array.from({ length: 100 }, (_, index) => node({ id: `node-${index}`, data: { title: `Target ${index}`, status: 'draft', config: {} } })),
+      node({ id: 'exact-last', data: { title: 'Target', status: 'draft', config: {} } }),
+    ]
+    const search = findExistingNodes(nodes, 'target')
+    expect(search.total).toBe(101)
+    expect(search.results).toHaveLength(100)
+    expect(search.results[0].node.id).toBe('exact-last')
     render(<ExistingNodeLocator nodes={nodes} onPick={vi.fn()} onClose={vi.fn()} />)
     expect(screen.getAllByRole('option')).toHaveLength(100)
     expect(screen.getByText('Showing first 100 of 101')).toBeVisible()

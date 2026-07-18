@@ -6,6 +6,7 @@ import { color, status } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 
 export type ExistingNodeResult = { node: CanvasNode; match: number; outputs: string[]; labels: string[] }
+export type ExistingNodeSearch = { results: ExistingNodeResult[]; total: number }
 const MAX_RENDERED_RESULTS = 100
 
 function normalized(value: string): string {
@@ -45,10 +46,34 @@ function stateLabels(node: CanvasNode): string[] {
   ]
 }
 
-/** Search only the current canvas document. Ranking and the 100-result render bound are stable. */
-export function findExistingNodes(nodes: CanvasNode[], query: string): ExistingNodeResult[] {
+function compareResults(left: ExistingNodeResult, right: ExistingNodeResult): number {
+  return left.match - right.match
+    || codePointCompare(normalized(left.node.data.title), normalized(right.node.data.title))
+    || codePointCompare(normalized(left.node.type), normalized(right.node.type))
+    || codePointCompare(normalized(left.node.id), normalized(right.node.id))
+}
+
+function insertResult(results: ExistingNodeResult[], result: ExistingNodeResult): void {
+  if (results.length === MAX_RENDERED_RESULTS
+      && compareResults(result, results[results.length - 1]) >= 0) return
+  let low = 0
+  let high = results.length
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2)
+    // Insert after equal entries so document order remains the final deterministic tie-breaker.
+    if (compareResults(result, results[middle]) < 0) high = middle
+    else low = middle + 1
+  }
+  results.splice(low, 0, result)
+  if (results.length > MAX_RENDERED_RESULTS) results.pop()
+}
+
+/** Search only the current canvas document while retaining at most 100 deterministically ranked results. */
+export function findExistingNodes(nodes: CanvasNode[], query: string): ExistingNodeSearch {
   const q = normalized(query)
-  return nodes.flatMap((node) => {
+  const results: ExistingNodeResult[] = []
+  let total = 0
+  for (const node of nodes) {
     const outputs = outputLabels(node)
     const labels = stateLabels(node)
     const candidates = [
@@ -58,13 +83,11 @@ export function findExistingNodes(nodes: CanvasNode[], query: string): ExistingN
       ...[...labels, ...outputs].map((label) => fieldMatch(label, q, 9, 9, 9)),
     ].filter((candidate) => candidate >= 0)
     const match = !q ? 10 : (candidates.length ? Math.min(...candidates) : -1)
-    return match === -1 ? [] : [{ node, match, outputs, labels }]
-  }).sort((left, right) => (
-    left.match - right.match
-    || codePointCompare(normalized(left.node.data.title), normalized(right.node.data.title))
-    || codePointCompare(normalized(left.node.type), normalized(right.node.type))
-    || codePointCompare(normalized(left.node.id), normalized(right.node.id))
-  ))
+    if (match === -1) continue
+    total += 1
+    insertResult(results, { node, match, outputs, labels })
+  }
+  return { results, total }
 }
 
 export function ExistingNodeLocator({ nodes, onPick, onClose }: {
@@ -73,9 +96,9 @@ export function ExistingNodeLocator({ nodes, onPick, onClose }: {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const input = useRef<HTMLInputElement>(null)
-  const results = useMemo(() => findExistingNodes(nodes, query), [nodes, query])
-  const shownResults = results.slice(0, MAX_RENDERED_RESULTS)
-  const truncated = results.length > shownResults.length
+  const search = useMemo(() => findExistingNodes(nodes, query), [nodes, query])
+  const shownResults = search.results
+  const truncated = search.total > shownResults.length
 
   useEffect(() => { input.current?.focus() }, [])
   useEffect(() => { setActive(0) }, [query, nodes])
@@ -110,8 +133,8 @@ export function ExistingNodeLocator({ nodes, onPick, onClose }: {
               </span>
             </button>
           ))}
-          {results.length === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching existing node.</div>}
-          {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {results.length}</div>}
+          {search.total === 0 && <div className="px-3 py-8 text-center text-[12px] text-muted-foreground">No matching existing node.</div>}
+          {truncated && <div className="px-3 py-2 text-center text-[11px] text-muted-foreground">Showing first {MAX_RENDERED_RESULTS} of {search.total}</div>}
         </div>
         <div className="border-t border-border px-3 py-2 text-[10.5px] text-muted-foreground">↑↓ to choose · Enter to locate</div>
       </section>
