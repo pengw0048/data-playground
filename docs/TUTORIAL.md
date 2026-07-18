@@ -15,7 +15,7 @@ cd kernel && uv run dataplay
 ```
 
 For Docker Compose, follow the README migrate-then-start sequence. First run seeds three datasets in
-Tables: `images` (with an embedding column), `movies`, and `events`
+**Workspace**: `images` (with an embedding column), `movies`, and `events`
 (`id`, `user_id`, `event`, `amount` — 2,000 rows). This tour uses `events`.
 
 If you want the finished graph without building it by hand, use **New from example → Purchases per
@@ -74,11 +74,12 @@ full pass has materialized upstream.
 
 ## 7. Save and run
 
-Add a **write**. Name the file `top_spenders.parquet`, leave mode **overwrite**, and keep the default
-Workspace outputs destination. Click **Run (▶)** on the write node.
+Add a **write**. Name the output `top_spenders.parquet`, leave the default **overwrite** mode, and
+keep the default Workspace outputs destination. Click **Run (▶)** on the write node.
 
-Writes always need a full pass. When the run finishes, open Tables and you should see `top_spenders`,
-ready to use as a later `source`.
+Writes always need a full pass. On the default managed-local destination, the create or replacement is
+admitted before work starts and a successful write publishes a new managed revision. When the run
+finishes, open **Workspace** and you should see `top_spenders`, ready to use as a later `source`.
 
 ## What just happened
 

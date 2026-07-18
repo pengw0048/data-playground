@@ -89,7 +89,7 @@ Stress a large catalog with:
 dataplay seed-catalog --count 5000
 ```
 
-Open Tables afterward. `--remove` cleans the synthetic entries up.
+Open **Workspace** afterward. `--remove` cleans the synthetic entries up.
 
 ## Semantic search
 
@@ -113,13 +113,13 @@ call onto paginated backend endpoints (`resolve_ref` runs on every preview and r
 external catalog can subclass the built-in provider, but it must deliberately choose whether lineage
 stays in the core metadata side store or moves to the external authority.
 
-Catalog selection and execution publication are not yet rebound as one operation. Built-in runners are
-constructed before workspace plugins load and retain the catalog publication authority they were given
-at construction. A later `reg.set_catalog(...)` changes the provider used by routes and other dependency
-lookups, but does not automatically rebind those runners. A fully replacing provider can therefore serve
-catalog reads while run write-backs, cache checks, and cache-reuse lineage still use the runner-bound
-catalog. Do not assume that implementing `register_output` on the replacement changes this behavior; the
-single-authority rebind is tracked in issue #166.
+The effective catalog is selected during startup before catalog-dependent runners are constructed.
+`reg.add_runner_factory(factory)` is the public seam for a runner that needs the selected catalog or
+the local runner; its factory receives the finished dependency set. `reg.set_catalog(...)` is therefore
+startup composition, not a live catalog hot-swap. A fully replacing provider must implement the
+write-back and lineage authority required by the execution paths it enables; inheriting
+`InMemoryCatalog` remains a practical way to retain the built-in behavior. The composition order is
+covered by the installed-plugin and kernel contract tests.
 
 The built-in catalog stores one immutable fact per source involved in an output publication. A fact
 keeps the source and destination catalog projections resolved by the first commit, including their

@@ -1,8 +1,9 @@
 # Versioned data and durable execution
 
-This document is a product and architecture roadmap, not a description of features that already
-exist. It defines the end state Data Playground should reach for reproducible dataset work,
-column-oriented enrichment, long-running jobs, and heterogeneous research data.
+This document records both the delivered foundation and the remaining product and architecture roadmap
+for reproducible dataset work, column-oriented enrichment, long-running jobs, and heterogeneous
+research data. It is intentionally capability-led: the sections below distinguish behavior on `main`
+from the semantics that still need a numbered implementation issue.
 
 The goal is not a thin first release. Each delivery phase below is a complete, supportable product
 slice with an explicit exit gate. Later phases extend the same identities and state machines instead
@@ -50,31 +51,24 @@ attention item in Inbox.
 motion, viewpoint, stream coverage, and quality; opens synchronized camera, depth, pose, action, and
 annotation streams; saves a reproducible subset; and compares distribution reports across revisions.
 
-## Where the product is today
+## Delivered foundation and remaining gaps
 
-Data Playground already has useful foundations:
+Status verified against `main` on 2026-07-18. The public release tracker is
+[#174](https://github.com/pengw0048/data-playground/issues/174); the ordered product work is
+[#175](https://github.com/pengw0048/data-playground/issues/175). This table is a navigation aid, not a
+second issue tracker.
 
-- a local-first workspace with durable canvas and run metadata;
-- logical catalog entries with current publication pointers;
-- immutable managed object attempts, references, leases, and garbage collection;
-- content-aware catalog fingerprints and lineage metadata;
-- optional execution backends and a narrow restart-durable external job path; and
-- browser recovery of active runs after reopening a canvas.
-
-Those foundations are not yet a revision system or a general durable task plane.
-
-| Area | Current boundary | Gap this roadmap closes |
+| Area | Delivered on `main` | Remaining boundary |
 | --- | --- | --- |
-| Catalog | A table exposes its current URI and a provider-supplied version label. | No first-class revision history, pinning, as-of resolution, diff, or historical retention contract. |
-| Source | A node stores a URI or catalog table reference. | It cannot distinguish follow-latest from a pinned revision, and version resolution is not part of run admission. |
-| Read adapters | A scan opens the current resource at a URI. | A mutable head can change between fingerprinting and execution; exact revision reads are not a provider contract. |
-| Write | Built-in UI and adapters expose overwrite or append. | No expected parent, idempotency key, commit receipt, conflict policy, upsert, or column merge. |
-| Run | The common lifecycle is queued, running, and terminal. | External waiting, retry delay, collecting, publishing, and recovery-blocked states are not one durable model. |
-| Workspace navigation | Canvases and catalog folders are separate surfaces. | Researchers cannot organize canvases, datasets, views, and reports in one provider-aware hierarchy. |
-| Multimodal data | Tables can contain media references and typed columns. | There is no compound dataset, time-domain, stream-coverage, alignment, or synchronized exploration model. |
+| Workspace | A local Workspace composes canvases, datasets, folders, local placement, browse, search, and read-only provider mounts. | Complete provider dataset-to-Source and overlay workflow remains in [#468](https://github.com/pengw0048/data-playground/issues/468). |
+| Exact reads | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before preview or execution. | A complete researcher-facing DatasetView/report model is [#311](https://github.com/pengw0048/data-playground/issues/311); a mutable-only provider must still be labeled and cannot be made reproducible by UI wording. |
+| Managed writes | Typed managed-local create and replace writes freeze destination, expected head, schema, provenance, and idempotency; managed Lance append is separately admitted. Receipts reconcile publication evidence. | Key-based upsert and sparse merge-columns require certified row identity and are intentionally deferred to [#310](https://github.com/pengw0048/data-playground/issues/310) and [#489](https://github.com/pengw0048/data-playground/issues/489). |
+| Durable work | Task/Attempt state supports managed local writes, external waits, checkpoints, bounded fan-out, restart/retry/cancel recovery, Jobs, and Inbox. The browser observes rather than owns durable work. | Backup/restore certification is active in [#485](https://github.com/pengw0048/data-playground/issues/485). This is not yet a general scheduler or arbitrary provider-job platform. |
+| Extension boundary | Installed-wheel plugin contracts and conformance cover catalog composition, read-only mounts, adapters, nodes, destinations, runners, capabilities, and telemetry. | New SPIs need a real consumer and deterministic conformance; provider-specific operational behavior remains outside core. |
+| Research semantics | The catalog can retain bounded lineage, schemas, previews, relationships, and native revision facts where an adapter supplies them. | Exact DatasetViews/distribution reports, sparse sidecars, and compound temporal data remain the scoped tracks [#311](https://github.com/pengw0048/data-playground/issues/311), [#310](https://github.com/pengw0048/data-playground/issues/310), and [#312](https://github.com/pengw0048/data-playground/issues/312). |
 
-The roadmap must preserve current local behavior while replacing these accidental boundaries with
-explicit contracts.
+The rest of this document keeps the north-star semantics for the remaining work. It does not imply that
+every type, operation, or UX described below is available today.
 
 ## One workspace for data and work
 
@@ -130,6 +124,11 @@ This part is complete only when:
 
 Versioning is an identity model, not a label on a card.
 
+The current foundation covers native revision reads where an adapter provides them and exact admission
+for ordinary local files. The complete cross-provider model specified in this section remains future
+work; in particular, UI pinning, as-of resolution, retention, and history are not implied for an
+adapter that has no corresponding capability.
+
 ### Core types
 
 | Type | Meaning |
@@ -155,9 +154,9 @@ Providers fall into three honest categories:
 3. Mutable-only providers cannot guarantee historical reads. They may follow latest, but the UI and
    run manifest must say that the source was not pinnable.
 
-Lance should be the first native-revision reference implementation because it is already a supported
-format and exposes exact dataset versions. Managed immutable files should provide the parallel
-core-owned reference path. The public types and acceptance suite remain format-neutral.
+Lance is the native-revision reference implementation: it exposes exact dataset versions. Managed
+immutable files provide the parallel core-owned path. The public types and acceptance suite remain
+format-neutral.
 
 Core must never synthesize a reassuring version such as v1 when the provider supplied no revision.
 Unknown means unknown.
@@ -228,6 +227,10 @@ the run manifest connects them.
 
 Adding more strings to writeMode will not produce safe retries. The execution boundary should use a
 typed WriteIntent.
+
+Today, the managed-local contract implements create and replace for files and append for managed Lance
+destinations. The broader operation table below defines the intended extension boundary; it does not
+advertise upsert or merge-columns before their row-identity prerequisites land.
 
 ### WriteIntent
 
@@ -361,6 +364,11 @@ and the revision that will be created.
 
 A long run belongs to the service, not the open canvas tab. The durable control plane should support
 local work, distributed workers, and asynchronous provider jobs with one model.
+
+The current Task/Attempt foundation already covers managed local writes, one external-wait contract,
+linear checkpoints, bounded fan-out, Jobs, and Inbox. The provider-neutral state machine and HA
+semantics below describe the remaining extension contract, not an implicit scheduler or guarantee for
+every backend.
 
 ### Durable entities
 
@@ -604,12 +612,19 @@ core support claim beyond the generic contract it exercised.
 
 ## Delivery plan
 
-The phases are ordered by invariants, not calendar estimates. Revision identity and the durable task
-ledger may proceed in parallel after their shared artifact and run-manifest identities are agreed.
-Local resume depends on the durable task and checkpoint foundation. Distributed merge additionally
-depends on revisioned writes and local merge correctness.
+The remaining phases are ordered by invariants, not calendar estimates. Completed foundations are
+[#277](https://github.com/pengw0048/data-playground/issues/277) (exact revisions/admission),
+[#308](https://github.com/pengw0048/data-playground/issues/308) (typed managed writes), and
+[#309](https://github.com/pengw0048/data-playground/issues/309) (durable Tasks/Attempts). The immediate
+release closeout is backup/restore certification [#485](https://github.com/pengw0048/data-playground/issues/485);
+it remains open and must not be inferred from the Task implementation alone. The current leaf order and
+cross-product dependencies belong to [#175](https://github.com/pengw0048/data-playground/issues/175).
 
-### Phase 0 — Truthful current behavior
+The phases below describe remaining completion work. Local resume depends on the durable task and
+checkpoint foundation. Distributed merge additionally depends on revisioned writes and local merge
+correctness.
+
+### Historical Phase 0 — truthful current behavior
 
 Deliver:
 
@@ -627,7 +642,7 @@ Exit gate:
 - active work survives browser navigation where the backend claims durability; and
 - current docs and UX make no claim that exceeds tested behavior.
 
-### Phase 1 — Revision and workspace identity
+### Phase 1 — complete revision and workspace identity
 
 Deliver:
 
@@ -649,7 +664,7 @@ Exit gate:
 - history, cache, lineage, backup, restore, and GC preserve exact revisions; and
 - provider move, rename, deletion, and permission-loss fixtures preserve or explicitly orphan overlays.
 
-### Phase 2 — Transactional write intents
+### Phase 2 — extend transactional write intents
 
 Deliver:
 
@@ -669,7 +684,7 @@ Exit gate:
 - each success creates one inspectable revision; and
 - unsupported provider semantics are unavailable in UI and rejected before allocation.
 
-### Phase 3 — Durable task and checkpoint foundation
+### Phase 3 — extend durable task and checkpoint foundation
 
 Deliver:
 

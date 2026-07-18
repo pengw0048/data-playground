@@ -474,8 +474,10 @@ error code. The fixture is an offline conformance dependency, not a default prov
 
 ## Reference plugins
 
-`examples/plugins/` ships thirteen working plugins. Each has a test in
-`kernel/hub/tests/test_kernel.py` you can copy:
+`examples/plugins/` contains sixteen reference packages: fourteen product examples and two deterministic
+conformance fixtures. The product examples below are small, supported demonstrations of a public seam;
+they are not a bundled provider marketplace. The fixtures exercise public contracts without becoming
+default product services.
 
 - [`dp_example`](../examples/plugins/dp_example/) — `add_node`: `redact` compute node (mask a PII
   column)
@@ -506,6 +508,12 @@ error code. The fixture is an offline conformance dependency, not a default prov
   finished run to `DP_RUN_LOG`.
 - [`dp_warm_resource`](../examples/plugins/dp_warm_resource/) — `add_node` (+ `ctx.resource`): builds
   an expensive handle once and reuses it across batches and runs on the warm kernel.
+- [`dp_semantic_catalog`](../examples/plugins/dp_semantic_catalog/) — `add_embedder`: local semantic
+  and hybrid catalog search; install its optional model dependency explicitly.
+- [`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) — installed
+  `dataplay.catalog_providers` reference for a bounded, read-only Workspace mount.
+- [`dp_descriptor_contract`](../examples/plugins/dp_descriptor_contract/) — installed-wheel fixture for
+  the NodeSpec and PortSpec descriptor contract; it is a conformance dependency, not a default pack.
 
 The adapters are read-only sources (`write` raises) and import their heavy dependency lazily, so the
 pack loads without the extra installed and only errors when its URI scheme is used. Adapter tests use
