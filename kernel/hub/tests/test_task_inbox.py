@@ -162,6 +162,29 @@ def test_stale_owner_and_progress_emit_nothing():
     assert _inbox_for(uid, task["id"]) == []
 
 
+def test_superseded_attempt_replay_does_not_duplicate_completed_inbox():
+    """A fenced attempt replaying an identical done payload must not mint a second item."""
+    uid, canvas_id = _user_canvas("supersede")
+    task = _submit_local(uid, canvas_id)
+    first = metadb.claim_durable_task(task["id"], "owner-1")["attempts"][-1]
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTaskAttempt, first["id"], with_for_update=True)
+        row.lease_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    second = metadb.claim_durable_task(task["id"], "owner-2")["attempts"][-1]
+    assert first["id"] != second["id"]
+    key = task["write_intent"]["idempotencyKey"]
+    done = _done_status(task["id"], key)
+    assert metadb.finish_durable_task_attempt(task["id"], second["id"], "owner-2", done)
+    assert len(_inbox_for(uid, task["id"])) == 1
+    # Late response-loss replay from the fenced attempt: task-level payload matches, but the
+    # attempt is not the terminalizing one.
+    assert metadb.finish_durable_task_attempt(task["id"], first["id"], "owner-1", done) is True
+    items = _inbox_for(uid, task["id"])
+    assert len(items) == 1
+    assert items[0]["task_attempt_id"] == second["id"]
+    assert items[0]["outcome"] == "completed"
+
+
 def test_lease_exhaustion_emits_failed_and_retry_keeps_prior_item():
     uid, canvas_id = _user_canvas("lease")
     task = _submit_local(uid, canvas_id)

@@ -4157,7 +4157,10 @@ def finish_durable_task_attempt(
             return False
         if task.status in _TERMINAL_RUN:
             ok = task.status == status.status and task.status_doc == payload
-            if ok:
+            # Same-attempt response-loss replay reconciles the existing item. A superseded /
+            # fenced caller that happens to carry an identical task-level status_doc must not
+            # mint a second Inbox row under a different attempt id.
+            if ok and attempt.task_id == task.id and attempt.status == status.status:
                 _emit_durable_task_inbox_item(
                     s, task=task, attempt=attempt, task_status=status.status)
             return ok
