@@ -5104,11 +5104,13 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         if durable_inbox:
             # Inbox rows FK to attempts; drop them before attempt deletion on Postgres.
             s.flush()
-        if durable_checkpoints:
-            # Terminal hidden checkpoints must release their durable owner / retire their candidate
-            # under the registry lock before the rows vanish, or a committed artifact would stay
-            # pinned forever and a reserved one would leak its exact writer file.
+        parent_ids = [task.id for task in durable_tasks]
+        if parent_ids or durable_checkpoints:
+            # Drop fan-out / checkpoint LocalResult owners under the registry lock first.
             _lock_local_result_registry(s)
+            if parent_ids:
+                from hub import bounded_fanout as _bounded_fanout
+                _bounded_fanout.purge_for_delete(s, parent_ids)
             task_by_id = {task.id: task for task in durable_tasks}
             for checkpoint in durable_checkpoints:
                 _purge_linear_checkpoint_for_delete(s, task_by_id[checkpoint.task_id], checkpoint)
@@ -14666,3 +14668,9 @@ def list_agent_egress_events(*, limit: int = 200) -> list[dict]:
             payload["createdAt"] = row.created_at.isoformat() if row.created_at else None
             out.append(payload)
         return out
+
+
+# Import sibling modules that declare ORM models on Base so Base.metadata is complete for
+# migrations and create_all regardless of which module is imported first. Must stay at the end:
+# these modules import metadb's helpers defined above.
+from hub import bounded_fanout as _bounded_fanout_models  # noqa: E402,F401
