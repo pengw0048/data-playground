@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlsplit
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
     Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select,
-    tuple_, update,
+    text, tuple_, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -101,8 +101,17 @@ class WorkspaceContainer(Base):
     ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
     is_root: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    # A non-null catalog folder binding makes this a projection, not a mutable Workspace hierarchy
+    # node.  The binding is deliberately not a foreign key: deleting a Catalog folder must leave a
+    # truthful local overlay tombstone rather than cascade or silently retarget a Canvas.
+    catalog_folder_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    catalog_folder_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    catalog_folder_path: Mapped[str | None] = mapped_column(String, nullable=True)
     __table_args__ = (
-        UniqueConstraint("parent_id", "name", name="uq_workspace_container_parent_name"),
+        Index("uq_workspace_local_container_parent_name", "parent_id", "name", unique=True,
+              sqlite_where=text("catalog_folder_id IS NULL"),
+              postgresql_where=text("catalog_folder_id IS NULL")),
+        Index("ix_workspace_containers_catalog_folder_id", "catalog_folder_id", unique=True),
         CheckConstraint("ordinal >= 0", name="ck_workspace_container_ordinal"),
         CheckConstraint("version >= 1", name="ck_workspace_container_version"),
         CheckConstraint("is_root = false OR parent_id IS NULL", name="ck_workspace_container_root"),
@@ -690,6 +699,9 @@ class CatalogFolder(Base):
     entry `folder` strings — so a folder created by simply registering a dataset is editable too."""
     __tablename__ = "catalog_folders"
     path: Mapped[str] = mapped_column(String, primary_key=True)
+    # Folder paths are editable display hierarchy.  This opaque ID is used by the Workspace
+    # projection so rename/move never changes the deep-link identity and delete/recreate cannot ABA.
+    id: Mapped[str] = mapped_column(String(32), nullable=False, default=_uid, unique=True, index=True)
     created_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -2621,6 +2633,22 @@ def _workspace_container_locked(s, container_id: str) -> WorkspaceContainer:
     return row
 
 
+def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceContainer:
+    """Lock a destination and reject writes anywhere below a detached Catalog tombstone."""
+    destination = _workspace_container_locked(s, container_id)
+    current: WorkspaceContainer | None = destination
+    visited: set[str] = set()
+    while current is not None:
+        if current.id in visited:
+            raise RuntimeError("Workspace container hierarchy contains a cycle")
+        visited.add(current.id)
+        if current.catalog_folder_state == "detached":
+            raise ValueError("a deleted Catalog folder subtree is a read-only Workspace tombstone")
+        current = (s.get(WorkspaceContainer, current.parent_id, with_for_update=True)
+                   if current.parent_id is not None else None)
+    return destination
+
+
 def _workspace_placement_locked(s, placement_id: str) -> WorkspacePlacement:
     row = s.get(WorkspacePlacement, placement_id, with_for_update=True)
     if row is None:
@@ -2654,9 +2682,10 @@ def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -
     """Create one local overlay container beneath a stable parent identity."""
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
     with _workspace_write_session() as s:
-        _workspace_container_locked(s, parent_id)
+        _workspace_writable_destination_locked(s, parent_id)
         if s.scalar(select(WorkspaceContainer.id).where(
-                WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name)) is not None:
+                WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name,
+                WorkspaceContainer.catalog_folder_id.is_(None))) is not None:
             raise WorkspaceNameConflict(f"workspace container '{name}' already exists under its parent")
         row = WorkspaceContainer(parent_id=parent_id, name=name, ordinal=ordinal)
         s.add(row)
@@ -2683,6 +2712,8 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be edited")
+        if row.catalog_folder_id is not None:
+            raise ValueError("a projected Catalog folder is managed by the Catalog")
         if row.version != expected_version:
             _workspace_version_conflict("container", container_id, expected_version)
         target_parent = parent_id if parent_id is not None else row.parent_id
@@ -2690,12 +2721,14 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
             raise ValueError("an overlay container requires a parent")
         if _workspace_parent_is_descendant(s, target_parent, container_id):
             raise ValueError("a workspace container cannot become its own descendant")
+        _workspace_writable_destination_locked(s, target_parent)
         target_name = _workspace_name(name) if name is not None else row.name
         target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
         sibling = s.scalar(select(WorkspaceContainer.id).where(
             WorkspaceContainer.parent_id == target_parent,
             WorkspaceContainer.name == target_name,
             WorkspaceContainer.id != container_id,
+            WorkspaceContainer.catalog_folder_id.is_(None),
         ))
         if sibling is not None:
             raise WorkspaceNameConflict(f"workspace container '{target_name}' already exists under its parent")
@@ -2720,6 +2753,8 @@ def workspace_delete_container(container_id: str, *, expected_version: int) -> N
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be deleted")
+        if row.catalog_folder_id is not None:
+            raise ValueError("a projected Catalog folder is managed by the Catalog")
         if row.version != expected_version:
             _workspace_version_conflict("container", container_id, expected_version)
         if s.scalar(select(WorkspaceContainer.id).where(
@@ -2743,6 +2778,98 @@ def workspace_builtin_dataset_identity(uri: str) -> str:
         if entry is None:
             raise KeyError(f"registered dataset '{uri}' not found")
         return entry.registration_id
+
+
+def _workspace_catalog_projection_parent(s, path: str) -> str:
+    parent_path = path.rsplit("/", 1)[0] if "/" in path else ""
+    if not parent_path:
+        return LOCAL_WORKSPACE_ROOT_ID
+    parent = s.scalar(select(CatalogFolder).where(CatalogFolder.path == parent_path).limit(1))
+    if parent is None:
+        raise RuntimeError("Catalog folder projection parent is missing")
+    projection = s.scalar(select(WorkspaceContainer).where(
+        WorkspaceContainer.catalog_folder_id == parent.id).limit(1))
+    if projection is None:
+        raise RuntimeError("Catalog folder projection parent was not materialized")
+    return projection.id
+
+
+def _workspace_sync_catalog_folder_projections_in_session(s, paths: list[str] | None = None) -> None:
+    """Mirror current built-in Catalog folders into local Workspace navigation.
+
+    The Catalog remains the only authority for folder hierarchy.  Workspace only persists a stable
+    overlay container keyed by the folder's opaque ID; that gives Canvas placements durable targets
+    across folder path edits without copying provider hierarchy or using paths as identities.
+    """
+    query = select(CatalogFolder)
+    if paths is not None:
+        wanted = list(dict.fromkeys(path for path in paths if path))
+        if not wanted:
+            return
+        query = query.where(CatalogFolder.path.in_(wanted))
+    folders = list(s.scalars(query.order_by(CatalogFolder.path)))
+    for folder in folders:
+        parent_id = _workspace_catalog_projection_parent(s, folder.path)
+        name = folder.path.rsplit("/", 1)[-1]
+        projection = s.scalar(select(WorkspaceContainer).where(
+            WorkspaceContainer.catalog_folder_id == folder.id).limit(1))
+        if projection is None:
+            projection = WorkspaceContainer(
+                parent_id=parent_id, name=name, ordinal=0, version=1,
+                catalog_folder_id=folder.id, catalog_folder_state="current",
+                catalog_folder_path=folder.path,
+            )
+            s.add(projection)
+        else:
+            if (projection.parent_id, projection.name, projection.catalog_folder_state,
+                    projection.catalog_folder_path) != (parent_id, name, "current", folder.path):
+                projection.parent_id = parent_id
+                projection.name = name
+                projection.catalog_folder_state = "current"
+                projection.catalog_folder_path = folder.path
+                projection.version += 1
+    s.flush()
+
+
+def _workspace_tombstone_catalog_folder_projection_in_session(s, folder_id: str) -> None:
+    projection = s.scalar(select(WorkspaceContainer).where(
+        WorkspaceContainer.catalog_folder_id == folder_id).limit(1))
+    if projection is None:
+        return
+    # Keep an orphan independently navigable and explain its last-known path even if a former
+    # ancestor later moves.  Its local Canvas overlay remains recoverable but cannot receive writes.
+    projection.parent_id = LOCAL_WORKSPACE_ROOT_ID
+    projection.name = f"Deleted Catalog folder: {projection.catalog_folder_path or projection.name}"
+    projection.catalog_folder_state = "detached"
+    projection.version += 1
+
+
+def _workspace_catalog_container_for_folder_in_session(s, folder: str) -> str:
+    if not folder:
+        return LOCAL_WORKSPACE_ROOT_ID
+    row = s.scalar(select(CatalogFolder).where(CatalogFolder.path == folder).limit(1))
+    if row is None:
+        raise RuntimeError("Catalog folder projection is missing")
+    projection = s.scalar(select(WorkspaceContainer).where(
+        WorkspaceContainer.catalog_folder_id == row.id,
+        WorkspaceContainer.catalog_folder_state == "current").limit(1))
+    if projection is None:
+        raise RuntimeError("Catalog folder projection is unavailable")
+    return projection.id
+
+
+def _workspace_sync_dataset_folder_in_session(
+        s, *, dataset_id: str, name: str, folder: str) -> None:
+    """Place a built-in dataset beside its Catalog folder using its registration identity."""
+    container_id = _workspace_catalog_container_for_folder_in_session(s, folder)
+    _workspace_ensure_root_placement_in_session(
+        s, target_kind="dataset", target_id=dataset_id, name=name or "dataset")
+    placement = s.scalar(select(WorkspacePlacement).where(
+        WorkspacePlacement.target_kind == "dataset",
+        WorkspacePlacement.target_id == dataset_id).limit(1))
+    if placement is None:
+        raise RuntimeError("Workspace dataset placement was not created")
+    placement.container_id = container_id
 
 
 def _workspace_ensure_root_placement_in_session(
@@ -2799,13 +2926,15 @@ def workspace_create_placement(container_id: str, *, target_kind: str, target_id
         raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
     with _workspace_write_session() as s:
-        _workspace_container_locked(s, container_id)
+        _workspace_writable_destination_locked(s, container_id)
         if target_kind == "canvas":
             if s.get(Canvas, target_id, with_for_update=True) is None:
                 raise KeyError(f"canvas '{target_id}' not found")
         elif s.scalar(select(CatalogEntry.uri).where(
                 CatalogEntry.registration_id == target_id).limit(1).with_for_update()) is None:
             raise KeyError(f"registered dataset identity '{target_id}' not found")
+        if target_kind == "dataset":
+            raise ValueError("built-in datasets are placed by the Catalog")
         if s.scalar(select(WorkspacePlacement.id).where(
                 WorkspacePlacement.target_kind == target_kind,
                 WorkspacePlacement.target_id == target_id)) is not None:
@@ -2825,9 +2954,10 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
         row = _workspace_placement_locked(s, placement_id)
         if row.version != expected_version:
             _workspace_version_conflict("placement", placement_id, expected_version)
+        if row.target_kind == "dataset":
+            raise ValueError("built-in datasets are placed by the Catalog")
         target_container = container_id if container_id is not None else row.container_id
-        if container_id is not None:
-            _workspace_container_locked(s, target_container)
+        _workspace_writable_destination_locked(s, target_container)
         target_name = _workspace_name(name) if name is not None else row.name
         target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
         changed = s.execute(update(WorkspacePlacement).where(
@@ -2847,7 +2977,7 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
 
 def _workspace_container_at_version(s, container_id: str,
                                     expected_version: int) -> WorkspaceContainer:
-    row = _workspace_container_locked(s, container_id)
+    row = _workspace_writable_destination_locked(s, container_id)
     if row.version != expected_version:
         _workspace_version_conflict("container", container_id, expected_version)
     return row
@@ -3117,7 +3247,10 @@ def _workspace_container_resource(row: WorkspaceContainer) -> dict:
     return {
         "id": _workspace_ref("container", row.id), "kind": "container", "name": row.name,
         "parentId": _workspace_ref("container", row.parent_id) if row.parent_id else None,
-        "version": row.version, "detached": False,
+        "version": row.version, "detached": row.catalog_folder_state == "detached",
+        "catalogFolderId": row.catalog_folder_id,
+        "catalogFolderState": row.catalog_folder_state,
+        "catalogFolderPath": row.catalog_folder_path,
     }
 
 
@@ -12626,6 +12759,9 @@ def _catalog_upsert_in_session(s, uri: str, name: str, doc: dict,
         _workspace_follow_target_name_in_session(
             s, target_kind="dataset", target_id=entry.registration_id,
             previous_name=previous_entry_name, name=entry.name)
+    _materialize_folder(s, entry.folder or "")
+    _workspace_sync_dataset_folder_in_session(
+        s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
     return True
 
 
@@ -12776,6 +12912,11 @@ def catalog_upsert_entry(uri: str, name: str, doc: dict, *,
             return False
         sync_local_result_owner(s, "catalog_entry", normalized, normalized, payload)
         _materialize_folder(s, payload.get("folder") or "")  # a registered dataset's folder is first-class
+        entry = s.get(CatalogEntry, normalized)
+        if entry is None:
+            raise RuntimeError("catalog entry disappeared during Workspace projection")
+        _workspace_sync_dataset_folder_in_session(
+            s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         return True
 
 
@@ -13285,6 +13426,10 @@ def catalog_publish_managed_local_file(
         logical.state = "active"
         logical.governance_doc = json.dumps(_catalog_governance(payload), default=str, sort_keys=True)
         _materialize_folder(s, folder)
+        entry = s.get(CatalogEntry, artifact_uri)
+        if entry is not None:
+            _workspace_sync_dataset_folder_in_session(
+                s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         # The revision ledger, rather than the replaceable head projection, retains every artifact.
         sync_local_result_owner(s, "managed_file_revision", revision_id, artifact_uri)
         if canonical_lineage is not None:
@@ -13432,6 +13577,8 @@ def catalog_set_metadata(uri: str, folder: str, owner: str | None, description: 
                 s, target_kind="dataset", target_id=r.registration_id,
                 previous_name=previous_name, name=r.name)
         _materialize_folder(s, folder)  # curating into a folder makes it a first-class entity (#155)
+        _workspace_sync_dataset_folder_in_session(
+            s, dataset_id=r.registration_id, name=r.name, folder=r.folder or "")
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)
@@ -13511,6 +13658,8 @@ def catalog_save_metadata_edit(
                 s, target_kind="dataset", target_id=entry.registration_id,
                 previous_name=previous_name, name=entry.name)
         _materialize_folder(s, folder)
+        _workspace_sync_dataset_folder_in_session(
+            s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         if logical is not None:
             logical.governance_doc = json.dumps(
                 _catalog_governance(doc), default=str, sort_keys=True)
@@ -14194,6 +14343,7 @@ def _ensure_folder_rows(s, paths) -> None:
             s.flush()
         except IntegrityError:
             sp.rollback()  # another writer inserted this path between the check and our insert
+    _workspace_sync_catalog_folder_projections_in_session(s, want)
 
 
 def _materialize_folder(s, raw: str) -> None:
@@ -14239,6 +14389,7 @@ def catalog_folder_create(path: str) -> str:
         except IntegrityError:
             sp.rollback()
             raise FolderExistsError(f"folder '{path}' already exists")
+        _workspace_sync_catalog_folder_projections_in_session(s, [path])
     return path
 
 
@@ -14324,12 +14475,16 @@ def catalog_folder_rename(old: str, new: str) -> None:
             CatalogFolder.path == old, CatalogFolder.path.like(like, escape="\\")))
             .order_by(CatalogFolder.path).with_for_update()))
         targets = [new + row.path[len(old):] for row in moved_entities]
-        for row in moved_entities:
-            s.delete(row)
+        for row, target in zip(moved_entities, targets, strict=True):
+            row.path = target
         s.flush()
         targets.extend(_rewrite_entry_folders(
             entries, lambda folder: new + folder[len(old):]))
         _materialize_folder_paths(s, targets + [new])
+        _workspace_sync_catalog_folder_projections_in_session(s, targets)
+        for entry, _logical in entries:
+            _workspace_sync_dataset_folder_in_session(
+                s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
 
 
 def catalog_folder_delete(path: str) -> None:
@@ -14363,10 +14518,19 @@ def catalog_folder_delete(path: str) -> None:
         deleted = list(s.scalars(select(CatalogFolder).where(or_(
             CatalogFolder.path == path, CatalogFolder.path.like(like, escape="\\")))
             .order_by(CatalogFolder.path).with_for_update()))
-        for row in deleted:
-            s.delete(row)
+        deleted_root = next((row for row in deleted if row.path == path), None)
+        for row, target in zip(moved, targets, strict=True):
+            row.path = target
+        if deleted_root is not None:
+            s.delete(deleted_root)
         s.flush()
         _materialize_folder_paths(s, targets + entry_targets)
+        _workspace_sync_catalog_folder_projections_in_session(s, targets)
+        if deleted_root is not None:
+            _workspace_tombstone_catalog_folder_projection_in_session(s, deleted_root.id)
+        for entry, _logical in entries:
+            _workspace_sync_dataset_folder_in_session(
+                s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
 
 
 def catalog_tree(prefix: str = "", table_limit: int = 100
@@ -15194,8 +15358,9 @@ def catalog_bulk_seed(entries: list[dict]) -> int:
             n += 1
         s.flush()
         for entry in inserted_entries:
-            _workspace_ensure_root_placement_in_session(
-                s, target_kind="dataset", target_id=entry.registration_id, name=entry.name)
+            _materialize_folder(s, entry.folder or "")
+            _workspace_sync_dataset_folder_in_session(
+                s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         for uri, doc in local_owners:
             sync_local_result_owner(s, "catalog_entry", uri, uri, doc)
     return n

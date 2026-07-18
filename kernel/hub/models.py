@@ -684,6 +684,9 @@ class WorkspaceResource(Wire):
     parent_id: str | None = None
     placement_id: str | None = None
     version: int | None = None
+    catalog_folder_id: str | None = None
+    catalog_folder_state: Literal["current", "detached"] | None = None
+    catalog_folder_path: str | None = None
     detached: bool = False
     source: Literal["local", "provider"] = "local"
     mount_id: str | None = None

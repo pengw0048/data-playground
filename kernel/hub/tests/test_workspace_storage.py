@@ -110,21 +110,10 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
     assert replacement["id"] != first["id"]
 
     destination = metadb.workspace_create_container(root_id, f"workspace-{token}-destination")
-    dataset_id = workspace_scope["dataset_id"]
     canvas_placement = metadb.workspace_create_placement(
         replacement["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
         name=f"workspace-{token}-canvas",
     )
-    with metadb.session() as session:
-        dataset_row = session.scalar(select(metadb.WorkspacePlacement).where(
-            metadb.WorkspacePlacement.target_kind == "dataset",
-            metadb.WorkspacePlacement.target_id == dataset_id,
-        ))
-        assert dataset_row is not None
-        dataset_placement = {"id": dataset_row.id, "version": dataset_row.version}
-    dataset_placement = metadb.workspace_update_placement(
-        dataset_placement["id"], expected_version=dataset_placement["version"],
-        container_id=replacement["id"], name=f"workspace-{token}-dataset")
 
     with metadb.session() as session:
         canvas_before = session.get(metadb.Canvas, workspace_scope["canvas_id"])
@@ -139,7 +128,6 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
     assert moved["id"] == canvas_placement["id"]
     assert moved["targetId"] == workspace_scope["canvas_id"]
     assert moved["containerId"] == destination["id"]
-    assert dataset_placement["targetId"] == dataset_id
 
     with metadb.session() as session:
         canvas_after = session.get(metadb.Canvas, workspace_scope["canvas_id"])
@@ -171,23 +159,17 @@ def test_delete_recreate_and_placement_moves_preserve_independent_targets(worksp
 
 def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
     uri = workspace_scope["uri"]
-    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     original = workspace_scope["dataset_id"]
-    container = metadb.workspace_create_container(
-        metadb.local_workspace_root()["id"], f"workspace-{token}-dataset-lifecycle")
     with metadb.session() as session:
         row = session.scalar(select(metadb.WorkspacePlacement).where(
             metadb.WorkspacePlacement.target_kind == "dataset",
             metadb.WorkspacePlacement.target_id == original,
         ))
         assert row is not None
-        placement = {"id": row.id, "version": row.version}
-    placement = metadb.workspace_update_placement(
-        placement["id"], expected_version=placement["version"], container_id=container["id"],
-        name=f"workspace-{token}-dataset-lifecycle")
+        placement_id = row.id
     metadb.catalog_delete_entry(uri)
     with metadb.session() as session:
-        detached = session.get(metadb.WorkspacePlacement, placement["id"])
+        detached = session.get(metadb.WorkspacePlacement, placement_id)
         assert detached is not None and detached.target_id == original
     metadb.catalog_upsert_entry(uri, "Replacement dataset", {
         "id": f"tbl_recreated_{uuid.uuid4().hex}", "name": "Replacement dataset", "uri": uri,
@@ -196,26 +178,153 @@ def test_dataset_recreate_gets_a_new_workspace_target_identity(workspace_scope):
     assert metadb.workspace_builtin_dataset_identity(uri) != original
 
 
+def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_overlay(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    uri, dataset_id = workspace_scope["uri"], workspace_scope["dataset_id"]
+    original = f"projection-{token}/daily"
+    renamed = f"renamed-{token}/daily"
+    metadb.catalog_set_metadata(uri, original, None, None, [])
+    with metadb.session() as session:
+        folder = session.scalar(select(metadb.CatalogFolder).where(
+            metadb.CatalogFolder.path == original))
+        assert folder is not None
+        projection = session.scalar(select(metadb.WorkspaceContainer).where(
+            metadb.WorkspaceContainer.catalog_folder_id == folder.id))
+        dataset = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == dataset_id))
+        assert projection is not None and dataset is not None
+        assert dataset.container_id == projection.id
+        folder_id, projection_id, projection_version = folder.id, projection.id, projection.version
+
+    created = metadb.workspace_create_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, container_id=projection_id,
+        expected_container_version=projection_version, name="Folder overlay")
+    nested = metadb.workspace_create_container(projection_id, f"workspace-{token}-nested-overlay")
+    metadb.catalog_folder_rename(original.rsplit("/", 1)[0], renamed.rsplit("/", 1)[0])
+    with metadb.session() as session:
+        renamed_folder = session.scalar(select(metadb.CatalogFolder).where(
+            metadb.CatalogFolder.path == renamed))
+        renamed_projection = session.get(metadb.WorkspaceContainer, projection_id)
+        assert renamed_folder is not None and renamed_folder.id == folder_id
+        assert renamed_projection is not None and renamed_projection.name == "daily"
+        assert renamed_projection.catalog_folder_path == renamed
+        assert session.get(metadb.WorkspacePlacement, created["resource"]["placementId"]).container_id == projection_id
+
+    metadb.catalog_folder_delete(renamed)
+    with metadb.session() as session:
+        tombstone = session.get(metadb.WorkspaceContainer, projection_id)
+        dataset = session.scalar(select(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "dataset",
+            metadb.WorkspacePlacement.target_id == dataset_id))
+        assert tombstone is not None and tombstone.catalog_folder_state == "detached"
+        assert tombstone.catalog_folder_path == renamed
+        assert tombstone.parent_id == metadb.LOCAL_WORKSPACE_ROOT_ID
+        assert dataset is not None and dataset.container_id != projection_id
+        with pytest.raises(ValueError, match="placed by the Catalog"):
+            metadb.workspace_update_placement(
+                dataset.id, expected_version=dataset.version,
+                container_id=metadb.LOCAL_WORKSPACE_ROOT_ID)
+        tombstone_version = tombstone.version
+
+    with pytest.raises(ValueError, match="read-only Workspace tombstone"):
+        metadb.workspace_create_canvas_action(
+            uid=metadb.DEFAULT_USER_ID, container_id=projection_id,
+            expected_container_version=tombstone_version, name="Blocked")
+    with pytest.raises(ValueError, match="read-only Workspace tombstone"):
+        metadb.workspace_create_container(nested["id"], f"workspace-{token}-blocked-child")
+    with pytest.raises(ValueError, match="read-only Workspace tombstone"):
+        metadb.workspace_update_placement(
+            created["resource"]["placementId"],
+            expected_version=created["resource"]["version"],
+            container_id=nested["id"])
+    escaped = metadb.workspace_update_container(
+        nested["id"], expected_version=nested["version"],
+        parent_id=metadb.LOCAL_WORKSPACE_ROOT_ID)
+    assert escaped["parentId"] == metadb.LOCAL_WORKSPACE_ROOT_ID
+    moved = metadb.workspace_move_canvas_action(
+        uid=metadb.DEFAULT_USER_ID, placement_id=created["resource"]["placementId"],
+        expected_version=created["resource"]["version"],
+        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID, expected_container_version=1)
+    assert moved["container"]["id"] == f"container:{metadb.LOCAL_WORKSPACE_ROOT_ID}"
+    metadb.catalog_delete_entry(uri)
+    metadb.catalog_upsert_entry(uri, "Recreated folder dataset", {
+        "id": f"tbl_recreated_folder_{token}", "name": "Recreated folder dataset", "uri": uri,
+        "folder": renamed, "version": "v2",
+    })
+    with metadb.session() as session:
+        replacement_folder = session.scalar(select(metadb.CatalogFolder).where(
+            metadb.CatalogFolder.path == renamed))
+        replacement_projection = session.scalar(select(metadb.WorkspaceContainer).where(
+            metadb.WorkspaceContainer.catalog_folder_id == replacement_folder.id)) if replacement_folder else None
+        assert replacement_folder is not None and replacement_folder.id != folder_id
+        assert replacement_projection is not None and replacement_projection.id != projection_id
+
+
+def test_catalog_projection_partial_uniqueness_serializes_local_name_collisions(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    name = f"workspace-{token}-authority-collision"
+    root_id = metadb.LOCAL_WORKSPACE_ROOT_ID
+    metadb.catalog_folder_create(name)
+    start = threading.Barrier(3)
+    results = []
+
+    def create_local_container():
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_create_container(root_id, name))
+        except Exception as exc:  # noqa: BLE001 - assert the public conflict type below
+            results.append(exc)
+
+    threads = [threading.Thread(target=create_local_container) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        winners = [result for result in results if isinstance(result, dict)]
+        conflicts = [result for result in results if isinstance(result, metadb.WorkspaceNameConflict)]
+        assert len(winners) == len(conflicts) == 1
+        with metadb.session() as session:
+            siblings = list(session.scalars(select(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.parent_id == root_id,
+                metadb.WorkspaceContainer.name == name)))
+        assert len(siblings) == 2
+        assert {row.catalog_folder_id is None for row in siblings} == {False, True}
+    finally:
+        for thread in threads:
+            thread.join(timeout=10)
+        with metadb.session() as session:
+            local = session.scalar(select(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.parent_id == root_id,
+                metadb.WorkspaceContainer.name == name,
+                metadb.WorkspaceContainer.catalog_folder_id.is_(None)))
+            if local is not None:
+                session.delete(local)
+        try:
+            metadb.catalog_folder_delete(name)
+        except ValueError:
+            pass
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.catalog_folder_path == name))
+
+
 def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_catalog(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
     folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-api", ordinal=0)
     child = metadb.workspace_create_container(folder["id"], f"workspace-{token}-api-child", ordinal=0)
+    second_child = metadb.workspace_create_container(
+        folder["id"], f"workspace-{token}-api-child-two", ordinal=0)
     metadb.set_visibility(workspace_scope["canvas_id"], "workspace")
     dataset_id = workspace_scope["dataset_id"]
     canvas = metadb.workspace_create_placement(
         folder["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
         name=f"workspace-{token}-canvas", ordinal=0)
-    with metadb.session() as session:
-        row = session.scalar(select(metadb.WorkspacePlacement).where(
-            metadb.WorkspacePlacement.target_kind == "dataset",
-            metadb.WorkspacePlacement.target_id == dataset_id,
-        ))
-        assert row is not None
-        dataset_placement = {"id": row.id, "version": row.version}
-    metadb.workspace_update_placement(
-        dataset_placement["id"], expected_version=dataset_placement["version"],
-        container_id=folder["id"], name=f"workspace-{token}-dataset", ordinal=0)
 
     with TestClient(app) as client:
         detail = client.get(f"/api/catalog/tables/{dataset_id}", params={"registration": True})
@@ -239,9 +348,10 @@ def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_ca
             })
             assert second.status_code == 200
             assert [item["id"] for item in first_doc["items"]] == [
-                f"container:{child['id']}", f"canvas:{workspace_scope['canvas_id']}",
+                f"container:{child['id']}", f"container:{second_child['id']}",
             ]
-            assert [item["id"] for item in second.json()["items"]] == [f"dataset:{dataset_id}"]
+            assert [item["id"] for item in second.json()["items"]] == [
+                f"canvas:{workspace_scope['canvas_id']}"]
             assert first_doc["hasMore"] is True and second.json()["hasMore"] is False
             resolved = client.get(f"/api/workspace/resources/{canvas['targetKind']}:{canvas['targetId']}")
             assert resolved.status_code == 200

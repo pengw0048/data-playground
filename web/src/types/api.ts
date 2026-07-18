@@ -163,6 +163,10 @@ export interface WorkspaceResource {
   parentId?: string | null
   placementId?: string | null
   version?: number | null
+  /** Stable built-in Catalog folder binding when this local container is a folder projection. */
+  catalogFolderId?: string | null
+  catalogFolderState?: 'current' | 'detached' | null
+  catalogFolderPath?: string | null
   detached: boolean
   source: 'local' | 'provider'
   mountId?: string | null
