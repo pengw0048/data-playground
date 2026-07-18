@@ -4865,11 +4865,13 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(admission)
         for wait in durable_waits:
             s.delete(wait)
-        if durable_checkpoints:
-            # Terminal hidden checkpoints must release their durable owner / retire their candidate
-            # under the registry lock before the rows vanish, or a committed artifact would stay
-            # pinned forever and a reserved one would leak its exact writer file.
+        parent_ids = [task.id for task in durable_tasks]
+        if parent_ids or durable_checkpoints:
+            # Drop fan-out / checkpoint LocalResult owners under the registry lock first.
             _lock_local_result_registry(s)
+            if parent_ids:
+                from hub import bounded_fanout as _bounded_fanout
+                _bounded_fanout.purge_for_delete(s, parent_ids)
             task_by_id = {task.id: task for task in durable_tasks}
             for checkpoint in durable_checkpoints:
                 _purge_linear_checkpoint_for_delete(s, task_by_id[checkpoint.task_id], checkpoint)
