@@ -492,19 +492,10 @@ def recover(deps) -> None:
         dispatch(task_id, deps)
 
 
-def request_cancel(task_id: str) -> None:
-    with _active_lock:
-        active = _active.get(str(task_id))
-    if active is not None and active[0] is not None:
-        key = active[2] or str(task_id)
-        try:
-            active[0].cancel(key)
-        except KeyError:
-            pass
-
-
-# Re-export checkpoint identity helpers used by admission.
+# Re-export checkpoint identity helpers used by admission. Cancellation is driven entirely by the
+# `cancel_requested` DB flag (durable_task_attempt_should_stop); the fan-out worker registers no
+# interruptible LocalRunner, so there is no request_cancel here.
 __all__ = [
-    "dispatch", "recover", "request_cancel",
+    "dispatch", "recover",
     "checkpoint_identity", "graph_prefix_sha256",
 ]

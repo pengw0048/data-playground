@@ -82,6 +82,31 @@ def test_exact_route_rejects_non_matching_shapes():
     assert exc.value.status_code == 409
 
 
+def test_route_rejects_disabled_or_bypassed_nodes():
+    from fastapi import HTTPException
+
+    def _graph(flag_node: str, flag: str) -> Graph:
+        nodes = {
+            "source": {"id": "source", "type": "source", "data": {"config": {"uri": "/x"}}},
+            "select": {"id": "select", "type": "select", "data": {
+                "config": {"select": "*", "checkpoint": True}}},
+            "write": {"id": "write", "type": "write", "data": {"config": {"filename": "o.parquet"}}},
+        }
+        nodes[flag_node]["data"][flag] = True
+        return Graph.model_validate({
+            "id": "g", "version": 1, "nodes": list(nodes.values()),
+            "edges": [
+                {"id": "e1", "source": "source", "target": "select"},
+                {"id": "e2", "source": "select", "target": "write"},
+            ],
+        })
+
+    for flag_node, flag in (("select", "bypassed"), ("source", "disabled"), ("write", "bypassed")):
+        with pytest.raises(HTTPException) as exc:
+            _linear_checkpoint_shape(_graph(flag_node, flag), "write")
+        assert exc.value.status_code == 409
+
+
 def test_happy_path_materialize_publish_and_jobs(tmp_path):
     uid, canvas_id = f"cp-user-{uuid.uuid4().hex}", f"cp-canvas-{uuid.uuid4().hex}"
     submission = str(uuid.uuid4())

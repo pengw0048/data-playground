@@ -189,9 +189,6 @@ def request_cancel(task_id: str) -> dict | None:
     if task.get("task_kind") == "linear_checkpoint_write":
         from hub.linear_checkpoint_tasks import request_cancel as cancel_linear
         cancel_linear(task_id)
-    elif task.get("task_kind") == "bounded_fanout_write":
-        from hub.bounded_fanout_tasks import request_cancel as cancel_fanout
-        cancel_fanout(task_id)
     return task
 
 

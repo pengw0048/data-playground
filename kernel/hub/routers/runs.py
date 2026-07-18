@@ -145,6 +145,11 @@ def _node_config(node) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _node_bypassed_or_disabled(node) -> bool:
+    data = node.data if isinstance(node.data, dict) else {}
+    return bool(data.get("bypassed")) or bool(data.get("disabled"))
+
+
 def _bounded_fanout_write_shape(graph, target_node_id: str | None):
     """Return (source, checkpoint_select, identity_select, write) for the exact four-node route.
 
@@ -179,10 +184,11 @@ def _bounded_fanout_write_shape(graph, target_node_id: str | None):
     identity_select = by_id.get(write_in.source)
     if identity_select is None or identity_select.type != "select":
         raise HTTPException(409, "bounded fan-out requires identity Select before Write")
-    id_cfg = _node_config(identity_select)
-    if id_cfg != {"select": "*"}:
-        raise HTTPException(
-            409, "bounded fan-out identity Select requires exact {\"select\":\"*\"}")
+    from hub.identity_projection import validate_identity_select_config
+    try:
+        validate_identity_select_config(_node_config(identity_select))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     identity_in = next((edge for edge in edges if edge.target == identity_select.id), None)
     if identity_in is None or identity_in.source != checkpoint_select.id:
         raise HTTPException(
@@ -201,6 +207,9 @@ def _bounded_fanout_write_shape(graph, target_node_id: str | None):
     expected = {source.id, checkpoint_select.id, identity_select.id, write.id}
     if {node.id for node in graph.nodes} != expected:
         raise HTTPException(409, "bounded fan-out tasks reject extra nodes")
+    if any(_node_bypassed_or_disabled(node)
+           for node in (source, checkpoint_select, identity_select, write)):
+        raise HTTPException(409, "bounded fan-out tasks reject disabled or bypassed nodes")
     return source, checkpoint_select, identity_select, write
 
 
@@ -238,6 +247,8 @@ def _linear_checkpoint_shape(graph, target_node_id: str | None):
     other_ids = {node.id for node in graph.nodes} - {source.id, select.id, write.id}
     if other_ids:
         raise HTTPException(409, "linear checkpoint tasks reject extra nodes")
+    if any(_node_bypassed_or_disabled(node) for node in (source, select, write)):
+        raise HTTPException(409, "linear checkpoint tasks reject disabled or bypassed nodes")
     # Reject unsupported Write modes and Select extras early via later admission; keep shape only here.
     return source, select, write
 
