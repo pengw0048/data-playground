@@ -5330,6 +5330,117 @@ def execution_manifest(sha256: str) -> dict | None:
         return {"sha256": row.sha256, "schema_version": row.schema_version, "document": doc}
 
 
+def _execution_manifest_summary_from_row(
+        sha256: str | None, schema_version: int | None, *, present: bool) -> dict:
+    from hub.execution_manifest import SCHEMA_VERSION
+
+    if sha256 is None:
+        return {
+            "executionManifestSha256": None,
+            "executionManifestSchemaVersion": None,
+            "executionManifestAvailability": "not_recorded",
+            "executionManifestReconstructable": False,
+        }
+    if not present:
+        return {
+            "executionManifestSha256": sha256,
+            "executionManifestSchemaVersion": None,
+            "executionManifestAvailability": "pruned",
+            "executionManifestReconstructable": False,
+        }
+    assert schema_version is not None
+    available = schema_version == SCHEMA_VERSION
+    return {
+        "executionManifestSha256": sha256,
+        "executionManifestSchemaVersion": schema_version,
+        "executionManifestAvailability": "available" if available else "unavailable",
+        "executionManifestReconstructable": available,
+    }
+
+
+def _execution_manifest_summaries(identities: set[str | None]) -> dict[str | None, dict]:
+    """Read only digest/schema metadata for one bounded History or Jobs page."""
+    normalized = {str(identity) for identity in identities if identity is not None}
+    with session() as s:
+        rows = {
+            sha256: schema_version
+            for sha256, schema_version in s.execute(select(
+                ExecutionManifest.sha256, ExecutionManifest.schema_version,
+            ).where(ExecutionManifest.sha256.in_(normalized))).all()
+        } if normalized else {}
+    return {
+        identity: _execution_manifest_summary_from_row(
+            identity, rows.get(identity), present=identity in rows)
+        for identity in {*normalized, None}
+    }
+
+
+def execution_manifest_detail_for_subject(
+        uid: str, canvas_id: str, subject_id: str) -> dict | None:
+    """Resolve one History/Jobs subject under its current Canvas visibility.
+
+    ``None`` means the Canvas itself is not visible. A missing subject on an otherwise visible Canvas
+    is an explicit unavailable result, so callers never fall back to a live Canvas or another owner
+    that happens to reference the same digest.
+    """
+    from hub.execution_manifest import (
+        SCHEMA_VERSION,
+        ExecutionManifestError,
+        execution_manifest_admission,
+        validate_execution_manifest,
+    )
+
+    with session() as s:
+        canvas = s.get(Canvas, str(canvas_id))
+        if canvas is None or _workspace_canvas_role_in_session(s, canvas, str(uid)) is None:
+            return None
+
+        identity: str | None
+        if subject_id.startswith("t:"):
+            task = s.get(DurableTask, subject_id.removeprefix("t:"))
+            identity = task.execution_manifest_sha256 if (
+                task is not None and task.canvas_id == canvas_id) else None
+            found = task is not None and task.canvas_id == canvas_id
+        elif subject_id.startswith("s:"):
+            state = s.get(RunState, subject_id.removeprefix("s:"))
+            identity = state.execution_manifest_sha256 if (
+                state is not None and state.canvas_id == canvas_id) else None
+            found = state is not None and state.canvas_id == canvas_id
+        else:
+            history = s.get(RunRecord, subject_id)
+            identity = history.execution_manifest_sha256 if (
+                history is not None and history.canvas_id == canvas_id) else None
+            found = history is not None and history.canvas_id == canvas_id
+
+        if not found:
+            return {
+                "sha256": None, "schemaVersion": None,
+                "availability": "unavailable", "document": None,
+            }
+        row = s.get(ExecutionManifest, identity) if identity is not None else None
+        summary = _execution_manifest_summary_from_row(
+            identity, row.schema_version if row is not None else None,
+            present=row is not None)
+        availability = summary["executionManifestAvailability"]
+        document = None
+        if availability == "available":
+            assert row is not None and row.schema_version == SCHEMA_VERSION
+            try:
+                document = validate_execution_manifest(row.sha256, row.semantic_doc)
+                execution_manifest_admission(row.sha256, row.semantic_doc)
+                if not isinstance(document.get("descriptors"), dict):
+                    raise ExecutionManifestError(
+                        "execution manifest descriptor snapshot is invalid")
+            except ExecutionManifestError:
+                availability = "corrupt"
+        return {
+            "sha256": identity,
+            "schemaVersion": row.schema_version if row is not None else None,
+            "availability": availability,
+            "document": document,
+        }
+
+
 def _execution_manifest_sha256_for_run_in_session(
         s, run_id: str, *, lock: bool = False) -> str | None:
     queries = [
@@ -5962,17 +6073,22 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
     with session() as s:
         rows = s.scalars(select(RunRecord).where(RunRecord.canvas_id == canvas_id)
                          .order_by(RunRecord.created_at.desc()).limit(limit)).all()
-        return [{"id": r.id, "runId": r.run_id, "requestId": r.request_id, "status": r.status,
-                 "targetNodeId": r.target_node_id, "targetPortId": r.target_port_id,
-                 "jobType": r.job_type, "rows": r.rows,
-                 "ms": r.ms, "error": r.error,
-                 "outputs": json.loads(r.outputs),
-                 "inputManifest": json.loads(r.input_manifest) if r.input_manifest else None,
-                 "executionManifestSha256": r.execution_manifest_sha256,
-                 "executionManifestReconstructable": r.execution_manifest_sha256 is not None,
-                 "profile": json.loads(r.profile) if r.profile else None,
-                 "perNode": json.loads(r.per_node) if r.per_node else None,
-                 "createdAt": r.created_at.isoformat() if r.created_at else None} for r in rows]
+        result = [{"id": r.id, "runId": r.run_id, "requestId": r.request_id,
+                   "status": r.status, "targetNodeId": r.target_node_id,
+                   "targetPortId": r.target_port_id, "jobType": r.job_type,
+                   "rows": r.rows, "ms": r.ms, "error": r.error,
+                   "outputs": json.loads(r.outputs),
+                   "inputManifest": json.loads(r.input_manifest) if r.input_manifest else None,
+                   "executionManifestSha256": r.execution_manifest_sha256,
+                   "profile": json.loads(r.profile) if r.profile else None,
+                   "perNode": json.loads(r.per_node) if r.per_node else None,
+                   "createdAt": r.created_at.isoformat() if r.created_at else None}
+                  for r in rows]
+    summaries = _execution_manifest_summaries({
+        item["executionManifestSha256"] for item in result})
+    for item in result:
+        item.update(summaries[item["executionManifestSha256"]])
+    return result
 
 
 def _workspace_run_cursor_encode(created_at: datetime.datetime, identity: str) -> str:
@@ -6516,6 +6632,10 @@ def list_workspace_runs(
     page = candidates[:limit]
     has_more = len(candidates) > limit
     next_cursor = _workspace_run_cursor_encode(*page[-1][0]) if has_more and page else None
+    summaries = _execution_manifest_summaries({
+        doc.get("executionManifestSha256") for _key, doc in page})
+    for _key, doc in page:
+        doc.update(summaries[doc.get("executionManifestSha256")])
     return {"items": [doc for _key, doc in page],
             "nextCursor": next_cursor, "hasMore": has_more}
 

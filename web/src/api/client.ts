@@ -461,6 +461,10 @@ export const api = {
   },
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
+  executionManifest: (canvasId: string, subjectId: string) =>
+    req<ExecutionManifestDetail>(
+      `/canvas/${encodeURIComponent(canvasId)}/runs/${encodeURIComponent(subjectId)}/manifest`,
+    ),
   workspaceJobs: (params: WorkspaceJobsQuery = {}) => {
     const query = new URLSearchParams()
     if (params.limit != null) query.set('limit', String(params.limit))
@@ -512,7 +516,23 @@ export interface DestinationPreset { id: string; name: string; backend: string; 
 export interface BrowseEntry { name: string; kind: 'dir' | 'file'; uri: string }
 export interface BrowseResult { path: string; entries: BrowseEntry[]; error?: string | null; writable?: boolean }
 export type PerNodeStat = PerNodeStatus
-export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; executionManifestSha256?: string | null; executionManifestReconstructable?: boolean; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
+export type ExecutionManifestAvailability = 'available' | 'pruned' | 'not_recorded' | 'unavailable' | 'corrupt'
+export interface ExecutionManifestDocument {
+  schemaVersion: number
+  graph: { nodes: unknown[]; edges: unknown[]; requirements: string[] }
+  target: { nodeId?: string | null; portId?: string | null }
+  admittedInputs: Array<{ nodeId: string; datasetId: string; revisionId: string; provider: string }>
+  writeIntent?: unknown | null
+  descriptors: unknown
+  parameters?: unknown
+}
+export interface ExecutionManifestDetail {
+  sha256?: string | null
+  schemaVersion?: number | null
+  availability: ExecutionManifestAvailability
+  document?: ExecutionManifestDocument | null
+}
+export interface RunRecordDto { id: string; runId?: string | null; requestId?: string | null; jobType: 'run' | 'profile'; status: string; targetNodeId?: string | null; targetPortId?: string | null; rows?: number | null; ms?: number | null; error?: string | null; inputManifest?: RunInputManifestItem[] | null; executionManifestSha256?: string | null; executionManifestSchemaVersion?: number | null; executionManifestAvailability?: ExecutionManifestAvailability; executionManifestReconstructable?: boolean; outputs: RunOutput[]; profile?: ProfileResult | null; perNode?: PerNodeStat[] | null; createdAt?: string | null }
 export interface DurableTaskAttemptDto { id: string; attemptNumber: number; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'fenced'; progress?: number | null; error?: string | null; startedAt?: string | null; completedAt?: string | null; updatedAt: string }
 export interface ExternalWaitJobDto { providerKind: string; phase: 'unsubmitted' | 'submitting' | 'accepted' | 'running' | 'provider_succeeded' | 'downloading' | 'downloaded' | 'publishing' | 'published' | 'provider_failed' | 'provider_cancelled' | 'finalization_failed' | 'cancelled_before_submit' | 'cancelled_after_success'; attemptNumber: number; cancelRequested: boolean; canRetry: boolean; diagnosticCode?: string | null }
 export interface CheckpointJobDto {

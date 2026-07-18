@@ -1270,6 +1270,10 @@ class RunHistoryRecord(Wire):
     # Null is an explicit legacy/non-reconstructable outcome. #504 adds the authorized detail surface;
     # readers must never substitute the current Canvas when this identity is absent.
     execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_schema_version: int | None = Field(default=None, ge=1)
+    execution_manifest_availability: Literal[
+        "available", "pruned", "not_recorded", "unavailable", "corrupt",
+    ] = "not_recorded"
     execution_manifest_reconstructable: bool = False
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     # Full-profile jobs have no materialized outputs. Keep their measured profile as a separate,
@@ -1289,8 +1293,17 @@ class RunHistoryRecord(Wire):
     @model_validator(mode="after")
     def _unique_outputs(self) -> "RunHistoryRecord":
         if self.execution_manifest_reconstructable != (
-                self.execution_manifest_sha256 is not None):
-            raise ValueError("run history reconstructability must match its manifest identity")
+                self.execution_manifest_availability == "available"):
+            raise ValueError("run history reconstructability must match manifest availability")
+        if self.execution_manifest_sha256 is None and self.execution_manifest_schema_version is not None:
+            raise ValueError("run history manifest schema requires a manifest identity")
+        if (self.execution_manifest_availability == "available"
+                and (self.execution_manifest_sha256 is None
+                     or self.execution_manifest_schema_version is None)):
+            raise ValueError("available run history requires manifest identity and schema")
+        if (self.execution_manifest_availability == "not_recorded"
+                and self.execution_manifest_sha256 is not None):
+            raise ValueError("unrecorded run history cannot have a manifest identity")
         keys = [(output.node_id, output.port_id) for output in self.outputs]
         if len(keys) != len(set(keys)):
             raise ValueError("run-history outputs must have unique (nodeId, portId) identities")
@@ -1324,6 +1337,30 @@ class RunHistoryRecord(Wire):
                     raise ValueError(
                         "successful targeted run history requires committed outputs")
             validate_run_output_rows(self.outputs, self.rows, field_name="history rows")
+        return self
+
+
+class ExecutionManifestDetail(Wire):
+    """One subject-authorized immutable execution-manifest read."""
+
+    sha256: PlanDigest | None = None
+    schema_version: int | None = Field(default=None, ge=1)
+    availability: Literal[
+        "available", "pruned", "not_recorded", "unavailable", "corrupt",
+    ]
+    document: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _availability_matches_document(self) -> "ExecutionManifestDetail":
+        if (self.document is not None) != (self.availability == "available"):
+            raise ValueError("only an available execution manifest can include its document")
+        if self.sha256 is None and self.schema_version is not None:
+            raise ValueError("execution manifest schema requires an identity")
+        if self.availability == "not_recorded" and self.sha256 is not None:
+            raise ValueError("an unrecorded execution manifest cannot have an identity")
+        if self.availability == "available" and (
+                self.sha256 is None or self.schema_version is None):
+            raise ValueError("an available execution manifest requires identity and schema")
         return self
 
 
@@ -1439,6 +1476,10 @@ class WorkspaceRunRecord(Wire):
     error: str | None = None
     input_manifest: list[dict[str, str]] | None = None
     execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_schema_version: int | None = Field(default=None, ge=1)
+    execution_manifest_availability: Literal[
+        "available", "pruned", "not_recorded", "unavailable", "corrupt",
+    ] = "not_recorded"
     execution_manifest_reconstructable: bool = False
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     profile: ProfileResult | None = None
@@ -1465,8 +1506,17 @@ class WorkspaceRunRecord(Wire):
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
         if self.execution_manifest_reconstructable != (
-                self.execution_manifest_sha256 is not None):
-            raise ValueError("workspace run reconstructability must match its manifest identity")
+                self.execution_manifest_availability == "available"):
+            raise ValueError("workspace run reconstructability must match manifest availability")
+        if self.execution_manifest_sha256 is None and self.execution_manifest_schema_version is not None:
+            raise ValueError("workspace run manifest schema requires a manifest identity")
+        if (self.execution_manifest_availability == "available"
+                and (self.execution_manifest_sha256 is None
+                     or self.execution_manifest_schema_version is None)):
+            raise ValueError("available workspace run requires manifest identity and schema")
+        if (self.execution_manifest_availability == "not_recorded"
+                and self.execution_manifest_sha256 is not None):
+            raise ValueError("unrecorded workspace run cannot have a manifest identity")
         keys = [(output.node_id, output.port_id) for output in self.outputs]
         if len(keys) != len(set(keys)):
             raise ValueError("workspace run outputs must have unique (nodeId, portId) identities")

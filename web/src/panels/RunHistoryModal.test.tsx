@@ -10,6 +10,7 @@ import { register } from '../nodes/registry'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
+  executionManifest: vi.fn(),
   tableByRegistration: vi.fn(),
   datasetRevision: vi.fn(),
   sample: vi.fn(),
@@ -41,6 +42,7 @@ function registerAssertUiTestNode() {
 
 beforeEach(() => {
   apiMock.listRuns.mockReset()
+  apiMock.executionManifest.mockReset()
   apiMock.tableByRegistration.mockReset()
   apiMock.datasetRevision.mockReset()
   apiMock.sample.mockReset()
@@ -193,6 +195,43 @@ describe('admitted run inputs', () => {
 
     expect(await screen.findByText('No admitted input manifest was recorded for this legacy run.')).toBeInTheDocument()
     expect(apiMock.datasetRevision).not.toHaveBeenCalled()
+  })
+})
+
+describe('execution manifest inspection', () => {
+  it('loads the immutable detail lazily and renders every recorded contract section', async () => {
+    const digest = 'a'.repeat(64)
+    apiMock.listRuns.mockResolvedValue([{
+      id: 'manifest-history', runId: 'manifest-run', jobType: 'run', status: 'failed',
+      outputs: [], executionManifestSha256: digest, executionManifestSchemaVersion: 1,
+      executionManifestAvailability: 'available', executionManifestReconstructable: true,
+    }])
+    apiMock.executionManifest.mockResolvedValue({
+      sha256: digest, schemaVersion: 1, availability: 'available', document: {
+        schemaVersion: 1,
+        graph: {
+          nodes: [{ id: 'source', type: 'source', data: { config: {} } }],
+          edges: [], requirements: ['polars==1.0'],
+        },
+        target: { nodeId: 'source', portId: null },
+        admittedInputs: [{ nodeId: 'source', datasetId: 'dataset-1', revisionId: 'revision-1', provider: 'local' }],
+        writeIntent: { mode: 'create', destination: { name: 'result' } },
+        descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
+      },
+    })
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    const toggle = await screen.findByRole('button', { name: /Execution manifest/ })
+    expect(apiMock.executionManifest).not.toHaveBeenCalled()
+    await user.click(toggle)
+
+    expect(await screen.findByText('Submitted graph')).toBeVisible()
+    expect(screen.getByText('Admitted write intent')).toBeVisible()
+    expect(screen.getByText('Runtime descriptor snapshot')).toBeVisible()
+    expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+    expect(screen.getByText(/dataset-1@revision-1/)).toBeVisible()
+    expect(apiMock.executionManifest).toHaveBeenCalledWith('history-canvas', 'manifest-history')
   })
 })
 
