@@ -317,6 +317,13 @@ def test_changed_semantics_conflict(tmp_path):
 
 
 def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
+    # This is a post-commit replay test, not a short-lease stress test. Own both
+    # leases here so unrelated three-shard CI contention cannot turn the initial
+    # healthy run into a recovery run before this test injects its retry.
+    from hub import bounded_fanout as fanout
+
+    monkeypatch.setattr(metadb, "_DURABLE_TASK_LEASE_SECONDS", 60 * 60)
+    monkeypatch.setattr(fanout, "_LEASE_S", 60 * 60)
     uid, canvas_id = f"once-user-{uuid.uuid4().hex}", f"once-canvas-{uuid.uuid4().hex}"
     submission = str(uuid.uuid4())
     with metadb.session() as session:
