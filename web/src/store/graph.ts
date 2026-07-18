@@ -123,6 +123,18 @@ export function newId(kind: string): string {
   return `${kind}-${_seq}-${Math.floor(performance.now() % 100000)}`
 }
 
+/** Stable logical identity for one promoted Canvas node. Display text is deliberately excluded: two
+ * same-title cells stay distinct, while a rename or a response-loss retry reuses the same identity. */
+export function promotedTransformKey(canvasId: string, nodeId: string): string {
+  const identity = JSON.stringify([canvasId, nodeId])
+  let hash = 0xcbf29ce484222325n
+  for (const byte of new TextEncoder().encode(identity)) {
+    hash ^= BigInt(byte)
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n)
+  }
+  return `canvas-node.${hash.toString(16).padStart(16, '0')}`
+}
+
 // In-app clipboard for copy/paste of a node selection — lives in the module so it works across canvases
 // in the same tab (the system clipboard can't hold graph structure).
 let _clipboard: { nodes: CanvasNode[]; edges: CanvasEdge[] } | null = null
@@ -2222,23 +2234,25 @@ export const useStore = create<Store>((set, get) => ({
 
   promote: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
-    const n = get().doc.nodes.find((x) => x.id === id)
+    const doc = get().doc
+    const n = doc.nodes.find((x) => x.id === id)
     if (!n) return
     const cfg = n.data.config
-    const pid = `user.${(n.data.title || 'op').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`
     const desc = await api.promote({
-      id: pid,
+      id: promotedTransformKey(doc.id, n.id),
       title: n.data.title,
       mode: (cfg.mode as string) ?? 'map',
       code: (cfg.code as string) ?? '',
       inputColumns: [],
       outputSchema: Array.isArray(cfg.outputSchema) ? (cfg.outputSchema as any) : [],  // a {ref} contract doesn't inline here
+      requirements: doc.requirements ?? [],
       blurb: 'promoted from an ad-hoc cell',
     })
-    // KEEP the original code on the node (don't null it): the promote is in-memory server-side, so
-    // after a kernel restart the library id may be gone — the kept code lets the node still run
-    // (engine falls back to it) instead of the user's code being destroyed.
-    get().updateConfig(id, { source: 'library', processor: desc.id, version: desc.version })
+    // The durable exact reference is now the execution definition. Inline code remains an ad-hoc
+    // representation only and must not silently become a fallback for an unavailable library version.
+    get().updateConfig(id, {
+      source: 'library', processor: desc.id, version: desc.version, mode: desc.mode, code: null,
+    })
     // refresh ONLY the processor list for the library picker — do NOT call bootstrap(), which
     // would re-hydrate the doc from (debounced, still-stale) localStorage and revert this node.
     try {

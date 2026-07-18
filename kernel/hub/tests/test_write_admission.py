@@ -17,7 +17,7 @@ from hub.models import Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
-from hub.plugins.processors import InMemoryProcessorRegistry
+from hub.plugins.processors import ProcessorRegistry
 from hub.routers.runs import _write_admission_for_graph
 from hub.routers.runs import _inject_write_intent
 from hub.routers.runs import _local_run_intent_sha256
@@ -68,7 +68,7 @@ def contract(tmp_path):
     deps = SimpleNamespace(
         workspace=str(tmp_path), storage=storage, catalog=catalog,
         resolve_adapter=lambda _uri: adapter,
-        registry=InMemoryProcessorRegistry(), node_builders={},
+        registry=ProcessorRegistry(), node_builders={},
         node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
     )
     try:
@@ -108,7 +108,7 @@ def lance_contract(tmp_path):
     deps = SimpleNamespace(
         workspace=str(tmp_path), storage=storage, catalog=catalog,
         resolve_adapter=resolve_adapter,
-        registry=InMemoryProcessorRegistry(), node_builders={},
+        registry=ProcessorRegistry(), node_builders={},
         node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
         node_ir={}, runners=[], runner=runner_capability,
         pick_runner=lambda _plan, _uid: runner_capability,

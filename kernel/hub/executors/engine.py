@@ -1032,17 +1032,22 @@ class BuildEngine:
     def _transform(self, node: GraphNode, parent: Relation) -> Relation:
         cfg = resolve_config(node)  # shared resolver (hub.ir): mode/code/source/processor/params/onError
         if node.type == "transform" and cfg.get("source") == "library":
-            pid = cfg.get("processor")
-            if pid and self.registry.has(pid):
-                proc = self.registry.get(pid)
-                fn, mode = proc.build(cfg.get("params", {})), proc.mode
-            elif cfg.get("code"):
-                # the library processor isn't registered (e.g. an in-memory promote lost on restart),
-                # but the node kept its original code — run that instead of failing (no data loss).
-                mode = cfg.get("mode", "map")
-                fn = sandbox.compile_operator(cfg["code"], mode)
-            else:
-                raise NotPreviewable(node, f"processor '{pid}' is not registered")
+            pid, version = cfg.get("processor"), cfg.get("version")
+            if not pid or not version:
+                raise NotPreviewable(node, "library transform requires an exact processor id and version")
+            try:
+                proc = self.registry.get(str(pid), str(version))
+            except KeyError as exc:
+                raise NotPreviewable(
+                    node, f"processor '{pid}' exact version '{version}' is unavailable") from exc
+            missing_requirements = sorted(set(proc.requirements) - set(self.graph.requirements))
+            if missing_requirements:
+                raise NotPreviewable(
+                    node,
+                    f"processor '{pid}' exact version '{version}' requires Canvas dependencies: "
+                    + ", ".join(missing_requirements),
+                )
+            fn, mode = proc.build(cfg.get("params", {})), proc.mode
         else:
             code = cfg.get("code")
             mode = cfg.get("mode", "map")
@@ -1407,9 +1412,9 @@ def node_previewable(node: GraphNode, registry=None, node_specs=None) -> bool:
     if node.type == "transform":
         cfg = _cfg(node)
         if cfg.get("source") == "library" and registry is not None:
-            pid = cfg.get("processor")
-            if pid and registry.has(pid):
-                return registry.get(pid).mode in PREVIEWABLE_MODES
+            pid, version = cfg.get("processor"), cfg.get("version")
+            if pid and version and registry.has(str(pid), str(version)):
+                return registry.get(str(pid), str(version)).mode in PREVIEWABLE_MODES
         return cfg.get("mode", "map") in PREVIEWABLE_MODES
     # plugin kinds: honor the declared spec.previewable (§8.1)
     if node_specs and node.type in node_specs:

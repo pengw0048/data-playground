@@ -27,9 +27,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select,
-    text, tuple_, update,
+    BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
+    Integer, LargeBinary, String, Text, UniqueConstraint, and_, cast, create_engine, delete, exists,
+    func, literal, or_, select, text, tuple_, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -293,6 +293,72 @@ class ExecutionManifest(Base):
     semantic_doc: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
+
+
+class PromotedTransform(Base):
+    """Owner-scoped logical identity for one promoted Transform.
+
+    ``key`` is the bounded client identity used to make a retried promotion converge. ``id`` is the
+    opaque stable reference stored by Canvases; neither identity nor version numbers are reusable.
+    """
+    __tablename__ = "promoted_transforms"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False, index=True)
+    key: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "key", name="uq_promoted_transform_owner_key"),
+    )
+
+
+class PromotedTransformVersion(Base):
+    """One immutable, server-digested promoted Transform definition."""
+    __tablename__ = "promoted_transform_versions"
+    transform_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("promoted_transforms.id"), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    semantic_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    blurb: Mapped[str] = mapped_column(String(2000), nullable=False, default="", server_default="")
+    category: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str] = mapped_column(String(64), nullable=False)
+    code: Mapped[str] = mapped_column(Text, nullable=False)
+    input_schema: Mapped[str] = mapped_column(Text, nullable=False)
+    output_schema: Mapped[str] = mapped_column(Text, nullable=False)
+    requirements: Mapped[str] = mapped_column(Text, nullable=False)
+    creator_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("transform_id", "semantic_digest", name="uq_promoted_transform_digest"),
+        CheckConstraint("version >= 1", name="ck_promoted_transform_version_positive"),
+    )
+
+
+class PromotedTransformVersionRef(Base):
+    """Exact retention hold owned only by a Canvas, Canvas snapshot, or execution manifest."""
+    __tablename__ = "promoted_transform_version_refs"
+    owner_kind: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    transform_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["transform_id", "version"],
+            ["promoted_transform_versions.transform_id", "promoted_transform_versions.version"],
+            name="fk_promoted_transform_version_ref",
+        ),
+        CheckConstraint(
+            "owner_kind IN ('canvas', 'canvas_version', 'execution_manifest')",
+            name="ck_promoted_transform_ref_owner_kind",
+        ),
+        Index("ix_promoted_transform_version_refs_version", "transform_id", "version"),
+    )
 
 
 class LocalFileInputRevision(Base):
@@ -3060,6 +3126,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         s.add_all([canvas, placement])
         s.flush()
         sync_local_result_owner(s, "canvas", canvas_id, doc)
+        _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         return {
             "ok": True, "id": canvas_id, "created": True,
             "resource": _workspace_placement_resource(placement, detached=False),
@@ -3096,6 +3163,7 @@ def workspace_add_datasets_action(*, uid: str, canvas_id: str,
         doc["version"] = canvas.version
         canvas.doc = json.dumps(doc)
         sync_local_result_owner(s, "canvas", canvas_id, doc)
+        _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
         return {"ok": True, "id": canvas_id, "version": canvas.version, "doc": doc}
 
 
@@ -5421,11 +5489,308 @@ def _admit_local_file_input_revisions(
             raise RuntimeError("local file input registration is unavailable")
 
 
+def _promoted_transform_id(owner_id: str, key: str) -> str:
+    digest = hashlib.sha256(f"{owner_id}\0{key}".encode("utf-8")).hexdigest()
+    return f"tr_{digest[:29]}"
+
+
+def _canonical_promoted_transform_definition(
+        *, title: str, blurb: str, category: str, mode: str, code: str,
+        input_schema: list[ColumnSchema], output_schema: list[ColumnSchema],
+        requirements: list[str]) -> tuple[str, str]:
+    """Return one immutable definition's server-derived digest and canonical document."""
+    from hub.promoted_transforms import promoted_transform_definition
+
+    digest, doc = promoted_transform_definition(
+        title=title, blurb=blurb, category=category, mode=mode, code=code,
+        input_schema=input_schema, output_schema=output_schema, requirements=requirements)
+    return digest, json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _promoted_transform_version_doc(row: PromotedTransformVersion) -> dict:
+    created_at = row.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    return {
+        "id": row.transform_id,
+        "version": f"v{row.version}",
+        "title": row.title,
+        "blurb": row.blurb,
+        "category": row.category,
+        "mode": row.mode,
+        "code": row.code,
+        "input_schema": json.loads(row.input_schema),
+        "output_schema": json.loads(row.output_schema),
+        "requirements": json.loads(row.requirements),
+        "creator_id": row.creator_id,
+        "created_at": created_at,
+        "semantic_digest": row.semantic_digest,
+        "deleted_at": row.deleted_at,
+    }
+
+
+def promote_transform(
+        *, owner_id: str, key: str, title: str, blurb: str, category: str,
+        mode: str, code: str, input_schema: list[ColumnSchema],
+        output_schema: list[ColumnSchema], requirements: list[str]) -> dict:
+    """Append or idempotently reopen one immutable owner-scoped Transform version."""
+    semantic_digest, canonical = _canonical_promoted_transform_definition(
+        title=title, blurb=blurb, category=category, mode=mode, code=code,
+        input_schema=input_schema, output_schema=output_schema, requirements=requirements)
+    definition = json.loads(canonical)
+    transform_id = _promoted_transform_id(owner_id, key)
+    with session() as s:
+        dialect = s.get_bind().dialect.name
+        values = {
+            "id": transform_id, "owner_id": owner_id, "key": key, "created_at": _now(),
+        }
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+            raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+        s.execute(dialect_insert(PromotedTransform).values(
+            **values,
+        ).on_conflict_do_nothing(index_elements=[PromotedTransform.id]))
+        s.flush()
+        identity = s.get(
+            PromotedTransform, transform_id, with_for_update=True, populate_existing=True)
+        if identity is None or identity.owner_id != owner_id or identity.key != key:
+            raise RuntimeError("promoted Transform identity collision")
+        existing = s.scalar(select(PromotedTransformVersion).where(
+            PromotedTransformVersion.transform_id == transform_id,
+            PromotedTransformVersion.semantic_digest == semantic_digest,
+        ).limit(1).with_for_update())
+        if existing is not None:
+            # A deleted immutable definition stays a tombstone and cannot be republished by replay.
+            if existing.deleted_at is not None:
+                raise ValueError("this promoted Transform definition was deleted and cannot be reused")
+            return _promoted_transform_version_doc(existing)
+        next_version = int(s.scalar(select(
+            func.max(PromotedTransformVersion.version),
+        ).where(PromotedTransformVersion.transform_id == transform_id)) or 0) + 1
+        row = PromotedTransformVersion(
+            transform_id=transform_id,
+            version=next_version,
+            semantic_digest=semantic_digest,
+            title=definition["title"],
+            blurb=definition["blurb"],
+            category=definition["category"],
+            mode=definition["mode"],
+            code=definition["code"],
+            input_schema=json.dumps(definition["inputSchema"], separators=(",", ":")),
+            output_schema=json.dumps(definition["outputSchema"], separators=(",", ":")),
+            requirements=json.dumps(definition["requirements"], separators=(",", ":")),
+            creator_id=owner_id,
+            created_at=_now(),
+        )
+        s.add(row)
+        s.flush()
+        return _promoted_transform_version_doc(row)
+
+
+def list_promoted_transforms(owner_id: str) -> list[dict]:
+    """Return the newest active version of each owner-visible promoted identity."""
+    with session() as s:
+        rows = list(s.scalars(select(PromotedTransformVersion).join(
+            PromotedTransform,
+            PromotedTransform.id == PromotedTransformVersion.transform_id,
+        ).where(
+            PromotedTransform.owner_id == owner_id,
+            PromotedTransformVersion.deleted_at.is_(None),
+        ).order_by(
+            PromotedTransformVersion.transform_id,
+            PromotedTransformVersion.version.desc(),
+        )))
+        latest: dict[str, PromotedTransformVersion] = {}
+        for row in rows:
+            latest.setdefault(row.transform_id, row)
+        return [_promoted_transform_version_doc(row) for row in latest.values()]
+
+
+def _promoted_transform_version_number(version) -> int | None:
+    from hub.promoted_transforms import promoted_transform_version_number
+    return promoted_transform_version_number(version)
+
+
+def promoted_transform_version(transform_id: str, version: str) -> dict | None:
+    """Resolve one exact active promoted version; never substitute a different version."""
+    number = _promoted_transform_version_number(version)
+    if number is None:
+        return None
+    with session() as s:
+        row = s.get(PromotedTransformVersion, (str(transform_id), number))
+        if row is None or row.deleted_at is not None:
+            return None
+        return _promoted_transform_version_doc(row)
+
+
+def _promoted_transform_refs(*values) -> set[tuple[str, int]]:
+    refs: set[tuple[str, int]] = set()
+
+    def walk(value) -> None:
+        if isinstance(value, dict):
+            if value.get("source") == "library":
+                transform_id, raw_version = value.get("processor"), value.get("version")
+                if isinstance(transform_id, str) and transform_id.startswith("tr_"):
+                    version = _promoted_transform_version_number(raw_version)
+                    if version is not None:
+                        refs.add((transform_id, version))
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for value in values:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump(by_alias=True, mode="json")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+        walk(value)
+    return refs
+
+
+def _replace_promoted_transform_refs(
+        s, owner_kind: str, owner_key: str, *values) -> None:
+    """Replace one durable owner's exact holds in the caller's transaction."""
+    if owner_kind not in {"canvas", "canvas_version", "execution_manifest"}:
+        raise ValueError("invalid promoted Transform reference owner")
+    owner_key = str(owner_key)
+    desired = _promoted_transform_refs(*values)
+    existing = {(str(transform_id), int(version)) for transform_id, version in s.execute(select(
+        PromotedTransformVersionRef.transform_id,
+        PromotedTransformVersionRef.version,
+    ).where(
+        PromotedTransformVersionRef.owner_kind == owner_kind,
+        PromotedTransformVersionRef.owner_key == owner_key,
+    ))}
+    # Global lock order shared with version deletion: exact version rows, sorted, then ref rows. Taking
+    # the old+new union before changing owner refs prevents Canvas replacement from holding a ref while
+    # waiting on a version that a concurrent tombstone owns (the inverse path deadlocked PostgreSQL).
+    active: set[tuple[str, int]] = set()
+    for transform_id, version in sorted(existing | desired):
+        row = s.get(
+            PromotedTransformVersion, (transform_id, version), with_for_update=True)
+        if (transform_id, version) in desired and row is not None and row.deleted_at is None:
+            active.add((transform_id, version))
+    list(s.scalars(select(PromotedTransformVersionRef).where(
+        PromotedTransformVersionRef.owner_kind == owner_kind,
+        PromotedTransformVersionRef.owner_key == owner_key,
+    ).order_by(
+        PromotedTransformVersionRef.transform_id,
+        PromotedTransformVersionRef.version,
+    ).with_for_update()))
+    s.execute(delete(PromotedTransformVersionRef).where(
+        PromotedTransformVersionRef.owner_kind == owner_kind,
+        PromotedTransformVersionRef.owner_key == owner_key,
+    ))
+    for transform_id, version in sorted(active):
+        s.add(PromotedTransformVersionRef(
+            owner_kind=owner_kind,
+            owner_key=owner_key,
+            transform_id=transform_id,
+            version=version,
+            created_at=_now(),
+        ))
+    s.flush()
+
+
+def _drop_promoted_transform_refs(s, owner_kind: str, owner_key: str) -> None:
+    s.execute(delete(PromotedTransformVersionRef).where(
+        PromotedTransformVersionRef.owner_kind == owner_kind,
+        PromotedTransformVersionRef.owner_key == str(owner_key),
+    ))
+
+
+def require_promoted_transform_use(
+        uid: str, graph_doc, *, canvas_id: str | None = None) -> None:
+    """Authorize promoted exact refs by ownership or an already-retained visible Canvas ref.
+
+    A missing/deleted exact ref is allowed through so validation/execution can report its truthful
+    unavailable state. Existing definitions cannot be imported into an unrelated user's Canvas merely
+    by guessing their opaque ID.
+    """
+    requested = _promoted_transform_refs(graph_doc)
+    if not requested:
+        return
+    with session() as s:
+        retained: set[tuple[str, int]] = set()
+        if canvas_id:
+            canvas = s.get(Canvas, str(canvas_id))
+            if (canvas is not None
+                    and _workspace_canvas_role_in_session(s, canvas, str(uid)) is not None):
+                # Authorization comes only from a hold that was durably established while the exact
+                # version existed and the Canvas writer was authorized. A raw missing-version ref in
+                # ``canvas.doc`` is intentionally not retained; otherwise a future owner promotion
+                # would silently turn that old document into a new cross-user capability.
+                retained = {(str(transform_id), int(version))
+                            for transform_id, version in s.execute(select(
+                                PromotedTransformVersionRef.transform_id,
+                                PromotedTransformVersionRef.version,
+                            ).join(PromotedTransformVersion, and_(
+                                PromotedTransformVersion.transform_id
+                                == PromotedTransformVersionRef.transform_id,
+                                PromotedTransformVersion.version
+                                == PromotedTransformVersionRef.version,
+                            )).where(
+                                PromotedTransformVersionRef.owner_kind == "canvas",
+                                PromotedTransformVersionRef.owner_key == str(canvas_id),
+                                PromotedTransformVersion.deleted_at.is_(None),
+                            ))}
+        for transform_id, version in sorted(requested):
+            row = s.get(PromotedTransformVersion, (transform_id, version))
+            if row is None or row.deleted_at is not None:
+                continue
+            identity = s.get(PromotedTransform, transform_id)
+            if identity is None:
+                raise RuntimeError("promoted Transform version has no logical identity")
+            if identity.owner_id != str(uid) and (transform_id, version) not in retained:
+                raise PermissionError(
+                    f"promoted Transform {transform_id}@v{version} is not available to this user")
+
+
+def delete_promoted_transform_version(
+        owner_id: str, transform_id: str, version: str) -> dict:
+    """Tombstone one unreferenced version while retaining its non-reusable identity."""
+    number = _promoted_transform_version_number(version)
+    if number is None:
+        raise KeyError("promoted Transform version not found")
+    with session() as s:
+        identity = s.get(PromotedTransform, str(transform_id), with_for_update=True)
+        row = s.get(
+            PromotedTransformVersion, (str(transform_id), number), with_for_update=True)
+        if identity is None or row is None or identity.owner_id != owner_id:
+            raise KeyError("promoted Transform version not found")
+        if row.deleted_at is not None:
+            return {"ok": True, "deleted": True}
+        owners = list(s.execute(select(
+            PromotedTransformVersionRef.owner_kind,
+            PromotedTransformVersionRef.owner_key,
+        ).where(
+            PromotedTransformVersionRef.transform_id == transform_id,
+            PromotedTransformVersionRef.version == number,
+        ).order_by(
+            PromotedTransformVersionRef.owner_kind,
+            PromotedTransformVersionRef.owner_key,
+        ).limit(20).with_for_update()))
+        if owners:
+            kinds = ", ".join(sorted({str(kind) for kind, _key in owners}))
+            raise ValueError(
+                f"promoted Transform {transform_id}@v{number} is retained by {kinds}")
+        row.deleted_at = _now()
+        return {"ok": True, "deleted": True}
+
+
 def _persist_execution_manifest(s, sha256: str, semantic_doc: str) -> str:
     """Create or verify one immutable content-addressed execution definition."""
     from hub.execution_manifest import SCHEMA_VERSION, validate_execution_manifest
 
-    validate_execution_manifest(sha256, semantic_doc)
+    manifest_doc = validate_execution_manifest(sha256, semantic_doc)
     values = {
         "sha256": str(sha256), "schema_version": SCHEMA_VERSION,
         "semantic_doc": semantic_doc, "created_at": _now(),
@@ -5452,6 +5817,8 @@ def _persist_execution_manifest(s, sha256: str, semantic_doc: str) -> str:
     if (existing is None or existing.schema_version != SCHEMA_VERSION
             or existing.semantic_doc != semantic_doc):
         raise RuntimeError("execution manifest digest collision")
+    _replace_promoted_transform_refs(
+        s, "execution_manifest", str(sha256), manifest_doc)
     return str(sha256)
 
 
@@ -5649,6 +6016,7 @@ def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> 
             DurableTaskInboxItem.execution_manifest_sha256,
         ))
         if not referenced:
+            _drop_promoted_transform_refs(s, "execution_manifest", sha256)
             s.delete(row)
 
 
@@ -6146,6 +6514,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(r)
         for v in versions:
             local_owners.append(("canvas_version", v.id))
+            _drop_promoted_transform_refs(s, "canvas_version", v.id)
             s.delete(v)
         for latest in profile_latest:
             local_owners.append(("profile_job", latest.run_id))
@@ -6172,6 +6541,7 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         _lock_local_result_registry(s)
         for owner_kind, owner_key in sorted(local_owners):
             _drop_local_result_owner_locked(s, owner_kind, owner_key)
+        _drop_promoted_transform_refs(s, "canvas", canvas_id)
         s.delete(canvas)
         s.flush()
         _delete_unreferenced_execution_manifests(
@@ -15775,8 +16145,11 @@ def _snapshot_canvas_in_session(
     if old_autos:
         _lock_local_result_registry(s)
     sync_local_result_owner(s, "canvas_version", snapshot_id, snapshot_doc)
+    _replace_promoted_transform_refs(
+        s, "canvas_version", snapshot_id, snapshot_doc)
     for old in old_autos:
         _drop_local_result_owner_locked(s, "canvas_version", old.id)
+        _drop_promoted_transform_refs(s, "canvas_version", old.id)
         s.delete(old)
     return True
 

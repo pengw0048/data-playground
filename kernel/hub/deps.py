@@ -21,7 +21,7 @@ from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, Wo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
 from hub.plugins.capabilities import BUILTIN_CAPABILITIES
-from hub.plugins.processors import InMemoryProcessorRegistry
+from hub.plugins.processors import ProcessorRegistry
 from hub.plugins.runner import LocalRunner
 from hub.settings import settings
 
@@ -435,7 +435,7 @@ class Deps:
         self.data_dir = data_dir
         self.adapters = default_adapters()
         self.default_adapter = DuckDBAdapter()
-        self.registry = InMemoryProcessorRegistry()
+        self.registry = ProcessorRegistry()
         from hub.plugins.importer import NullImporter
         self.importer = NullImporter()  # replaced by a plugin via reg.set_importer; else /import → 501
         self.capabilities = list(BUILTIN_CAPABILITIES)
@@ -508,7 +508,8 @@ class Deps:
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileProcessRunner
         self.profile_runner = ProfileProcessRunner(
-            workspace, data_dir, storage=self.storage, node_specs=self.node_specs)
+            workspace, data_dir, storage=self.storage, node_specs=self.node_specs,
+            registry=self.registry)
         self.profile_runner.on_complete = _on_complete
         self.profile_runner.on_status = _persist_run_state
         from hub.subprocess_runner import SubprocessRunner
@@ -517,7 +518,7 @@ class Deps:
         sub = SubprocessRunner(
             workspace, data_dir, catalog=self.catalog, storage=self.storage,
             resolve_adapter=self.resolve_adapter, node_builders=self.node_builders,
-            node_specs=self.node_specs)
+            node_specs=self.node_specs, registry=self.registry)
         sub.on_complete = _on_complete  # record cancelled/crashed isolated runs the child couldn't
         sub.on_status = _persist_run_state
         sub.result_put = _result_put
@@ -531,7 +532,7 @@ class Deps:
             pool = PoolRunner(
                 workspace, data_dir, pool_cfg, node_specs=self.node_specs, catalog=self.catalog,
                 storage=self.storage, resolve_adapter=self.resolve_adapter,
-                node_builders=self.node_builders)
+                node_builders=self.node_builders, registry=self.registry)
             pool.on_complete = _on_complete
             pool.on_status = _persist_run_state
             pool.result_put = _result_put

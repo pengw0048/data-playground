@@ -146,7 +146,8 @@ class SubprocessRunner:
         return False  # the ephemeral child has ambient data identity only; it cannot resolve hub Creds
 
     def __init__(self, workspace: str, data_dir: str, catalog=None, deadline_s: float | None = None,
-                 storage=None, resolve_adapter=None, node_builders=None, node_specs=None):
+                 storage=None, resolve_adapter=None, node_builders=None, node_specs=None,
+                 registry=None):
         self.workspace = workspace
         self.data_dir = data_dir
         self.catalog = catalog  # register outputs written by children into the parent's live catalog
@@ -160,6 +161,7 @@ class SubprocessRunner:
             from hub.nodespecs import BUILTIN_NODE_SPECS
             node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
         self.node_specs = node_specs
+        self.registry = registry
         self.result_put = None  # optional parent DB cache publication after RunState owns the result
         self.on_complete = None  # optional (graph, target, status) hook — Deps wires it to run-history
         self.on_status = None    # optional (graph, status) hook — Deps wires it to DB-backed live status
@@ -736,7 +738,7 @@ class SubprocessRunner:
         cancel_file = os.path.join(job_dir, "cancel.requested")
         job_file = os.path.join(job_dir, "job.json")
         try:
-            prepared_graph = prepare_workload_graph(graph)
+            prepared_graph = prepare_workload_graph(graph, target, self.registry)
             with open(job_file, "w") as f:
                 json.dump({"workspace": self.workspace, "dataDir": self.data_dir,
                            "graph": prepared_graph,

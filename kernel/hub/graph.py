@@ -42,7 +42,7 @@ def node_map(graph: Graph) -> dict[str, GraphNode]:
     return {n.id: n for n in graph.nodes}
 
 
-_MAX_EXECUTION_SOURCE_NODES = 10_000
+_MAX_EXECUTION_NODES = 10_000
 MAX_EFFECTIVE_OUTPUT_PORTS = 64
 
 
@@ -126,13 +126,12 @@ def require_output_port(
     return found
 
 
-def _execution_source_bindings(
-        graph: Graph, roots: list[GraphNode]) -> list[tuple[GraphNode, dict]]:
-    """Source configs a selected execution cone can actually reach, including section bodies.
+def execution_nodes(graph: Graph, roots: list[GraphNode]) -> list[GraphNode]:
+    """Nodes a selected execution cone can actually reach, including nested Section bodies.
 
     A section executes its ``parent_id`` children rather than ordinary graph edges. Bound the
-    iterative walk so malformed containment cannot turn source ownership/fingerprinting into an
-    unbounded traversal.
+    iterative walk so malformed containment cannot turn dispatch or source fingerprinting into an
+    unbounded traversal. This is the shared traversal for every private execution sidecar.
     """
     children: dict[str, list[GraphNode]] = {}
     for node in graph.nodes:
@@ -141,22 +140,31 @@ def _execution_source_bindings(
 
     queue = list(roots)
     seen: set[str] = set()
-    bindings: list[tuple[GraphNode, dict]] = []
+    result: list[GraphNode] = []
     cursor = 0
     while cursor < len(queue):
-        if cursor >= _MAX_EXECUTION_SOURCE_NODES:
-            raise RuntimeError("section source traversal exceeds the supported node limit")
+        if cursor >= _MAX_EXECUTION_NODES:
+            raise RuntimeError("section execution traversal exceeds the supported node limit")
         node = queue[cursor]
         cursor += 1
         if not isinstance(node, GraphNode) or node.id in seen:
             continue
         seen.add(node.id)
+        result.append(node)
+        if node.type == "section":
+            queue.extend(children.get(node.id, []))
+    return result
+
+
+def _execution_source_bindings(
+        graph: Graph, roots: list[GraphNode]) -> list[tuple[GraphNode, dict]]:
+    """Source configs from the shared execution traversal, including nested Section bodies."""
+    bindings: list[tuple[GraphNode, dict]] = []
+    for node in execution_nodes(graph, roots):
         data = node.data if isinstance(node.data, dict) else {}
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
         if node.type == "source":
             bindings.append((node, config))
-        if node.type == "section":
-            queue.extend(children.get(node.id, []))
     return bindings
 
 

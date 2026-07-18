@@ -9,6 +9,7 @@ import { Popover } from '../../ui/Popover'
 import { CodeSnippet } from '../../ui/CodeSnippet'
 import { cn } from '@/lib/utils'
 import type { ProcessorMode, TransformSource } from '../../types/graph'
+import { configuredProcessorRef, exactProcessor } from '../processorIdentity'
 
 const DEFAULT_CODE = `def fn(row):
     # edit me — runs per row
@@ -27,10 +28,12 @@ function Transform({ id, data }: NodeComponentProps) {
   const src: TransformSource = (data.config.source as TransformSource) ?? 'adhoc'
   const mode: ProcessorMode = (data.config.mode as ProcessorMode) ?? 'map'
   const scope = (data.config.scope as 'dataset' | 'sample') ?? 'dataset'
-  const proc = processors.find((p) => p.id === data.config.processor)
+  const proc = exactProcessor(processors, data.config.processor, data.config.version)
+  const configuredRef = configuredProcessorRef(
+    data.config.processor, data.config.version)
 
   const meta = src === 'library'
-    ? (proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : 'pick a processor →')
+    ? (proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'pick a processor →'))
     : `${mode} · on ${scope}`
 
   return (
@@ -68,7 +71,7 @@ function Transform({ id, data }: NodeComponentProps) {
             >
               <Icon name="fx" size={13} />
               <span className="flex-1 truncate text-left">
-                {proc?.title ?? 'select processor'}
+                {proc?.title ?? configuredRef ?? 'select processor'}
               </span>
               {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
               <Icon name="chevronDown" size={12} />

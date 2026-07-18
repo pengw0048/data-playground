@@ -5,6 +5,7 @@ import { Icon } from '../ui/Icon'
 import { MiniSelect } from '../ui/controls'
 import { DataPanel } from './DataPanel'
 import type { ProcessorMode } from '../types/graph'
+import { configuredProcessorRef, exactProcessor } from '../nodes/processorIdentity'
 
 const CodeEditor = lazy(() => import('../ui/CodeEditor').then((m) => ({ default: m.CodeEditor })))
 
@@ -33,7 +34,8 @@ export function CodeFullscreen() {
   const value = String(cfg[fs.param] ?? '')
   const isTransform = node.type === 'transform'
   const isLibrary = isTransform && cfg.source === 'library'
-  const proc = processors.find((p) => p.id === cfg.processor)
+  const proc = exactProcessor(processors, cfg.processor, cfg.version)
+  const configuredRef = configuredProcessorRef(cfg.processor, cfg.version)
   // annotation `code` nodes and library transforms don't run/preview here
   const canPreview = runnable && node.type !== 'code' && !isLibrary
   // seed Monaco autocomplete with THIS node's input columns (precise — what a filter/select/sql/transform
@@ -52,7 +54,7 @@ export function CodeFullscreen() {
           <span className="flex items-center text-muted-foreground"><Icon name="code" size={14} /></span>
           <span className="text-[13px] font-semibold text-foreground">{node.data.title}</span>
           <span className="text-[12.5px] text-muted-foreground">· {fs.param} · {language}</span>
-          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${proc?.title ?? ''} ${proc?.version ?? ''} (registry)` : ''}</span>}
+          {(isLibrary || !canEdit) && <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">· read-only{isLibrary ? ` · ${proc ? `${proc.title} ${proc.version} (registry)` : `${configuredRef ?? 'unconfigured library transform'} (exact reference)`}` : ''}</span>}
           <span className="flex-1" />
           <button onClick={close} aria-label="Close" title="Close (Esc)"
             className="grid h-[26px] w-7 place-items-center rounded-md border-0 bg-transparent text-muted-foreground hover:text-foreground">

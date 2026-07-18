@@ -167,6 +167,10 @@ jobs:
           hub/tests/test_run_identity.py
           hub/tests/test_object_lifecycle.py
           hub/tests/test_workspace_storage.py
+      - name: Verify promoted Transform versions on PostgreSQL
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_promoted_transform_versions.py
       - name: Verify typed local write contracts on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60

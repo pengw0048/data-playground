@@ -1617,10 +1617,16 @@ class ProcessorDescriptor(Wire):
     mode: ProcessorMode
     category: str = "processor"
     input_columns: list[str] = []
+    input_schema: list[ColumnSchema] = []
     output_schema: list[ColumnSchema] = []
+    requirements: list[str] = []
     params_schema: dict[str, Any] = {}
     previewable: bool = True
     blurb: str = ""
+    provenance: Literal["plugin", "promoted"] = "plugin"
+    creator_id: str | None = None
+    created_at: datetime.datetime | None = None
+    semantic_digest: str | None = None
 
 
 # --------------------------------------------------------------------------- #

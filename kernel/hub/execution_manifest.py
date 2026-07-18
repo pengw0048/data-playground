@@ -90,6 +90,12 @@ def _canonical_graph(
         # metric emits its title as a value, Write uses it as the destination fallback, and a
         # Section addresses contained children by title. Retain only those semantic titles.
         config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        if node.type == "transform" and config.get("source") == "library":
+            # The exact promoted `(id, version)` is the durable definition. Never retain a stale
+            # inline body as a second, hidden persistence or replay path.
+            config = dict(config)
+            config.pop("code", None)
+            data["config"] = config
         semantic_title = bool(
             node.type == "metric"
             or (node.type == "write" and not (config.get("filename") or config.get("name")))

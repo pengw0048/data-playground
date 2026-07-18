@@ -7,6 +7,7 @@ const apiMocks = vi.hoisted(() => ({
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
+  promote: vi.fn(), processors: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   api: new Proxy({}, {
@@ -42,8 +43,12 @@ vi.mock('../api/client', () => ({
                     ? apiMocks.cancelRun
                     : property === 'activeRuns'
                       ? apiMocks.activeRuns
-                      : property === 'profileJobs'
-                        ? apiMocks.profileJobs
+                    : property === 'profileJobs'
+                      ? apiMocks.profileJobs
+                      : property === 'promote'
+                        ? apiMocks.promote
+                        : property === 'processors'
+                          ? apiMocks.processors
           : async () => ({}),
   }),
   KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
@@ -111,6 +116,8 @@ describe('graph store — core authority ops', () => {
     }))
     apiMocks.activeRuns.mockReset().mockResolvedValue([])
     apiMocks.profileJobs.mockReset().mockResolvedValue([])
+    apiMocks.promote.mockReset()
+    apiMocks.processors.mockReset().mockResolvedValue([])
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
@@ -118,6 +125,37 @@ describe('graph store — core authority ops', () => {
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
       serverVersion: 1, saved: true,
     })
+  })
+
+  it('promotes same-title nodes with distinct stable identities and reuses one identity on retry', async () => {
+    const transform = (id: string) => ({
+      ...NODE(id, 'transform'),
+      data: { ...NODE(id, 'transform').data, title: 'Same title', config: {
+        mode: 'map', code: 'def fn(row): return row',
+      } },
+    })
+    useStore.setState((state) => ({
+      doc: { ...state.doc, id: 'stable-canvas', nodes: [transform('first'), transform('second')] },
+    }))
+    let attempt = 0
+    apiMocks.promote.mockImplementation(async (body: { id: string; title: string; mode: string }) => {
+      attempt += 1
+      if (attempt === 1) throw new Error('response lost')
+      return {
+        id: `tr_${'a'.repeat(29)}`, version: 'v1', title: body.title, mode: body.mode,
+        category: 'compute', inputColumns: [], inputSchema: [], outputSchema: [], requirements: [],
+        paramsSchema: {}, previewable: true, blurb: '', provenance: 'promoted',
+      }
+    })
+
+    await expect(useStore.getState().promote('first')).rejects.toThrow('response lost')
+    await useStore.getState().promote('first')
+    await useStore.getState().promote('second')
+
+    const keys = apiMocks.promote.mock.calls.map(([body]) => body.id)
+    expect(keys[0]).toBe(keys[1])
+    expect(keys[2]).not.toBe(keys[1])
+    expect(keys.every((key) => key.length <= 256)).toBe(true)
   })
 
   it('applyAgentGraph REPLACES nodes/edges and marks them stale (undoable)', () => {

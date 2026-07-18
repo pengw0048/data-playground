@@ -1477,7 +1477,7 @@ class RayRunner:
             raise RuntimeError(
                 "Ray Jobs requires a durable run owner before artifact allocation"
             )
-        graph_doc = prepare_workload_graph(graph)
+        graph_doc = prepare_workload_graph(graph, target, self.deps.registry)
         publication_targets = {} if sink_targets is None else sink_targets
         lineage_parents = self._publication_lineage_parents(
             graph, publication_targets)
@@ -3577,7 +3577,7 @@ class RayRunner:
             self, ref: RunBackendRef, candidate: RunStatus):
         """Best-effort telemetry context from immutable SQL only after effects have started."""
         from hub import metadb
-        from hub.models import Graph
+        from hub.workload_env import public_workload_graph
 
         payload = metadb.backend_job_artifact_payload(candidate.run_id)
         if payload is None:
@@ -3587,7 +3587,7 @@ class RayRunner:
             return None
         self._validate_job_artifact_integrity(ref, candidate, job)
         return self._restore_publication_context(
-            job, Graph.model_validate(job["graph"]))
+            job, public_workload_graph(job["graph"]))
 
     def _publish_job_result(self, job: dict, graph, target, status: RunStatus, result: dict, *,
                             artifact_error: bool = False) -> None:
@@ -4061,8 +4061,8 @@ class RayRunner:
             if ref is None or ref.backend != _JOBS_BACKEND:
                 raise RuntimeError("Ray result reconciliation has no durable backend reference")
             job = self._durable_sql_job_envelope(ref, status)
-            from hub.models import Graph
-            graph = Graph.model_validate(job["graph"])
+            from hub.workload_env import public_workload_graph
+            graph = public_workload_graph(job["graph"])
             target = job.get("target")
         completed = self._terminal_result_if_present(job)
         if completed is None:
@@ -4763,7 +4763,8 @@ class RayRunner:
         self._emit(graph, status)
         job_file, status_file = os.path.join(work, "job.json"), os.path.join(work, "status.json")
         job = {"workspace": self.deps.workspace, "data_dir": self.deps.data_dir, "target": target,
-               "graph": prepare_workload_graph(graph), "module": os.path.abspath(__file__), "requires": requires,
+               "graph": prepare_workload_graph(graph, target, self.deps.registry),
+               "module": os.path.abspath(__file__), "requires": requires,
                "materialize_uri": materialize_uri, "attempt_id": run_id, "status_file": status_file}
         if sink_targets is not None:  # whole-graph run only; region materialization has no write sink
             job["sink_targets"] = sink_targets

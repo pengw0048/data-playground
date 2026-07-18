@@ -24,10 +24,10 @@ class ProfileProcessRunner(SubprocessRunner):
     name = "local-profile"
 
     def __init__(self, workspace: str, data_dir: str, *, storage=None,
-                 node_specs=None, deadline_s: float | None = None):
+                 node_specs=None, deadline_s: float | None = None, registry=None):
         super().__init__(
             workspace, data_dir, storage=storage, node_specs=node_specs,
-            deadline_s=deadline_s)
+            deadline_s=deadline_s, registry=registry)
         self._profile_identities: dict[str, dict[str, object]] = {}
         self._terminal_persistence_pending: dict[str, RunStatus] = {}
         self._deferred_completions: dict[
