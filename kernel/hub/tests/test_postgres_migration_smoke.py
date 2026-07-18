@@ -342,6 +342,9 @@ def test_postgres_linear_checkpoint_two_owner_retire_and_release(tmp_path):
         writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
     w = store.materialize_checkpoint(old)
     w.write(b"stale-bytes")
+    metadb.bind_linear_checkpoint_materialization(
+        task_id=admission["task_id"], attempt_id=attempt_a, owner_token="owner-a",
+        uri=old["uri"], dev=w.identity()[0], ino=w.identity()[1])
     w.seal()
     w.release()
     with metadb.session() as session:

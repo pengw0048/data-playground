@@ -32,12 +32,22 @@ def _set_task_status(task_id: str, status: str) -> None:
         task.completed_at = metadb._now()
 
 
-def _materialize_only(store: LocalStorage, ctx: dict, content: bytes) -> None:
-    """Produce the exact reserved file/lock on disk but leave it uncommitted (producer then gone)."""
+def _materialize_only(store: LocalStorage, ctx: dict, content: bytes) -> dict:
+    """Produce the exact reserved file/lock on disk, bind its inode, leave it uncommitted."""
     writer = store.materialize_checkpoint(ctx["candidate"])
-    writer.write(content)
-    writer.seal()
-    writer.release()
+    try:
+        writer.write(content)
+        dev, ino = writer.identity()
+        metadb.bind_linear_checkpoint_materialization(
+            task_id=ctx["task_id"], attempt_id=ctx["attempt_id"], owner_token=ctx["owner"],
+            uri=ctx["candidate"]["uri"], dev=dev, ino=ino)
+        writer.seal()
+    finally:
+        writer.release()
+    candidate = metadb.linear_checkpoint_candidate(ctx["task_id"])
+    assert candidate is not None and candidate["dev"] == dev and candidate["ino"] == ino
+    ctx["candidate"] = candidate
+    return candidate
 
 
 def _artifact(uri: str):
@@ -158,7 +168,9 @@ def test_recover_retires_a_superseded_candidate_before_a_replacement_reservation
         task_id=admission["task_id"], attempt_id=attempt_a, owner_token="owner-a",
         namespace_id=store.namespace_id, storage_root=store.result_root,
         writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
-    _materialize_only(store, {"candidate": old}, _parquet_bytes(3))
+    _materialize_only(store, {
+        "task_id": admission["task_id"], "attempt_id": attempt_a, "owner": "owner-a",
+        "candidate": old}, _parquet_bytes(3))
     old_uri = old["uri"]
     assert os.path.isfile(old_uri)
 
@@ -198,7 +210,9 @@ def test_a_fenced_old_owner_cannot_mutate_new_state(tmp_path):
         task_id=admission["task_id"], attempt_id=attempt_a, owner_token="owner-a",
         namespace_id=store.namespace_id, storage_root=store.result_root,
         writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
-    _materialize_only(store, {"candidate": old}, _parquet_bytes(3))
+    _materialize_only(store, {
+        "task_id": admission["task_id"], "attempt_id": attempt_a, "owner": "owner-a",
+        "candidate": old}, _parquet_bytes(3))
     _expire_lease(attempt_a)
     task_b = metadb.claim_linear_checkpoint_task(admission["task_id"], "owner-b")
     attempt_b = task_b["attempts"][-1]["id"]
@@ -441,3 +455,118 @@ def test_restore_audit_rejects_a_missing_committed_artifact(_isolated_db, tmp_pa
         s.delete(s.get(metadb.LocalResultArtifact, uri))
     with pytest.raises(RuntimeError, match="inconsistent"):
         metadb.linear_checkpoint_restore_audit()
+
+
+# ----------------------------------------------------------------- #449 / #450 / #451 rework
+
+def test_prune_results_inside_recovery_window_preserves_uncommitted_candidate(tmp_path):
+    """#449: maintenance must not destroy a reserved candidate before reattach."""
+    store = _storage(tmp_path)
+    ctx = _reserve(_identity(), store)
+    uri = ctx["candidate"]["uri"]
+    content = _parquet_bytes(6)
+    _materialize_only(store, ctx, content)
+    assert os.path.isfile(uri)
+
+    # Drop the producer (lock free, lease still alive) and run the exact startup/periodic reclaim path.
+    store.prune_results()
+    assert os.path.isfile(uri)
+    assert _artifact(uri) is not None
+    assert metadb.reconcile_linear_checkpoint(ctx["task_id"])["phase"] == "reserved"
+    assert metadb.claim_local_result_reclaims(store.namespace_id, limit=50) == []
+
+    recovered = lc.recover_checkpoint(
+        store, task_id=ctx["task_id"], attempt_id=ctx["attempt_id"], owner_token=ctx["owner"])
+    assert recovered["action"] == "reattach"
+    evidence = lc.commit_reattached_checkpoint(
+        store, task_id=ctx["task_id"], attempt_id=ctx["attempt_id"], owner_token=ctx["owner"],
+        candidate=recovered["candidate"])
+    assert evidence.rows == 6
+    assert lc.reconcile_checkpoint(ctx["task_id"]) == evidence
+
+
+def test_pre_commit_inode_swap_cannot_become_committed_truth(tmp_path):
+    """#450 window 1: a path swap between seal and commit fails closed (no attacker evidence)."""
+    store = _storage(tmp_path)
+    ctx = _reserve(_identity(), store)
+    candidate = ctx["candidate"]
+    writer = store.materialize_checkpoint(candidate)
+    try:
+        writer.write(_parquet_bytes(9))
+        metadb.bind_linear_checkpoint_materialization(
+            task_id=ctx["task_id"], attempt_id=ctx["attempt_id"], owner_token=ctx["owner"],
+            uri=candidate["uri"], dev=writer.identity()[0], ino=writer.identity()[1])
+        writer.seal()
+        proof = store.prove_checkpoint(writer)
+        assert proof.evidence["rows"] == 9
+        name, _ = store._result_names(candidate["uri"])
+        replacement = f"{name}.replacement"
+        fd = os.open(replacement, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                     dir_fd=store._result_dir_fd)
+        os.write(fd, _parquet_bytes(2))
+        os.close(fd)
+        os.replace(replacement, name,
+                   src_dir_fd=store._result_dir_fd, dst_dir_fd=store._result_dir_fd)
+        # Path no longer names the held inode; the final recheck fails closed.
+        with pytest.raises(RuntimeError, match="identity changed|single-link"):
+            proof.recheck()
+        proof.close()
+    finally:
+        writer.abort()
+    # Nothing committed; reserved binding may still exist until abort.
+    assert metadb.reconcile_linear_checkpoint(ctx["task_id"])["phase"] == "reserved"
+
+
+def test_reattach_after_inode_swap_fails_closed(tmp_path):
+    """#450 window 2: reattach refuses a swapped parquet that keeps the lock file."""
+    store = _storage(tmp_path)
+    ctx = _reserve(_identity(), store)
+    uri = ctx["candidate"]["uri"]
+    _materialize_only(store, ctx, _parquet_bytes(9))
+    name, _ = store._result_names(uri)
+    replacement = f"{name}.replacement"
+    fd = os.open(replacement, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                 dir_fd=store._result_dir_fd)
+    os.write(fd, _parquet_bytes(2))
+    os.close(fd)
+    os.replace(replacement, name,
+               src_dir_fd=store._result_dir_fd, dst_dir_fd=store._result_dir_fd)
+    recovered = lc.recover_checkpoint(
+        store, task_id=ctx["task_id"], attempt_id=ctx["attempt_id"], owner_token=ctx["owner"])
+    assert recovered["action"] == "reattach"
+    with pytest.raises(RuntimeError, match="materialized identity"):
+        lc.commit_reattached_checkpoint(
+            store, task_id=ctx["task_id"], attempt_id=ctx["attempt_id"],
+            owner_token=ctx["owner"], candidate=recovered["candidate"])
+
+
+def test_indeterminate_reconcile_readback_releases_never_aborts(tmp_path, monkeypatch):
+    """#451: when reconcile itself raises after a durable commit, keep the committed bytes."""
+    store = _storage(tmp_path)
+    ctx = _reserve(_identity(), store)
+    content = _parquet_bytes(4)
+    real_commit = metadb.commit_linear_checkpoint
+    real_reconcile = metadb.reconcile_linear_checkpoint
+
+    def commit_then_lose(**kwargs):
+        real_commit(**kwargs)
+        raise RuntimeError("response lost after durable commit")
+
+    def reconcile_raises(task_id):
+        raise RuntimeError("correlated DB outage during reconcile")
+
+    monkeypatch.setattr(metadb, "commit_linear_checkpoint", commit_then_lose)
+    monkeypatch.setattr(metadb, "reconcile_linear_checkpoint", reconcile_raises)
+    with pytest.raises(RuntimeError, match="response lost"):
+        _commit(store, ctx, content)
+    monkeypatch.undo()
+
+    assert os.path.isfile(ctx["candidate"]["uri"])
+    monkeypatch.setattr(metadb, "reconcile_linear_checkpoint", real_reconcile)
+    evidence = lc.reconcile_checkpoint(ctx["task_id"])
+    assert evidence is not None and evidence.rows == 4
+    guard, reopened = lc.reopen_checkpoint(store, ctx["task_id"])
+    try:
+        assert reopened == evidence
+    finally:
+        guard.close()

@@ -73,15 +73,21 @@ def materialize_and_commit_checkpoint(
 
     ``candidate`` is exactly the binding returned by the reservation/candidate readback. ``content``
     is the producer's parquet bytes; its rows/hash/schema are never trusted — evidence is proven from
-    the exact materialized inode. On an unknown commit response the writer keeps its fence only when a
-    DB readback proves the reservation committed; otherwise the exact file and lock are cleaned.
+    the exact materialized inode. On an unknown commit response the writer keeps its fence when a DB
+    readback proves the reservation committed *or* the readback is indeterminate (#451); only an
+    affirmative not-committed readback aborts and cleans the exact file and lock.
     """
     writer = storage.materialize_checkpoint(candidate)
     proof = None
     try:
+        # Bind the held inode before any path-visible window so crash recovery can refuse a swap (#450).
+        dev, ino = writer.identity()
+        metadb.bind_linear_checkpoint_materialization(
+            task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,
+            uri=candidate["uri"], dev=dev, ino=ino)
         writer.write(content)
         writer.seal()
-        proof = storage.open_checkpoint_proof(candidate["uri"], writer.lock_fileno())
+        proof = storage.prove_checkpoint(writer)
         evidence = proof.evidence
         # The final identity check occurs immediately before the fenced SQL commit while the exact
         # read descriptor is still held open.
@@ -97,13 +103,15 @@ def materialize_and_commit_checkpoint(
         if proof is not None:
             proof.close()
         committed = False
+        indeterminate = False
         try:
             state = metadb.reconcile_linear_checkpoint(task_id)
             committed = isinstance(state, dict) and state.get("phase") == "committed"
         except Exception:
-            committed = False
-        if committed:
-            # Commit-before-response-loss: never erase committed truth, only drop the write FD/lock.
+            # Indeterminate readback: the commit may have landed. Never abort possibly-committed
+            # bytes (#451); drop only the write FD/lock and let a later readable DB decide.
+            indeterminate = True
+        if committed or indeterminate:
             writer.release()
         else:
             writer.abort()
@@ -183,15 +191,13 @@ def commit_reattached_checkpoint(
         candidate: dict) -> CheckpointEvidence:
     """Prove and fence-commit an already-materialized same-generation candidate after reattach.
 
-    The exact reserved file is never re-created; it is reopened under its own lock, proven from the
-    held descriptor, and committed. The pre-existing file is never destroyed on a failure, and any
-    rejection is surfaced unchanged; commit-response loss is recovered by the caller through
-    :func:`reconcile_checkpoint`, exactly as :func:`materialize_and_commit_checkpoint` requires.
+    The exact reserved file is never re-created; reattach opens it under its own lock, verifies the
+    recorded materialization identity, proves from that held descriptor, and commits. The
+    pre-existing file is never destroyed on a failure, and any rejection is surfaced unchanged;
+    commit-response loss is recovered by the caller through :func:`reconcile_checkpoint`.
     """
-    lock_fd = storage.reattach_checkpoint(candidate)
-    proof = None
+    lock_fd, proof = storage.reattach_checkpoint(candidate)
     try:
-        proof = storage.open_checkpoint_proof(candidate["uri"], lock_fd)
         evidence = proof.evidence
         proof.recheck()
         doc = metadb.commit_linear_checkpoint(
@@ -202,7 +208,6 @@ def commit_reattached_checkpoint(
             content_sha256=evidence["content_sha256"], schema_sha256=evidence["schema_sha256"],
             dev=evidence["dev"], ino=evidence["ino"])
     finally:
-        if proof is not None:
-            proof.close()
+        proof.close()
         os.close(lock_fd)
     return CheckpointEvidence.from_doc(doc)

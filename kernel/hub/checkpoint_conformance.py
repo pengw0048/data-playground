@@ -17,6 +17,7 @@ import hashlib
 import io
 import logging
 import os
+import re
 import sys
 import tempfile
 import uuid
@@ -260,12 +261,15 @@ def _positive(workspace: Path) -> None:
         _fail("release", "not_idempotent")
 
 
-def _expect_fail(stage: str, code: str, fn) -> None:
+def _expect_fail(stage: str, code: str, fn, *, match: str) -> None:
+    """Require a production failure whose message matches ``match`` (canonical stem regex)."""
     try:
         fn()
     except _CheckFailed:
         raise
-    except Exception:
+    except Exception as exc:
+        if re.search(match, str(exc), flags=re.IGNORECASE) is None:
+            _fail(stage, "unexpected_diagnostic")
         return
     _fail(stage, code)
 
@@ -288,7 +292,7 @@ def _negatives(workspace: Path) -> None:
     _expire(attempt_a)
     _expect_fail("stale_token", "accepted", lambda: lc.materialize_and_commit_checkpoint(
         store, task_id=admission["task_id"], attempt_id=attempt_a, owner_token="owner-a",
-        candidate=candidate, content=_parquet_bytes(2)))
+        candidate=candidate, content=_parquet_bytes(2)), match="stale or fenced")
 
     # lease transfer/retire: new attempt retires superseded candidate before replacement
     task_b = _claim(admission["task_id"], "owner-b")
@@ -301,53 +305,117 @@ def _negatives(workspace: Path) -> None:
     if outcome.get("action") != "retire":
         _fail("lease_retire", "unexpected_action")
     _expect_fail("stale_token", "accepted", lambda: metadb.abort_linear_checkpoint_candidate(
-        admission["task_id"], attempt_a, "owner-a"))
+        admission["task_id"], attempt_a, "owner-a"), match="stale or fenced")
 
-    # fresh reservation + commit for remaining negative probes on a new admission
+    # fresh reservation for remaining negative probes
     admission2 = _admit(canvas_id, uuid.uuid4().hex)
     task2 = _claim(admission2["task_id"], "owner-c")
     attempt2 = task2["attempts"][-1]["id"]
     candidate2 = _reserve(store, admission2["task_id"], attempt2, "owner-c")
 
-    # symlink / FIFO at the reserved path fail closed
-    artifact_name, _lock = store._result_names(candidate2["uri"])
-    target = os.path.join(store.result_root, artifact_name)
-    os.symlink(os.path.join(str(workspace), "elsewhere.parquet"), target)
-    _expect_fail("symlink", "accepted", lambda: store.materialize_checkpoint(candidate2))
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(target)
-    os.mkfifo(target)
-    _expect_fail("fifo", "accepted", lambda: store.materialize_checkpoint(candidate2))
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(target)
-
-    # hardlink after materialize is rejected by held-FD proof
+    # symlink / FIFO: seal a real file, then swap the sealed path and drive proof/open so the
+    # production O_NOFOLLOW / S_ISREG defenses are actually exercised (#452).
     writer = store.materialize_checkpoint(candidate2)
     try:
         writer.write(_parquet_bytes(3))
         writer.seal()
+        artifact_name, _lock = store._result_names(candidate2["uri"])
+        target = os.path.join(store.result_root, artifact_name)
+        os.unlink(artifact_name, dir_fd=store._result_dir_fd)
+        os.symlink(os.path.join(str(workspace), "elsewhere.parquet"), target)
+        _expect_fail("symlink", "accepted",
+                     lambda: store.open_checkpoint_proof(candidate2["uri"], writer.lock_fileno()),
+                     match="symbolic link|Too many levels|ELOOP|No such file|not a")
+        os.unlink(target)
+        os.mkfifo(target)
+        _expect_fail("fifo", "accepted",
+                     lambda: store.open_checkpoint_proof(candidate2["uri"], writer.lock_fileno()),
+                     match="fifo|not a|regular|single-link|ISREG|Invalid argument|Errno")
+    finally:
+        with contextlib.suppress(FileNotFoundError, OSError):
+            os.unlink(os.path.join(store.result_root, store._result_names(candidate2["uri"])[0]))
+        writer.abort()
+    try:
+        lc.abort_checkpoint(store, task_id=admission2["task_id"], attempt_id=attempt2,
+                            owner_token="owner-c")
+    except Exception:
+        _fail("symlink", "abort_failed")
+
+    # hardlink after materialize is rejected by held-FD proof
+    candidate2b = _reserve(store, admission2["task_id"], attempt2, "owner-c")
+    writer = store.materialize_checkpoint(candidate2b)
+    try:
+        writer.write(_parquet_bytes(3))
+        writer.seal()
+        artifact_name, _lock = store._result_names(candidate2b["uri"])
         os.link(artifact_name, "hardlink.parquet",
                 src_dir_fd=store._result_dir_fd, dst_dir_fd=store._result_dir_fd)
         _expect_fail("hardlink", "accepted",
-                     lambda: store.open_checkpoint_proof(candidate2["uri"], writer.lock_fileno()))
+                     lambda: store.prove_checkpoint(writer), match="single-link")
     finally:
         writer.abort()
-    # Retire the reserved binding through the production abort path before the next probe.
     try:
         lc.abort_checkpoint(store, task_id=admission2["task_id"], attempt_id=attempt2,
                             owner_token="owner-c")
     except Exception:
         _fail("hardlink", "abort_failed")
 
-    # wrong caller evidence cannot establish commit (foreign owner)
+    # wrong authority
     candidate3 = _reserve(store, admission2["task_id"], attempt2, "owner-c")
     _expect_fail("wrong_authority", "accepted", lambda: metadb.commit_linear_checkpoint(
         task_id=admission2["task_id"], attempt_id=attempt2, owner_token="intruder",
         namespace_id=candidate3["namespace_id"], writer_token=candidate3["writer_token"],
         lock_token=candidate3["lock_token"], generation=candidate3["generation"],
-        rows=1, size_bytes=10, content_sha256="c" * 64, schema_sha256="d" * 64, dev=1, ino=1))
+        rows=1, size_bytes=10, content_sha256="c" * 64, schema_sha256="d" * 64, dev=1, ino=1),
+        match="stale or fenced")
 
-    # commit response-loss path: commit succeeds, orchestrator raises, reconcile recovers
+    # legitimate owner + forged evidence must fail closed at reopen (#452)
+    content = _parquet_bytes(5)
+    evidence = lc.materialize_and_commit_checkpoint(
+        store, task_id=admission2["task_id"], attempt_id=attempt2, owner_token="owner-c",
+        candidate=candidate3, content=content)
+    with metadb.session() as s:
+        checkpoint = s.get(metadb.DurableCheckpoint, admission2["task_id"])
+        checkpoint.content_sha256 = "e" * 64
+    _expect_fail("forged_evidence", "accepted",
+                 lambda: lc.reopen_checkpoint(store, admission2["task_id"]),
+                 match="disagrees with committed evidence")
+    # Restore truth so later release probes stay consistent.
+    with metadb.session() as s:
+        s.get(metadb.DurableCheckpoint, admission2["task_id"]).content_sha256 = (
+            evidence.content_sha256)
+
+    # truncate of a sealed file during proof fails closed
+    admission3 = _admit(canvas_id, uuid.uuid4().hex)
+    task3 = _claim(admission3["task_id"], "owner-d")
+    attempt3 = task3["attempts"][-1]["id"]
+    candidate4 = _reserve(store, admission3["task_id"], attempt3, "owner-d")
+    writer = store.materialize_checkpoint(candidate4)
+    try:
+        writer.write(_parquet_bytes(8))
+        metadb.bind_linear_checkpoint_materialization(
+            task_id=admission3["task_id"], attempt_id=attempt3, owner_token="owner-d",
+            uri=candidate4["uri"], dev=writer.identity()[0], ino=writer.identity()[1])
+        writer.seal()
+        name, _ = store._result_names(candidate4["uri"])
+        victim = os.open(name, os.O_RDWR, dir_fd=store._result_dir_fd)
+        try:
+            os.ftruncate(victim, 16)
+        finally:
+            os.close(victim)
+        _expect_fail("truncate", "accepted",
+                     lambda: store.prove_checkpoint(writer),
+                     match="changed|identity|parquet|size|not a")
+    finally:
+        writer.abort()
+    lc.abort_checkpoint(store, task_id=admission3["task_id"], attempt_id=attempt3,
+                        owner_token="owner-d")
+
+    # commit response-loss path
+    admission4 = _admit(canvas_id, uuid.uuid4().hex)
+    task4 = _claim(admission4["task_id"], "owner-e")
+    attempt4 = task4["attempts"][-1]["id"]
+    candidate5 = _reserve(store, admission4["task_id"], attempt4, "owner-e")
     real_commit = metadb.commit_linear_checkpoint
 
     def commit_then_lose(**kwargs):
@@ -358,13 +426,13 @@ def _negatives(workspace: Path) -> None:
     try:
         try:
             lc.materialize_and_commit_checkpoint(
-                store, task_id=admission2["task_id"], attempt_id=attempt2,
-                owner_token="owner-c", candidate=candidate3, content=_parquet_bytes(4))
+                store, task_id=admission4["task_id"], attempt_id=attempt4,
+                owner_token="owner-e", candidate=candidate5, content=_parquet_bytes(4))
         except Exception:
             pass
         else:
             _fail("commit_loss", "raise_missing")
-        recovered = lc.reconcile_checkpoint(admission2["task_id"])
+        recovered = lc.reconcile_checkpoint(admission4["task_id"])
         if recovered is None or recovered.rows != 4:
             _fail("commit_loss", "reconcile_missed")
     finally:
@@ -373,28 +441,32 @@ def _negatives(workspace: Path) -> None:
     # missing/mismatched owner fails closed on release
     from sqlalchemy import select
 
-    _expire(attempt2)
+    _expire(attempt4)
     with metadb.session() as s:
-        uri = candidate3["uri"]
+        uri = candidate5["uri"]
         ref = s.scalar(select(metadb.LocalResultReference).where(
             metadb.LocalResultReference.uri == uri))
         if ref is not None:
             s.delete(ref)
     _expect_fail("owner_mismatch", "accepted",
-                 lambda: metadb.release_linear_checkpoint(admission2["task_id"]))
+                 lambda: metadb.release_linear_checkpoint(admission4["task_id"]),
+                 match="inconsistent")
 
-    # inode replacement after open is rejected by proof recheck
-    admission3 = _admit(canvas_id, uuid.uuid4().hex)
-    task3 = _claim(admission3["task_id"], "owner-d")
-    attempt3 = task3["attempts"][-1]["id"]
-    candidate4 = _reserve(store, admission3["task_id"], attempt3, "owner-d")
-    writer = store.materialize_checkpoint(candidate4)
+    # inode replacement after open is rejected
+    admission5 = _admit(canvas_id, uuid.uuid4().hex)
+    task5 = _claim(admission5["task_id"], "owner-f")
+    attempt5 = task5["attempts"][-1]["id"]
+    candidate6 = _reserve(store, admission5["task_id"], attempt5, "owner-f")
+    writer = store.materialize_checkpoint(candidate6)
     proof = None
     try:
         writer.write(_parquet_bytes(3))
+        metadb.bind_linear_checkpoint_materialization(
+            task_id=admission5["task_id"], attempt_id=attempt5, owner_token="owner-f",
+            uri=candidate6["uri"], dev=writer.identity()[0], ino=writer.identity()[1])
         writer.seal()
-        proof = store.open_checkpoint_proof(candidate4["uri"], writer.lock_fileno())
-        name, _ = store._result_names(candidate4["uri"])
+        proof = store.prove_checkpoint(writer)
+        name, _ = store._result_names(candidate6["uri"])
         replacement = f"{name}.replacement"
         fd = os.open(replacement, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
                      dir_fd=store._result_dir_fd)
@@ -402,28 +474,43 @@ def _negatives(workspace: Path) -> None:
         os.close(fd)
         os.replace(replacement, name,
                    src_dir_fd=store._result_dir_fd, dst_dir_fd=store._result_dir_fd)
-        _expect_fail("inode_replace", "accepted", proof.recheck)
+        _expect_fail("inode_replace", "accepted", proof.recheck,
+                     match="identity changed|single-link")
     finally:
         if proof is not None:
             proof.close()
         writer.abort()
+    lc.abort_checkpoint(store, task_id=admission5["task_id"], attempt_id=attempt5,
+                        owner_token="owner-f")
 
-    # cleanup retry: abort an unmaterialized reservation, then reclaim
-    admission4 = _admit(canvas_id, uuid.uuid4().hex)
-    task4 = _claim(admission4["task_id"], "owner-e")
-    attempt4 = task4["attempts"][-1]["id"]
-    candidate5 = _reserve(store, admission4["task_id"], attempt4, "owner-e")
+    # replaced storage root fails closed on reopen of a committed checkpoint
+    admission6 = _admit(canvas_id, uuid.uuid4().hex)
+    task6 = _claim(admission6["task_id"], "owner-g")
+    attempt6 = task6["attempts"][-1]["id"]
+    candidate7 = _reserve(store, admission6["task_id"], attempt6, "owner-g")
+    lc.materialize_and_commit_checkpoint(
+        store, task_id=admission6["task_id"], attempt_id=attempt6, owner_token="owner-g",
+        candidate=candidate7, content=_parquet_bytes(2))
+    foreign = LocalStorage(str(workspace / "other-outputs"))
+    _expect_fail("replaced_root", "accepted",
+                 lambda: lc.reopen_checkpoint(foreign, admission6["task_id"]),
+                 match="different namespace|disagrees|not committed|incomplete")
+
+    # cleanup retry: abort an unmaterialized reservation
+    admission7 = _admit(canvas_id, uuid.uuid4().hex)
+    task7 = _claim(admission7["task_id"], "owner-h")
+    attempt7 = task7["attempts"][-1]["id"]
+    candidate8 = _reserve(store, admission7["task_id"], attempt7, "owner-h")
     try:
-        lc.abort_checkpoint(store, task_id=admission4["task_id"], attempt_id=attempt4,
-                            owner_token="owner-e")
-        # Idempotent response-loss replay of abort.
-        lc.abort_checkpoint(store, task_id=admission4["task_id"], attempt_id=attempt4,
-                            owner_token="owner-e")
+        lc.abort_checkpoint(store, task_id=admission7["task_id"], attempt_id=attempt7,
+                            owner_token="owner-h")
+        lc.abort_checkpoint(store, task_id=admission7["task_id"], attempt_id=attempt7,
+                            owner_token="owner-h")
     except Exception:
         _fail("cleanup_retry", "abort_failed")
-    if metadb.linear_checkpoint_candidate(admission4["task_id"]) is not None:
+    if metadb.linear_checkpoint_candidate(admission7["task_id"]) is not None:
         _fail("cleanup_retry", "still_bound")
-    if os.path.exists(candidate5["uri"]):
+    if os.path.exists(candidate8["uri"]):
         _fail("cleanup_retry", "bytes_retained")
 
 

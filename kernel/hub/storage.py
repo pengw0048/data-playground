@@ -195,14 +195,21 @@ class CheckpointWriter:
         return self._lock_fd
 
     def seal(self) -> None:
-        """Durably persist the exact materialized bytes and close only the write descriptor."""
+        """Durably persist the exact materialized bytes while retaining the artifact descriptor.
+
+        The held descriptor is the only proof surface for rows/schema/hash through the fenced commit
+        (#450). Closing it here would force a path reopen that an inode swap could win.
+        """
         if self._sealed:
             return
         os.fsync(self.fileno())
         self.storage._fsync_dir(self.storage._result_dir_fd)
-        os.close(self._artifact_fd)
-        self._artifact_fd = -1
         self._sealed = True
+
+    def identity(self) -> tuple[int, int]:
+        """Device/inode of the exact held artifact descriptor."""
+        info = os.fstat(self.fileno())
+        return int(info.st_dev), int(info.st_ino)
 
     def release(self) -> None:
         """Close the retained writer lock/descriptors after a committed response."""
@@ -802,7 +809,7 @@ class LocalStorage:
             lock_name, create=True, lock_token=str(candidate["lock_token"]))
         artifact_fd = -1
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             artifact_fd = (os.open(artifact_name, flags, 0o600, dir_fd=self._result_dir_fd)
                            if self._result_dir_fd is not None else os.open(uri, flags, 0o600))
             info = os.fstat(artifact_fd)
@@ -835,6 +842,21 @@ class LocalStorage:
             os.close(artifact_fd)
             raise
 
+    def prove_checkpoint(self, writer: CheckpointWriter) -> CheckpointProof:
+        """Prove evidence from the writer's held descriptor; never reopen the artifact by path."""
+        if not writer._sealed:
+            raise RuntimeError("checkpoint must be sealed before proof")
+        # Dup so CheckpointProof.close() cannot drop the writer's commit fence.
+        proof_fd = os.dup(writer.fileno())
+        try:
+            if writer.lock_fileno() is not None:
+                os.fstat(writer.lock_fileno())
+            evidence = self._result_artifact_evidence(writer.uri, proof_fd)
+            return CheckpointProof(self, writer.uri, proof_fd, writer.lock_fileno(), evidence)
+        except Exception:
+            os.close(proof_fd)
+            raise
+
     def reopen_checkpoint(self, committed: dict) -> LocalResultReadGuard:
         """Reconstruct a held reader for one committed checkpoint and fully revalidate evidence."""
         if committed.get("namespace_id") != self.namespace_id:
@@ -854,11 +876,11 @@ class LocalStorage:
             raise
         return guard
 
-    def reattach_checkpoint(self, candidate: dict) -> int:
-        """Reopen only the exact reserved lock of a same-generation candidate, verifying its token.
+    def reattach_checkpoint(self, candidate: dict) -> tuple[int, CheckpointProof]:
+        """Reopen the exact reserved lock and prove the data inode against recorded identity.
 
-        The returned descriptor is the caller's fence for proving and committing an already
-        materialized candidate after a transient process loss; it never creates or discovers a file.
+        Returns ``(lock_fd, proof)``. The artifact descriptor inside ``proof`` is the same inode
+        that matched candidate_dev/ino — commit never reopens by path after this check (#450).
         """
         if (candidate.get("namespace_id") != self.namespace_id
                 or candidate.get("storage_root") != self.result_root):
@@ -867,18 +889,36 @@ class LocalStorage:
             raise RuntimeError("checkpoint reattach requires a protected lock")
         if not self.lock_supported:
             raise RuntimeError("checkpoint reattach requires OS lock support")
-        _, lock_name = self._result_names(str(candidate["uri"]))
+        expected_dev, expected_ino = candidate.get("dev"), candidate.get("ino")
+        if (not isinstance(expected_dev, int) or isinstance(expected_dev, bool)
+                or not isinstance(expected_ino, int) or isinstance(expected_ino, bool)):
+            raise RuntimeError("checkpoint reattach requires a recorded materialization identity")
+        uri = str(candidate["uri"])
+        _, lock_name = self._result_names(uri)
         if lock_name != candidate.get("lock_name"):
             raise RuntimeError("checkpoint candidate lock name is inconsistent")
         lock_fd = self._open_shared_lock(lock_name)
+        artifact_fd = -1
         try:
             if self._read_lock_token(lock_fd) != str(candidate["lock_token"]):
                 raise RuntimeError("checkpoint reattach lock token changed")
+            artifact_fd = self._open_result_artifact(uri)
+            info = os.fstat(artifact_fd)
+            if (int(info.st_dev), int(info.st_ino)) != (int(expected_dev), int(expected_ino)):
+                raise RuntimeError("checkpoint reattach disagrees with materialized identity")
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise RuntimeError("reattached checkpoint is not a private regular file")
+            evidence = self._result_artifact_evidence(uri, artifact_fd)
+            if (evidence["dev"], evidence["ino"]) != (int(expected_dev), int(expected_ino)):
+                raise RuntimeError("checkpoint reattach disagrees with materialized identity")
+            return lock_fd, CheckpointProof(self, uri, artifact_fd, lock_fd, evidence)
         except Exception:
+            if artifact_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(artifact_fd)
             if lock_fd is not None:
                 os.close(lock_fd)
             raise
-        return lock_fd
 
     def discard_checkpoint_artifact(
             self, uri: str, delete_token: str, lock_token: str | None) -> None:
@@ -1138,7 +1178,9 @@ class LocalStorage:
 
     def _open_result_artifact(self, uri: str, *, allow_public_mode: bool = False) -> int:
         artifact_name, _lock_name = self._result_names(uri)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK so a planted FIFO cannot stall the process before the S_ISREG check (#452).
+        flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
         fd = (os.open(artifact_name, flags, dir_fd=self._result_dir_fd)
               if self._result_dir_fd is not None else os.open(uri, flags))
         try:
