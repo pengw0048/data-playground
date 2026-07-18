@@ -33,6 +33,23 @@ def _plan_for(ctx, owner: str | None = None):
         owner_token=owner or ctx["owner"])
 
 
+@pytest.fixture(autouse=True)
+def _reset_fanout_state():
+    """Isolate the global 4-slot pool + plans/units/result-owners between tests so the suite is safe
+    on a shared (PostgreSQL) database, not only a fresh per-module SQLite file."""
+    yield
+    from sqlalchemy import delete, update
+    with metadb.session() as s:
+        s.execute(update(fanout.BoundedFanoutSlot).values(
+            holder_attempt_id=None, claim_token=None, lease_until=None))
+        s.execute(delete(fanout.BoundedFanoutUnitAttempt))
+        s.execute(delete(fanout.BoundedFanoutUnit))
+        s.execute(delete(fanout.BoundedFanoutPlan))
+        s.execute(delete(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind.in_(
+                (fanout.CHILD_OWNER, fanout.GATHER_OWNER))))
+
+
 @pytest.mark.parametrize("rows,expected", [
     (0, [(0, 0)]),
     (1, [(0, 1)]),
