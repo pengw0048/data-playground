@@ -184,3 +184,19 @@ export function deleteCanvasDraft(principalId: string, draftId: string): DraftWr
 export function canvasDocsEqual(left: CanvasDoc, right: CanvasDoc): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
+
+function editableCanvasDoc(doc: CanvasDoc): unknown {
+  const { version: _version, ...editable } = doc
+  return {
+    ...editable,
+    nodes: doc.nodes.map((node) => {
+      const { status: _status, ...data } = node.data
+      return { ...node, data }
+    }),
+  }
+}
+
+/** Server versions and execution badges are not user-authored Canvas content. */
+export function canvasEditableContentEqual(left: CanvasDoc, right: CanvasDoc): boolean {
+  return JSON.stringify(editableCanvasDoc(left)) === JSON.stringify(editableCanvasDoc(right))
+}

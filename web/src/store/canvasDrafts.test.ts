@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  deleteCanvasDraft, MAX_LOCAL_CANVAS_DRAFTS, readCanvasDrafts, writeCanvasDraft,
+  canvasEditableContentEqual, deleteCanvasDraft, MAX_LOCAL_CANVAS_DRAFTS,
+  readCanvasDrafts, writeCanvasDraft,
   type LocalCanvasDraft,
 } from './canvasDrafts'
 
@@ -100,5 +101,30 @@ describe('principal-scoped Canvas draft storage', () => {
 
     expect(readCanvasDrafts('alice').drafts).toEqual([])
     expect(readCanvasDrafts('bob').drafts).toHaveLength(1)
+  })
+
+  it('distinguishes editable content from server versions and execution badges', () => {
+    const base = {
+      id: 'canvas', name: 'Canvas', version: 1, edges: [],
+      nodes: [{
+        id: 'source', type: 'source', position: { x: 0, y: 0 },
+        data: { title: 'Source', status: 'draft' as const, config: { uri: 'input.csv' } },
+      }],
+    }
+    const executionUpdate = {
+      ...base,
+      version: 2,
+      nodes: base.nodes.map((node) => ({
+        ...node, data: { ...node.data, status: 'latest' as const },
+      })),
+    }
+
+    expect(canvasEditableContentEqual(base, executionUpdate)).toBe(true)
+    expect(canvasEditableContentEqual(base, {
+      ...executionUpdate,
+      nodes: executionUpdate.nodes.map((node) => ({
+        ...node, data: { ...node.data, config: { uri: 'other.csv' } },
+      })),
+    })).toBe(false)
   })
 })

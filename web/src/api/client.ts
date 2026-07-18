@@ -378,11 +378,15 @@ export const api = {
     inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
+    const admittedProducerVersion = writeIntent?.provenance.publication.producerVersion
+    const submittedDoc = admittedProducerVersion == null
+      ? doc
+      : { ...doc, version: admittedProducerVersion }
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
+          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error

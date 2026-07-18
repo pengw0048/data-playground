@@ -984,7 +984,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
   })
 
-  it('reuses the admitted write submission after an ambiguous response loss', async () => {
+  it('reuses the admitted write submission after response loss and a Canvas version save', async () => {
     const write = NODE('write', 'write')
     write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] }
@@ -1020,6 +1020,9 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write).toMatchObject({
       phase: 'failed', writeAdmission: admission, writeSubmissionId: submissionId,
     })
+    // Autosave advances Canvas metadata independently of execution semantics. It must not invalidate
+    // the admitted write or mint a second submission identity after an ambiguous response loss.
+    useStore.setState((state) => ({ doc: { ...state.doc, version: state.doc.version + 1 } }))
 
     await useStore.getState().run('write')
 
@@ -1028,6 +1031,7 @@ describe('graph store — core authority ops', () => {
       'write', false, submissionId, undefined, intent,
     ])
     expect(apiMocks.run.mock.calls[1][0].nodes[0].data.config).toEqual(doc.nodes[0].data.config)
+    expect(apiMocks.run.mock.calls[1][0].version).toBe(2)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
   })
 
@@ -2678,6 +2682,35 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().currentUser?.id).toBe('bob')
     expect(useStore.getState().localDrafts).toEqual([])
     expect(useStore.getState().toasts).toEqual([])
+  })
+
+  it('does not overwrite newer local edits when an in-flight retry fails', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const original = useStore.getState().localDrafts[0]
+    let rejectRetry!: (error: Error) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectRetry = reject
+    }))
+
+    const retrying = useStore.getState().retryLocalDraft(original.draftId)
+    const editedDoc = { ...original.doc, name: 'edited while retrying' }
+    useStore.setState((state) => ({
+      doc: editedDoc,
+      localDrafts: state.localDrafts.map((draft) => draft.draftId === original.draftId
+        ? { ...draft, doc: editedDoc, name: editedDoc.name!, syncState: 'dirty' as const,
+          lastLocalEditAt: '2026-07-18T13:00:00.000Z' }
+        : draft),
+    }))
+    rejectRetry(new TypeError('late response loss'))
+    await retrying
+
+    expect(useStore.getState().localDrafts[0]).toMatchObject({
+      doc: editedDoc,
+      name: 'edited while retrying',
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-18T13:00:00.000Z',
+    })
   })
 
   it('keeps the importer destination as a local draft on a genuine transport failure', async () => {

@@ -215,6 +215,36 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('autosave')).toHaveText(/saved|saving/)
   })
 
+  test('an online Canvas edit inside the autosave debounce survives tab reload as a local draft', async ({ page }) => {
+    await fresh(page)
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const name = `Close recovery ${Date.now()}`
+    let unloadPuts = 0
+    const canvasUrl = `**/api/canvas/${canvasId}`
+    await page.route(canvasUrl, async (route) => {
+      if (route.request().method() === 'PUT') {
+        unloadPuts += 1
+        await route.abort('connectionfailed')
+        return
+      }
+      await route.continue()
+    })
+
+    await page.getByTestId('file-menu').click()
+    await page.getByPlaceholder('untitled').fill(name)
+    await page.reload()
+
+    await expect(page).toHaveURL(new RegExp(`#\/canvas\/${canvasId}$`))
+    await expect(page.getByTestId('file-menu')).toContainText(name)
+    await expect(page.getByTestId('autosave')).toHaveText(/saved locally/)
+    expect(unloadPuts).toBe(0)
+
+    await page.unroute(canvasUrl)
+    await page.getByTestId('file-menu').click()
+    await page.getByRole('button', { name: `Retry local draft ${name}` }).click()
+    await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
+  })
+
   test('minimap and zoom controls are both present and do not overlap', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter') // minimap + zoom controls only mount once the canvas has a node to navigate
