@@ -253,9 +253,18 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           setAvailability('error')
         }
       })
-    }).catch(() => {
+    }).catch((error) => {
       if (live && generation === historyGeneration.current) {
-        setExactAvailable(false); setAsOfAvailable(false); setAvailability('unavailable')
+        setExactAvailable(false); setAsOfAvailable(false)
+        // A provider's explicit unsupported/missing response proves this Source has no selector.
+        // Transport and server failures do not: keep the retryable error visible rather than making
+        // a potentially supported control silently disappear.
+        if (kernelErrorStatus(error) === 410 || kernelErrorStatus(error) === 501) {
+          setAvailability('unavailable')
+        } else {
+          setHistoryError(error instanceof Error ? error.message : String(error))
+          setAvailability('error')
+        }
       }
     }).finally(() => {
       if (live && generation === historyGeneration.current) setCapabilitiesChecking(false)
@@ -339,6 +348,10 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const registrationReplaced = selectedExact != null && revisions.length > 0
     && revisions.every((revision) => revision.datasetId !== selectedExact.datasetId)
   const checking = availability === 'checking' || capabilitiesChecking
+  // Do not reserve card space for an inactive selector after capability discovery has proved that
+  // neither exact nor as-of is available. Loading and errors remain visible because neither is proof.
+  const showControl = checking || availability === 'error' || exactAvailable || asOfAvailable
+  const capabilityError = availability === 'error' && !exactAvailable && !asOfAvailable
   const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
     : !controlAvailable ? 'Revision selection unavailable'
       : selected?.kind === 'as_of' ? `As of ${new Date(selected.asOf).toLocaleString()} → ${selectedExact?.revisionId}`
@@ -346,18 +359,20 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
             : asOfAvailable ? 'Choose revision as of a time' : 'Pin exact revision'
 
+  if (!showControl && !selectedExact) return null
+
   return (
     <div className="mt-1.5" data-testid={`source-revision-${nodeId}`}>
-      <button ref={anchorRef} type="button" disabled={!canEdit || !controlAvailable}
+      {showControl && <button ref={anchorRef} type="button" disabled={!canEdit || !controlAvailable}
         title={controlLabel} onClick={(event) => { event.stopPropagation(); setOpen((value) => !value) }}
         className="flex w-full items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-left text-[10px] text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60">
         <Icon name="clock" size={11} />
         <span className="min-w-0 flex-1 truncate">{controlLabel}</span>
         {controlAvailable && <Icon name="chevronDown" size={10} />}
-      </button>
+      </button>}
       {availability === 'error' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
-          Couldn't load revision history: {historyError}{' '}
+          {capabilityError ? "Couldn't check revision capabilities" : "Couldn't load revision history"}: {historyError}{' '}
           <button type="button" className="font-semibold underline" onClick={() => setRequest((value) => value + 1)}>Retry</button>
         </div>
       )}
@@ -396,7 +411,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry verification</button>
         </div>
       )}
-      <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
+      {showControl && <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
         <div className="px-2 py-1 text-[10px] text-muted-foreground">Persist one exact provider revision. The Source will never retarget it to latest.</div>
         {selected && (
           <button type="button" onClick={() => { onChange(undefined); setOpen(false) }}
@@ -442,7 +457,7 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
           </div>
           {asOfError && <div role="alert" className="mt-1 text-[9.5px] text-destructive">{asOfError}</div>}
         </div>}
-      </Popover>
+      </Popover>}
     </div>
   )
 }
