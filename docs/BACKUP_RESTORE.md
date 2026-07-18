@@ -4,6 +4,7 @@ This runbook defines what a Data Playground backup must capture, how to take and
 it for each supported storage profile, and how the repository proves that an isolated
 restore works. Disaster-recovery takeover of an existing object-store namespace is **not**
 implemented and must not be inferred from this procedure — see [RAY.md](RAY.md).
+Run the repository commands below from the checkout root.
 
 ## What to back up
 
@@ -12,7 +13,7 @@ steps below differ by profile.
 
 | Item | Why it matters |
 |---|---|
-| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
+| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. Durable task recovery additionally requires `durable_tasks`, `durable_task_attempts`, `durable_task_inbox_items`, `durable_external_waits`, `durable_checkpoints`, and the bounded fan-out plan, unit, attempt, and slot tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results plus immutable core-owned revision artifacts under `.dp-results/`), and `plugins/` (operator-installed packs). Preserve the complete `.dp-results` namespace metadata and record hashes for every core-owned artifact referenced by `managed_local_file_revisions`; copying only current catalog heads loses retained history. |
 | **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
 | **Provider-owned history evidence (not provider bytes)** | The database retains opaque registration / dataset IDs, exact provider revision IDs, pinned Source refs, and admitted run manifests. The logical backup does **not** include provider-owned Lance or plugin-provider bytes. Back those up through the provider's own system if required, and classify each restored exact read as available or unavailable instead of treating a current same-name/path dataset as the old revision. |
@@ -40,14 +41,23 @@ Assume the hub was started with `DP_WORKSPACE=/data` (default: the kernel packag
 no `DP_DATABASE_URL` / `DP_STORAGE_URL` overrides.
 
 ```bash
-# 1. Stop every process writing this workspace (hub, kernels, MCP, headless).
-# 2. Record release identity while the old process is still readable, or from the frozen tree:
-curl -sS http://127.0.0.1:8471/api/version | tee backup/version.json
-# After stop:
+# 1. Record release identity while the old process is still readable:
 mkdir -p backup
+curl -sS http://127.0.0.1:8471/api/version | tee backup/version.json
+# 2. Stop every process writing this workspace (hub, kernels, MCP, headless), then copy:
 cp -a "$DP_WORKSPACE/dataplay.db" backup/dataplay.db
 cp -a "$DP_WORKSPACE/outputs" backup/outputs
 cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
+# Bind the frozen DB schema to the recorded release identity:
+uv run --project kernel python - <<'PY'
+import json
+from pathlib import Path
+from hub import metadb
+path = Path("backup/version.json")
+doc = json.loads(path.read_text())
+doc["alembic"] = metadb.require_schema_at_head()
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
+PY
 # Record content evidence relative to outputs/ (use `shasum -a 256` where sha256sum is unavailable):
 (cd "$DP_WORKSPACE/outputs" && \
   find ./.dp-results -type f ! -path '*/.locks/*' -print0 | sort -z | \
@@ -67,6 +77,7 @@ mkdir -p "$RESTORE"
 cp -a "$BACKUP/dataplay.db" "$RESTORE/dataplay.db"
 cp -a "$BACKUP/outputs" "$RESTORE/outputs"
 cp -a "$BACKUP/plugins" "$RESTORE/plugins" 2>/dev/null || true
+cp -a "$BACKUP/version.json" "$RESTORE/version.json"
 (cd "$RESTORE/outputs" && sha256sum -c "$BACKUP/core-artifacts.sha256")
 
 # Built-in local-result and managed-revision URIs are exact absolute paths. For an isolated
@@ -83,7 +94,7 @@ export DP_WORKSPACE="$RESTORE"
 export DP_DATABASE_URL="sqlite:///$RESTORE/dataplay.db"
 export DP_STORAGE_URL="<mounted original outputs root>"
 # Read the source namespace from the restored DB, then isolate:
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 from hub import metadb
 metadb.init_db()
 expected = metadb.object_storage_namespace()  # only safe before DP_STORAGE_NAMESPACE is set wrongly
@@ -129,13 +140,24 @@ docker compose -f docker-compose.ray.yml up -d minio createbucket
 ### Backup
 
 ```bash
-# 1. Stop every metadata / object-store writer for this installation.
-# 2. Record release identity:
+# 1. Record release identity while the old process is still readable:
+mkdir -p backup
 curl -sS http://127.0.0.1:8471/api/version | tee backup/version.json
 
+# 2. Stop every metadata / object-store writer for this installation.
 # 3. Dump Postgres (custom format keeps restore flexible):
 pg_dump --format=custom --no-owner --no-acl \
   "$DP_DATABASE_URL_LIBPQ" -f backup/dataplay.dump
+uv run --project kernel python - <<'PY'
+import json
+from pathlib import Path
+from hub import metadb
+path = Path("backup/version.json")
+doc = json.loads(path.read_text())
+doc["alembic"] = metadb.require_schema_at_head()
+doc["namespace"] = metadb.object_storage_namespace()
+path.write_text(json.dumps(doc, sort_keys=True) + "\n")
+PY
 # Example libpq URL for the compose harness:
 #   postgresql://dp:dp@127.0.0.1:5432/dataplay
 
@@ -143,7 +165,7 @@ pg_dump --format=custom --no-owner --no-acl \
 #    Marker path: s3://<bucket>/_dp_control/namespaces/<namespace>.json
 #    With the MinIO harness (endpoint from DP_S3_ENDPOINT):
 mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
-NS="$(python -c 'from hub import metadb; metadb.init_db(); print(metadb.object_storage_namespace())')"
+NS="$(uv run --project kernel python -c 'from hub import metadb; metadb.init_db(); print(metadb.object_storage_namespace())')"
 mc cp --recursive "dp/${DP_S3_BUCKET}/" "backup/objects/"
 # Prefer filtering to the namespace prefix + _dp_control/namespaces/${NS}.json when the bucket is shared.
 
@@ -162,8 +184,11 @@ interleave either with live writes.
 
 ```bash
 # Fresh database and fresh object-store prefix/namespace — never the live ones.
+RESTORE=/tmp/dp-restore-$$
+mkdir -p "$RESTORE"
 createdb -U dp dataplay_restore   # or restore into an empty database owned by the drill
 pg_restore --clean --if-exists --no-owner --no-acl -d "$RESTORE_DATABASE_URL_LIBPQ" backup/dataplay.dump
+cp -a backup/version.json "$RESTORE/version.json"
 
 # Copy objects into a scratch prefix if you need file presence for local checks; the clone must
 # NOT claim the source namespace marker. Isolation creates a new claim under the replacement namespace.
@@ -174,7 +199,7 @@ pg_restore --clean --if-exists --no-owner --no-acl -d "$RESTORE_DATABASE_URL_LIB
 export DP_DATABASE_URL="postgresql+psycopg://..."   # the restore DB only
 export DP_STORAGE_URL="s3://..."                    # bucket/prefix the clone may use
 unset DP_STORAGE_NAMESPACE                          # until after isolation
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 from hub import metadb
 metadb.init_db()
 expected = metadb.object_storage_namespace()
@@ -232,6 +257,51 @@ The automated drill emits `BACKUP_RESTORE_REVISION_EVIDENCE` on success. A failu
 operators can distinguish a missing DB row, identity drift, a missing/corrupt core artifact, and an
 unexpected provider result.
 
+## Durable task recovery verification
+
+Treat each durable task as a whole recovery unit, not as a task status row that can be restored on
+its own. The drill keeps one bounded fixture for each currently certified kind:
+
+- A terminal `managed_local_write` task retains its frozen logical graph, exact write receipt and
+  publication identity, ordinary local input manifest, `local_file_input_revisions` mapping,
+  task-owned `local_result_references` row, and the hashed snapshot artifact. Private execution-only
+  artifact bindings must not appear in `durable_tasks.graph_doc`.
+- A terminal `linear_checkpoint_write` task retains its attempt, committed `durable_checkpoints`
+  evidence, exact candidate generation, ready artifact, hash, inode evidence, and sole
+  `durable_checkpoint` owner.
+- A terminal `bounded_fanout_write` task retains the same committed parent checkpoint plus the
+  immutable plan, complete child/gather unit and attempt set, released four-slot pool, exact result
+  hashes, and one `bounded_fanout_child` or `bounded_fanout_gather` owner for each done unit.
+- A nonterminal `external_wait` task retains its attempt, provider-neutral handle and monotonic
+  checkpoint in `durable_external_waits`. Before provider success it must have no write receipt,
+  Inbox item, download evidence, staged artifact identity, or publication.
+
+After loading the database and artifact set, but before enabling normal traffic:
+
+1. Read the restored `version.json`, compare its `version`, `sha`, database, and storage fields with the
+   selected restore profile, and compare its Alembic revision with
+   `metadb.require_schema_at_head()`. For the object-store profile, also compare its namespace with
+   the restored `installation_identity` before isolation. The presence of the file alone is not a
+   release/schema check.
+2. Run `metadb.linear_checkpoint_restore_audit()` and `bounded_fanout.restore_audit()`. A failed
+   audit rejects the restore; report it as structured mismatch evidence rather than dropping an
+   owner, checkpoint, unit, or artifact to make the restore start.
+3. Verify every terminal task and attempt has the original status, receipt identity, artifact hash,
+   owner references, and exactly one Inbox item. Preserve both read and unread Inbox state. A
+   nonterminal external wait has no Inbox item.
+4. Start recovery once with the external provider adapter unavailable. The task must remain
+   recoverable with its original handle/checkpoint and an `adapter_unavailable` diagnostic; it must
+   not be resubmitted or fabricated as successful.
+5. Restore the adapter and restart recovery. It must poll the existing handle from the retained
+   checkpoint. Concurrent supervisors converge through the restored DB lease, so only one polls;
+   `submit` remains uncalled, and late task, fan-out, or external-wait owners remain fenced.
+6. Confirm recovery did not add a second publication or leave a fan-out slot held. New work uses
+   fresh DB-clock leases; copied lease timestamps never authorize a stale owner.
+
+The automated drill emits `BACKUP_RESTORE_DURABLE_TASK_EVIDENCE` on success. A consistency failure
+emits `BACKUP_RESTORE_DURABLE_TASK_MISMATCH` entries with `subject`, `expected`, and `actual` fields;
+release/schema failures use `BACKUP_RESTORE_IDENTITY_MISMATCH` with the same shape.
+
 ## Automated restore drill
 
 The repository owns an automated drill in `kernel/hub/tests/test_backup_restore_drill.py`.
@@ -249,10 +319,11 @@ cd kernel && uv run pytest -q hub/tests/test_backup_restore_drill.py -k postgres
 
 ### How to read RPO / RTO evidence
 
-Each passing drill prints three structured lines (also captured in CI logs):
+Each passing drill prints four structured lines (also captured in CI logs):
 
 ```
 BACKUP_RESTORE_REVISION_EVIDENCE: <JSON exact-read and identity summary>
+BACKUP_RESTORE_DURABLE_TASK_EVIDENCE: <JSON task identities and reattach summary>
 BACKUP_RESTORE_DRILL RPO: <human summary of which fixture writes the backup captured>
 BACKUP_RESTORE_DRILL RTO_MS: <integer milliseconds from restore start to verified restore>
 ```

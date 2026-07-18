@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -10,7 +12,9 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
+from importlib.metadata import version as package_version
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -19,9 +23,15 @@ import pyarrow.parquet as pq
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
-from hub import handoff, metadb
+from hub import bounded_fanout, external_wait_tasks, handoff, linear_checkpoint, metadb
+from hub.external_wait import ExternalWaitCheckpoint, ExternalWaitPollOutcome
 from hub.local_run_inputs import finalize_local_file_candidates, snapshot_local_file_input
-from hub.models import CatalogTable, RunOutput
+from hub.models import (
+    CatalogTable,
+    RunOutput,
+    RunStatus,
+    WriteIntent,
+)
 from hub.plugins.adapters import (
     DuckDBAdapter, LanceAdapter, LocalFileInputRevisionAdapter,
     ManagedLocalFileRevisionAdapter, RevisionUnavailable,
@@ -216,6 +226,438 @@ def _exact_source_node(node_id: str, ref: dict) -> dict:
     }
 
 
+def _parquet_bytes(rows: int) -> bytes:
+    sink = io.BytesIO()
+    pq.write_table(pa.table({
+        "id": list(range(rows)),
+        "label": [f"row-{index}" for index in range(rows)],
+    }), sink)
+    return sink.getvalue()
+
+
+def _task_write_intent(task_id: str, canvas_id: str, logical_uri: str) -> dict:
+    key = f"write:{task_id}"
+    return {
+        "destination": {
+            "logicalUri": logical_uri,
+            "name": "durable_result",
+            "provider": "managed-local-file",
+        },
+        "mode": "create",
+        "expectedSchema": [{"name": "value", "type": "int"}],
+        "idempotencyKey": key,
+        "partitions": [],
+        "provenance": {
+            "publication": {
+                "idempotencyKey": key,
+                "runId": task_id,
+                "producer": canvas_id,
+                "producerVersion": 1,
+                "stepId": "write",
+                "provenance": "run",
+                "fieldMappings": [],
+            },
+            "parents": [],
+        },
+    }
+
+
+def _finish_task(
+        storage: LocalStorage, catalog: InMemoryCatalog, *, task_id: str,
+        attempt_id: str, owner_token: str, intent: dict) -> dict:
+    from hub.local_writes import write_managed_local_file
+
+    receipt = write_managed_local_file(
+        storage=storage,
+        catalog=catalog,
+        intent=WriteIntent.model_validate(intent),
+        write_artifact=lambda uri: pq.write_table(pa.table({"value": [1]}), uri),
+    )
+    status = RunStatus(
+        run_id=task_id,
+        status="done",
+        target_node_id="write",
+        total_rows=1,
+        outputs=[RunOutput(
+            node_id="write",
+            port_id="out",
+            wire="dataset",
+            publication_kind="catalog",
+            outcome="committed",
+            uri=receipt.publication.artifact_uri,
+            table="durable_result",
+            version=receipt.publication.catalog_version,
+            rows=1,
+            write_receipt=receipt,
+        )],
+    ).model_dump()
+    assert metadb.finish_durable_task_attempt(
+        task_id, attempt_id, owner_token, status)
+    return receipt.model_dump(by_alias=True, mode="json")
+
+
+def _checkpoint_admission(
+        *, canvas_id: str, submission_id: str, task_kind: str,
+        input_manifest: list[dict], logical_uri: str) -> dict:
+    task_id = metadb.durable_task_submission_id(
+        metadb.DEFAULT_USER_ID, canvas_id, submission_id)
+    graph = {
+        "id": canvas_id,
+        "version": 1,
+        "nodes": [
+            {"id": "checkpoint", "type": "write", "data": {
+                "title": "checkpoint", "config": {"filename": "checkpoint.parquet"}}},
+            {"id": "write", "type": "write", "data": {
+                "title": "durable result", "config": {"filename": "result.parquet"}}},
+        ],
+        "edges": [{
+            "id": "checkpoint-write",
+            "source": "checkpoint",
+            "target": "write",
+            "sourceHandle": "out",
+            "targetHandle": "in",
+        }],
+    }
+    manifest_sha = hashlib.sha256(json.dumps(
+        input_manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode()).hexdigest()
+    admission, created = metadb.submit_linear_checkpoint_task(
+        uid=metadb.DEFAULT_USER_ID,
+        canvas_id=canvas_id,
+        submission_id=submission_id,
+        final_target_node_id="write",
+        checkpoint_id=f"checkpoint:{uuid.uuid4().hex}",
+        checkpoint_node_id="checkpoint",
+        output_port_id="out",
+        task_intent_sha256=hashlib.sha256(task_id.encode()).hexdigest(),
+        graph_prefix_sha256=hashlib.sha256(
+            json.dumps(graph, sort_keys=True).encode()).hexdigest(),
+        input_manifest_sha256=manifest_sha,
+        graph_doc=graph,
+        input_manifest=input_manifest,
+        write_intent=_task_write_intent(task_id, canvas_id, logical_uri),
+        task_kind=task_kind,
+    )
+    assert created is True
+    return admission
+
+
+def _seed_checkpoint(
+        storage: LocalStorage, *, canvas_id: str, task_kind: str,
+        owner_token: str, rows: int, logical_uri: str) -> dict:
+    admission = _checkpoint_admission(
+        canvas_id=canvas_id,
+        submission_id=str(uuid.uuid4()),
+        task_kind=task_kind,
+        input_manifest=[],
+        logical_uri=logical_uri,
+    )
+    claim_fn = (
+        metadb.claim_linear_checkpoint_task
+        if task_kind == "linear_checkpoint_write"
+        else metadb.claim_bounded_fanout_write_task
+    )
+    task = claim_fn(admission["task_id"], owner_token)
+    assert task is not None
+    attempt = task["attempts"][-1]
+    candidate = metadb.reserve_linear_checkpoint_candidate(
+        task_id=admission["task_id"],
+        attempt_id=attempt["id"],
+        owner_token=owner_token,
+        namespace_id=storage.namespace_id,
+        storage_root=storage.result_root,
+        writer_token=uuid.uuid4().hex,
+        lock_token=uuid.uuid4().hex,
+    )
+    evidence = linear_checkpoint.materialize_and_commit_checkpoint(
+        storage,
+        task_id=admission["task_id"],
+        attempt_id=attempt["id"],
+        owner_token=owner_token,
+        candidate=candidate,
+        content=_parquet_bytes(rows),
+    )
+    return {
+        "admission": admission,
+        "attempt": attempt,
+        "candidate": candidate,
+        "evidence": evidence,
+        "owner_token": owner_token,
+    }
+
+
+class _ReattachAdapter:
+    provider_kind = "backup-drill"
+
+    def __init__(self):
+        self.submit_calls = 0
+        self.status_calls = 0
+        self.seen_handles: list[str] = []
+
+    def submit(self, _request):
+        self.submit_calls += 1
+        raise AssertionError("restored external wait must not resubmit")
+
+    def status(self, handle, checkpoint=None):
+        self.status_calls += 1
+        self.seen_handles.append(handle.job_id)
+        sequence = checkpoint.sequence + 1 if checkpoint else 1
+        return ExternalWaitPollOutcome(
+            phase="running",
+            checkpoint=ExternalWaitCheckpoint(
+                sequence=sequence, token=f"restore-{sequence}"),
+            retry={"after_seconds": 1.0},
+        )
+
+    def cancel(self, _handle, checkpoint=None):
+        raise AssertionError(f"unexpected cancel at {checkpoint}")
+
+
+def _seed_durable_tasks(
+        workspace: Path, storage: LocalStorage, catalog: InMemoryCatalog, *, canvas_id: str,
+        ordinary_input: dict) -> dict:
+    manifest = [{
+        "node_id": "ordinary",
+        "dataset_id": ordinary_input["dataset_id"],
+        "revision_id": ordinary_input["revision_id"],
+        "provider": "local-file-snapshot",
+        "resolved_at": "2026-07-18T00:00:00+00:00",
+    }]
+    logical_root = workspace / "data"
+
+    managed_submission = str(uuid.uuid4())
+    managed_task_id = metadb.durable_task_submission_id(
+        metadb.DEFAULT_USER_ID, canvas_id, managed_submission)
+    managed_graph = {
+        "id": canvas_id,
+        "version": 1,
+        "nodes": [
+            _exact_source_node("ordinary", ordinary_input),
+            {"id": "write", "type": "write", "data": {
+                "config": {"filename": "managed-task.parquet"}}},
+        ],
+        "edges": [{"id": "ordinary-write", "source": "ordinary", "target": "write"}],
+    }
+    managed, created = metadb.submit_durable_local_write_task(
+        uid=metadb.DEFAULT_USER_ID,
+        canvas_id=canvas_id,
+        submission_id=managed_submission,
+        target_node_id="write",
+        intent_sha256=hashlib.sha256(managed_task_id.encode()).hexdigest(),
+        graph_doc=managed_graph,
+        input_manifest=manifest,
+        write_intent=_task_write_intent(
+            managed_task_id, canvas_id, str(logical_root / "managed-task.parquet")),
+    )
+    assert created is True
+    managed_claim = metadb.claim_durable_task(managed["id"], "backup-managed-owner")
+    assert managed_claim is not None
+    managed_attempt = managed_claim["attempts"][-1]
+    managed_receipt = _finish_task(
+        storage, catalog, task_id=managed["id"], attempt_id=managed_attempt["id"],
+        owner_token="backup-managed-owner",
+        intent=_task_write_intent(
+            managed_task_id, canvas_id, str(logical_root / "managed-task.parquet")),
+    )
+
+    checkpoint = _seed_checkpoint(
+        storage,
+        canvas_id=canvas_id,
+        task_kind="linear_checkpoint_write",
+        owner_token="backup-checkpoint-owner",
+        rows=3,
+        logical_uri=str(logical_root / "checkpoint-task.parquet"),
+    )
+    checkpoint_receipt = _finish_task(
+        storage, catalog,
+        task_id=checkpoint["admission"]["task_id"],
+        attempt_id=checkpoint["attempt"]["id"],
+        owner_token=checkpoint["owner_token"],
+        intent=checkpoint["admission"]["write_intent"],
+    )
+
+    fanout = _seed_checkpoint(
+        storage,
+        canvas_id=canvas_id,
+        task_kind="bounded_fanout_write",
+        owner_token="backup-fanout-owner",
+        rows=5,
+        logical_uri=str(logical_root / "fanout-task.parquet"),
+    )
+    plan = bounded_fanout.create_or_reopen_plan(
+        parent_task_id=fanout["admission"]["task_id"],
+        parent_attempt_id=fanout["attempt"]["id"],
+        owner_token=fanout["owner_token"],
+    )
+    fanout_artifacts = []
+    for unit in [item for item in plan["units"] if item["kind"] == "child"]:
+        claim = bounded_fanout.claim_unit(
+            parent_task_id=fanout["admission"]["task_id"],
+            unit_id=unit["unit_id"],
+            parent_attempt_id=fanout["attempt"]["id"],
+            owner_token=fanout["owner_token"],
+        )
+        candidate = bounded_fanout.reserve_unit_artifact(
+            storage, attempt_id=claim["attempt_id"])
+        plan = bounded_fanout.commit_unit_evidence(
+            storage,
+            attempt_id=claim["attempt_id"],
+            claim_token=claim["claim_token"],
+            owner_token=fanout["owner_token"],
+            candidate=candidate,
+            content=_parquet_bytes(unit["range_end"] - unit["range_start"]),
+        )
+        fanout_artifacts.append(candidate["uri"])
+    gather = next(item for item in plan["units"] if item["kind"] == "gather")
+    gather_claim = bounded_fanout.claim_unit(
+        parent_task_id=fanout["admission"]["task_id"],
+        unit_id=gather["unit_id"],
+        parent_attempt_id=fanout["attempt"]["id"],
+        owner_token=fanout["owner_token"],
+    )
+    gather_candidate = bounded_fanout.reserve_unit_artifact(
+        storage, attempt_id=gather_claim["attempt_id"])
+    plan = bounded_fanout.commit_unit_evidence(
+        storage,
+        attempt_id=gather_claim["attempt_id"],
+        claim_token=gather_claim["claim_token"],
+        owner_token=fanout["owner_token"],
+        candidate=gather_candidate,
+        content=_parquet_bytes(5),
+    )
+    fanout_artifacts.append(gather_candidate["uri"])
+    assert all(unit["status"] == "done" for unit in plan["units"])
+    fanout_receipt = _finish_task(
+        storage, catalog,
+        task_id=fanout["admission"]["task_id"],
+        attempt_id=fanout["attempt"]["id"],
+        owner_token=fanout["owner_token"],
+        intent=fanout["admission"]["write_intent"],
+    )
+
+    external_submission = str(uuid.uuid4())
+    external_task_id = metadb.durable_task_submission_id(
+        metadb.DEFAULT_USER_ID, canvas_id, external_submission)
+    external_graph = {
+        "id": canvas_id,
+        "version": 1,
+        "nodes": [
+            {"id": "wait", "type": "external_wait_fixture", "data": {"config": {
+                "operation": "backup.restore",
+                "documentJson": "{}",
+                "outputSchema": [{"name": "value", "type": "int"}],
+            }}},
+            {"id": "write", "type": "write", "data": {"config": {
+                "destination": str(logical_root / "external-task.parquet"),
+                "mode": "create",
+            }}},
+        ],
+        "edges": [{"id": "wait-write", "source": "wait", "target": "write"}],
+    }
+    external, created = metadb.submit_durable_external_wait_task(
+        uid=metadb.DEFAULT_USER_ID,
+        canvas_id=canvas_id,
+        submission_id=external_submission,
+        target_node_id="write",
+        intent_sha256=hashlib.sha256(external_task_id.encode()).hexdigest(),
+        graph_doc=external_graph,
+        provider_kind="backup-drill",
+        operation="backup.restore",
+        document_json="{}",
+        write_intent=_task_write_intent(
+            external_task_id, canvas_id, str(logical_root / "external-task.parquet")),
+    )
+    assert created is True
+    submit_claim = metadb.claim_external_wait_transition(
+        external["id"], "backup-external-submit")
+    assert submit_claim is not None
+    handle = {"provider_kind": "backup-drill", "job_id": f"job-{uuid.uuid4().hex}"}
+    assert metadb.commit_external_wait_transition(
+        external["id"], submit_claim["attempt_id"], "backup-external-submit",
+        handle=handle,
+    )
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, external["id"], with_for_update=True)
+        wait.next_poll_at = metadb._now() - datetime.timedelta(seconds=1)
+        wait.deadline_at = metadb._now() + datetime.timedelta(days=1)
+    poll_claim = metadb.claim_external_wait_transition(
+        external["id"], "backup-external-poll")
+    assert poll_claim is not None
+    checkpoint_doc = {"sequence": 7, "token": "before-backup"}
+    assert metadb.commit_external_wait_transition(
+        external["id"], poll_claim["attempt_id"], "backup-external-poll",
+        outcome={
+            "phase": "running",
+            "checkpoint": checkpoint_doc,
+            "retry": {"after_seconds": 1.0},
+            "diagnostic": None,
+        },
+    )
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, external["id"], with_for_update=True)
+        wait.deadline_at = metadb._now() + datetime.timedelta(days=1)
+
+    inbox = metadb.list_durable_task_inbox_items(metadb.DEFAULT_USER_ID, limit=200)["items"]
+    task_ids = {
+        managed["id"], checkpoint["admission"]["task_id"],
+        fanout["admission"]["task_id"],
+    }
+    terminal_inbox = {item["task_id"]: item for item in inbox if item["task_id"] in task_ids}
+    assert set(terminal_inbox) == task_ids
+    read_item = metadb.mark_durable_task_inbox_item_read(
+        metadb.DEFAULT_USER_ID, terminal_inbox[managed["id"]]["id"])
+    assert read_item is not None and read_item["read_at"] is not None
+    assert not any(item["task_id"] == external["id"] for item in inbox)
+
+    artifact_uris = [
+        managed_receipt["publication"]["artifactUri"],
+        checkpoint_receipt["publication"]["artifactUri"], checkpoint["candidate"]["uri"],
+        fanout_receipt["publication"]["artifactUri"], fanout["candidate"]["uri"],
+        *fanout_artifacts,
+    ]
+    return {
+        "managed": {
+            "task_id": managed["id"],
+            "attempt_id": managed_attempt["id"],
+            "input_manifest": manifest,
+            "input_artifact_uri": ordinary_input["artifact_uri"],
+            "receipt": managed_receipt,
+        },
+        "checkpoint": {
+            "task_id": checkpoint["admission"]["task_id"],
+            "attempt_id": checkpoint["attempt"]["id"],
+            "receipt": checkpoint_receipt,
+        },
+        "fanout": {
+            "task_id": fanout["admission"]["task_id"],
+            "attempt_id": fanout["attempt"]["id"],
+            "plan_digest": plan["plan_digest"],
+            "unit_count": len(plan["units"]),
+            "old_unit_attempt_id": gather_claim["attempt_id"],
+            "old_unit_claim_token": gather_claim["claim_token"],
+            "receipt": fanout_receipt,
+        },
+        "external": {
+            "task_id": external["id"],
+            "attempt_id": poll_claim["attempt_id"],
+            "handle": handle,
+            "checkpoint": checkpoint_doc,
+        },
+        "inbox": {
+            task_id: {
+                "id": terminal_inbox[task_id]["id"],
+                "read": task_id == managed["id"],
+            }
+            for task_id in task_ids
+        },
+        "artifacts": [{
+            "uri": uri,
+            "rel": str(Path(uri).resolve().relative_to(Path(storage.root).resolve())),
+            "sha256": _file_sha256(Path(uri)),
+        } for uri in artifact_uris],
+    }
+
+
 def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
                   provider: _ClaimProvider) -> dict:
     metadb.init_db()
@@ -224,6 +666,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     alembic_head = metadb.expected_schema_head()
     assert metadb.require_schema_at_head() == alembic_head
     release_sha = os.environ.get("DP_GIT_SHA", "").strip() or "drill-fixture"
+    release_version = package_version("data-playground")
 
     canvas_id = f"drill-canvas-{uuid.uuid4().hex}"
     data_dir = workspace / "data"
@@ -419,12 +862,17 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     plugins.mkdir(parents=True, exist_ok=True)
     (plugins / "drill-note.txt").write_text("fixture plugin tree\n", encoding="utf-8")
 
+    durable_tasks = _seed_durable_tasks(
+        workspace, storage, revision_catalog,
+        canvas_id=canvas_id, ordinary_input=ordinary_input)
+
     claim_key = (urlsplit(claim_uri).netloc, namespace)
     return {
         "namespace": namespace,
         "owner": owner,
         "alembic_head": alembic_head,
         "release_sha": release_sha,
+        "release_version": release_version,
         "canvas_id": canvas_id,
         "workspace_container_id": workspace_container["id"],
         "workspace_placement_id": workspace_placement["id"],
@@ -451,6 +899,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "marker_body": provider.claims[claim_key]["body"],
         "cred_id": object_store_cred["id"],
         "secret_ref": "file:/run/secrets/dp-backup-drill-secret",
+        "durable_tasks": durable_tasks,
     }
 
 
@@ -730,6 +1179,242 @@ def _assert_revision_recovery(
     )
 
 
+def _assert_backup_identity(path: Path, info: dict, *, db: str, storage: str) -> None:
+    mismatches: list[dict[str, object]] = []
+
+    def check(subject: str, actual, expected) -> None:
+        if actual != expected:
+            mismatches.append({"subject": subject, "expected": expected, "actual": actual})
+
+    try:
+        identity = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — emit bounded restore evidence
+        identity = {"read_error": f"{type(exc).__name__}: {exc}"}
+    check("version release sha", identity.get("sha"), info["release_sha"])
+    check("version package release", identity.get("version"), info["release_version"])
+    check("version database profile", identity.get("db"), db)
+    check("version storage profile", identity.get("storage"), storage)
+    check("version schema head", identity.get("alembic"), info["alembic_head"])
+    try:
+        restored_head = metadb.require_schema_at_head()
+    except Exception as exc:  # noqa: BLE001 — structured mismatch replaces raw audit failure
+        restored_head = f"{type(exc).__name__}: {exc}"
+    check("restored database schema identity", restored_head, identity.get("alembic"))
+    if db == "postgresql":
+        check("version object namespace", identity.get("namespace"), info["namespace"])
+        check("restored database object namespace",
+              metadb.object_storage_namespace(), identity.get("namespace"))
+    if mismatches:
+        pytest.fail(
+            "BACKUP_RESTORE_IDENTITY_MISMATCH: "
+            + json.dumps(mismatches, sort_keys=True, default=str)
+        )
+
+
+def _wait_for(predicate, timeout: float = 3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(.01)
+    raise AssertionError("durable recovery condition did not become true")
+
+
+def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
+    fixture = info["durable_tasks"]
+    mismatches: list[dict[str, object]] = []
+
+    def check(subject: str, actual, expected) -> None:
+        if actual != expected:
+            mismatches.append({"subject": subject, "expected": expected, "actual": actual})
+
+    kinds = {
+        "managed": "managed_local_write",
+        "checkpoint": "linear_checkpoint_write",
+        "fanout": "bounded_fanout_write",
+        "external": "external_wait",
+    }
+    for label, task_kind in kinds.items():
+        expected = fixture[label]
+        task = metadb.durable_task(expected["task_id"])
+        check(f"{label} task present", task is not None, True)
+        if task is None:
+            continue
+        check(f"{label} task kind", task["task_kind"], task_kind)
+        check(f"{label} attempt identity", task["attempts"][-1]["id"],
+              expected["attempt_id"])
+        check(f"{label} status", task["status"],
+              "running" if label == "external" else "done")
+        check(f"{label} attempt status", task["attempts"][-1]["status"],
+              "running" if label == "external" else "done")
+        check(f"{label} receipt identity", task["output_receipt"],
+              None if label == "external" else expected["receipt"])
+    managed = metadb.durable_task(fixture["managed"]["task_id"])
+    if managed is not None:
+        check("managed input manifest", managed["input_manifest"],
+              fixture["managed"]["input_manifest"])
+        graph_text = json.dumps(managed["graph_doc"], sort_keys=True)
+        check("managed graph excludes private artifact binding",
+              "_input_artifact_uri" not in graph_text, True)
+    with metadb.session() as session:
+        managed_ref = session.get(metadb.LocalResultReference, {
+            "uri": fixture["managed"]["input_artifact_uri"],
+            "owner_kind": "durable_task",
+            "owner_key": fixture["managed"]["task_id"],
+        })
+        check("managed task exact input owner", managed_ref is not None, True)
+
+        wait = session.get(metadb.DurableExternalWait, fixture["external"]["task_id"])
+        check("external handle identity",
+              json.loads(wait.handle_doc) if wait and wait.handle_doc else None,
+              fixture["external"]["handle"])
+        check("external checkpoint identity",
+              json.loads(wait.checkpoint_doc) if wait and wait.checkpoint_doc else None,
+              fixture["external"]["checkpoint"])
+        check("external download evidence", wait.download_evidence if wait else None, None)
+        check("external staged artifact identity",
+              (wait.stage_dev, wait.stage_ino) if wait else None, (None, None))
+
+        fanout_slots = list(session.scalars(select(
+            bounded_fanout.BoundedFanoutSlot).order_by(
+                bounded_fanout.BoundedFanoutSlot.slot_number)))
+        check("bounded fanout slots released",
+              [(slot.holder_attempt_id, slot.claim_token) for slot in fanout_slots],
+              [(None, None)] * 4)
+
+    for artifact in fixture["artifacts"]:
+        restored = outputs_root / artifact["rel"]
+        check(f"durable artifact present {artifact['rel']}", restored.is_file(), True)
+        check(f"durable artifact sha256 {artifact['rel']}",
+              _file_sha256(restored) if restored.is_file() else None,
+              artifact["sha256"])
+
+    try:
+        checkpoint_audit = {
+            item["task_id"]: item for item in metadb.linear_checkpoint_restore_audit()
+        }
+    except Exception as exc:  # noqa: BLE001 — convert audit refusal to bounded evidence
+        mismatches.append({
+            "subject": "linear checkpoint restore audit",
+            "expected": "complete",
+            "actual": f"{type(exc).__name__}: {exc}",
+        })
+    else:
+        for label in ("checkpoint", "fanout"):
+            task_id = fixture[label]["task_id"]
+            check(f"{label} committed checkpoint audit",
+                  checkpoint_audit.get(task_id, {}).get("phase"), "committed")
+    try:
+        fanout_audit = {
+            item["parent_task_id"]: item for item in bounded_fanout.restore_audit()
+        }
+    except Exception as exc:  # noqa: BLE001 — convert audit refusal to bounded evidence
+        mismatches.append({
+            "subject": "bounded fanout restore audit",
+            "expected": "complete",
+            "actual": f"{type(exc).__name__}: {exc}",
+        })
+    else:
+        restored_plan = fanout_audit.get(fixture["fanout"]["task_id"])
+        check("bounded fanout plan digest",
+              restored_plan.get("plan_digest") if restored_plan else None,
+              fixture["fanout"]["plan_digest"])
+        check("bounded fanout complete unit set",
+              restored_plan.get("done_units") if restored_plan else None,
+              fixture["fanout"]["unit_count"])
+
+    inbox = metadb.list_durable_task_inbox_items(
+        metadb.DEFAULT_USER_ID, limit=200)["items"]
+    restored_inbox = {
+        item["task_id"]: item for item in inbox if item["task_id"] in fixture["inbox"]
+    }
+    check("terminal inbox task set", set(restored_inbox), set(fixture["inbox"]))
+    for task_id, expected in fixture["inbox"].items():
+        item = restored_inbox.get(task_id)
+        check(f"inbox identity {task_id}", item.get("id") if item else None,
+              expected["id"])
+        check(f"inbox read state {task_id}",
+              item.get("read_at") is not None if item else None, expected["read"])
+    check("external wait has no Inbox item",
+          any(item["task_id"] == fixture["external"]["task_id"] for item in inbox), False)
+
+    if mismatches:
+        pytest.fail(
+            "BACKUP_RESTORE_DURABLE_TASK_MISMATCH: "
+            + json.dumps(mismatches, sort_keys=True, default=str)
+        )
+
+    external_id = fixture["external"]["task_id"]
+    with metadb.session() as session:
+        publication_count = int(session.scalar(
+            select(func.count()).select_from(metadb.CatalogPublicationEvent)) or 0)
+        wait = session.get(metadb.DurableExternalWait, external_id, with_for_update=True)
+        assert wait is not None
+        wait.next_poll_at = metadb._now() - datetime.timedelta(seconds=1)
+    offline_deps = SimpleNamespace(_external_wait_adapter=lambda _kind: None)
+    external_wait_tasks.recover(offline_deps)
+    offline = _wait_for(lambda: (
+        task if (task := metadb.durable_task(external_id))
+        and task["external_wait"]["diagnostic_code"] == "adapter_unavailable" else None
+    ))
+    assert offline["status"] == "running"
+    assert offline["external_wait"]["phase"] == "running"
+    assert offline["output_receipt"] is None
+
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, external_id, with_for_update=True)
+        assert wait is not None
+        wait.next_poll_at = metadb._now() - datetime.timedelta(seconds=1)
+        poll_count = wait.poll_count
+    adapter = _ReattachAdapter()
+    online_deps = SimpleNamespace(
+        _external_wait_adapter=lambda kind: adapter if kind == "backup-drill" else None)
+    external_wait_tasks.recover(online_deps)
+    external_wait_tasks.recover(online_deps)
+    online = _wait_for(lambda: (
+        task if (task := metadb.durable_task(external_id))
+        and task["external_wait"]["poll_count"] > poll_count else None
+    ))
+    time.sleep(.05)
+    assert adapter.submit_calls == 0
+    assert adapter.status_calls == 1
+    assert adapter.seen_handles == [fixture["external"]["handle"]["job_id"]]
+    assert online["external_wait"]["phase"] == "running"
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, external_id)
+        assert wait is not None
+        assert json.loads(wait.checkpoint_doc)["sequence"] == 8
+        assert int(session.scalar(select(func.count()).select_from(
+            metadb.CatalogPublicationEvent)) or 0) == publication_count
+    assert not metadb.commit_external_wait_transition(
+        external_id, fixture["external"]["attempt_id"], "backup-external-poll",
+        failure_code="adapter_unavailable", retry_after=1.0)
+    assert metadb.claim_durable_task(fixture["managed"]["task_id"], "late-owner") is None
+    assert metadb.claim_linear_checkpoint_task(
+        fixture["checkpoint"]["task_id"], "late-owner") is None
+    assert metadb.claim_bounded_fanout_write_task(
+        fixture["fanout"]["task_id"], "late-owner") is None
+    assert bounded_fanout.heartbeat_attempt(
+        attempt_id=fixture["fanout"]["old_unit_attempt_id"],
+        claim_token=fixture["fanout"]["old_unit_claim_token"],
+        owner_token="backup-fanout-owner",
+    ) is False
+
+    print(
+        "BACKUP_RESTORE_DURABLE_TASK_EVIDENCE: "
+        + json.dumps({
+            "tasks": {label: fixture[label]["task_id"] for label in kinds},
+            "external_handle": fixture["external"]["handle"]["job_id"],
+            "external_submit_calls": adapter.submit_calls,
+            "external_status_calls": adapter.status_calls,
+            "checkpoint_audit": "verified",
+            "fanout_audit": "verified",
+        }, sort_keys=True),
+        flush=True,
+    )
+
+
 def _assert_isolation_applied(info: dict, replacement: str, provider: _ClaimProvider) -> None:
     assert metadb.object_storage_namespace() == replacement
     assert metadb.object_attempt_owner_id() != info["owner"]
@@ -847,7 +1532,8 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
         shutil.copytree(source_outputs, backup / "outputs")
         shutil.copytree(source_ws / "plugins", backup / "plugins")
         (backup / "version.json").write_text(json.dumps({
-            "sha": info["release_sha"], "db": "sqlite", "storage": "local",
+            "version": info["release_version"], "sha": info["release_sha"],
+            "db": "sqlite", "storage": "local",
             "alembic": info["alembic_head"],
         }), encoding="utf-8")
         assert not any("provider-owned" in path.parts for path in backup.rglob("*"))
@@ -868,9 +1554,12 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
         shutil.copy2(backup / "dataplay.db", restore_ws / "dataplay.db")
         shutil.copytree(backup / "outputs", restore_ws / "outputs")
         shutil.copytree(backup / "plugins", restore_ws / "plugins")
+        shutil.copy2(backup / "version.json", restore_ws / "version.json")
 
         _switch_db(f"sqlite:///{restore_ws / 'dataplay.db'}")
         metadb.init_db()
+        _assert_backup_identity(
+            restore_ws / "version.json", info, db="sqlite", storage="local")
         # Confirm the copied identity still matches the freeze before isolating.
         assert metadb.object_storage_namespace() == info["namespace"]
         replacement = f"restore-{uuid.uuid4().hex[:16]}"
@@ -888,6 +1577,8 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
+                    _assert_durable_task_recovery(
+                        info, outputs_root=restore_ws / "outputs")
                     _assert_isolation_applied(info, replacement, provider)
                     assert (restore_ws / "outputs" / info["artifact_rel"]).is_file()
                 finally:
@@ -978,7 +1669,8 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         assert dumped.returncode == 0, dumped.stderr
         shutil.copytree(source_outputs, backup / "outputs")
         (backup / "version.json").write_text(json.dumps({
-            "sha": info["release_sha"], "db": "postgresql", "storage": "s3",
+            "version": info["release_version"], "sha": info["release_sha"],
+            "db": "postgresql", "storage": "s3",
             "alembic": info["alembic_head"], "namespace": info["namespace"],
         }), encoding="utf-8")
         assert not any("provider-owned" in path.parts for path in backup.rglob("*"))
@@ -1008,9 +1700,12 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         assert restored.returncode == 0, restored.stderr
         restore_ws = tmp_path / "pg-restore"
         shutil.copytree(backup / "outputs", restore_ws / "outputs")
+        shutil.copy2(backup / "version.json", restore_ws / "version.json")
 
         _switch_db(restore_url)
         metadb.init_db()
+        _assert_backup_identity(
+            restore_ws / "version.json", info, db="postgresql", storage="s3")
         assert metadb.object_storage_namespace() == info["namespace"]
         replacement = f"restore-{uuid.uuid4().hex[:16]}"
         assert metadb.isolate_cloned_object_storage(info["namespace"], replacement) == replacement
@@ -1025,6 +1720,8 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
+                    _assert_durable_task_recovery(
+                        info, outputs_root=restore_ws / "outputs")
                     _assert_isolation_applied(info, replacement, provider)
                 finally:
                     exact_storage.close()
