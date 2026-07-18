@@ -283,8 +283,8 @@ def claim_unit(*, parent_task_id, unit_id, parent_attempt_id, owner_token) -> di
                 unit.active_attempt_id = None
         free = next((
             slot for slot in _slots(s)
-            if slot.holder_attempt_id is None or _tz(slot.lease_until) is None
-            or _tz(slot.lease_until) <= now
+            if slot.holder_attempt_id is None
+            or (lease := _tz(slot.lease_until)) is None or lease <= now
         ), None)
         if free is None:
             raise RuntimeError("no free bounded fan-out slot")
