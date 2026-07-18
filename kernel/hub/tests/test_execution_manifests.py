@@ -278,6 +278,15 @@ def test_manifest_rejects_material_secrets_and_is_byte_bounded(monkeypatch):
         _build(graph)
 
     graph.nodes[1].data["config"]["apiKeyRef"] = "env:MODEL_API_KEY"
+    graph.nodes[1].data["config"]["documentJson"] = json.dumps({
+        "request": {"apiKey": "embedded-material-secret"},
+    })
+    with pytest.raises(ExecutionManifestError, match="sensitive field"):
+        _build(graph)
+
+    graph.nodes[1].data["config"]["documentJson"] = json.dumps({
+        "request": {"apiKeyRef": "env:MODEL_API_KEY"},
+    })
     import hub.execution_manifest as contract
     monkeypatch.setattr(contract, "MAX_MANIFEST_BYTES", 128)
     with pytest.raises(ExecutionManifestError, match="encoded bytes"):

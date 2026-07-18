@@ -63,6 +63,12 @@ def _assert_secret_free(value: Any, path: tuple[str, ...] = ()) -> None:
                         "execution manifest cannot retain sensitive field "
                         f"{'.'.join((*path, key))}")
             _assert_secret_free(child, (*path, key))
+            if key == "documentJson" and isinstance(child, str):
+                try:
+                    document = json.loads(child)
+                except (TypeError, ValueError):
+                    continue
+                _assert_secret_free(document, (*path, key))
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _assert_secret_free(child, (*path, str(index)))
