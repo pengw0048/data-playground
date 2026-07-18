@@ -75,27 +75,42 @@ def _request(revision: dict, submission_id: str, **changes) -> dict:
     return request
 
 
-def _workspace_item(client: TestClient, container_id: str, resource_id: str) -> dict:
-    """Find one resource without assuming a shared Workspace fits on its first page."""
+def _workspace_items(
+    client: TestClient,
+    container_id: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> list[dict]:
+    """Exhaust one bounded Workspace cursor without assuming a shared first page."""
     cursor = None
     seen: set[str] = set()
+    items: list[dict] = []
     for _ in range(100):
-        params = {"limit": 100}
+        params: dict[str, object] = {"limit": 100}
         if cursor is not None:
             params["cursor"] = cursor
-        response = client.get(f"/api/workspace/containers/{container_id}", params=params)
+        response = client.get(
+            f"/api/workspace/containers/{container_id}", params=params, headers=headers)
         assert response.status_code == 200, response.text
         page = response.json()
-        found = next((item for item in page["items"] if item["id"] == resource_id), None)
-        if found is not None:
-            return found
+        items.extend(page["items"])
         if not page["hasMore"]:
-            break
+            return items
         next_cursor = page["nextCursor"]
         assert next_cursor and next_cursor not in seen
         seen.add(next_cursor)
         cursor = next_cursor
-    raise AssertionError(f"Workspace resource {resource_id!r} was not found")
+    raise AssertionError("Workspace pagination did not terminate within 10,000 resources")
+
+
+def _workspace_item(client: TestClient, container_id: str, resource_id: str) -> dict:
+    found = next(
+        (item for item in _workspace_items(client, container_id) if item["id"] == resource_id),
+        None,
+    )
+    if found is None:
+        raise AssertionError(f"Workspace resource {resource_id!r} was not found")
+    return found
 
 
 def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_path):
@@ -173,9 +188,9 @@ def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_pat
         assert client.get(f"/api/dataset-views/{view_id}", headers=headers).status_code == 404
         assert client.get(
             f"/api/workspace/resources/dataset_view:{view_id}", headers=headers).status_code == 404
-        other_browse = client.get(
-            "/api/workspace/containers/workspace-local-root", headers=headers)
-        assert all(item["id"] != f"dataset_view:{view_id}" for item in other_browse.json()["items"])
+        other_items = _workspace_items(
+            client, definition["placement"]["containerId"], headers=headers)
+        assert all(item["id"] != f"dataset_view:{view_id}" for item in other_items)
 
         deleted = client.delete(f"/api/dataset-views/{view_id}")
         assert deleted.status_code == 200 and deleted.json() == {"ok": True, "deleted": True}
@@ -185,6 +200,11 @@ def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_pat
         assert client.delete(f"/api/dataset-views/{view_id}").json()["deleted"] is False
         assert client.get(
             f"/api/workspace/resources/dataset_view:{view_id}").status_code == 404
+        with metadb.session() as session:
+            assert session.get(
+                metadb.WorkspacePlacement,
+                definition["placement"]["placementId"],
+            ) is None
 
 
 def test_reservoir_is_deterministic_and_invalid_draft_does_not_claim_submission(tmp_path):

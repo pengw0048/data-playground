@@ -27,6 +27,11 @@ const TABLE: CatalogTable = { id: 'table-1', name: 'orders', uri: 'lance:///orde
 const revision = (revisionId: string) => ({
   datasetId: 'dataset-stable', revisionId, committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' as const,
 })
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((next) => { resolve = next })
+  return { promise, resolve }
+}
 const detail = (revisionId: string, overrides: Partial<DatasetRevisionDetail> = {}): DatasetRevisionDetail => ({
   ...revision(revisionId), parentRevisionId: null, producerOperation: null,
   summary: { rowCount: 2, dataFileCount: 1, totalBytes: 20, fragmentCount: 1 },
@@ -111,6 +116,32 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(screen.getByTestId('revision-history-load-more'))
     expect(await screen.findByText('rev-1')).toBeInTheDocument()
     expect(mocks.datasetRevisions).toHaveBeenLastCalledWith(TABLE.id, { limit: 20, cursor: 'opaque cursor' })
+  })
+
+  it('keeps a slow save capability probe current while revision pagination advances', async () => {
+    const capability = deferred<{
+      selectors: ('exact' | 'latest')[]
+      asOfOrdering: null
+      timezone: null
+      datasetViewSave: boolean
+    }>()
+    mocks.datasetRevisionCapabilities.mockReturnValue(capability.promise)
+    mocks.datasetRevisions
+      .mockResolvedValueOnce({ items: [revision('rev-2')], nextCursor: 'next-page', hasMore: true })
+      .mockResolvedValueOnce({ items: [revision('rev-1')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-2'))
+    render(<DatasetRevisionHistory table={TABLE} />)
+
+    fireEvent.click(await screen.findByTestId('revision-history-load-more'))
+    expect(await screen.findByText('rev-1')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open revision rev-2' }))
+    expect(await screen.findByText('Exact revision rev-2')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Save view' })).toBeNull()
+
+    capability.resolve({
+      selectors: ['exact', 'latest'], asOfOrdering: null, timezone: null, datasetViewSave: true,
+    })
+    expect(await screen.findByRole('button', { name: 'Save view' })).toBeInTheDocument()
   })
 
   it('opens the selected identity exactly and compares its retained parent honestly', async () => {

@@ -54,10 +54,12 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
   const [saveDetail, setSaveDetail] = useState<DatasetRevisionDetail | null>(null)
   const [canSaveView, setCanSaveView] = useState(false)
   const historyRequest = useRef(0)
+  const capabilityRequest = useRef(0)
   const detailRequest = useRef(0)
 
   const loadFirst = useCallback(async () => {
     const request = ++historyRequest.current
+    const capability = ++capabilityRequest.current
     setAvailability('checking'); setHistoryError(null); setLoadMoreError(null); setCanSaveView(false)
     const capabilities = api.datasetRevisionCapabilities(table.id).catch(() => null)
     try {
@@ -66,7 +68,7 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
       setItems(page.items); setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
       setAvailability('supported')
       const advertised = await capabilities
-      if (request === historyRequest.current) {
+      if (capability === capabilityRequest.current) {
         setCanSaveView(advertised?.datasetViewSave === true)
       }
     } catch (error) {
@@ -80,7 +82,11 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
 
   useEffect(() => {
     void loadFirst()
-    return () => { historyRequest.current += 1; detailRequest.current += 1 }
+    return () => {
+      historyRequest.current += 1
+      capabilityRequest.current += 1
+      detailRequest.current += 1
+    }
   }, [loadFirst])
 
   const loadMore = async () => {
