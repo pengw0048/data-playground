@@ -11,11 +11,18 @@ function Write({ id, data }: NodeComponentProps) {
   const dest = (data.config.destName as string | undefined) ?? 'Workspace outputs'
   const prepareWrite = useStore((s) => s.prepareWrite)
   const admission = useStore((s) => s.runs[id]?.writeAdmission)
+  const runPhase = useStore((s) => s.runs[id]?.phase)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
   useEffect(() => {
+    if (runPhase === 'estimating' || runPhase === 'confirm'
+        || runPhase === 'drift' || runPhase === 'running') return
     void prepareWrite(id).catch(() => { /* the Run panel surfaces actionable admission failures */ })
-  }, [id, data.config, prepareWrite])
+  // A terminal run deliberately drops its admission/submission identity so a later managed write
+  // cannot reuse a completed request. Re-run the existing preflight when that happens: config is
+  // unchanged, but the card still needs a truthful current destination summary. Active run intent
+  // owns admission while it estimates, waits at a gate, or executes; the card must not race it.
+  }, [id, data.config, admission, runPhase, prepareWrite])
   const semantics = receipt
     ? `revision ${receipt.revisionId}`
     : admission?.managed
