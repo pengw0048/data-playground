@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
+import { api, type CanvasFile, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
 import { routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
@@ -40,6 +40,8 @@ const jobKey = (job: WorkspaceJobDto) => job.runId ?? job.id
 export function JobsView() {
   const jobsQuery = useStore((state) => state.jobsQuery)
   const setJobsQuery = useStore((state) => state.setJobsQuery)
+  const canvases = useStore((state) => state.files)
+  const refreshFiles = useStore((state) => state.refreshFiles)
   const params = useMemo(() => new URLSearchParams(jobsQuery), [jobsQuery])
   const filterKey = useMemo(() => {
     const copy = new URLSearchParams(params)
@@ -59,6 +61,10 @@ export function JobsView() {
   const request = useRef(0)
   const deepLinkRequest = useRef('')
   const retryActions = useRef(new Map<string, string>())
+
+  // Jobs only names canvases returned by the existing authorized list. Refresh it when entering the
+  // view so a revoked share does not remain selectable after the rest of the shell has updated.
+  useEffect(() => { void refreshFiles() }, [refreshFiles])
 
   const load = useCallback(async (nextCursor?: string, refresh = false) => {
     const sequence = ++request.current
@@ -140,6 +146,33 @@ export function JobsView() {
       setActionError(caught instanceof Error ? caught.message : String(caught))
     } finally { setActing('') }
   }
+  const nodeChoices = useMemo(() => currentPageNodeChoices(items), [items])
+  const backendChoices = useMemo(() => [...new Set(items.map((item) => item.backend).filter(Boolean))], [items])
+  const selectedNodeChoice = nodeChoiceValue(params.get('canvas'), params.get('node'))
+  const listedNode = nodeChoices.some((choice) => choice.value === selectedNodeChoice)
+  const backend = params.get('backend') ?? ''
+  const listedBackend = backendChoices.includes(backend)
+  const selectNode = (value: string) => {
+    if (!value) {
+      update('node', '')
+      return
+    }
+    const [canvasId, nodeId] = JSON.parse(value) as [string, string]
+    const next = new URLSearchParams(params)
+    next.set('canvas', canvasId)
+    next.set('node', nodeId)
+    next.delete('run'); next.delete('output')
+    setJobsQuery(next.toString())
+  }
+  const selectCanvas = (value: string) => {
+    const next = new URLSearchParams(params)
+    if (value) next.set('canvas', value); else next.delete('canvas')
+    // A node identity is scoped to its canvas. Do not leave an invisible stale node filter
+    // behind when choosing a different canvas (or returning to all accessible canvases).
+    next.delete('node')
+    next.delete('run'); next.delete('output')
+    setJobsQuery(next.toString())
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -157,15 +190,34 @@ export function JobsView() {
           <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             {STATUSES.map((value) => <option key={value} value={value}>{value || 'All states'}</option>)}
           </select></label>
-        <Filter label="Canvas ID" name="canvas" value={params.get('canvas') ?? ''} onChange={update} />
-        <Filter label="Node ID" name="node" value={params.get('node') ?? ''} onChange={update} />
-        <Filter label="Backend" name="backend" value={params.get('backend') ?? ''} onChange={update} />
+        <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
+        <label className="grid gap-1 text-[10.5px] text-muted-foreground">Node
+          <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+            <option value="">All nodes on loaded Jobs</option>
+            {!listedNode && selectedNodeChoice && <option value={selectedNodeChoice}>Exact node ID: {params.get('node')}</option>}
+            {nodeChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+          </select></label>
+        <label className="grid gap-1 text-[10.5px] text-muted-foreground">Backend
+          <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+            <option value="">All backends on loaded Jobs</option>
+            {!listedBackend && backend && <option value={backend}>Exact backend ID: {backend}</option>}
+            {backendChoices.map((backend) => <option key={backend} value={backend}>{backend}</option>)}
+          </select></label>
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">From
           <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">To
           <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
         <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
       </section>
+
+      <details className="border-b border-border bg-card/30 px-4 py-2 text-[11.5px] xl:px-7">
+        <summary className="cursor-pointer text-muted-foreground">Advanced exact IDs</summary>
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+          <Filter label="Canvas ID (exact)" name="canvas" value={params.get('canvas') ?? ''} onChange={update} />
+          <Filter label="Node ID (exact)" name="node" value={params.get('node') ?? ''} onChange={update} />
+          <Filter label="Backend ID (exact)" name="backend" value={params.get('backend') ?? ''} onChange={update} />
+        </div>
+      </details>
 
       <div className="min-h-0 flex-1 overflow-auto px-3 py-3 sm:px-7">
         {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
@@ -196,6 +248,39 @@ export function JobsView() {
       )}
     </div>
   )
+}
+
+function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[]; value: string; onChange: (value: string) => void }) {
+  const listed = canvases.some((canvas) => canvas.id === value)
+  return <label className="grid gap-1 text-[10.5px] text-muted-foreground">Canvas
+    <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+      <option value="">All accessible canvases</option>
+      {!listed && value && <option value={value}>Exact canvas ID: {value}</option>}
+      {canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvasLabel(canvas)}</option>)}
+    </select></label>
+}
+
+function canvasLabel(canvas: CanvasFile): string {
+  return `${canvas.name || 'Untitled canvas'} · ${canvas.id}`
+}
+
+function nodeChoiceValue(canvasId: string | null, nodeId: string | null): string {
+  return canvasId && nodeId ? JSON.stringify([canvasId, nodeId]) : ''
+}
+
+function currentPageNodeChoices(items: WorkspaceJobDto[]) {
+  const choices = new Map<string, { value: string; label: string }>()
+  for (const item of items) {
+    if (!item.targetNodeId) continue
+    const value = nodeChoiceValue(item.canvasId, item.targetNodeId)
+    if (choices.has(value)) continue
+    const node = item.nodeLabel || `Node ${item.targetNodeId}`
+    choices.set(value, {
+      value,
+      label: `${node} · ${item.canvasName || 'Untitled canvas'} (${item.canvasId}) · ${item.targetNodeId}`,
+    })
+  }
+  return [...choices.values()]
 }
 
 function Filter({ label, name, value, onChange, placeholder }: { label: string; name: string; value: string; onChange: (name: string, value: string) => void; placeholder?: string }) {

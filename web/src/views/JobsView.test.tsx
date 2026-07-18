@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
-  workspaceJobs: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(),
+  workspaceJobs: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
@@ -24,7 +24,8 @@ describe('JobsView', () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job()], hasMore: false, nextCursor: null })
     mocks.cancelRun.mockResolvedValue(undefined)
     mocks.retryRun.mockResolvedValue(undefined)
-    useStore.setState({ view: 'jobs', jobsQuery: '', toasts: [] } as never)
+    mocks.listCanvases.mockResolvedValue([])
+    useStore.setState({ view: 'jobs', jobsQuery: '', files: [], toasts: [] } as never)
   })
 
   it('distinguishes loading from an empty filtered result', async () => {
@@ -70,6 +71,57 @@ describe('JobsView', () => {
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       limit: 50, status: 'running',
     })))
+  })
+
+  it('uses authorized canvas names and current-page node/backend context while retaining canonical IDs', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [
+      job({ canvasId: 'canvas-1', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish' }),
+      job({ id: 'history-2', runId: 'run-2', canvasId: 'canvas-2', canvasName: 'Research', targetNodeId: 'publish', nodeLabel: 'Publish', backend: 'ray' }),
+      job({ id: 'history-3', runId: 'run-3', canvasId: 'canvas-2', canvasName: 'Research', targetNodeId: 'unlabelled', nodeLabel: null, backend: 'ray' }),
+    ], hasMore: false, nextCursor: null })
+    useStore.setState({ files: [
+      { id: 'canvas-1', name: 'Research', version: 1 },
+      { id: 'canvas-2', name: 'Research', version: 1 },
+    ] } as never)
+    render(<JobsView />)
+
+    await screen.findAllByText('Research')
+    expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Publish · Research (canvas-1) · publish' })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Node unlabelled · Research (canvas-2) · unlabelled' })).toBeVisible()
+
+    fireEvent.change(screen.getByLabelText('Filter jobs by node'), {
+      target: { value: JSON.stringify(['canvas-2', 'publish']) },
+    })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-2&node=publish'))
+    expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: 'canvas-2', nodeId: 'publish', limit: 50,
+    }))
+
+    fireEvent.change(screen.getByLabelText('Filter jobs by canvas'), { target: { value: 'canvas-1' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toBe('canvas=canvas-1'))
+    await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
+      canvasId: 'canvas-1', nodeId: undefined, limit: 50,
+    })))
+
+    fireEvent.change(screen.getByLabelText('Filter jobs by backend'), { target: { value: 'ray' } })
+    await waitFor(() => expect(useStore.getState().jobsQuery).toContain('backend=ray'))
+  })
+
+  it('keeps a deep-linked exact ID filter editable without inventing an inaccessible canvas name', async () => {
+    useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
+    render(<JobsView />)
+
+    expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
+    expect(screen.getByRole('option', { name: 'Exact node ID: exact-node' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
+    expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
+    expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
+    fireEvent.click(screen.getByText('Advanced exact IDs'))
+    expect(screen.getByLabelText('Filter jobs by canvas id (exact)')).toHaveValue('not-accessible')
+    expect(screen.getByLabelText('Filter jobs by node id (exact)')).toHaveValue('exact-node')
+    expect(screen.getByLabelText('Filter jobs by backend id (exact)')).toHaveValue('exact-backend')
   })
 
   it('preserves completed pages when a load-more request fails', async () => {
