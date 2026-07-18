@@ -32,7 +32,7 @@ vi.mock('../ui/VirtualList', () => ({
   </div>,
 }))
 
-import { CatalogView } from './CatalogView'
+import { CatalogDiscovery, CatalogView } from './CatalogView'
 
 const TABLE: CatalogTable = {
   id: 't1', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
@@ -80,6 +80,16 @@ describe('CatalogView request and mutation truth', () => {
     store.uploadDataset.mockResolvedValue(null)
   })
   afterEach(() => cleanup())
+
+  it('delegates Use to the supplied destination without assuming the current canvas', async () => {
+    const onUseTables = vi.fn()
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      onUseTables={onUseTables} onUploadDataset={store.uploadDataset} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use table orders' }))
+    expect(onUseTables).toHaveBeenCalledWith([TABLE])
+    expect(store.addToCanvas).not.toHaveBeenCalled()
+  })
 
   it('shows a 5xx folder-tree failure as an error and retries instead of claiming there are no folders', async () => {
     mocks.catalogTree

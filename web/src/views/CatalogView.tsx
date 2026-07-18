@@ -19,15 +19,38 @@ const ROW_H = 58
 type Sort = NonNullable<CatalogQueryParams['sort']>
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
+/**
+ * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
+ * CatalogView keeps the legacy current-canvas adapter below, while Workspace can supply an explicit
+ * target in #497 without copying its query, paging, selection, or curation behavior.
+ */
+export interface CatalogDiscoveryProps {
+  sourceIdentity: KernelInfo | null
+  foldersMutable: boolean
+  onUseTables: (tables: CatalogTable[]) => void
+  onUploadDataset: (file: File) => Promise<CatalogTable | null>
+}
+
 export function CatalogView() {
   const addToCanvas = useStore((s) => s.addToCanvas)
   const rememberTables = useStore((s) => s.rememberTables)
   const uploadDataset = useStore((s) => s.uploadDataset)
-  const pushToast = useStore((s) => s.pushToast)
   // folder create/rename/delete only mean something when the active catalog provider owns the local
   // folder store; a read-only/external provider omits this capability and we hide the affordances.
   const catalogSource = useStore((s) => s.kernelInfo)
   const foldersMutable = catalogSource?.capabilities?.includes('catalog.folder_mutation') ?? false
+
+  const useTables = useCallback((tables: CatalogTable[]) => {
+    rememberTables(tables)
+    tables.forEach((t) => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name))
+  }, [addToCanvas, rememberTables])
+
+  return <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
+    onUseTables={useTables} onUploadDataset={uploadDataset} />
+}
+
+export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset }: CatalogDiscoveryProps) {
+  const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // query state
@@ -167,8 +190,7 @@ export function CatalogView() {
   const selectAllLoaded = () => setSelectedIds(new Set(items.map((t) => t.id)))
   const useSelected = () => {
     const ts = items.filter((t) => selectedIds.has(t.id)); if (!ts.length) return
-    rememberTables(ts)
-    ts.forEach((t) => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name))
+    onUseTables(ts)
     clearSelection()
   }
   const deleteSelected = async () => {
@@ -184,13 +206,13 @@ export function CatalogView() {
   }
   const onUpload = async (f?: File) => {
     if (!f) return
-    if (await uploadDataset(f)) {
+    if (await onUploadDataset(f)) {
       setCatalogRevision((v) => v + 1)
       await loadFirst()
     }
   }
   // warm the working set first, or the new source node can't resolve its table and shows "Select dataset"
-  const use = (t: CatalogTable) => { rememberTables([t]); addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name) }
+  const use = (t: CatalogTable) => onUseTables([t])
 
   return (
     <div className="flex h-full flex-col">
