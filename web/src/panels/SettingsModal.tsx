@@ -20,7 +20,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 
 // App / workspace settings — a full-screen page with a left category nav (like Figma / most apps),
 // not a cramped modal. These are GLOBAL: the LLM agent (provider-agnostic; the key lives in the
-// kernel), the execution backend, and save/open destinations. Datasets have their own Tables page;
+// kernel), the execution backend, and save/open destinations. Datasets are curated from Workspace;
 // canvas-scoped settings live in the separate CanvasSettingsModal (opened from the file menu).
 const CATS: { id: string; label: string; icon: IconName }[] = [
   { id: 'agent', label: 'Agent', icon: 'sparkle' },

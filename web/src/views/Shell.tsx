@@ -106,7 +106,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         {item('jobs', 'clock', 'Jobs')}
         {item('inbox', 'note', 'Inbox', unreadCount)}
         {item('transforms', 'fx', 'Transforms')}
-        {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
+        {/* Relationships is reached from a dataset detail drawer (Workspace → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}
         <Button variant="ghost" onClick={(event) => onSettings(event.currentTarget)} data-testid="rail-settings"
           title={collapsed ? 'Settings' : undefined} aria-label={collapsed ? 'Settings' : undefined}
