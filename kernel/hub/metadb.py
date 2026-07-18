@@ -3450,13 +3450,6 @@ _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write",
 })
-_FANOUT_PHASE_TO_STAGE = {
-    "checkpoint_pending": "checkpointing",
-    "planning": "planning",
-    "children": "running_partitions",
-    "gather": "gathering",
-    "publishing": "publishing",
-}
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -5539,16 +5532,13 @@ def _sanitized_checkpoint_jobs_view(
 def _sanitized_bounded_fanout_jobs_view(
         s, task: DurableTask, checkpoint: DurableCheckpoint | None,
         status_doc: dict) -> dict:
-    """Parent-only Jobs surface for bounded_fanout_write — no child/plan internals."""
-    from hub import bounded_fanout as fanout
+    """Parent-only Jobs surface for bounded_fanout_write — no child/plan internals.
 
-    raw_phase = status_doc.get("fanout_phase")
-    if task.status in _TERMINAL_RUN:
-        stage = "terminal"
-    elif isinstance(raw_phase, str) and raw_phase in _FANOUT_PHASE_TO_STAGE:
-        stage = _FANOUT_PHASE_TO_STAGE[raw_phase]
-    else:
-        stage = "checkpointing"
+    Stage and checkpoint/gather aggregates are derived from SQL-authoritative rows.
+    ``status_doc`` extras such as ``fanout_phase`` are not durable: ``update_durable_task_status``
+    round-trips through ``RunStatus`` and drops unknown fields.
+    """
+    from hub import bounded_fanout as fanout
 
     plan = s.get(fanout.BoundedFanoutPlan, task.id)
     units = list(s.scalars(select(fanout.BoundedFanoutUnit).where(
@@ -5559,23 +5549,40 @@ def _sanitized_bounded_fanout_jobs_view(
     partition_count = int(plan.partition_count) if plan is not None else None
     completed = sum(1 for unit in children if unit.status == "done")
     failed = sum(1 for unit in children if unit.status in ("failed", "cancelled"))
+    checkpoint_committed = checkpoint is not None and checkpoint.phase == "committed"
+    gather_done = gather is not None and gather.status == "done"
+    gather_running = gather is not None and gather.status in ("claimed", "running")
+    children_started = any(
+        unit.status in ("claimed", "done", "failed", "cancelled") for unit in children)
+    all_children_done = bool(children) and all(unit.status == "done" for unit in children)
 
-    if checkpoint is None or checkpoint.phase != "committed":
-        checkpoint_state = "pending"
-    elif stage in ("checkpointing",) and task.status not in _TERMINAL_RUN:
-        checkpoint_state = "committed"
+    if task.status in _TERMINAL_RUN:
+        stage = "terminal"
+    elif gather_done:
+        # Committed gather means publication (or receipt reconcile) remains.
+        stage = "publishing"
+    elif gather_running or all_children_done:
+        stage = "gathering"
+    elif children_started:
+        stage = "running_partitions"
+    elif plan is not None or checkpoint_committed:
+        stage = "planning"
     else:
-        # Past checkpoint materialization (plan/children/gather/publish/terminal) reuses evidence.
-        checkpoint_state = "reused" if (
-            plan is not None or stage in (
-                "planning", "running_partitions", "gathering", "publishing", "terminal")
-        ) else "committed"
+        stage = "checkpointing"
+
+    if not checkpoint_committed:
+        checkpoint_state = "pending"
+    elif plan is not None:
+        # Fan-out plan exists: checkpoint evidence is being consumed.
+        checkpoint_state = "reused"
+    else:
+        checkpoint_state = "committed"
 
     if gather is None:
         gather_state = "pending"
-    elif gather.status == "done":
+    elif gather_done:
         gather_state = "committed"
-    elif gather.status in ("claimed", "running"):
+    elif gather_running:
         gather_state = "running"
     else:
         gather_state = "pending"
@@ -5583,9 +5590,10 @@ def _sanitized_bounded_fanout_jobs_view(
     diagnosis = None
     error = task.error or status_doc.get("error")
     if isinstance(error, str):
-        if "checkpoint_invalid" in error:
+        lowered = error.lower()
+        if "checkpoint_invalid" in lowered:
             diagnosis = "checkpoint_invalid"
-        elif "attempts_exhausted" in error or "exhausted" in error.lower():
+        elif "durable_task_attempts_exhausted" in lowered:
             diagnosis = "durable_task_attempts_exhausted"
 
     return {

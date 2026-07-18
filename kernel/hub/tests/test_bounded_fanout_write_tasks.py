@@ -312,3 +312,88 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
     assert counts["prefix"] == 1
     assert metadb.durable_task(task_id)["status"] == "done"
     deps.storage.close()
+
+
+def test_jobs_stage_follows_sql_when_fanout_phase_absent(tmp_path):
+    """Jobs stage must not depend on status_doc.fanout_phase (stripped by RunStatus)."""
+    from hub import bounded_fanout as fanout
+    from hub.storage import LocalStorage
+    from hub.tests.test_linear_checkpoint_admission import _identity
+    from hub.tests.test_linear_checkpoint_commit import _commit, _parquet_bytes
+
+    values = {**_identity(), "task_kind": "bounded_fanout_write"}
+    store = LocalStorage(str(tmp_path / "outputs"))
+    admission, _ = metadb.submit_linear_checkpoint_task(**values)
+    task_id = admission["task_id"]
+    claimed = metadb.claim_bounded_fanout_write_task(task_id, "jobs-owner")
+    assert claimed is not None
+    attempt_id = claimed["attempts"][-1]["id"]
+    candidate = metadb.reserve_linear_checkpoint_candidate(
+        task_id=task_id, attempt_id=attempt_id, owner_token="jobs-owner",
+        namespace_id=store.namespace_id, storage_root=store.result_root,
+        writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    _commit(store, {
+        "task_id": task_id, "attempt_id": attempt_id, "owner": "jobs-owner",
+        "candidate": candidate,
+    }, _parquet_bytes(5))
+
+    # status_doc deliberately omits fanout_phase (as production persistence does).
+    with metadb.session() as session:
+        task = session.get(metadb.DurableTask, task_id)
+        task.status = "running"
+        task.status_doc = json.dumps({
+            "runId": task_id, "status": "running", "targetNodeId": "final",
+            "progress": 0.55,
+        })
+        task.error = None
+
+    # Committed checkpoint, no plan yet → planning + committed.
+    page = metadb.list_workspace_runs(values["uid"], run_id=task_id)
+    assert len(page["items"]) == 1
+    view = page["items"][0]["boundedFanout"]
+    assert view["stage"] == "planning"
+    assert view["checkpoint"] == "committed"
+    assert view["gather"] == "pending"
+    assert view["partitionCount"] is None
+    assert view["completedPartitions"] == 0
+
+    plan = fanout.create_or_reopen_plan(
+        parent_task_id=task_id, parent_attempt_id=attempt_id, owner_token="jobs-owner")
+    children = [unit for unit in plan["units"] if unit["kind"] == "child"]
+    assert len(children) == 4
+
+    # Mark two children done without touching status_doc phase.
+    with metadb.session() as session:
+        for unit in children[:2]:
+            row = session.get(fanout.BoundedFanoutUnit, unit["unit_id"])
+            row.status = "done"
+            row.result_rows = int(unit["range_end"]) - int(unit["range_start"])
+
+    page = metadb.list_workspace_runs(values["uid"], run_id=task_id)
+    view = page["items"][0]["boundedFanout"]
+    assert view["stage"] == "running_partitions"
+    assert view["checkpoint"] == "reused"
+    assert view["partitionCount"] == 4
+    assert view["completedPartitions"] == 2
+    assert view["failedPartitions"] == 0
+    assert view["gather"] == "pending"
+
+    # All children done → gathering even before gather claim.
+    with metadb.session() as session:
+        for unit in children[2:]:
+            row = session.get(fanout.BoundedFanoutUnit, unit["unit_id"])
+            row.status = "done"
+
+    page = metadb.list_workspace_runs(values["uid"], run_id=task_id)
+    view = page["items"][0]["boundedFanout"]
+    assert view["stage"] == "gathering"
+    assert view["completedPartitions"] == 4
+
+    # Broad "exhausted" errors must not invent a parent diagnostic.
+    with metadb.session() as session:
+        task = session.get(metadb.DurableTask, task_id)
+        task.error = "RuntimeError: connection pool exhausted"
+
+    page = metadb.list_workspace_runs(values["uid"], run_id=task_id)
+    assert page["items"][0]["boundedFanout"]["diagnosticCode"] is None
+    store.close()
