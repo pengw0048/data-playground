@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from hub import graph as graph_mod, metadb
+from hub.execution_manifest import build_execution_manifest
 from hub.local_run_inputs import bind_manifest
 from hub.main import app
 from hub.local_writes import write_managed_local_file
@@ -29,6 +30,7 @@ from hub.models import (
     WriteIntent,
     WriteProvenance,
 )
+from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import catalog as catalog_routes
@@ -81,14 +83,25 @@ def _publish(storage, catalog, logical_uri: str, value: int) -> tuple[str, dict]
     return artifact, published
 
 
-def _lineage(key: str) -> LineagePublication:
-    return LineagePublication(idempotency_key=key, provenance="manual")
+def _lineage(key: str, *, run_id: str | None = None) -> LineagePublication:
+    if run_id is None:
+        return LineagePublication(idempotency_key=key, provenance="manual")
+    return LineagePublication(
+        idempotency_key=key,
+        run_id=run_id,
+        producer="managed-local-test-canvas",
+        producer_version=1,
+        step_id="write",
+        provenance="run",
+    )
 
 
 def _write_intent(
         logical_uri: str, key: str, *, head: dict | None = None,
         name: str = "managed_local",
-        expected_schema: list[ColumnSchema] | None = None) -> WriteIntent:
+        expected_schema: list[ColumnSchema] | None = None,
+        run_id: str | None = None,
+        parents: list[str] | None = None) -> WriteIntent:
     replacing = head is not None
     return WriteIntent(
         destination=WriteDestination(
@@ -106,7 +119,8 @@ def _write_intent(
         ) if replacing else None),
         idempotency_key=key,
         provenance=WriteProvenance(
-            publication=_lineage(key),
+            publication=_lineage(key, run_id=run_id),
+            parents=parents or [],
         ),
     )
 
@@ -208,6 +222,64 @@ def test_typed_local_create_replace_receipts_reopen_exact_revisions_after_restar
     assert adapter.open_revision(
         replaced.publication.artifact_uri, replaced.revision_id).fetchall() == [(2,)]
     assert restarted.get_table(replaced.publication.artifact_uri).id
+
+
+def test_typed_local_publication_persists_admitted_manifest_on_receipt_and_lineage(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    canvas_id = "managed-local-test-canvas"
+    submission_id = str(uuid.uuid4())
+    run_id = metadb.local_run_submission_id("local", canvas_id, submission_id)
+    logical_uri = str(tmp_path / "published" / "manifest.parquet")
+    source_uri = _register_source(catalog, tmp_path)
+    intent = _write_intent(
+        logical_uri,
+        "manifest-create",
+        run_id=run_id,
+        parents=[source_uri],
+    )
+    digest, manifest_doc = build_execution_manifest(
+        Graph(id=canvas_id, version=1, nodes=[], edges=[]),
+        target_node_id=None,
+        target_port_id=None,
+        input_manifest=[],
+        write_intent=intent,
+        deps=SimpleNamespace(
+            node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
+            plugins=[],
+        ),
+    )
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id="local", name="Manifest publication"))
+    admitted_run_id, created = metadb.admit_local_run_inputs(
+        uid="local",
+        canvas_id=canvas_id,
+        submission_id=submission_id,
+        target_node_id=None,
+        intent_sha256="a" * 64,
+        manifest=[],
+        execution_manifest_sha256=digest,
+        execution_manifest_doc=manifest_doc,
+    )
+    assert created is True and admitted_run_id == run_id
+
+    receipt = _typed_write(storage, catalog, intent, 1)
+    recovered = metadb.catalog_managed_local_write_receipt(
+        intent.model_dump(by_alias=True, mode="json"))
+    facts, _cursor, _has_more = metadb.catalog_lineage_facts_page(limit=10, after_id=0)
+    with metadb.session() as session:
+        revision = session.scalar(select(metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.write_idempotency_key == "manifest-create"))
+
+    assert receipt.execution_manifest_sha256 == digest
+    assert recovered is not None and recovered["executionManifestSha256"] == digest
+    assert revision is not None
+    assert revision.run_id == run_id
+    assert revision.execution_manifest_sha256 == digest
+    run_facts = [fact for fact in facts if fact["run_id"] == run_id]
+    assert len(run_facts) == 1
+    assert run_facts[0]["execution_manifest_sha256"] == digest
 
 
 def test_typed_local_write_preconditions_fail_before_artifact_allocation(
