@@ -10,11 +10,13 @@ import pyarrow as pa
 import pytest
 
 from hub import db, metadb
+from hub.executors import engine as engine_mod
+from hub.executors.engine import BuildEngine, NotPreviewable
 from hub.kernel import RunBody, _admitted_kernel_graph
 from hub.kernel_backend import KernelBackend
 from hub.local_run_inputs import LocalRunInputError, bind_manifest, validate_manifest
 from hub.models import CompilePlan, Graph, GraphNode, RunStatus
-from hub.plugins.adapters import LanceAdapter
+from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import runs
 from hub.subprocess_runner import SubprocessRunner
@@ -181,6 +183,37 @@ def test_isolated_local_job_carries_and_revalidates_manifest_identity(tmp_path, 
     }, "target": "check"}
     with pytest.raises(RuntimeError, match="identity is invalid"):
         _validate_admitted_input_manifest(stale, graph)
+
+
+def test_metadata_isolated_engine_reads_only_the_parent_attested_exact_artifact(
+        tmp_path, monkeypatch):
+    artifact = str(tmp_path / "exact.parquet")
+    DuckDBAdapter().write(artifact, db.conn().from_arrow(pa.table({"value": [1]})))
+    graph = _source_graph(artifact)
+    config = graph.nodes[0].data["config"]
+    config["_input_revision_id"] = "content-revision"
+    config["_input_artifact_uri"] = artifact
+    revision_lookups: list[str] = []
+    original_lookup = engine_mod.revision_adapter_for_uri
+
+    def traced_lookup(uri, resolve_adapter):
+        revision_lookups.append(uri)
+        return original_lookup(uri, resolve_adapter)
+
+    monkeypatch.setattr(engine_mod, "revision_adapter_for_uri", traced_lookup)
+
+    with db.run_scope():
+        with pytest.raises(NotPreviewable, match="persisted input revision is unavailable"):
+            BuildEngine(
+                graph, lambda _uri: DuckDBAdapter(), {}, full=True,
+            ).relation("source")
+        assert revision_lookups == [artifact]
+
+        graph._input_artifact_uris["source"] = artifact
+        assert BuildEngine(
+            graph, lambda _uri: DuckDBAdapter(), {}, full=True,
+        ).relation("source").fetchall() == [(1,)]
+        assert revision_lookups == [artifact]
 
 
 def test_isolated_local_rejects_malformed_manifest_before_claim_or_spawn(tmp_path, monkeypatch):

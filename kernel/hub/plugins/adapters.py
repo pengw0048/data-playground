@@ -369,6 +369,22 @@ class DuckDBAdapter:
             rel = rel.limit(int(limit))
         return rel
 
+    def scan_local_snapshot(
+            self, snapshot_path: str, source_uri: str,
+            options: dict | None = None) -> Relation:
+        """Read one private stable byte copy using the ordinary source's declared file format."""
+        con = db.conn()
+        low = path_of(source_uri).lower()
+        if low.endswith((".parquet", ".pq")):
+            return con.read_parquet(snapshot_path)
+        if low.endswith((".csv", ".tsv")):
+            return con.read_csv(snapshot_path, **_csv_kwargs(options))
+        if low.endswith((".json", ".ndjson")):
+            return con.read_json(snapshot_path)
+        if low.endswith((".arrow", ".feather", ".ipc")):
+            return _read_ipc(con, snapshot_path)
+        raise ValueError("ordinary local exact admission supports Parquet, CSV, JSON, and Arrow files")
+
     def preview_scan(self, uri: str, columns: list[str] | None = None,
                      limit: int = 2000, options: dict | None = None) -> Relation:
         """A hard-bounded source read for interactive preview.
@@ -908,12 +924,61 @@ def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAda
     return _MANAGED_LOCAL_FILE_REVISION_ADAPTER
 
 
+class LocalFileInputRevisionAdapter:
+    """Private exact-open provider for content-identified ordinary local-file snapshots."""
+
+    name = "local-file-snapshot"
+    retention_owner = "run"
+
+    @staticmethod
+    def _binding(uri: str, revision_id: str) -> dict:
+        from hub import metadb
+
+        binding = metadb.local_file_input_revision_for_artifact(uri)
+        if binding is None or binding["revision_id"] != str(revision_id):
+            raise RevisionUnavailable("revision_unavailable")
+        return binding
+
+    def revision_history(
+            self, uri: str, *, limit: int,
+            cursor: str | None = None) -> tuple[list[dict], str | None]:
+        del uri, limit, cursor
+        raise RevisionUnavailable("revision_unavailable")
+
+    def resolve_revision(
+            self, uri: str, *, as_of: datetime.datetime | None = None) -> dict:
+        del uri, as_of
+        raise RevisionUnavailable("revision_unavailable")
+
+    def open_revision(self, uri: str, revision_id: str) -> Relation:
+        binding = self._binding(uri, revision_id)
+        try:
+            return DuckDBAdapter().scan(binding["artifact_uri"])
+        except (OSError, duckdb.Error) as exc:
+            _raise_revision_access_error(exc)
+
+    def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
+        del uri, revision_id, preview_limit
+        raise RevisionUnavailable("revision_unavailable")
+
+
+def local_file_input_revision_adapter(uri: str) -> LocalFileInputRevisionAdapter | None:
+    """Select the private admission provider only for a persisted snapshot artifact."""
+    from hub import metadb
+
+    return (_LOCAL_FILE_INPUT_REVISION_ADAPTER
+            if metadb.local_file_input_revision_for_artifact(uri) is not None else None)
+
+
 def revision_adapter_for_uri(uri: str, resolve_adapter) -> object:
     """Return the provider owning revision identity, which may differ from the scan adapter."""
-    return managed_local_file_revision_adapter(uri) or resolve_adapter(uri)
+    return (managed_local_file_revision_adapter(uri)
+            or local_file_input_revision_adapter(uri)
+            or resolve_adapter(uri))
 
 
 _MANAGED_LOCAL_FILE_REVISION_ADAPTER = ManagedLocalFileRevisionAdapter()
+_LOCAL_FILE_INPUT_REVISION_ADAPTER = LocalFileInputRevisionAdapter()
 
 
 class LanceAdapter:

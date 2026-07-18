@@ -18,7 +18,7 @@ import pyarrow as pa
 from hub import db, graph as g, sandbox
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode, dataset_ref_identity
-from hub.plugins.adapters import BoundedPreviewUnsupported, display_type, managed_local_file_revision_adapter
+from hub.plugins.adapters import BoundedPreviewUnsupported, display_type, revision_adapter_for_uri
 from hub.plugins.capabilities import tag_columns
 # The faithful-preview SQL gates parse with DuckDB's OWN parser (hub.sqlanalyze) rather than regex, so
 # detection matches execution exactly — handling quoting / string literals / a column named `input2` /
@@ -589,7 +589,6 @@ class BuildEngine:
             # resolver — passed only when set, so an adapter whose scan() predates the kwarg keeps working
             extra = {"options": cfg["options"]} if cfg.get("options") else {}
             adapter = self.resolve_adapter(uri)
-            revision_adapter = managed_local_file_revision_adapter(uri) or adapter
             dataset_ref = cfg.get("datasetRef")
             if isinstance(dataset_ref, dict):
                 # A persisted Source pin is path-independent. Re-resolve the current catalog binding
@@ -597,6 +596,7 @@ class BuildEngine:
                 # retarget an old reference to a numerically identical provider version.
                 from hub import metadb
                 binding = metadb.catalog_revision_binding_for_uri(uri)
+                revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
                 try:
                     dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                 except ValueError as exc:
@@ -633,6 +633,19 @@ class BuildEngine:
             # exact revision is deliberately preferred to scanning the mutable provider head.
             revision_id = cfg.get("_input_revision_id")
             if revision_id is not None:
+                exact_artifact = self.graph._input_artifact_uris.get(str(node.id))
+                if (exact_artifact is not None
+                        and cfg.get("_input_artifact_uri") == exact_artifact):
+                    # Metadata-isolated local children cannot query the provider ledger. The parent
+                    # already reopened this revision, serialized its physical artifact, and retained
+                    # a read fence; subrun restores this private sidecar only after validating the
+                    # admitted manifest and parent attestation. Read that exact artifact directly.
+                    try:
+                        return self.resolve_adapter(exact_artifact).scan(exact_artifact)
+                    except Exception as exc:
+                        raise NotPreviewable(
+                            node, "persisted input revision is unavailable") from exc
+                revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
                 open_revision = getattr(revision_adapter, "open_revision", None)
                 if not callable(open_revision):
                     raise NotPreviewable(node, "persisted input revision is unavailable")

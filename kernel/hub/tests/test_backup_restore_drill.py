@@ -20,9 +20,11 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
 from hub import handoff, metadb
+from hub.local_run_inputs import finalize_local_file_candidates, snapshot_local_file_input
 from hub.models import CatalogTable, RunOutput
 from hub.plugins.adapters import (
-    DuckDBAdapter, LanceAdapter, ManagedLocalFileRevisionAdapter, RevisionUnavailable,
+    DuckDBAdapter, LanceAdapter, LocalFileInputRevisionAdapter,
+    ManagedLocalFileRevisionAdapter, RevisionUnavailable,
 )
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
@@ -281,6 +283,27 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         storage, revision_catalog, managed_logical_uri, 202)
     assert core_original["dataset_id"] == core_head["dataset_id"]
 
+    ordinary_path = data_dir / "ordinary-input.parquet"
+    pq.write_table(pa.table({"value": [606]}), ordinary_path)
+    revision_catalog._add(
+        name="ordinary-input", uri=str(ordinary_path), strict_probe=True)
+    ordinary_binding = metadb.catalog_revision_binding_for_uri(str(ordinary_path))
+    assert ordinary_binding is not None
+    ordinary_revision_id, ordinary_candidate = snapshot_local_file_input(
+        uri=str(ordinary_path), config={"uri": str(ordinary_path)},
+        dataset_id=ordinary_binding["dataset_id"], adapter=DuckDBAdapter(), storage=storage)
+    assert ordinary_candidate is not None
+    ordinary_input = {
+        "dataset_id": ordinary_binding["dataset_id"],
+        "revision_id": ordinary_revision_id,
+        "artifact_uri": ordinary_candidate["artifact_uri"],
+        "artifact_rel": str(Path(ordinary_candidate["artifact_uri"]).resolve().relative_to(
+            Path(storage.root).resolve())),
+        "artifact_sha256": _file_sha256(Path(ordinary_candidate["artifact_uri"])),
+        "source_uri": str(ordinary_path),
+        "value": 606,
+    }
+
     tombstone_logical_uri = str(data_dir / "unregistered-recovery.parquet")
     tombstone = _publish_core_revision(
         storage, revision_catalog, tombstone_logical_uri, 303)
@@ -300,6 +323,8 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
             _exact_source_node("core", core_original),
             _exact_source_node("provider-available", provider_available),
             _exact_source_node("provider-unavailable", provider_unavailable),
+            {"id": "ordinary", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": ordinary_input["source_uri"]}}},
         ],
         "edges": [],
     }
@@ -321,6 +346,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
             ("core", "managed-local-file", core_original),
             ("provider-available", "lance", provider_available),
             ("provider-unavailable", "lance", provider_unavailable),
+            ("ordinary", "local-file-snapshot", ordinary_input),
         )
     ]
     run_id, created = metadb.admit_local_run_inputs(
@@ -330,8 +356,10 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         target_node_id="core",
         intent_sha256=hashlib.sha256(b"backup-restore-revision-drill").hexdigest(),
         manifest=admitted_manifest,
+        local_file_candidates=[ordinary_candidate],
     )
     assert created is True
+    finalize_local_file_candidates(storage, [ordinary_candidate], run_id)
     artifact_uri = storage.begin_result(f"plan-{uuid.uuid4().hex}", run_id)
     Path(artifact_uri).write_bytes(b"drill-local-result-bytes")
     storage.commit_result(artifact_uri, run_id)
@@ -413,6 +441,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "tombstone_logical_uri": tombstone_logical_uri,
         "provider_available": provider_available,
         "provider_unavailable": provider_unavailable,
+        "ordinary_input": ordinary_input,
         "artifact_uri": artifact_uri,
         "artifact_rel": artifact_rel,
         "artifact_bytes": Path(artifact_uri).read_bytes(),
@@ -430,7 +459,7 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
         canvas = session.get(metadb.Canvas, info["canvas_id"])
         assert canvas is not None and canvas.name == "backup-restore-drill"
         assert [node["id"] for node in json.loads(canvas.doc)["nodes"]] == [
-            "core", "provider-available", "provider-unavailable",
+            "core", "provider-available", "provider-unavailable", "ordinary",
         ]
         runs = list(session.scalars(
             select(metadb.RunRecord).where(metadb.RunRecord.canvas_id == info["canvas_id"])))
@@ -581,6 +610,21 @@ def _assert_revision_recovery(
                 "owner_key": owner_key,
             })
             check(f"exact core {owner_kind} reference", ref is not None, True)
+        ordinary = session.get(metadb.LocalFileInputRevision, {
+            "dataset_id": info["ordinary_input"]["dataset_id"],
+            "revision_id": info["ordinary_input"]["revision_id"],
+        })
+        check(
+            "ordinary exact input mapping",
+            ordinary.artifact_uri if ordinary is not None else None,
+            info["ordinary_input"]["artifact_uri"],
+        )
+        ordinary_ref = session.get(metadb.LocalResultReference, {
+            "uri": info["ordinary_input"]["artifact_uri"],
+            "owner_kind": "run_input_admission",
+            "owner_key": info["run_id"],
+        })
+        check("ordinary exact input retention", ordinary_ref is not None, True)
 
     for label, ref in (
             ("core original artifact", info["core_original"]),
@@ -593,6 +637,28 @@ def _assert_revision_recovery(
             _file_sha256(restored) if restored.is_file() else None,
             ref["artifact_sha256"],
         )
+
+    ordinary_restored = outputs_root / info["ordinary_input"]["artifact_rel"]
+    check("ordinary exact input artifact present", ordinary_restored.is_file(), True)
+    check(
+        "ordinary exact input artifact sha256",
+        _file_sha256(ordinary_restored) if ordinary_restored.is_file() else None,
+        info["ordinary_input"]["artifact_sha256"],
+    )
+    try:
+        ordinary_rows = LocalFileInputRevisionAdapter().open_revision(
+            info["ordinary_input"]["artifact_uri"],
+            info["ordinary_input"]["revision_id"],
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — report exact operational evidence
+        mismatches.append({
+            "subject": "ordinary exact input read-back",
+            "expected": [[info["ordinary_input"]["value"]]],
+            "actual": f"{type(exc).__name__}: {exc}",
+        })
+    else:
+        check("ordinary exact input read-back", [list(row) for row in ordinary_rows],
+              [[info["ordinary_input"]["value"]]])
 
     core_binding = metadb.catalog_revision_binding(info["core_original"]["dataset_id"])
     check(
@@ -891,6 +957,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.LocalResultReference,
+                          metadb.LocalFileInputRevision,
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
                           metadb.RunInputAdmission, metadb.ObjectAttempt):
                 source_row_counts[model.__tablename__] = session.scalar(
@@ -974,6 +1041,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                           metadb.WorkspaceContainer, metadb.WorkspacePlacement,
                           metadb.CatalogLineageFact, metadb.CatalogPublicationEvent,
                           metadb.LocalResultArtifact, metadb.LocalResultReference,
+                          metadb.LocalFileInputRevision,
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
                           metadb.RunInputAdmission, metadb.ObjectAttempt):
                 assert session.scalar(select(func.count()).select_from(model)) == \

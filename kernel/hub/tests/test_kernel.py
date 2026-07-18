@@ -143,6 +143,46 @@ def _full_result(graph: dict, target_node_id: str, k: int = 100) -> tuple[dict, 
     return status, sampled.json()
 
 
+def test_seeded_example_run_admits_an_exact_ordinary_local_file_binding():
+    """Normal CI exercises the fresh-seed path that regressed in issue #467."""
+    from hub import metadb
+
+    canvas_id = f"seeded-exact-local-{uuid.uuid4().hex}"
+    graph = {
+        "id": canvas_id,
+        "name": "Purchases per user exact admission",
+        "version": 1,
+        "nodes": [
+            N("src", "source", {"uri": "events"}),
+            N("flt", "filter", {"predicate": "event = 'purchase'"}),
+            N("agg", "aggregate", {
+                "groupBy": "user_id", "aggs": "sum(amount) AS total, count(*) AS n",
+            }),
+        ],
+        "edges": [E("src", "flt"), E("flt", "agg")],
+    }
+    created = client.post("/api/canvas", json=graph)
+    assert created.status_code == 200, created.text
+
+    started = client.post("/api/run", json={
+        "graph": graph,
+        "targetNodeId": "agg",
+        "confirmed": True,
+    })
+    assert started.status_code == 200, started.text
+    status = _poll(started.json()["runId"])
+    assert status["status"] == "done", status
+    assert 1 <= status["totalRows"] <= 200
+
+    manifest = metadb.local_run_input_manifest(started.json()["runId"])
+    assert manifest is not None and len(manifest) == 1
+    assert manifest[0]["node_id"] == "src"
+    assert manifest[0]["provider"] == "local-file-snapshot"
+    artifact = metadb.local_file_input_revision_artifact(
+        manifest[0]["dataset_id"], manifest[0]["revision_id"])
+    assert artifact is not None and get_deps().storage.is_managed_result_uri(artifact)
+
+
 def test_kernel_info():
     info = client.get("/api/kernel").json()
     assert info["backend"] == "duckdb+polars+arrow"

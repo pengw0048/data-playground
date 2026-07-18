@@ -2,16 +2,217 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import json
+import os
+import stat
+import uuid
+
 from hub import db, graph as graph_mod, metadb
 from hub.backends import DatasetRevisionAdapter
 from hub.models import dataset_ref_identity
-from hub.plugins.adapters import revision_adapter_for_uri
+from hub.plugins.adapters import DuckDBAdapter, revision_adapter_for_uri
 
 _MANIFEST_FIELDS = {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
+LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
+_LOCAL_FILE_INPUT_EXTENSIONS = (
+    ".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson",
+    ".arrow", ".feather", ".ipc",
+)
 
 
 class LocalRunInputError(RuntimeError):
     """The admitted local-run input contract is malformed, stale, or unavailable."""
+
+
+def supports_local_file_snapshot(uri: str, adapter) -> bool:
+    """Whether automatic exact admission can snapshot this one ordinary local Source."""
+    from hub import paths
+
+    path = paths.checked_local_path(uri)
+    return bool(
+        isinstance(adapter, DuckDBAdapter)
+        and path is not None
+        and os.path.isfile(path)
+        and path.lower().endswith(_LOCAL_FILE_INPUT_EXTENSIONS)
+    )
+
+
+def _source_options(config: dict) -> dict[str, str]:
+    options = {
+        key: (str(config.get(key, "")).strip().lower()
+              if key == "header" else str(config.get(key, "")).strip())
+        for key in ("delimiter", "header") if str(config.get(key, "")).strip()
+    }
+    return {
+        key: value for key, value in options.items()
+        if key != "header" or value in ("yes", "no")
+    }
+
+
+@contextlib.contextmanager
+def _stable_local_file_copy(storage, uri: str, artifact_uri: str):
+    """Copy one regular source while proving its path and inode did not change mid-read."""
+    from hub import paths
+
+    path = paths.checked_local_path(uri)
+    result_root = getattr(storage, "result_root", None)
+    namespace_identity = getattr(storage, "result_namespace_identity", None)
+    if path is None or not isinstance(result_root, str) or not callable(namespace_identity):
+        raise LocalRunInputError(
+            "ordinary local input exact admission requires the built-in local result storage")
+    if os.path.dirname(artifact_uri) != result_root:
+        raise LocalRunInputError("ordinary local input candidate is outside managed result storage")
+    temp_path = f"{artifact_uri}.tmp-{uuid.uuid4().hex[:8]}"
+    source_fd = temp_fd = None
+    try:
+        source_fd = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(source_fd)
+        visible_before = os.stat(path, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode)
+                or (before.st_dev, before.st_ino) != (
+                    visible_before.st_dev, visible_before.st_ino)):
+            raise LocalRunInputError(
+                "ordinary local exact admission supports one regular file per Source")
+        root_before = tuple(namespace_identity())
+        temp_fd = os.open(
+            temp_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError("short write while snapshotting local run input")
+                view = view[written:]
+        os.fsync(temp_fd)
+        after = os.fstat(source_fd)
+        visible_after = os.stat(path, follow_symlinks=False)
+        identity = lambda value: (  # noqa: E731 - one exact stat tuple is easier to audit inline
+            value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if (identity(before) != identity(after)
+                or identity(after) != identity(visible_after)
+                or copied != before.st_size
+                or tuple(namespace_identity()) != root_before):
+            raise LocalRunInputError(
+                "ordinary local input changed while its exact binding was created")
+        os.close(temp_fd)
+        temp_fd = None
+        yield temp_path, digest.hexdigest()
+    except LocalRunInputError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise LocalRunInputError(
+            "ordinary local input could not be bound to an immutable exact snapshot") from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temp_path)
+
+
+def _candidate_writer_id(dataset_id: str) -> str:
+    identity = hashlib.sha256(dataset_id.encode()).hexdigest()[:32]
+    return f"local-file-input:{identity}"
+
+
+def snapshot_local_file_input(
+        *, uri: str, config: dict, dataset_id: str, adapter, storage,
+        ) -> tuple[str, dict[str, str] | None]:
+    """Create or reuse one canonical immutable Parquet binding for an ordinary local file."""
+    if not isinstance(adapter, DuckDBAdapter):
+        raise LocalRunInputError(
+            "source adapter cannot create an immutable exact local-file binding")
+    options = _source_options(config)
+    format_name = os.path.splitext(uri.split("?", 1)[0])[1].lower()
+    writer_id = _candidate_writer_id(dataset_id)
+    begin = getattr(storage, "begin_result", None)
+    commit = getattr(storage, "commit_result", None)
+    abort = getattr(storage, "abort_result", None)
+    if not callable(begin) or not callable(commit) or not callable(abort):
+        raise LocalRunInputError(
+            "ordinary local input exact admission requires managed local-result ownership")
+    artifact_uri = begin(f"local-input:{dataset_id}", writer_id)
+    try:
+        with _stable_local_file_copy(
+                storage, uri, artifact_uri) as (snapshot_path, content_sha256):
+            semantic = json.dumps({
+                # Identity describes the user's stable bytes plus the declared interpretation.
+                # Canonical Parquet is the retained transport, not the identity: retries/upgrades
+                # must keep reopening the first admitted rows instead of silently re-parsing them.
+                "contract": "local-file-input-v1",
+                "content_sha256": content_sha256,
+                "format": format_name,
+                "options": options,
+            }, sort_keys=True, separators=(",", ":"))
+            revision_id = hashlib.sha256(semantic.encode()).hexdigest()
+            if metadb.local_file_input_revision_artifact(dataset_id, revision_id) is not None:
+                abort(artifact_uri, writer_id)
+                return revision_id, None
+            relation = adapter.scan_local_snapshot(snapshot_path, uri, options=options)
+            adapter.write(artifact_uri, relation, mode="overwrite")
+            commit(artifact_uri, writer_id)
+    except LocalRunInputError:
+        abort(artifact_uri, writer_id)
+        raise
+    except Exception as exc:
+        abort(artifact_uri, writer_id)
+        raise LocalRunInputError(
+            "ordinary local input could not be parsed into an immutable exact binding") from exc
+    except BaseException:
+        abort(artifact_uri, writer_id)
+        raise
+    return revision_id, {
+        "dataset_id": dataset_id,
+        "revision_id": revision_id,
+        "artifact_uri": artifact_uri,
+    }
+
+
+def finalize_local_file_candidates(
+        storage, candidates: list[dict[str, str]], run_id: str) -> None:
+    """Release winning snapshot writers or abort candidates excluded by the durable admission."""
+    if not candidates:
+        return
+    try:
+        admitted = metadb.local_run_input_manifest(run_id)
+    except Exception:
+        # Unknown DB outcome: retain each exact writer fence for retry/dead-writer reconciliation.
+        return
+    admitted_ids = {
+        (item["dataset_id"], item["revision_id"])
+        for item in admitted or [] if item.get("provider") == LOCAL_FILE_INPUT_PROVIDER}
+    for candidate in candidates:
+        identity = (candidate["dataset_id"], candidate["revision_id"])
+        writer_id = _candidate_writer_id(candidate["dataset_id"])
+        try:
+            winner = metadb.local_file_input_revision_artifact(*identity)
+        except Exception:
+            continue
+        if identity in admitted_ids and winner == candidate["artifact_uri"]:
+            if not storage.release_result(candidate["artifact_uri"], writer_id):
+                raise RuntimeError(
+                    "local file input admission is missing its durable artifact owner")
+        else:
+            storage.abort_result(candidate["artifact_uri"], writer_id)
 
 
 def validate_manifest(value: object) -> list[dict[str, str]]:
@@ -67,20 +268,33 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
                                  if isinstance(dataset_ref, dict) else None)
         except ValueError as exc:
             raise LocalRunInputError("local run input manifest does not match the graph") from exc
-        if (source_binding is None
+        if item["provider"] == LOCAL_FILE_INPUT_PROVIDER:
+            if (source_binding is None
+                    or str(source_binding["dataset_id"]) != item["dataset_id"]
+                    or (selected_identity is not None and selected_identity != (
+                        item["dataset_id"], item["revision_id"]))):
+                raise LocalRunInputError("local run input manifest does not match the graph")
+            artifact_uri = metadb.local_file_input_revision_artifact(
+                item["dataset_id"], item["revision_id"])
+            if artifact_uri is None:
+                raise LocalRunInputError("local run input revision is unavailable")
+            revision_uri = artifact_uri
+        elif (source_binding is None
                 or str(source_binding["dataset_id"]) != item["dataset_id"]
                 or (selected_identity is not None and selected_identity != (
                     item["dataset_id"], item["revision_id"]))):
             raise LocalRunInputError("local run input manifest does not match the graph")
+        else:
+            try:
+                binding = metadb.catalog_revision_binding(item["dataset_id"])
+            except Exception as exc:
+                raise LocalRunInputError("local run input revision is unavailable") from exc
+            if binding is None:
+                raise LocalRunInputError("local run input revision is unavailable")
+            uri = str(binding["uri"])
+            revision_uri = uri
         try:
-            binding = metadb.catalog_revision_binding(item["dataset_id"])
-        except Exception as exc:
-            raise LocalRunInputError("local run input revision is unavailable") from exc
-        if binding is None:
-            raise LocalRunInputError("local run input revision is unavailable")
-        uri = str(binding["uri"])
-        try:
-            adapter = revision_adapter_for_uri(uri, resolve_adapter)
+            adapter = revision_adapter_for_uri(revision_uri, resolve_adapter)
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         if (not isinstance(adapter, DatasetRevisionAdapter)
@@ -88,19 +302,23 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             raise LocalRunInputError("local run input revision is unavailable")
         try:
             with db.base_guard():
-                adapter.open_revision(uri, item["revision_id"])
+                adapter.open_revision(revision_uri, item["revision_id"])
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
         config = node.data.setdefault("config", {})
-        config["uri"] = uri
+        if item["provider"] != LOCAL_FILE_INPUT_PROVIDER:
+            config["uri"] = uri
         # Keep the complete manifest identity on the private dispatch copy. Revision ids are only
         # provider-local and can restart after a dataset is unregistered/replaced at the same URI;
         # cache/profile keys must therefore include dataset and provider identity as well.
         config["_input_dataset_id"] = item["dataset_id"]
         config["_input_provider"] = item["provider"]
         config["_input_revision_id"] = item["revision_id"]
-        artifact_uri = metadb.managed_local_file_revision_artifact(
+        artifact_uri = (metadb.local_file_input_revision_artifact(
             item["dataset_id"], item["revision_id"])
+            if item["provider"] == LOCAL_FILE_INPUT_PROVIDER
+            else metadb.managed_local_file_revision_artifact(
+                item["dataset_id"], item["revision_id"]))
         if artifact_uri is not None:
             # Execution ownership must fence the selected old artifact, not the mutable catalog head.
             config["_input_artifact_uri"] = artifact_uri

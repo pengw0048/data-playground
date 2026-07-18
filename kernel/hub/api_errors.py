@@ -34,6 +34,7 @@ class APIErrorCode(StrEnum):
     CANVAS_NOT_FOUND = "canvas_not_found"
     METHOD_NOT_ALLOWED = "method_not_allowed"
     CONFLICT = "conflict"
+    LOCAL_RUN_INPUT_BINDING_FAILED = "local_run_input_binding_failed"
     RESOURCE_GONE = "resource_gone"
     PAYLOAD_TOO_LARGE = "payload_too_large"
     VALIDATION_ERROR = "validation_error"
