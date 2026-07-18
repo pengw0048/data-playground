@@ -229,7 +229,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
 
-  it('stores UTC as-of intent and one exact provider resolution only when advertised', async () => {
+  it('stores UTC as-of intent with exact and as-of capabilities after history is ready', async () => {
     const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
       title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
     } }
@@ -248,8 +248,37 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     mocks.resolveDatasetRevision.mockResolvedValue(resolved)
     render1(source.data)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Choose revision as of a time/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose exact or as-of revision' }))
     expect(screen.getByText(/latest provider commit at or before this UTC instant \(inclusive\)/i)).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('As-of UTC date and time'), { target: { value: localIntent } })
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve once' }))
+
+    await waitFor(() => expect(mocks.resolveDatasetRevision).toHaveBeenCalledWith('t1', utcIntent))
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({
+      kind: 'as_of', asOf: utcIntent, resolved,
+    })
+  })
+
+  it('offers as-of-only resolution without requesting exact history', async () => {
+    const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
+      title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, nodes: [source], edges: [] } } as any)
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: ['as_of'], asOfOrdering: 'latest_committed_at_at_or_before', timezone: 'UTC',
+    })
+    const localIntent = '2026-07-16T12:30'
+    const utcIntent = new Date(`${localIntent}Z`).toISOString()
+    const resolved = {
+      datasetId: 'dataset-1', revisionId: '7', committedAt: '2026-07-16T15:00:00Z',
+      retentionOwner: 'provider', selector: 'as_of',
+    }
+    mocks.resolveDatasetRevision.mockResolvedValue(resolved)
+    render1(source.data)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Choose revision as of a time' }))
+    expect(mocks.datasetRevisions).not.toHaveBeenCalled()
     fireEvent.change(screen.getByLabelText('As-of UTC date and time'), { target: { value: localIntent } })
     fireEvent.click(screen.getByRole('button', { name: 'Resolve once' }))
 
