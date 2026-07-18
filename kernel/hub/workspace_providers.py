@@ -299,6 +299,35 @@ def provider_dataset_dispatch_uri(adapter: object, source_uri: str) -> str:
     return adapter.physical_uri
 
 
+def provider_dataset_inspection_graph(
+    graph, target_node_id: str | None, resolve_adapter: Callable[[str], object],
+):
+    """Bind mutable provider Sources only on a private preview/profile graph.
+
+    The logical Workspace URI remains the visible identity. The physical URI is a one-request kernel
+    capability, and disabling the warm cache prevents a mutable head from being reused after it changes.
+    """
+    from hub import graph as graph_mod
+
+    bound = graph.model_copy(deep=True)
+    cone = graph_mod.upstream_chain(bound, target_node_id) if target_node_id else bound.nodes
+    for node in cone:
+        if node.type != "source" or not isinstance(node.data, dict):
+            continue
+        config = node.data.get("config")
+        if not isinstance(config, dict):
+            continue
+        config.pop("_input_provider_preview_uri", None)
+        source_uri = str(config.get("uri") or "")
+        if not is_provider_dataset_uri(source_uri):
+            continue
+        adapter = resolve_adapter(source_uri)
+        config["_input_provider_preview_uri"] = provider_dataset_dispatch_uri(
+            adapter, source_uri)
+        config["cacheable"] = False
+    return bound
+
+
 def provider_dataset_source(resource_ref: str, *, uid: str,
                             resolve_physical: Callable[[str], object]) -> dict:
     """Create one minimal Source config from a live stable provider dataset reference."""
@@ -787,7 +816,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         provider = _load_provider(mounted.mount.provider)
     except Exception:  # noqa: BLE001 -- activation failure is isolated from local Workspace reads
         cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="offline", error=_activation_error())
+            binding_id, state="provider_error", error=_activation_error())
         return _cached_resolution(
             cached, mounted, source, uid=uid, completeness="unavailable",
             error=_activation_error())

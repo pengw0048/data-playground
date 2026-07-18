@@ -179,6 +179,9 @@ def resolve_config(node: GraphNode) -> dict:
             c["_input_artifact_uri"] = cfg["_input_artifact_uri"]
         if isinstance(cfg.get("_input_provider_uri"), str) and cfg["_input_provider_uri"]:
             c["_input_provider_uri"] = cfg["_input_provider_uri"]
+        if (isinstance(cfg.get("_input_provider_preview_uri"), str)
+                and cfg["_input_provider_preview_uri"]):
+            c["_input_provider_preview_uri"] = cfg["_input_provider_preview_uri"]
         if opts:
             c["options"] = opts
         return c

@@ -27,6 +27,8 @@ from hub.catalog_provider import (
 )
 from hub.main import app
 from hub.deps import get_deps
+from hub.executors.preview import preview_node
+from hub.executors.profile import profile_node
 from hub.plugins.adapters import DuckDBAdapter, RevisionProviderOffline, RevisionUnavailable
 
 
@@ -624,6 +626,48 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert "tenant" not in sanitized.text
         monkeypatch.setattr(provider, "resolve", normal_resolve)
 
+        def missing_provider(_name):
+            raise LookupError("secret package activation detail")
+
+        monkeypatch.setattr(workspace_providers, "_load_provider", missing_provider)
+        incompatible = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider incompatible",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert incompatible.status_code == 409, incompatible.text
+        assert incompatible.json()["detail"] == (
+            "provider dataset binding is unavailable; install or restore a compatible provider "
+            "and dataset adapter")
+        assert "secret" not in incompatible.text
+        incompatible_add = client.post(
+            f"/api/workspace/canvases/{created.json()['id']}/datasets",
+            json={
+                "expectedCanvasVersion": graph["version"],
+                "providerDatasetRefs": [provider_resource["id"]],
+            },
+        )
+        assert incompatible_add.status_code == 409, incompatible_add.text
+        assert incompatible_add.json()["detail"] == incompatible.json()["detail"]
+        monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+
+        invalid_item = CatalogResource.model_construct(
+            id="dataset-a", kind="dataset", name="x" * 513, uri=str(path), columns=[])
+        monkeypatch.setattr(provider, "resolve", lambda *_args, **_kwargs:
+                            ProviderResourceResult.model_construct(
+                                state="ready", item=invalid_item, reason=None, failure=None))
+        malformed = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider malformed",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert malformed.status_code == 409, malformed.text
+        assert malformed.json()["detail"] == incompatible.json()["detail"]
+        assert "x" * 513 not in malformed.text
+        monkeypatch.setattr(provider, "resolve", normal_resolve)
+
         monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: DuckDBAdapter())
         monkeypatch.setattr(deps, "resolve_adapter", normal_resolve_adapter)
         mutable = client.post("/api/workspace/canvases", json={
@@ -642,6 +686,148 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         })
         assert mutable_preview.status_code == 200, mutable_preview.text
         assert mutable_preview.json()["rows"] == [{"value": 1}]
+
+        class _PathEchoingAdapter(DuckDBAdapter):
+            def preview_scan(self, uri, columns=None, limit=2000, options=None):
+                del columns, limit, options
+                raise RuntimeError(f"cannot read private provider path {uri}")
+
+        monkeypatch.setattr(deps, "chosen_backend", lambda _uid=None: "local-out-of-core")
+        path_echoing_adapter = _PathEchoingAdapter()
+        monkeypatch.setattr(
+            deps, "resolve_adapter",
+            lambda uri: (path_echoing_adapter if uri == str(path)
+                         else normal_resolve_adapter(uri)),
+        )
+        direct_preview_failure = client.post("/api/run/preview", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"], "k": 1,
+        })
+        assert direct_preview_failure.status_code == 200, direct_preview_failure.text
+        assert direct_preview_failure.json()["reason"] == "provider dataset inspection failed"
+        assert str(path) not in direct_preview_failure.text
+        direct_profile_failure = client.post("/api/run/profile", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert direct_profile_failure.status_code == 200, direct_profile_failure.text
+        assert direct_profile_failure.json()["reason"] == "provider dataset inspection failed"
+        assert str(path) not in direct_profile_failure.text
+        monkeypatch.setattr(deps, "resolve_adapter", normal_resolve_adapter)
+
+        class _KernelPreview:
+            echo_path = False
+            transport_error: str | None = None
+
+            def _child_resolve(self, uri):
+                if uri == str(path):
+                    return _PathEchoingAdapter() if self.echo_path else DuckDBAdapter()
+                raise workspace_providers.ProviderDatasetUnavailable(
+                    "provider mount config is absent from the kernel")
+
+            def preview(self, private_graph, node_id, k, offset, port_id):
+                if self.transport_error is not None:
+                    raise RuntimeError(self.transport_error)
+                private_config = private_graph.nodes[0].data["config"]
+                assert private_config["uri"].startswith("workspace-provider://")
+                assert private_config["_input_provider_preview_uri"] == str(path)
+                assert private_config["cacheable"] is False
+                return preview_node(
+                    private_graph, node_id, k, self._child_resolve, deps.registry,
+                    deps.node_builders, deps.node_specs, offset=offset,
+                    storage=deps.storage, port_id=port_id,
+                ).model_dump()
+
+            def profile(self, private_graph, node_id, *, full, port_id):
+                if self.transport_error is not None:
+                    raise RuntimeError(self.transport_error)
+                assert full is False
+                assert private_graph.nodes[0].data["config"]["_input_provider_preview_uri"] == str(path)
+                return profile_node(
+                    private_graph, node_id, self._child_resolve, deps.registry,
+                    deps.node_builders, deps.node_specs, full=False,
+                    storage=deps.storage, port_id=port_id,
+                ).model_dump()
+
+        kernel_preview_backend = _KernelPreview()
+        monkeypatch.setattr(deps, "chosen_backend", lambda _uid=None: "kernel")
+        monkeypatch.setattr(deps, "kernel_backend", lambda: kernel_preview_backend)
+        kernel_preview = client.post("/api/run/preview", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"], "k": 1,
+        })
+        assert kernel_preview.status_code == 200, kernel_preview.text
+        assert kernel_preview.json()["rows"] == [{"value": 1}]
+        assert str(path) not in kernel_preview.text
+        kernel_profile = client.post("/api/run/profile", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert kernel_profile.status_code == 200, kernel_profile.text
+        assert kernel_profile.json()["rowCount"] == 2
+        assert str(path) not in kernel_profile.text
+
+        kernel_preview_backend.echo_path = True
+        kernel_preview_failure = client.post("/api/run/preview", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"], "k": 1,
+        })
+        assert kernel_preview_failure.status_code == 200, kernel_preview_failure.text
+        assert kernel_preview_failure.json()["reason"] == "provider dataset inspection failed"
+        assert str(path) not in kernel_preview_failure.text
+        kernel_preview_backend.echo_path = False
+        kernel_preview_backend.transport_error = f"kernel cannot read {path}"
+        kernel_profile_failure = client.post("/api/run/profile", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert kernel_profile_failure.status_code == 200, kernel_profile_failure.text
+        assert kernel_profile_failure.json()["reason"] == "provider dataset inspection failed"
+        assert str(path) not in kernel_profile_failure.text
+        kernel_preview_backend.transport_error = "downstream column is missing"
+        downstream_failure = client.post("/api/run/profile", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert downstream_failure.status_code == 200, downstream_failure.text
+        assert "downstream column is missing" in downstream_failure.json()["reason"]
+        kernel_preview_backend.transport_error = None
+
+        preallocations = 0
+        original_preallocate = metadb.preallocate_or_adopt_profile_run_owner
+
+        def track_preallocation(*args, **kwargs):
+            nonlocal preallocations
+            preallocations += 1
+            return original_preallocate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            metadb, "preallocate_or_adopt_profile_run_owner", track_preallocation)
+        mutable_identity = client.post("/api/run/profile-identity", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert mutable_identity.status_code == 409, mutable_identity.text
+        mutable_estimate = client.post("/api/run/profile-estimate", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"],
+        })
+        assert mutable_estimate.status_code == 409, mutable_estimate.text
+        mutable_profile_job = client.post("/api/run/profile-job", json={
+            "graph": mutable_graph,
+            "nodeId": mutable_source["id"],
+            "planDigest": "0" * 64,
+            "submissionId": "00000000-0000-4000-8000-000000000474",
+        })
+        assert mutable_profile_job.status_code == 409, mutable_profile_job.text
+        assert preallocations == 0
+
+        missing_binding_graph = json.loads(json.dumps(mutable_graph))
+        missing_binding_graph["nodes"][0]["data"]["config"]["uri"] = (
+            "workspace-provider://00000000000000000000000000000000")
+        missing_binding = client.post("/api/run", json={
+            "graph": missing_binding_graph, "targetNodeId": mutable_source["id"],
+        })
+        assert missing_binding.status_code == 410, missing_binding.text
+        malformed_binding_graph = json.loads(json.dumps(mutable_graph))
+        malformed_binding_graph["nodes"][0]["data"]["config"]["uri"] = (
+            "workspace-provider://malformed")
+        malformed_binding = client.post("/api/run", json={
+            "graph": malformed_binding_graph, "targetNodeId": mutable_source["id"],
+        })
+        assert malformed_binding.status_code == 409, malformed_binding.text
+        assert dispatched is False
         rejected = client.post("/api/run", json={
             "graph": mutable_graph, "targetNodeId": mutable_source["id"],
         })
@@ -669,6 +855,23 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         detached = client.get(f"/api/workspace/resources/{provider_resource['id']}")
         assert detached.status_code == 200, detached.text
         assert detached.json()["resource"]["referenceState"] == "detached"
+        gone_use = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider gone",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert gone_use.status_code == 410, gone_use.text
+        assert gone_use.json()["detail"] == "provider dataset was deleted; relink it explicitly"
+        gone_add = client.post(
+            f"/api/workspace/canvases/{created.json()['id']}/datasets",
+            json={
+                "expectedCanvasVersion": graph["version"],
+                "providerDatasetRefs": [provider_resource["id"]],
+            },
+        )
+        assert gone_add.status_code == 410, gone_add.text
+        assert gone_add.json()["detail"] == gone_use.json()["detail"]
         monkeypatch.setattr(provider, "resolve", normal_resolve)
         gone = client.post("/api/run", json={
             "graph": graph, "targetNodeId": source["id"],

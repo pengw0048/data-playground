@@ -440,6 +440,26 @@ def _provider_dataset_sources(refs: list[str], uid: str) -> list[dict]:
         for ref in refs]
 
 
+def _provider_dataset_action_error(exc: Exception) -> None:
+    if isinstance(exc, workspace_providers.ProviderDatasetGone):
+        raise APIError(
+            410, "provider dataset was deleted; relink it explicitly",
+            code=APIErrorCode.RESOURCE_GONE, retryable=False,
+        ) from exc
+    if isinstance(exc, workspace_providers.ProviderDatasetOffline):
+        raise APIError(
+            503, "provider dataset is offline",
+            code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
+        ) from exc
+    if isinstance(exc, workspace_providers.ProviderDatasetUnavailable):
+        raise APIError(
+            409, ("provider dataset binding is unavailable; install or restore a compatible "
+                  "provider and dataset adapter"),
+            code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
+        ) from exc
+    _workspace_action_error(exc)
+
+
 @router.get("/workspace/containers/{container_id}", response_model=WorkspaceBrowsePage)
 def browse_workspace_container(container_id: str, limit: int = 50, cursor: str | None = None,
                                uid: str = Depends(current_user)) -> dict:
@@ -533,10 +553,9 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
             expected_container_version=body.expected_container_version,
             name=body.name, dataset_ids=body.dataset_ids,
             provider_sources=provider_sources)
-    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
-        _workspace_action_error(exc)
-    except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        _provider_dataset_action_error(exc)
 
 
 @router.post("/workspace/canvases/{canvas_id}/datasets")
@@ -547,10 +566,9 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
     try:
         provider_sources = await run_in_threadpool(
             _provider_dataset_sources, body.provider_dataset_refs, uid)
-    except (KeyError, PermissionError, ValueError) as exc:
-        _workspace_action_error(exc)
-    except workspace_providers.ProviderDatasetUnavailable as exc:
-        raise HTTPException(503, str(exc)) from exc
+    except (KeyError, PermissionError, ValueError,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        _provider_dataset_action_error(exc)
     async with _idle_collab_room_edit(canvas_id) as idle:
         if not idle:
             raise HTTPException(

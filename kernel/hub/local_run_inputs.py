@@ -385,6 +385,7 @@ def bind_manifest(
             if provider_dataset_id is not None else revision_uri
         )
         config = node.data.setdefault("config", {})
+        config.pop("_input_provider_preview_uri", None)
         # The exact DatasetRef is the canonical persisted identity. Once it has been checked against
         # the manifest above, the private dispatch fields below are the execution binding; leaving
         # the ref in place would make Source planning consult the mutable catalog again.

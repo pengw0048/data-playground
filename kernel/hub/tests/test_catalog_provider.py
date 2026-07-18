@@ -14,8 +14,9 @@ from pathlib import Path
 import pytest
 
 from hub.catalog_provider import (
-    _PROVIDER_READ_CONCURRENCY, CatalogMount, CatalogResource, ProviderPage, ProviderResourceResult,
-    bounded_dataset_detail, bounded_list_children,
+    _PROVIDER_READ_CONCURRENCY, CatalogMount, CatalogResource, ProviderAncestors, ProviderPage,
+    ProviderResourceResult, bounded_ancestors, bounded_dataset_detail, bounded_list_children,
+    bounded_resolve,
 )
 
 
@@ -139,6 +140,36 @@ def test_constructed_dataset_detail_instance_is_revalidated():
     assert result.state == "unavailable"
     assert result.failure == "provider_error"
     assert result.reason == "provider dataset detail is invalid"
+
+
+def test_constructed_browse_resolve_and_ancestor_instances_are_revalidated():
+    invalid_item = CatalogResource.model_construct(
+        id="dataset", kind="dataset", name="x" * 513, uri="fixture://data", columns=[])
+
+    class ConstructedProvider:
+        def list_children(self, *_args, **_kwargs):
+            return ProviderPage.model_construct(
+                state="ready", items=[invalid_item], next_cursor=None, reason=None)
+
+        def resolve(self, *_args, **_kwargs):
+            return ProviderResourceResult.model_construct(
+                state="ready", item=invalid_item, reason=None, failure=None)
+
+        def ancestors(self, *_args, **_kwargs):
+            return ProviderAncestors.model_construct(
+                state="ready", items=[invalid_item], reason=None)
+
+    provider = ConstructedProvider()
+    mount = CatalogMount(id="mount", provider="fixture")
+    listed = bounded_list_children(provider, mount, None, limit=10)
+    assert listed.state == "unavailable"
+    assert listed.reason == "provider list result is invalid"
+    resolved = bounded_resolve(provider, mount, "dataset")
+    assert resolved.state == "unavailable" and resolved.failure == "provider_error"
+    assert resolved.reason == "provider resolve result is invalid"
+    ancestors = bounded_ancestors(provider, mount, "dataset")
+    assert ancestors.state == "unavailable"
+    assert ancestors.reason == "provider ancestor result is invalid"
 
 
 def _run(args: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:

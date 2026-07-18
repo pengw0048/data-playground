@@ -169,11 +169,20 @@ def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount
     """
     if limit < 1 or limit > 500:
         raise ValueError("limit must be between 1 and 500")
+
+    def read() -> ProviderPage:
+        raw = provider.list_children(mount, parent_id, limit=limit, cursor=cursor)
+        if isinstance(raw, ProviderPage):
+            raw = raw.model_dump(mode="python")
+        return ProviderPage.model_validate(raw)
+
     return _bounded_provider_read(
-        lambda: provider.list_children(mount, parent_id, limit=limit, cursor=cursor),
+        read,
         unavailable=lambda reason: ProviderPage(state="unavailable", reason=reason),
         unsupported=lambda: ProviderPage(
             state="unsupported", reason="list_children is unsupported"),
+        failed=lambda: ProviderPage(
+            state="unavailable", reason="provider list result is invalid"),
         timeout=timeout,
     )
 
@@ -181,12 +190,22 @@ def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount
 def bounded_resolve(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
                     resource_id: str, *, timeout: float = 1.0) -> ProviderResourceResult:
     """Resolve one provider identity without letting synchronous provider I/O block Workspace."""
+
+    def read() -> ProviderResourceResult:
+        raw = provider.resolve(mount, resource_id)
+        if isinstance(raw, ProviderResourceResult):
+            raw = raw.model_dump(mode="python")
+        return ProviderResourceResult.model_validate(raw)
+
     return _bounded_provider_read(
-        lambda: provider.resolve(mount, resource_id),
+        read,
         unavailable=lambda reason: ProviderResourceResult(
             state="unavailable", reason=reason, failure="offline"),
         unsupported=lambda: ProviderResourceResult(
             state="unsupported", reason="resolve is unsupported", failure="provider_error"),
+        failed=lambda: ProviderResourceResult(
+            state="unavailable", reason="provider resolve result is invalid",
+            failure="provider_error"),
         timeout=timeout,
     )
 
@@ -220,11 +239,20 @@ def bounded_dataset_detail(provider: ReadOnlyCatalogProvider, mount: CatalogMoun
 def bounded_ancestors(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
                       resource_id: str, *, timeout: float = 1.0) -> ProviderAncestors:
     """Read one bounded ancestor chain without materializing a provider catalog."""
+
+    def read() -> ProviderAncestors:
+        raw = provider.ancestors(mount, resource_id)
+        if isinstance(raw, ProviderAncestors):
+            raw = raw.model_dump(mode="python")
+        return ProviderAncestors.model_validate(raw)
+
     return _bounded_provider_read(
-        lambda: provider.ancestors(mount, resource_id),
+        read,
         unavailable=lambda reason: ProviderAncestors(state="unavailable", reason=reason),
         unsupported=lambda: ProviderAncestors(
             state="unsupported", reason="ancestors is unsupported"),
+        failed=lambda: ProviderAncestors(
+            state="unavailable", reason="provider ancestor result is invalid"),
         timeout=timeout,
     )
 

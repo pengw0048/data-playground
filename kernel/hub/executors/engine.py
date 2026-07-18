@@ -583,6 +583,10 @@ class BuildEngine:
             uri = cfg.get("uri")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            provider_preview_uri = cfg.get("_input_provider_preview_uri")
+            if (isinstance(uri, str) and uri.startswith("workspace-provider://")
+                    and isinstance(provider_preview_uri, str) and provider_preview_uri):
+                uri = provider_preview_uri
             provider_dispatch_uri = cfg.get("_input_provider_uri")
             if (cfg.get("_input_revision_id") is not None
                     and isinstance(provider_dispatch_uri, str) and provider_dispatch_uri):
