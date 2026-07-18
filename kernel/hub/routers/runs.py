@@ -2077,25 +2077,38 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             raise HTTPException(409, "kernel runs require a saved canvas")
         prebound_local_run_id = metadb.local_run_submission_id(
             uid, operational_canvas, str(submission_id))
-        candidates: list[dict[str, str]] = []
-        try:
-            prior_manifest = metadb.local_run_input_manifest(prebound_local_run_id)
-            manifest = (input_manifest if input_manifest is not None
-                        else prior_manifest if prior_manifest is not None
-                        else _resolve_local_run_manifest(
-                            graph, target_node_id, deps,
-                            materialize_local_files=True,
-                            local_file_candidates=candidates,
-                        ))
-            prebound_local_run_id, _created = metadb.admit_local_run_inputs(
-                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-                target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
-                local_file_candidates=candidates,
-            )
-        finally:
-            from hub.local_run_inputs import finalize_local_file_candidates
-            if candidates:
-                finalize_local_file_candidates(deps.storage, candidates, prebound_local_run_id)
+        prior_manifest = metadb.local_run_input_manifest(prebound_local_run_id)
+        for admission_attempt in range(2):
+            candidates: list[dict[str, str]] = []
+            try:
+                manifest = (input_manifest if input_manifest is not None
+                            else prior_manifest if prior_manifest is not None
+                            else _resolve_local_run_manifest(
+                                graph, target_node_id, deps,
+                                materialize_local_files=True,
+                                local_file_candidates=candidates,
+                            ))
+                prebound_local_run_id, _created = metadb.admit_local_run_inputs(
+                    uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                    target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
+                    local_file_candidates=candidates,
+                )
+                break
+            except metadb.LocalFileInputAdmissionRetry as exc:
+                # A caller-supplied or already-persisted manifest must never be rebound to a different
+                # artifact here. Only a fresh server-resolved ordinary file may be snapshotted again.
+                if (input_manifest is not None or prior_manifest is not None
+                        or admission_attempt > 0):
+                    raise APIError(
+                        409, "ordinary local input changed during exact admission; retry",
+                        code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
+                        retryable=True,
+                    ) from exc
+            finally:
+                from hub.local_run_inputs import finalize_local_file_candidates
+                if candidates:
+                    finalize_local_file_candidates(
+                        deps.storage, candidates, prebound_local_run_id)
         persisted = metadb.local_run_input_manifest(prebound_local_run_id)
         if persisted is None:
             raise RuntimeError("local run admission was not persisted")

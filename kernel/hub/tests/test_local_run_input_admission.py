@@ -199,7 +199,10 @@ def test_ordinary_local_binding_can_be_recreated_after_cleanup(tmp_path):
     assert manifest2[0]["revision_id"] == manifest1[0]["revision_id"]
     assert artifact2 != artifact1
     bound = runs._bind_local_run_manifest(graph2, manifest2, deps2, "source")
-    assert adapter.scan(bound.nodes[0].data["config"]["uri"]).fetchall() == [(3,), (4,)]
+    _write_ordinary_source(source, [99])
+    with db.run_scope():
+        assert BuildEngine(bound, deps2.resolve_adapter, {}, full=True).relation(
+            "source").fetchall() == [(3,), (4,)]
 
 
 def test_readmission_replaces_a_mapping_while_its_old_artifact_is_deleting(tmp_path):
@@ -237,7 +240,79 @@ def test_readmission_replaces_a_mapping_while_its_old_artifact_is_deleting(tmp_p
     assert metadb.local_file_input_revision_artifact(
         manifest2[0]["dataset_id"], manifest2[0]["revision_id"]) == artifact2
     bound = runs._bind_local_run_manifest(graph2, manifest2, deps2, "source")
-    assert adapter.scan(bound.nodes[0].data["config"]["uri"]).fetchall() == [(8,), (9,)]
+    _write_ordinary_source(source, [99])
+    with db.run_scope():
+        assert BuildEngine(bound, deps2.resolve_adapter, {}, full=True).relation(
+            "source").fetchall() == [(8,), (9,)]
+
+
+def test_start_run_retries_when_reclaim_wins_after_ready_snapshot_lookup(tmp_path, monkeypatch):
+    resolve_manifest = runs._resolve_local_run_manifest
+    bind_manifest = runs._bind_local_run_manifest
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    source = tmp_path / "lookup-reclaim-race.parquet"
+    _write_ordinary_source(source, [5, 6])
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)
+    catalog._add(name="lookup-reclaim-race", uri=str(source), strict_probe=True)
+    _graph1, _deps1, manifest1, _run1, artifact1 = _admit_ordinary_source(
+        source=source, canvas_id="lookup-reclaim-first", storage=storage,
+        adapter=adapter, intent="5" * 64)
+    metadb.delete_canvas_cascade("lookup-reclaim-first")
+
+    deps, graph = _local_start_context(monkeypatch)
+    deps.catalog = catalog
+    deps.resolve_adapter = lambda _uri: adapter
+    deps.storage = storage
+    graph = _graph(str(source))
+    monkeypatch.setattr(runs, "_resolve_local_run_manifest", resolve_manifest)
+    monkeypatch.setattr(runs, "_bind_local_run_manifest", bind_manifest)
+    monkeypatch.setattr(
+        "hub.observability.invoke_backend_run",
+        lambda _runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs:
+        RunStatus(run_id=run_id, status="queued"),
+    )
+
+    ready_observed = threading.Event()
+    reclaim_finished = threading.Event()
+    claims: list[tuple[str, str, str]] = []
+    reclaim_errors: list[BaseException] = []
+    lookup = metadb.local_file_input_revision_artifact
+
+    def lookup_with_barrier(dataset_id: str, revision_id: str) -> str | None:
+        artifact = lookup(dataset_id, revision_id)
+        if artifact == artifact1 and not ready_observed.is_set():
+            ready_observed.set()
+            assert reclaim_finished.wait(timeout=5)
+        return artifact
+
+    def reclaim_after_lookup() -> None:
+        try:
+            assert ready_observed.wait(timeout=5)
+            claims.extend(metadb.claim_local_result_reclaims(storage.namespace_id, limit=10))
+        except BaseException as exc:
+            reclaim_errors.append(exc)
+        finally:
+            reclaim_finished.set()
+
+    monkeypatch.setattr(metadb, "local_file_input_revision_artifact", lookup_with_barrier)
+    reclaimer = threading.Thread(target=reclaim_after_lookup)
+    reclaimer.start()
+    status, _owner = runs.start_run(
+        deps, graph, "source", "local", confirmed=True,
+        submission_id=str(uuid.uuid4()))
+    reclaimer.join(timeout=5)
+
+    assert not reclaimer.is_alive()
+    assert reclaim_errors == []
+    old_claim = next(claim for claim in claims if claim[0] == artifact1)
+    admitted = metadb.local_run_input_manifest(status.run_id)
+    assert admitted is not None
+    replacement = lookup(
+        admitted[0]["dataset_id"], admitted[0]["revision_id"])
+    assert replacement is not None and replacement != artifact1
+    storage._delete_claimed_result(old_claim[0], old_claim[1], lock_token=old_claim[2])
+    assert lookup(admitted[0]["dataset_id"], admitted[0]["revision_id"]) == replacement
 
 
 def test_local_file_mutation_during_snapshot_fails_before_admission(tmp_path, monkeypatch):

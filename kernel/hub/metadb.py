@@ -4938,6 +4938,10 @@ def local_run_submission_id(uid: str, canvas_id: str | None, submission_id: str)
 _LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
 
 
+class LocalFileInputAdmissionRetry(RuntimeError):
+    """A reusable local-file snapshot lost its ready lifecycle state before admission."""
+
+
 def _admit_local_file_input_revisions(
         s, manifest: list[dict[str, str]], candidates: list[dict[str, str]]) -> None:
     """Publish candidate snapshot mappings and prove every local-file manifest binding."""
@@ -4973,6 +4977,9 @@ def _admit_local_file_input_revisions(
             {"dataset_id": dataset_id, "revision_id": revision_id},
             with_for_update=True,
         )
+        current_artifact = (s.get(
+            LocalResultArtifact, binding.artifact_uri, with_for_update=True)
+            if binding is not None else None)
         if binding is None and candidate_artifact is not None:
             binding = LocalFileInputRevision(
                 dataset_id=dataset_id,
@@ -4982,15 +4989,21 @@ def _admit_local_file_input_revisions(
             )
             s.add(binding)
             s.flush()
-        elif binding is not None and candidate_artifact is not None:
-            current_artifact = s.get(
-                LocalResultArtifact, binding.artifact_uri, with_for_update=True)
-            if current_artifact is None or current_artifact.state == "deleting":
+        elif binding is not None and (current_artifact is None
+                                      or current_artifact.state != "ready"):
+            if candidate_artifact is not None:
                 binding.artifact_uri = candidate_artifact.uri
                 binding.created_at = _db_now(s)
                 s.flush()
+            else:
+                # Snapshot lookup observed this mapping while it was ready, but reclaim won the
+                # registry before admission could retain it. Roll back and let the caller materialize
+                # one replacement; never publish an owner for a deleting or missing artifact.
+                raise LocalFileInputAdmissionRetry(
+                    "local file input snapshot changed lifecycle state during admission")
         if binding is None:
-            raise RuntimeError("local file input revision is unavailable")
+            raise LocalFileInputAdmissionRetry(
+                "local file input snapshot mapping disappeared during admission")
         registration = s.scalars(select(CatalogEntry).where(
             CatalogEntry.registration_id == dataset_id).limit(1)).first()
         if registration is None:
