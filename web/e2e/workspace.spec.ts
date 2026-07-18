@@ -87,6 +87,38 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
       if (exploreCanvasId) await page.request.delete(`/api/canvas/${exploreCanvasId}`)
     }
   })
+
+  test('keeps an ordinary bundled Parquet Source compact when it has no revision selector @ux-smoke', async ({ page }) => {
+    const catalog = await page.request.get('/api/catalog/tables?q=images')
+    expect(catalog.ok()).toBe(true)
+    const images = (await catalog.json()).items.find((table: { name: string }) => table.name === 'images') as {
+      id: string; name: string; uri: string
+    } | undefined
+    expect(images).toBeTruthy()
+    expect(images!.uri).toMatch(/images\.parquet$/)
+
+    const canvasId = `ordinary-parquet-source-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Ordinary bundled Parquet Source', version: 1,
+      nodes: [{ id: 'source', type: 'source', position: { x: 80, y: 80 }, data: {
+        title: 'Ordinary bundled Parquet source', status: 'latest',
+        config: { uri: images!.uri, tableId: images!.id },
+      } }], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+
+    try {
+      const capabilities = page.waitForResponse((response) =>
+        response.url().includes(`/api/catalog/tables/${encodeURIComponent(images!.id)}/revisions/capabilities`))
+      await page.goto(`/#/canvas/${canvasId}`)
+      const source = page.locator('.react-flow__node', { hasText: 'Ordinary bundled Parquet source' })
+      await expect(source).toBeVisible()
+      expect((await capabilities).status()).toBe(501)
+      await expect(source.getByRole('button', { name: 'Revision selection unavailable' })).toHaveCount(0)
+    } finally {
+      await page.request.delete(`/api/canvas/${canvasId}`)
+    }
+  })
 })
 
 test('browses and opens one exact retained dataset revision without drifting to latest', async ({ page }) => {

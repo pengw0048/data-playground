@@ -148,7 +148,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
   })
 
-  it('does not request history or offer exact pinning when the provider omits exact capability', async () => {
+  it('omits revision controls once the provider proves it has no selector capability', async () => {
     const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
       title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
     } }
@@ -159,8 +159,41 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     render1(source.data)
 
-    expect(await screen.findByRole('button', { name: 'Revision selection unavailable' })).toBeDisabled()
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Revision selection unavailable' })).not.toBeInTheDocument())
     expect(mocks.datasetRevisions).not.toHaveBeenCalled()
+  })
+
+  it('keeps the capability check visible while unresolved, then removes it when no selector is advertised', async () => {
+    let resolveCapabilities!: (value: { selectors: Array<'latest'>; asOfOrdering: null; timezone: null }) => void
+    mocks.datasetRevisionCapabilities.mockImplementationOnce(() => new Promise((resolve) => { resolveCapabilities = resolve }))
+    const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
+      title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, nodes: [source], edges: [] } } as any)
+    render1(source.data)
+
+    expect(await screen.findByRole('button', { name: 'Checking revision capabilities…' })).toBeDisabled()
+    resolveCapabilities({ selectors: ['latest'], asOfOrdering: null, timezone: null })
+    await waitFor(() => expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument())
+  })
+
+  it('keeps an unknown capability failure visible and retries it instead of treating it as unsupported', async () => {
+    mocks.datasetRevisionCapabilities
+      .mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValueOnce({ selectors: ['latest'], asOfOrdering: null, timezone: null })
+    const source = { id: 's1', type: 'source', position: { x: 0, y: 0 }, data: {
+      title: 'orders', status: 'latest', config: { uri: 'mem://orders', tableId: 't1' },
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1, nodes: [source], edges: [] } } as any)
+    render1(source.data)
+
+    expect(await screen.findByText(/Couldn't check revision capabilities: network unavailable/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Revision selection unavailable' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(mocks.datasetRevisionCapabilities).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument())
   })
 
   it('preserves an unavailable pinned selection with a recoverable explanation', async () => {
@@ -176,10 +209,41 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       new Error('dataset_revision_unavailable'),
       { status: 410, code: 'resource_gone', retryable: false },
     ))
+    mocks.datasetRevisionCapabilities.mockResolvedValueOnce({
+      selectors: ['latest'], asOfOrdering: null, timezone: null,
+    })
     render1(data)
 
     expect(await screen.findByText(/revision missing.*missing or compacted.*Selection preserved.*latest was not substituted/i)).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/Last known provider commit.*stale/i)
+    expect(screen.queryByRole('button', { name: 'Revision selection unavailable' })).not.toBeInTheDocument()
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
+  })
+
+  it('preserves an unavailable as-of binding when the current provider has no selector', async () => {
+    const selected = {
+      kind: 'as_of' as const, asOf: '2026-07-15T12:00:00.000Z',
+      resolved: {
+        datasetId: 'dataset-1', revisionId: 'missing', committedAt: '2026-07-15T11:00:00Z',
+        retentionOwner: 'provider', selector: 'as_of' as const,
+      },
+    }
+    const data = { title: 'orders', status: 'stale', config: {
+      uri: '/data/orders.parquet', tableId: 't1', datasetRef: selected,
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [{ ...useStore.getState().catalog[0], uri: '/data/orders.parquet' }],
+      doc: { id: 'c', name: 'test', version: 1, nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
+    mocks.datasetRevisionCapabilities.mockResolvedValueOnce({
+      selectors: ['latest'], asOfOrdering: null, timezone: null,
+    })
+    mocks.datasetRevision.mockRejectedValueOnce(Object.assign(
+      new Error('dataset_revision_unavailable'), { status: 410, code: 'resource_gone', retryable: false },
+    ))
+    render1(data)
+
+    expect(await screen.findByText(/revision missing.*missing or compacted.*Selection preserved/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /revision/i })).not.toBeInTheDocument()
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
 
