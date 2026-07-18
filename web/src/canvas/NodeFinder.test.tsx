@@ -34,7 +34,7 @@ describe('node finder', () => {
     const onPick = vi.fn()
     const onClose = vi.fn()
     render(<NodeFinder specs={[node({ source: 'plugin:quality-pack' })]} onPick={onPick} onClose={onClose} />)
-    const search = screen.getByRole('textbox', { name: 'Search nodes' })
+    const search = screen.getByRole('textbox', { name: 'Search operations' })
     expect(search).toHaveFocus()
     expect(screen.getByRole('option').textContent).toContain('Plugin · quality-pack')
     fireEvent.keyDown(search, { key: 'Enter' })

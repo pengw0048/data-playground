@@ -113,11 +113,11 @@ test.describe('Data Playground canvas', () => {
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
   })
 
-  test('node finder searches, adds with Enter, and keeps category browsing available', async ({ page }) => {
+  test('operation search is explicit about adding and keeps category browsing available', async ({ page }) => {
     await fresh(page)
-    await page.getByRole('button', { name: 'Find node', exact: true }).click()
-    const finder = page.getByRole('dialog', { name: 'Find a node' })
-    const search = finder.getByRole('textbox', { name: 'Search nodes' })
+    await page.getByRole('button', { name: 'Add operation', exact: true }).click()
+    const finder = page.getByRole('dialog', { name: 'Add an operation' })
+    const search = finder.getByRole('textbox', { name: 'Search operations' })
     await expect(search).toBeFocused()
     await search.fill('descriptor_contract')
     await expect(finder.getByRole('option', { name: /descriptor_contract/i }).first()).toContainText('Plugin · dp-descriptor-contract')
@@ -128,6 +128,100 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByRole('button', { name: 'Shape', exact: true }).click()
     await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
+  })
+
+  test('existing-node locator selects and centers an off-screen duplicate without mutating the graph', async ({ page }) => {
+    const canvasId = `node-locator-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Existing node locator', version: 1,
+      nodes: [
+        { id: 'duplicate-near', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'Duplicate', status: 'stale', config: {} } },
+        { id: 'duplicate-off-screen', type: 'filter', position: { x: 8000, y: 6000 }, data: { title: 'Duplicate', status: 'failed', config: {}, disabled: true } },
+      ], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const viewport = page.locator('.react-flow__viewport')
+    const beforeViewport = await viewport.getAttribute('style')
+    const saves: string[] = []
+    await page.route(`**/api/canvas/${canvasId}`, async (route) => {
+      if (route.request().method() === 'PUT') saves.push(route.request().postData() ?? '')
+      await route.continue()
+    })
+
+    await page.getByRole('button', { name: 'Locate existing node', exact: true }).click()
+    const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
+    const search = locator.getByRole('textbox', { name: 'Search existing nodes' })
+    await search.fill('duplicate-off-screen')
+    await expect(locator.getByRole('option', { name: /duplicate-off-screen/i })).toContainText('failed · disabled')
+    await search.press('Enter')
+
+    await expect(locator).toBeHidden()
+    const selected = page.locator('.react-flow__node[data-id="duplicate-off-screen"]')
+    await expect(selected).toBeVisible()
+    await expect(selected).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('Duplicate')
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    await expect.poll(() => viewport.getAttribute('style')).not.toBe(beforeViewport)
+    await expect.poll(async () => {
+      const nodeBox = await selected.boundingBox()
+      const canvasBox = await page.locator('.react-flow').boundingBox()
+      return !!nodeBox && !!canvasBox
+        && nodeBox.x >= canvasBox.x && nodeBox.y >= canvasBox.y
+        && nodeBox.x + nodeBox.width <= canvasBox.x + canvasBox.width
+        && nodeBox.y + nodeBox.height <= canvasBox.y + canvasBox.height
+    }).toBe(true)
+    await page.waitForTimeout(700) // longer than autosave debounce: locating must remain presentation-only
+    expect(saves).toEqual([])
+    const stored = await page.request.get(`/api/canvas/${canvasId}`)
+    expect((await stored.json()).nodes).toEqual([
+      { id: 'duplicate-near', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'Duplicate', status: 'stale', config: {} } },
+      { id: 'duplicate-off-screen', type: 'filter', position: { x: 8000, y: 6000 }, data: { title: 'Duplicate', status: 'failed', config: {}, disabled: true } },
+    ])
+    await page.unroute(`**/api/canvas/${canvasId}`)
+  })
+
+  test('ReactFlow click, shift, and rubber-band selections stay synchronized with Inspector', async ({ page }) => {
+    const canvasId = `selection-sync-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Selection sync', version: 1,
+      nodes: [
+        { id: 'select-a', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'First', status: 'draft', config: {} } },
+        { id: 'select-b', type: 'filter', position: { x: 420, y: 80 }, data: { title: 'Second', status: 'draft', config: {} } },
+      ], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    await expect(page.locator('.react-flow__node')).toHaveCount(2)
+    const first = page.locator('.react-flow__node[data-id="select-a"]')
+    const second = page.locator('.react-flow__node[data-id="select-b"]')
+
+    await first.click()
+    await expect(first).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector').getByRole('textbox', { name: 'Node title' })).toHaveValue('First')
+    await second.click({ modifiers: ['Shift'] })
+    await expect(first).toHaveClass(/selected/)
+    await expect(second).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
+
+    const pane = page.locator('.react-flow__pane')
+    await pane.click({ position: { x: 5, y: 5 } })
+    await expect(first).not.toHaveClass(/selected/)
+    await expect(second).not.toHaveClass(/selected/)
+    const firstBox = await boxOf(first)
+    const secondBox = await boxOf(second)
+    await page.mouse.move(firstBox.x - 12, firstBox.y - 12)
+    await page.mouse.down()
+    await page.mouse.move(firstBox.x + firstBox.width + 12, firstBox.y + firstBox.height + 12, { steps: 5 })
+    await expect(first).toHaveClass(/selected/) // selection has already reconciled through the store mid-drag
+    await expect(second).not.toHaveClass(/selected/)
+    await page.mouse.move(secondBox.x + secondBox.width + 12, secondBox.y + secondBox.height + 12, { steps: 5 })
+    await page.mouse.up()
+    await expect(first).toHaveClass(/selected/)
+    await expect(second).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector')).toContainText('2 nodes selected')
   })
 
   test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {
