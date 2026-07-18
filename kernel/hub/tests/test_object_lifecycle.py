@@ -263,9 +263,14 @@ def test_usage_publication_bumps_popularity_without_touching_updated_at():
             f"run-{uuid.uuid4().hex}", f"event-{uuid.uuid4().hex}", [uri])
         assert metadb.catalog_apply_usage_publication(plan) is True
         with metadb.session() as s:
+            if metadb.engine().dialect.name == "postgresql":
+                s.execute(text("SET LOCAL TIME ZONE 'America/New_York'"))
             entry = s.get(metadb.CatalogEntry, uri)
             assert entry.usage == 1
-            assert entry.updated_at.replace(tzinfo=datetime.timezone.utc) == old
+            updated_at = entry.updated_at
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=datetime.timezone.utc)
+            assert updated_at.astimezone(datetime.timezone.utc) == old
     finally:
         metadb.catalog_delete_prefix("mem://usage-updated-at/")
 
