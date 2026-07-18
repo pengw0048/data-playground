@@ -12,6 +12,7 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager
+from importlib.metadata import version as package_version
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -665,6 +666,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     alembic_head = metadb.expected_schema_head()
     assert metadb.require_schema_at_head() == alembic_head
     release_sha = os.environ.get("DP_GIT_SHA", "").strip() or "drill-fixture"
+    release_version = package_version("data-playground")
 
     canvas_id = f"drill-canvas-{uuid.uuid4().hex}"
     data_dir = workspace / "data"
@@ -870,6 +872,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "owner": owner,
         "alembic_head": alembic_head,
         "release_sha": release_sha,
+        "release_version": release_version,
         "canvas_id": canvas_id,
         "workspace_container_id": workspace_container["id"],
         "workspace_placement_id": workspace_placement["id"],
@@ -1188,6 +1191,7 @@ def _assert_backup_identity(path: Path, info: dict, *, db: str, storage: str) ->
     except Exception as exc:  # noqa: BLE001 — emit bounded restore evidence
         identity = {"read_error": f"{type(exc).__name__}: {exc}"}
     check("version release sha", identity.get("sha"), info["release_sha"])
+    check("version package release", identity.get("version"), info["release_version"])
     check("version database profile", identity.get("db"), db)
     check("version storage profile", identity.get("storage"), storage)
     check("version schema head", identity.get("alembic"), info["alembic_head"])
@@ -1528,7 +1532,8 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
         shutil.copytree(source_outputs, backup / "outputs")
         shutil.copytree(source_ws / "plugins", backup / "plugins")
         (backup / "version.json").write_text(json.dumps({
-            "sha": info["release_sha"], "db": "sqlite", "storage": "local",
+            "version": info["release_version"], "sha": info["release_sha"],
+            "db": "sqlite", "storage": "local",
             "alembic": info["alembic_head"],
         }), encoding="utf-8")
         assert not any("provider-owned" in path.parts for path in backup.rglob("*"))
@@ -1664,7 +1669,8 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
         assert dumped.returncode == 0, dumped.stderr
         shutil.copytree(source_outputs, backup / "outputs")
         (backup / "version.json").write_text(json.dumps({
-            "sha": info["release_sha"], "db": "postgresql", "storage": "s3",
+            "version": info["release_version"], "sha": info["release_sha"],
+            "db": "postgresql", "storage": "s3",
             "alembic": info["alembic_head"], "namespace": info["namespace"],
         }), encoding="utf-8")
         assert not any("provider-owned" in path.parts for path in backup.rglob("*"))

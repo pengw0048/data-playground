@@ -4,6 +4,7 @@ This runbook defines what a Data Playground backup must capture, how to take and
 it for each supported storage profile, and how the repository proves that an isolated
 restore works. Disaster-recovery takeover of an existing object-store namespace is **not**
 implemented and must not be inferred from this procedure — see [RAY.md](RAY.md).
+Run the repository commands below from the checkout root.
 
 ## What to back up
 
@@ -48,7 +49,7 @@ cp -a "$DP_WORKSPACE/dataplay.db" backup/dataplay.db
 cp -a "$DP_WORKSPACE/outputs" backup/outputs
 cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
 # Bind the frozen DB schema to the recorded release identity:
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 import json
 from pathlib import Path
 from hub import metadb
@@ -93,7 +94,7 @@ export DP_WORKSPACE="$RESTORE"
 export DP_DATABASE_URL="sqlite:///$RESTORE/dataplay.db"
 export DP_STORAGE_URL="<mounted original outputs root>"
 # Read the source namespace from the restored DB, then isolate:
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 from hub import metadb
 metadb.init_db()
 expected = metadb.object_storage_namespace()  # only safe before DP_STORAGE_NAMESPACE is set wrongly
@@ -147,7 +148,7 @@ curl -sS http://127.0.0.1:8471/api/version | tee backup/version.json
 # 3. Dump Postgres (custom format keeps restore flexible):
 pg_dump --format=custom --no-owner --no-acl \
   "$DP_DATABASE_URL_LIBPQ" -f backup/dataplay.dump
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 import json
 from pathlib import Path
 from hub import metadb
@@ -164,7 +165,7 @@ PY
 #    Marker path: s3://<bucket>/_dp_control/namespaces/<namespace>.json
 #    With the MinIO harness (endpoint from DP_S3_ENDPOINT):
 mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
-NS="$(python -c 'from hub import metadb; metadb.init_db(); print(metadb.object_storage_namespace())')"
+NS="$(uv run --project kernel python -c 'from hub import metadb; metadb.init_db(); print(metadb.object_storage_namespace())')"
 mc cp --recursive "dp/${DP_S3_BUCKET}/" "backup/objects/"
 # Prefer filtering to the namespace prefix + _dp_control/namespaces/${NS}.json when the bucket is shared.
 
@@ -198,7 +199,7 @@ cp -a backup/version.json "$RESTORE/version.json"
 export DP_DATABASE_URL="postgresql+psycopg://..."   # the restore DB only
 export DP_STORAGE_URL="s3://..."                    # bucket/prefix the clone may use
 unset DP_STORAGE_NAMESPACE                          # until after isolation
-python - <<'PY'
+uv run --project kernel python - <<'PY'
 from hub import metadb
 metadb.init_db()
 expected = metadb.object_storage_namespace()
@@ -277,7 +278,7 @@ its own. The drill keeps one bounded fixture for each currently certified kind:
 
 After loading the database and artifact set, but before enabling normal traffic:
 
-1. Read the restored `version.json`, compare its release, database, and storage fields with the
+1. Read the restored `version.json`, compare its `version`, `sha`, database, and storage fields with the
    selected restore profile, and compare its Alembic revision with
    `metadb.require_schema_at_head()`. For the object-store profile, also compare its namespace with
    the restored `installation_identity` before isolation. The presence of the file alone is not a
