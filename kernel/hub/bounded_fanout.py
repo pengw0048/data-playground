@@ -1,7 +1,7 @@
 """Fenced bounded fan-out plan, units/attempts, slots, and held LocalResult evidence."""
 
 import contextlib, datetime, hashlib, json, os, re, uuid
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, mapped_column
 from hub.metadb import (
     Base, DurableCheckpoint, DurableTask, DurableTaskAttempt, LocalResultArtifact,
@@ -30,6 +30,12 @@ class BoundedFanoutPlan(Base):
     paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint("operation_id = 'identity_projection_v1'", name="ck_bounded_fanout_plan_operation"),
+        CheckConstraint("requested_partitions = 4", name="ck_bounded_fanout_plan_requested_partitions"),
+        CheckConstraint("partition_count >= 1 AND partition_count <= 4", name="ck_bounded_fanout_plan_partition_count"),
+        CheckConstraint("checkpoint_rows >= 0", name="ck_bounded_fanout_plan_rows"),
+    )
 class BoundedFanoutUnit(Base):
     __tablename__ = "bounded_fanout_units"
     unit_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -50,7 +56,10 @@ class BoundedFanoutUnit(Base):
     active_attempt_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    __table_args__ = (UniqueConstraint("parent_task_id", "partition_index", name="uq_bounded_fanout_unit_partition"),)
+    __table_args__ = (
+        UniqueConstraint("parent_task_id", "partition_index", name="uq_bounded_fanout_unit_partition"),
+        CheckConstraint("kind IN ('child','gather')", name="ck_bounded_fanout_unit_kind"),
+    )
 class BoundedFanoutUnitAttempt(Base):
     __tablename__ = "bounded_fanout_unit_attempts"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -75,7 +84,11 @@ class BoundedFanoutSlot(Base):
     holder_attempt_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("bounded_fanout_unit_attempts.id"), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True))
-    __table_args__ = (UniqueConstraint("holder_attempt_id", name="uq_bounded_fanout_slot_holder"),)
+    __table_args__ = (
+        UniqueConstraint("holder_attempt_id", name="uq_bounded_fanout_slot_holder"),
+        CheckConstraint("scope = 'bounded_fanout_v1'", name="ck_bounded_fanout_slot_scope"),
+        CheckConstraint("slot_number >= 0 AND slot_number <= 3", name="ck_bounded_fanout_slot_number"),
+    )
 def partition_ranges(row_count: int) -> list[tuple[int, int]]:
     if row_count < 0:
         raise ValueError("checkpoint rows must be non-negative")

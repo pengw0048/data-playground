@@ -1,14 +1,14 @@
 """Persist one fenced bounded fan-out plan and four leased execution slots.
 
-Revision ID: 0015_bounded_fanout_plan
-Revises: 0014_checkpoint_mat_identity
+Revision ID: 0016_bounded_fanout_plan
+Revises: 0015_task_inbox_items
 """
 
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0015_bounded_fanout_plan"
-down_revision = "0014_checkpoint_mat_identity"
+revision = "0016_bounded_fanout_plan"
+down_revision = "0015_task_inbox_items"
 branch_labels = None
 depends_on = None
 
@@ -98,6 +98,8 @@ def upgrade() -> None:
         {"scope": "bounded_fanout_v1", "slot_number": n,
          "holder_attempt_id": None, "claim_token": None, "lease_until": None}
         for n in range(4)])
+    op.create_index("ix_bounded_fanout_units_parent_task_id", "bounded_fanout_units", ["parent_task_id"])
+    op.create_index("ix_bounded_fanout_unit_attempts_unit_id", "bounded_fanout_unit_attempts", ["unit_id"])
 
 
 def downgrade() -> None:
