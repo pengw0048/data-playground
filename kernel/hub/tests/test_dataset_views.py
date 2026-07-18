@@ -75,6 +75,29 @@ def _request(revision: dict, submission_id: str, **changes) -> dict:
     return request
 
 
+def _workspace_item(client: TestClient, container_id: str, resource_id: str) -> dict:
+    """Find one resource without assuming a shared Workspace fits on its first page."""
+    cursor = None
+    seen: set[str] = set()
+    for _ in range(100):
+        params = {"limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = client.get(f"/api/workspace/containers/{container_id}", params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        found = next((item for item in page["items"] if item["id"] == resource_id), None)
+        if found is not None:
+            return found
+        if not page["hasMore"]:
+            break
+        next_cursor = page["nextCursor"]
+        assert next_cursor and next_cursor not in seen
+        seen.add(next_cursor)
+        cursor = next_cursor
+    raise AssertionError(f"Workspace resource {resource_id!r} was not found")
+
+
 def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_path):
     lance = pytest.importorskip("lance")
     with TestClient(app) as client:
@@ -124,9 +147,11 @@ def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_pat
         assert mismatch.status_code == 409
         assert mismatch.json()["code"] == "conflict"
 
-        browsed = client.get("/api/workspace/containers/workspace-local-root")
-        assert browsed.status_code == 200, browsed.text
-        workspace_item = next(item for item in browsed.json()["items"] if item["id"] == f"dataset_view:{view_id}")
+        workspace_item = _workspace_item(
+            client,
+            definition["placement"]["containerId"],
+            f"dataset_view:{view_id}",
+        )
         assert workspace_item["name"] == "Useful rows"
         resolved = client.get(f"/api/workspace/resources/dataset_view:{view_id}")
         assert resolved.status_code == 200
@@ -158,8 +183,8 @@ def test_exact_view_replay_workspace_owner_isolation_and_terminal_delete(tmp_pat
         assert client.post(f"/api/dataset-views/{view_id}/preview").status_code == 410
         assert client.post("/api/dataset-views", json=request).status_code == 410
         assert client.delete(f"/api/dataset-views/{view_id}").json()["deleted"] is False
-        after = client.get("/api/workspace/containers/workspace-local-root").json()["items"]
-        assert all(item["id"] != f"dataset_view:{view_id}" for item in after)
+        assert client.get(
+            f"/api/workspace/resources/dataset_view:{view_id}").status_code == 404
 
 
 def test_reservoir_is_deterministic_and_invalid_draft_does_not_claim_submission(tmp_path):
