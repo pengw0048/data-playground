@@ -33,7 +33,7 @@ function relTime(iso: string): string {
   return `${Math.round(s / 604800)}w ago`
 }
 
-function mergeMonotonic(current: InboxItemDto[], incoming: InboxItemDto[]): InboxItemDto[] {
+export function mergeMonotonic(current: InboxItemDto[], incoming: InboxItemDto[]): InboxItemDto[] {
   const byId = new Map(current.map((item) => [item.id, item]))
   for (const item of incoming) {
     const prior = byId.get(item.id)
@@ -47,9 +47,9 @@ function mergeMonotonic(current: InboxItemDto[], incoming: InboxItemDto[]): Inbo
       readAt: prior.readAt ?? item.readAt ?? null,
     })
   }
-  const order = incoming.map((item) => item.id)
+  const order = current.map((item) => item.id)
   const seen = new Set(order)
-  for (const id of current.map((item) => item.id)) {
+  for (const id of incoming.map((item) => item.id)) {
     if (!seen.has(id)) order.push(id)
   }
   return order.map((id) => byId.get(id)!).filter(Boolean)

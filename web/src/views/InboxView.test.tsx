@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { InboxView } from './InboxView'
+import { InboxView, mergeMonotonic } from './InboxView'
 import { useStore } from '../store/graph'
 
 const mocks = vi.hoisted(() => ({
@@ -86,5 +86,16 @@ describe('InboxView', () => {
     await waitFor(() => expect(mocks.inboxList).toHaveBeenCalledTimes(2))
     expect(screen.queryByText('Unread', { selector: 'span' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull()
+  })
+})
+
+describe('mergeMonotonic (load-more ordering)', () => {
+  const mk = (id: string) => item({ id }) as never
+  const ids = (rows: unknown[]) => rows.map((row) => (row as { id: string }).id)
+  it('appends an older page after the newer one, preserving terminal_at DESC order', () => {
+    expect(ids(mergeMonotonic([mk('b9'), mk('b8')], [mk('b7'), mk('b6')]))).toEqual(['b9', 'b8', 'b7', 'b6'])
+  })
+  it('dedupes an overlapping boundary item without reordering', () => {
+    expect(ids(mergeMonotonic([mk('b9'), mk('b8')], [mk('b8'), mk('b7')]))).toEqual(['b9', 'b8', 'b7'])
   })
 })
