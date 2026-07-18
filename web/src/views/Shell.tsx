@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useStore, type DpView } from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
@@ -8,6 +8,7 @@ import { SettingsModal } from '../panels/SettingsModal'
 import { ERDiagram } from './ERDiagram'
 import { WorkspaceExplorer } from './WorkspaceExplorer'
 import { JobsView } from './JobsView'
+import { InboxView } from './InboxView'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
@@ -20,6 +21,7 @@ import { useCollapsibleRegion } from '../layoutPreferences'
 export function Shell() {
   const view = useStore((s) => s.view)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [unreadCount, setUnreadCount] = useState(0)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
@@ -29,12 +31,19 @@ export function Shell() {
     setSettingsOpen(false)
     requestAnimationFrame(() => settingsTrigger.current?.focus())
   }
+  const refreshUnread = () => {
+    void api.inboxUnreadCount()
+      .then((result) => setUnreadCount(result.count))
+      .catch(() => { /* badge stays at last known truthful count */ })
+  }
+  useEffect(() => { refreshUnread() }, [view])
   return (
     <div style={{ position: 'absolute', inset: 0, display: 'flex', background: color.canvas ?? '#fbfbfc' }}>
-      <Rail onSettings={openSettings} />
+      <Rail onSettings={openSettings} unreadCount={unreadCount} />
       <main style={{ flex: 1, minWidth: 0, overflowY: 'auto' }}>
         {view === 'workspace' && <WorkspaceExplorer />}
         {view === 'jobs' && <JobsView />}
+        {view === 'inbox' && <InboxView onUnreadChange={refreshUnread} />}
         {view === 'transforms' && <TransformsContent />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
@@ -43,23 +52,38 @@ export function Shell() {
   )
 }
 
-function Rail({ onSettings }: { onSettings: (trigger: HTMLElement) => void }) {
+function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) => void; unreadCount: number }) {
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
+  const setInboxQuery = useStore((s) => s.setInboxQuery)
   const currentUser = useStore((s) => s.currentUser)
   const authEnabled = useStore((s) => s.authEnabled)
   const [collapsed, setCollapsed] = useCollapsibleRegion('navigation')
   const [pwOpen, setPwOpen] = useState(false)
   const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
-  const item = (v: DpView, icon: IconName, label: string) => (
-    <Button variant="ghost" onClick={() => setView(v)} data-testid={`rail-${v}`}
+  const item = (v: DpView, icon: IconName, label: string, badge?: number) => (
+    <Button variant="ghost" onClick={() => (v === 'inbox' ? setInboxQuery('') : setView(v))} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}
-      aria-label={collapsed ? label : undefined}
+      aria-label={collapsed ? (badge ? `${label}, ${badge} unread` : label) : undefined}
       className={cn('h-auto w-full gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
         collapsed ? 'justify-center' : 'justify-start',
         view === v && 'bg-accent text-accent-foreground')}>
-      <Icon name={icon} size={15} /> <span className={collapsed ? 'sr-only' : undefined}>{label}</span>
+      <span className="relative inline-flex">
+        <Icon name={icon} size={15} />
+        {!!badge && badge > 0 && (
+          <span
+            data-testid="inbox-unread-badge"
+            className="absolute -right-1.5 -top-1.5 grid min-w-[14px] place-items-center rounded-sm bg-foreground px-0.5 text-[9px] font-bold leading-none text-background"
+          >
+            {badge > 99 ? '99+' : badge}
+          </span>
+        )}
+      </span>
+      <span className={collapsed ? 'sr-only' : undefined}>{label}</span>
+      {!collapsed && !!badge && badge > 0 && (
+        <span className="ml-auto text-[11px] font-semibold text-foreground">{badge > 99 ? '99+' : badge}</span>
+      )}
     </Button>
   )
 
@@ -80,6 +104,7 @@ function Rail({ onSettings }: { onSettings: (trigger: HTMLElement) => void }) {
       <div className="flex flex-col gap-0.5">
         {item('workspace', 'grid', 'Workspace')}
         {item('jobs', 'clock', 'Jobs')}
+        {item('inbox', 'note', 'Inbox', unreadCount)}
         {item('transforms', 'fx', 'Transforms')}
         {/* Relationships is reached from a table's detail drawer (Tables → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}

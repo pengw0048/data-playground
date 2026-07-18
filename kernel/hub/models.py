@@ -1340,6 +1340,31 @@ class DurableExternalWaitView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableTaskInboxItemView(Wire):
+    """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
+
+    id: str
+    task_id: str
+    canvas_id: str
+    canvas_name: str | None = None
+    task_kind: Literal["managed_local_write", "external_wait"]
+    outcome: Literal["completed", "failed", "cancelled"]
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+    terminal_at: datetime.datetime
+    read_at: datetime.datetime | None = None
+    job_available: bool
+
+
+class DurableTaskInboxPage(Wire):
+    items: list[DurableTaskInboxItemView]
+    next_cursor: str | None = None
+    has_more: bool
+
+
+class DurableTaskInboxUnreadCount(Wire):
+    count: int = Field(ge=0)
+
+
 class WorkspaceRunRecord(Wire):
     """One visible run in the workspace-wide, read-only Jobs projection."""
 

@@ -3485,13 +3485,17 @@ def _canonical_inbox_diagnostic(
     return _INBOX_DIAGNOSTIC_FALLBACK.get(task_kind)
 
 
-def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
-    def _stamp(value: datetime.datetime | None) -> datetime.datetime | None:
-        if value is None:
-            return None
-        return (value.replace(tzinfo=datetime.timezone.utc)
-                if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+_INBOX_CURSOR_VERSION = 1
 
+
+def _inbox_stamp(value: datetime.datetime | None) -> datetime.datetime | None:
+    if value is None:
+        return None
+    return (value.replace(tzinfo=datetime.timezone.utc)
+            if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+
+
+def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
     return {
         "id": item.id,
         "owner_id": item.owner_id,
@@ -3501,9 +3505,78 @@ def _durable_task_inbox_doc(item: DurableTaskInboxItem) -> dict:
         "task_kind": item.task_kind,
         "outcome": item.outcome,
         "diagnostic_code": item.diagnostic_code,
-        "terminal_at": _stamp(item.terminal_at),
-        "created_at": _stamp(item.created_at),
-        "read_at": _stamp(item.read_at),
+        "terminal_at": _inbox_stamp(item.terminal_at),
+        "created_at": _inbox_stamp(item.created_at),
+        "read_at": _inbox_stamp(item.read_at),
+    }
+
+
+def _inbox_cursor_encode(filter_name: str, terminal_at: datetime.datetime, item_id: str) -> str:
+    stamp = _inbox_stamp(terminal_at)
+    assert stamp is not None
+    raw = json.dumps(
+        {"v": _INBOX_CURSOR_VERSION, "f": filter_name, "t": stamp.isoformat(), "i": item_id},
+        separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _inbox_cursor_decode(
+        cursor: str | None, expected_filter: str) -> tuple[datetime.datetime, str] | None:
+    if cursor is None:
+        return None
+    if len(cursor) > 4096:
+        raise ValueError("invalid Inbox cursor")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("invalid Inbox cursor")
+        if value.get("v") != _INBOX_CURSOR_VERSION:
+            raise ValueError("invalid Inbox cursor")
+        if value.get("f") != expected_filter:
+            raise ValueError("invalid Inbox cursor")
+        terminal_at = datetime.datetime.fromisoformat(value["t"])
+        if terminal_at.tzinfo is None:
+            terminal_at = terminal_at.replace(tzinfo=datetime.timezone.utc)
+        item_id = value["i"]
+    except (ValueError, TypeError, KeyError, binascii.Error, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Inbox cursor") from exc
+    if (not isinstance(item_id, str) or not item_id
+            or terminal_at.tzinfo is None or terminal_at.utcoffset() is None):
+        raise ValueError("invalid Inbox cursor")
+    return terminal_at, item_id
+
+
+def _inbox_authorized_canvas_names(s, uid: str, canvas_ids: set[str]) -> dict[str, str]:
+    """Map currently authorized canvas ids to display names for the Inbox viewer."""
+    if not canvas_ids:
+        return {}
+    rows = list(s.execute(select(Canvas, CanvasShare.role).outerjoin(
+        CanvasShare,
+        and_(CanvasShare.canvas_id == Canvas.id, CanvasShare.user_id == uid),
+    ).where(Canvas.id.in_(canvas_ids))).all())
+    authorized: dict[str, str] = {}
+    for canvas, share_role in rows:
+        if _effective_canvas_role(canvas, uid, share_role) is not None:
+            authorized[canvas.id] = canvas.name
+    return authorized
+
+
+def _inbox_public_doc(
+        item: DurableTaskInboxItem, *, authorized_names: dict[str, str]) -> dict:
+    """Owner-scoped Inbox wire shape for #417 — no raw docs, tokens, or route URLs."""
+    canvas_name = authorized_names.get(item.canvas_id)
+    return {
+        "id": item.id,
+        "task_id": item.task_id,
+        "canvas_id": item.canvas_id,
+        "canvas_name": canvas_name,
+        "task_kind": item.task_kind,
+        "outcome": item.outcome,
+        "diagnostic_code": item.diagnostic_code,
+        "terminal_at": _inbox_stamp(item.terminal_at),
+        "read_at": _inbox_stamp(item.read_at),
+        "job_available": canvas_name is not None,
     }
 
 
@@ -3560,30 +3633,36 @@ def _emit_durable_task_inbox_item(
 
 
 def list_durable_task_inbox_items(
-        owner_id: str, *, limit: int = 50, before_created_at: datetime.datetime | None = None,
-        before_id: str | None = None) -> dict:
-    """Bounded owner-scoped Inbox page for #417 reuse. Every query includes the owner predicate."""
+        owner_id: str, *, limit: int = 50, cursor: str | None = None,
+        unread_only: bool = False) -> dict:
+    """Bounded owner-scoped Inbox page. Owner predicate and keyset live in one SQL query."""
     owner_id = str(owner_id)
     limit = max(1, min(int(limit), 200))
+    filter_name = "unread" if unread_only else "all"
+    decoded = _inbox_cursor_decode(cursor, filter_name)
     with session() as s:
         predicates = [DurableTaskInboxItem.owner_id == owner_id]
-        if before_created_at is not None and before_id is not None:
-            stamp = before_created_at
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+        if unread_only:
+            predicates.append(DurableTaskInboxItem.read_at.is_(None))
+        if decoded is not None:
+            stamp, before_id = decoded
             predicates.append(or_(
-                DurableTaskInboxItem.created_at < stamp,
-                and_(DurableTaskInboxItem.created_at == stamp,
+                DurableTaskInboxItem.terminal_at < stamp,
+                and_(DurableTaskInboxItem.terminal_at == stamp,
                      DurableTaskInboxItem.id < str(before_id)),
             ))
         rows = list(s.scalars(select(DurableTaskInboxItem).where(*predicates).order_by(
-            DurableTaskInboxItem.created_at.desc(), DurableTaskInboxItem.id.desc(),
+            DurableTaskInboxItem.terminal_at.desc(), DurableTaskInboxItem.id.desc(),
         ).limit(limit + 1)))
         page = rows[:limit]
-        return {
-            "items": [_durable_task_inbox_doc(row) for row in page],
-            "has_more": len(rows) > limit,
-        }
+        authorized = _inbox_authorized_canvas_names(
+            s, owner_id, {row.canvas_id for row in page})
+        items = [_inbox_public_doc(row, authorized_names=authorized) for row in page]
+        has_more = len(rows) > limit
+        next_cursor = (
+            _inbox_cursor_encode(filter_name, page[-1].terminal_at, page[-1].id)
+            if has_more and page else None)
+        return {"items": items, "has_more": has_more, "next_cursor": next_cursor}
 
 
 def count_durable_task_inbox_unread(owner_id: str) -> int:
@@ -3603,7 +3682,8 @@ def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | Non
             return None
         if item.read_at is None:
             item.read_at = _durable_task_db_now(s)
-        return _durable_task_inbox_doc(item)
+        authorized = _inbox_authorized_canvas_names(s, owner_id, {item.canvas_id})
+        return _inbox_public_doc(item, authorized_names=authorized)
 
 
 def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
@@ -3611,7 +3691,8 @@ def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
         item = s.get(DurableTaskInboxItem, str(item_id))
         if item is None or item.owner_id != str(owner_id):
             return None
-        return _durable_task_inbox_doc(item)
+        authorized = _inbox_authorized_canvas_names(s, owner_id, {item.canvas_id})
+        return _inbox_public_doc(item, authorized_names=authorized)
 
 
 def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> str:

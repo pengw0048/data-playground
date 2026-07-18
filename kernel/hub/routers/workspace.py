@@ -23,6 +23,9 @@ from hub import auth, auth_admission, metadb, workspace_providers
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
 from hub.models import (
     CredUpsert,
+    DurableTaskInboxItemView,
+    DurableTaskInboxPage,
+    DurableTaskInboxUnreadCount,
     RunHistoryRecord,
     RunStatus,
     WorkspaceRunPage,
@@ -754,6 +757,37 @@ def workspace_jobs(
         return WorkspaceRunPage.model_validate(page)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/inbox", response_model=DurableTaskInboxPage)
+def workspace_inbox(
+        limit: int = Query(default=50, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=4096),
+        filter: Literal["unread", "all"] = Query(default="all"),
+        uid: str = Depends(current_user)) -> DurableTaskInboxPage:
+    """Owner-scoped durable Task outcomes. Shared-canvas peers never see another owner's items."""
+    try:
+        page = metadb.list_durable_task_inbox_items(
+            uid, limit=limit, cursor=cursor, unread_only=(filter == "unread"))
+        return DurableTaskInboxPage.model_validate(page)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/inbox/unread-count", response_model=DurableTaskInboxUnreadCount)
+def workspace_inbox_unread_count(
+        uid: str = Depends(current_user)) -> DurableTaskInboxUnreadCount:
+    return DurableTaskInboxUnreadCount(count=metadb.count_durable_task_inbox_unread(uid))
+
+
+@router.post("/inbox/{item_id}/read", response_model=DurableTaskInboxItemView)
+def workspace_inbox_mark_read(
+        item_id: str, uid: str = Depends(current_user)) -> DurableTaskInboxItemView:
+    """Idempotent mark-one-read. Missing or cross-owner items are unavailable."""
+    item = metadb.mark_durable_task_inbox_item_read(uid, item_id)
+    if item is None:
+        raise HTTPException(404, "not found")
+    return DurableTaskInboxItemView.model_validate(item)
 
 
 @router.get("/canvas/{canvas_id}/active-runs", response_model=list[RunStatus])

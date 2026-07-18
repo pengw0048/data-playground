@@ -108,6 +108,16 @@ def _inbox_for(owner_id: str, task_id: str) -> list[dict]:
     return [item for item in page["items"] if item["task_id"] == task_id]
 
 
+def _inbox_attempt_id(owner_id: str, task_id: str) -> str:
+    with metadb.session() as session:
+        row = session.scalar(metadb.select(metadb.DurableTaskInboxItem).where(
+            metadb.DurableTaskInboxItem.owner_id == owner_id,
+            metadb.DurableTaskInboxItem.task_id == task_id,
+        ).limit(1))
+        assert row is not None
+        return row.task_attempt_id
+
+
 def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     uid, canvas_id = _user_canvas("mlw")
 
@@ -123,7 +133,7 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     done_items = _inbox_for(uid, done_task["id"])
     assert len(done_items) == 1
     assert done_items[0]["outcome"] == "completed"
-    assert done_items[0]["task_attempt_id"] == attempt["id"]
+    assert _inbox_attempt_id(uid, done_task["id"]) == attempt["id"]
     assert done_items[0]["diagnostic_code"] is None
 
     failed_task = _submit_local(uid, canvas_id)
@@ -181,7 +191,7 @@ def test_superseded_attempt_replay_does_not_duplicate_completed_inbox():
     assert metadb.finish_durable_task_attempt(task["id"], first["id"], "owner-1", done) is True
     items = _inbox_for(uid, task["id"])
     assert len(items) == 1
-    assert items[0]["task_attempt_id"] == second["id"]
+    assert _inbox_attempt_id(uid, task["id"]) == second["id"]
     assert items[0]["outcome"] == "completed"
 
 
@@ -201,7 +211,7 @@ def test_lease_exhaustion_emits_failed_and_retry_keeps_prior_item():
     assert len(items) == 1
     assert items[0]["outcome"] == "failed"
     assert items[0]["diagnostic_code"] == "durable_task_attempts_exhausted"
-    assert items[0]["task_attempt_id"] == attempt["id"]
+    assert _inbox_attempt_id(uid, task["id"]) == attempt["id"]
 
     # Explicit retry after a non-exhausted failure keeps prior history immutable.
     task2 = _submit_local(uid, canvas_id)
@@ -218,10 +228,18 @@ def test_lease_exhaustion_emits_failed_and_retry_keeps_prior_item():
         task2["id"], second["id"], "owner-2", _done_status(task2["id"], key))
     items = _inbox_for(uid, task2["id"])
     assert len(items) == 2
-    by_attempt = {item["task_attempt_id"]: item for item in items}
-    assert by_attempt[first["id"]]["outcome"] == "failed"
-    assert by_attempt[second["id"]]["outcome"] == "completed"
-    assert by_attempt[first["id"]]["read_at"] is None
+    assert {item["outcome"] for item in items} == {"failed", "completed"}
+    assert all(item["read_at"] is None for item in items)
+    with metadb.session() as session:
+        attempt_outcomes = {
+            row.task_attempt_id: row.outcome
+            for row in session.scalars(metadb.select(metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.owner_id == uid,
+                metadb.DurableTaskInboxItem.task_id == task2["id"],
+            ))
+        }
+    assert attempt_outcomes[first["id"]] == "failed"
+    assert attempt_outcomes[second["id"]] == "completed"
     assert retried["attempts"][0]["id"] == first["id"]
 
 
@@ -298,7 +316,7 @@ def test_external_wait_terminals_and_corrupt_recovery_emit():
     assert len(items) == 1
     assert items[0]["outcome"] == "failed"
     assert items[0]["diagnostic_code"] == "external_wait_evidence_invalid"
-    assert items[0]["task_attempt_id"] == recovered["attempts"][0]["id"]
+    assert _inbox_attempt_id(uid, missing_task["id"]) == recovered["attempts"][0]["id"]
 
 
 def test_owner_list_count_mark_read_and_cross_owner_isolation():
@@ -318,6 +336,8 @@ def test_owner_list_count_mark_read_and_cross_owner_isolation():
     page_b = metadb.list_durable_task_inbox_items(owner_b)
     assert {item["task_id"] for item in page_a["items"]} == {task_a["id"]}
     assert {item["task_id"] for item in page_b["items"]} == {task_b["id"]}
+    assert page_a["items"][0]["job_available"] is True
+    assert page_a["items"][0]["canvas_name"] == "owner-a"
     assert metadb.count_durable_task_inbox_unread(owner_a) == 1
     item_a = page_a["items"][0]
     assert metadb.durable_task_inbox_item(owner_b, item_a["id"]) is None
@@ -327,6 +347,63 @@ def test_owner_list_count_mark_read_and_cross_owner_isolation():
     assert first is not None and first["read_at"] is not None
     assert second["read_at"] == first["read_at"]
     assert metadb.count_durable_task_inbox_unread(owner_a) == 0
+    unread = metadb.list_durable_task_inbox_items(owner_a, unread_only=True)
+    assert unread["items"] == []
+
+
+def test_inbox_keyset_cursor_filter_and_role_revocation():
+    owner, canvas_id = _user_canvas("cursor-owner")
+    peer = f"cursor-peer-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=peer, name="shared editor"))
+    metadb.share_canvas(canvas_id, peer, "editor")
+
+    task_ids = []
+    for index in range(3):
+        task = _submit_local(peer, canvas_id)
+        claimed = metadb.claim_durable_task(task["id"], f"peer-{index}")
+        attempt = claimed["attempts"][-1]
+        failed = RunStatus(
+            run_id=task["id"], status="failed", target_node_id="write", error="x")
+        assert metadb.finish_durable_task_attempt(
+            task["id"], attempt["id"], f"peer-{index}", failed.model_dump())
+        task_ids.append(task["id"])
+    base = datetime.datetime(2026, 7, 17, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    with metadb.session() as session:
+        for index, task_id in enumerate(task_ids):
+            item = session.scalar(metadb.select(metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.task_id == task_id))
+            item.terminal_at = base + datetime.timedelta(seconds=index)
+
+    page = metadb.list_durable_task_inbox_items(peer, limit=2)
+    assert len(page["items"]) == 2 and page["has_more"] is True and page["next_cursor"]
+    assert [item["task_id"] for item in page["items"]] == [task_ids[2], task_ids[1]]
+    cont = metadb.list_durable_task_inbox_items(peer, limit=2, cursor=page["next_cursor"])
+    assert [item["task_id"] for item in cont["items"]] == [task_ids[0]]
+    assert cont["has_more"] is False
+
+    mismatched = None
+    try:
+        metadb.list_durable_task_inbox_items(
+            peer, cursor=page["next_cursor"], unread_only=True)
+    except ValueError as exc:
+        mismatched = str(exc)
+    assert mismatched == "invalid Inbox cursor"
+    try:
+        metadb.list_durable_task_inbox_items(peer, cursor="not-a-cursor")
+        raise AssertionError("expected invalid cursor")
+    except ValueError as exc:
+        assert str(exc) == "invalid Inbox cursor"
+
+    before = metadb.list_durable_task_inbox_items(peer)["items"][0]
+    assert before["job_available"] is True and before["canvas_name"] == "cursor-owner"
+    metadb.unshare_canvas(canvas_id, peer)
+    after = metadb.list_durable_task_inbox_items(peer)["items"][0]
+    assert after["job_available"] is False
+    assert after["canvas_name"] is None
+    assert after["task_id"] == before["task_id"]
+    # Shared-canvas owner never sees the peer's personal Inbox.
+    assert metadb.list_durable_task_inbox_items(owner)["items"] == []
 
 
 def test_canvas_delete_cascades_inbox_items():
