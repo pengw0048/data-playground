@@ -4,7 +4,7 @@ import type {
   CanvasDoc, CanvasEdge, CanvasNode, NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
-  CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
+  CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
   RunInputManifestItem, RunStatus, SampleResult, WriteAdmission,
 } from '../types/api'
 import { getSpec, nodeOutputs } from '../nodes/registry'
@@ -786,6 +786,7 @@ interface Store {
   accessDenied: boolean  // server rejected the save with 401/403 (session/access changed) — NOT offline
   catalog: CatalogTable[]
   processors: ProcessorDescriptor[]
+  canvasTransformReferences: CanvasTransformReference[]
   specsVersion: number
   schemas: SchemaMap               // per-node, per-output-port columns; null port entry = untyped
   sizes: Record<string, { rows: number | null; confidence: string }>  // per-node size estimate (card hint)
@@ -903,6 +904,14 @@ interface Store {
   setJobsQuery: (query: string) => void
   inboxQuery: string
   setInboxQuery: (query: string) => void
+  transformResourceId: string | null
+  transformVersion: string | null
+  transformUpgradeCanvasId: string | null
+  transformUpgradeNodeId: string | null
+  transformLibraryQuery: string
+  setTransformResource: (resourceId: string | null, version?: string | null,
+    upgrade?: { canvasId: string; nodeId: string } | null) => void
+  setTransformLibraryQuery: (query: string) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -1152,7 +1161,10 @@ export const useStore = create<Store>((set, get) => ({
   view: 'canvas',
   setView: (view) => {
     if (get().view !== view) _fileNavigationGeneration += 1
-    set({ view })
+    set(view === 'transforms' && get().view !== 'transforms'
+      ? { view, transformResourceId: null, transformVersion: null,
+          transformUpgradeCanvasId: null, transformUpgradeNodeId: null }
+      : { view })
   },
   erFocusUri: null,
   openRelationships: (uri) => {
@@ -1193,6 +1205,24 @@ export const useStore = create<Store>((set, get) => ({
     if (get().view !== 'inbox') _fileNavigationGeneration += 1
     set({ inboxQuery: query, view: 'inbox' })
   },
+  transformResourceId: null,
+  transformVersion: null,
+  transformUpgradeCanvasId: null,
+  transformUpgradeNodeId: null,
+  transformLibraryQuery: '',
+  setTransformResource: (transformResourceId, transformVersion = null, upgrade = null) => {
+    if (get().view !== 'transforms') _fileNavigationGeneration += 1
+    set({
+      transformResourceId, transformVersion,
+      transformUpgradeCanvasId: upgrade?.canvasId ?? null,
+      transformUpgradeNodeId: upgrade?.nodeId ?? null,
+      view: 'transforms',
+    })
+  },
+  setTransformLibraryQuery: (transformLibraryQuery) => {
+    if (get().view !== 'transforms') _fileNavigationGeneration += 1
+    set({ transformLibraryQuery, view: 'transforms' })
+  },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
       get().pushToast('This canvas is view-only', 'info')
@@ -1226,6 +1256,7 @@ export const useStore = create<Store>((set, get) => ({
   accessDenied: false,
   catalog: [],
   processors: [],
+  canvasTransformReferences: [],
   specsVersion: 0,
   schemas: {},
   sizes: {},
@@ -2348,6 +2379,14 @@ export const useStore = create<Store>((set, get) => ({
         }
         else if (route.view === 'jobs') get().setJobsQuery(route.jobsQuery ?? '')
         else if (route.view === 'inbox') get().setInboxQuery(route.inboxQuery ?? '')
+        else if (route.view === 'transforms') {
+          get().setTransformLibraryQuery(route.transformQuery ?? '')
+          get().setTransformResource(
+            route.transformId ?? null, route.transformVersion ?? null,
+            route.transformCanvasId && route.transformNodeId
+              ? { canvasId: route.transformCanvasId, nodeId: route.transformNodeId } : null,
+          )
+        }
         else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {
@@ -2425,6 +2464,13 @@ export const useStore = create<Store>((set, get) => ({
       const selectedId = get().doc.id === id ? get().selectedId : null
       const inspectConflict = options?.serverCopy === true && localDraft?.syncState === 'conflict'
       get().loadDoc(doc, inspectConflict ? 'viewer' : role)
+      try {
+        const references = await api.canvasTransformReferences(id)
+        if (!isCurrent()) return false
+        set({ canvasTransformReferences: references })
+      } catch {
+        if (isCurrent()) set({ canvasTransformReferences: [] })
+      }
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
@@ -2986,6 +3032,7 @@ export const useStore = create<Store>((set, get) => ({
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
         previews: {}, previewBindings: readPreviewBindings(get().currentUser?.id, d), runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+        canvasTransformReferences: [],
       })
     } finally {
       _settlingLoadedDoc = false

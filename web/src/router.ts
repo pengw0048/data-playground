@@ -3,7 +3,7 @@
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
 
-export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string }
+export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string }
 
 const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match'] as const
 
@@ -37,13 +37,29 @@ export function parseHash(): Route {
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
   if (seg === 'jobs') return { view: 'jobs', jobsQuery: params.toString() }
   if (seg === 'inbox') return { view: 'inbox', inboxQuery: params.toString() }
-  if (seg === 'transforms' || seg === 'relationships') return { view: seg }
+  if (seg === 'transforms') {
+    const transformVersion = params.get('version') || undefined
+    const transformCanvasId = params.get('canvas') || undefined
+    const transformNodeId = params.get('node') || undefined
+    params.delete('version')
+    params.delete('canvas')
+    params.delete('node')
+    return {
+      view: 'transforms',
+      ...(id ? { transformId: decodeURIComponent(id) } : {}),
+      ...(transformVersion ? { transformVersion } : {}),
+      ...(transformCanvasId && transformNodeId ? { transformCanvasId, transformNodeId } : {}),
+      ...(params.size ? { transformQuery: params.toString() } : {}),
+    }
+  }
+  if (seg === 'relationships') return { view: seg }
   // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id).
   return { view: 'canvas' }
 }
 
-export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string): string {
-  const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}` : `#/${view}`
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string, transformId?: string, transformVersion?: string, transformQuery?: string, transformCanvasId?: string, transformNodeId?: string): string {
+  const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}`
+    : view === 'transforms' && transformId ? `#/transforms/${encodeURIComponent(transformId)}` : `#/${view}`
     + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
   const workspaceParams = new URLSearchParams()
   if (view === 'workspace' && workspaceScope === 'datasets') {
@@ -54,11 +70,18 @@ export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?:
       if (value) workspaceParams.set(key, value)
     }
   } else if (view === 'workspace' && workspaceQuery?.trim()) workspaceParams.set('q', workspaceQuery.trim())
+  const transformParams = new URLSearchParams(transformQuery)
+  if (view === 'transforms' && transformVersion) transformParams.set('version', transformVersion)
+  if (view === 'transforms' && transformCanvasId && transformNodeId) {
+    transformParams.set('canvas', transformCanvasId)
+    transformParams.set('node', transformNodeId)
+  }
   const query = view === 'workspace' && workspaceParams.size
     ? `?${workspaceParams}`
     : view === 'jobs' && jobsQuery ? `?${jobsQuery}`
     : view === 'inbox' && inboxQuery ? `?${inboxQuery}`
-    : view === 'canvas' && nodeId ? `?${new URLSearchParams({ node: nodeId })}` : ''
+    : view === 'canvas' && nodeId ? `?${new URLSearchParams({ node: nodeId })}`
+    : view === 'transforms' && transformParams.size ? `?${transformParams}` : ''
   return path + query
 }
 
@@ -68,9 +91,9 @@ export function canvasLink(id: string): string {
 }
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
-interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string }
+interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
+  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => void
 }
 
@@ -82,7 +105,12 @@ const hashFor = (s: RouterState) =>
     s.view === 'canvas' ? s.selectedId ?? undefined : undefined,
     s.view === 'inbox' ? s.inboxQuery : undefined,
     s.view === 'workspace' ? s.workspaceScope : undefined,
-    s.view === 'workspace' ? s.workspaceDatasetQuery : undefined)
+    s.view === 'workspace' ? s.workspaceDatasetQuery : undefined,
+    s.view === 'transforms' ? s.transformResourceId ?? undefined : undefined,
+    s.view === 'transforms' ? s.transformVersion ?? undefined : undefined,
+    s.view === 'transforms' ? s.transformLibraryQuery : undefined,
+    s.view === 'transforms' ? s.transformUpgradeCanvasId ?? undefined : undefined,
+    s.view === 'transforms' ? s.transformUpgradeNodeId ?? undefined : undefined)
 
 let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
@@ -124,6 +152,18 @@ export function initRouter(store: RouterStore): void {
         st.setJobsQuery(r.jobsQuery ?? '')
       } else if (r.view === 'inbox' && (st.view !== 'inbox' || st.inboxQuery !== (r.inboxQuery ?? ''))) {
         st.setInboxQuery(r.inboxQuery ?? '')
+      } else if (r.view === 'transforms' && (st.view !== 'transforms'
+          || st.transformResourceId !== (r.transformId ?? null)
+          || st.transformVersion !== (r.transformVersion ?? null)
+          || st.transformUpgradeCanvasId !== (r.transformCanvasId ?? null)
+          || st.transformUpgradeNodeId !== (r.transformNodeId ?? null)
+          || st.transformLibraryQuery !== (r.transformQuery ?? ''))) {
+        st.setTransformLibraryQuery(r.transformQuery ?? '')
+        st.setTransformResource(
+          r.transformId ?? null, r.transformVersion ?? null,
+          r.transformCanvasId && r.transformNodeId
+            ? { canvasId: r.transformCanvasId, nodeId: r.transformNodeId } : null,
+        )
       } else if (st.view !== r.view) {
         st.setView(r.view)
       }

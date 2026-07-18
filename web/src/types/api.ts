@@ -223,6 +223,7 @@ export interface WorkspaceCreateCanvasResult {
   ok: boolean
   id: string
   created: boolean
+  nodeId?: string | null
   resource: WorkspaceResource
 }
 export interface WorkspaceAddDatasetResult {
@@ -381,6 +382,42 @@ export interface ProcessorDescriptor {
   creatorId?: string | null
   createdAt?: string | null
   semanticDigest?: string | null
+}
+
+export type TransformAvailability = 'active' | 'deleted' | 'missing'
+
+export interface TransformRetention {
+  canvas: number
+  canvasVersion: number
+  executionManifest: number
+}
+
+export interface TransformLibraryEntry extends ProcessorDescriptor {
+  availability: TransformAvailability
+  deletedAt?: string | null
+  versionCount: number
+  retention: TransformRetention
+}
+
+export interface TransformLibraryPage {
+  items: TransformLibraryEntry[]
+  nextCursor?: string | null
+  hasMore: boolean
+}
+
+export interface TransformLibraryDetail {
+  id: string
+  provenance: 'plugin' | 'promoted'
+  requestedVersion?: string | null
+  versions: TransformLibraryEntry[]
+}
+
+export interface CanvasTransformReference {
+  id: string
+  version: string
+  nodeIds: string[]
+  availability: TransformAvailability
+  descriptor?: ProcessorDescriptor | null
 }
 
 export type Placement = 'local' | 'distributed'

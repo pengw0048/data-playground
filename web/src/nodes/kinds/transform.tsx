@@ -1,11 +1,9 @@
-import { useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
 import { color } from '../../theme/tokens'
 import { Segmented } from '../../ui/controls'
 import { Icon } from '../../ui/Icon'
-import { Popover } from '../../ui/Popover'
 import { CodeSnippet } from '../../ui/CodeSnippet'
 import { cn } from '@/lib/utils'
 import type { ProcessorMode, TransformSource } from '../../types/graph'
@@ -22,18 +20,25 @@ function Transform({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
   const openFullscreen = useStore((s) => s.openCodeFullscreen)
   const processors = useStore((s) => s.processors)
-  const [pickOpen, setPickOpen] = useState(false)
-  const pickRef = useRef<HTMLButtonElement>(null)
+  const references = useStore((s) => s.canvasTransformReferences)
+  const setTransformResource = useStore((s) => s.setTransformResource)
+  const canvasId = useStore((s) => s.doc.id)
 
   const src: TransformSource = (data.config.source as TransformSource) ?? 'adhoc'
   const mode: ProcessorMode = (data.config.mode as ProcessorMode) ?? 'map'
   const scope = (data.config.scope as 'dataset' | 'sample') ?? 'dataset'
+  const reference = references.find((candidate) => (
+    candidate.id === data.config.processor && candidate.version === data.config.version
+  ))
   const proc = exactProcessor(processors, data.config.processor, data.config.version)
+    ?? reference?.descriptor ?? undefined
   const configuredRef = configuredProcessorRef(
     data.config.processor, data.config.version)
 
   const meta = src === 'library'
-    ? (proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'pick a processor →'))
+    ? (reference?.availability === 'deleted' ? `${configuredRef} · deleted`
+      : reference?.availability === 'missing' ? `${configuredRef} · unavailable`
+      : proc ? `${proc.mode} · ${proc.title} · ${proc.version}` : (configuredRef ?? 'choose in Transforms →'))
     : `${mode} · on ${scope}`
 
   return (
@@ -62,8 +67,15 @@ function Transform({ id, data }: NodeComponentProps) {
         {src === 'library' ? (
           <div>
             <button
-              ref={pickRef}
-              onClick={(e) => { e.stopPropagation(); setPickOpen((v) => !v) }}
+              onClick={(e) => {
+                e.stopPropagation()
+                setTransformResource(
+                  typeof data.config.processor === 'string' ? data.config.processor : null,
+                  typeof data.config.version === 'string' ? data.config.version : null,
+                  typeof data.config.processor === 'string'
+                    ? { canvasId, nodeId: id } : null,
+                )
+              }}
               className={cn(
                 'flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px]',
                 proc ? 'text-foreground' : 'text-muted-foreground',
@@ -74,24 +86,8 @@ function Transform({ id, data }: NodeComponentProps) {
                 {proc?.title ?? configuredRef ?? 'select processor'}
               </span>
               {proc && <span className="text-[10px] text-muted-foreground">{proc.version}</span>}
-              <Icon name="chevronDown" size={12} />
+              <span className="text-[10px] font-semibold text-primary">Manage</span>
             </button>
-            <Popover anchorRef={pickRef} open={pickOpen} onClose={() => setPickOpen(false)} width={220}>
-              {processors.length === 0 && (
-                <div className="p-[9px] text-[11px] leading-[1.4] text-muted-foreground">
-                  Library is empty. Write an ad-hoc cell and “Promote to library”.
-                </div>
-              )}
-              {processors.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={(e) => { e.stopPropagation(); updateConfig(id, { processor: p.id, version: p.version, mode: p.mode }); setPickOpen(false) }}
-                  className="flex w-full flex-col gap-px rounded-md px-[9px] py-[7px] text-left hover:bg-accent"
-                >
-                  <span className="text-xs font-semibold text-foreground">{p.title} <span className="font-normal text-muted-foreground">· {p.mode}</span></span>
-                </button>
-              ))}
-            </Popover>
           </div>
         ) : (
           <button

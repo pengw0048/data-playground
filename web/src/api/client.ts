@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasTransformReference, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
@@ -220,7 +220,7 @@ export const api = {
     if (params?.limit) search.set('limit', String(params.limit))
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },
-  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[]; providerDatasetRefs?: string[] }) =>
+  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[]; providerDatasetRefs?: string[]; transformId?: string; transformVersion?: string }) =>
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),
     }),
@@ -228,6 +228,11 @@ export const api = {
     req<WorkspaceAddDatasetResult>(`/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`, {
       method: 'POST', body: JSON.stringify(body),
     }),
+  workspaceAddTransform: (canvasId: string, body: { transformId: string; transformVersion: string; expectedCanvasVersion: number; replaceNodeId?: string }) =>
+    req<{ ok: boolean; id: string; version: number; nodeId: string; doc: CanvasDoc }>(
+      `/workspace/canvases/${encodeURIComponent(canvasId)}/transforms`, {
+        method: 'POST', body: JSON.stringify(body),
+      }),
   workspaceMoveCanvas: (placementId: string, body: { containerId: string; expectedContainerVersion: number; expectedVersion: number }) =>
     req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
       method: 'PUT', body: JSON.stringify(body),
@@ -290,6 +295,30 @@ export const api = {
   },
 
   processors: () => req<ProcessorDescriptor[]>('/processors'),
+  transformLibrary: (params: { q?: string; source?: 'all' | 'promoted' | 'plugin'; mode?: string; category?: string; limit?: number; cursor?: string } = {}) => {
+    const query = new URLSearchParams()
+    if (params.q) query.set('q', params.q)
+    if (params.source && params.source !== 'all') query.set('source', params.source)
+    if (params.mode) query.set('mode', params.mode)
+    if (params.category) query.set('category', params.category)
+    if (params.limit != null) query.set('limit', String(params.limit))
+    if (params.cursor) query.set('cursor', params.cursor)
+    const suffix = query.size ? `?${query}` : ''
+    return req<TransformLibraryPage>(`/transform-library${suffix}`)
+  },
+  transformLibraryDetail: (id: string, version?: string) => {
+    const query = version ? `?${new URLSearchParams({ version })}` : ''
+    return req<TransformLibraryDetail>(`/transform-library/${encodeURIComponent(id)}${query}`)
+  },
+  deleteTransformVersion: (id: string, version: string) =>
+    req<{ ok: boolean; deleted: boolean }>(
+      `/processors/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+      { method: 'DELETE' },
+    ),
+  canvasTransformReferences: (canvasId: string) =>
+    req<CanvasTransformReference[]>(
+      `/canvas/${encodeURIComponent(canvasId)}/transform-references`,
+    ),
   promote: (body: {
     id: string; title: string; mode: string; code: string
     inputColumns: string[]; inputSchema?: ColumnSchema[]; outputSchema: ColumnSchema[]

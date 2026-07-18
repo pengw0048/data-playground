@@ -7,8 +7,11 @@ Split out of main.py. All routes are authed: main includes this router with
 from __future__ import annotations
 
 import contextlib
+import base64
+import binascii
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -61,6 +64,8 @@ from hub.models import (
     PipelineImport,
     ProcessorDescriptor,
     ProcessorMode,
+    TransformLibraryDetail,
+    TransformLibraryPage,
     MAX_CODE_LEN,
     Relationship,
     SchemaCompatibility,
@@ -1075,6 +1080,141 @@ def import_pipeline(req: ImportRequest) -> PipelineImport:
 @router.get("/processors", response_model=list[ProcessorDescriptor])
 def list_processors(uid: str = Depends(current_user)) -> list[ProcessorDescriptor]:
     return get_deps().registry.list(uid)
+
+
+def _transform_library_entry(item: dict, *, availability: str = "active") -> dict:
+    input_schema = item.get("input_schema", item.get("inputSchema", []))
+    return {
+        "id": item["id"], "version": item["version"], "title": item["title"],
+        "mode": item["mode"], "category": item.get("category", "processor"),
+        "input_columns": item.get("input_columns", [field.get("name", "") for field in input_schema]),
+        "input_schema": input_schema,
+        "output_schema": item.get("output_schema", item.get("outputSchema", [])),
+        "requirements": item.get("requirements", []),
+        "params_schema": item.get("params_schema", {}),
+        "previewable": item.get("previewable", item.get("mode") in ("map", "flat_map")),
+        "blurb": item.get("blurb", ""),
+        "provenance": item.get("provenance", "promoted"),
+        "creator_id": item.get("creator_id"), "created_at": item.get("created_at"),
+        "semantic_digest": item.get("semantic_digest"),
+        "availability": availability,
+        "deleted_at": item.get("deleted_at"),
+        "version_count": item.get("version_count", 1),
+        "retention": item.get("retention", {}),
+        "_sort_key": item.get(
+            "library_sort_key", metadb.transform_library_sort_key(item["title"])),
+    }
+
+
+def _library_cursor(processor_id: str, version: str, signature: str) -> str:
+    raw = json.dumps([processor_id, version, signature], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _library_after(cursor: str | None, signature: str) -> tuple[str | None, str | None]:
+    if cursor is None:
+        return None, None
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        processor_id, version, cursor_signature = json.loads(raw)
+        if (not isinstance(processor_id, str) or not isinstance(version, str)
+                or cursor_signature != signature):
+            raise ValueError
+        return processor_id, version
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError,
+            binascii.Error) as exc:
+        raise HTTPException(422, "invalid Transform library cursor") from exc
+
+
+@router.get("/transform-library", response_model=TransformLibraryPage)
+def browse_transform_library(
+        q: str = Query(default="", max_length=256),
+        source: Literal["all", "promoted", "plugin"] = "all",
+        mode: str = Query(default="", max_length=64),
+        category: str = Query(default="", max_length=128),
+        limit: int = Query(default=25, ge=1, le=100),
+        cursor: str | None = Query(default=None, max_length=512),
+        uid: str = Depends(current_user)) -> dict:
+    """Browse a bounded, exact-version Transform library without exposing executable code."""
+    query = metadb.transform_library_text(q.strip())
+    wanted_mode = metadb.transform_library_text(mode.strip())
+    wanted_category = metadb.transform_library_text(category.strip())
+    signature = hashlib.sha256(json.dumps(
+        [query, source, wanted_mode, wanted_category], separators=(",", ":")).encode()).hexdigest()[:16]
+    after_id, after_version = _library_after(cursor, signature)
+    plugin_entries: list[dict] = []
+    if source in ("all", "plugin"):
+        plugin_entries.extend(_transform_library_entry(
+            descriptor.model_dump(mode="python"))
+            for descriptor in get_deps().registry.list()
+        )
+    after_sort_key = None
+    if after_id is not None and after_version is not None:
+        if after_id.startswith("tr_") and source in ("all", "promoted"):
+            after_sort_key = metadb.promoted_transform_library_cursor_key(
+                uid, after_id, after_version)
+        elif not after_id.startswith("tr_") and source in ("all", "plugin"):
+            prior = next((entry for entry in plugin_entries
+                          if entry["id"] == after_id and entry["version"] == after_version), None)
+            after_sort_key = str(prior["_sort_key"]) if prior is not None else None
+        if after_sort_key is None:
+            raise HTTPException(422, "invalid Transform library cursor")
+    entries = list(plugin_entries)
+    if source in ("all", "promoted"):
+        entries.extend(_transform_library_entry(
+            item, availability="deleted" if item.get("deleted_at") else "active")
+            for item in metadb.promoted_transform_library_page(
+                uid, q=query, mode=wanted_mode, category=wanted_category,
+                after_sort_key=after_sort_key, after_id=after_id, limit=limit + 1)
+        )
+    if query:
+        entries = [entry for entry in entries if query in metadb.transform_library_search_text(
+            *(entry.get(field, "") for field in ("title", "blurb", "category", "mode", "id")))]
+    if wanted_mode:
+        entries = [entry for entry in entries
+                   if metadb.transform_library_text(entry["mode"]) == wanted_mode]
+    if wanted_category:
+        entries = [entry for entry in entries
+                   if metadb.transform_library_text(entry["category"]) == wanted_category]
+    if after_sort_key is not None and after_id is not None:
+        entries = [entry for entry in entries if (
+            str(entry["_sort_key"]), str(entry["id"])) > (after_sort_key, after_id)]
+    entries.sort(key=lambda entry: (str(entry["_sort_key"]), str(entry["id"])))
+    has_more = len(entries) > limit
+    page = entries[:limit]
+    last = page[-1] if page else None
+    return {
+        "items": page, "has_more": has_more,
+        "next_cursor": _library_cursor(
+            str(last["id"]), str(last["version"]), signature) if has_more and last else None,
+    }
+
+
+@router.get("/transform-library/{processor_id}", response_model=TransformLibraryDetail)
+def transform_library_detail(
+        processor_id: str, version: str | None = Query(default=None, max_length=64),
+        uid: str = Depends(current_user)) -> dict:
+    """Inspect immutable versions; promoted identities remain owner-scoped."""
+    if processor_id.startswith("tr_"):
+        try:
+            versions = metadb.promoted_transform_library_detail(uid, processor_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Transform not found") from exc
+        entries = [_transform_library_entry(
+            item, availability="deleted" if item.get("deleted_at") else "active")
+            for item in versions]
+        return {
+            "id": processor_id, "provenance": "promoted",
+            "requested_version": version, "versions": entries,
+        }
+    plugin = next((item for item in get_deps().registry.list() if item.id == processor_id), None)
+    if plugin is None:
+        raise HTTPException(404, "Transform not found")
+    entry = _transform_library_entry(plugin.model_dump(mode="python"))
+    return {
+        "id": processor_id, "provenance": "plugin",
+        "requested_version": version, "versions": [entry],
+    }
 
 
 class PromoteRequest(BaseModel):
