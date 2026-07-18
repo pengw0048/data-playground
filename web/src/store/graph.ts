@@ -17,6 +17,11 @@ import {
   type AgentBackendNode, type AgentBackendEdge, type CanvasFile, type CanvasRole, type DpUser,
 } from '../api/client'
 import { crdtUndo, crdtUndoActive, collabApply } from '../collab/undo'
+import {
+  canvasDocsEqual, canvasEditableContentEqual, deleteCanvasDraft, readCanvasDrafts, writeCanvasDraft,
+  type LocalCanvasDraft,
+} from './canvasDrafts'
+import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -26,8 +31,6 @@ export type CanvasCreationResult =
   | { ok: true; canvasId: string; persistence: CanvasPersistence }
   | { ok: false }
 
-const LS_KEY = 'dp-canvas'       // offline cache of the open doc
-const USER_KEY = 'dp-user'       // last-selected user id
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
 const PREVIEW_BINDINGS_KEY = (userId: string, canvasId: string) => `dp-preview-bindings-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
@@ -62,10 +65,12 @@ let _fileListGeneration = 0       // stale same-user list responses cannot overw
 let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
+const _draftSyncInFlight = new Set<string>()
 // True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
 // still refreshes the browser cache, but must not PUT that presentation-only normalization back into
 // the authoritative canvas or create a misleading Version history snapshot.
 let _settlingLoadedDoc = false
+let _acceptingServerVersion = false
 
 /** A canvas position near `base` that doesn't overlap any existing node (so added nodes never stack). */
 export function freePosition(nodes: CanvasNode[], base: { x: number; y: number }): { x: number; y: number } {
@@ -344,8 +349,9 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
 }
 
 function writeAdmissionFingerprint(doc: CanvasDoc): string {
+  const { version: _version, ...executionDoc } = doc
   return JSON.stringify({
-    ...doc,
+    ...executionDoc,
     nodes: doc.nodes.map((node) => {
       const { status: _status, ...data } = node.data
       return { ...node, data }
@@ -782,6 +788,10 @@ interface Store {
   past: CanvasDoc[]
   future: CanvasDoc[]
   saved: boolean          // auto-save state (localStorage), shown subtly in the top bar
+  serverVersion: number | null
+  currentDraftId: string | null
+  localDrafts: LocalCanvasDraft[]
+  draftStorageErrors: string[]
   numericParamDrafts: Record<string, Record<string, string>>  // invalid/pending text; never persisted
 
   agentOpen: boolean
@@ -905,12 +915,18 @@ interface Store {
   files: CanvasFile[]
   refreshFiles: () => Promise<boolean>  // true only when this user's authoritative list was refreshed
   refreshUsers: () => Promise<void>
-  openFile: (id: string) => Promise<boolean>
+  openFile: (id: string, options?: { serverCopy?: boolean }) => Promise<boolean>
   newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
   newFromExample: (key: string) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   deleteFile: (id: string) => Promise<void>
+  refreshLocalDrafts: () => void
+  openLocalDraft: (draftId: string) => boolean
+  retryLocalDraft: (draftId: string) => Promise<void>
+  forkLocalDraft: (draftId: string) => Promise<void>
+  discardLocalDraft: (draftId: string) => Promise<void>
+  exportLocalDraft: (draftId: string) => void
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
@@ -920,6 +936,43 @@ function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
   // collide across freshly-loaded tabs/tests and leak one canvas's runs/history into another
   return { id: `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`, name: 'untitled', version: 1, nodes: [], edges: [] }
+}
+
+function replaceDraft(drafts: LocalCanvasDraft[], draft: LocalCanvasDraft): LocalCanvasDraft[] {
+  return [draft, ...drafts.filter((candidate) => candidate.draftId !== draft.draftId)]
+    .sort((a, b) => b.lastLocalEditAt.localeCompare(a.lastLocalEditAt))
+}
+
+function draftAfterStorageWrite(
+  draft: LocalCanvasDraft, result: { ok: boolean; error?: string },
+): LocalCanvasDraft {
+  return result.ok ? draft : { ...draft, syncState: 'error', lastError: result.error }
+}
+
+function draftForDoc(principalId: string, doc: CanvasDoc, baseVersion: number | null,
+                     previous?: LocalCanvasDraft, createAttemptDoc?: CanvasDoc | null): LocalCanvasDraft {
+  return {
+    draftId: doc.id,
+    principalId,
+    canvasId: doc.id,
+    baseCanvasId: baseVersion == null ? null : doc.id,
+    baseVersion,
+    name: doc.name || 'untitled',
+    doc,
+    createAttemptDoc: createAttemptDoc === undefined ? previous?.createAttemptDoc ?? null : createAttemptDoc,
+    syncState: 'dirty',
+    lastLocalEditAt: new Date().toISOString(),
+  }
+}
+
+function downloadDraft(draft: LocalCanvasDraft): void {
+  const blob = new Blob([JSON.stringify(draft.doc, null, 2)], { type: 'application/json' })
+  const href = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = href
+  anchor.download = `${draft.name || draft.canvasId}.canvas.json`
+  anchor.click()
+  URL.revokeObjectURL(href)
 }
 
 // true if the node, or anything feeding it, has an unmet required param — so running the pipeline
@@ -1174,6 +1227,10 @@ export const useStore = create<Store>((set, get) => ({
   past: [],
   future: [],
   saved: true,
+  serverVersion: null,
+  currentDraftId: null,
+  localDrafts: [],
+  draftStorageErrors: [],
   numericParamDrafts: {},
   agentOpen: false,
   agentLog: [],
@@ -2214,7 +2271,14 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   bootstrap: async () => {
-    setApiUser(localStorage.getItem(USER_KEY))  // restore chosen user (server defaults to 'local')
+    const rememberedUser = localStorage.getItem(LAST_USER_KEY)
+    setApiUser(rememberedUser)  // restore chosen user (server defaults to 'local')
+    if (!get().authEnabled && confirmedLocalMode() && rememberedUser) {
+      // A server-confirmed local-mode workstation has no login transition. This cached principal is
+      // used only to enumerate its own Canvas draft index while the hub is unavailable on reload.
+      set({ currentUser: { id: rememberedUser, name: rememberedUser } })
+      get().refreshLocalDrafts()
+    }
     try {
       // NOTE: we deliberately do NOT load the whole catalog here — it can be thousands of tables. The
       // Workspace browses it server-side (paginated + faceted); the working set is filled on demand
@@ -2231,10 +2295,11 @@ export const useStore = create<Store>((set, get) => ({
     try {
       // resolve identity, load this user's files, open the last-opened (or newest, or a fresh one)
       const me = await api.me()
-      setApiUser(me.id); localStorage.setItem(USER_KEY, me.id)
+      setApiUser(me.id); localStorage.setItem(LAST_USER_KEY, me.id)
       // Identity is server-confirmed now. Set it before the remaining calls so an offline failure may
       // use only THIS user's cached canvas role; an unknown identity always stays fail-closed.
       set({ currentUser: me })
+      get().refreshLocalDrafts()
       const users = await api.users()
       set({ users })
       await get().refreshFiles()
@@ -2244,12 +2309,18 @@ export const useStore = create<Store>((set, get) => ({
       // current canvas underneath, then switches to that shell view below.
       const route = parseHash()
       const last = localStorage.getItem(OPEN_KEY(me.id))
+      const fallbackDraft = last ? get().localDrafts.find((draft) => draft.canvasId === last) : undefined
       const fallback = last && files.some((f) => f.id === last) ? last : files[0]?.id
       // a deep-linked canvas that can't be opened (bad/revoked/other-user's link) must NOT discard
       // the last-opened file into a throwaway blank — fall back cleanly.
-      const opened = (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId) : false
+      const routeDraft = route.view === 'canvas' && route.canvasId
+        ? get().localDrafts.find((draft) => draft.canvasId === route.canvasId)
+        : undefined
+      const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId)
+        : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId) : false
       if (!opened) {
-        if (fallback) await get().openFile(fallback)
+        if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
+        else if (fallback) await get().openFile(fallback)
         else await get().newFile()
         // A Workspace dataset/container deep link carries more identity than the top-level view.
         // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
@@ -2266,17 +2337,17 @@ export const useStore = create<Store>((set, get) => ({
         else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {
-      // offline / no kernel: fall back to the local cached doc so work survives a refresh
-      try {
-        const saved = localStorage.getItem(LS_KEY)
-        if (saved) {
-          const doc = JSON.parse(saved) as CanvasDoc
-          if (doc?.nodes) {
-            const role = cachedRole(get().currentUser?.id, doc.id)
-            get().loadDoc(doc, role)
-          }
-        }
-      } catch { /* ignore corrupt state */ }
+      // Only a server-confirmed principal may see its local drafts. If identity was confirmed before
+      // another bootstrap request failed, recover that principal's last draft without revealing any
+      // other principal's index.
+      const principalId = get().currentUser?.id
+      if (principalId) {
+        get().refreshLocalDrafts()
+        const last = localStorage.getItem(OPEN_KEY(principalId))
+        const draft = get().localDrafts.find((candidate) => candidate.canvasId === last)
+          ?? get().localDrafts[0]
+        if (draft) get().openLocalDraft(draft.draftId)
+      }
     }
     _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
     void get().refreshSchemas()
@@ -2315,13 +2386,15 @@ export const useStore = create<Store>((set, get) => ({
   },
   refreshUsers: async () => { try { set({ users: await api.users() }) } catch { /* offline */ } },
 
-  openFile: async (id) => {
+  openFile: async (id, options) => {
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id
     if (!userId) {
       get().pushToast('Your identity is not available yet', 'error')
       return false
     }
+    const localDraft = get().localDrafts.find((draft) => draft.canvasId === id && draft.principalId === userId)
+    if (localDraft && !options?.serverCopy) return get().openLocalDraft(localDraft.draftId)
     const isCurrent = () => generation === _fileNavigationGeneration && get().currentUser?.id === userId
     try {
       const doc = await api.getCanvas(id)
@@ -2336,12 +2409,14 @@ export const useStore = create<Store>((set, get) => ({
       const accessRemoved = roleRefreshed && !file
       if (accessRemoved) rememberRole(userId, id, null) // authoritative revoke/delete
       const selectedId = get().doc.id === id ? get().selectedId : null
-      get().loadDoc(doc, role)
+      const inspectConflict = options?.serverCopy === true && localDraft?.syncState === 'conflict'
+      get().loadDoc(doc, inspectConflict ? 'viewer' : role)
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor
-      if (accessRemoved) get().pushToast('This canvas is no longer in your accessible files. Opened the fetched snapshot read-only.', 'error')
+      if (inspectConflict) get().pushToast('Opened the server copy read-only. Resolve or fork the local draft before editing this Canvas.', 'info')
+      else if (accessRemoved) get().pushToast('This canvas is no longer in your accessible files. Opened the fetched snapshot read-only.', 'error')
       else if (!roleRefreshed || !role) get().pushToast('Opened read-only because your current access could not be confirmed', 'error')
       return true
     } catch {
@@ -2392,7 +2467,12 @@ export const useStore = create<Store>((set, get) => ({
         return { ok: false }
       }
       if (e instanceof KernelError) {
-        if (e.status === 401) {
+        if (e.status >= 500) {
+          // A proxy/hub 5xx has an unknown commit outcome just like response loss. Preserve the exact
+          // attempted document under its stable ID; idempotent create retry will prove insert vs.
+          // existing content before any later update.
+          persistence = 'local-draft'
+        } else if (e.status === 401) {
           rememberRole(userId, get().doc.id, null)
           set({ canvasRole: null, agentOpen: false, accessDenied: true, kernelUp: true })
           get().pushToast('Your session no longer permits creating canvases. The current canvas is now read-only.', 'error')
@@ -2403,16 +2483,29 @@ export const useStore = create<Store>((set, get) => ({
           set({ kernelUp: true })
           get().pushToast(`Could not create canvas: ${e.message}`, 'error')
         }
-        return { ok: false }
+        if (persistence !== 'local-draft') return { ok: false }
       }
       // A transport failure is the one case where local-first creation is truthful: this is a new,
-      // collision-resistant local draft and a later PUT can create it as the current user's canvas.
+      // collision-resistant local draft and a later idempotent POST can prove or create its server copy.
       persistence = 'local-draft'
     }
     if (!isCurrent()) {
       return { ok: false }
     }
     get().loadDoc(doc, 'owner')
+    if (persistence === 'local-draft' && userId) {
+      const draft = draftForDoc(userId, doc, null, undefined, doc)
+      const stored = writeCanvasDraft(draft)
+      const visibleDraft = draftAfterStorageWrite(draft, stored)
+      set((state) => ({
+        currentDraftId: draft.draftId,
+        serverVersion: null,
+        localDrafts: replaceDraft(state.localDrafts, visibleDraft),
+        saved: stored.ok,
+        draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
+      }))
+      if (!stored.ok) get().pushToast(stored.error!, 'error')
+    }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
@@ -2436,7 +2529,9 @@ export const useStore = create<Store>((set, get) => ({
     } catch (e) {
       if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       if (e instanceof KernelError) {
-        if (e.status === 401) {
+        if (e.status >= 500) {
+          persistence = 'local-draft'
+        } else if (e.status === 401) {
           rememberRole(userId, get().doc.id, null)
           set({ canvasRole: null, agentOpen: false, accessDenied: true, kernelUp: true })
           get().pushToast('Your session no longer permits creating canvases. The current canvas is now read-only.', 'error')
@@ -2447,13 +2542,26 @@ export const useStore = create<Store>((set, get) => ({
           set({ kernelUp: true })
           get().pushToast(`Could not create canvas: ${e.message}`, 'error')
         }
-        return { ok: false }
+        if (persistence !== 'local-draft') return { ok: false }
       }
       // Transport failure: keep the runnable example as an offline local-first draft.
       persistence = 'local-draft'
     }
     if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
+    if (persistence === 'local-draft' && userId) {
+      const draft = draftForDoc(userId, doc, null, undefined, doc)
+      const stored = writeCanvasDraft(draft)
+      const visibleDraft = draftAfterStorageWrite(draft, stored)
+      set((state) => ({
+        currentDraftId: draft.draftId,
+        serverVersion: null,
+        localDrafts: replaceDraft(state.localDrafts, visibleDraft),
+        saved: stored.ok,
+        draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
+      }))
+      if (!stored.ok) get().pushToast(stored.error!, 'error')
+    }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas' })
@@ -2485,6 +2593,274 @@ export const useStore = create<Store>((set, get) => ({
       if (next) await get().openFile(next)
       else await get().newFile()
     }
+  },
+
+  refreshLocalDrafts: () => {
+    const principalId = get().currentUser?.id
+    if (!principalId) {
+      set({ localDrafts: [], draftStorageErrors: [], currentDraftId: null })
+      return
+    }
+    const result = readCanvasDrafts(principalId)
+    set({ localDrafts: result.drafts, draftStorageErrors: result.errors })
+    for (const error of result.errors) get().pushToast(error, 'error')
+  },
+
+  openLocalDraft: (draftId) => {
+    const principalId = get().currentUser?.id
+    const draft = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === principalId
+    ))
+    if (!draft || !principalId) return false
+    const role = draft.baseCanvasId === null ? 'owner' : cachedRole(principalId, draft.canvasId)
+    get().loadDoc(draft.doc, role)
+    set({
+      currentDraftId: draft.draftId,
+      serverVersion: draft.baseVersion,
+      saved: true,
+      view: 'canvas',
+    })
+    try { localStorage.setItem(OPEN_KEY(principalId), draft.canvasId) } catch { /* visible writes happen through the draft store */ }
+    if (!roleCanEdit(role)) get().pushToast('Opened the local draft read-only because current edit access is not confirmed', 'error')
+    return true
+  },
+
+  retryLocalDraft: async (draftId) => {
+    const principalId = get().currentUser?.id
+    const original = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === principalId
+    ))
+    if (!original || !principalId || original.syncState === 'syncing') return
+    const syncKey = `${principalId}:${draftId}`
+    if (_draftSyncInFlight.has(syncKey)) return
+    _draftSyncInFlight.add(syncKey)
+    const stillCurrentPrincipal = () => get().currentUser?.id === principalId
+
+    const syncing: LocalCanvasDraft = { ...original, syncState: 'syncing', lastError: undefined }
+    const started = writeCanvasDraft(syncing)
+    if (!started.ok) {
+      _draftSyncInFlight.delete(syncKey)
+      const failed = draftAfterStorageWrite(original, started)
+      set((state) => ({
+        localDrafts: replaceDraft(state.localDrafts, failed),
+        saved: false,
+        draftStorageErrors: [...state.draftStorageErrors, started.error!],
+      }))
+      get().pushToast(started.error!, 'error')
+      return
+    }
+    set((state) => ({ localDrafts: replaceDraft(state.localDrafts, syncing) }))
+
+    const finish = async (version: number) => {
+      if (!stillCurrentPrincipal()) {
+        _draftSyncInFlight.delete(syncKey)
+        return
+      }
+      const latest = get().localDrafts.find((draft) => draft.draftId === draftId)
+      if (latest && latest.lastLocalEditAt !== original.lastLocalEditAt
+        && !canvasDocsEqual(latest.doc, original.doc)) {
+        const rebased: LocalCanvasDraft = {
+          ...latest,
+          doc: { ...latest.doc, version },
+          baseCanvasId: latest.canvasId,
+          baseVersion: version,
+          syncState: 'dirty',
+          lastError: undefined,
+        }
+        const stored = writeCanvasDraft(rebased)
+        const visibleDraft = draftAfterStorageWrite(rebased, stored)
+        _acceptingServerVersion = true
+        try {
+          set((state) => ({
+            localDrafts: replaceDraft(state.localDrafts, visibleDraft),
+            serverVersion: state.doc.id === rebased.canvasId ? version : state.serverVersion,
+            doc: state.doc.id === rebased.canvasId ? { ...state.doc, version } : state.doc,
+            saved: state.doc.id === rebased.canvasId ? stored.ok : state.saved,
+            draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
+          }))
+        } finally {
+          _acceptingServerVersion = false
+        }
+        if (!stored.ok) get().pushToast(stored.error!, 'error')
+        else window.setTimeout(() => { void get().retryLocalDraft(draftId) }, 0)
+        _draftSyncInFlight.delete(syncKey)
+        return
+      }
+      const removed = deleteCanvasDraft(principalId, draftId)
+      if (!removed.ok) {
+        const failed = { ...syncing, syncState: 'error' as const, lastError: removed.error }
+        set((state) => ({
+          localDrafts: replaceDraft(state.localDrafts, failed), saved: false,
+          draftStorageErrors: [...state.draftStorageErrors, removed.error!],
+        }))
+        get().pushToast(removed.error!, 'error')
+        _draftSyncInFlight.delete(syncKey)
+        return
+      }
+      if (original.baseCanvasId === null) rememberRole(principalId, original.canvasId, 'owner')
+      _acceptingServerVersion = true
+      try {
+        set((state) => {
+          const isOpen = state.doc.id === original.canvasId
+          return {
+            localDrafts: state.localDrafts.filter((draft) => draft.draftId !== draftId),
+            currentDraftId: isOpen ? null : state.currentDraftId,
+            serverVersion: isOpen ? version : state.serverVersion,
+            doc: isOpen ? { ...state.doc, version } : state.doc,
+            saved: isOpen ? true : state.saved,
+            kernelUp: true,
+          }
+        })
+      } finally {
+        _acceptingServerVersion = false
+      }
+      await get().refreshFiles()
+      if (stillCurrentPrincipal()) get().pushToast(`Synced “${original.name}”`, 'success')
+      _draftSyncInFlight.delete(syncKey)
+    }
+
+    try {
+      if (original.baseCanvasId === null) {
+        const created = await api.createCanvas(original.doc)
+        if (!created.ok || created.id !== original.canvasId) throw new Error('The hub returned an incompatible create result.')
+        if (created.created) {
+          await finish(original.doc.version)
+          return
+        }
+        // A false insert result is the expected response-loss retry. Confirm both ownership and the
+        // exact first-attempt document before establishing a server base; an unrelated collision is
+        // never overwritten merely because it has the same client-generated ID.
+        const [files, serverDoc] = await Promise.all([api.listCanvases(), api.getCanvas(original.canvasId)])
+        if (files.find((file) => file.id === original.canvasId)?.role !== 'owner'
+          || !original.createAttemptDoc || !canvasDocsEqual(serverDoc, original.createAttemptDoc)) {
+          throw new KernelError(409, 'The Canvas ID already exists with different server content.')
+        }
+        if (canvasDocsEqual(serverDoc, original.doc)) {
+          await finish(serverDoc.version)
+          return
+        }
+        const saved = await api.saveCanvas(original.doc, false, serverDoc.version)
+        await finish(saved.version)
+        return
+      }
+      if (original.baseVersion == null) throw new Error('The draft has no server base version.')
+      const saved = await api.saveCanvas(original.doc, false, original.baseVersion)
+      await finish(saved.version)
+    } catch (error) {
+      if (!stillCurrentPrincipal()) {
+        _draftSyncInFlight.delete(syncKey)
+        return
+      }
+      const latest = get().localDrafts.find((draft) => (
+        draft.draftId === draftId && draft.principalId === principalId
+      ))
+      // The request may fail after the user has continued editing or deleted the draft. Never restore
+      // the retry's older snapshot over newer local work, and never recreate an explicitly deleted row.
+      if (!latest) {
+        _draftSyncInFlight.delete(syncKey)
+        return
+      }
+      const conflict = error instanceof KernelError && (error.status === 404 || error.status === 409)
+      const denied = error instanceof KernelError && (error.status === 401 || error.status === 403)
+      const message = conflict
+        ? 'The server Canvas changed or was deleted. Open the server copy or keep this draft as a new Canvas.'
+        : denied
+          ? 'Current access does not permit syncing this draft.'
+          : `Sync failed: ${error instanceof Error ? error.message : 'the hub is unreachable'}`
+      const failed: LocalCanvasDraft = {
+        ...latest,
+        syncState: conflict ? 'conflict' : denied ? 'error' : 'dirty',
+        lastError: message,
+      }
+      const stored = writeCanvasDraft(failed)
+      const visibleDraft = draftAfterStorageWrite(failed, stored)
+      set((state) => ({
+        localDrafts: replaceDraft(state.localDrafts, visibleDraft),
+        currentDraftId: state.doc.id === failed.canvasId ? failed.draftId : state.currentDraftId,
+        saved: state.doc.id === failed.canvasId ? stored.ok : state.saved,
+        kernelUp: conflict || denied ? true : false,
+        draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
+      }))
+      if (denied) {
+        rememberRole(principalId, failed.canvasId, null)
+        set({ accessDenied: true, canvasRole: null, agentOpen: false })
+        void get().refreshFiles()
+      }
+      get().pushToast(stored.ok ? message : stored.error!, 'error')
+      _draftSyncInFlight.delete(syncKey)
+    }
+  },
+
+  forkLocalDraft: async (draftId) => {
+    const principalId = get().currentUser?.id
+    const original = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === principalId
+    ))
+    if (!original || !principalId) return
+    const newId = emptyDoc().id
+    const doc: CanvasDoc = {
+      ...original.doc,
+      id: newId,
+      name: `${original.name || 'untitled'} (recovered)`,
+      version: 1,
+    }
+    const fork = draftForDoc(principalId, doc, null, undefined, doc)
+    const stored = writeCanvasDraft(fork)
+    if (!stored.ok) {
+      get().pushToast(stored.error!, 'error')
+      set((state) => ({ saved: false, draftStorageErrors: [...state.draftStorageErrors, stored.error!] }))
+      return
+    }
+    const removed = deleteCanvasDraft(principalId, original.draftId)
+    if (!removed.ok) {
+      deleteCanvasDraft(principalId, fork.draftId)
+      get().pushToast(removed.error!, 'error')
+      return
+    }
+    set((state) => ({
+      localDrafts: replaceDraft(
+        state.localDrafts.filter((draft) => draft.draftId !== original.draftId), fork,
+      ),
+    }))
+    get().openLocalDraft(fork.draftId)
+    await get().retryLocalDraft(fork.draftId)
+  },
+
+  discardLocalDraft: async (draftId) => {
+    const principalId = get().currentUser?.id
+    const draft = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === principalId
+    ))
+    if (!draft || !principalId) return
+    if (typeof window !== 'undefined' && !window.confirm(`Delete local draft “${draft.name}”? This can't be undone.`)) return
+    const removed = deleteCanvasDraft(principalId, draftId)
+    if (!removed.ok) {
+      get().pushToast(removed.error!, 'error')
+      return
+    }
+    const wasOpen = get().doc.id === draft.canvasId && get().currentDraftId === draftId
+    const inspectingServer = get().doc.id === draft.canvasId && get().currentDraftId === null
+    set((state) => ({
+      localDrafts: state.localDrafts.filter((candidate) => candidate.draftId !== draftId),
+      currentDraftId: wasOpen ? null : state.currentDraftId,
+      canvasRole: inspectingServer ? cachedRole(principalId, draft.canvasId) : state.canvasRole,
+    }))
+    if (!wasOpen) return
+    if (draft.baseCanvasId && await get().openFile(draft.baseCanvasId)) return
+    const next = get().localDrafts[0]
+    if (next) get().openLocalDraft(next.draftId)
+    else if (get().files[0]) await get().openFile(get().files[0].id)
+    else await get().newFile()
+  },
+
+  exportLocalDraft: (draftId) => {
+    const principalId = get().currentUser?.id
+    const draft = get().localDrafts.find((candidate) => (
+      candidate.draftId === draftId && candidate.principalId === principalId
+    ))
+    if (!draft) return
+    downloadDraft(draft)
+    get().pushToast(`Exported local draft “${draft.name}”`, 'success')
   },
 
   // Refresh the WORKING SET (not the whole catalog): re-fetch the tables the open canvas references,
@@ -2556,9 +2932,23 @@ export const useStore = create<Store>((set, get) => ({
   save: async () => {
     if (!roleCanEdit(get().canvasRole)) return
     if (get().doc.nodes.some((node) => numericDraftInvalidReason(node, get().numericParamDrafts[node.id]))) return
-    try {
-      await api.saveCanvas(get().doc)
-    } catch { /* offline: keep in memory */ }
+    const principalId = get().currentUser?.id
+    if (!principalId) return
+    const previous = get().localDrafts.find((draft) => draft.draftId === get().doc.id)
+    const draft = draftForDoc(principalId, get().doc, previous?.baseVersion ?? get().serverVersion, previous)
+    const stored = writeCanvasDraft(draft)
+    const visibleDraft = draftAfterStorageWrite(draft, stored)
+    set((state) => ({
+      currentDraftId: draft.draftId,
+      localDrafts: replaceDraft(state.localDrafts, visibleDraft),
+      saved: stored.ok,
+      draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
+    }))
+    if (!stored.ok) {
+      get().pushToast(stored.error!, 'error')
+      return
+    }
+    await get().retryLocalDraft(draft.draftId)
   },
 
   loadDoc: (doc, role = get().canvasRole) => {
@@ -2575,6 +2965,8 @@ export const useStore = create<Store>((set, get) => ({
         canvasRole: role,
         accessDenied: false,
         saved: true,
+        serverVersion: d.version,
+        currentDraftId: null,
         agentOpen: roleCanEdit(role) ? get().agentOpen : false,
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
@@ -2651,29 +3043,30 @@ useStore.subscribe((state) => {
     canvasRole: null,
     agentOpen: false,
     profileJobs: {},
+    localDrafts: [],
+    draftStorageErrors: [],
+    currentDraftId: null,
+    serverVersion: null,
   })
 })
 
-// Auto-persist the canvas to localStorage (debounced) so a refresh keeps your work.
+// Persist every locally edited Canvas in its principal-scoped draft record before attempting a
+// version-fenced server save. Drafts are never retried in the background after a transport failure;
+// the Workspace/Canvas chrome exposes an explicit Retry action.
 let _saveTimer: ReturnType<typeof setTimeout> | undefined
-let _cacheTimer: ReturnType<typeof setTimeout> | undefined
 let _lastDoc: CanvasDoc | undefined
 let _bootstrapped = false  // don't autosave the throwaway initial empty doc before the real one loads
 useStore.subscribe((s) => {
   if (s.doc === _lastDoc) return
+  const previousDoc = _lastDoc
   _lastDoc = s.doc
   if (!_bootstrapped) return  // bootstrap will load & set the real doc; skip persisting anything before that
-  // Always keep THIS browser's offline cache current — INCLUDING a peer's merged edit. It's network-free
-  // (no PUT), so it causes no write amplification, but it stops an offline reload from losing peer edits
-  // received this session.
-  clearTimeout(_cacheTimer)
-  _cacheTimer = setTimeout(() => {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(useStore.getState().doc)) } catch { /* quota */ }
-  }, 400)
-  if (_settlingLoadedDoc) return
+  if (_settlingLoadedDoc || _acceptingServerVersion) return
+  // Running a graph changes presentation-only node badges and the server owns the top-level version.
+  // Neither is a local edit, so they must not create a draft or compete with an actual autosave CAS.
+  if (previousDoc && canvasEditableContentEqual(previousDoc, s.doc)) return
   // a peer's edit was merged into our doc (via the CRDT) — the editing peer PUTs it, so we must NOT also
-  // PUT it. Without this guard, N co-editors each write the whole doc on every edit (N-way amplification).
-  // Local edits + local undo/redo (collabApply.remote === false) still PUT. (Cache above is unconditional.)
+  // PUT or claim it as this principal's offline edit. Local edits + local undo/redo still persist.
   if (collabApply.remote) return
   // Viewer/unknown access is fail-closed before any PUT. Store-level mutation guards mean this is
   // normally just a safety net for a server/external document refresh or a role changing mid-debounce.
@@ -2682,57 +3075,55 @@ useStore.subscribe((s) => {
     if (!s.saved) useStore.setState({ saved: true })
     return
   }
-  if (s.saved) useStore.setState({ saved: false })  // dirty → "saving…"
+  if (s.saved) useStore.setState({ saved: false })
   clearTimeout(_saveTimer)
-  _saveTimer = setTimeout(async () => {
+  _saveTimer = setTimeout(() => {
     const state = useStore.getState()
-    if (!roleCanEdit(state.canvasRole)) {
-      useStore.setState({ saved: true })
-      return
-    }
+    const principalId = state.currentUser?.id
+    if (!principalId || !roleCanEdit(state.canvasRole)) return
     if (state.doc.nodes.some((node) => numericDraftInvalidReason(node, state.numericParamDrafts[node.id]))) return
     const doc = state.doc
-    try {
-      await api.saveCanvas(doc)  // PUT to the metadata DB (per-user, upsert)
-      useStore.setState((st) => ({
-        saved: true,
-        kernelUp: true,  // a successful save confirms the kernel is reachable (clears the offline banner)
-        accessDenied: false,  // a save went through → we clearly still have edit access
-        files: st.files.map((f) => (f.id === doc.id ? { ...f, name: doc.name ?? f.name, version: doc.version } : f)),
-      }))
-    } catch (e) {
-      if (e instanceof KernelError && (e.status === 401 || e.status === 403)) {
-        // Permission/session rejection, NOT connectivity. Fail closed immediately; refreshFiles may
-        // then recover the precise viewer/editor role without allowing another local edit first.
-        if (!useStore.getState().accessDenied) useStore.getState().pushToast(
-          e.status === 401
-            ? 'Your session no longer permits editing. This canvas is now read-only.'
-            : 'Your editing access changed. This canvas is now read-only and the last change was not saved.',
-          'error',
-        )
-        rememberRole(useStore.getState().currentUser?.id, doc.id, null)
-        useStore.setState({ saved: true, kernelUp: true, accessDenied: true, canvasRole: null, agentOpen: false })
-        void useStore.getState().refreshFiles()
-      } else {
-        // offline: the localStorage cache still holds it; flag the kernel down so the banner shows
-        useStore.setState({ saved: true, kernelUp: false })
-      }
+    const previous = state.localDrafts.find((draft) => draft.draftId === doc.id)
+    const draft = draftForDoc(principalId, doc, previous?.baseVersion ?? state.serverVersion, previous)
+    const stored = writeCanvasDraft(draft)
+    const visibleDraft = draftAfterStorageWrite(draft, stored)
+    useStore.setState((current) => ({
+      currentDraftId: draft.draftId,
+      localDrafts: replaceDraft(current.localDrafts, visibleDraft),
+      saved: stored.ok,
+      draftStorageErrors: stored.ok ? current.draftStorageErrors : [...current.draftStorageErrors, stored.error!],
+    }))
+    if (!stored.ok) {
+      useStore.getState().pushToast(stored.error!, 'error')
+      return
     }
+    // A new local-only Canvas is synchronized only through its explicit Retry control. Existing
+    // online Canvases retain autosave, now protected by the persisted base-version CAS.
+    if (draft.baseVersion != null) void useStore.getState().retryLocalDraft(draft.draftId)
   }, 400)
 })
 
-// Flush a pending local save on tab close, so an edit made inside the 400ms debounce isn't lost. This
-// also closes the collab case where the originating editor — the only client that PUTs its own edit —
-// disconnects mid-debounce. Fires ONLY when there's an unsaved LOCAL edit (saved === false); a client
-// that merely merged peer edits stays saved:true, so it won't redundantly PUT. keepalive lets the
-// request outlive the unloading page.
+// Flush an edit still inside the debounce to its principal-scoped record on tab close. Do not start a
+// remote save during unload: its response cannot reliably advance/remove the local draft, and a
+// committed keepalive would therefore leave that draft fenced to a stale server version on reload.
 if (typeof window !== 'undefined') {
   window.addEventListener('pagehide', () => {
     const state = useStore.getState()
     if (!_bootstrapped || state.saved || !roleCanEdit(state.canvasRole)) return
-    const doc = state.doc
-    try { localStorage.setItem(LS_KEY, JSON.stringify(doc)) } catch { /* quota */ }
-    void api.saveCanvas(doc, true).catch(() => {})  // best-effort; can't await on unload
+    const principalId = state.currentUser?.id
+    if (!principalId) return
+    const previous = state.localDrafts.find((draft) => draft.draftId === state.doc.id)
+    const draft = draftForDoc(principalId, state.doc, previous?.baseVersion ?? state.serverVersion, previous)
+    const stored = writeCanvasDraft(draft)
+    const visibleDraft = draftAfterStorageWrite(draft, stored)
+    useStore.setState((current) => ({
+      currentDraftId: draft.draftId,
+      localDrafts: replaceDraft(current.localDrafts, visibleDraft),
+      saved: stored.ok,
+      draftStorageErrors: stored.ok
+        ? current.draftStorageErrors
+        : [...current.draftStorageErrors, stored.error!],
+    }))
   })
 }
 

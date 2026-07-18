@@ -10,6 +10,7 @@ import {
   CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
   type CatalogDiscoveryQueryState,
 } from './CatalogDiscovery'
+import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
@@ -54,7 +55,10 @@ export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState
 
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
-  return scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />
+  return <div className="flex h-full min-h-0 flex-col">
+    <WorkspaceLocalDrafts />
+    <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
+  </div>
 }
 
 // The explorer deliberately consumes the bounded Workspace API rather than composing a canvas list

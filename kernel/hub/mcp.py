@@ -138,7 +138,9 @@ class Playground:
         from hub.routers import workspace as ws
         doc["version"] = (doc.get("version") or 1) + 1
         try:
-            ws.put_canvas(canvas_id, doc, uid=self.user_id)
+            # This direct Python call bypasses FastAPI dependency injection, so pass the query default
+            # explicitly instead of leaking its Query() FieldInfo object into the persistence path.
+            ws.put_canvas(canvas_id, doc, expected_version=None, uid=self.user_id)
         except HTTPException as e:
             raise ToolError(f"canvas '{canvas_id}': {e.detail}")
         self.changed_canvases.add(canvas_id)  # so the HTTP transport can nudge an open browser tab

@@ -603,23 +603,41 @@ def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
 
 
 @router.put("/canvas/{canvas_id}")
-def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> dict:
+def put_canvas(canvas_id: str, doc: dict,
+               expected_version: int | None = Query(None, alias="expectedVersion", ge=1),
+               uid: str = Depends(current_user)) -> dict:
     role = metadb.canvas_role(canvas_id, uid)  # None if the canvas doesn't exist yet
-    doc_json = json.dumps(doc)
-    version = doc.get("version", 1)
     with metadb.session() as s:
         c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         previous_name = c.name if c is not None else None
         if c and role not in ("owner", "editor"):
             raise HTTPException(403, "you don't have edit access to this canvas")
+        if expected_version is not None:
+            if c is None:
+                raise APIError(
+                    409,
+                    f"canvas '{canvas_id}' was deleted before this draft could sync",
+                    code=APIErrorCode.CONFLICT,
+                    retryable=False,
+                )
+            if c.version != expected_version:
+                raise APIError(
+                    409,
+                    f"canvas '{canvas_id}' changed from expected version {expected_version}",
+                    code=APIErrorCode.CONFLICT,
+                    retryable=False,
+                )
         if not c:
             c = metadb.Canvas(id=canvas_id, owner_id=uid)  # first save → the creator owns it
             s.add(c)
+        version = expected_version + 1 if expected_version is not None else doc.get("version", 1)
+        persisted_doc = {**doc, "id": canvas_id, "version": version}
+        doc_json = json.dumps(persisted_doc)
         c.name = doc.get("name") or c.name or "untitled"
         c.version = version
         c.doc = doc_json
         s.flush()  # settle a newly-created owner row before the local-result registry lock
-        metadb.sync_local_result_owner(s, "canvas", canvas_id, doc)
+        metadb.sync_local_result_owner(s, "canvas", canvas_id, persisted_doc)
         metadb._workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=canvas_id, name=c.name)
         if previous_name is not None:
@@ -629,7 +647,7 @@ def put_canvas(canvas_id: str, doc: dict, uid: str = Depends(current_user)) -> d
     # keep a throttled snapshot history so a bad edit is recoverable (autosave fires ~every 400ms; the
     # snapshotter dedups + rate-limits so it doesn't store every keystroke)
     metadb.snapshot_canvas(canvas_id, doc_json, version, author_id=uid)
-    return {"ok": True, "id": canvas_id}
+    return {"ok": True, "id": canvas_id, "version": version}
 
 
 @router.get("/canvas/{canvas_id}/versions")

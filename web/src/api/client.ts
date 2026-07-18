@@ -378,11 +378,15 @@ export const api = {
     inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
+    const admittedProducerVersion = writeIntent?.provenance.publication.producerVersion
+    const submittedDoc = admittedProducerVersion == null
+      ? doc
+      : { ...doc, version: admittedProducerVersion }
     for (let attempt = 0; ; attempt += 1) {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(doc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
+          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error
@@ -449,8 +453,12 @@ export const api = {
     req<{ ok: boolean; id: string; created: boolean }>('/canvas', {
       method: 'POST', body: JSON.stringify(doc),
     }),
-  saveCanvas: (doc: CanvasDoc, keepalive = false) =>  // keepalive: let the PUT survive a tab-close flush
-    req<{ ok: boolean; id: string }>(`/canvas/${doc.id}`, { method: 'PUT', body: JSON.stringify(doc), keepalive }),
+  saveCanvas: (doc: CanvasDoc, keepalive = false, expectedVersion?: number) => {  // keepalive: let the PUT survive a tab-close flush
+    const query = expectedVersion == null ? '' : `?expectedVersion=${encodeURIComponent(expectedVersion)}`
+    return req<{ ok: boolean; id: string; version: number }>(`/canvas/${doc.id}${query}`, {
+      method: 'PUT', body: JSON.stringify(doc), keepalive,
+    })
+  },
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
   workspaceJobs: (params: WorkspaceJobsQuery = {}) => {

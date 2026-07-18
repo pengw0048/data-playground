@@ -125,3 +125,39 @@ def test_workspace_explicit_viewer_is_read_only_in_list_put_and_collab(monkeypat
                     # Presence remains visible, but the preceding Yjs write is dropped by the same
                     # effective viewer role used by list_canvas and put_canvas.
                     assert owner_ws.receive_json()["type"] == "presence"
+
+
+def test_canvas_put_expected_version_prevents_stale_or_deleted_draft_overwrite(monkeypatch):
+    canvas_id = "canvas_draft_expected_version"
+    with _canvas(canvas_id, "private"):
+        monkeypatch.setenv("DP_AUTH_SECRET", AUTH_SECRET)
+        owner_headers = {"Cookie": f"dp_session={auth.sign(OWNER_ID)}"}
+        with TestClient(app) as client:
+            first = client.put(
+                f"/api/canvas/{canvas_id}?expectedVersion=1",
+                json=_doc(canvas_id, "first edit"),
+                headers=owner_headers,
+            )
+            assert first.status_code == 200
+            assert first.json() == {"ok": True, "id": canvas_id, "version": 2}
+            assert client.get(f"/api/canvas/{canvas_id}", headers=owner_headers).json() == {
+                **_doc(canvas_id, "first edit"), "version": 2,
+            }
+
+            stale = client.put(
+                f"/api/canvas/{canvas_id}?expectedVersion=1",
+                json=_doc(canvas_id, "stale offline edit"),
+                headers=owner_headers,
+            )
+            assert stale.status_code == 409
+            assert stale.json()["code"] == "conflict"
+            assert client.get(f"/api/canvas/{canvas_id}", headers=owner_headers).json()["name"] == "first edit"
+
+            metadb.delete_canvas_cascade(canvas_id)
+            deleted = client.put(
+                f"/api/canvas/{canvas_id}?expectedVersion=2",
+                json={**_doc(canvas_id, "deleted offline edit"), "version": 2},
+                headers=owner_headers,
+            )
+            assert deleted.status_code == 409
+            assert deleted.json()["code"] == "conflict"

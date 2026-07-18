@@ -1,6 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
 import { api, KernelError, setApiUser, toGraph } from './client'
 import type { CanvasDoc } from '../types/graph'
+import type { WriteIntent } from '../types/api'
 
 afterEach(() => {
   setApiUser(null)
@@ -61,6 +62,33 @@ describe('toGraph wire serialization', () => {
 })
 
 describe('run-scoped result access', () => {
+  it('resubmits a frozen write with its admitted producer version after Canvas autosave', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      runId: 'run-1', status: 'running', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const doc: CanvasDoc = {
+      id: 'canvas', version: 8, nodes: [{
+        id: 'write', type: 'write', position: { x: 0, y: 0 },
+        data: { title: 'write', status: 'failed', config: { filename: 'output.parquet' } },
+      }], edges: [],
+    }
+    const intent: WriteIntent = {
+      destination: { logicalUri: '/outputs/output.parquet', name: 'output', provider: 'managed-local-file' },
+      mode: 'create', expectedSchema: [], expectedHead: null, idempotencyKey: 'write-key', partitions: [],
+      provenance: { publication: {
+        idempotencyKey: 'write-key', producer: 'canvas', producerVersion: 7, provenance: 'run',
+      }, parents: [] },
+    }
+
+    await api.run(doc, 'write', true, 'submission', undefined, intent)
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
+    expect(body.graph.version).toBe(7)
+    expect(body.writeIntent).toEqual(intent)
+    expect(doc.version).toBe(8)
+  })
+
   it('samples a persisted output by run/node/port identity instead of a client-provided URI', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       columns: [], rows: [], truncated: false, completeness: 'complete',

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // the store module runs autosave side-effects at import; stub the network client so nothing escapes.
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
-  listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
@@ -16,6 +16,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.getCanvas
         : property === 'createCanvas'
           ? apiMocks.createCanvas
+          : property === 'saveCanvas'
+            ? apiMocks.saveCanvas
           : property === 'deleteCanvas'
             ? apiMocks.deleteCanvas
           : property === 'preview'
@@ -53,6 +55,7 @@ import {
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
+import { writeCanvasDraft } from './canvasDrafts'
 
 const storage = new Map<string, string>()
 Object.defineProperty(globalThis, 'localStorage', {
@@ -80,6 +83,9 @@ describe('graph store — core authority ops', () => {
     apiMocks.getCanvas.mockReset()
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
       { ok: true, id: doc.id, created: true }
+    ))
+    apiMocks.saveCanvas.mockReset().mockImplementation(async (_doc: unknown, _keepalive: boolean, expectedVersion?: number) => (
+      { ok: true, id: 'c', version: (expectedVersion ?? 0) + 1 }
     ))
     apiMocks.deleteCanvas.mockReset().mockResolvedValue({ ok: true })
     apiMocks.preview.mockReset()
@@ -109,7 +115,8 @@ describe('graph store — core authority ops', () => {
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
-      profileJobs: {}, agentLog: [],
+      profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
+      serverVersion: 1, saved: true,
     })
   })
 
@@ -977,7 +984,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
   })
 
-  it('reuses the admitted write submission after an ambiguous response loss', async () => {
+  it('reuses the admitted write submission after response loss and a Canvas version save', async () => {
     const write = NODE('write', 'write')
     write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
     const doc = { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] }
@@ -1013,6 +1020,9 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write).toMatchObject({
       phase: 'failed', writeAdmission: admission, writeSubmissionId: submissionId,
     })
+    // Autosave advances Canvas metadata independently of execution semantics. It must not invalidate
+    // the admitted write or mint a second submission identity after an ambiguous response loss.
+    useStore.setState((state) => ({ doc: { ...state.doc, version: state.doc.version + 1 } }))
 
     await useStore.getState().run('write')
 
@@ -1021,6 +1031,7 @@ describe('graph store — core authority ops', () => {
       'write', false, submissionId, undefined, intent,
     ])
     expect(apiMocks.run.mock.calls[1][0].nodes[0].data.config).toEqual(doc.nodes[0].data.config)
+    expect(apiMocks.run.mock.calls[1][0].version).toBe(2)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
   })
 
@@ -2531,6 +2542,175 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().canvasRole).toBe('owner')
     expect(useStore.getState().view).toBe('canvas')
     expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+    expect(useStore.getState().localDrafts).toMatchObject([{
+      canvasId: useStore.getState().doc.id,
+      baseVersion: null,
+      syncState: 'dirty',
+    }])
+  })
+
+  it('keeps a local-first owner draft when a 5xx leaves create outcome unknown', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new KernelError(502, 'proxy lost the hub response'))
+
+    const created = await useStore.getState().newFile()
+
+    expect(created).toMatchObject({ ok: true, persistence: 'local-draft' })
+    expect(useStore.getState().localDrafts).toMatchObject([{
+      canvasId: useStore.getState().doc.id,
+      createAttemptDoc: useStore.getState().doc,
+      baseVersion: null,
+      syncState: 'dirty',
+    }])
+  })
+
+  it('retries a local-only draft with the same stable idempotent create identity', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+    const created = await useStore.getState().newFile()
+    if (!created.ok) throw new Error('expected local draft')
+    const draft = useStore.getState().localDrafts[0]
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: true })
+
+    await useStore.getState().retryLocalDraft(draft.draftId)
+
+    expect(apiMocks.createCanvas).toHaveBeenLastCalledWith(draft.doc)
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().currentDraftId).toBeNull()
+    expect(useStore.getState().serverVersion).toBe(1)
+  })
+
+  it('recovers a lost create response only after confirming owner and exact first content', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    const edited = { ...draft, doc: { ...draft.doc, name: 'edited offline' }, name: 'edited offline' }
+    useStore.setState({ doc: edited.doc, localDrafts: [edited] })
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: false })
+    apiMocks.listCanvases.mockResolvedValueOnce([{ id: draft.canvasId, name: 'untitled', version: 1, role: 'owner' }])
+    apiMocks.getCanvas.mockResolvedValueOnce(draft.createAttemptDoc)
+    apiMocks.saveCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, version: 2 })
+
+    await useStore.getState().retryLocalDraft(draft.draftId)
+
+    expect(apiMocks.saveCanvas).toHaveBeenCalledWith(edited.doc, false, 1)
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().doc.version).toBe(2)
+  })
+
+  it('marks a same-id create collision as a conflict instead of overwriting it', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    apiMocks.createCanvas.mockResolvedValueOnce({ ok: true, id: draft.canvasId, created: false })
+    apiMocks.listCanvases.mockResolvedValueOnce([{ id: draft.canvasId, name: 'other', version: 3, role: 'owner' }])
+    apiMocks.getCanvas.mockResolvedValueOnce({ ...draft.doc, name: 'other', version: 3 })
+
+    await useStore.getState().retryLocalDraft(draft.draftId)
+
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().localDrafts[0]).toMatchObject({ syncState: 'conflict' })
+    expect(useStore.getState().localDrafts[0].lastError).toContain('changed or was deleted')
+  })
+
+  it('preserves an existing-canvas draft when the server canvas was deleted', async () => {
+    const doc = { ...emptyTestDoc('existing'), name: 'edited offline' }
+    expect(writeCanvasDraft({
+      draftId: doc.id,
+      principalId: 'alice',
+      canvasId: doc.id,
+      baseCanvasId: doc.id,
+      baseVersion: 1,
+      name: doc.name,
+      doc,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-18T12:00:00.000Z',
+    }).ok).toBe(true)
+    useStore.getState().refreshLocalDrafts()
+    expect(useStore.getState().openLocalDraft(doc.id)).toBe(true)
+    apiMocks.saveCanvas.mockRejectedValueOnce(new KernelError(409, 'canvas was deleted'))
+
+    await useStore.getState().retryLocalDraft(doc.id)
+
+    expect(apiMocks.saveCanvas).toHaveBeenCalledWith(doc, false, 1)
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().localDrafts[0]).toMatchObject({
+      syncState: 'conflict',
+      doc,
+    })
+  })
+
+  it('clears another principal draft list synchronously on identity change', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    expect(useStore.getState().localDrafts).toHaveLength(1)
+
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().currentDraftId).toBeNull()
+    expect(useStore.getState().canvasRole).toBeNull()
+  })
+
+  it('deletes the selected local-only draft without deleting a server canvas', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+
+    await useStore.getState().discardLocalDraft(draft.draftId)
+    confirm.mockRestore()
+
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(apiMocks.deleteCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().doc.id).not.toBe(draft.canvasId)
+  })
+
+  it('does not reintroduce a previous principal draft when an in-flight retry settles', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const draft = useStore.getState().localDrafts[0]
+    let rejectRetry!: (error: Error) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectRetry = reject
+    }))
+
+    const retrying = useStore.getState().retryLocalDraft(draft.draftId)
+    useStore.setState({ currentUser: { id: 'bob', name: 'Bob' } })
+    rejectRetry(new TypeError('late response loss'))
+    await retrying
+
+    expect(useStore.getState().currentUser?.id).toBe('bob')
+    expect(useStore.getState().localDrafts).toEqual([])
+    expect(useStore.getState().toasts).toEqual([])
+  })
+
+  it('does not overwrite newer local edits when an in-flight retry fails', async () => {
+    apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
+    await useStore.getState().newFile()
+    const original = useStore.getState().localDrafts[0]
+    let rejectRetry!: (error: Error) => void
+    apiMocks.createCanvas.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectRetry = reject
+    }))
+
+    const retrying = useStore.getState().retryLocalDraft(original.draftId)
+    const editedDoc = { ...original.doc, name: 'edited while retrying' }
+    useStore.setState((state) => ({
+      doc: editedDoc,
+      localDrafts: state.localDrafts.map((draft) => draft.draftId === original.draftId
+        ? { ...draft, doc: editedDoc, name: editedDoc.name!, syncState: 'dirty' as const,
+          lastLocalEditAt: '2026-07-18T13:00:00.000Z' }
+        : draft),
+    }))
+    rejectRetry(new TypeError('late response loss'))
+    await retrying
+
+    expect(useStore.getState().localDrafts[0]).toMatchObject({
+      doc: editedDoc,
+      name: 'edited while retrying',
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-18T13:00:00.000Z',
+    })
   })
 
   it('keeps the importer destination as a local draft on a genuine transport failure', async () => {

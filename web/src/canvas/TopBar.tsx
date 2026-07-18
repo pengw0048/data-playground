@@ -20,11 +20,14 @@ import { ShareModal } from '../panels/ShareModal'
 import { crdtUndoActive } from '../collab/undo'
 import { resolvedTheme, toggleTheme } from '../theme/mode'
 import { KernelBadge } from './KernelBadge'
+import { CanvasDraftMenu } from './LocalDrafts'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
   const kernelInfo = useStore((s) => s.kernelInfo)
   const saved = useStore((s) => s.saved)
+  const currentDraftId = useStore((s) => s.currentDraftId)
+  const currentDraft = useStore((s) => s.localDrafts.find((draft) => draft.draftId === s.currentDraftId))
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
   const rerunAll = useStore((s) => s.rerunAll)
@@ -41,6 +44,12 @@ export function TopBar() {
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
+    : currentDraft?.syncState === 'conflict'
+      ? 'sync conflict'
+      : currentDraft?.syncState === 'error'
+        ? 'draft not saved'
+        : currentDraftId
+          ? (currentDraft?.syncState === 'syncing' ? 'syncing…' : 'saved locally')
     : saved
       ? (kernelUp ? 'saved' : 'saved locally')
       : 'saving…'
@@ -66,11 +75,11 @@ export function TopBar() {
 
   return (
     <>
-      <div style={{ position: 'absolute', top: 16, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
-        <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : !kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined} className="ml-0.5 text-[11px] text-muted-foreground">· {saveLabel}</span>
+        <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined)} className={cn('ml-0.5 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
         <span className="ml-1.5 inline-flex gap-0.5">
           <IconBtn name="undo" label="Undo" disabled={!canEdit || !canUndo} onClick={() => useStore.getState().undo()} />
           <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
@@ -78,7 +87,7 @@ export function TopBar() {
         </span>
       </div>
 
-      <div style={{ position: 'absolute', top: 16, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
+      <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
         <PeerAvatars />
         <KernelBadge kernelUp={kernelUp} kernelInfo={kernelInfo} />
         <Button onClick={rerunAll} disabled={!canEdit} title={canEdit ? 'Re-run the whole graph' : 'View-only canvas'} size="sm" className="rounded-full bg-foreground text-background hover:bg-foreground/90">
@@ -158,6 +167,8 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const newFromExample = useStore((s) => s.newFromExample)
   const renameFile = useStore((s) => s.renameFile)
   const deleteFile = useStore((s) => s.deleteFile)
+  const discardLocalDraft = useStore((s) => s.discardLocalDraft)
+  const currentDraftId = useStore((s) => s.currentDraftId)
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
 
@@ -199,6 +210,7 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
           ))}
           {files.length === 0 && <div className="p-2.5 text-[11.5px] text-muted-foreground">No files yet.</div>}
         </div>
+        <CanvasDraftMenu close={() => setOpen(false)} />
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
@@ -209,7 +221,7 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
           </DropdownMenuItem>
         ))}
         {canvasRole === 'owner' && <DropdownMenuSeparator />}
-        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> Delete this file</DropdownMenuItem>}
+        {canvasRole === 'owner' && <DropdownMenuItem onSelect={() => currentDraftId ? void discardLocalDraft(currentDraftId) : void deleteFile(doc.id)} className="text-destructive focus:text-destructive"><Icon name="trash" size={14} /> {currentDraftId ? 'Delete this local draft' : 'Delete this file'}</DropdownMenuItem>}
       </DropdownMenuContent>
     </DropdownMenu>
   )

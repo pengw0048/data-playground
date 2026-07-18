@@ -26,8 +26,9 @@ describe('Write card — typed local mode truth', () => {
         } },
       }],
     }
+    const { version: _version, ...executionDoc } = doc
     const fingerprint = JSON.stringify({
-      ...doc,
+      ...executionDoc,
       nodes: doc.nodes.map((node) => {
         const { status: _status, ...data } = node.data
         return { ...node, data }
@@ -78,8 +79,9 @@ describe('Write card — typed local mode truth', () => {
   it('re-admits after terminal cleanup without reusing the completed submission or polling', async () => {
     const doc = useStore.getState().doc
     const data = doc.nodes[0].data
+    const { version: _version, ...executionDoc } = doc
     const fingerprint = JSON.stringify({
-      ...doc,
+      ...executionDoc,
       nodes: doc.nodes.map((node) => {
         const { status: _status, ...nodeData } = node.data
         return { ...node, data: nodeData }

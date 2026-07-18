@@ -17,6 +17,7 @@ import { initRouter } from './router'
 import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { useCollapsibleRegion } from './layoutPreferences'
+import { confirmedLocalMode, rememberAuthMode } from './localIdentity'
 
 type AuthState =
   | { kind: 'checking' }
@@ -76,6 +77,7 @@ export default function App() {
         if (!isAuthStatus(status)) throw new Error('The auth status response is incompatible with this app version.')
         if (generation !== requestGeneration.current) return
         useStore.getState().setAuthEnabled(status.authEnabled)
+        rememberAuthMode(status.authEnabled)
         setAuth(!status.authEnabled ? { kind: 'local' }
           : status.userId ? { kind: 'authenticated', userId: status.userId } : { kind: 'login' })
         return
@@ -88,7 +90,11 @@ export default function App() {
       }
     }
     if (generation === requestGeneration.current) {
-      setAuth({ kind: 'unavailable', attempts: AUTH_BOOTSTRAP_ATTEMPTS, diagnostic })
+      // A previously server-confirmed no-auth local deployment has one stable workstation principal.
+      // Re-enter only that mode while the hub is down so its Canvas drafts can survive a full reload.
+      // Signed-in deployments never use this fallback: identity/logout must be re-confirmed online.
+      if (confirmedLocalMode()) setAuth({ kind: 'local' })
+      else setAuth({ kind: 'unavailable', attempts: AUTH_BOOTSTRAP_ATTEMPTS, diagnostic })
     }
   }, [])
 

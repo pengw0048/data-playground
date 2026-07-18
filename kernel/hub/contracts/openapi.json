@@ -7884,6 +7884,23 @@
             }
           },
           {
+            "in": "query",
+            "name": "expectedVersion",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expectedversion"
+            }
+          },
+          {
             "in": "header",
             "name": "x-dp-user",
             "required": false,
