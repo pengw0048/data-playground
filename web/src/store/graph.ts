@@ -870,6 +870,8 @@ interface Store {
   setWorkspaceSearchQuery: (query: string) => void
   jobsQuery: string
   setJobsQuery: (query: string) => void
+  inboxQuery: string
+  setInboxQuery: (query: string) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -903,7 +905,7 @@ interface Store {
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
-export type DpView = 'canvas' | 'workspace' | 'jobs' | 'files' | 'tables' | 'transforms' | 'relationships'
+export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'tables' | 'transforms' | 'relationships'
 
 function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
@@ -1097,6 +1099,11 @@ export const useStore = create<Store>((set, get) => ({
   setJobsQuery: (query) => {
     if (get().view !== 'jobs') _fileNavigationGeneration += 1
     set({ jobsQuery: query, view: 'jobs' })
+  },
+  inboxQuery: '',
+  setInboxQuery: (query) => {
+    if (get().view !== 'inbox') _fileNavigationGeneration += 1
+    set({ inboxQuery: query, view: 'inbox' })
   },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
@@ -2229,6 +2236,7 @@ export const useStore = create<Store>((set, get) => ({
           get().setWorkspaceSearchQuery(route.workspaceQuery ?? '')
         }
         else if (route.view === 'jobs') get().setJobsQuery(route.jobsQuery ?? '')
+        else if (route.view === 'inbox') get().setInboxQuery(route.inboxQuery ?? '')
         else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {
