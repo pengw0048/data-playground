@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type InboxItemDto } from '../api/client'
+import { api, type InboxItemDto, type InboxTaskKind } from '../api/client'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
@@ -18,8 +18,15 @@ function outcomeLabel(item: InboxItemDto): string {
   return 'Failed'
 }
 
-function kindLabel(kind: InboxItemDto['taskKind']): string {
-  return kind === 'managed_local_write' ? 'Managed local write' : 'External wait'
+const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
+  managed_local_write: 'Managed local write',
+  external_wait: 'External wait',
+  linear_checkpoint_write: 'Checkpointed write',
+  bounded_fanout_write: 'Bounded fan-out write',
+}
+
+export function kindLabel(kind: InboxItemDto['taskKind'] | string): string {
+  return TASK_KIND_LABELS[kind as InboxTaskKind] ?? `Unknown task type: ${kind}`
 }
 
 function relTime(iso: string): string {

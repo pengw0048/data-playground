@@ -534,13 +534,18 @@ export interface InboxItemDto {
   taskId: string
   canvasId: string
   canvasName?: string | null
-  taskKind: 'managed_local_write' | 'external_wait'
+  taskKind: InboxTaskKind
   outcome: 'completed' | 'failed' | 'cancelled'
   diagnosticCode?: string | null
   terminalAt: string
   readAt?: string | null
   jobAvailable: boolean
 }
+export type InboxTaskKind =
+  | 'managed_local_write'
+  | 'external_wait'
+  | 'linear_checkpoint_write'
+  | 'bounded_fanout_write'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface InboxUnreadCount { count: number }
 export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }
