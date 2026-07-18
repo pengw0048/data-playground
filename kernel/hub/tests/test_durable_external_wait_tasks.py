@@ -624,7 +624,9 @@ def test_missing_or_invalid_evidence_fails_closed_and_stays_listable(identity):
     metadb.fail_corrupt_external_wait_tasks()
     assert metadb.durable_task(third["id"])["status"] == "failed"
     missing_attempt = metadb.list_workspace_runs(identity[0], run_id=third["id"])["items"][0]
-    assert missing_attempt["status"] == "failed" and missing_attempt["taskAttempts"] == []
+    assert missing_attempt["status"] == "failed"
+    assert len(missing_attempt["taskAttempts"]) == 1
+    assert missing_attempt["taskAttempts"][0]["status"] == "failed"
 
 
 def test_database_due_backoff_budget_deadline_and_regressions(identity):
