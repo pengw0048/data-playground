@@ -228,6 +228,8 @@ def test_happy_path_rows_match_select_star(tmp_path, rows):
     assert fanout["partitionCount"] in (1, 2, 3, 4)
     assert fanout["completedPartitions"] == fanout["partitionCount"]
     assert fanout["failedPartitions"] == 0
+    assert job["updatedAt"].endswith("+00:00")
+    assert job["taskAttempts"][-1]["updatedAt"].endswith("+00:00")
     forbidden = (
         "planDigest", "plan_digest", "ranges", "unitId", "unit_id", "slot",
         "lease", "token", "digest", "uri", "schema", "attempt_id",

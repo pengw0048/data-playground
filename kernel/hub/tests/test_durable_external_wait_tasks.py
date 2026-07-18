@@ -230,6 +230,9 @@ def test_submit_response_loss_restart_download_and_publish(identity, tmp_path):
     item = page["items"][0]
     assert item["externalWait"]["phase"] == "published"
     assert item["externalWait"]["attemptNumber"] == 1
+    assert item["progress"] is None
+    assert item["updatedAt"].endswith("+00:00")
+    assert item["taskAttempts"][0]["updatedAt"].endswith("+00:00")
     assert item["outputReceipt"] is not None and len(item["outputs"]) == 1
     for sentinel in ("job_id", "checkpoint", "documentJson", "SECRET", ".dp-external-stage"):
         assert sentinel not in encoded
