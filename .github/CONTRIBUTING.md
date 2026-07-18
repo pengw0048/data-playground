@@ -26,7 +26,10 @@ forward migration from the released head.
 
 ## Before you open a PR
 
-- `make test` (kernel) and, if you touched `web/`, `tsc` + `vitest` + `build` are green.
+- `make preflight` is green. It mirrors the required CI checks — artifact hygiene, ruff, basedpyright,
+  the OpenAPI contract, migrations, the full kernel suite, and (when their toolchain is present) web
+  and PostgreSQL — so a green run is the same thing CI gates on. `make preflight-fast` is a quick
+  static-only tier for iteration; run the full `make preflight` before submitting.
 - New behavior has a test. The kernel suite (`kernel/hub/tests/test_kernel.py`) tests against the
   real engine and the real seeded data — mirror the nearest existing test.
 - Keep the change focused. Prefer the smallest patch that solves the problem; don't expand scope.
