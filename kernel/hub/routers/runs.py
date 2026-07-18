@@ -34,6 +34,7 @@ from hub.executors.engine import declared_schema
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
+from hub.execution_manifest import ExecutionManifestError, build_execution_manifest
 from hub.local_run_inputs import LocalRunInputError
 from hub.plugins.adapters import revision_adapter_for_uri
 from hub.run_outputs import (
@@ -90,6 +91,15 @@ _EXPORT_MEDIA_TYPES = {
     ".tsv": "text/tab-separated-values; charset=utf-8",
     ".json": "application/json",
 }
+
+
+def _admitted_execution_manifest(*args, **kwargs) -> tuple[str, str]:
+    try:
+        return build_execution_manifest(*args, **kwargs)
+    except ExecutionManifestError as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.INVALID_REQUEST, retryable=False,
+        ) from exc
 
 
 def _local_run_intent_sha256(
@@ -1297,11 +1307,25 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
                     if owner is None:
                         raise HTTPException(503, "canvas execution kernel is unavailable")
 
+                    execution_sha256, execution_doc = _admitted_execution_manifest(
+                        req.graph,
+                        target_node_id=req.node_id,
+                        target_port_id=port_id,
+                        input_manifest=manifest,
+                        write_intent=None,
+                        deps=deps,
+                    )
+                    graph._execution_manifest_sha256 = execution_sha256
+                    graph._execution_manifest_doc = execution_doc
+
                     try:
                         reservation = metadb.preallocate_or_adopt_profile_run_owner(
                             submission_id, uid, auth_canvas, operational_canvas,
                             req.node_id, port_id, authoritative_digest,
-                            input_manifest=manifest, request_id=request_id,
+                            input_manifest=manifest,
+                            execution_manifest_sha256=execution_sha256,
+                            execution_manifest_doc=execution_doc,
+                            request_id=request_id,
                         )
                     except metadb.ProfileSubmissionConflict as exc:
                         raise HTTPException(409, str(exc)) from exc
@@ -2151,9 +2175,19 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                                 materialize_local_files=True,
                                 local_file_candidates=candidates,
                             ))
+                execution_sha256, execution_doc = _admitted_execution_manifest(
+                    intent_graph,
+                    target_node_id=target_node_id,
+                    target_port_id=None,
+                    input_manifest=manifest,
+                    write_intent=effective_write_intent,
+                    deps=deps,
+                )
                 prebound_local_run_id, _created = metadb.admit_local_run_inputs(
                     uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
                     target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
+                    execution_manifest_sha256=execution_sha256,
+                    execution_manifest_doc=execution_doc,
                     local_file_candidates=candidates,
                 )
                 break
@@ -2176,6 +2210,8 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if persisted is None:
             raise RuntimeError("local run admission was not persisted")
         dispatch_manifest = persisted
+        graph._execution_manifest_sha256 = execution_sha256
+        graph._execution_manifest_doc = execution_doc
         dispatch_graph = _bind_local_run_manifest(graph, persisted, deps, target_node_id)
         if isinstance(runner, KernelBackend):
             # A newly spawned kernel runs boot recovery before serving. Start it only after admission and
@@ -2189,6 +2225,19 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         )
         if not should_dispatch:
             return RunStatus(**claimed_status), deps.runner
+    if graph._execution_manifest_sha256 is None:
+        execution_sha256, execution_doc = _admitted_execution_manifest(
+            intent_graph,
+            target_node_id=target_node_id,
+            target_port_id=None,
+            input_manifest=input_manifest,
+            write_intent=effective_write_intent,
+            deps=deps,
+        )
+        graph._execution_manifest_sha256 = execution_sha256
+        graph._execution_manifest_doc = execution_doc
+        dispatch_graph._execution_manifest_sha256 = execution_sha256
+        dispatch_graph._execution_manifest_doc = execution_doc
     # a run that splits across placement regions (a placed node / checkpoint / fan-out) is owned by the
     # RunController; a single default region returns None → the base runner, exactly as before. Hand it the
     # schema+actual-aware `sizes` we just computed so cost-based placement routes on the SAME measured
@@ -2213,7 +2262,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             # This commit is the authorization boundary: external artifacts, workload identity, and
             # submission are forbidden until the logical run has an authoritative principal.
             token = metadb.preallocate_run_owner(
-                run_id, uid, auth_canvas, operational_canvas_id=operational_canvas
+                run_id, uid, auth_canvas, operational_canvas_id=operational_canvas,
+                execution_manifest_sha256=graph._execution_manifest_sha256,
+                execution_manifest_doc=graph._execution_manifest_doc,
             )
             keepalive_stop = threading.Event()
 

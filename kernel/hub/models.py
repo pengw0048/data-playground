@@ -1262,6 +1262,10 @@ class RunHistoryRecord(Wire):
     ms: int | None = Field(default=None, ge=0)
     error: str | None = None
     input_manifest: list[dict[str, str]] | None = None
+    # Null is an explicit legacy/non-reconstructable outcome. #504 adds the authorized detail surface;
+    # readers must never substitute the current Canvas when this identity is absent.
+    execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_reconstructable: bool = False
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     # Full-profile jobs have no materialized outputs. Keep their measured profile as a separate,
     # bounded history payload instead of abusing result-output fields.
@@ -1279,6 +1283,9 @@ class RunHistoryRecord(Wire):
 
     @model_validator(mode="after")
     def _unique_outputs(self) -> "RunHistoryRecord":
+        if self.execution_manifest_reconstructable != (
+                self.execution_manifest_sha256 is not None):
+            raise ValueError("run history reconstructability must match its manifest identity")
         keys = [(output.node_id, output.port_id) for output in self.outputs]
         if len(keys) != len(set(keys)):
             raise ValueError("run-history outputs must have unique (nodeId, portId) identities")
@@ -1415,6 +1422,8 @@ class WorkspaceRunRecord(Wire):
     progress: float | None = Field(default=None, ge=0, le=1)
     error: str | None = None
     input_manifest: list[dict[str, str]] | None = None
+    execution_manifest_sha256: PlanDigest | None = None
+    execution_manifest_reconstructable: bool = False
     outputs: list[RunOutput] = Field(default_factory=list, max_length=64)
     profile: ProfileResult | None = None
     per_node: list[PerNodeStatus] | None = None
@@ -1439,6 +1448,9 @@ class WorkspaceRunRecord(Wire):
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
+        if self.execution_manifest_reconstructable != (
+                self.execution_manifest_sha256 is not None):
+            raise ValueError("workspace run reconstructability must match its manifest identity")
         keys = [(output.node_id, output.port_id) for output in self.outputs]
         if len(keys) != len(set(keys)):
             raise ValueError("workspace run outputs must have unique (nodeId, portId) identities")
@@ -1615,6 +1627,10 @@ class Graph(Wire):
     _publication_attempt_id: str | None = PrivateAttr(default=None)
     _publication_producer_id: str | None = PrivateAttr(default=None)
     _publication_producer_version: int | None = PrivateAttr(default=None)
+    # Parent-minted execution identity. Private attrs keep the manifest out of worker payloads while
+    # allowing every existing status/history callback to attach the same durable reference.
+    _execution_manifest_sha256: str | None = PrivateAttr(default=None)
+    _execution_manifest_doc: str | None = PrivateAttr(default=None)
 
     @field_validator("id")
     @classmethod

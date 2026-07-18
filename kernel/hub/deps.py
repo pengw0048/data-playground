@@ -311,7 +311,10 @@ def _persist_run(deps, graph, target, status) -> None:
                       rows=status.total_rows, ms=status.ms, error=status.error,
                       outputs=[output.model_dump() for output in status.outputs], per_node=per_node,
                       profile=status.profile.model_dump() if status.profile else None,
-                      run_id=status.run_id, request_id=request_id)
+                      run_id=status.run_id, request_id=request_id,
+                      execution_manifest_sha256=getattr(
+                          graph, "_execution_manifest_sha256", None),
+                      execution_manifest_doc=getattr(graph, "_execution_manifest_doc", None))
     _emit_telemetry(deps, graph, persisted_target, status, per_node, request_id=request_id)
     labels = finished_run_metric_labels(status.status, status.placement)
     emit_metric(MetricName.RUN_FINISHED, 1.0, labels=labels,
@@ -348,7 +351,11 @@ def _persist_run_state(graph, status) -> None:
     from hub import metadb
     metadb.save_run_state(
         status.run_id, status.model_dump(), canvas_id=getattr(graph, "id", None),
-        publish_region=status.status in ("done", "failed"))
+        publish_region=status.status in ("done", "failed"),
+        execution_manifest_sha256=getattr(
+            graph, "_execution_manifest_sha256", None),
+        execution_manifest_doc=getattr(graph, "_execution_manifest_doc", None),
+    )
 
 
 def _result_get(key):
