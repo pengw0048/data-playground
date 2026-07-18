@@ -92,6 +92,7 @@ export interface DatasetRevisionCapabilities {
   selectors: Array<'exact' | 'latest' | 'as_of'>
   asOfOrdering?: 'latest_committed_at_at_or_before' | null
   timezone?: 'UTC' | null
+  datasetViewSave: boolean
 }
 
 export interface DatasetRevisionSummary {
@@ -113,6 +114,45 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   producerOperation?: string | null
   summary: DatasetRevisionSummary
   preview: DatasetRevisionPreview
+}
+
+export type DatasetViewSampling =
+  | { kind: 'all' }
+  | { kind: 'reservoir'; size: number; seed: number }
+
+export interface DatasetViewCreateRequest {
+  submissionId: string
+  name: string
+  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string; lastKnown?: { committedAt?: string | null } | null }
+  selectedColumns: string[]
+  predicate?: string | null
+  sampling: DatasetViewSampling
+}
+
+export interface DatasetViewDefinition {
+  schemaVersion: 1
+  id: string
+  creatorId: string
+  name: string
+  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string; lastKnown?: { committedAt?: string | null } | null }
+  placement: { containerId: string; placementId: string; sourceRegistrationId: string }
+  selectedColumns: string[]
+  predicate?: string | null
+  sampling: DatasetViewSampling
+  sampleProvenance?: SampleProvenance | null
+  retentionOwner: 'provider' | 'core'
+  createdAt: string
+  semanticSha256: string
+  definitionSha256: string
+}
+
+export interface DatasetViewPreview {
+  columns: ColumnSchema[]
+  rows: Record<string, unknown>[]
+  rowCount?: number | null
+  hasMore: boolean
+  rowLimit: 100
+  sampleProvenance?: SampleProvenance | null
 }
 
 export type SchemaCompatibilityStatus = 'compatible' | 'breaking' | 'unknown'
@@ -155,7 +195,7 @@ export interface Facets { folders: FacetValue[]; tags: FacetValue[]; owners: Fac
 export interface FolderNode { name: string; path: string; tableCount: number }
 export interface CatalogFolder { path: string }
 export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
-export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset'
+export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset' | 'dataset_view'
 export interface WorkspaceResource {
   id: string
   kind: WorkspaceResourceKind

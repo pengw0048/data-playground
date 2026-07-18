@@ -20,7 +20,7 @@ test.describe('local Workspace golden journey @ux-smoke', () => {
     await expect(page.getByRole('button', { name: `Open canvas ${canvasName}` })).toBeVisible()
     await expect(page.getByRole('button', { name: `Open dataset ${dataset.name}` })).toBeVisible()
 
-    const search = page.getByRole('textbox', { name: 'Search datasets, canvases, and containers' })
+    const search = page.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' })
     await search.fill(dataset.name)
     await search.press('Enter')
     await expect(page).toHaveURL(/#\/workspace\?q=/)

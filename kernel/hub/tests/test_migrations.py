@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0026_dataset_views", "0025_transform_library_keys"),
         ("0025_transform_library_keys", "0024_promoted_transforms"),
         ("0024_promoted_transforms", "0023_catalog_folder_overlay"),
         ("0023_catalog_folder_overlay", "0022_task_manifests"),
@@ -80,8 +81,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0025_transform_library_keys"]
-    assert metadb.expected_schema_head() == "0025_transform_library_keys"
+    assert scripts.get_heads() == ["0026_dataset_views"]
+    assert metadb.expected_schema_head() == "0026_dataset_views"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -168,6 +169,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0025_transform_library_keys.py": (
             "e8cec95b871d07febaf9762c94f66c1bacb5a812b3064314e5926c70523861cc"
+        ),
+        "0026_dataset_views.py": (
+            "8ce5cbbc09987ad539c9a65ec544373559df0850f4dde27ba079bd13b4b432e9"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
@@ -462,6 +466,52 @@ def test_catalog_folder_overlay_upgrade_and_dataset_only_downgrade_round_trip(tm
                 "JOIN workspace_containers c ON c.id = p.container_id "
                 "WHERE p.id = 'migration-placement'"
             )).scalar_one() == "research"
+
+
+def test_dataset_view_migration_round_trip_and_retention_guard(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'dataset-views.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0024_promoted_transforms")
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+        with metadb.engine().begin() as connection:
+            assert "dataset_views" in inspect(connection).get_table_names()
+            connection.execute(sa.text(
+                "INSERT INTO dataset_views "
+                "(id, owner_id, submission_id, request_sha256, definition_sha256, "
+                "definition_doc, created_at) VALUES "
+                "('migration-view', 'local', 'migration-submission', :request, :definition, "
+                "'{}', CURRENT_TIMESTAMP)"
+            ), {"request": "a" * 64, "definition": "b" * 64})
+            connection.execute(sa.text(
+                "INSERT INTO workspace_placements "
+                "(id, container_id, target_kind, target_id, name, ordinal, version) VALUES "
+                "('migration-view-placement', 'workspace-local-root', 'dataset_view', "
+                "'migration-view', 'Migration view', 0, 1)"
+            ))
+
+        with metadb.engine().connect() as connection:
+            with pytest.raises(RuntimeError, match="cannot downgrade"):
+                command.downgrade(
+                    metadb._alembic_cfg(connection), "0024_promoted_transforms")
+
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "DELETE FROM workspace_placements WHERE id = 'migration-view-placement'"))
+            connection.execute(sa.text(
+                "DELETE FROM dataset_views WHERE id = 'migration-view'"))
+        with metadb.engine().connect() as connection:
+            command.downgrade(
+                metadb._alembic_cfg(connection), "0024_promoted_transforms")
+            assert "dataset_views" not in inspect(connection).get_table_names()
+            with pytest.raises(sa.exc.IntegrityError):
+                connection.execute(sa.text(
+                    "INSERT INTO workspace_placements "
+                    "(id, container_id, target_kind, target_id, name, ordinal, version) VALUES "
+                    "('forbidden-view-placement', 'workspace-local-root', 'dataset_view', "
+                    "'missing-view', 'Forbidden view', 0, 1)"
+                ))
+            connection.rollback()
+            command.upgrade(metadb._alembic_cfg(connection), "head")
 
 
 def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):

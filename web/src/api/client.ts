@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, Facets,
+  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   CanvasTransformReference, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
@@ -265,6 +265,20 @@ export const api = {
   },
   datasetRevision: (datasetId: string, revisionId: string) =>
     req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
+  createDatasetView: (body: DatasetViewCreateRequest) =>
+    req<DatasetViewDefinition>('/dataset-views', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  datasetView: (viewId: string) =>
+    req<DatasetViewDefinition>(`/dataset-views/${encodeURIComponent(viewId)}`),
+  previewDatasetView: (viewId: string) =>
+    req<DatasetViewPreview>(`/dataset-views/${encodeURIComponent(viewId)}/preview`, {
+      method: 'POST',
+    }),
+  deleteDatasetView: (viewId: string) =>
+    req<{ ok: boolean; deleted: boolean }>(`/dataset-views/${encodeURIComponent(viewId)}`, {
+      method: 'DELETE',
+    }),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>

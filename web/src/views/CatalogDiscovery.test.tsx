@@ -6,7 +6,7 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(), tableByRegistration: vi.fn(),
-  datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
+  datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
   setTableMetadata: vi.fn(), saveTableEdit: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
   catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
 }))
@@ -70,6 +70,9 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: [], asOfOrdering: null, timezone: null, datasetViewSave: false,
+    })
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
       hasMore: true, truncated: true, completeness: 'page',
