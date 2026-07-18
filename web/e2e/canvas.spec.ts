@@ -113,6 +113,23 @@ test.describe('Data Playground canvas', () => {
     expect(second.y + second.height).toBeLessThanOrEqual(tb.y + 2)
   })
 
+  test('node finder searches, adds with Enter, and keeps category browsing available', async ({ page }) => {
+    await fresh(page)
+    await page.getByRole('button', { name: 'Find node', exact: true }).click()
+    const finder = page.getByRole('dialog', { name: 'Find a node' })
+    const search = finder.getByRole('textbox', { name: 'Search nodes' })
+    await expect(search).toBeFocused()
+    await search.fill('descriptor_contract')
+    await expect(finder.getByRole('option', { name: /descriptor_contract/i }).first()).toContainText('Plugin · dp-descriptor-contract')
+    await search.fill('filter')
+    await expect(finder.getByRole('option', { name: /filter/i }).first()).toContainText('in dataset/sample · out dataset')
+    await search.press('Enter')
+    await expect(finder).toBeHidden()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    await page.getByRole('button', { name: 'Shape', exact: true }).click()
+    await expect(page.locator('.dp-panel', { hasText: 'filter' }).last()).toBeVisible()
+  })
+
   test('the theme toggle switches between light and dark (and flips the tokens)', async ({ page }) => {
     await page.emulateMedia({ colorScheme: 'light' })  // deterministic default (no OS 'dark' bleed-through)
     await page.goto('/')

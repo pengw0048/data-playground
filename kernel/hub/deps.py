@@ -141,6 +141,9 @@ class Registry:
             print(f"[deps] plugin node '{spec.kind}' already registered by another plugin — refused")
             self._conflict(f"Node '{spec.kind}' conflicts with another plugin.")
             return
+        # Keep the registry's declared owner with the schema so consumers such as the node finder
+        # can identify an active plugin without guessing from a node kind.
+        spec = spec.model_copy(update={"source": f"plugin:{self._pack or 'unknown'}"})
         self.deps.node_specs[spec.kind] = spec
         if build is not None:
             self.deps.node_builders[spec.kind] = build

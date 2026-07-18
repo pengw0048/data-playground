@@ -19,6 +19,8 @@ export interface NodeSpec {
   requires?: ResourceSpec | null
   defaultData: () => NodeData
   blurb: string
+  // `builtin` by default; backend-registered plugin specs carry `plugin:<pack>`.
+  source?: string
   // Optional: dynamically resolve output wire types (e.g. a source's out depends on nothing,
   // but a transform's could vary). Defaults to static `outputs`.
 }

@@ -52,6 +52,9 @@ class NodeSpec(_M):
     can_bypass: bool = False
     previewable: bool = True
     blurb: str = ""
+    # A finder result needs to distinguish core operations from an active extension without
+    # inferring ownership from a kind string. Registry.add_node stamps plugin-owned specs.
+    source: str = "builtin"
     requires: "ResourceSpec | None" = None  # plugin-declared default compute need (e.g. gpu>=8); per-
     #                                          instance override lives in node config.requires (Phase B+)
 

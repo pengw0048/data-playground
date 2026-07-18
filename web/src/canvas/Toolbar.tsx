@@ -6,6 +6,7 @@ import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
+import { NodeFinder } from './NodeFinder'
 import { cn } from '@/lib/utils'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
@@ -23,6 +24,7 @@ export function Toolbar() {
   const agentOpen = useStore((s) => s.agentOpen)
   const canvasRole = useStore((s) => s.canvasRole)
   const [open, setOpen] = useState<Category | null>(null)
+  const [finderOpen, setFinderOpen] = useState(false)
 
   const specs = allSpecs()
   const cats = categoryOrder.filter((c) => specs.some((s) => s.category === c))
@@ -32,6 +34,7 @@ export function Toolbar() {
     const pos = freePosition(useStore.getState().doc.nodes, { x: c.x - 116, y: c.y - 40 })
     addNode(kind, pos)
     setOpen(null)
+    setFinderOpen(false)
   }
 
   if (!roleCanEdit(canvasRole)) {
@@ -59,6 +62,13 @@ export function Toolbar() {
 
         <div className="mx-1 h-[22px] w-px bg-border" />
 
+        <Tooltip label="Find node">
+          <button aria-label="Find node" onClick={() => { setOpen(null); setFinderOpen(true) }}
+            className="grid h-[34px] w-[38px] place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+            <Icon name="search" size={16} />
+          </button>
+        </Tooltip>
+
         <button
           onClick={() => setAgentOpen(!agentOpen)}
           className="inline-flex items-center gap-[7px] rounded-lg px-3.5 py-[7px] text-[12.5px] font-semibold"
@@ -68,6 +78,7 @@ export function Toolbar() {
           <Icon name="sparkle" size={14} /> Agent
         </button>
       </div>
+      {finderOpen && <NodeFinder specs={specs} onPick={add} onClose={() => setFinderOpen(false)} />}
     </div>
   )
 }

@@ -135,7 +135,7 @@ export interface BackendParam { name: string; type: string; default?: unknown; o
 export interface BackendNodeSpec {
   kind: string; title: string; category: string; tag?: string
   inputs: BackendPort[]; outputs: BackendPort[]; params: BackendParam[]
-  canBypass: boolean; previewable: boolean; requires?: ResourceSpec | null; blurb: string
+  canBypass: boolean; previewable: boolean; requires?: ResourceSpec | null; blurb: string; source?: string
 }
 
 export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }

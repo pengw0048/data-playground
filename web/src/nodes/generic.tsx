@@ -232,7 +232,7 @@ export function registerGenericNodes(specs: BackendNodeSpec[]): number {
           accepts: p.accepts as WireType[] | undefined, multi: p.multi,
         })),
         outputs: b.outputs.map((p) => ({ id: p.id, label: p.label, wire: p.wire as WireType })),
-        canBypass: b.canBypass, previewable: b.previewable, requires: b.requires, blurb: b.blurb,
+        canBypass: b.canBypass, previewable: b.previewable, requires: b.requires, blurb: b.blurb, source: b.source,
         defaultData: () => ({
           title: b.title, status: 'draft',
           config: Object.fromEntries(b.params.filter((p) => p.default != null).map((p) => [p.name, p.default])),
