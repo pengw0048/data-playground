@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DatasetViewDefinition, DatasetViewPreview } from '../types/api'
+import type { DatasetViewDefinition, DatasetViewPreview, TemporalWindowV1 } from '../types/api'
 
 const mocks = vi.hoisted(() => ({ previewDatasetView: vi.fn(), deleteDatasetView: vi.fn() }))
 vi.mock('../api/client', () => ({
@@ -80,6 +80,36 @@ describe('DatasetViewDetail', () => {
       'This exact revision is no longer available. The view did not substitute the current head.',
     )
     expect(mocks.previewDatasetView).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders a lossless half-open temporal window without implying the whole dataset', async () => {
+    const windows: TemporalWindowV1[] = [
+      {
+        timeField: 'frame_tick', timeDomain: 'robot-monotonic-v1',
+        startTick: '-9223372036854775808', endTick: '1700000000000000001',
+      },
+      {
+        timeField: 'frame_tick', timeDomain: 'robot-monotonic-v1',
+        startTick: '1700000000000000001', endTick: '9223372036854775807',
+      },
+    ]
+    const browserRoundTrip = JSON.parse(JSON.stringify(windows)) as TemporalWindowV1[]
+    expect(browserRoundTrip).toEqual(windows)
+    const definition: DatasetViewDefinition = {
+      ...DEFINITION,
+      predicate: null,
+      temporalWindow: browserRoundTrip[1],
+    }
+    render(<DatasetViewDetail definition={definition} onClose={vi.fn()} onDeleted={vi.fn()} />)
+
+    expect(await screen.findByText('grasp')).toBeInTheDocument()
+    const dialog = screen.getByRole('dialog', { name: 'robot interactions' })
+    expect(dialog).toHaveTextContent('No additional predicate')
+    expect(dialog).not.toHaveTextContent('All rows (no predicate)')
+    expect(dialog).toHaveTextContent(
+      'frame_tick [1700000000000000001, 9223372036854775807)',
+    )
+    expect(dialog).toHaveTextContent('Time domain: robot-monotonic-v1')
   })
 
   it('keeps an independent exact preview alive when deletion fails', async () => {

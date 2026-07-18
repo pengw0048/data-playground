@@ -50,6 +50,11 @@ from hub.storage import ManagedSourceReadError, source_read_scope
 
 router = APIRouter()
 
+_INTEGER_LOGICAL_TYPES = frozenset({
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+})
+
 
 class _DatasetViewUnsupported(ValueError):
     pass
@@ -88,6 +93,9 @@ def _request_payload(request: DatasetViewCreateRequest, *, include_name: bool) -
         "predicate": request.predicate,
         "sampling": request.sampling.model_dump(by_alias=True, mode="json"),
     }
+    if request.temporal_window is not None:
+        payload["temporalWindow"] = request.temporal_window.model_dump(
+            by_alias=True, mode="json")
     if include_name:
         payload["name"] = request.name
     return payload
@@ -165,10 +173,27 @@ def _defined_relation(
     ]
     if len({identifier_key(column) for column in selected}) != len(selected):
         raise SQLPolicyError("DatasetView columns resolve to the same input column")
+    window = definition.temporal_window
+    if window is not None:
+        time_field = identifier(
+            window.time_field, available, label="DatasetView temporal window field")
+        time_index = next(
+            index for index, column in enumerate(available)
+            if identifier_key(column) == identifier_key(time_field)
+        )
+        if str(relation.types[time_index]).upper() not in _INTEGER_LOGICAL_TYPES:
+            raise _DatasetViewUnsupported(
+                "DatasetView temporal window field must be an integer column")
     if definition.predicate:
         predicate = validate_fragment(
             FragmentKind.PREDICATE, definition.predicate, con=db.conn()).sql
         relation = relation.filter(predicate)
+    if window is not None:
+        start_tick, end_tick = int(window.start_tick), int(window.end_tick)
+        relation = relation.filter(
+            f"{quote_identifier(time_field)} >= {start_tick} "
+            f"AND {quote_identifier(time_field)} < {end_tick}"
+        )
     relation = relation.project(", ".join(quote_identifier(column) for column in selected))
     # DuckDB relations bind lazily. Force schema binding without reading a row so invalid predicates
     # and projections fail before the immutable definition is committed.
@@ -318,6 +343,9 @@ def create_dataset_view(
                 "createdAt": created_at.isoformat(),
                 "semanticSha256": semantic_sha256,
             }
+            if request.temporal_window is not None:
+                base["temporalWindow"] = request.temporal_window.model_dump(
+                    by_alias=True, mode="json")
             definition_sha256 = _canonical_sha256(base)
             definition = DatasetViewDefinitionV1.model_validate({
                 **base, "definitionSha256": definition_sha256,

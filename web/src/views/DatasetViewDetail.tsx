@@ -60,6 +60,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
   }
 
   const evidence = definition.sampleProvenance
+  const temporalWindow = definition.temporalWindow
   const requestClose = () => { if (!deleting) onClose() }
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={requestClose}>
     <div role="dialog" aria-modal="true" aria-label={definition.name} aria-busy={deleting} onClick={(event) => event.stopPropagation()}
@@ -82,7 +83,12 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
           <section className="grid gap-1.5">
             <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Definition</div>
             <div className="flex flex-wrap gap-1">{definition.selectedColumns.map((column) => <span key={column} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{column}</span>)}</div>
-            <div className="rounded-md border border-border bg-muted/25 p-2 font-mono text-[10.5px]">{definition.predicate || 'All rows (no predicate)'}</div>
+            <div className="rounded-md border border-border bg-muted/25 p-2 font-mono text-[10.5px]">{definition.predicate || 'No additional predicate'}</div>
+            {temporalWindow && <div className="rounded-md border border-border bg-muted/25 p-2">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Temporal window</div>
+              <div className="mt-1 font-mono text-[10.5px]">{temporalWindow.timeField} [{temporalWindow.startTick}, {temporalWindow.endTick})</div>
+              <div className="text-muted-foreground">Time domain: {temporalWindow.timeDomain}</div>
+            </div>}
             <div>{definition.sampling.kind === 'all'
               ? 'All matching rows'
               : `Deterministic reservoir · ${definition.sampling.size.toLocaleString()} rows · seed ${definition.sampling.seed}`}</div>
