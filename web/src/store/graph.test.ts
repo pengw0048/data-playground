@@ -6,6 +6,7 @@ const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
+  executionManifest: vi.fn(),
   activeRuns: vi.fn(), profileJobs: vi.fn(),
   promote: vi.fn(), processors: vi.fn(),
 }))
@@ -27,6 +28,8 @@ vi.mock('../api/client', () => ({
               ? apiMocks.estimate
               : property === 'writeAdmission'
                 ? apiMocks.writeAdmission
+              : property === 'executionManifest'
+                ? apiMocks.executionManifest
               : property === 'inputDrift'
                 ? apiMocks.inputDrift
               : property === 'run'
@@ -96,6 +99,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.preview.mockReset()
     apiMocks.estimate.mockReset().mockResolvedValue({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false })
     apiMocks.writeAdmission.mockReset()
+    apiMocks.executionManifest.mockReset()
     apiMocks.inputDrift.mockReset().mockResolvedValue({ drifted: false, sources: [] })
     apiMocks.run.mockReset().mockResolvedValue({
       runId: 'run-store-test', status: 'running', jobType: 'run', targetNodeId: 'target',
@@ -536,9 +540,10 @@ describe('graph store — core authority ops', () => {
 
   it('recovers a durable full profile against the retained preview manifest after reload', async () => {
     const source = NODE('source')
-    source.data.config = { uri: '/data/events.lance' }
+    source.data.config = { uri: '/data/events.lance', datasetRef: { parameterRef: 'input' } }
     const doc = {
       id: 'c', version: 1, name: 'test', requirements: [], nodes: [source], edges: [],
+      parameters: [{ name: 'input', type: 'dataset' as const, required: true }],
     }
     const manifest = [{
       node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'lance',
@@ -552,6 +557,12 @@ describe('graph store — core authority ops', () => {
     apiMocks.profileIdentity.mockResolvedValueOnce({
       targetPortId: 'out', planDigest: digest, inputManifest: manifest,
     })
+    apiMocks.executionManifest.mockResolvedValueOnce({
+      availability: 'available', document: { parameters: [{
+        name: 'input', type: 'dataset',
+        value: { kind: 'latest', datasetId: 'dataset', resolvedRevisionId: '1' },
+      }] },
+    })
     apiMocks.profileJobs.mockResolvedValueOnce([{
       runId: 'profile-recovered-manifest', status: 'done', jobType: 'profile',
       targetNodeId: 'source', targetPortId: 'out', planDigest: digest,
@@ -560,15 +571,18 @@ describe('graph store — core authority ops', () => {
         targetPortId: 'out', columns: [], rowCount: 1, sampled: false,
         completeness: 'complete', notPreviewable: false, inputManifest: manifest,
       },
+      executionManifestSha256: 'c'.repeat(64),
     }])
 
     useStore.getState().loadDoc(doc, 'owner')
 
     await vi.waitFor(() => expect(apiMocks.profileIdentity).toHaveBeenCalledWith(
       doc, 'source', 'out', manifest,
+      [{ name: 'input', value: { kind: 'latest', datasetId: 'dataset' } }],
     ))
     await vi.waitFor(() => expect(useStore.getState().profileJobs.source).toMatchObject({
       phase: 'done', identityVerified: true, inputManifest: manifest,
+      parameterBindings: [{ name: 'input', value: { kind: 'latest', datasetId: 'dataset' } }],
       status: { runId: 'profile-recovered-manifest', profile: { inputManifest: manifest } },
     }))
     expect(useStore.getState().previewBindings.source.inputManifest).toEqual(manifest)
@@ -2866,6 +2880,254 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc).toBe(before)
     expect(useStore.getState().view).toBe(beforeView)
     expect(useStore.getState().toasts).toEqual([])
+  })
+
+  it('keeps typed bindings through estimate and run while fencing stale estimate responses', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.parquet' }
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
+      nodes: [source, target], edges: [{ id: 'edge', source: 'source', target: 'target' }] }
+    useStore.setState({ doc, runs: {}, previewBindings: {} })
+    apiMocks.estimate.mockResolvedValueOnce({ rows: 10, placement: 'local', needsConfirm: true })
+
+    await useStore.getState().requestRun('target')
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 10 })
+    await useStore.getState().submitRunParameters('target')
+
+    expect(apiMocks.estimate).toHaveBeenCalledWith(
+      doc, 'target', undefined, [{ name: 'threshold', value: 10 }])
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'confirm', parameterBindings: [{ name: 'threshold', value: 10 }],
+    })
+
+    let finish!: (value: unknown) => void
+    apiMocks.estimate.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    useStore.getState().editRunParameters('target')
+    const pending = useStore.getState().submitRunParameters('target')
+    await vi.waitFor(() => expect(apiMocks.estimate).toHaveBeenCalledTimes(2))
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 11 })
+    finish({ rows: 20, placement: 'local', needsConfirm: false })
+    await pending
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'estimating', parametersReady: false,
+      parameterBindings: [{ name: 'threshold', value: 11 }],
+    })
+  })
+
+  it('opens the shared parameter gate before a panel-only estimate', async () => {
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
+      nodes: [target], edges: [] }
+    useStore.setState({ doc, runs: {} })
+
+    await useStore.getState().estimate('target')
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'parameters', parameterContinuation: { kind: 'estimate' },
+    })
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 10 })
+    await useStore.getState().submitRunParameters('target')
+    expect(apiMocks.estimate).toHaveBeenCalledWith(
+      doc, 'target', undefined, [{ name: 'threshold', value: 10 }])
+    expect(apiMocks.run).not.toHaveBeenCalled()
+  })
+
+  it('passes one binding through preview, drift, run, and write admission identity', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.parquet' }
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const write = NODE('write', 'write')
+    write.data.config = { filename: { parameterRef: 'output' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [
+        { name: 'threshold', type: 'integer' as const, required: true },
+        { name: 'output', type: 'string' as const, required: true },
+      ], nodes: [source, target, write], edges: [
+        { id: 'source-target', source: 'source', target: 'target' },
+        { id: 'target-write', source: 'target', target: 'write' },
+      ] }
+    const threshold = [{ name: 'threshold', value: 10 }]
+    useStore.setState({ doc, runs: { target: { phase: 'idle', parameterBindings: threshold } }, previewBindings: {} })
+    apiMocks.preview.mockResolvedValueOnce(previewResult('bound'))
+    await useStore.getState().runPreview('target')
+    expect(apiMocks.preview).toHaveBeenCalledWith(doc, 'target', 50, 0, undefined, undefined, threshold)
+
+    const manifest = [{ node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'local', resolved_at: 'now' }]
+    useStore.setState({ previewBindings: { target: {
+      canvasId: 'c', nodeId: 'target', planIdentity: previewPlanIdentity(doc, 'target'),
+      parameterBindings: threshold, inputManifest: manifest,
+    } } })
+    const failedRun = {
+      runId: 'bound-run', status: 'failed', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 0, ms: 1, placement: 'local', perNode: [], outputs: [], error: 'expected',
+    }
+    apiMocks.run.mockResolvedValueOnce(failedRun)
+    apiMocks.runStatus.mockResolvedValueOnce(failedRun)
+    await useStore.getState().run('target')
+    expect(apiMocks.inputDrift).toHaveBeenCalledWith(doc, 'target', manifest, threshold)
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      doc, 'target', false, expect.any(String), manifest, undefined, threshold)
+
+    const first = [{ name: 'output', value: 'one.parquet' }]
+    useStore.setState({ runs: { write: { phase: 'idle', parameterBindings: first } } })
+    apiMocks.writeAdmission.mockResolvedValue({ nodeId: 'write', managed: true, destination: '/out', mode: 'create', provider: 'local' })
+    await useStore.getState().prepareWrite('write')
+    useStore.getState().setRunParameterBinding('write', { name: 'output', value: 'two.parquet' })
+    await useStore.getState().prepareWrite('write')
+    expect(apiMocks.writeAdmission).toHaveBeenNthCalledWith(
+      1, expect.objectContaining({ id: doc.id }), 'write', expect.any(String), undefined, first)
+    expect(apiMocks.writeAdmission).toHaveBeenNthCalledWith(
+      2, expect.objectContaining({ id: doc.id }), 'write', expect.any(String), undefined, [{ name: 'output', value: 'two.parquet' }])
+  })
+
+  it('uses the shared RunPanel binding gate before profile preflight without starting a job', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: { parameterRef: 'source_uri' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'source_uri', type: 'string' as const, required: true }],
+      nodes: [source], edges: [] }
+    useStore.setState({ doc, runs: {}, profileJobs: {} })
+
+    await useStore.getState().prepareFullProfile('source')
+    expect(useStore.getState().runs.source).toMatchObject({
+      phase: 'parameters', parameterContinuation: { kind: 'profile' },
+    })
+    expect(apiMocks.profileEstimate).not.toHaveBeenCalled()
+
+    useStore.getState().setRunParameterBinding('source', { name: 'source_uri', value: '/data/events.parquet' })
+    await useStore.getState().submitRunParameters('source')
+    expect(apiMocks.profileEstimate).toHaveBeenCalledWith(
+      doc, 'source', 'out', undefined,
+      [{ name: 'source_uri', value: '/data/events.parquet' }])
+    expect(useStore.getState().profileJobs.source).toMatchObject({
+      phase: 'preflight', parameterBindings: [{ name: 'source_uri', value: '/data/events.parquet' }],
+    })
+    expect(apiMocks.fullProfile).not.toHaveBeenCalled()
+  })
+
+  it('treats every Play as a fresh one-shot parameter authorization and preserves prior values', async () => {
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
+      nodes: [target], edges: [] }
+    useStore.setState({ doc, runs: {}, previewBindings: {} })
+    apiMocks.estimate.mockResolvedValue({ rows: 10, placement: 'local', needsConfirm: true })
+
+    await useStore.getState().requestRun('target')
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 10 })
+    await useStore.getState().submitRunParameters('target')
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'confirm', parametersReady: false,
+      parameterBindings: [{ name: 'threshold', value: 10 }],
+    })
+
+    await useStore.getState().requestRun('target')
+    expect(useStore.getState().runs.target).toMatchObject({
+      phase: 'parameters', parameterContinuation: { kind: 'run' },
+      parameterBindings: [{ name: 'threshold', value: 10 }],
+    })
+    expect(apiMocks.estimate).toHaveBeenCalledTimes(1)
+
+    useStore.getState().editRunParameters('target')
+    await useStore.getState().submitRunParameters('target')
+    expect(apiMocks.estimate).toHaveBeenCalledTimes(2)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.target.parametersReady).toBe(false)
+  })
+
+  it('invalidates parameter-derived previews immediately and fences a slow preview response', async () => {
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }],
+      nodes: [target], edges: [] }
+    const first = [{ name: 'threshold', value: 1 }]
+    let finish!: (value: ReturnType<typeof previewResult>) => void
+    apiMocks.preview.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    useStore.setState({ doc, runs: { target: { phase: 'idle', parameterBindings: first } },
+      previews: {}, previewBindings: {}, profileJobs: { target: {
+        canvasId: 'c', nodeId: 'target', planIdentity: profilePlanIdentity(doc, 'target'),
+        parameterBindings: first, requestGeneration: 1, phase: 'running',
+      } } })
+
+    const pending = useStore.getState().runPreview('target')
+    await vi.waitFor(() => expect(apiMocks.preview).toHaveBeenCalledTimes(1))
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 2 })
+    expect(useStore.getState().previews.target).toBeUndefined()
+    expect(useStore.getState().previewBindings.target).toBeUndefined()
+    // The old durable job remains tracked; changing a binding is not a cancellation request.
+    expect(useStore.getState().profileJobs.target?.phase).toBe('running')
+
+    finish(previewResult('stale'))
+    await pending
+    expect(useStore.getState().previews.target).toBeUndefined()
+  })
+
+  it('fences a slow full-profile preflight after rebinding without cancelling background work', async () => {
+    const target = NODE('target', 'filter')
+    target.data.config = { threshold: { parameterRef: 'threshold' } }
+    const parameters = [{ name: 'threshold', type: 'integer' as const, required: true }]
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [], parameters,
+      nodes: [target], edges: [] }
+    const first = [{ name: 'threshold', value: 1 }]
+    let finish!: (value: any) => void
+    apiMocks.profileEstimate.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+    useStore.setState({ doc, runs: { target: {
+      phase: 'idle', parameterBindings: first, parametersReady: true,
+      parameterContractFingerprint: JSON.stringify(parameters),
+    } }, previews: {}, previewBindings: {}, profileJobs: {} })
+
+    const pending = useStore.getState().prepareFullProfile('target')
+    await vi.waitFor(() => expect(apiMocks.profileEstimate).toHaveBeenCalledTimes(1))
+    useStore.getState().setRunParameterBinding('target', { name: 'threshold', value: 2 })
+    finish({ rows: 10, bytes: 100, placement: 'local', needsConfirm: false,
+      targetPortId: 'out', planDigest: 'a'.repeat(64) })
+    await pending
+
+    expect(useStore.getState().profileJobs.target).toMatchObject({
+      phase: 'estimating', parameterBindings: first,
+    })
+    expect(apiMocks.cancelRun).not.toHaveBeenCalled()
+  })
+
+  it('renames exact parameter refs structurally and blocks dangling deletion or incompatible source types', () => {
+    const source = NODE('source')
+    source.data.config = { datasetRef: { parameterRef: 'input_data' } }
+    const target = NODE('target', 'filter')
+    target.data.config = { nested: { exact: { parameterRef: 'input_data' }, literal: 'input_data' } }
+    const doc = { id: 'c', version: 1, name: 'test', requirements: [],
+      parameters: [{ name: 'input_data', type: 'dataset' as const, required: true }],
+      nodes: [source, target], edges: [] }
+    useStore.setState({ doc, runs: { source: { phase: 'idle', parameterBindings: [
+      { name: 'input_data', value: { kind: 'latest', datasetId: 'dataset-a' } },
+    ] } }, previews: {}, previewBindings: {} })
+
+    expect(useStore.getState().setParameters([
+      { name: 'robot_data', type: 'dataset', required: true },
+    ])).toBeNull()
+    expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual({ parameterRef: 'robot_data' })
+    expect(useStore.getState().doc.nodes[1].data.config).toEqual({
+      nested: { exact: { parameterRef: 'robot_data' }, literal: 'input_data' },
+    })
+    expect(useStore.getState().runs.source.parameterBindings?.[0].name).toBe('robot_data')
+
+    const deletion = useStore.getState().setParameters([])
+    expect(deletion).toMatch(/Cannot remove 'robot_data'/)
+    expect(useStore.getState().doc.parameters?.[0].name).toBe('robot_data')
+
+    const typeChange = useStore.getState().setParameters([
+      { name: 'robot_data', type: 'string', required: true },
+    ])
+    expect(typeChange).toMatch(/source\.datasetRef requires dataset/)
+    expect(useStore.getState().doc.parameters?.[0].type).toBe('dataset')
   })
 })
 

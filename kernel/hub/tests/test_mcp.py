@@ -10,6 +10,7 @@ import io
 import json
 import uuid
 
+import pytest
 from fastapi.testclient import TestClient
 
 from hub.deps import get_deps
@@ -378,6 +379,21 @@ def test_run_canvas_multiple_sinks_requires_node_id():
     data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("images")}})
     res = call("run_canvas", {"canvasId": cid})
     assert res["isError"] is True and "specify nodeId" in res["content"][0]["text"]
+
+
+@pytest.mark.parametrize("value", [{}, "", 0, False])
+@pytest.mark.parametrize("tool", ["preview_node", "run_canvas"])
+def test_typed_parameter_bindings_reject_explicit_falsey_non_arrays(value, tool):
+    cid = data("create_canvas", {})["canvasId"]
+    source = data("add_node", {
+        "canvasId": cid, "kind": "source", "config": {"uri": _uri("events")},
+    })["nodeId"]
+    arguments = {"canvasId": cid, "parameterBindings": value}
+    if tool == "preview_node":
+        arguments["nodeId"] = source
+    result = call(tool, arguments)
+    assert result["isError"] is True
+    assert "parameterBindings must be an array" in result["content"][0]["text"]
 
 
 def test_run_canvas_confirm_gate_trips_on_real_size(monkeypatch):

@@ -602,6 +602,7 @@ export interface RunStatus {
   profile?: ProfileResult | null
   planDigest?: string | null
   profileAttemptOrder?: number | null
+  executionManifestSha256?: string | null
 }
 
 export interface PlanStep {

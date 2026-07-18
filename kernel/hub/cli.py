@@ -84,38 +84,6 @@ def _load_canvas_graph(canvas_ref: str):
         return Graph.model_validate(json.loads(c.doc)), c.id
 
 
-def _apply_params(graph, params: dict, node: str | None = None) -> None:
-    """Substitute ${NAME} tokens in the CONFIG values of a canvas with the given params — headless
-    parameterization for cron/CI (e.g. a source uri / filter predicate / sql templated per run). Mutates
-    the graph in place. ANY ${...} is a token: it's bound to a param or it fails LOUDLY — never left as a
-    silent literal (which would e.g. read a path named "${date}"). Only the nodes that actually run are
-    considered — the whole canvas, or `node`'s upstream cone when a single node is targeted — so an unbound
-    token in an unrelated branch doesn't block a targeted run."""
-    import re
-
-    from hub import graph as g
-    tok = re.compile(r"\$\{([^}]+)\}")  # [^}]+ so names with -/./space bind too, and are never silently kept
-    unbound: set[str] = set()
-
-    def sub(v):
-        if isinstance(v, str):  # set.add returns None → the `or` keeps the original token for the error
-            return tok.sub(lambda m: params[m.group(1)] if m.group(1) in params
-                           else (unbound.add(m.group(1)) or m.group(0)), v)
-        if isinstance(v, dict):
-            return {k: sub(x) for k, x in v.items()}
-        if isinstance(v, list):
-            return [sub(x) for x in v]
-        return v
-
-    scope = g.upstream_chain(graph, node) if node else graph.nodes  # only the nodes that will actually run
-    for n in scope:
-        cfg = n.data.get("config") if isinstance(n.data, dict) else None
-        if isinstance(cfg, dict):  # substitute only within config (leave title/id/type untouched)
-            n.data = {**n.data, "config": sub(cfg)}
-    if unbound:
-        raise SystemExit(f"unbound canvas parameter(s): {', '.join(sorted(unbound))} — pass --param NAME=value")
-
-
 _CANCEL_ACK_TIMEOUT_S = 10.0
 
 
@@ -151,7 +119,7 @@ def _cancel_and_wait(owner, run_id: str, status, metadb, timeout_s: float = _CAN
 
 
 def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_json: bool,
-                  uid: str | None = None, params: dict | None = None) -> int:
+                  uid: str | None = None, params: list[str] | None = None) -> int:
     """Run a saved canvas to completion in-process (no browser) and return a shell exit code:
     0=done, 1=failed, 2=cancelled, 124=timeout, 130=SIGINT. Timeout/SIGINT request cancellation and wait
     for bounded terminal acknowledgement. Reuses the exact start_run path the UI + MCP use, so
@@ -166,10 +134,30 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
     from fastapi import HTTPException
 
     from hub import metadb
+    from hub.api_errors import APIError, APIErrorCode
     from hub.models import RunStatus
+    from hub.run_parameters import ParameterResolutionError, parse_cli_bindings
     from hub.routers.runs import start_run
     graph, cid = _load_canvas_graph(canvas_ref)
-    _apply_params(graph, params or {}, node)  # ${NAME} → --param values (raises SystemExit on an unbound token)
+    summary_stdout = sys.stdout
+
+    def parameter_failure(detail: str) -> int:
+        if as_json:
+            print(json.dumps({
+                "status": "failed",
+                "error": {
+                    "code": APIErrorCode.VALIDATION_ERROR.value,
+                    "detail": detail,
+                    "retryable": False,
+                },
+            }), file=summary_stdout)
+            return 2
+        raise SystemExit(detail)
+
+    try:
+        bindings = parse_cli_bindings(graph, params or [])
+    except ParameterResolutionError as exc:
+        return parameter_failure(str(exc))
     uid = uid or metadb.DEFAULT_USER_ID
     abort_reason = None
     abort_code = None
@@ -177,8 +165,11 @@ def _headless_run(deps, canvas_ref: str, node: str | None, timeout_s: float, as_
     cancel_error = None
     with contextlib.redirect_stdout(sys.stderr):  # protect stdout during the run (node print() → stderr)
         try:
-            status, owner = start_run(deps, graph, node, uid, confirmed=True)
+            status, owner = start_run(
+                deps, graph, node, uid, confirmed=True, parameter_bindings=bindings)
         except HTTPException as e:  # invalid/cyclic graph, size-gate, auth 404 (in-process path)
+            if isinstance(e, APIError) and e.code == APIErrorCode.VALIDATION_ERROR:
+                return parameter_failure(str(e.detail))
             raise SystemExit(f"cannot run canvas '{cid}': {e.detail}")
         except (RuntimeError, OSError) as e:  # kernel failed to start / became unreachable (default backend)
             raise SystemExit(f"cannot run canvas '{cid}': {e}")
@@ -266,18 +257,11 @@ def _run_canvas(argv: list[str]) -> None:
     p.add_argument("--user", default=None, help="run as this user id (default: the local user). In auth "
                                                 "mode this must own/share the canvas (mirrors `dataplay mcp`).")
     p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
-                   help="bind a ${NAME} token in the canvas's configs (repeatable) — e.g. --param date=2026-07-12")
+                   help="bind a declared typed Canvas parameter (repeatable) — e.g. --param date=2026-07-12")
     p.add_argument("--timeout", type=float, default=3600.0,
                    help="max seconds to wait; cancels the run and exits 124 on timeout (default 3600)")
     p.add_argument("--json", dest="as_json", action="store_true", help="print the final RunStatus as JSON")
     args = p.parse_args(argv)
-
-    params: dict[str, str] = {}
-    for kv in args.param:
-        k, sep, v = kv.partition("=")
-        if not sep or not k.strip():
-            raise SystemExit(f"--param must be NAME=VALUE, got '{kv}'")
-        params[k.strip()] = v
 
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr,  # keep stdout clean for the summary / --json
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -288,7 +272,8 @@ def _run_canvas(argv: list[str]) -> None:
         metadb.init_db()  # locked local init, or a production schema-head check (never production DDL)
         from hub.deps import set_workspace
         deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"])
-    raise SystemExit(_headless_run(deps, args.canvas, args.node, args.timeout, args.as_json, args.user, params))
+    raise SystemExit(_headless_run(
+        deps, args.canvas, args.node, args.timeout, args.as_json, args.user, args.param))
 
 
 def _run_seed_catalog(argv: list[str]) -> None:

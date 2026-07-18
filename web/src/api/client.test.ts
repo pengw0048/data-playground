@@ -141,6 +141,7 @@ describe('inspection input manifests', () => {
       node_id: 'source', dataset_id: 'dataset', revision_id: '7', provider: 'lance',
       resolved_at: '2026-07-16T00:00:00Z',
     }]
+    const parameterBindings = [{ name: 'threshold', value: 10 }]
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (path) => {
       if (path === '/api/run/preview') {
         return new Response(JSON.stringify({
@@ -168,14 +169,42 @@ describe('inspection input manifests', () => {
       }), { status: 200 })
     })
 
-    await api.preview(doc, 'source', 50, 0, undefined, inputManifest)
-    await api.profile(doc, 'source', undefined, inputManifest)
-    await api.profileEstimate(doc, 'source', 'out', inputManifest)
-    await api.fullProfile(doc, 'source', 'out', 'a'.repeat(64), crypto.randomUUID(), true, inputManifest)
+    await api.preview(doc, 'source', 50, 0, undefined, inputManifest, parameterBindings)
+    await api.profile(doc, 'source', undefined, inputManifest, parameterBindings)
+    await api.profileEstimate(doc, 'source', 'out', inputManifest, parameterBindings)
+    await api.fullProfile(doc, 'source', 'out', 'a'.repeat(64), crypto.randomUUID(), true, inputManifest, parameterBindings)
 
     for (const path of ['/api/run/preview', '/api/run/profile', '/api/run/profile-estimate', '/api/run/profile-job']) {
       const call = fetchMock.mock.calls.find(([observed]) => observed === path)
       expect(JSON.parse(String(call?.[1]?.body)).inputManifest).toEqual(inputManifest)
+      expect(JSON.parse(String(call?.[1]?.body)).parameterBindings).toEqual(parameterBindings)
+    }
+  })
+
+  it('carries optional bindings through schema, graph estimate, plan, and join analysis', async () => {
+    const doc: CanvasDoc = {
+      id: 'parameter-canvas', version: 1, name: 'parameterized', requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer', required: true }],
+      nodes: [{
+        id: 'target', type: 'filter', position: { x: 0, y: 0 },
+        data: { title: 'target', config: { threshold: { parameterRef: 'threshold' } }, status: 'draft' },
+      }], edges: [],
+    }
+    const parameterBindings = [{ name: 'threshold', value: 10 }]
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({}), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await api.schema(doc, 'target', undefined, parameterBindings)
+    await api.graphSizes(doc, 'target', parameterBindings)
+    await api.plan(doc, 'target', parameterBindings)
+    await api.joinAnalysis(doc, 'target', parameterBindings)
+
+    for (const path of ['/api/graph/schema', '/api/graph/estimate', '/api/graph/plan', '/api/graph/join-analysis']) {
+      const call = fetchMock.mock.calls.find(([observed]) => observed === path)
+      expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({
+        targetNodeId: 'target', parameterBindings,
+      })
     }
   })
 })

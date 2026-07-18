@@ -16590,6 +16590,12 @@ def kernel_for_run(run_id: str) -> dict | None:
         return {"endpoint": k.endpoint, "token": k.token, "kernel_id": k.kernel_id}
 
 
+def run_kernel_id(run_id: str) -> str | None:
+    """Return the durable kernel owner stamp for a run, independent of the live kernel lease."""
+    with session() as s:
+        return s.scalar(select(RunState.kernel_id).where(RunState.run_id == str(run_id)))
+
+
 def reap_kernels() -> list[tuple[str, str]]:
     """Delete leases whose kernel is presumed dead (stale heartbeat). Any hub, on boot + on a timer.
     Returns the reaped (canvas_id, kernel_id) pairs so the caller can also tear down the substrate

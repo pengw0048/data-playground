@@ -787,6 +787,14 @@
             ],
             "title": "Inputmanifest"
           },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
+          },
           "targetNodeId": {
             "anyOf": [
               {
@@ -2194,6 +2202,14 @@
             ],
             "title": "Inputmanifest"
           },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
+          },
           "targetNodeId": {
             "anyOf": [
               {
@@ -2460,6 +2476,15 @@
             "title": "Nodes",
             "type": "array"
           },
+          "parameters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterDeclaration"
+            },
+            "maxItems": 128,
+            "title": "Parameters",
+            "type": "array"
+          },
           "requirements": {
             "default": [],
             "items": {
@@ -2703,6 +2728,14 @@
               "type": "object"
             },
             "title": "Inputmanifest",
+            "type": "array"
+          },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
             "type": "array"
           },
           "targetNodeId": {
@@ -3466,6 +3499,160 @@
         "title": "MkdirRequest",
         "type": "object"
       },
+      "ParameterBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "title": "ParameterBinding",
+        "type": "object"
+      },
+      "ParameterConstraints": {
+        "additionalProperties": false,
+        "properties": {
+          "maxLength": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maxlength"
+          },
+          "maximum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum"
+          },
+          "minLength": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minlength"
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum"
+          }
+        },
+        "title": "ParameterConstraints",
+        "type": "object"
+      },
+      "ParameterDeclaration": {
+        "additionalProperties": false,
+        "properties": {
+          "constraints": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ParameterConstraints"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "default": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default"
+          },
+          "help": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Help"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+            "title": "Name",
+            "type": "string"
+          },
+          "required": {
+            "default": false,
+            "title": "Required",
+            "type": "boolean"
+          },
+          "type": {
+            "enum": [
+              "string",
+              "integer",
+              "float",
+              "boolean",
+              "date",
+              "datetime",
+              "dataset"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ],
+        "title": "ParameterDeclaration",
+        "type": "object"
+      },
       "PasswordChangeBody": {
         "additionalProperties": false,
         "properties": {
@@ -3864,6 +4051,14 @@
             "title": "Offset",
             "type": "integer"
           },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
+          },
           "portId": {
             "anyOf": [
               {
@@ -4133,6 +4328,14 @@
             "title": "Nodeid",
             "type": "string"
           },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
+          },
           "portId": {
             "anyOf": [
               {
@@ -4222,6 +4425,14 @@
             "title": "Nodeid",
             "type": "string"
           },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
+          },
           "portId": {
             "anyOf": [
               {
@@ -4274,6 +4485,14 @@
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
+          },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
           },
           "planDigest": {
             "maxLength": 64,
@@ -5255,6 +5474,14 @@
               }
             ],
             "title": "Inputmanifest"
+          },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
           },
           "submissionId": {
             "anyOf": [
@@ -7860,6 +8087,14 @@
           "nodeId": {
             "title": "Nodeid",
             "type": "string"
+          },
+          "parameterBindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ParameterBinding"
+            },
+            "title": "Parameterbindings",
+            "type": "array"
           },
           "submissionId": {
             "format": "uuid4",

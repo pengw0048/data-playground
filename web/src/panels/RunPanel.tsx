@@ -1,11 +1,11 @@
 import { useEffect } from 'react'
-import { roleCanEdit, useStore } from '../store/graph'
+import { roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
 import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
-import { datasetRefIdentity, type CanvasDoc, type DatasetRef } from '../types/graph'
+import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -16,6 +16,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
+  const setParameterBinding = useStore((s) => s.setRunParameterBinding)
+  const clearParameterBinding = useStore((s) => s.clearRunParameterBinding)
+  const editParameters = useStore((s) => s.editRunParameters)
+  const submitParameters = useStore((s) => s.submitRunParameters)
 
   useEffect(() => {
     if (!run || run.phase === 'idle') estimate(nodeId)
@@ -30,10 +34,32 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const writeSubmissionUnresolved = Boolean(
     writeAdmission?.managed && writeAdmission.intent && run?.writeSubmissionId,
   )
+  const parameterDeclarations = targetParameterDeclarations(doc, nodeId)
+  const parameterBindings = new Map((run?.parameterBindings ?? []).map((item) => [item.name, item.value]))
+  const parameterErrors = parameterDeclarations.map((item) => parameterValueError(
+    item, parameterBindings.has(item.name), parameterBindings.get(item.name)))
 
   return (
     <div className="p-3.5">
-      {(phase === 'estimating' || (!est && phase !== 'running' && phase !== 'done' && phase !== 'failed')) && (
+      {phase === 'parameters' && (
+        <>
+          <Label>RUN PARAMETERS</Label>
+          <div className="mt-1 text-[11px] text-muted-foreground">Bindings apply only to this target's upstream pipeline.</div>
+          <div className="mt-3 flex flex-col gap-3">
+            {parameterDeclarations.map((declaration) => {
+              const bound = parameterBindings.get(declaration.name)
+              return <ParameterField key={`${declaration.name}:${declaration.type}`} declaration={declaration}
+                isBound={parameterBindings.has(declaration.name)} value={bound}
+                error={parameterValueError(declaration, parameterBindings.has(declaration.name), bound)}
+                setValue={(value) => setParameterBinding(nodeId, { name: declaration.name, value })}
+                clear={() => clearParameterBinding(nodeId, declaration.name)} />
+            })}
+          </div>
+          <Button size="sm" onClick={() => void submitParameters(nodeId)} disabled={!canEdit || parameterErrors.some(Boolean)} className="mt-4 w-full">Continue</Button>
+        </>
+      )}
+
+      {(phase === 'estimating' || (!est && phase !== 'parameters' && phase !== 'running' && phase !== 'done' && phase !== 'failed')) && (
         <div className="py-2.5 text-xs text-muted-foreground">estimating…</div>
       )}
 
@@ -154,8 +180,115 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </div>
         </div>
       )}
+
+      {parameterDeclarations.length > 0 && phase !== 'parameters' && (
+        <Button size="sm" variant="outline" onClick={() => editParameters(nodeId)}
+          disabled={!canEdit || phase === 'running'}
+          title={phase === 'running' ? 'Stop or wait for the active run before editing its parameters.' : 'Edit bindings, then return to a fresh estimate.'}
+          className="mt-3 w-full">Edit parameters</Button>
+      )}
     </div>
   )
+}
+
+function isBuiltInSecretRef(value: string): boolean {
+  return /^(?:env|file):/i.test(value)
+}
+
+function parameterValueError(declaration: CanvasParameterDeclaration, isBound: boolean, value: unknown): string | null {
+  if (!isBound) return declaration.default == null ? 'A binding is required because this parameter has no default.' : null
+  if (declaration.type === 'string') {
+    if (typeof value !== 'string') return 'Enter a string value.'
+    if (isBuiltInSecretRef(value)) return 'Secret references are not public run parameters.'
+    if (declaration.constraints?.minLength != null && value.length < declaration.constraints.minLength) return `Minimum length is ${declaration.constraints.minLength}.`
+    if (declaration.constraints?.maxLength != null && value.length > declaration.constraints.maxLength) return `Maximum length is ${declaration.constraints.maxLength}.`
+  } else if (declaration.type === 'integer') {
+    if (!Number.isSafeInteger(value)) return 'Enter a complete safe integer.'
+  } else if (declaration.type === 'float') {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return 'Enter a finite number.'
+  } else if (declaration.type === 'boolean') {
+    if (typeof value !== 'boolean') return 'Select true or false.'
+  } else if (declaration.type === 'date') {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)
+        || Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+        || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value) return 'Enter a real date (YYYY-MM-DD).'
+  } else if (declaration.type === 'datetime') {
+    if (typeof value !== 'string' || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value) || Number.isNaN(Date.parse(value))) return 'Enter ISO 8601 with an explicit timezone.'
+  } else {
+    const ref = value as { kind?: unknown; datasetId?: unknown; revisionId?: unknown }
+    if (!value || typeof value !== 'object' || !['exact', 'latest'].includes(String(ref.kind))
+        || typeof ref.datasetId !== 'string' || !ref.datasetId
+        || isBuiltInSecretRef(ref.datasetId)
+        || (ref.kind === 'exact' && (typeof ref.revisionId !== 'string' || !ref.revisionId))) return 'Choose latest or exact and provide the dataset identity and revision.'
+  }
+  if ((declaration.type === 'integer' || declaration.type === 'float') && typeof value === 'number') {
+    if (declaration.constraints?.minimum != null && value < declaration.constraints.minimum) return `Minimum is ${declaration.constraints.minimum}.`
+    if (declaration.constraints?.maximum != null && value > declaration.constraints.maximum) return `Maximum is ${declaration.constraints.maximum}.`
+  }
+  return null
+}
+
+function ParameterField({ declaration, isBound, value, error, setValue, clear }: {
+  declaration: CanvasParameterDeclaration; isBound: boolean; value: unknown; error: string | null
+  setValue: (value: unknown) => void; clear: () => void
+}) {
+  const label = declaration.label || declaration.name
+  const common = 'w-full rounded-md border border-border bg-background px-2 py-1.5'
+  const fallback = declaration.default == null ? 'Use declared type' : `Use default (${JSON.stringify(declaration.default)})`
+  let control
+  if (declaration.type === 'boolean') {
+    control = <select aria-label={label} value={value == null ? '' : String(value)} onChange={(event) => {
+      event.target.value ? setValue(event.target.value === 'true') : clear()
+    }} className={common}><option value="">{fallback}</option><option value="true">true</option><option value="false">false</option></select>
+  } else if (declaration.type === 'dataset') {
+    type DatasetParameterValue = { kind?: string; datasetId?: string; revisionId?: string }
+    const declaredDefault = !isBound && declaration.default && typeof declaration.default === 'object'
+      ? declaration.default as DatasetParameterValue
+      : null
+    const ref = value && typeof value === 'object' ? value as DatasetParameterValue : declaredDefault ?? {}
+    const usingDefault = declaredDefault != null
+    const kind = ref.kind === 'latest' ? 'latest' : 'exact'
+    control = <div className="grid grid-cols-[92px_1fr] gap-1.5">
+      <select aria-label={`${label} selection`} value={kind} onChange={(event) => setValue({
+        kind: event.target.value, datasetId: ref.datasetId ?? '', ...(event.target.value === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}),
+      })} disabled={usingDefault} className={common}><option value="exact">Exact</option><option value="latest">Follow latest</option></select>
+      <input aria-label={`${label} dataset`} value={ref.datasetId ?? ''} placeholder="Dataset identity" onChange={(event) => {
+        event.target.value ? setValue({ kind, datasetId: event.target.value, ...(kind === 'exact' ? { revisionId: ref.revisionId ?? '' } : {}) }) : clear()
+      }} disabled={usingDefault} className={common} />
+      {kind === 'exact' && <input aria-label={`${label} revision`} value={ref.revisionId ?? ''} placeholder="Exact revision" onChange={(event) => {
+        event.target.value ? setValue({ kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: event.target.value }) : clear()
+      }} disabled={usingDefault} className={`col-start-2 ${common}`} />}
+      {usingDefault && <div className="col-span-2 flex items-center justify-between gap-2 text-muted-foreground">
+        <span>Using declared default.</span>
+        <Button type="button" size="sm" variant="ghost" onClick={() => setValue(kind === 'latest'
+          ? { kind: 'latest', datasetId: ref.datasetId ?? '' }
+          : { kind: 'exact', datasetId: ref.datasetId ?? '', revisionId: ref.revisionId ?? '' })}
+          className="h-6 px-1.5 text-[10px]">Override default</Button>
+      </div>}
+    </div>
+  } else {
+    const text = value == null ? '' : String(value)
+    control = <input aria-label={label} type={declaration.type === 'date' ? 'date' : 'text'} value={text}
+      placeholder={declaration.type === 'datetime' ? '2026-07-18T14:30:00-04:00' : fallback}
+      onChange={(event) => {
+        const raw = event.target.value
+        if (!raw && declaration.type !== 'string') return clear()
+        if (declaration.type === 'integer') return setValue(/^[+-]?\d+$/.test(raw) ? Number(raw) : raw)
+        if (declaration.type === 'float') return setValue(Number.isFinite(Number(raw)) ? Number(raw) : raw)
+        setValue(raw)
+      }} className={common} />
+  }
+  return <label className="text-[11px]">
+    <span className="mb-1 block font-medium text-foreground">{label}{declaration.required ? ' *' : ''}</span>
+    {control}
+    {declaration.type === 'datetime' && <span className="mt-1 block text-muted-foreground">Timezone required; the server records UTC.</span>}
+    {declaration.help && <span className="mt-1 block text-muted-foreground">{declaration.help}</span>}
+    {declaration.type === 'string' && !isBound && <Button type="button" size="sm" variant="ghost"
+      onClick={() => setValue('')} className="mt-1 h-6 px-1.5 text-[10px]">Use empty string</Button>}
+    {isBound && <Button type="button" size="sm" variant="ghost" onClick={clear}
+      className="mt-1 h-6 px-1.5 text-[10px]">{declaration.default == null ? 'Clear binding' : 'Use default'}</Button>}
+    {error && <span role="alert" className="mt-1 block text-destructive">{error}</span>}
+  </label>
 }
 
 function InputDriftNotice({ drift, doc }: { drift: InputDrift; doc: CanvasDoc }) {
@@ -201,7 +334,7 @@ function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: str
   }
   return doc.nodes.flatMap((node) => {
     const ref = node.data.config.datasetRef
-    return selected.has(node.id) && node.type === 'source' && ref
+    return selected.has(node.id) && node.type === 'source' && ref && !isParameterRef(ref)
       ? [{ nodeId: node.id, title: node.data.title, ref }]
       : []
   })

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey, roleCanEdit, useStore,
+  parameterBindingsIdentity, previewIsCurrent, previewPlanIdentity, profileJobIsCurrent, profileJobKey,
+  roleCanEdit, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
 import { api } from '../api/client'
@@ -433,6 +434,7 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   const preview = useStore((s) => s.previews[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const currentUserId = useStore((s) => s.currentUser?.id)
+  const parameterBindings = useStore((s) => s.runs[nodeId]?.parameterBindings)
   const profileJob = useStore((s) => (
     s.profileJobs[profileJobKey(nodeId, portId)] ?? s.profileJobs[nodeId]
   ))
@@ -445,40 +447,50 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
     ? preview.result?.inputManifest ?? undefined
     : undefined
   const inputManifestIdentity = JSON.stringify(inputManifest ?? null)
+  const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
   const sampleRequestGeneration = useRef(0)
   const [sampleState, setSampleState] = useState<{
-    planIdentity: string; loading: boolean; res?: ProfileResult; err?: string
-  }>({ planIdentity, loading: true })
+    planIdentity: string; bindingsIdentity: string; loading: boolean; res?: ProfileResult; err?: string
+  }>({ planIdentity, bindingsIdentity, loading: true })
   const loadSample = () => {
     const requestDoc = doc
     const requestIdentity = previewPlanIdentity(requestDoc, nodeId, portId)
+    const requestBindingsIdentity = parameterBindingsIdentity(parameterBindings)
     const requestGeneration = ++sampleRequestGeneration.current
-    setSampleState({ planIdentity: requestIdentity, loading: true })
+    setSampleState({ planIdentity: requestIdentity, bindingsIdentity: requestBindingsIdentity, loading: true })
     const request = inputManifest
-      ? api.profile(requestDoc, nodeId, portId, inputManifest)
-      : api.profile(requestDoc, nodeId, portId)
+      ? parameterBindings?.length
+        ? api.profile(requestDoc, nodeId, portId, inputManifest, parameterBindings)
+        : api.profile(requestDoc, nodeId, portId, inputManifest)
+      : parameterBindings?.length
+        ? api.profile(requestDoc, nodeId, portId, undefined, parameterBindings)
+        : api.profile(requestDoc, nodeId, portId)
     request
       .then((res) => {
         if (sampleRequestGeneration.current !== requestGeneration
-            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity) return
-        setSampleState({ planIdentity: requestIdentity, loading: false, res })
+            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity
+            || parameterBindingsIdentity(useStore.getState().runs[nodeId]?.parameterBindings) !== requestBindingsIdentity) return
+        setSampleState({ planIdentity: requestIdentity, bindingsIdentity: requestBindingsIdentity, loading: false, res })
       })
       .catch((e) => {
         if (sampleRequestGeneration.current !== requestGeneration
-            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity) return
-        setSampleState({ planIdentity: requestIdentity, loading: false, err: e?.message ?? String(e) })
+            || previewPlanIdentity(useStore.getState().doc, nodeId, portId) !== requestIdentity
+            || parameterBindingsIdentity(useStore.getState().runs[nodeId]?.parameterBindings) !== requestBindingsIdentity) return
+        setSampleState({ planIdentity: requestIdentity, bindingsIdentity: requestBindingsIdentity, loading: false, err: e?.message ?? String(e) })
       })
   }
   useEffect(() => {
     if (!full) loadSample()
     return () => { sampleRequestGeneration.current += 1 }
-  }, [nodeId, portId, full, planIdentity, inputManifestIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [nodeId, portId, full, planIdentity, inputManifestIdentity, bindingsIdentity])  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => setFull(false), [nodeId, portId, multiOutput])
   // Never paint a sample-profile response bound to another node or execution plan, even for the render
   // before the effect above starts its replacement request.
-  const st = sampleState.planIdentity === planIdentity ? sampleState : { planIdentity, loading: true }
+  const st = sampleState.planIdentity === planIdentity && sampleState.bindingsIdentity === bindingsIdentity
+    ? sampleState : { planIdentity, bindingsIdentity, loading: true }
   const job = currentUserId && profileJob?.principalId === currentUserId
       && profileJobIsCurrent(profileJob, doc, nodeId, portId)
+      && parameterBindingsIdentity(profileJob.parameterBindings) === bindingsIdentity
     ? profileJob
     : undefined
   const selectMode = (v: boolean) => {

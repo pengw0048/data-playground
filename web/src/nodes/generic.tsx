@@ -29,6 +29,8 @@ export function nodeInvalidReason(
   for (const p of spec.params) {
     if (p.showWhen && !p.showWhen.in.includes(String(node.data.config[p.showWhen.param] ?? ''))) continue
     const v = node.data.config[p.name]
+    if (v && typeof v === 'object' && !Array.isArray(v)
+        && Object.keys(v).length === 1 && typeof (v as { parameterRef?: unknown }).parameterRef === 'string') continue
     if (p.type === 'int' || p.type === 'float') {
       const draft = numericDrafts?.[p.name]
       if (draft !== undefined) {
@@ -89,6 +91,8 @@ export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; om
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const setNumericDraft = useStore((s) => s.setNumericParamDraft)
   const columns = useInputColumns(nodeId)
+  const canvasParameters = useStore((s) => s.doc.parameters)
+  const declarations = canvasParameters ?? []
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
   // hide a conditional param whose showWhen dependency isn't met (e.g. batchFormat only for map_batches)
   const visible = (p: { showWhen?: { param: string; in: string[] } }) =>
@@ -100,10 +104,26 @@ export function NodeParamFields({ nodeId, omitNames = [] }: { nodeId: string; om
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
       {editable.map((p) => {
-        const val = (node?.data.config as any)?.[p.name] ?? p.default ?? (p.type === 'columns' ? [] : '')
+        const configured = (node?.data.config as any)?.[p.name]
+        const refName = configured && typeof configured === 'object'
+          && Object.keys(configured).length === 1 && typeof configured.parameterRef === 'string'
+          ? configured.parameterRef as string : null
+        const val = refName == null ? configured ?? p.default ?? (p.type === 'columns' ? [] : '') : ''
+        const acceptedTypes = p.type === 'int' ? ['integer']
+          : p.type === 'float' ? ['float', 'integer']
+            : p.type === 'bool' ? ['boolean'] : p.type === 'columns' ? [] : ['string']
+        const compatible = declarations.filter((item) => acceptedTypes.includes(item.type))
         return (
           <Field key={p.name} label={p.label ?? p.name}>
-            {p.type === 'select' && p.options ? (
+            {compatible.length > 0 && <MiniSelect value={refName ?? ''}
+              options={[{ value: '', label: 'Literal value' }, ...compatible.map((item) => ({
+                value: item.name, label: `Parameter: ${item.label || item.name}`,
+              }))]}
+              onChange={(value) => updateConfig(nodeId, {
+                [p.name]: value ? { parameterRef: value } : p.default,
+              })} />}
+            {refName ? <div className="text-[10.5px] text-muted-foreground">Resolved when previewing or running.</div>
+              : p.type === 'select' && p.options ? (
               <MiniSelect value={String(val)} options={p.options.map((o) => ({ value: o, label: o }))}
                 onChange={(v) => updateConfig(nodeId, { [p.name]: v })} />
             ) : p.type === 'columns' ? (

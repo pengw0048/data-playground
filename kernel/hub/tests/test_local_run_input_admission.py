@@ -16,7 +16,7 @@ from sqlalchemy import event, func, select
 from hub import db, metadb
 from hub.api_errors import APIError, APIErrorCode
 from hub.executors.engine import BuildEngine
-from hub.models import Graph, RunEstimate, RunStatus
+from hub.models import Graph, ParameterBinding, ParameterDeclaration, RunEstimate, RunStatus
 from hub.local_run_inputs import finalize_local_file_candidates
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
@@ -709,6 +709,7 @@ def test_queued_response_loss_adopts_the_claimed_local_run(monkeypatch):
     calls = []
 
     def dispatch(_runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs):
+        assert deps.run_index[run_id] is deps.runner
         calls.append(run_id)
         return RunStatus(run_id=run_id, status="queued")
 
@@ -723,6 +724,87 @@ def test_queued_response_loss_adopts_the_claimed_local_run(monkeypatch):
     assert retry.status == "queued"
     assert owner is deps.runner
     assert calls == [first.run_id]
+
+
+def test_typed_latest_retry_uses_retained_manifest_without_mutable_head(monkeypatch):
+    deps, graph = _local_start_context(monkeypatch)
+    deps.resolve_adapter = lambda _uri: object()
+    graph.parameters = [ParameterDeclaration(
+        name="input", type="dataset", required=True)]
+    graph.nodes[0].data["config"]["datasetRef"] = {"parameterRef": "input"}
+    binding = ParameterBinding(
+        name="input", value={"kind": "latest", "datasetId": "dataset"})
+
+    class InitialAdapter:
+        @staticmethod
+        def resolve_revision(_uri):
+            return {"revision_id": "revision"}
+
+    monkeypatch.setattr(
+        "hub.run_parameters.revision_adapter_for_uri", lambda *_args: InitialAdapter())
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
+        lambda _uri: {"dataset_id": "dataset"},
+    )
+    monkeypatch.setattr(
+        "hub.observability.invoke_backend_run",
+        lambda _runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs:
+        RunStatus(run_id=run_id, status="queued"),
+    )
+    submission = str(uuid.uuid4())
+    first, _ = runs.start_run(
+        deps, graph, "source", "local", confirmed=True,
+        submission_id=submission, parameter_bindings=[binding])
+
+    actual_owner = SimpleNamespace(status=lambda run_id: RunStatus(
+        run_id=run_id, status="queued"))
+    deps.kernel_backend = lambda: actual_owner
+    metadb.save_run_state(
+        first.run_id,
+        RunStatus(run_id=first.run_id, status="queued").model_dump(),
+        canvas_id="local-admission",
+        kernel_id="kernel-after-hub-restart",
+    )
+    deps.run_index.clear()
+
+    def mutable_head_access_is_a_bug(*_args, **_kwargs):
+        raise AssertionError("response-loss retry consulted the mutable provider head")
+
+    monkeypatch.setattr(
+        "hub.run_parameters.revision_adapter_for_uri", mutable_head_access_is_a_bug)
+    monkeypatch.setattr(
+        "hub.run_parameters.metadb.catalog_revision_binding_for_uri",
+        mutable_head_access_is_a_bug,
+    )
+    retry, owner = runs.start_run(
+        deps, graph, "source", "local", confirmed=True,
+        submission_id=submission, parameter_bindings=[binding])
+
+    assert retry.run_id == first.run_id
+    assert owner is actual_owner
+    assert deps.run_index[first.run_id] is actual_owner
+
+    changed_binding = ParameterBinding(
+        name="input", value={"kind": "latest", "datasetId": "other-dataset"})
+    with pytest.raises(Exception) as conflict:
+        runs.start_run(
+            deps, graph, "source", "local", confirmed=True,
+            submission_id=submission, parameter_bindings=[changed_binding])
+    assert getattr(conflict.value, "status_code", None) == 409
+
+    changed_declaration = graph.model_copy(deep=True)
+    changed_declaration.parameters[0].required = False
+    with pytest.raises(Exception) as conflict:
+        runs.start_run(
+            deps, changed_declaration, "source", "local", confirmed=True,
+            submission_id=submission, parameter_bindings=[binding])
+    assert getattr(conflict.value, "status_code", None) == 409
+
+    with pytest.raises(Exception) as conflict:
+        runs.start_run(
+            deps, graph, None, "local", confirmed=True,
+            submission_id=submission, parameter_bindings=[binding])
+    assert getattr(conflict.value, "status_code", None) == 409
 
 
 def test_start_run_admits_the_caller_preview_manifest_without_resolving_latest(monkeypatch):

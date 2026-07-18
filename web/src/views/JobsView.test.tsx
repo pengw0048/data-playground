@@ -287,6 +287,7 @@ describe('JobsView', () => {
         target: { nodeId: 'write-1', portId: null },
         admittedInputs: [], writeIntent: null,
         descriptors: { core: { apiVersion: '1' }, nodes: [], plugins: [] },
+        parameters: [{ name: 'threshold', type: 'integer', value: 10 }],
       },
     })
     render(<JobsView />)
@@ -298,7 +299,7 @@ describe('JobsView', () => {
     fireEvent.click(screen.getByRole('button', { name: /Execution manifest/ }))
 
     expect(await screen.findByText('Submitted graph')).toBeVisible()
-    expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+    expect(screen.getByText(/"threshold"/)).toBeVisible()
     expect(mocks.executionManifest).toHaveBeenCalledWith('canvas-1', 't:task-manifest')
   })
 

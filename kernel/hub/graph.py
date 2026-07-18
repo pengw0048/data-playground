@@ -180,7 +180,9 @@ def resolve_source_refs(graph: Graph, resolve) -> None:
     """
     for node, cfg in _execution_source_bindings(graph, list(graph.nodes)):
         value = cfg.get("uri")
-        if value:
+        # A structured run-parameter sentinel on an unused branch is intentionally unresolved; only
+        # the selected upstream cone has to bind. Never feed that dict into a catalog string lookup.
+        if isinstance(value, str) and value:
             cfg["uri"] = resolve(value)
         # A pinned/as-of core revision is read from its immutable artifact rather than the mutable
         # catalog head. Carry that server-resolved physical identity privately so every preview,

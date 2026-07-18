@@ -977,6 +977,79 @@ describe('durable full results', () => {
     expect(screen.getByText('Preview sample · 20 rows inspected')).toBeInTheDocument()
   })
 
+  it('keeps sample-profile responses bound to the latest parameter binding', async () => {
+    let finishOld!: (value: any) => void
+    let finishCurrent!: (value: any) => void
+    apiMock.profile
+      .mockImplementationOnce(() => new Promise((resolve) => { finishOld = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishCurrent = resolve }))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }], edges: [], nodes: [{
+        id: 'target', type: 'filter', position: { x: 0, y: 0 },
+        data: { title: 'target', status: 'latest', config: { threshold: { parameterRef: 'threshold' } }, history: [] },
+      }] }
+    const first = [{ name: 'threshold', value: 1 }]
+    const second = [{ name: 'threshold', value: 2 }]
+    useStore.setState({
+      doc, canvasRole: 'owner', profileJobs: {},
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      runs: { target: { phase: 'idle', parameterBindings: first } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(1))
+    act(() => useStore.setState((state) => ({ runs: { ...state.runs, target: {
+      ...state.runs.target!, parameterBindings: second,
+    } } })))
+    await waitFor(() => expect(apiMock.profile).toHaveBeenCalledTimes(2))
+
+    await act(async () => finishCurrent({
+      columns: [], rowCount: 20, sampled: true, completeness: 'sample',
+    }))
+    expect(await screen.findByText('Preview sample · 20 rows inspected')).toBeInTheDocument()
+    await act(async () => finishOld({
+      columns: [], rowCount: 10, sampled: true, completeness: 'sample',
+    }))
+    expect(screen.queryByText('Preview sample · 10 rows inspected')).not.toBeInTheDocument()
+    expect(apiMock.profile).toHaveBeenNthCalledWith(1, doc, 'target', undefined, undefined, first)
+    expect(apiMock.profile).toHaveBeenNthCalledWith(2, doc, 'target', undefined, undefined, second)
+  })
+
+  it('hides a completed full profile produced with an older parameter binding', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [],
+      parameters: [{ name: 'threshold', type: 'integer' as const, required: true }], edges: [], nodes: [{
+        id: 'target', type: 'filter', position: { x: 0, y: 0 },
+        data: { title: 'target', status: 'latest', config: { threshold: { parameterRef: 'threshold' } }, history: [] },
+      }] }
+    const first = [{ name: 'threshold', value: 1 }]
+    const second = [{ name: 'threshold', value: 2 }]
+    useStore.setState({
+      doc, canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', sample(0, 10, false)) },
+      runs: { target: { phase: 'idle', parameterBindings: second } },
+      profileJobs: { target: {
+        canvasId: doc.id, nodeId: 'target', portId: 'out', principalId: 'alice',
+        parameterBindings: first, planIdentity: profilePlanIdentity(doc, 'target', 'out'),
+        requestGeneration: 1, phase: 'done', identityVerified: true,
+        status: {
+          runId: 'old-binding-profile', status: 'done', jobType: 'profile', targetNodeId: 'target', targetPortId: 'out',
+          planDigest: 'a'.repeat(64), profileAttemptOrder: 1, rowsProcessed: 999, totalRows: 999,
+          ms: 10, placement: 'local', perNode: [], outputs: [],
+          profile: { columns: [], rowCount: 999, sampled: false, completeness: 'complete' },
+        },
+      } },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Stats' }))
+    await user.click(screen.getByRole('button', { name: 'full dataset' }))
+    expect(screen.getByRole('button', { name: 'Estimate full profile' })).toBeInTheDocument()
+    expect(screen.queryByText(/999 rows scanned/)).not.toBeInTheDocument()
+  })
+
   it('does not guess profile scope when the kernel reports unknown completeness', async () => {
     apiMock.profile.mockResolvedValueOnce({
       columns: [{

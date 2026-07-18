@@ -1,14 +1,15 @@
 import { create } from 'zustand'
 import type { WireType } from '../theme/tokens'
 import type {
-  CanvasDoc, CanvasEdge, CanvasNode, NodeConfig, NodeData, NodeStatus, NodeVersion,
+  CanvasDoc, CanvasEdge, CanvasNode, CanvasParameterBinding, CanvasParameterDeclaration,
+  NodeConfig, NodeData, NodeStatus, NodeVersion,
 } from '../types/graph'
 import type {
   CanvasTransformReference, CatalogTable, InputDrift, KernelInfo, ProcessorDescriptor, ProfileResult, RunEstimate,
   RunInputManifestItem, RunStatus, SampleResult, WriteAdmission,
 } from '../types/api'
 import { getSpec, nodeOutputs } from '../nodes/registry'
-import { registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
+import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
 import { parseHash } from '../router'
 import { exampleDoc } from '../examples'
@@ -174,6 +175,7 @@ export interface PreviewState {
   nodeId: string
   portId?: string
   planIdentity: string
+  parameterBindings?: CanvasParameterBinding[]
   requestGeneration: number
   loading?: boolean
   result?: SampleResult
@@ -186,6 +188,7 @@ export interface PreviewBindingState {
   nodeId: string
   portId?: string
   planIdentity: string
+  parameterBindings?: CanvasParameterBinding[]
   inputManifest: RunInputManifestItem[]
 }
 
@@ -286,6 +289,12 @@ export function profilePlanIdentity(doc: CanvasDoc, nodeId: string, portId?: str
   return targetExecutionPlanIdentity(doc, nodeId, portId)
 }
 
+export function parameterBindingsIdentity(bindings?: CanvasParameterBinding[]): string {
+  return JSON.stringify([...(bindings ?? [])]
+    .sort((left, right) => compareIdentityText(left.name, right.name))
+    .map((binding) => canonicalIdentityValue(binding)))
+}
+
 export function profileJobKey(nodeId: string, portId?: string): string {
   return portId === undefined ? nodeId : JSON.stringify([nodeId, portId])
 }
@@ -311,11 +320,13 @@ export function previewIsCurrent(preview: PreviewState, doc: CanvasDoc, nodeId: 
     && preview.planIdentity === previewPlanIdentity(doc, nodeId, portId)
 }
 
-function previewBindingIsCurrent(binding: PreviewBindingState, doc: CanvasDoc, nodeId: string): boolean {
+function previewBindingIsCurrent(binding: PreviewBindingState, doc: CanvasDoc, nodeId: string,
+                                 parameterBindings?: CanvasParameterBinding[]): boolean {
   return binding.canvasId === doc.id
     && binding.nodeId === nodeId
     && doc.nodes.some((node) => node.id === nodeId)
     && binding.planIdentity === previewPlanIdentity(doc, nodeId, binding.portId)
+    && parameterBindingsIdentity(binding.parameterBindings) === parameterBindingsIdentity(parameterBindings)
 }
 
 function readPreviewBindings(userId: string | undefined, doc: CanvasDoc): Record<string, PreviewBindingState> {
@@ -330,11 +341,14 @@ function readPreviewBindings(userId: string | undefined, doc: CanvasDoc): Record
         && binding.nodeId === nodeId
         && (binding.portId === undefined || typeof binding.portId === 'string')
         && typeof binding.planIdentity === 'string'
+        && Array.isArray(binding.parameterBindings)
+        && binding.parameterBindings.every((item) => item && typeof item === 'object'
+          && typeof item.name === 'string' && Object.prototype.hasOwnProperty.call(item, 'value'))
         && Array.isArray(binding.inputManifest)
         && binding.inputManifest.every((item) => item && typeof item === 'object'
           && ['node_id', 'dataset_id', 'revision_id', 'provider', 'resolved_at']
             .every((field) => typeof item[field as keyof RunInputManifestItem] === 'string'))
-        && previewBindingIsCurrent(binding, doc, nodeId)
+        && previewBindingIsCurrent(binding, doc, nodeId, binding.parameterBindings)
     })) as Record<string, PreviewBindingState>
   } catch {
     return {}
@@ -350,17 +364,19 @@ function writePreviewBindings(userId: string | undefined, canvasId: string,
 function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingState | undefined {
   const live = state.previews[nodeId]
   const manifest = live?.result?.inputManifest
-  if (live && manifest && previewIsCurrent(live, state.doc, nodeId)) {
+  const parameterBindings = state.runs[nodeId]?.parameterBindings
+  if (live && manifest && previewIsCurrent(live, state.doc, nodeId)
+      && parameterBindingsIdentity(live.parameterBindings) === parameterBindingsIdentity(parameterBindings)) {
     return {
       canvasId: live.canvasId, nodeId, portId: live.portId,
-      planIdentity: live.planIdentity, inputManifest: manifest,
+      planIdentity: live.planIdentity, parameterBindings: live.parameterBindings, inputManifest: manifest,
     }
   }
   const retained = state.previewBindings[nodeId]
-  return retained && previewBindingIsCurrent(retained, state.doc, nodeId) ? retained : undefined
+  return retained && previewBindingIsCurrent(retained, state.doc, nodeId, parameterBindings) ? retained : undefined
 }
 
-function writeAdmissionFingerprint(doc: CanvasDoc): string {
+function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
   const { version: _version, ...executionDoc } = doc
   return JSON.stringify({
     ...executionDoc,
@@ -368,6 +384,7 @@ function writeAdmissionFingerprint(doc: CanvasDoc): string {
       const { status: _status, ...data } = node.data
       return { ...node, data }
     }),
+    parameterBindings: parameterBindings ?? [],
   })
 }
 
@@ -398,13 +415,139 @@ export function currentPreviews(doc: CanvasDoc, previews: Record<string, Preview
 interface RunState {
   estimate?: RunEstimate
   status?: RunStatus
-  phase: 'idle' | 'estimating' | 'estimated' | 'confirm' | 'drift' | 'running' | 'done' | 'failed'
+  phase: 'idle' | 'parameters' | 'estimating' | 'estimated' | 'confirm' | 'drift' | 'running' | 'done' | 'failed'
   error?: string
   inputDrift?: InputDrift
   driftInputManifest?: RunInputManifestItem[]
   writeAdmission?: WriteAdmission
   writeSubmissionId?: string
   writeAdmissionFingerprint?: string
+  parameterBindings?: CanvasParameterBinding[]
+  parametersReady?: boolean
+  parameterContractFingerprint?: string
+  parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
+}
+
+export function targetParameterDeclarations(doc: CanvasDoc, targetNodeId: string): CanvasParameterDeclaration[] {
+  const incoming = new Map<string, string[]>()
+  for (const edge of doc.edges) incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source])
+  const selected = new Set<string>()
+  const pending = [targetNodeId]
+  while (pending.length) {
+    const id = pending.pop()!
+    if (selected.has(id)) continue
+    selected.add(id)
+    pending.push(...(incoming.get(id) ?? []))
+    for (const child of doc.nodes) if (child.parentId === id) pending.push(child.id)
+  }
+  const used = new Set<string>()
+  const visit = (value: unknown) => {
+    if (value && typeof value === 'object') {
+      if (!Array.isArray(value) && Object.keys(value).length === 1
+          && typeof (value as { parameterRef?: unknown }).parameterRef === 'string') {
+        used.add((value as { parameterRef: string }).parameterRef)
+      } else if (Array.isArray(value)) value.forEach(visit)
+      else Object.values(value as Record<string, unknown>).forEach(visit)
+    }
+  }
+  for (const node of doc.nodes) if (selected.has(node.id)) visit(node.data.config)
+  return (doc.parameters ?? []).filter((item) => used.has(item.name))
+}
+
+type ParameterRefUse = {
+  nodeId: string
+  path: string[]
+  expectedTypes: CanvasParameterDeclaration['type'][] | null
+}
+
+function parameterRefUses(doc: CanvasDoc, name: string): ParameterRefUse[] {
+  const uses: ParameterRefUse[] = []
+  const visit = (node: CanvasNode, value: unknown, path: string[]) => {
+    if (!value || typeof value !== 'object') return
+    if (!Array.isArray(value) && Object.keys(value).length === 1
+        && (value as { parameterRef?: unknown }).parameterRef === name) {
+      let expectedTypes: ParameterRefUse['expectedTypes'] = null
+      if (node.type === 'source' && path.length === 1 && path[0] === 'datasetRef') expectedTypes = ['dataset']
+      else if (path.length === 1) {
+        const parameter = getBackendSpec(node.type)?.params.find((item) => item.name === path[0])
+        expectedTypes = parameter?.type === 'int' ? ['integer']
+          : parameter?.type === 'float' ? ['float', 'integer']
+            : parameter?.type === 'bool' ? ['boolean']
+              : parameter && parameter.type !== 'columns' && parameter.type !== 'code' ? ['string'] : null
+      }
+      uses.push({ nodeId: node.id, path, expectedTypes })
+      return
+    }
+    if (Array.isArray(value)) value.forEach((item, index) => visit(node, item, [...path, String(index)]))
+    else Object.entries(value as Record<string, unknown>)
+      .forEach(([key, item]) => visit(node, item, [...path, key]))
+  }
+  for (const node of doc.nodes) visit(node, node.data.config, [])
+  return uses
+}
+
+function rewriteParameterRef(value: unknown, renames: Map<string, string>): unknown {
+  if (!value || typeof value !== 'object') return value
+  if (!Array.isArray(value) && Object.keys(value).length === 1
+      && typeof (value as { parameterRef?: unknown }).parameterRef === 'string') {
+    const current = (value as { parameterRef: string }).parameterRef
+    return renames.has(current) ? { parameterRef: renames.get(current)! } : value
+  }
+  if (Array.isArray(value)) return value.map((item) => rewriteParameterRef(item, renames))
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .map(([key, item]) => [key, rewriteParameterRef(item, renames)]))
+}
+
+function parameterDeclarationMutation(doc: CanvasDoc, next: CanvasParameterDeclaration[]): {
+  error: string | null
+  renames: Map<string, string>
+  changedTypes: Set<string>
+} {
+  const previous = doc.parameters ?? []
+  const previousByName = new Map(previous.map((item) => [item.name, item]))
+  const nextByName = new Map(next.map((item) => [item.name, item]))
+  const removed = previous.filter((item) => !nextByName.has(item.name))
+  const added = next.filter((item) => !previousByName.has(item.name))
+  const renames = new Map<string, string>()
+  if (removed.length === 1 && added.length === 1 && previous.length === next.length) {
+    renames.set(removed[0].name, added[0].name)
+  } else {
+    for (const declaration of removed) {
+      const uses = parameterRefUses(doc, declaration.name)
+      if (uses.length) {
+        return {
+          error: `Cannot remove '${declaration.name}': ${uses.length} Canvas configuration ${uses.length === 1 ? 'field still references' : 'fields still reference'} it.`,
+          renames, changedTypes: new Set(),
+        }
+      }
+    }
+  }
+  const changedTypes = new Set<string>()
+  for (const declaration of next) {
+    const priorName = [...renames.entries()].find(([, renamed]) => renamed === declaration.name)?.[0]
+      ?? declaration.name
+    const prior = previousByName.get(priorName)
+    if (!prior || prior.type === declaration.type) continue
+    changedTypes.add(declaration.name)
+    const uses = parameterRefUses(doc, prior.name)
+    const incompatible = uses.find((use) => !use.expectedTypes?.includes(declaration.type))
+    if (incompatible) {
+      return {
+        error: `Cannot change '${prior.name}' to ${declaration.type}: ${incompatible.nodeId}.${incompatible.path.join('.')} requires ${incompatible.expectedTypes?.join(' or ') ?? 'its existing type'}.`,
+        renames, changedTypes,
+      }
+    }
+  }
+  return { error: null, renames, changedTypes }
+}
+
+function parameterRequestFingerprint(doc: CanvasDoc, targetNodeId: string,
+                                     bindings?: CanvasParameterBinding[]): string {
+  return JSON.stringify({
+    plan: targetExecutionPlanIdentity(doc, targetNodeId),
+    declarations: targetParameterDeclarations(doc, targetNodeId),
+    bindings: bindings ?? [],
+  })
 }
 
 export interface ProfileJobState {
@@ -417,6 +560,7 @@ export interface ProfileJobState {
   // Authority is captured for this canvas when the job is started/recovered. Detached cleanup must
   // never consult the role of whichever canvas happens to be open later.
   canCancel?: boolean
+  parameterBindings?: CanvasParameterBinding[]
   // Raw identity remains local for synchronous stale-result checks. The server-minted SHA-256 is the
   // durable authority used to bind a recovered result to the graph and source content it profiled.
   planIdentity: string
@@ -495,6 +639,7 @@ async function submitFullProfile(
   submissionId: string,
   userId: string,
   inputManifest?: RunInputManifestItem[] | null,
+  parameterBindings?: CanvasParameterBinding[],
 ): Promise<RunStatus> {
   for (let attempt = 0; ; attempt += 1) {
     if (_profileSubmissionUserId !== userId) {
@@ -502,8 +647,12 @@ async function submitFullProfile(
     }
     try {
       return await (inputManifest
-        ? api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true, inputManifest)
-        : api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true))
+        ? parameterBindings?.length
+          ? api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true, inputManifest, parameterBindings)
+          : api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true, inputManifest)
+        : parameterBindings?.length
+          ? api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true, undefined, parameterBindings)
+          : api.fullProfile(doc, nodeId, portId, planDigest, submissionId, true))
     } catch (error) {
       if (!retryableProfileRequest(error) || attempt >= PROFILE_RETRY_DELAYS_MS.length) throw error
       await wait(PROFILE_RETRY_DELAYS_MS[attempt])
@@ -534,6 +683,7 @@ interface PendingProfileSubmission {
   portId?: string
   planDigest: string
   inputManifest?: RunInputManifestItem[] | null
+  parameterBindings?: CanvasParameterBinding[]
   submissionId: string
   userId: string
   canCancel: boolean
@@ -723,13 +873,23 @@ function reconcileAndCancelProfileSubmission(entry: PendingProfileSubmission): v
       let status: RunStatus
       try {
         status = await (entry.inputManifest
-          ? api.fullProfile(
-            entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
-            entry.inputManifest,
-          )
-          : api.fullProfile(
-            entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
-          ))
+          ? entry.parameterBindings?.length
+            ? api.fullProfile(
+              entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+              entry.inputManifest, entry.parameterBindings,
+            )
+            : api.fullProfile(
+              entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+              entry.inputManifest,
+            )
+          : entry.parameterBindings?.length
+            ? api.fullProfile(
+              entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+              undefined, entry.parameterBindings,
+            )
+            : api.fullProfile(
+              entry.doc, entry.nodeId, entry.portId, entry.planDigest, entry.submissionId, true,
+            ))
       } catch (error) {
         if (!retryableProfileRequest(error)) {
           forgetProfileSubmission(entry)
@@ -847,6 +1007,10 @@ interface Store {
   runPreview: (id: string, offset?: number, portId?: string, refreshLatest?: boolean) => Promise<void>
   refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
+  setRunParameterBinding: (id: string, binding: CanvasParameterBinding) => void
+  clearRunParameterBinding: (id: string, name: string) => void
+  editRunParameters: (id: string) => void
+  submitRunParameters: (id: string) => Promise<void>
   estimate: (id: string) => Promise<void>
   prepareWrite: (id: string) => Promise<WriteAdmission | undefined>
   run: (id: string, confirmed?: boolean, acceptPreviewDrift?: boolean) => Promise<void>
@@ -941,6 +1105,7 @@ interface Store {
   newFromExample: (key: string) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
+  setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
   openLocalDraft: (draftId: string) => boolean
@@ -1623,19 +1788,22 @@ export const useStore = create<Store>((set, get) => ({
       ? ports.find((port) => port.id === currentPortId)?.id ?? defaultPortId
       : undefined)
     const planIdentity = previewPlanIdentity(doc, id, portId)
+    const parameterBindings = get().runs[id]?.parameterBindings ?? []
+    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
     const requestGeneration = ++_previewRequestGeneration
     const isCurrent = () => {
       const state = get()
       const preview = state.previews[id]
       return preview?.requestGeneration === requestGeneration
         && previewIsCurrent(preview, state.doc, id, portId)
+        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
     }
     set((s) => ({
       previews: {
         ...s.previews,
         [id]: refreshLatest && previousPreview
-          ? { ...previousPreview, requestGeneration, loading: true, error: undefined }
-          : { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, loading: true, offset },
+          ? { ...previousPreview, parameterBindings, requestGeneration, loading: true, error: undefined }
+          : { canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, loading: true, offset },
       },
       openPanels: { [id]: 'data' },
     }))
@@ -1645,7 +1813,7 @@ export const useStore = create<Store>((set, get) => ({
         previews: {
           ...s.previews,
           [id]: {
-            canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, offset,
+            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, offset,
             result: {
               columns: [],
               rows: [],
@@ -1668,16 +1836,23 @@ export const useStore = create<Store>((set, get) => ({
       const k = node.type === 'chart' ? 2000 : 50
       const retainedBinding = refreshLatest ? undefined : currentPreviewBinding(get(), id)?.inputManifest
       const result = retainedBinding
-        ? await api.preview(doc, id, k, offset, portId, retainedBinding)
-        : await api.preview(doc, id, k, offset, portId)
+        ? parameterBindings.length
+          ? await api.preview(doc, id, k, offset, portId, retainedBinding, parameterBindings)
+          : await api.preview(doc, id, k, offset, portId, retainedBinding)
+        : parameterBindings.length
+          ? await api.preview(doc, id, k, offset, portId, undefined, parameterBindings)
+          : await api.preview(doc, id, k, offset, portId)
       if (!isCurrent()) return
       const binding = result.inputManifest ? {
         canvasId: doc.id, nodeId: id, portId, planIdentity,
+        parameterBindings,
         inputManifest: result.inputManifest,
       } : undefined
       const clearRetainedBinding = refreshLatest && !binding && !result.error && !result.notPreviewable
       set((s) => ({
-        previews: { ...s.previews, [id]: { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, result, offset } },
+        previews: { ...s.previews, [id]: {
+          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, result, offset,
+        } },
         previewBindings: (() => {
           if (binding) return { ...s.previewBindings, [id]: binding }
           if (!clearRetainedBinding) return s.previewBindings
@@ -1696,7 +1871,7 @@ export const useStore = create<Store>((set, get) => ({
           ...s.previews,
           [id]: refreshLatest && previousPreview
             ? { ...previousPreview, requestGeneration, error: (e as Error).message, loading: false }
-            : { canvasId: doc.id, nodeId: id, portId, planIdentity, requestGeneration, error: (e as Error).message, offset },
+            : { canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, error: (e as Error).message, offset },
         },
       }))
     }
@@ -1748,41 +1923,166 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast('Fix invalid node parameters before running.', 'error')
       return
     }
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } } }))
+    const declarations = targetParameterDeclarations(get().doc, id)
+    const parameterContractFingerprint = JSON.stringify(declarations)
+    if (declarations.length > 0 && (!get().runs[id]?.parametersReady
+        || get().runs[id]?.parameterContractFingerprint !== parameterContractFingerprint)) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'parameters',
+        parametersReady: false, parameterContractFingerprint,
+        parameterContinuation: { kind: 'run' },
+      } }, openPanels: { [id]: 'run' } }))
+      return
+    }
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'estimating', parametersReady: false,
+    } } }))
     let estimate
+    const requestFingerprint = parameterRequestFingerprint(
+      get().doc, id, get().runs[id]?.parameterBindings)
     try {
       const doc = get().doc
       const binding = currentPreviewBinding(get(), id)
+      const parameters = get().runs[id]?.parameterBindings
       estimate = binding
-        ? await api.estimate(doc, id, binding.inputManifest)
-        : await api.estimate(doc, id)
+        ? parameters?.length
+          ? await api.estimate(doc, id, binding.inputManifest, parameters)
+          : await api.estimate(doc, id, binding.inputManifest)
+        : parameters?.length ? await api.estimate(doc, id, undefined, parameters) : await api.estimate(doc, id)
     } catch (e) {
-      set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
+      if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
+      } } }))
       get().pushToast((e as Error).message || 'Could not estimate the run', 'error')
       return
     }
+    if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
     if (estimate.needsConfirm) {
-      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'confirm' } }, openPanels: { [id]: 'run' } }))
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), estimate, phase: 'confirm',
+      } }, openPanels: { [id]: 'run' } }))
     } else {
-      set((s) => ({ runs: { ...s.runs, [id]: { estimate, phase: 'running' } } }))
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), estimate, phase: 'running',
+      } } }))
       await get().run(id, false)
     }
   },
 
+  setRunParameterBinding: (id, binding) => {
+    set((s) => {
+      const current = s.runs[id]?.parameterBindings ?? []
+      const parameterBindings = [...current.filter((item) => item.name !== binding.name), binding]
+      if (parameterBindingsIdentity(parameterBindings) === parameterBindingsIdentity(current)) return {}
+      const previews = { ...s.previews }; delete previews[id]
+      const previewBindings = { ...s.previewBindings }; delete previewBindings[id]
+      return {
+        previews, previewBindings,
+        runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? { phase: 'parameters' as const }),
+          parameterBindings, parametersReady: false, estimate: undefined,
+          inputDrift: undefined, driftInputManifest: undefined,
+          writeAdmission: undefined, writeSubmissionId: undefined, writeAdmissionFingerprint: undefined,
+        } },
+      }
+    })
+    writePreviewBindings(get().currentUser?.id, get().doc.id, get().previewBindings)
+  },
+
+  clearRunParameterBinding: (id, name) => {
+    set((s) => {
+      const current = s.runs[id]?.parameterBindings ?? []
+      const parameterBindings = current.filter((item) => item.name !== name)
+      if (parameterBindings.length === current.length) return {}
+      const previews = { ...s.previews }; delete previews[id]
+      const previewBindings = { ...s.previewBindings }; delete previewBindings[id]
+      return {
+        previews, previewBindings,
+        runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? { phase: 'parameters' as const }),
+          parameterBindings, parametersReady: false, estimate: undefined,
+          inputDrift: undefined, driftInputManifest: undefined,
+          writeAdmission: undefined, writeSubmissionId: undefined, writeAdmissionFingerprint: undefined,
+        } },
+      }
+    })
+    writePreviewBindings(get().currentUser?.id, get().doc.id, get().previewBindings)
+  },
+
+  editRunParameters: (id) => {
+    const declarations = targetParameterDeclarations(get().doc, id)
+    if (!declarations.length) return
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'parameters', parametersReady: false,
+      parameterContractFingerprint: JSON.stringify(declarations),
+      parameterContinuation: { kind: 'estimate' },
+    } }, openPanels: { [id]: 'run' } }))
+  },
+
+  submitRunParameters: async (id) => {
+    const parameterContractFingerprint = JSON.stringify(
+      targetParameterDeclarations(get().doc, id))
+    const continuation = get().runs[id]?.parameterContinuation
+    set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? { phase: 'parameters' as const }), phase: 'idle',
+        parametersReady: true, parameterContractFingerprint, parameterContinuation: undefined,
+    } } }))
+    const metadataDoc = get().doc
+    const metadataBindings = get().runs[id]?.parameterBindings
+    const metadataFingerprint = parameterRequestFingerprint(metadataDoc, id, metadataBindings)
+    void api.schema(metadataDoc, id, undefined, metadataBindings).then((schemas) => {
+      if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== metadataFingerprint) return
+      set((s) => ({ schemas: { ...s.schemas, ...schemas } }))
+    }).catch(() => {})
+    void api.graphSizes(metadataDoc, id, metadataBindings).then((sizes) => {
+      if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== metadataFingerprint) return
+      set((s) => ({ sizes: { ...s.sizes, ...sizes } }))
+    }).catch(() => {})
+    if (continuation?.kind === 'profile') {
+      get().closePanel(id)
+      await get().prepareFullProfile(id, continuation.portId)
+    } else if (continuation?.kind === 'estimate') await get().estimate(id)
+    else await get().requestRun(id)
+  },
+
   estimate: async (id) => {
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
-    set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'estimating' } }, openPanels: { [id]: 'run' } }))
+    const declarations = targetParameterDeclarations(get().doc, id)
+    const parameterContractFingerprint = JSON.stringify(declarations)
+    if (declarations.length > 0 && (!get().runs[id]?.parametersReady
+        || get().runs[id]?.parameterContractFingerprint !== parameterContractFingerprint)) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'parameters',
+        parametersReady: false, parameterContractFingerprint,
+        parameterContinuation: { kind: 'estimate' },
+      } }, openPanels: { [id]: 'run' } }))
+      return
+    }
+    set((s) => ({ runs: { ...s.runs, [id]: {
+      ...(s.runs[id] ?? {}), phase: 'estimating', parametersReady: false,
+    } }, openPanels: { [id]: 'run' } }))
+    const requestFingerprint = parameterRequestFingerprint(
+      get().doc, id, get().runs[id]?.parameterBindings)
     try {
       const doc = get().doc
       const binding = currentPreviewBinding(get(), id)
+      const parameters = get().runs[id]?.parameterBindings
       const estimate = binding
-        ? await api.estimate(doc, id, binding.inputManifest)
-        : await api.estimate(doc, id)
-      set((s) => ({
-        runs: { ...s.runs, [id]: { estimate, phase: estimate.needsConfirm ? 'confirm' : 'estimated' } },
-      }))
+        ? parameters?.length
+          ? await api.estimate(doc, id, binding.inputManifest, parameters)
+          : await api.estimate(doc, id, binding.inputManifest)
+        : parameters?.length ? await api.estimate(doc, id, undefined, parameters) : await api.estimate(doc, id)
+      if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), estimate,
+        phase: estimate.needsConfirm ? 'confirm' : 'estimated',
+      } } }))
     } catch (e) {
-      set((s) => ({ runs: { ...s.runs, [id]: { phase: 'failed', error: (e as Error).message } } }))
+      if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
+      } } }))
     }
   },
 
@@ -1790,7 +2090,8 @@ export const useStore = create<Store>((set, get) => ({
     const doc = get().doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
-    const fingerprint = writeAdmissionFingerprint(doc)
+    const parameterBindings = get().runs[id]?.parameterBindings
+    const fingerprint = writeAdmissionFingerprint(doc, parameterBindings)
     const existing = get().runs[id]
     if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
       return existing.writeAdmission
@@ -1803,12 +2104,14 @@ export const useStore = create<Store>((set, get) => ({
       writeAdmission: undefined,
     } } }))
     const binding = currentPreviewBinding(get(), id)
-    const admission = await api.writeAdmission(
-      doc, id, submissionId, binding?.inputManifest)
+    const admission = parameterBindings?.length
+      ? await api.writeAdmission(doc, id, submissionId, binding?.inputManifest, parameterBindings)
+      : await api.writeAdmission(doc, id, submissionId, binding?.inputManifest)
     const current = get().runs[id]
     if (current?.writeSubmissionId !== submissionId
         || current.writeAdmissionFingerprint !== fingerprint
-        || writeAdmissionFingerprint(get().doc) !== fingerprint) return undefined
+        || writeAdmissionFingerprint(
+          get().doc, get().runs[id]?.parameterBindings) !== fingerprint) return undefined
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
     } } }))
@@ -1822,7 +2125,10 @@ export const useStore = create<Store>((set, get) => ({
     const binding = currentPreviewBinding(get(), id)
     if (binding && !acceptPreviewDrift) {
       try {
-        const inputDrift = await api.inputDrift(doc, id, binding.inputManifest)
+        const parameters = get().runs[id]?.parameterBindings
+        const inputDrift = parameters?.length
+          ? await api.inputDrift(doc, id, binding.inputManifest, parameters)
+          : await api.inputDrift(doc, id, binding.inputManifest)
         if (inputDrift.drifted) {
           set((s) => ({
             runs: { ...s.runs, [id]: {
@@ -1833,7 +2139,7 @@ export const useStore = create<Store>((set, get) => ({
           }))
           return
         }
-        if (!previewBindingIsCurrent(binding, get().doc, id)) return
+        if (!previewBindingIsCurrent(binding, get().doc, id, get().runs[id]?.parameterBindings)) return
       } catch (e) {
         set((s) => ({ runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? {}), phase: 'failed',
@@ -1878,13 +2184,22 @@ export const useStore = create<Store>((set, get) => ({
         ? get().runs[id]?.writeSubmissionId ?? globalThis.crypto.randomUUID()
         : globalThis.crypto.randomUUID()
       const status = writeAdmission
-        ? await api.run(
-          doc, id, confirmed, submissionId, binding?.inputManifest,
-          writeAdmission.intent ?? undefined,
-        )
+        ? get().runs[id]?.parameterBindings?.length
+          ? await api.run(
+            doc, id, confirmed, submissionId, binding?.inputManifest,
+            writeAdmission.intent ?? undefined, get().runs[id]?.parameterBindings,
+          )
+          : await api.run(
+            doc, id, confirmed, submissionId, binding?.inputManifest,
+            writeAdmission.intent ?? undefined,
+          )
         : binding
-          ? await api.run(doc, id, confirmed, submissionId, binding.inputManifest)
-          : await api.run(doc, id, confirmed, submissionId)
+          ? get().runs[id]?.parameterBindings?.length
+            ? await api.run(doc, id, confirmed, submissionId, binding.inputManifest, undefined, get().runs[id]?.parameterBindings)
+            : await api.run(doc, id, confirmed, submissionId, binding.inputManifest)
+          : get().runs[id]?.parameterBindings?.length
+            ? await api.run(doc, id, confirmed, submissionId, undefined, undefined, get().runs[id]?.parameterBindings)
+            : await api.run(doc, id, confirmed, submissionId)
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
       pollRun(get, set, id, status.runId)
     } catch (e) {
@@ -1947,23 +2262,43 @@ export const useStore = create<Store>((set, get) => ({
     if (!roleCanEdit(get().canvasRole)) return
     const doc = get().doc
     if (!doc.nodes.some((node) => node.id === id)) return
+    const declarations = targetParameterDeclarations(doc, id)
+    const parameterContractFingerprint = JSON.stringify(declarations)
+    if (declarations.length > 0 && (!get().runs[id]?.parametersReady
+        || get().runs[id]?.parameterContractFingerprint !== parameterContractFingerprint)) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), phase: 'parameters',
+        parametersReady: false, parameterContractFingerprint,
+        parameterContinuation: { kind: 'profile', portId: requestedPortId },
+      } }, openPanels: { [id]: 'run' } }))
+      return
+    }
+    if (declarations.length > 0) {
+      set((s) => ({ runs: { ...s.runs, [id]: {
+        ...(s.runs[id] ?? {}), parametersReady: false,
+      } } }))
+    }
     const portId = resolvedProfilePort(doc, id, requestedPortId)
     const initialJobKey = profileJobKeyForDoc(doc, id, portId)
     const planIdentity = profilePlanIdentity(doc, id, portId)
     const requestGeneration = ++_profileRequestGeneration
     const previous = get().profileJobs[initialJobKey]
     cancelDetachedProfileJob(previous)
+    const parameterBindings = get().runs[id]?.parameterBindings
+    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
     const isCurrent = () => {
       const job = get().profileJobs[initialJobKey]
       return job?.requestGeneration === requestGeneration
         && profileJobIsCurrent(job, get().doc, id, portId)
+        && parameterBindingsIdentity(get().runs[id]?.parameterBindings) === parameterIdentity
     }
     set((s) => ({ profileJobs: {
       ...s.profileJobs,
       [initialJobKey]: {
         canvasId: doc.id, nodeId: id, portId,
         principalId: s.currentUser?.id,
-        canCancel: roleCanEdit(s.canvasRole), planIdentity, requestGeneration, phase: 'estimating',
+        canCancel: roleCanEdit(s.canvasRole), planIdentity, parameterBindings,
+        requestGeneration, phase: 'estimating',
       },
     } }))
     let estimate: RunEstimate
@@ -1972,8 +2307,12 @@ export const useStore = create<Store>((set, get) => ({
     try {
       const retainedManifest = currentPreviewBinding(get(), id)?.inputManifest
       const preflight = await (retainedManifest
-        ? api.profileEstimate(doc, id, portId, retainedManifest)
-        : api.profileEstimate(doc, id, portId))
+        ? parameterBindings?.length
+          ? api.profileEstimate(doc, id, portId, retainedManifest, parameterBindings)
+          : api.profileEstimate(doc, id, portId, retainedManifest)
+        : parameterBindings?.length
+          ? api.profileEstimate(doc, id, portId, undefined, parameterBindings)
+          : api.profileEstimate(doc, id, portId))
       if (portId !== undefined && preflight.targetPortId !== portId) {
         throw new Error('Profile estimate returned a different output port')
       }
@@ -1990,6 +2329,7 @@ export const useStore = create<Store>((set, get) => ({
     if (!isCurrent()) return
     set((s) => ({ profileJobs: { ...s.profileJobs, [initialJobKey]: {
       ...(s.profileJobs[initialJobKey]!), estimate, planDigest, inputManifest,
+      parameterBindings,
       phase: 'preflight', error: undefined,
     } } }))
   },
@@ -2010,14 +2350,15 @@ export const useStore = create<Store>((set, get) => ({
       } } }))
       return
     }
-    const { planDigest, requestGeneration, inputManifest } = job
+    const { planDigest, requestGeneration, inputManifest, parameterBindings } = job
     const submissionId = retryingUnknownSubmission && job.submissionId
       ? job.submissionId
       : globalThis.crypto.randomUUID()
     let pendingSubmission = _pendingProfileSubmissions.get(submissionId)
     if (!pendingSubmission) {
       pendingSubmission = {
-        doc: _clone(doc), nodeId: id, portId, planDigest, inputManifest, submissionId,
+        doc: _clone(doc), nodeId: id, portId, planDigest, inputManifest,
+        parameterBindings, submissionId,
         userId: submissionUserId, canCancel: true,
         cancelRequested: false, reconciling: false,
       }
@@ -2048,6 +2389,7 @@ export const useStore = create<Store>((set, get) => ({
       // graph and still rejects a large/unknown direct API call that omits ``confirmed``.
       status = await submitFullProfile(
         doc, id, portId, planDigest, submissionId, submissionUserId, inputManifest,
+        parameterBindings,
       )
     } catch (e) {
       const unresolved = retryableProfileRequest(e)
@@ -2634,6 +2976,51 @@ export const useStore = create<Store>((set, get) => ({
   setRequirements: (reqs) => {
     if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, requirements: reqs } }))
   },  // canvas pip deps; autosave persists
+  setParameters: (parameters) => {
+    if (!roleCanEdit(get().canvasRole)) return 'You do not have permission to edit Canvas parameters.'
+    const currentDoc = get().doc
+    const mutation = parameterDeclarationMutation(currentDoc, parameters)
+    if (mutation.error) return mutation.error
+    const executionDefinition = (value: CanvasParameterDeclaration | undefined) => value && JSON.stringify({
+      type: value.type, required: value.required === true,
+      default: value.default, constraints: value.constraints,
+    })
+    const previousByName = new Map((currentDoc.parameters ?? []).map((value) => [value.name, value]))
+    const nextByName = new Map(parameters.map((value) => [value.name, value]))
+    const changedNames = new Set([...previousByName.keys(), ...nextByName.keys()].filter((name) => (
+      executionDefinition(previousByName.get(name)) !== executionDefinition(nextByName.get(name))
+    )))
+    for (const [previous, next] of mutation.renames) { changedNames.add(previous); changedNames.add(next) }
+    const executionChanged = [...changedNames].some((name) => parameterRefUses(currentDoc, name).length > 0)
+    set((s) => {
+      const nodes = mutation.renames.size
+        ? s.doc.nodes.map((node) => ({ ...node, data: {
+            ...node.data,
+            config: rewriteParameterRef(node.data.config, mutation.renames) as NodeConfig,
+          } }))
+        : s.doc.nodes
+      const runs = executionChanged
+        ? Object.fromEntries(Object.entries(s.runs).map(([nodeId, run]) => [nodeId, {
+            ...run,
+            parametersReady: false,
+            estimate: undefined,
+            parameterBindings: run.parameterBindings?.flatMap((binding) => {
+              const renamed = mutation.renames.get(binding.name) ?? binding.name
+              return mutation.changedTypes.has(renamed) ? [] : [{ ...binding, name: renamed }]
+            }),
+            writeAdmission: undefined,
+            writeSubmissionId: undefined,
+            writeAdmissionFingerprint: undefined,
+          }]))
+        : s.runs
+      return {
+        doc: { ...s.doc, nodes, parameters }, runs,
+        ...(executionChanged ? { previews: {}, previewBindings: {}, schemas: {}, sizes: {} } : {}),
+      }
+    })
+    if (executionChanged) writePreviewBindings(get().currentUser?.id, get().doc.id, {})
+    return null
+  },
 
   deleteFile: async (id) => {
     const targetRole = get().files.find((file) => file.id === id)?.role
@@ -3020,6 +3407,12 @@ export const useStore = create<Store>((set, get) => ({
     const agentLog = d.id === get().doc.id ? get().agentLog : []
     _settlingLoadedDoc = d !== doc
     try {
+      const previewBindings = readPreviewBindings(get().currentUser?.id, d)
+      const retainedRuns = Object.fromEntries(Object.entries(previewBindings).flatMap(([nodeId, binding]) => (
+        binding.parameterBindings?.length
+          ? [[nodeId, { phase: 'idle' as const, parameterBindings: binding.parameterBindings }]]
+          : []
+      )))
       set({
         doc: d,
         canvasRole: role,
@@ -3031,7 +3424,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, previewBindings: readPreviewBindings(get().currentUser?.id, d), runs: {}, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {
@@ -3305,8 +3698,9 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
   }
   const currentPlanByTarget = new Map<string, Promise<{ identity: string; digest: string }>>()
 
-  const currentPlan = (nodeId: string, portId: string) => {
-    const targetKey = profileJobKeyForDoc(get().doc, nodeId, portId)
+  const currentPlan = (nodeId: string, portId: string,
+                       parameterBindings?: CanvasParameterBinding[]) => {
+    const targetKey = `${profileJobKeyForDoc(get().doc, nodeId, portId)}:${JSON.stringify(parameterBindings ?? [])}`
     let pending = currentPlanByTarget.get(targetKey)
     if (!pending) {
       const identity = profilePlanIdentity(get().doc, nodeId, portId)
@@ -3316,8 +3710,12 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
           try {
             const retainedManifest = currentPreviewBinding(get(), nodeId)?.inputManifest
             const currentIdentity = await (retainedManifest
-              ? api.profileIdentity(doc, nodeId, portId, retainedManifest)
-              : api.profileIdentity(doc, nodeId, portId))
+              ? parameterBindings?.length
+                ? api.profileIdentity(doc, nodeId, portId, retainedManifest, parameterBindings)
+                : api.profileIdentity(doc, nodeId, portId, retainedManifest)
+              : parameterBindings?.length
+                ? api.profileIdentity(doc, nodeId, portId, undefined, parameterBindings)
+                : api.profileIdentity(doc, nodeId, portId))
             if (currentIdentity.targetPortId !== portId) {
               throw new Error('Profile identity returned a different output port')
             }
@@ -3345,6 +3743,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     st: RunStatus,
     verification: RecoveryVerification,
     error?: string,
+    parameterBindings?: CanvasParameterBinding[],
   ): { installed: boolean; requestGeneration?: number; blockedByLocalIntent: boolean } => {
     const nodeId = st.targetNodeId!
     const portId = st.targetPortId!
@@ -3385,11 +3784,18 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       const cancelRequested = sameAttempt && existingJob?.cancelRequested === true
       installed = true
       installedGeneration = requestGeneration
-      return { profileJobs: { ...s.profileJobs, [jobKey]: {
+      const recoveredRuns = verification === 'verified' && parameterBindings
+          && !s.runs[nodeId]
+        ? { ...s.runs, [nodeId]: {
+            phase: 'idle' as const, parameterBindings,
+          } }
+        : s.runs
+      return { runs: recoveredRuns, profileJobs: { ...s.profileJobs, [jobKey]: {
         canvasId, nodeId, portId, principalId: reattachUserId!, canCancel: recoveryCanCancel,
         planIdentity: profilePlanIdentity(s.doc, nodeId, portId),
         planDigest: st.planDigest ?? undefined,
         inputManifest: st.profile?.inputManifest,
+        parameterBindings,
         requestGeneration,
         status,
         identityVerified: verification === 'verified',
@@ -3439,8 +3845,27 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
     }
     let planIdentity: string
     let planDigest: string
+    let parameterBindings: CanvasParameterBinding[] | undefined
     try {
-      ({ identity: planIdentity, digest: planDigest } = await currentPlan(nodeId, portId))
+      if (st.executionManifestSha256) {
+        const detail = await api.executionManifest(canvasId, st.runId)
+        const raw = detail.document?.parameters
+        if (Array.isArray(raw)) {
+          parameterBindings = raw.flatMap((item) => {
+            if (!item || typeof item !== 'object') return []
+            const binding = item as { name?: unknown; value?: unknown }
+            const value = binding.value && typeof binding.value === 'object'
+              && (binding.value as { kind?: unknown }).kind === 'latest'
+              ? Object.fromEntries(Object.entries(binding.value as Record<string, unknown>)
+                .filter(([key]) => key !== 'resolvedRevisionId'))
+              : binding.value
+            return typeof binding.name === 'string'
+              ? [{ name: binding.name, value }] : []
+          })
+        }
+      }
+      ({ identity: planIdentity, digest: planDigest } = await currentPlan(
+        nodeId, portId, parameterBindings))
     } catch (error) {
       if (!current()) {
         superviseRecoveredIfDetached(st)
@@ -3450,6 +3875,7 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         st,
         'failed',
         `Could not verify the recovered full profile. Statistics are hidden${error instanceof Error && error.message ? `: ${error.message}` : '.'}`,
+        parameterBindings,
       )
       if (!failed.installed) superviseRecoveredIfDetached(st)
       return
@@ -3463,7 +3889,8 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
       superviseRecoveredIfDetached(st)
       return
     }
-    const { installed, requestGeneration } = installRecoveredState(st, 'verified')
+    const { installed, requestGeneration } = installRecoveredState(
+      st, 'verified', undefined, parameterBindings)
     if (installed && requestGeneration !== undefined && current()
         && (st.status === 'queued' || st.status === 'running')) {
       pollProfile(

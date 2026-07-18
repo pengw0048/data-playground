@@ -31,6 +31,11 @@ export interface AsOfDatasetRef {
 }
 
 export type DatasetRef = ExactDatasetRef | AsOfDatasetRef
+export interface ParameterRef { parameterRef: string }
+export function isParameterRef(value: unknown): value is ParameterRef {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === 1 && typeof (value as ParameterRef).parameterRef === 'string'
+}
 
 export function datasetRefIdentity(ref: DatasetRef): { datasetId: string; revisionId: string } {
   return ref.kind === 'as_of' ? ref.resolved : ref
@@ -40,7 +45,7 @@ export interface NodeConfig {
   // source
   uri?: string
   tableId?: string
-  datasetRef?: DatasetRef
+  datasetRef?: DatasetRef | ParameterRef
   providerResourceRef?: string
   providerMountId?: string
   providerName?: string
@@ -129,6 +134,18 @@ export interface CanvasEdge {
   data?: { wire: WireType }
 }
 
+export type CanvasParameterType = 'string' | 'integer' | 'float' | 'boolean' | 'date' | 'datetime' | 'dataset'
+export interface CanvasParameterDeclaration {
+  name: string
+  type: CanvasParameterType
+  required?: boolean
+  default?: unknown
+  label?: string
+  help?: string
+  constraints?: { minimum?: number; maximum?: number; minLength?: number; maxLength?: number }
+}
+export interface CanvasParameterBinding { name: string; value: unknown }
+
 export interface CanvasDoc {
   id: string
   name?: string
@@ -136,6 +153,7 @@ export interface CanvasDoc {
   nodes: CanvasNode[]
   edges: CanvasEdge[]
   requirements?: string[]  // pip specs this canvas needs; its kernel installs them (travels with the canvas)
+  parameters?: CanvasParameterDeclaration[]
 }
 
 export interface ColumnSchema {

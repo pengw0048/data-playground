@@ -33,6 +33,7 @@ describe('Write card — typed local mode truth', () => {
         const { status: _status, ...data } = node.data
         return { ...node, data }
       }),
+      parameterBindings: [],
     })
     useStore.setState({
       canvasRole: 'owner', doc,
@@ -86,6 +87,7 @@ describe('Write card — typed local mode truth', () => {
         const { status: _status, ...nodeData } = node.data
         return { ...node, data: nodeData }
       }),
+      parameterBindings: [],
     })
     useStore.setState({
       runs: { write: {

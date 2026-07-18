@@ -7,7 +7,7 @@ import type {
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
-import type { CanvasDoc, ColumnSchema } from '../types/graph'
+import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
 const BASE = '/api'
 
@@ -79,6 +79,7 @@ function toGraph(doc: CanvasDoc) {
     id: doc.id,
     version: doc.version,
     requirements: doc.requirements ?? [],  // the canvas's declared pip deps → the kernel installs them
+    parameters: doc.parameters ?? [],
     nodes: dataNodes.map((n) => ({
       id: n.id,
       type: n.type,
@@ -344,36 +345,41 @@ export const api = {
       method: 'POST', body: JSON.stringify({ config, params }), signal: options?.signal,
     }),
 
-  compile: (doc: CanvasDoc, targetNodeId?: string) =>
-    req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
+  compile: (doc: CanvasDoc, targetNodeId?: string, parameterBindings?: CanvasParameterBinding[]) =>
+    req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }) }),
 
   preview: (doc: CanvasDoc, nodeId: string, k = 50, offset = 0, portId?: string,
-    inputManifest?: RunInputManifestItem[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<SampleResult>('/run/preview', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, k, offset, inputManifest, parameterBindings }),
     }),
   profile: (doc: CanvasDoc, nodeId: string, portId?: string,
-    inputManifest?: RunInputManifestItem[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<ProfileResult>('/run/profile', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest, parameterBindings }),
     }),
 
   // per-node, per-output-port columns (metadata only); null = untyped port
-  schema: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[]) =>
+  schema: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[],
+    parameterBindings?: CanvasParameterBinding[]) =>
     req<Record<string, Record<string, ColumnSchema[] | null>>>('/graph/schema', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest, parameterBindings }),
     }),
   // per-node output-size estimate (rows + confidence) → the card "~N rows" hint; unknown → rows null
-  graphSizes: (doc: CanvasDoc) =>
-    req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc) }) }),
+  graphSizes: (doc: CanvasDoc, targetNodeId?: string, parameterBindings?: CanvasParameterBinding[]) =>
+    req<Record<string, { rows: number | null; confidence: string }>>('/graph/estimate', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }),
+    }),
   // the execution plan for a target: regions + backend + boundary tier + estimated size (the run-plan preview)
-  plan: (doc: CanvasDoc, targetNodeId: string) =>
+  plan: (doc: CanvasDoc, targetNodeId: string, parameterBindings?: CanvasParameterBinding[]) =>
     req<{ regions: { id: string; outputNode: string; backend: string; worker: string | null; nodeIds: string[]; tier: string | null; rows: number | null; confidence: string; requires?: string; unsatisfied?: boolean; available?: string; preflight?: string[] }[]; error?: string }>(
-      '/graph/plan', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId }) }),
+      '/graph/plan', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }) }),
 
   // catalog-driven join hints for a join node: ranked keys (measured cardinality) + a fan-out warning
-  joinAnalysis: (doc: CanvasDoc, nodeId: string) =>
-    req<JoinAnalysis>('/graph/join-analysis', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId: nodeId }) }),
+  joinAnalysis: (doc: CanvasDoc, nodeId: string, parameterBindings?: CanvasParameterBinding[]) =>
+    req<JoinAnalysis>('/graph/join-analysis', {
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId: nodeId, parameterBindings }),
+    }),
   // ranked ways to join two catalog datasets directly (used outside the canvas)
   joinSuggestions: (leftUri: string, rightUri: string) =>
     req<JoinSuggestion[]>('/catalog/join-suggestions', { method: 'POST', body: JSON.stringify({ leftUri, rightUri }) }),
@@ -388,38 +394,40 @@ export const api = {
   deleteRelationship: (rel: Relationship) =>
     req<Relationship[]>('/catalog/relationships/delete', { method: 'POST', body: JSON.stringify(rel) }),
 
-  estimate: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[]) =>
+  estimate: (doc: CanvasDoc, targetNodeId?: string, inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<RunEstimate>('/run/estimate', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest, parameterBindings }),
     }),
 
   writeAdmission: (doc: CanvasDoc, nodeId: string, submissionId: string,
-    inputManifest?: RunInputManifestItem[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<WriteAdmission>('/run/write-admission', {
       method: 'POST', body: JSON.stringify({
-        graph: toGraph(doc), nodeId, submissionId, inputManifest,
+        graph: toGraph(doc), nodeId, submissionId, inputManifest, parameterBindings,
       }),
     }),
 
-  inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[]) =>
+  inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[],
+    parameterBindings?: CanvasParameterBinding[]) =>
     req<InputDrift>('/run/input-drift', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, inputManifest, parameterBindings }),
     }),
 
   profileEstimate: (doc: CanvasDoc, nodeId: string, portId?: string,
-    inputManifest?: RunInputManifestItem[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<ProfileEstimate>('/run/profile-estimate', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest, parameterBindings }),
     }),
 
   profileIdentity: (doc: CanvasDoc, nodeId: string, portId?: string,
-    inputManifest?: RunInputManifestItem[]) =>
+    inputManifest?: RunInputManifestItem[], parameterBindings?: CanvasParameterBinding[]) =>
     req<ProfileIdentity>('/run/profile-identity', {
-      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest }),
+      method: 'POST', body: JSON.stringify({ graph: toGraph(doc), nodeId, portId, inputManifest, parameterBindings }),
     }),
 
   run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string,
-    inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent) => {
+    inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent,
+    parameterBindings?: CanvasParameterBinding[]) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
     const admittedProducerVersion = writeIntent?.provenance.publication.producerVersion
@@ -430,7 +438,7 @@ export const api = {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent }),
+          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent, parameterBindings }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error
@@ -440,10 +448,11 @@ export const api = {
   },
 
   fullProfile: (doc: CanvasDoc, nodeId: string, portId: string | undefined, planDigest: string,
-    submissionId: string, confirmed = false, inputManifest?: RunInputManifestItem[]) =>
+    submissionId: string, confirmed = false, inputManifest?: RunInputManifestItem[],
+    parameterBindings?: CanvasParameterBinding[]) =>
     req<RunStatus>('/run/profile-job', {
       method: 'POST', body: JSON.stringify({
-        graph: toGraph(doc), nodeId, portId, planDigest, submissionId, confirmed, inputManifest,
+        graph: toGraph(doc), nodeId, portId, planDigest, submissionId, confirmed, inputManifest, parameterBindings,
       }),
     }),
 

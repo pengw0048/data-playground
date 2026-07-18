@@ -7,6 +7,7 @@ snake_case in Python. These shapes ARE the contract.
 from __future__ import annotations
 
 import datetime
+import math
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -1873,7 +1874,9 @@ class GraphNode(Wire):
                     if isinstance(val, str) and len(val) > MAX_CODE_LEN:
                         raise ValueError(f"node {key} exceeds the {MAX_CODE_LEN}-char limit")
                 if "datasetRef" in cfg:
-                    _DATASET_REF_ADAPTER.validate_python(cfg["datasetRef"])
+                    value = cfg["datasetRef"]
+                    if not (isinstance(value, dict) and set(value) == {"parameterRef"}):
+                        _DATASET_REF_ADAPTER.validate_python(value)
         return v
 
 
@@ -1890,12 +1893,124 @@ class GraphEdge(Wire):
     data: GraphEdgeData = GraphEdgeData()
 
 
+class ParameterConstraints(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    minimum: float | None = None
+    maximum: float | None = None
+    min_length: int | None = Field(default=None, ge=0, le=4096)
+    max_length: int | None = Field(default=None, ge=0, le=4096)
+
+    @model_validator(mode="after")
+    def _ordered_bounds(self) -> "ParameterConstraints":
+        if any(value is not None and not math.isfinite(value)
+               for value in (self.minimum, self.maximum)):
+            raise ValueError("parameter numeric constraints must be finite")
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("parameter minimum cannot exceed maximum")
+        if (self.min_length is not None and self.max_length is not None
+                and self.min_length > self.max_length):
+            raise ValueError("parameter minLength cannot exceed maxLength")
+        return self
+
+
+class ParameterDeclaration(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
+    type: Literal["string", "integer", "float", "boolean", "date", "datetime", "dataset"]
+    required: bool = False
+    default: Any | None = None
+    label: str | None = Field(default=None, max_length=128)
+    help: str | None = Field(default=None, max_length=1024)
+    constraints: ParameterConstraints | None = None
+
+    @model_validator(mode="after")
+    def _valid_declaration(self) -> "ParameterDeclaration":
+        if self.required and self.default is not None:
+            raise ValueError("a required parameter cannot also declare a default")
+        limits = self.constraints
+        if limits is not None:
+            numeric = self.type in ("integer", "float")
+            textual = self.type == "string"
+            if (not numeric and (limits.minimum is not None or limits.maximum is not None)
+                    or not textual and (limits.min_length is not None
+                                           or limits.max_length is not None)):
+                raise ValueError(f"parameter constraints are incompatible with type '{self.type}'")
+        if self.default is None:
+            return self
+        value = self.default
+        from hub.secrets import is_registered_secret_ref
+        if self.type == "string":
+            if not isinstance(value, str):
+                raise ValueError("string parameter default must be a string")
+            if is_registered_secret_ref(value):
+                raise ValueError("parameter defaults cannot contain a SecretRef")
+            if limits and limits.min_length is not None and len(value) < limits.min_length:
+                raise ValueError("string parameter default is shorter than minLength")
+            if limits and limits.max_length is not None and len(value) > limits.max_length:
+                raise ValueError("string parameter default is longer than maxLength")
+        elif self.type == "integer":
+            if isinstance(value, bool) or not isinstance(value, int) or abs(value) > MAX_SAFE_INTEGER:
+                raise ValueError("integer parameter default must be a safe integer")
+        elif self.type == "float":
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))):
+                raise ValueError("float parameter default must be finite")
+        elif self.type == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError("boolean parameter default must be a boolean")
+        elif self.type == "date":
+            if not isinstance(value, str):
+                raise ValueError("date parameter default must be YYYY-MM-DD")
+            try:
+                datetime.date.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("date parameter default must be YYYY-MM-DD") from exc
+        elif self.type == "datetime":
+            if not isinstance(value, str):
+                raise ValueError("datetime parameter default must include a timezone")
+            try:
+                parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("datetime parameter default must include a timezone") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("datetime parameter default must include a timezone")
+        elif (not isinstance(value, dict)
+              or value.get("kind") not in ("exact", "latest")
+              or not isinstance(value.get("datasetId"), str)
+              or not value["datasetId"]
+              or (value["kind"] == "exact" and (
+                  set(value) != {"kind", "datasetId", "revisionId"}
+                  or not isinstance(value.get("revisionId"), str) or not value["revisionId"]))
+              or (value["kind"] == "latest" and set(value) != {"kind", "datasetId"})):
+            raise ValueError("dataset parameter default must be an exact or latest DatasetRef")
+        elif self.type == "dataset" and (is_registered_secret_ref(value["datasetId"])
+                                         or is_registered_secret_ref(value.get("revisionId"))):
+            raise ValueError("dataset parameter defaults cannot contain a SecretRef")
+        if self.type in ("integer", "float") and limits:
+            numeric_value = float(value)
+            if limits.minimum is not None and numeric_value < limits.minimum:
+                raise ValueError("numeric parameter default is below minimum")
+            if limits.maximum is not None and numeric_value > limits.maximum:
+                raise ValueError("numeric parameter default is above maximum")
+        return self
+
+
+class ParameterBinding(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    value: Any
+
+
 class Graph(Wire):
     id: str = Field(default="canvas", min_length=1, max_length=512)
     version: int = Field(default=1, ge=0, le=MAX_SAFE_INTEGER)
     nodes: Annotated[list[GraphNode], Field(max_length=MAX_GRAPH_NODES)] = []
     edges: Annotated[list[GraphEdge], Field(max_length=MAX_GRAPH_EDGES)] = []
     requirements: list[str] = []  # pip specs the canvas needs; the kernel installs them + allows importing them
+    parameters: Annotated[list[ParameterDeclaration], Field(max_length=128)] = []
     # Parent-owned provenance for synthetic region ref-sources. PrivateAttr keeps this control-plane
     # metadata out of the client wire model, workload serialization, and user-controlled node data.
     _publication_source_uris: dict[str, tuple[str, ...]] = PrivateAttr(default_factory=dict)
@@ -1908,6 +2023,50 @@ class Graph(Wire):
     # allowing every existing status/history callback to attach the same durable reference.
     _execution_manifest_sha256: str | None = PrivateAttr(default=None)
     _execution_manifest_doc: str | None = PrivateAttr(default=None)
+    _parameter_bindings: list[dict[str, Any]] = PrivateAttr(default_factory=list)
+
+    @field_validator("parameters")
+    @classmethod
+    def _unique_parameter_names(cls, value: list[ParameterDeclaration]):
+        names = [item.name for item in value]
+        if len(names) != len(set(names)):
+            raise ValueError("canvas parameter names must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_parameter_references(self) -> "Graph":
+        declarations = {item.name: item for item in self.parameters}
+
+        def visit(value: Any, *, node: GraphNode, path: tuple[str, ...]) -> None:
+            if isinstance(value, dict) and "parameterRef" in value:
+                if set(value) != {"parameterRef"} or not isinstance(value["parameterRef"], str):
+                    raise ValueError("parameterRef sentinel must contain only one string name")
+                name = value["parameterRef"]
+                declaration = declarations.get(name)
+                if declaration is None:
+                    raise ValueError(f"canvas config references undeclared parameter '{name}'")
+                is_dataset_ref = (
+                    node.type == "source" and path == ("datasetRef",)
+                )
+                if declaration.type == "dataset" and not is_dataset_ref:
+                    raise ValueError(
+                        f"dataset parameter '{name}' must be the complete datasetRef of a Source")
+                if is_dataset_ref and declaration.type != "dataset":
+                    raise ValueError(
+                        f"Source datasetRef parameter '{name}' must have type 'dataset'")
+                return
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    visit(child, node=node, path=(*path, str(key)))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, node=node, path=(*path, str(index)))
+
+        for node in self.nodes:
+            config = node.data.get("config") if isinstance(node.data, dict) else None
+            if isinstance(config, dict):
+                visit(config, node=node, path=())
+        return self
 
     @field_validator("id")
     @classmethod
@@ -1943,6 +2102,7 @@ class CompileRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class PreviewRequest(Wire):
@@ -1956,6 +2116,7 @@ class PreviewRequest(Wire):
     # Reusing this binding makes pagination/refresh read the same preview population. Omitting it is
     # the explicit request to resolve a new latest binding.
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class InputDriftRequest(Wire):
@@ -1964,6 +2125,7 @@ class InputDriftRequest(Wire):
     graph: Graph
     target_node_id: str
     input_manifest: list[dict[str, str]]
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class InputDriftSource(Wire):
@@ -1986,6 +2148,7 @@ class ProfileEstimateRequest(Wire):
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class ProfileIdentityRequest(Wire):
@@ -1994,6 +2157,7 @@ class ProfileIdentityRequest(Wire):
     node_id: str
     port_id: str | None = Field(default=None, min_length=1, max_length=128)
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class ProfileJobRequest(Wire):
@@ -2010,12 +2174,14 @@ class ProfileJobRequest(Wire):
     submission_id: UUID4
     confirmed: bool = False
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class EstimateRequest(Wire):
     graph: Graph
     target_node_id: str | None = None
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class RunRequest(Wire):
@@ -2031,6 +2197,7 @@ class RunRequest(Wire):
     # The default local Write card obtains this frozen, side-effect-free admission before execution.
     # The server revalidates it against the submitted graph and current destination head.
     write_intent: WriteIntent | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class WriteAdmissionRequest(Wire):
@@ -2038,6 +2205,7 @@ class WriteAdmissionRequest(Wire):
     node_id: str
     submission_id: UUID4
     input_manifest: list[dict[str, str]] | None = None
+    parameter_bindings: list[ParameterBinding] = []
 
 
 class WriteAdmission(Wire):
