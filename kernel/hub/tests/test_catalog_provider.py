@@ -319,7 +319,8 @@ with TestClient(app) as client:
     assert final["totalRows"] == 2
 
     history = None
-    while time.monotonic() < deadline:
+    history_deadline = time.monotonic() + 5
+    while time.monotonic() < history_deadline:
         history_response = client.get(f"/api/canvas/{canvas_id}/runs")
         assert history_response.status_code == 200, history_response.text
         history = next(
