@@ -1280,6 +1280,16 @@
             "minLength": 1,
             "title": "Submissionid",
             "type": "string"
+          },
+          "temporalWindow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalWindowV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -1399,6 +1409,16 @@
             "pattern": "^[0-9a-f]{64}$",
             "title": "Semanticsha256",
             "type": "string"
+          },
+          "temporalWindow": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalWindowV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -6041,6 +6061,48 @@
           "revision"
         ],
         "title": "SettingsSnapshot",
+        "type": "object"
+      },
+      "TemporalWindowV1": {
+        "additionalProperties": false,
+        "description": "One bounded half-open interval over an integer field in a named time domain.",
+        "properties": {
+          "endTick": {
+            "description": "Canonical signed-int64 decimal string.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+            "title": "Endtick",
+            "type": "string"
+          },
+          "startTick": {
+            "description": "Canonical signed-int64 decimal string.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+            "title": "Starttick",
+            "type": "string"
+          },
+          "timeDomain": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Timedomain",
+            "type": "string"
+          },
+          "timeField": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Timefield",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timeField",
+          "timeDomain",
+          "startTick",
+          "endTick"
+        ],
+        "title": "TemporalWindowV1",
         "type": "object"
       },
       "TransformLibraryDetail": {

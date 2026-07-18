@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from hub import metadb
 from hub.main import app
+from hub.models import DatasetViewDefinitionV1
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import dataset_views as dataset_view_routes
@@ -276,6 +277,180 @@ def test_reservoir_is_deterministic_and_invalid_draft_does_not_claim_submission(
             metadb.DEFAULT_USER_ID, rejected_submission) is None
 
 
+def test_temporal_windows_are_half_open_composable_and_part_of_immutable_identity(tmp_path):
+    lance = pytest.importorskip("lance")
+    with TestClient(app) as client:
+        uri, _table, revision = _register_lance(client, tmp_path, {
+            "id": [0, 1, 2, 3, 4],
+            "value": ["at-0", "at-99", "at-100", "at-199", "at-200"],
+            "tick": [0, 99, 100, 199, 200],
+            "other_tick": [0, 99, 100, 199, 200],
+        })
+        base = _request(
+            revision,
+            uuid.uuid4().hex,
+            predicate="id != 1",
+            temporalWindow={
+                "timeField": "tick",
+                "timeDomain": "robot-monotonic-v1",
+                "startTick": "0",
+                "endTick": "100",
+            },
+        )
+        left = client.post("/api/dataset-views", json=base)
+        assert left.status_code == 201, left.text
+        left_definition = left.json()
+        assert left_definition["temporalWindow"] == base["temporalWindow"]
+        left_preview = client.post(
+            f"/api/dataset-views/{left_definition['id']}/preview")
+        assert left_preview.status_code == 200, left_preview.text
+        assert left_preview.json()["rows"] == [{"value": "at-0", "id": 0}]
+        assert [column["name"] for column in left_preview.json()["columns"]] == ["value", "id"]
+
+        right_request = {
+            **base,
+            "submissionId": uuid.uuid4().hex,
+            "temporalWindow": {
+                **base["temporalWindow"], "startTick": "100", "endTick": "200",
+            },
+        }
+        right = client.post("/api/dataset-views", json=right_request)
+        assert right.status_code == 201, right.text
+        right_definition = right.json()
+        right_preview = client.post(
+            f"/api/dataset-views/{right_definition['id']}/preview")
+        assert right_preview.status_code == 200, right_preview.text
+        assert right_preview.json()["rows"] == [
+            {"value": "at-100", "id": 2}, {"value": "at-199", "id": 3},
+        ]
+        assert {row["id"] for row in left_preview.json()["rows"]}.isdisjoint(
+            row["id"] for row in right_preview.json()["rows"])
+
+        same_population = client.post("/api/dataset-views", json={
+            **base,
+            "submissionId": uuid.uuid4().hex,
+            "name": "Same temporal population",
+        })
+        assert same_population.status_code == 201
+        assert same_population.json()["semanticSha256"] == left_definition["semanticSha256"]
+        assert same_population.json()["definitionSha256"] != left_definition["definitionSha256"]
+
+        changed_windows = [
+            {**base["temporalWindow"], "timeField": "other_tick"},
+            {**base["temporalWindow"], "timeDomain": "camera-monotonic-v1"},
+            {**base["temporalWindow"], "startTick": "-1"},
+            {**base["temporalWindow"], "endTick": "101"},
+        ]
+        for window in changed_windows:
+            changed = client.post("/api/dataset-views", json={
+                **base, "submissionId": uuid.uuid4().hex, "temporalWindow": window,
+            })
+            assert changed.status_code == 201, changed.text
+            assert changed.json()["semanticSha256"] != left_definition["semanticSha256"]
+        conflict = client.post("/api/dataset-views", json={
+            **base,
+            "temporalWindow": {**base["temporalWindow"], "timeDomain": "changed-clock"},
+        })
+        assert conflict.status_code == 409
+
+        sampled = client.post("/api/dataset-views", json={
+            **base,
+            "submissionId": uuid.uuid4().hex,
+            "predicate": None,
+            "temporalWindow": {**base["temporalWindow"], "endTick": "200"},
+            "sampling": {"kind": "reservoir", "size": 10, "seed": 7},
+        })
+        assert sampled.status_code == 201, sampled.text
+        evidence = sampled.json()["sampleProvenance"]
+        assert evidence["strategy"] == "reservoir"
+        assert evidence["returnedRows"] == evidence["scannedRows"] == evidence["totalRows"] == 4
+        assert evidence["datasetIdentity"] == revision["datasetId"]
+        assert evidence["datasetRevision"] == revision["revisionId"]
+
+        full_int64 = client.post("/api/dataset-views", json={
+            **base,
+            "submissionId": uuid.uuid4().hex,
+            "predicate": None,
+            "temporalWindow": {
+                **base["temporalWindow"],
+                "startTick": "-9223372036854775808",
+                "endTick": "9223372036854775807",
+            },
+        })
+        assert full_int64.status_code == 201, full_int64.text
+        assert full_int64.json()["temporalWindow"]["startTick"] == "-9223372036854775808"
+        assert full_int64.json()["temporalWindow"]["endTick"] == "9223372036854775807"
+
+        # The exact revision fence also fixes temporal membership when the provider head advances.
+        lance.write_dataset(pa.table({
+            "id": [99], "value": ["new-head-inside-window"], "tick": [50], "other_tick": [50],
+        }), uri, mode="append")
+        replay = client.post(f"/api/dataset-views/{left_definition['id']}/preview")
+        assert replay.status_code == 200
+        assert replay.json()["rows"] == left_preview.json()["rows"]
+
+
+def test_temporal_window_wire_is_strict_and_invalid_drafts_are_not_claimed(
+    tmp_path, monkeypatch,
+):
+    valid_window = {
+        "timeField": "tick", "timeDomain": "robot-clock", "startTick": "0", "endTick": "10",
+    }
+    malformed = [
+        {**valid_window, "startTick": True},
+        {**valid_window, "startTick": 0},
+        {**valid_window, "startTick": 0.0},
+        {**valid_window, "startTick": "+0"},
+        {**valid_window, "startTick": "00"},
+        {**valid_window, "startTick": "-0"},
+        {**valid_window, "startTick": " 0"},
+        {**valid_window, "startTick": "0 "},
+        {**valid_window, "startTick": "1.0"},
+        {**valid_window, "startTick": "1e0"},
+        {**valid_window, "startTick": "-9223372036854775809"},
+        {**valid_window, "endTick": "9223372036854775808"},
+        {**valid_window, "startTick": "10"},
+        {**valid_window, "startTick": "11"},
+        {**valid_window, "timeField": " "},
+        {**valid_window, "timeField": " tick "},
+        {**valid_window, "timeField": "tick\x00field"},
+        {**valid_window, "timeDomain": ""},
+        {**valid_window, "timeDomain": "clock\x00name"},
+        {**valid_window, "unexpected": "field"},
+    ]
+    fake_revision = {"datasetId": "dataset", "revisionId": "revision"}
+    with monkeypatch.context() as guarded:
+        guarded.setattr(
+            dataset_view_routes,
+            "_open_exact",
+            lambda *_args, **_kwargs: pytest.fail("malformed wire reached exact source open"),
+        )
+        with TestClient(app) as client:
+            for window in malformed:
+                submission_id = uuid.uuid4().hex
+                response = client.post("/api/dataset-views", json=_request(
+                    fake_revision, submission_id, temporalWindow=window))
+                assert response.status_code == 422, (window, response.text)
+                assert metadb.dataset_view_submission(
+                    metadb.DEFAULT_USER_ID, submission_id) is None
+
+    with TestClient(app) as client:
+        _uri, _table, revision = _register_lance(client, tmp_path, {
+            "id": [1, 2], "value": ["one", "two"], "tick": ["0", "1"],
+        })
+        for field in ("tick", "missing"):
+            submission_id = uuid.uuid4().hex
+            invalid_source = client.post("/api/dataset-views", json=_request(
+                revision,
+                submission_id,
+                temporalWindow={**valid_window, "timeField": field},
+                sampling={"kind": "reservoir", "size": 1, "seed": 1},
+            ))
+            assert invalid_source.status_code == 422, invalid_source.text
+            assert metadb.dataset_view_submission(
+                metadb.DEFAULT_USER_ID, submission_id) is None
+
+
 def test_core_revision_hold_is_installed_and_released_with_view(
     tmp_path, monkeypatch,
 ):
@@ -327,9 +502,16 @@ def test_sqlite_backup_restores_definition_placement_and_tombstone(tmp_path):
         pytest.skip("SQLite backup contract")
     with TestClient(app) as client:
         _uri, _table, revision = _register_lance(client, tmp_path, {
-            "id": [1, 2, 3], "value": ["one", "two", "three"],
+            "id": [1, 2, 3], "value": ["one", "two", "three"], "tick": [10, 20, 30],
         })
-        live_request = _request(revision, uuid.uuid4().hex)
+        live_request = _request(
+            revision,
+            uuid.uuid4().hex,
+            temporalWindow={
+                "timeField": "tick", "timeDomain": "restart-clock", "startTick": "15",
+                "endTick": "31",
+            },
+        )
         deleted_request = _request(
             revision, uuid.uuid4().hex, name="Deleted view", predicate=None)
         live = client.post("/api/dataset-views", json=live_request)
@@ -337,6 +519,9 @@ def test_sqlite_backup_restores_definition_placement_and_tombstone(tmp_path):
         assert live.status_code == deleted.status_code == 201
         live_definition = live.json()
         deleted_definition = deleted.json()
+        historical_document = dict(deleted_definition)
+        assert historical_document.pop("temporalWindow") is None
+        assert DatasetViewDefinitionV1.model_validate(historical_document).temporal_window is None
         assert client.delete(
             f"/api/dataset-views/{deleted_definition['id']}").status_code == 200
 
@@ -426,7 +611,20 @@ def test_concurrent_same_submission_has_one_atomic_winner(tmp_path):
 
 
 def test_dataset_view_openapi_documents_create_and_replay_responses():
-    responses = app.openapi()["paths"]["/api/dataset-views"]["post"]["responses"]
+    schema = app.openapi()
+    responses = schema["paths"]["/api/dataset-views"]["post"]["responses"]
     expected = {"$ref": "#/components/schemas/DatasetViewDefinitionV1"}
     assert responses["200"]["content"]["application/json"]["schema"] == expected
     assert responses["201"]["content"]["application/json"]["schema"] == expected
+    temporal = schema["components"]["schemas"]["TemporalWindowV1"]
+    assert temporal["additionalProperties"] is False
+    assert temporal["required"] == ["timeField", "timeDomain", "startTick", "endTick"]
+    tick_schema = {
+        "description": "Canonical signed-int64 decimal string.",
+        "maxLength": 20,
+        "minLength": 1,
+        "pattern": r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        "type": "string",
+    }
+    assert temporal["properties"]["startTick"] == {**tick_schema, "title": "Starttick"}
+    assert temporal["properties"]["endTick"] == {**tick_schema, "title": "Endtick"}

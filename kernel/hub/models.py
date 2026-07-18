@@ -855,6 +855,47 @@ DatasetViewSampling = Annotated[
 ]
 
 
+class TemporalWindowV1(Wire):
+    """One bounded half-open interval over an integer field in a named time domain."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True,
+    )
+
+    time_field: str = Field(min_length=1, max_length=512)
+    time_domain: str = Field(min_length=1, max_length=512)
+    start_tick: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        description="Canonical signed-int64 decimal string.",
+    )
+    end_tick: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        description="Canonical signed-int64 decimal string.",
+    )
+
+    @field_validator("time_field", "time_domain")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or normalized != value or "\x00" in value:
+            raise ValueError("temporal window names must be trimmed, non-empty, and NUL-free")
+        return value
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "TemporalWindowV1":
+        start_tick, end_tick = int(self.start_tick), int(self.end_tick)
+        if not (-(1 << 63) <= start_tick <= (1 << 63) - 1
+                and -(1 << 63) <= end_tick <= (1 << 63) - 1):
+            raise ValueError("temporal window ticks must be signed 64-bit integers")
+        if start_tick >= end_tick:
+            raise ValueError("temporal window startTick must be less than endTick")
+        return self
+
+
 class DatasetViewCreateRequest(Wire):
     """Immutable DatasetView intent. Workspace placement is derived by the server."""
 
@@ -865,6 +906,7 @@ class DatasetViewCreateRequest(Wire):
     dataset_ref: ExactDatasetRef
     selected_columns: list[str] = Field(min_length=1, max_length=500)
     predicate: str | None = Field(default=None, max_length=65_536)
+    temporal_window: TemporalWindowV1 | None = None
     sampling: DatasetViewSampling = DatasetViewAllSampling()
 
     @model_validator(mode="after")
@@ -908,6 +950,7 @@ class DatasetViewDefinitionV1(Wire):
     placement: DatasetViewPlacement
     selected_columns: list[str] = Field(min_length=1, max_length=500)
     predicate: str | None = None
+    temporal_window: TemporalWindowV1 | None = None
     sampling: DatasetViewSampling
     sample_provenance: SampleProvenance | None = None
     retention_owner: Literal["provider", "core"]

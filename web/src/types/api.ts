@@ -120,12 +120,20 @@ export type DatasetViewSampling =
   | { kind: 'all' }
   | { kind: 'reservoir'; size: number; seed: number }
 
+export interface TemporalWindowV1 {
+  timeField: string
+  timeDomain: string
+  startTick: string
+  endTick: string
+}
+
 export interface DatasetViewCreateRequest {
   submissionId: string
   name: string
   datasetRef: { kind: 'exact'; datasetId: string; revisionId: string; lastKnown?: { committedAt?: string | null } | null }
   selectedColumns: string[]
   predicate?: string | null
+  temporalWindow?: TemporalWindowV1 | null
   sampling: DatasetViewSampling
 }
 
@@ -138,6 +146,7 @@ export interface DatasetViewDefinition {
   placement: { containerId: string; placementId: string; sourceRegistrationId: string }
   selectedColumns: string[]
   predicate?: string | null
+  temporalWindow?: TemporalWindowV1 | null
   sampling: DatasetViewSampling
   sampleProvenance?: SampleProvenance | null
   retentionOwner: 'provider' | 'core'
