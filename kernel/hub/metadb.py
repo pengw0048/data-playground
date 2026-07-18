@@ -5442,10 +5442,15 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
     admission = s.get(RunInputAdmission, str(run_id)) if run_id else None
     rec.input_manifest = admission.manifest if admission is not None else None
     state = s.get(RunState, str(run_id)) if run_id else None
-    retained_manifest_sha256 = (
-        admission.execution_manifest_sha256 if admission is not None
-        else state.execution_manifest_sha256 if state is not None else None
-    )
+    owner_manifest_sha256s = {
+        identity for identity in (
+            admission.execution_manifest_sha256 if admission is not None else None,
+            state.execution_manifest_sha256 if state is not None else None,
+        ) if identity is not None
+    }
+    if len(owner_manifest_sha256s) > 1:
+        raise RuntimeError("run owners disagree on their execution manifest")
+    retained_manifest_sha256 = next(iter(owner_manifest_sha256s), None)
     if execution_manifest_sha256 is not None:
         if (retained_manifest_sha256 is not None
                 and retained_manifest_sha256 != execution_manifest_sha256):

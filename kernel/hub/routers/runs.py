@@ -34,7 +34,11 @@ from hub.executors.engine import declared_schema
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
-from hub.execution_manifest import ExecutionManifestError, build_execution_manifest
+from hub.execution_manifest import (
+    ExecutionManifestError,
+    build_execution_manifest,
+    execution_manifest_accepts_graph_replay,
+)
 from hub.local_run_inputs import LocalRunInputError
 from hub.plugins.adapters import revision_adapter_for_uri
 from hub.run_outputs import (
@@ -1260,7 +1264,34 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
         owner = deps.kernel_backend()
         if existing is not None and not existing.should_dispatch:
             # A consumed or terminal submission is adopted from its immutable durable binding before
-            # consulting mutable source state. Response-loss replay therefore survives source updates.
+            # consulting mutable source state. Compare only against its retained exact definition: this
+            # catches a retargeted graph while preserving response-loss replay after source/runtime moves.
+            retained_sha256 = metadb.execution_manifest_sha256_for_run(existing.run_id)
+            if retained_sha256 is not None:
+                retained = metadb.execution_manifest(retained_sha256)
+                if retained is None:
+                    raise RuntimeError("profile execution manifest is unavailable")
+                retained_payload = json.dumps(
+                    retained["document"], sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                try:
+                    matches = execution_manifest_accepts_graph_replay(
+                        retained_sha256,
+                        retained_payload,
+                        req.graph,
+                        target_node_id=req.node_id,
+                        target_port_id=port_id,
+                    )
+                except ExecutionManifestError as exc:
+                    raise RuntimeError("profile execution manifest is invalid") from exc
+                if not matches:
+                    raise HTTPException(
+                        409,
+                        "profile submission id is already bound to a different execution manifest",
+                    )
+            # Legacy/pruned identities without a retained manifest remain non-reconstructable. They are
+            # adopted without synthesizing a definition from the current Canvas.
             run_id = existing.run_id
             status = RunStatus(**existing.status)
         else:

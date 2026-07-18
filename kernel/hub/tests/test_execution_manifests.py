@@ -14,6 +14,7 @@ from hub import metadb
 from hub.execution_manifest import (
     ExecutionManifestError,
     build_execution_manifest,
+    execution_manifest_accepts_graph_replay,
     validate_execution_manifest,
 )
 from hub.models import (
@@ -172,6 +173,60 @@ def test_digest_ignores_nonsemantic_canvas_display_and_admission_time():
         "kind": "exact", "datasetId": "dataset-1", "revisionId": "revision-1",
     }
     assert "parameters" not in doc
+
+
+def test_digest_retains_only_titles_consumed_by_execution():
+    baseline, _ = _build()
+
+    metric = _graph()
+    metric.nodes[1].type = "metric"
+    metric.nodes[1].data["title"] = "Rows kept"
+    first_metric, _ = _build(metric)
+    metric.nodes[1].data["title"] = "Useful rows"
+    second_metric, _ = _build(metric)
+    assert second_metric != first_metric
+
+    write = _graph()
+    write.nodes[1].type = "write"
+    write.nodes[1].data["config"] = {"format": "parquet"}
+    write.nodes[1].data["title"] = "daily output"
+    first_write, _ = _build(write)
+    write.nodes[1].data["title"] = "weekly output"
+    second_write, _ = _build(write)
+    assert second_write != first_write
+
+    # An explicit filename makes the Write title display-only again.
+    write.nodes[1].data["config"]["filename"] = "fixed.parquet"
+    explicit_write, _ = _build(write)
+    write.nodes[1].data["title"] = "Display-only rename"
+    renamed_explicit_write, _ = _build(write)
+    assert renamed_explicit_write == explicit_write
+
+    section_child = _graph()
+    section_child.nodes[1].parent_id = "section"
+    section_child.nodes[1].data["title"] = "clean rows"
+    first_alias, _ = _build(section_child)
+    section_child.nodes[1].data["title"] = "validated rows"
+    second_alias, _ = _build(section_child)
+    assert second_alias != first_alias
+
+    assert baseline == _build()[0]
+
+
+def test_manifest_replay_compares_graph_without_re_resolving_retained_inputs():
+    digest, payload = _build()
+    moved_source = _graph()
+    moved_source.nodes[0].data["config"]["uri"] = "/new/provider/location.parquet"
+    assert execution_manifest_accepts_graph_replay(
+        digest, payload, moved_source,
+        target_node_id="filter", target_port_id=None,
+    )
+
+    moved_source.nodes[1].data["config"]["predicate"] = "score >= 0"
+    assert not execution_manifest_accepts_graph_replay(
+        digest, payload, moved_source,
+        target_node_id="filter", target_port_id=None,
+    )
 
 
 @pytest.mark.parametrize("change", ["config", "disabled", "target", "port", "input", "write"])
@@ -347,6 +402,26 @@ def test_admission_state_history_share_manifest_and_canvas_delete_reclaims_it():
 
     metadb.delete_canvas_cascade("manifest-canvas")
     assert metadb.execution_manifest(digest) is None
+
+
+def test_history_rejects_disagreeing_admission_and_state_manifest_owners():
+    _canvas("manifest-canvas")
+    digest, payload = _build()
+    run_id = _admit("manifest-canvas", str(uuid.uuid4()), digest, payload)
+    metadb.claim_local_run_dispatch(
+        run_id=run_id, uid="local", auth_canvas_id=None, request_id="request-1")
+    changed_digest, changed_payload = _build(target="source")
+    with metadb.session() as session:
+        metadb._persist_execution_manifest(session, changed_digest, changed_payload)
+        state = session.get(metadb.RunState, run_id)
+        assert state is not None
+        state.execution_manifest_sha256 = changed_digest
+
+    with pytest.raises(RuntimeError, match="owners disagree"):
+        metadb.record_run(
+            canvas_id="manifest-canvas", target_node_id="filter", job_type="run",
+            status="failed", error="expected", run_id=run_id,
+        )
 
 
 def test_receipt_and_canvas_lineage_resolve_the_same_manifest_through_run_identity():

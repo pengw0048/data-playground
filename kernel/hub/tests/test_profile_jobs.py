@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime
 import hashlib
 import threading
@@ -819,12 +820,18 @@ def test_same_submission_replay_adopts_after_source_identity_changes(monkeypatch
     wrong_node = client.post("/api/run/profile-job", json={
         **body, "nodeId": "different-node",
     })
+    changed_graph = copy.deepcopy(graph)
+    changed_graph["nodes"][0]["data"]["disabled"] = True
+    changed_graph_replay = client.post("/api/run/profile-job", json={
+        **body, "graph": changed_graph,
+    })
 
     assert replay.status_code == 200, replay.text
     assert replay.json()["runId"] == first.json()["runId"]
     assert replay.json()["profileAttemptOrder"] == first.json()["profileAttemptOrder"]
     assert wrong_digest.status_code == 409
     assert wrong_node.status_code == 400
+    assert changed_graph_replay.status_code == 409
     assert dispatches == 1
     deps.run_index.pop(first.json()["runId"], None)
     deps.run_owner.pop(first.json()["runId"], None)

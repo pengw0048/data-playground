@@ -80,6 +80,17 @@ def _canonical_graph(
             for key, value in node.data.items()
             if key not in _DISPLAY_NODE_FIELDS
         }
+        # Most titles are editor-only labels, but three existing execution seams consume them:
+        # metric emits its title as a value, Write uses it as the destination fallback, and a
+        # Section addresses contained children by title. Retain only those semantic titles.
+        config = data.get("config") if isinstance(data.get("config"), dict) else {}
+        semantic_title = bool(
+            node.type == "metric"
+            or (node.type == "write" and not (config.get("filename") or config.get("name")))
+            or node.parent_id is not None
+        )
+        if semantic_title and "title" in node.data:
+            data["title"] = node.data["title"]
         input_ref = admitted.get(node.id)
         if input_ref is not None:
             config = dict(data.get("config") or {})
@@ -252,3 +263,41 @@ def validate_execution_manifest(sha256: str, payload: str) -> dict[str, Any]:
     if not secrets.compare_digest(observed, sha256):
         raise ExecutionManifestError("execution manifest digest does not match its document")
     return doc
+
+
+def execution_manifest_accepts_graph_replay(
+    sha256: str,
+    payload: str,
+    graph: Graph,
+    *,
+    target_node_id: str | None,
+    target_port_id: str | None,
+) -> bool:
+    """Compare replayed graph semantics without consulting mutable source state.
+
+    The retained exact inputs and compatibility descriptors remain authoritative. Re-canonicalizing
+    only the caller-controlled graph and target catches a retargeted submission while allowing the
+    original response-loss retry after a source alias or installed package has moved.
+    """
+    doc = validate_execution_manifest(sha256, payload)
+    admitted = doc.get("admittedInputs")
+    if not isinstance(admitted, list):
+        raise ExecutionManifestError("execution manifest admitted inputs are invalid")
+    source_inputs: list[dict[str, str]] = []
+    for item in admitted:
+        if not isinstance(item, dict) or set(item) != {
+            "nodeId", "datasetId", "revisionId", "provider",
+        } or any(not isinstance(value, str) or not value for value in item.values()):
+            raise ExecutionManifestError("execution manifest admitted inputs are invalid")
+        source_inputs.append({
+            "node_id": item["nodeId"],
+            "dataset_id": item["datasetId"],
+            "revision_id": item["revisionId"],
+            "provider": item["provider"],
+        })
+    return bool(
+        doc.get("graph") == _canonical_graph(graph, source_inputs)
+        and doc.get("target") == {
+            "nodeId": target_node_id, "portId": target_port_id,
+        }
+    )
