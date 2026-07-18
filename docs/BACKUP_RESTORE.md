@@ -13,7 +13,7 @@ steps below differ by profile.
 
 | Item | Why it matters |
 |---|---|
-| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. Durable task recovery additionally requires `durable_tasks`, `durable_task_attempts`, `durable_task_inbox_items`, `durable_external_waits`, `durable_checkpoints`, and the bounded fan-out plan, unit, attempt, and slot tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
+| **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. Exact execution history additionally requires `execution_manifests` and every `execution_manifest_sha256` owner on admissions, run state/history, receipts/revisions, lineage, durable Tasks/Attempts, and Inbox items. Durable task recovery also requires `durable_tasks`, `durable_task_attempts`, `durable_task_inbox_items`, `durable_external_waits`, `durable_checkpoints`, and the bounded fan-out plan, unit, attempt, and slot tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results plus immutable core-owned revision artifacts under `.dp-results/`), and `plugins/` (operator-installed packs). Preserve the complete `.dp-results` namespace metadata and record hashes for every core-owned artifact referenced by `managed_local_file_revisions`; copying only current catalog heads loses retained history. |
 | **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
 | **Provider-owned history evidence (not provider bytes)** | The database retains opaque registration / dataset IDs, exact provider revision IDs, pinned Source refs, and admitted run manifests. The logical backup does **not** include provider-owned Lance or plugin-provider bytes. Back those up through the provider's own system if required, and classify each restored exact read as available or unavailable instead of treating a current same-name/path dataset as the old revision. |
@@ -257,6 +257,37 @@ The automated drill emits `BACKUP_RESTORE_REVISION_EVIDENCE` on success. A failu
 operators can distinguish a missing DB row, identity drift, a missing/corrupt core artifact, and an
 unexpected provider result.
 
+## Execution manifest recovery verification
+
+Treat `execution_manifests` and its surviving owners as one database consistency unit. The canonical
+document is content-addressed metadata, not provider bytes and not a second backup format. The drill
+retains one ordinary write manifest through its admission, run state, history, managed-file receipt,
+and lineage fact, then edits the live Canvas before backup to prove restore never substitutes it. It
+also retains one distinct manifest for terminal managed-local, terminal linear
+checkpoint, terminal bounded fan-out, and nonterminal external-wait Tasks through their Task/Attempt,
+receipt, Inbox, and Jobs projections where those owners apply.
+
+After loading the database, but before recovery or normal traffic:
+
+1. For every surviving owner, read its original `execution_manifest_sha256`; do not rebuild it from
+   the live Canvas, current plugin descriptors, a source head, or the external provider request.
+2. Resolve that digest through `metadb.execution_manifest()`. This validates canonical JSON, schema
+   version, secret-free bounds, and the document digest before returning the document.
+3. Compare the returned document with the exact document recorded at the backup recovery point.
+   Matching a digest-shaped string or making all projections agree is insufficient if the document
+   row is absent or corrupt.
+4. Pruning is valid only when the existing retention lifecycle removed every owner. A missing owner
+   that was expected to survive, a surviving owner with no document, or a digest/document mismatch
+   rejects the restore. Do not drop the remaining owner or substitute mutable current state to make
+   the clone start.
+
+The automated drill emits `BACKUP_RESTORE_EXECUTION_MANIFEST_EVIDENCE` with the ordinary and four
+Task digests plus the verified owner count. Failure emits
+`BACKUP_RESTORE_EXECUTION_MANIFEST_MISMATCH` entries with `subject`, `code`, `expected`, and `actual`.
+The stable codes distinguish `execution_manifest_owner_pruned`,
+`execution_manifest_document_missing`, `execution_manifest_document_corrupt`, and reference or exact
+document mismatch.
+
 ## Durable task recovery verification
 
 Treat each durable task as a whole recovery unit, not as a task status row that can be restored on
@@ -319,10 +350,11 @@ cd kernel && uv run pytest -q hub/tests/test_backup_restore_drill.py -k postgres
 
 ### How to read RPO / RTO evidence
 
-Each passing drill prints four structured lines (also captured in CI logs):
+Each passing drill prints five structured lines (also captured in CI logs):
 
 ```
 BACKUP_RESTORE_REVISION_EVIDENCE: <JSON exact-read and identity summary>
+BACKUP_RESTORE_EXECUTION_MANIFEST_EVIDENCE: <JSON exact documents and owner summary>
 BACKUP_RESTORE_DURABLE_TASK_EVIDENCE: <JSON task identities and reattach summary>
 BACKUP_RESTORE_DRILL RPO: <human summary of which fixture writes the backup captured>
 BACKUP_RESTORE_DRILL RTO_MS: <integer milliseconds from restore start to verified restore>
