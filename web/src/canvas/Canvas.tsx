@@ -4,7 +4,7 @@ import {
   applyNodeChanges, applyEdgeChanges, useReactFlow,
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
 } from '@xyflow/react'
-import { buildNodeTypes } from '../nodes'
+import { allSpecs, buildNodeTypes } from '../nodes'
 import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
@@ -15,6 +15,7 @@ import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
 import type { WireType } from '../theme/tokens'
 import { ConnectMenu } from './ConnectMenu'
+import { NodeFinder } from './NodeFinder'
 import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
@@ -115,6 +116,7 @@ export function Canvas() {
   }, [docId])
 
   const [menu, setMenu] = useState<{ x: number; y: number; wire: WireType; source: { nodeId: string | null; handleId: string | null } } | null>(null)
+  const [finder, setFinder] = useState<typeof menu>(null)
 
   // Drag a data file from the OS onto the canvas → upload it and drop a bound source node where it landed.
   const [dropActive, setDropActive] = useState(false)
@@ -443,6 +445,7 @@ export function Canvas() {
           y={menu.y}
           wire={menu.wire}
           onClose={() => setMenu(null)}
+          onFind={() => { setFinder(menu); setMenu(null) }}
           onPick={(kind) => {
             const p = screenToFlowPosition({ x: menu.x, y: menu.y })
             // place to the right of the port, in a clear spot (never on top of the source)
@@ -456,6 +459,28 @@ export function Canvas() {
               })
             }
             setMenu(null)
+          }}
+        />
+      )}
+
+      {canEdit && finder && (
+        <NodeFinder
+          specs={allSpecs()}
+          wire={finder.wire}
+          onClose={() => setFinder(null)}
+          onPick={(kind) => {
+            const p = screenToFlowPosition({ x: finder.x, y: finder.y })
+            const pos = freePosition(useStore.getState().doc.nodes, { x: p.x + 60, y: p.y - 20 })
+            const node = useStore.getState().addNode(kind, pos)
+            const spec = getSpec(kind)
+            const target = spec?.inputs.find((port) => (port.accepts ?? [port.wire]).includes(finder.wire))
+            if (node && target && finder.source.nodeId) {
+              useStore.getState().connect({
+                id: newId('e'), source: finder.source.nodeId, target: node.id,
+                sourceHandle: finder.source.handleId, targetHandle: target.id, data: { wire: finder.wire },
+              })
+            }
+            setFinder(null)
           }}
         />
       )}

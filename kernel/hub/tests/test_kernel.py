@@ -156,6 +156,7 @@ def test_nodes_endpoint():
     assert {"source", "filter", "select", "transform", "sql", "join", "aggregate", "sort",
             "dedup", "write", "metric", "vector-search"} <= set(specs)
     assert specs["aggregate"]["previewable"] is False
+    assert specs["filter"]["source"] == "builtin"
     assert specs["filter"]["params"][0]["name"] == "predicate"
     assert specs["union"]["inputs"] == [{
         "id": "in", "label": None, "wire": "dataset",

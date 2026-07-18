@@ -33,6 +33,7 @@ def test_plugin_status_reports_only_effective_runtime_capabilities(tmp_path):
     assert active["effective_capabilities"] == ["node:status-active-node"]
     assert active["process_placement"] == ["execution"]
     assert "status-active-node" in deps.node_specs
+    assert deps.node_specs["status-active-node"].source == "plugin:status_active_pack"
     assert inactive["state"] == "inactive"
     assert inactive["effective_capabilities"] == []
     assert inactive["process_placement"] == []

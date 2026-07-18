@@ -4,8 +4,8 @@ import { color, kindAccent, radius, shadow, wire as wireTok, type WireType } fro
 
 // Drag from an output port → a menu filtered to nodes whose first input accepts this type
 // (FR-C2). You can only build valid graphs.
-export function ConnectMenu({ x, y, wire, onPick, onClose }: {
-  x: number; y: number; wire: WireType; onPick: (kind: string) => void; onClose: () => void
+export function ConnectMenu({ x, y, wire, onPick, onFind, onClose }: {
+  x: number; y: number; wire: WireType; onPick: (kind: string) => void; onFind: () => void; onClose: () => void
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const candidates = kindsAcceptingWire(wire)
@@ -51,6 +51,10 @@ export function ConnectMenu({ x, y, wire, onPick, onClose }: {
         </button>
       ))}
       {candidates.length === 0 && <div style={{ padding: 10, fontSize: 11.5, color: color.text3 }}>no compatible node</div>}
+      <button onClick={(e) => { e.stopPropagation(); onFind() }}
+        style={{ width: '100%', marginTop: 3, padding: '7px 8px', border: 'none', borderTop: `1px solid ${color.border}`, background: 'transparent', color: color.text2, fontSize: 11, textAlign: 'left' }}>
+        Search all nodes…
+      </button>
     </div>
   )
 }
