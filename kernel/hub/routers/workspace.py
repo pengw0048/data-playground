@@ -388,11 +388,11 @@ class WorkspaceCreateCanvasBody(_StrictAuthBody):
     container_id: str
     expected_container_version: int = Field(ge=1)
     name: str = "untitled"
-    dataset_id: str | None = None
+    dataset_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
 class WorkspaceAddDatasetBody(_StrictAuthBody):
-    dataset_id: str
+    dataset_ids: list[str] = Field(min_length=1, max_length=50)
     expected_canvas_version: int = Field(ge=1)
 
 
@@ -504,7 +504,7 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
         return metadb.workspace_create_canvas_action(
             uid=uid, container_id=body.container_id,
             expected_container_version=body.expected_container_version,
-            name=body.name, dataset_id=body.dataset_id)
+            name=body.name, dataset_ids=body.dataset_ids)
     except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
         _workspace_action_error(exc)
 
@@ -522,10 +522,10 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
             )
         try:
             result = await run_in_threadpool(
-                metadb.workspace_add_dataset_action,
+                metadb.workspace_add_datasets_action,
                 uid=uid, canvas_id=canvas_id,
                 expected_canvas_version=body.expected_canvas_version,
-                dataset_id=body.dataset_id)
+                dataset_ids=body.dataset_ids)
         except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
             _workspace_action_error(exc)
     # This is an out-of-band document edit, like MCP. Nudge any currently open collab room to refetch

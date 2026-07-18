@@ -439,6 +439,17 @@
             ],
             "title": "Owner"
           },
+          "registrationId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registrationid"
+          },
           "rowCount": {
             "anyOf": [
               {
@@ -5415,18 +5426,49 @@
       },
       "UnregisterManyRequest": {
         "properties": {
-          "ids": {
+          "targets": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/UnregisterTarget"
             },
-            "title": "Ids",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Targets",
             "type": "array"
           }
         },
         "required": [
-          "ids"
+          "targets"
         ],
         "title": "UnregisterManyRequest",
+        "type": "object"
+      },
+      "UnregisterTarget": {
+        "properties": {
+          "expectedRegistrationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Expectedregistrationid",
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Expectedrevision",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "expectedRegistrationId",
+          "expectedRevision"
+        ],
+        "title": "UnregisterTarget",
         "type": "object"
       },
       "UserBody": {
@@ -5538,9 +5580,14 @@
       "WorkspaceAddDatasetBody": {
         "additionalProperties": false,
         "properties": {
-          "datasetId": {
-            "title": "Datasetid",
-            "type": "string"
+          "datasetIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Datasetids",
+            "type": "array"
           },
           "expectedCanvasVersion": {
             "minimum": 1.0,
@@ -5549,7 +5596,7 @@
           }
         },
         "required": [
-          "datasetId",
+          "datasetIds",
           "expectedCanvasVersion"
         ],
         "title": "WorkspaceAddDatasetBody",
@@ -5623,16 +5670,13 @@
             "title": "Containerid",
             "type": "string"
           },
-          "datasetId": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Datasetid"
+          "datasetIds": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 50,
+            "title": "Datasetids",
+            "type": "array"
           },
           "expectedContainerVersion": {
             "minimum": 1.0,
@@ -10300,7 +10344,7 @@
     },
     "/api/catalog/tables/delete": {
       "post": {
-        "description": "Batch-remove datasets from the catalog (the Tables view's multi-select delete). Returns which\nids were removed and which were already gone, so a partial result is reported honestly.",
+        "description": "Best-effort, bounded removal with one metadata CAS precondition per dataset.\n\nResults are deliberately per-item: one stale or concurrently busy dataset never hides which\nother removals committed. Providers without revision-aware unregister remain read-only here.",
         "operationId": "unregister_tables_api_catalog_tables_delete_post",
         "parameters": [
           {
@@ -10385,7 +10429,7 @@
     },
     "/api/catalog/tables/{table_id}": {
       "delete": {
-        "description": "Remove a dataset from the catalog (e.g. a dead entry whose file was deleted).",
+        "description": "Remove one exact dataset only while its editable metadata still matches the caller's read.",
         "operationId": "unregister_table_api_catalog_tables__table_id__delete",
         "parameters": [
           {
@@ -10394,6 +10438,28 @@
             "required": true,
             "schema": {
               "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_registration_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Expected Registration Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_revision",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "Expected Revision",
               "type": "string"
             }
           },

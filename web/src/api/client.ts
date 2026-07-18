@@ -4,7 +4,7 @@ import type {
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, WriteAdmission, WriteIntent, WriteReceipt,
-  WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
+  CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
 import type { CanvasDoc, ColumnSchema } from '../types/graph'
@@ -220,11 +220,11 @@ export const api = {
     if (params?.limit) search.set('limit', String(params.limit))
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },
-  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetId?: string }) =>
+  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[] }) =>
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),
     }),
-  workspaceAddDataset: (canvasId: string, body: { datasetId: string; expectedCanvasVersion: number }) =>
+  workspaceAddDatasets: (canvasId: string, body: { datasetIds: string[]; expectedCanvasVersion: number }) =>
     req<WorkspaceAddDatasetResult>(`/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`, {
       method: 'POST', body: JSON.stringify(body),
     }),
@@ -264,9 +264,12 @@ export const api = {
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/edit`, { method: 'PUT', body: JSON.stringify(edit) }),
-  unregisterTable: (id: string) => req<{ ok: boolean }>(`/catalog/tables/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  unregisterTables: (ids: string[]) =>
-    req<{ deleted: string[]; missing: string[] }>('/catalog/tables/delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  unregisterTable: (id: string, expectedRegistrationId: string, expectedRevision: string) => req<{ ok: boolean }>(
+    `/catalog/tables/${encodeURIComponent(id)}?${new URLSearchParams({ expected_registration_id: expectedRegistrationId, expected_revision: expectedRevision })}`,
+    { method: 'DELETE' },
+  ),
+  unregisterTables: (targets: { id: string; expectedRegistrationId: string; expectedRevision: string }[]) =>
+    req<CatalogUnregisterResult>('/catalog/tables/delete', { method: 'POST', body: JSON.stringify({ targets }) }),
   lineage: (uri: string, depth = 6, maxNodes = 500) =>
     req<LineageResult>(`/catalog/lineage?uri=${encodeURIComponent(uri)}&depth=${depth}&maxNodes=${maxNodes}`),
 

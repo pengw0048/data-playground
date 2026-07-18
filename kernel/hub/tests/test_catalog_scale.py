@@ -127,6 +127,27 @@ def test_pagination_body_and_windowing(scale_catalog):
     assert first.isdisjoint(second)
 
 
+def test_five_thousand_dataset_discovery_stays_bounded():
+    prefix = f"{_SCALE}five-thousand/"
+    metadb.catalog_delete_prefix(prefix)
+    entries = [
+        _doc(f"five_thousand_{index:04d}", f"{prefix}{index}", folder=f"large/{index % 10}")
+        for index in range(5_000)
+    ]
+    try:
+        assert metadb.catalog_bulk_seed(entries) == 5_000
+        page = client.get("/api/catalog/tables", params={
+            "q": "five_thousand_", "limit": 50, "offset": 0, "sort": "name",
+        })
+        assert page.status_code == 200, page.text
+        body = page.json()
+        assert body["total"] == 5_000
+        assert len(body["items"]) == 50
+        assert body["hasMore"] is True
+    finally:
+        metadb.catalog_delete_prefix(prefix)
+
+
 def test_sort_by_rows_and_usage(scale_catalog):
     r = client.get("/api/catalog/tables", params={"folder": "team1", "sort": "rows", "order": "desc", "limit": 5})
     rows = [t["rowCount"] for t in r.json()["items"]]
@@ -222,7 +243,10 @@ def test_register_with_folder_and_tags(tmp_path):
     try:
         assert client.get("/api/catalog/tables", params={"folder": "sandbox"}).json()["total"] >= 1
     finally:
-        client.delete(f"/api/catalog/tables/{t['id']}")
+        client.delete(f"/api/catalog/tables/{t['id']}", params={
+            "expected_registration_id": t["registrationId"],
+            "expected_revision": t["metadataRevision"],
+        })
 
 
 def test_semantic_and_hybrid_search():
@@ -356,7 +380,11 @@ def test_unregister_cleans_facts_keys_relationships_without_reregister_inheritan
         client.post("/api/catalog/relationships", json={
             "leftUri": a, "leftColumns": ["id"], "rightUri": b, "rightColumns": ["id"],
             "kind": "one_to_one"})
-        assert client.delete("/api/catalog/tables/tbl_orph_b").json() == {"ok": True}
+        registered = client.get("/api/catalog/tables/tbl_orph_b").json()
+        assert client.delete("/api/catalog/tables/tbl_orph_b", params={
+            "expected_registration_id": registered["registrationId"],
+            "expected_revision": registered["metadataRevision"],
+        }).json() == {"ok": True}
         lin = client.get("/api/catalog/lineage", params={"uri": a}).json()
         assert all(n["uri"] != b for n in lin["nodes"]) and not lin["edges"]
         assert metadb.catalog_declared_keys([b]) == {}

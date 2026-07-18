@@ -317,7 +317,10 @@ def test_unregistered_lance_binding_never_retargets_same_path(tmp_path):
     uri, table = _register_lance(tmp_path)
     history = client.get(f"/api/catalog/tables/{table['id']}/revisions")
     old = history.json()["items"][-1]
-    assert client.delete(f"/api/catalog/tables/{table['id']}").status_code == 200
+    assert client.delete(f"/api/catalog/tables/{table['id']}", params={
+        "expected_registration_id": table["registrationId"],
+        "expected_revision": table["metadataRevision"],
+    }).status_code == 200
     shutil.rmtree(uri)
     lance.write_dataset(pa.table({"value": [999]}), uri)
     replacement = client.post("/api/catalog/register", json={"uri": uri, "name": table["name"]})

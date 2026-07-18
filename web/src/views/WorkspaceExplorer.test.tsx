@@ -3,12 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tableByRegistration: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceAddDataset: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   workspaceResourceId: null as string | null,
   workspaceSearchQuery: '', setWorkspaceSearchQuery: vi.fn(),
+  workspaceScope: 'all' as 'all' | 'datasets', setWorkspaceScope: vi.fn(), switchWorkspaceScope: vi.fn(),
+  workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
   setWorkspaceResource: vi.fn(), openFile: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
+  kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
+  uploadDataset: vi.fn(),
   files: [] as { id: string; name: string; version: number; role: 'owner' | 'editor' | 'viewer' }[],
   refreshFiles: vi.fn(),
 }))
@@ -16,6 +20,22 @@ const store = vi.hoisted(() => ({
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 vi.mock('./CatalogView', () => ({
+  CATALOG_BATCH_LIMIT: 50,
+  emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
+  CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId }: {
+    onUseTables: (tables: { id: string; registrationId: string; name: string; uri: string; columns: never[] }[]) => void
+    onQueryStateChange: (query: object) => void
+    onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; columns: never[] } | null) => void
+    selectedRegistrationId?: string | null
+  }) => <div data-testid="catalog-discovery">
+    <span>Selected registration: {selectedRegistrationId ?? 'none'}</span>
+    <button onClick={() => onUseTables([
+      { id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] },
+      { id: 't2', registrationId: 'dataset-2', name: 'actions', uri: 'file:///actions.parquet', columns: [] },
+    ])}>Use selected datasets</button>
+    <button onClick={() => onQueryStateChange({ q: 'robot hands', folder: 'robotics', tags: ['gold'], owner: '', hasColumns: ['frame_id'], sort: 'updated', order: 'desc', match: 'meaning' })}>Change dataset query</button>
+    <button onClick={() => onSelectedTableChange({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })}>Open dataset</button>
+  </div>,
   CatalogDetail: ({ table, onClose, onUse }: { table: { name: string }; onClose: () => void; onUse: (table: { name: string }) => void }) =>
     <div data-testid="catalog-detail">{table.name}<button onClick={() => onUse(table)}>Use</button><button onClick={onClose}>close detail</button></div>,
 }))
@@ -35,6 +55,8 @@ describe('WorkspaceExplorer', () => {
     vi.clearAllMocks()
     store.workspaceResourceId = null
     store.workspaceSearchQuery = ''
+    store.workspaceScope = 'all'
+    store.workspaceDatasetQuery = ''
     store.files = []
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
@@ -125,11 +147,11 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('Stable dataset: dataset:dataset-1')
+    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('observations · dataset:dataset-1')
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
       containerId: 'folder-1', expectedContainerVersion: 1,
-      name: 'observations exploration', datasetId: 'dataset-1',
+      name: 'observations exploration', datasetIds: ['dataset-1'],
     }))
     expect(store.openFile).toHaveBeenCalledWith('explore-1')
   })
@@ -141,7 +163,7 @@ describe('WorkspaceExplorer', () => {
       { id: 'target-canvas', name: 'Exact target', version: 9, role: 'editor' },
     ]
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.workspaceAddDataset.mockResolvedValue({ ok: true, id: 'target-canvas', version: 10 })
+    mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'target-canvas', version: 10 })
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
@@ -149,10 +171,43 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas')
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
-    await waitFor(() => expect(mocks.workspaceAddDataset).toHaveBeenCalledWith('target-canvas', {
-      datasetId: 'dataset-1', expectedCanvasVersion: 9,
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 9,
     }))
     expect(store.openFile).toHaveBeenCalledWith('target-canvas')
+  })
+
+  it('renders the shared bounded Catalog inside the Datasets scope and preserves independent URL state', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:dataset-1'
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByTestId('catalog-discovery')).toHaveTextContent('Selected registration: dataset-1')
+    expect(screen.queryByLabelText('Workspace search')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Change dataset query' }))
+    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(
+      'dq=robot+hands&folder=robotics&tags=gold&columns=frame_id&sort=updated&order=desc&match=meaning',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:dataset-1')
+  })
+
+  it('uses a bounded dataset selection atomically in one exact new Canvas destination', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'batch-canvas', created: true, resource: CANVAS })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use selected datasets' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Use 2 datasets' })
+    expect(dialog).toHaveTextContent('Bounded to 50 datasets')
+    expect(dialog).toHaveTextContent('applied atomically under one Canvas version precondition')
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
+      containerId: 'workspace-local-root', expectedContainerVersion: 1,
+      name: '2 datasets exploration', datasetIds: ['dataset-1', 'dataset-2'],
+    }))
+    expect(store.openFile).toHaveBeenCalledWith('batch-canvas')
+    expect(mocks.workspaceBrowse).toHaveBeenCalledWith('workspace-local-root', { limit: 1 })
   })
 
   it('confirms a placement-only canvas move and offers a versioned undo', async () => {
@@ -266,7 +321,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('button', { name: 'New canvas here' })).toHaveAttribute('title', 'Read-only external mounts do not support creating canvases')
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
-    expect(mocks.workspaceAddDataset).not.toHaveBeenCalled()
+    expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
   })
 

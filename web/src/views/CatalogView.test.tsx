@@ -5,7 +5,7 @@ import type { CatalogTable } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
-  registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(),
+  registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(), tableByRegistration: vi.fn(),
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(),
   setTableMetadata: vi.fn(), saveTableEdit: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
   catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
@@ -17,7 +17,7 @@ vi.mock('../api/client', () => ({
 
 const store = vi.hoisted(() => ({
   addToCanvas: vi.fn(), rememberTables: vi.fn(), uploadDataset: vi.fn(), pushToast: vi.fn(),
-  kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] },  // catalog mutation UI is capability-gated
+  kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },  // catalog mutation UI is capability-gated
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
 
@@ -35,12 +35,13 @@ vi.mock('../ui/VirtualList', () => ({
 import { CatalogDiscovery, CatalogView } from './CatalogView'
 
 const TABLE: CatalogTable = {
-  id: 't1', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
+  id: 't1', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
   metadataRevision: 'm1_orders',
   columns: [{ name: 'order_id', type: 'int', capabilities: ['key'] }],
 }
 const TABLE_2: CatalogTable = {
-  id: 't2', name: 'customers', uri: 'mem://customers', rowCount: 1, version: 'v1',
+  id: 't2', registrationId: 'registration-customers', name: 'customers', uri: 'mem://customers', rowCount: 1, version: 'v1',
+  metadataRevision: 'm1_customers',
   columns: [{ name: 'customer_id', type: 'int', capabilities: ['key'] }],
 }
 const FACETS = { folders: [{ value: 'sales', count: 1 }], tags: [], owners: [] }
@@ -70,6 +71,7 @@ describe('CatalogView request and mutation truth', () => {
       notPreviewable: false, wire: 'dataset',
     })
     mocks.table.mockResolvedValue(TABLE)
+    mocks.tableByRegistration.mockResolvedValue(TABLE)
     mocks.setTableMetadata.mockResolvedValue(TABLE)
     mocks.saveTableEdit.mockResolvedValue({ ...TABLE, metadataRevision: 'm1_test' })
     mocks.unregisterTable.mockResolvedValue({ ok: true })
@@ -89,6 +91,24 @@ describe('CatalogView request and mutation truth', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Use table orders' }))
     expect(onUseTables).toHaveBeenCalledWith([TABLE])
     expect(store.addToCanvas).not.toHaveBeenCalled()
+  })
+
+  it('keeps a 5,000-dataset discovery path bounded to pages, facets, and the lazy tree', async () => {
+    mocks.tablesPage
+      .mockResolvedValueOnce({ items: [TABLE], total: 5_000, hasMore: true })
+      .mockResolvedValueOnce({ items: [TABLE_2], total: 5_000, hasMore: true })
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable />)
+
+    expect(await screen.findByText('orders')).toBeInTheDocument()
+    expect(mocks.tablesPage).toHaveBeenNthCalledWith(1, expect.objectContaining({ limit: 50, offset: 0 }))
+    expect(mocks.facets).toHaveBeenCalledTimes(1)
+    expect(mocks.catalogTree).toHaveBeenCalledWith('')
+    expect(mocks.catalogFolders).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByTestId('request-next-page'))
+    expect(await screen.findByText('customers')).toBeInTheDocument()
+    expect(mocks.tablesPage).toHaveBeenNthCalledWith(2, expect.objectContaining({ limit: 50, offset: 1 }))
+    expect(mocks.catalogFolders).not.toHaveBeenCalled()
   })
 
   it('shows a 5xx folder-tree failure as an error and retries instead of claiming there are no folders', async () => {
@@ -268,7 +288,13 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
     mocks.saveTableEdit.mockResolvedValue(TABLE)
-    mocks.unregisterTables.mockResolvedValue({ deleted: ['t1', 't2'], missing: [] })
+    mocks.unregisterTables.mockResolvedValue({
+      mode: 'best_effort', limit: 50,
+      results: [
+        { id: 't1', status: 'deleted', detail: null },
+        { id: 't2', status: 'deleted', detail: null },
+      ],
+    })
     mocks.registerDataset.mockResolvedValue(TABLE)
     mocks.catalogFolders.mockResolvedValue([])
     mocks.createFolder.mockResolvedValue({ path: 'archive' })
@@ -285,7 +311,14 @@ describe('CatalogView selection, register modal, and rename', () => {
     fireEvent.click(screen.getByLabelText('Select customers'))
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('catalog-delete-selected'))
-    await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith(['t1', 't2']))
+    await waitFor(() => expect(mocks.unregisterTables).toHaveBeenCalledWith([
+      { id: 't1', expectedRegistrationId: 'registration-orders', expectedRevision: 'm1_orders' },
+      { id: 't2', expectedRegistrationId: 'registration-customers', expectedRevision: 'm1_customers' },
+    ]))
+    const result = await screen.findByTestId('catalog-unregister-result')
+    expect(result).toHaveTextContent('Best-effort unregister result')
+    expect(result).toHaveTextContent('orders: deleted')
+    expect(result).toHaveTextContent('customers: deleted')
   })
 
   it('registers a dataset through the modal with the full payload', async () => {

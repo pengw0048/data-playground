@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
@@ -6,7 +6,10 @@ import type {
   WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
-import { CatalogDetail } from './CatalogView'
+import {
+  CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
+  type CatalogDiscoveryQueryState,
+} from './CatalogView'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
@@ -19,10 +22,45 @@ const statusMessage = (status: WorkspaceSourceStatus) => status.error
     : status.completeness === 'unsupported' ? 'browse is not supported'
       : status.completeness === 'partial' ? 'source returned partial results' : null)
 
+const DATASET_SORTS = new Set<CatalogDiscoveryQueryState['sort']>(['name', 'rows', 'updated', 'usage', 'folder'])
+
+export function parseWorkspaceDatasetQuery(value: string): CatalogDiscoveryQueryState {
+  const params = new URLSearchParams(value)
+  const state = emptyCatalogDiscoveryQuery()
+  state.q = params.get('dq')?.trim() ?? ''
+  state.folder = params.get('folder')?.trim().replace(/^\/+|\/+$/g, '') ?? ''
+  state.tags = (params.get('tags') ?? '').split(',').map((item) => item.trim()).filter(Boolean).slice(0, 50)
+  state.owner = params.get('owner')?.trim() ?? ''
+  state.hasColumns = (params.get('columns') ?? '').split(',').map((item) => item.trim()).filter(Boolean).slice(0, 50)
+  const sort = params.get('sort') as CatalogDiscoveryQueryState['sort'] | null
+  if (sort && DATASET_SORTS.has(sort)) state.sort = sort
+  if (params.get('order') === 'desc') state.order = 'desc'
+  if (params.get('match') === 'meaning') state.match = 'meaning'
+  return state
+}
+
+export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState): string {
+  const params = new URLSearchParams()
+  if (state.q) params.set('dq', state.q)
+  if (state.folder) params.set('folder', state.folder)
+  if (state.tags.length) params.set('tags', state.tags.join(','))
+  if (state.owner) params.set('owner', state.owner)
+  if (state.hasColumns.length) params.set('columns', state.hasColumns.join(','))
+  if (state.sort !== 'name') params.set('sort', state.sort)
+  if (state.order !== 'asc') params.set('order', state.order)
+  if (state.match !== 'text') params.set('match', state.match)
+  return params.toString()
+}
+
+export function WorkspaceExplorer() {
+  const scope = useStore((state) => state.workspaceScope) ?? 'all'
+  return scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />
+}
+
 // The explorer deliberately consumes the bounded Workspace API rather than composing a canvas list
 // and catalog page in the browser. A resource URL is opaque and remains valid when its display name
 // or placement changes; only containers are expanded locally, one page at a time.
-export function WorkspaceExplorer() {
+function WorkspaceMixedExplorer() {
   const requestedResourceId = useStore((s) => s.workspaceResourceId)
   const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
   const searchQuery = useStore((s) => s.workspaceSearchQuery)
@@ -32,6 +70,7 @@ export function WorkspaceExplorer() {
   const refreshFiles = useStore((s) => s.refreshFiles)
   const rememberTables = useStore((s) => s.rememberTables)
   const pushToast = useStore((s) => s.pushToast)
+  const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
   const [containerId, setContainerId] = useState(LOCAL_ROOT_ID)
   const [container, setContainer] = useState<WorkspaceResource | null>(null)
   const [crumbs, setCrumbs] = useState<WorkspaceResource[]>([])
@@ -51,7 +90,7 @@ export function WorkspaceExplorer() {
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
-  const [datasetAction, setDatasetAction] = useState<{ resource: WorkspaceResource; table: CatalogTable } | null>(null)
+  const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
   const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
   const [relinkResource, setRelinkResource] = useState<WorkspaceResource | null>(null)
   const [undoMove, setUndoMove] = useState<{
@@ -205,7 +244,7 @@ export function WorkspaceExplorer() {
     }
     rememberTables([table])
     void refreshFiles()
-    setDatasetAction({ resource: selectedDataset, table })
+    setDatasetAction({ tables: [{ ...table, registrationId: identity(selectedDataset) }] })
   }
   // Re-resolve the stable resource before reloading. This keeps rename/move refreshes truthful and
   // retries the same deep link rather than silently falling back to a different container.
@@ -237,6 +276,7 @@ export function WorkspaceExplorer() {
             {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1"><span>/</span><button onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground">{crumb.name}</button></span>)}
           </nav>
         </div>
+        <WorkspaceScopeTabs active="all" onChange={switchWorkspaceScope} />
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
           event.preventDefault()
@@ -317,6 +357,94 @@ export function WorkspaceExplorer() {
         }} />}
     </div>
   )
+}
+
+function WorkspaceScopeTabs({ active, onChange }: {
+  active: 'all' | 'datasets'; onChange: (scope: 'all' | 'datasets') => void
+}) {
+  return <div role="tablist" aria-label="Workspace scope" className="flex shrink-0 items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
+    {([['all', 'All Workspace'], ['datasets', 'Datasets']] as const).map(([scope, label]) => (
+      <button key={scope} role="tab" aria-selected={active === scope} onClick={() => onChange(scope)}
+        className={`rounded-md px-2.5 py-1 ${active === scope ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+        {label}
+      </button>
+    ))}
+  </div>
+}
+
+function WorkspaceDatasets() {
+  const catalogSource = useStore((state) => state.kernelInfo)
+  const foldersMutable = catalogSource?.capabilities?.includes('catalog.folder_mutation') ?? false
+  const uploadDataset = useStore((state) => state.uploadDataset)
+  const rememberTables = useStore((state) => state.rememberTables)
+  const files = useStore((state) => state.files)
+  const refreshFiles = useStore((state) => state.refreshFiles)
+  const openFile = useStore((state) => state.openFile)
+  const pushToast = useStore((state) => state.pushToast)
+  const requestedResourceId = useStore((state) => state.workspaceResourceId)
+  const setWorkspaceResource = useStore((state) => state.setWorkspaceResource)
+  const switchWorkspaceScope = useStore((state) => state.switchWorkspaceScope)
+  const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
+  const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
+  const query = useMemo(() => parseWorkspaceDatasetQuery(encodedQuery), [encodedQuery])
+  const selectedRegistrationId = requestedResourceId?.startsWith('dataset:')
+    ? requestedResourceId.slice('dataset:'.length) : null
+  const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
+  const [rootContainer, setRootContainer] = useState<WorkspaceResource | null>(null)
+  const [destinationError, setDestinationError] = useState<string | null>(null)
+  const [destinationRevision, setDestinationRevision] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    setDestinationError(null)
+    api.workspaceBrowse(LOCAL_ROOT_ID, { limit: 1 }).then((page) => {
+      if (cancelled) return
+      if (!page.container || page.container.version == null) throw new Error('Workspace root is unavailable')
+      setRootContainer(page.container)
+    }).catch((caught) => {
+      if (!cancelled) { setRootContainer(null); setDestinationError(errorMessage(caught)) }
+    })
+    return () => { cancelled = true }
+  }, [destinationRevision])
+
+  const useTables = (tables: CatalogTable[]) => {
+    if (!tables.length) return
+    if (tables.length > CATALOG_BATCH_LIMIT) {
+      pushToast(`Use is limited to ${CATALOG_BATCH_LIMIT} datasets`, 'error')
+      return
+    }
+    if (tables.some((table) => !table.registrationId)) {
+      pushToast('Reload before using: a dataset has no stable Workspace identity', 'error')
+      return
+    }
+    rememberTables(tables)
+    setDatasetAction({ tables })
+    void refreshFiles()
+  }
+
+  return <div className="flex h-full min-w-0 flex-col">
+    <div className="flex items-center gap-3 border-b border-border px-7 py-2">
+      <span className="text-[13px] font-bold text-foreground">Workspace</span>
+      <WorkspaceScopeTabs active="datasets" onChange={switchWorkspaceScope} />
+      <span className="ml-auto text-[11px] text-muted-foreground">Catalog folders are dataset metadata, not Workspace containers.</span>
+    </div>
+    <div className="min-h-0 flex-1">
+      <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
+        title="Datasets" queryState={query}
+        onQueryStateChange={(next) => setEncodedQuery(serializeWorkspaceDatasetQuery(next))}
+        selectedRegistrationId={selectedRegistrationId}
+        onSelectedTableChange={(table) => {
+          if (!table) setWorkspaceResource(null)
+          else if (table.registrationId) setWorkspaceResource(`dataset:${table.registrationId}`)
+          else pushToast('This dataset has no stable Workspace identity', 'error')
+        }}
+        onUseTables={useTables} onUploadDataset={uploadDataset} />
+    </div>
+    {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
+      destinationError={destinationError} files={files} onClose={() => setDatasetAction(null)}
+      onRetryDestination={() => setDestinationRevision((current) => current + 1)}
+      onOpened={(canvasId) => { setDatasetAction(null); void openFile(canvasId) }} />}
+  </div>
 }
 
 function WorkspaceSearchResults({ query, onOpen }: {
@@ -473,13 +601,16 @@ function NewCanvasDialog({ container, onClose, onCreated }: {
   </Modal>
 }
 
-function DatasetActionDialog({ action, container, files, onClose, onOpened }: {
-  action: { resource: WorkspaceResource; table: CatalogTable }; container: WorkspaceResource
+function DatasetActionDialog({ action, container, destinationError, files, onClose, onOpened, onRetryDestination }: {
+  action: { tables: CatalogTable[] }; container: WorkspaceResource | null; destinationError?: string | null
   files: CanvasFile[]; onClose: () => void; onOpened: (canvasId: string) => void
+  onRetryDestination?: () => void
 }) {
   const editable = files.filter((file) => file.role === 'owner' || file.role === 'editor')
+  const datasetIds = action.tables.flatMap((table) => table.registrationId ? [table.registrationId] : [])
+  const label = action.tables.length === 1 ? action.tables[0].name : `${action.tables.length} datasets`
   const [mode, setMode] = useState<'explore' | 'add'>('explore')
-  const [name, setName] = useState(`${action.table.name} exploration`)
+  const [name, setName] = useState(`${label} exploration`)
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -490,30 +621,37 @@ function DatasetActionDialog({ action, container, files, onClose, onOpened }: {
     if (busy) return
     setBusy(true); setError(null)
     try {
-      const datasetId = identity(action.resource)
+      if (datasetIds.length !== action.tables.length || !datasetIds.length) {
+        setError('Reload the selection before using it; a stable dataset identity is missing')
+        return
+      }
       if (mode === 'explore') {
-        if (container.version == null || !name.trim()) return
+        if (!container || container.version == null) { setError('Load an exact Workspace destination first'); return }
+        if (!name.trim()) return
         const created = await api.workspaceCreateCanvas({
           containerId: identity(container), expectedContainerVersion: container.version,
-          name: name.trim(), datasetId,
+          name: name.trim(), datasetIds,
         })
         onOpened(created.id)
       } else {
         const target = editable.find((file) => file.id === canvasId)
         if (!target) { setError('Choose an editable target canvas'); return }
-        await api.workspaceAddDataset(target.id, {
-          datasetId, expectedCanvasVersion: target.version,
+        await api.workspaceAddDatasets(target.id, {
+          datasetIds, expectedCanvasVersion: target.version,
         })
         onOpened(target.id)
       }
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
-  return <Modal label={`Use ${action.table.name}`} onClose={onClose}>
-    <p className="break-all text-[11px] text-muted-foreground">Stable dataset: {action.resource.id}</p>
+  return <Modal label={`Use ${label}`} onClose={onClose}>
+    <div className="max-h-24 overflow-y-auto rounded-md border border-border bg-muted/25 px-2 py-1 text-[10.5px] text-muted-foreground">
+      {action.tables.map((table) => <div key={table.id} className="truncate">{table.name} · dataset:{table.registrationId ?? 'identity unavailable'}</div>)}
+    </div>
+    <p className="text-[11px] text-muted-foreground">Bounded to {CATALOG_BATCH_LIMIT} datasets. The selected sources are applied atomically under one Canvas version precondition.</p>
     <div className="grid grid-cols-2 gap-2">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}>
-        <span className="block text-[12px] font-semibold">Explore in new canvas</span><span className="text-[10.5px] text-muted-foreground">Create in {container.name}</span>
+        <span className="block text-[12px] font-semibold">Explore in new canvas</span><span className="text-[10.5px] text-muted-foreground">{container ? `Create in ${container.name}` : 'Loading exact destination…'}</span>
       </button>
       <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}>
         <span className="block text-[12px] font-semibold">Add to canvas</span><span className="text-[10.5px] text-muted-foreground">Choose one exact target</span>
@@ -526,9 +664,10 @@ function DatasetActionDialog({ action, container, files, onClose, onOpened }: {
         {editable.map((file) => <option key={file.id} value={file.id}>{file.name} · {file.id}</option>)}
       </select>
     </label> : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available. Explore in a new canvas instead.</div>}
+    {destinationError && mode === 'explore' && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>Couldn't load the Workspace destination: {destinationError}</span>{onRetryDestination && <button onClick={onRetryDestination} className="font-semibold underline">Retry</button>}</div>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
-      <button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
+      <button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
   </Modal>
 }
 

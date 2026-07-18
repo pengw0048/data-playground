@@ -10533,7 +10533,11 @@ def test_catalog_missing_flag_and_unregister(tmp_path):
     assert client.get(f"/api/catalog/tables/{tid}").json()["missing"] is False   # file present
     os.remove(p)
     assert client.get(f"/api/catalog/tables/{tid}").json()["missing"] is True    # file gone → flagged
-    assert client.delete(f"/api/catalog/tables/{tid}").status_code == 200
+    current = client.get(f"/api/catalog/tables/{tid}").json()
+    assert client.delete(f"/api/catalog/tables/{tid}", params={
+        "expected_registration_id": current["registrationId"],
+        "expected_revision": current["metadataRevision"],
+    }).status_code == 200
     assert client.get(f"/api/catalog/tables/{tid}").status_code == 404           # pruned, not resurrected
 
 

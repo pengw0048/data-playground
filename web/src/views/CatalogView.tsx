@@ -6,7 +6,7 @@ import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
-import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
+import type { CatalogQueryParams, CatalogTable, CatalogUnregisterResult, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
 
 // The Tables catalog — built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
@@ -15,6 +15,7 @@ import type { CatalogQueryParams, CatalogTable, Facets, FolderNode, KernelInfo, 
 // and curate the dataset's folder/tags/owner/description.
 
 const PAGE = 50
+export const CATALOG_BATCH_LIMIT = 50
 const ROW_H = 58
 type Sort = NonNullable<CatalogQueryParams['sort']>
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
@@ -29,7 +30,27 @@ export interface CatalogDiscoveryProps {
   foldersMutable: boolean
   onUseTables: (tables: CatalogTable[]) => void
   onUploadDataset: (file: File) => Promise<CatalogTable | null>
+  title?: string
+  queryState?: CatalogDiscoveryQueryState
+  onQueryStateChange?: (state: CatalogDiscoveryQueryState) => void
+  selectedRegistrationId?: string | null
+  onSelectedTableChange?: (table: CatalogTable | null) => void
 }
+
+export interface CatalogDiscoveryQueryState {
+  q: string
+  folder: string
+  tags: string[]
+  owner: string
+  hasColumns: string[]
+  sort: Sort
+  order: 'asc' | 'desc'
+  match: 'text' | 'meaning'
+}
+
+export const emptyCatalogDiscoveryQuery = (): CatalogDiscoveryQueryState => ({
+  q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text',
+})
 
 export function CatalogView() {
   const addToCanvas = useStore((s) => s.addToCanvas)
@@ -49,20 +70,37 @@ export function CatalogView() {
     onUseTables={useTables} onUploadDataset={uploadDataset} />
 }
 
-export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset }: CatalogDiscoveryProps) {
+export function CatalogDiscovery({
+  sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Tables',
+  queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange,
+}: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // query state
-  const [rawQ, setRawQ] = useState('')
-  const [q, setQ] = useState('')
-  const [folder, setFolder] = useState('')
-  const [tags, setTags] = useState<string[]>([])
-  const [owner, setOwner] = useState('')
-  const [hasColumns, setHasColumns] = useState<string[]>([])
-  const [sort, setSort] = useState<Sort>('name')
-  const [order, setOrder] = useState<'asc' | 'desc'>('asc')
-  const [match, setMatch] = useState<'text' | 'meaning'>('text')
+  const [localQuery, setLocalQuery] = useState<CatalogDiscoveryQueryState>(emptyCatalogDiscoveryQuery)
+  const query = queryState ?? localQuery
+  const { q, folder, tags, owner, hasColumns, sort, order, match } = query
+  const commitQuery = (next: CatalogDiscoveryQueryState) => {
+    if (queryState && onQueryStateChange) onQueryStateChange(next)
+    else setLocalQuery(next)
+  }
+  const setQueryField = <K extends keyof CatalogDiscoveryQueryState>(
+    key: K, value: CatalogDiscoveryQueryState[K] | ((current: CatalogDiscoveryQueryState[K]) => CatalogDiscoveryQueryState[K]),
+  ) => {
+    const next = typeof value === 'function'
+      ? (value as (current: CatalogDiscoveryQueryState[K]) => CatalogDiscoveryQueryState[K])(query[key])
+      : value
+    commitQuery({ ...query, [key]: next })
+  }
+  const setQ = (value: string) => setQueryField('q', value)
+  const setFolder = (value: string | ((current: string) => string)) => setQueryField('folder', value)
+  const setTags = (value: string[] | ((current: string[]) => string[])) => setQueryField('tags', value)
+  const setOwner = (value: string) => setQueryField('owner', value)
+  const setHasColumns = (value: string[] | ((current: string[]) => string[])) => setQueryField('hasColumns', value)
+  const setMatch = (value: 'text' | 'meaning') => setQueryField('match', value)
+  const [rawQ, setRawQ] = useState(q)
+  useEffect(() => { setRawQ(q) }, [q])
 
   // results + facets
   const [items, setItems] = useState<CatalogTable[]>([])
@@ -74,22 +112,26 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const [facets, setFacets] = useState<Facets>({ folders: [], tags: [], owners: [] })
   const [selected, setSelected] = useState<CatalogTable | null>(null)
+  const [selectionError, setSelectionError] = useState<string | null>(null)
+  const [selectionRevision, setSelectionRevision] = useState(0)
   const [dialog, setDialog] = useState(false)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [unregisterResult, setUnregisterResult] = useState<{
+    response: CatalogUnregisterResult; names: Record<string, string>
+  } | null>(null)
   const [catalogRevision, setCatalogRevision] = useState(0)
-  const [folderPaths, setFolderPaths] = useState<string[]>([])  // folder ENTITIES (incl. empty) for autocomplete
   const seq = useRef(0)
   const loadingMore = useRef(false)
+  const selectionSeq = useRef(0)
 
   // debounce the search box into the query
-  useEffect(() => { const t = setTimeout(() => setQ(rawQ.trim()), 250); return () => clearTimeout(t) }, [rawQ])
-
-  // folder entities (empty folders live only here) reload with every catalog change; best-effort
-  const reloadFolderList = useCallback(async () => {
-    try { setFolderPaths((await api.catalogFolders()).map((f) => f.path)) } catch { /* autocomplete only */ }
-  }, [])
-  useEffect(() => { void reloadFolderList() }, [reloadFolderList, catalogRevision])
+  useEffect(() => {
+    const next = rawQ.trim()
+    if (next === q) return
+    const timer = setTimeout(() => setQ(next), 250)
+    return () => clearTimeout(timer)
+  }, [rawQ, q])
 
   const params = useMemo<CatalogQueryParams>(
     () => ({ q: q || undefined, folder: folder || undefined, tags, owner: owner || undefined, hasColumns, sort, order, limit: PAGE }),
@@ -134,6 +176,25 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
 
   useEffect(() => { void loadFirst() }, [loadFirst])
 
+  const selectTable = useCallback((table: CatalogTable | null) => {
+    setSelected(table)
+    onSelectedTableChange?.(table)
+  }, [onSelectedTableChange])
+  useEffect(() => {
+    if (selectedRegistrationId === undefined) return
+    const requestId = ++selectionSeq.current
+    setSelectionError(null)
+    if (!selectedRegistrationId) { setSelected(null); return }
+    if (selected?.registrationId === selectedRegistrationId) return
+    setSelected(null)
+    api.tableByRegistration(selectedRegistrationId).then((table) => {
+      if (requestId === selectionSeq.current) setSelected(table)
+    }).catch((caught) => {
+      if (requestId === selectionSeq.current) setSelectionError(errorMessage(caught))
+    })
+    return () => { selectionSeq.current += 1 }
+  }, [selectedRegistrationId, selected?.registrationId, selectionRevision])
+
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMore.current) return
     loadingMore.current = true
@@ -160,7 +221,10 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
   }, [hasMore, loading, params, items.length])
 
   const toggleTag = (t: string) => setTags((cur) => cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t])
-  const clearFilters = () => { setFolder(''); setTags([]); setOwner(''); setHasColumns([]); setRawQ(''); setQ('') }
+  const clearFilters = () => {
+    setRawQ('')
+    commitQuery({ ...emptyCatalogDiscoveryQuery(), sort, order, match })
+  }
   const hasFilters = !!(folder || tags.length || owner || hasColumns.length || q)
 
   const onRegistered = (t: CatalogTable) => {
@@ -183,24 +247,46 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
   }
   const toggleSelect = (id: string) => setSelectedIds((cur) => {
     const next = new Set(cur)
-    if (next.has(id)) next.delete(id); else next.add(id)
+    if (next.has(id)) next.delete(id)
+    else if (next.size < CATALOG_BATCH_LIMIT) next.add(id)
+    else pushToast(`A dataset action is limited to ${CATALOG_BATCH_LIMIT} items`, 'info')
     return next
   })
   const clearSelection = () => setSelectedIds(new Set())
-  const selectAllLoaded = () => setSelectedIds(new Set(items.map((t) => t.id)))
+  const selectAllLoaded = () => setSelectedIds(new Set(items.slice(0, CATALOG_BATCH_LIMIT).map((t) => t.id)))
   const useSelected = () => {
     const ts = items.filter((t) => selectedIds.has(t.id)); if (!ts.length) return
     onUseTables(ts)
     clearSelection()
   }
   const deleteSelected = async () => {
-    const ids = [...selectedIds]; if (!ids.length) return
-    if (!window.confirm(`Remove ${ids.length} dataset${ids.length === 1 ? '' : 's'} from the catalog?`)) return
+    const tables = items.filter((table) => selectedIds.has(table.id)); if (!tables.length) return
+    const targets = tables.flatMap((table) => table.metadataRevision && table.registrationId
+      ? [{ id: table.id, expectedRegistrationId: table.registrationId, expectedRevision: table.metadataRevision }] : [])
+    if (targets.length !== tables.length) {
+      pushToast('Reload before removing: at least one dataset has no version precondition', 'error')
+      return
+    }
+    if (!window.confirm(
+      `Remove ${targets.length} dataset${targets.length === 1 ? '' : 's'}? `
+      + 'This is best effort: each item is version-checked and the result may be partial.',
+    )) return
     try {
-      const res = await api.unregisterTables(ids)
-      pushToast(res.missing.length
-        ? `Removed ${res.deleted.length}, ${res.missing.length} already gone`
-        : `Removed ${res.deleted.length} dataset${res.deleted.length === 1 ? '' : 's'}`, 'success')
+      const result = await api.unregisterTables(targets)
+      setUnregisterResult({
+        response: result,
+        names: Object.fromEntries(tables.map((table) => [table.id, table.name])),
+      })
+      const counts = result.results.reduce<Record<string, number>>((current, item) => {
+        current[item.status] = (current[item.status] ?? 0) + 1
+        return current
+      }, {})
+      const failures = (counts.conflict ?? 0) + (counts.failed ?? 0)
+      pushToast(
+        `Unregister result: ${counts.deleted ?? 0} removed, ${counts.missing ?? 0} already gone`
+        + (failures ? `, ${failures} need review` : ''),
+        failures ? 'info' : 'success',
+      )
     } catch (e) { pushToast(errorMessage(e), 'error') }
     clearSelection(); setCatalogRevision((v) => v + 1); await loadFirst()
   }
@@ -218,7 +304,7 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
     <div className="flex h-full flex-col">
       {/* header: title + register / upload */}
       <div className="flex items-center gap-3 px-7 pb-3 pt-5">
-        <h1 className="text-[20px] font-bold text-foreground">Tables</h1>
+        <h1 className="text-[20px] font-bold text-foreground">{title}</h1>
         <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} datasets</span>
         <span className="flex-1" />
         <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset by path / uri"
@@ -250,7 +336,10 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
             ))}
           </div>
         )}
-        <select value={`${sort}:${order}`} onChange={(e) => { const [s, o] = e.target.value.split(':'); setSort(s as Sort); setOrder(o as 'asc' | 'desc') }}
+        <select value={`${sort}:${order}`} onChange={(e) => {
+          const [nextSort, nextOrder] = e.target.value.split(':')
+          commitQuery({ ...query, sort: nextSort as Sort, order: nextOrder as 'asc' | 'desc' })
+        }}
           disabled={semantic} aria-label="Sort tables"
           className="rounded-lg border border-border bg-card px-2 py-1.5 text-[12.5px] outline-none disabled:opacity-50" data-testid="catalog-sort">
           <option value="name:asc">Name A–Z</option>
@@ -272,6 +361,12 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
         </div>
       )}
 
+      {selectionError && <div role="alert" className="flex items-center gap-2 border-t border-destructive/30 bg-destructive/5 px-7 py-2 text-[11.5px] text-destructive">
+        <span className="min-w-0 flex-1 truncate">Couldn't open the selected dataset: {selectionError}</span>
+        <button onClick={() => setSelectionRevision((current) => current + 1)} className="shrink-0 font-semibold underline">Retry</button>
+        <button onClick={() => selectTable(null)} className="shrink-0 font-semibold underline">Clear selection</button>
+      </div>}
+
       {selectedIds.size > 0 && (
         <div className="flex items-center gap-2 px-7 pb-2 text-[12px]" data-testid="catalog-selection-bar">
           <span className="font-semibold text-foreground">{selectedIds.size} selected</span>
@@ -279,16 +374,32 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
             <Icon name="plus" size={11} /> Use
           </button>
           <button onClick={() => void deleteSelected()} data-testid="catalog-delete-selected"
+            disabled={!catalogSource?.capabilities?.includes('catalog.cas_unregister')}
             className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 font-semibold text-destructive hover:bg-accent">
             <Icon name="trash" size={11} /> Delete
           </button>
           <button onClick={clearSelection} className="rounded-md px-2 py-1 text-muted-foreground hover:text-foreground">Clear</button>
           <span className="flex-1" />
           {selectedIds.size < items.length && (
-            <button onClick={selectAllLoaded} className="text-[11px] text-muted-foreground underline">Select all {items.length} loaded</button>
+            <button onClick={selectAllLoaded} className="text-[11px] text-muted-foreground underline">
+              Select first {Math.min(items.length, CATALOG_BATCH_LIMIT)} loaded
+            </button>
           )}
         </div>
       )}
+
+      {unregisterResult && <div role="status" data-testid="catalog-unregister-result" className="border-t border-border bg-muted/25 px-7 py-2 text-[11px] text-muted-foreground">
+        <div className="flex items-center gap-2">
+          <strong className="text-foreground">Best-effort unregister result</strong>
+          <span>Each item was checked against its registration and metadata revision.</span>
+          <button onClick={() => setUnregisterResult(null)} className="ml-auto font-semibold underline">Dismiss</button>
+        </div>
+        <div className="mt-1 flex max-h-20 flex-wrap gap-x-3 gap-y-0.5 overflow-y-auto">
+          {unregisterResult.response.results.map((item) => <span key={item.id} title={item.detail ?? undefined} className={item.status === 'deleted' || item.status === 'missing' ? '' : 'text-destructive'}>
+            {unregisterResult.names[item.id] ?? item.id}: {item.status}{item.detail ? ` — ${item.detail}` : ''}
+          </span>)}
+        </div>
+      </div>}
 
       {/* body: folder tree | list | facets */}
       <div className="flex min-h-0 flex-1 border-t border-border">
@@ -317,7 +428,7 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
                 {loading ? 'Loading…' : hasFilters ? 'No datasets match these filters.' : 'No datasets registered — add one above.'}
               </div>}
               renderRow={(t) => <TableRow t={t} selected={selectedIds.has(t.id)} selectionActive={selectedIds.size > 0}
-                onToggleSelect={() => toggleSelect(t.id)} onOpen={() => setSelected(t)} onUse={() => use(t)} onFolder={setFolder} />}
+                onToggleSelect={() => toggleSelect(t.id)} onOpen={() => selectTable(t)} onUse={() => use(t)} onFolder={setFolder} />}
             />
           )}
           <div className="border-t border-border px-4 py-1.5 text-[11px] text-muted-foreground">
@@ -358,10 +469,10 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
       </div>
 
       {selected && (
-        <CatalogDetail key={selected.id} table={selected} onClose={() => setSelected(null)} onUse={use}
-          onChanged={(t) => { setSelected(t); setCatalogRevision((v) => v + 1); void loadFirst() }} onFolder={(f) => { setFolder(f); setSelected(null) }}
-          onDeleted={() => { setSelected(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={setSelected}
-          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); setSelected(null) }} />
+        <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
+          onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }} onFolder={(f) => { setFolder(f); selectTable(null) }}
+          onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
+          onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
       )}
       {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)}
         onPick={async (r) => {
@@ -372,10 +483,10 @@ export function CatalogDiscovery({ sourceIdentity: catalogSource, foldersMutable
         }} />}
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
 
-      {/* known folder paths → autocomplete for every folder input (register modal + detail drawer):
-          the union of entry-derived facet folders and the folder ENTITIES (which include empty ones) */}
+      {/* Facets stay bounded with the active query. Empty folders remain discoverable through
+          the lazy folder tree rather than forcing every folder into the page. */}
       <datalist id="dp-folder-options">
-        {[...new Set([...facets.folders.map((f) => f.value), ...folderPaths])].map((v) => <option key={v} value={v} />)}
+        {facets.folders.map((item) => <option key={item.value} value={item.value} />)}
       </datalist>
     </div>
   )
@@ -743,6 +854,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const openRelationships = useStore((s) => s.openRelationships)
   const catalogSource = useStore((s) => s.kernelInfo)
   const atomicMetadataEditable = catalogSource?.capabilities?.includes('catalog.atomic_metadata_edit') ?? false
+  const unregisterSupported = catalogSource?.capabilities?.includes('catalog.cas_unregister') ?? false
   const [base, setBase] = useState(table)
   const [name, setName] = useState(table.name)
   const [folder, setFolder] = useState(table.folder ?? '')
@@ -801,9 +913,13 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     if (next && !preview && !previewLoading) void loadPreview()
   }
   const unregister = async () => {
+    if (!unregisterSupported || !base.registrationId || !base.metadataRevision) {
+      pushToast('This catalog entry cannot be removed with a version precondition', 'error')
+      return
+    }
     if (!window.confirm(`Remove "${table.name}" from the catalog?`)) return
     setDeleting(true)
-    try { await api.unregisterTable(table.id); pushToast('Removed from catalog', 'success'); onDeleted() }
+    try { await api.unregisterTable(table.id, base.registrationId, base.metadataRevision); pushToast('Removed from catalog', 'success'); onDeleted() }
     catch (e) { pushToast(errorMessage(e), 'error') }
     finally { setDeleting(false) }
   }
@@ -1008,7 +1124,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           {table.folder && (
             <button onClick={() => onFolder(table.folder!)} className="self-start text-[11.5px] text-primary hover:underline">Browse folder “{table.folder}” →</button>
           )}
-          <button onClick={() => void unregister()} disabled={deleting} data-testid="detail-unregister"
+          <button onClick={() => void unregister()} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
+            title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'
+              : !base.registrationId || !base.metadataRevision ? 'Reload this dataset before removing it' : undefined}
             className="self-start text-[11.5px] text-destructive opacity-70 hover:underline hover:opacity-100 disabled:opacity-40">
             {deleting ? 'Removing…' : 'Remove from catalog…'}
           </button>

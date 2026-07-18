@@ -18,6 +18,23 @@ describe('Workspace routes', () => {
     })
   })
 
+  it('round-trips Datasets scope state without reusing the mixed-search query', () => {
+    const resourceId = 'dataset:registration/with spaces'
+    const datasetQuery = new URLSearchParams({
+      dq: 'robot hands', folder: 'robotics/curated', tags: 'gold,ego', columns: 'frame_id',
+      sort: 'updated', order: 'desc', match: 'meaning',
+    }).toString()
+    window.location.hash = routeHash(
+      'workspace', undefined, resourceId, 'must-not-leak', undefined, undefined, undefined,
+      'datasets', datasetQuery,
+    )
+    expect(parseHash()).toEqual({
+      view: 'workspace', workspaceResourceId: resourceId, workspaceScope: 'datasets',
+      workspaceDatasetQuery: datasetQuery,
+    })
+    expect(window.location.hash).not.toContain('q=must-not-leak')
+  })
+
   it('deliberately redirects former Recents and Tables URLs to Workspace', () => {
     window.location.hash = '#/files'
     expect(parseHash()).toEqual({ view: 'workspace' })

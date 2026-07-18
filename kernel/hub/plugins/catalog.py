@@ -758,6 +758,21 @@ class InMemoryCatalog:
             self._emb_dirty += 1  # its embedding row went with it
         return True
 
+    def unregister_if_revision(self, id_or_name: str, expected_registration_id: str,
+                               expected_revision: str) -> bool:
+        """Remove one exact current entry, or fail if its editable metadata changed."""
+        with self._lock:
+            doc = metadb.catalog_get(id_or_name)
+            if doc is None:
+                return False
+            token = (id_or_name if metadb.object_attempt_is_managed(id_or_name)
+                     else doc["uri"])
+            metadb.catalog_delete_entry(
+                token, expected_registration_id=expected_registration_id,
+                expected_metadata_revision=expected_revision)
+            self._emb_dirty += 1
+        return True
+
     # -- semantic search (opt-in via reg.add_embedder) -------------------- #
     def search_modes(self) -> list[str]:
         """Which search modes are live: lexical always; semantic/hybrid once an embedder is installed.
