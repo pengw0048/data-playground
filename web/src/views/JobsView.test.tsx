@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -136,6 +136,69 @@ describe('JobsView', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent("Couldn’t load more Jobs: network unavailable")
     expect(screen.getByText('Alpha research')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Retry load more' })).toBeVisible()
+  })
+
+  it('auto-refreshes an active first page and records the successful refresh', async () => {
+    vi.useFakeTimers()
+    mocks.workspaceJobs.mockResolvedValue({
+      items: [job({ status: 'running', error: null })], hasMore: false, nextCursor: null,
+    })
+    try {
+      render(<JobsView />)
+      await act(async () => { await Promise.resolve() })
+      expect(screen.getByText(/Live first page\. Last successful refresh:/)).toBeVisible()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(mocks.workspaceJobs).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('labels a successful first page without active Jobs as a snapshot', async () => {
+    render(<JobsView />)
+
+    expect(await screen.findByText(/Snapshot; no active Jobs\. Last successful refresh:/)).toBeVisible()
+  })
+
+  it('pauses automatic refresh only after Load more succeeds', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: true, nextCursor: 'next-page' })
+      .mockResolvedValueOnce({ items: [job({ id: 'history-2', runId: 'run-2', status: 'done', error: null })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
+
+    expect(await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByText(/Automatic refresh paused after loading more\. Last successful refresh:/)).toBeVisible()
+  })
+
+  it('replaces paginated pages with a fresh first page on manual refresh', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: true, nextCursor: 'next-page' })
+      .mockResolvedValueOnce({ items: [job({ id: 'history-2', runId: 'run-2', status: 'done', error: null })], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [job({ id: 'history-3', runId: 'run-3', status: 'running', error: null })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Load more' }))
+    await screen.findByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByRole('button', { name: 'Open run run-3 in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Open run run-2 in Alpha research', expanded: false })).not.toBeInTheDocument()
+    expect(screen.getByText(/Live first page\. Last successful refresh:/)).toBeVisible()
+    expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: undefined, limit: 50 }))
+  })
+
+  it('keeps the last successful first page visible after refresh failure', async () => {
+    mocks.workspaceJobs
+      .mockResolvedValueOnce({ items: [job({ status: 'running', error: null })], hasMore: false, nextCursor: null })
+      .mockRejectedValueOnce(new Error('network unavailable'))
+    render(<JobsView />)
+    await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t refresh Jobs: network unavailable')
+    expect(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false })).toBeVisible()
+    expect(screen.getByText(/Refresh failed; showing the last successful first page\. Last successful refresh:/)).toBeVisible()
   })
 
   it('deep-links and opens a retained artifact by run/node/port identity', async () => {

@@ -43,6 +43,7 @@ const progressLabel = (progress: number | null | undefined) => (
 const updateLabel = (updatedAt: string | null | undefined) => (
   updatedAt ? new Date(updatedAt).toLocaleString() : 'Unavailable'
 )
+const refreshLabel = (refreshedAt: number) => new Date(refreshedAt).toLocaleTimeString()
 
 function jobPhase(item: WorkspaceJobDto): string | null {
   if (item.externalWait) return `External wait · ${readable(item.externalWait.phase)}`
@@ -68,8 +69,10 @@ export function JobsView() {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
+  const [refreshError, setRefreshError] = useState('')
   const [loadMoreError, setLoadMoreError] = useState('')
   const [loadedMore, setLoadedMore] = useState(false)
+  const [lastSuccessfulRefresh, setLastSuccessfulRefresh] = useState<number | null>(null)
   const [actionError, setActionError] = useState('')
   const [acting, setActing] = useState('')
   const request = useRef(0)
@@ -80,17 +83,29 @@ export function JobsView() {
   // view so a revoked share does not remain selectable after the rest of the shell has updated.
   useEffect(() => { void refreshFiles() }, [refreshFiles])
 
-  const load = useCallback(async (nextCursor?: string, refresh = false) => {
+  const load = useCallback(async (nextCursor?: string, mode: 'initial' | 'refresh' = 'initial') => {
     const sequence = ++request.current
-    if (nextCursor) { setLoadingMore(true); setLoadMoreError(''); setLoadedMore(true) }
-    else if (!refresh) {
-      setLoading(true); setError(''); setItems([]); setLoadedMore(false)
-      deepLinkRequest.current = ''
+    if (nextCursor) {
+      // Loading another keyset page commits this view to a bounded snapshot, even if the
+      // request needs a retry. A background first-page response must not race that retry.
+      setLoadingMore(true); setLoadMoreError(''); setLoadedMore(true)
+    }
+    else {
+      setLoading(true); setError(''); setRefreshError(''); setLoadMoreError('')
+      if (mode === 'initial') {
+        setItems([]); setCursor(null); setHasMore(false); setLoadedMore(false); setLastSuccessfulRefresh(null)
+        deepLinkRequest.current = ''
+      }
     }
     try {
       const page = await api.workspaceJobs(queryFrom(new URLSearchParams(filterKey), nextCursor))
       if (sequence !== request.current) return
-      if (!nextCursor) setError('')
+      if (!nextCursor) {
+        setError('')
+        setRefreshError('')
+        setLastSuccessfulRefresh(Date.now())
+        setLoadedMore(false)
+      }
       setItems((current) => nextCursor
         ? [...current, ...page.items.filter((item) => !current.some((row) => row.id === item.id))]
         : page.items)
@@ -99,7 +114,8 @@ export function JobsView() {
       if (sequence !== request.current) return
       const message = caught instanceof Error ? caught.message : String(caught)
       if (nextCursor) setLoadMoreError(message)
-      else setError(message)
+      else if (mode === 'initial') setError(message)
+      else setRefreshError(message)
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
@@ -120,9 +136,9 @@ export function JobsView() {
   }, [filterKey, items, loading, params])
   useEffect(() => {
     if (loadedMore || !items.some((item) => item.status === 'queued' || item.status === 'running')) return
-    const timer = window.setInterval(() => { if (!loadingMore) void load(undefined, true) }, 5000)
+    const timer = window.setInterval(() => { if (!loading && !loadingMore) void load(undefined, 'refresh') }, 5000)
     return () => window.clearInterval(timer)
-  }, [items, load, loadedMore, loadingMore])
+  }, [items, load, loadedMore, loading, loadingMore])
 
   const update = (name: string, value: string) => {
     const next = new URLSearchParams(params)
@@ -155,7 +171,7 @@ export function JobsView() {
         await api.retryRun(runId, actionId)
         retryActions.current.delete(runId)
       }
-      await load(undefined, true)
+      await load(undefined, 'refresh')
     } catch (caught) {
       setActionError(caught instanceof Error ? caught.message : String(caught))
     } finally { setActing('') }
@@ -187,14 +203,26 @@ export function JobsView() {
     next.delete('run'); next.delete('output')
     setJobsQuery(next.toString())
   }
+  const hasActiveJobs = items.some((item) => item.status === 'queued' || item.status === 'running')
+  const freshness = lastSuccessfulRefresh == null
+    ? null
+    : refreshError
+      ? loadedMore
+        ? `Refresh failed; showing the prior paginated snapshot. Automatic refresh remains paused. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+        : `Refresh failed; showing the last successful first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+      : loadedMore
+        ? `Automatic refresh paused after loading more. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+        : hasActiveJobs
+          ? `Live first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+          : `Snapshot; no active Jobs. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
 
   return (
     <div className="flex h-full min-w-0 flex-col">
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
         <div><h1 className="text-[20px] font-bold text-foreground">Jobs</h1>
-          <p className="text-[11.5px] text-muted-foreground">Persisted runs across accessible canvases</p></div>
+          <p className="text-[11.5px] text-muted-foreground">{freshness ?? 'Persisted runs across accessible canvases'}</p></div>
         <span className="flex-1" />
-        <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading || loadingMore}>
+        <Button variant="outline" size="sm" onClick={() => void load(undefined, 'refresh')} disabled={loading || loadingMore}>
           <Icon name="refresh" size={13} /> Refresh
         </Button>
       </header>
@@ -237,6 +265,7 @@ export function JobsView() {
         {actionError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Job action failed: {actionError}</div>}
         {loading && <div className="p-5 text-[12.5px] text-muted-foreground">Loading Jobs…</div>}
         {!loading && error && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 p-4 text-[12.5px] text-destructive">Couldn’t load Jobs: {error} <button className="ml-2 font-semibold underline" onClick={() => void load()}>Retry</button></div>}
+        {!loading && refreshError && <div role="alert" className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t refresh Jobs: {refreshError} Showing the prior Jobs snapshot.</div>}
         {!loading && !error && items.length === 0 && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">No runs match these filters.</div>}
         {items.length > 0 && <div className="min-w-[850px] overflow-hidden rounded-lg border border-border bg-card">
           <div className="grid grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
