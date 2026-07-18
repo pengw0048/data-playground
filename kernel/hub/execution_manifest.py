@@ -122,7 +122,9 @@ def _canonical_graph(
     return {
         "nodes": nodes,
         "edges": edges,
-        "requirements": list(graph.requirements),
+        # Package declaration order does not change the environment contract (the execution/cache
+        # identity already treats it as a set), so keep harmless editor reordering digest-stable.
+        "requirements": sorted(graph.requirements),
     }
 
 

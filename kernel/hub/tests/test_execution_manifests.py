@@ -174,6 +174,13 @@ def test_digest_ignores_nonsemantic_canvas_display_and_admission_time():
     }
     assert "parameters" not in doc
 
+    reordered_requirements = _graph()
+    reordered_requirements.requirements = ["polars==1.32.0", "numpy==2.5.0"]
+    first_order, _ = _build(reordered_requirements)
+    reordered_requirements.requirements.reverse()
+    second_order, _ = _build(reordered_requirements)
+    assert second_order == first_order
+
 
 def test_digest_retains_only_titles_consumed_by_execution():
     baseline, _ = _build()
