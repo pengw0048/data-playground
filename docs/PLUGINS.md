@@ -474,10 +474,9 @@ error code. The fixture is an offline conformance dependency, not a default prov
 
 ## Reference plugins
 
-`examples/plugins/` contains sixteen reference packages: fourteen product examples and two deterministic
-conformance fixtures. The product examples below are small, supported demonstrations of a public seam;
-they are not a bundled provider marketplace. The fixtures exercise public contracts without becoming
-default product services.
+`examples/plugins/` contains working reference plugins. The product examples below are small, supported
+demonstrations of public seams; they are not a bundled provider marketplace. Deterministic conformance
+fixtures exercise public contracts without becoming default product services.
 
 - [`dp_example`](../examples/plugins/dp_example/) — `add_node`: `redact` compute node (mask a PII
   column)
