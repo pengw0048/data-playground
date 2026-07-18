@@ -60,10 +60,11 @@ second issue tracker.
 
 | Area | Delivered on `main` | Remaining boundary |
 | --- | --- | --- |
-| Workspace | A local Workspace composes canvases, datasets, folders, local placement, browse, search, and read-only provider mounts. | Complete provider dataset-to-Source and overlay workflow remains in [#468](https://github.com/pengw0048/data-playground/issues/468). |
-| Exact reads | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before supported local execution. Their bounded previews read the current file and are not revision-pinned. | A complete researcher-facing DatasetView/report model is [#311](https://github.com/pengw0048/data-playground/issues/311); a mutable-only provider must still be labeled and cannot be made reproducible by UI wording. |
+| Workspace | A local Workspace composes canvases, datasets, folders, local placement, browse, search, and read-only provider mounts. An installed provider dataset can become a local Canvas Source through a stable local binding without writing to the provider. | The complete Workspace discovery-to-runnable-data track is closed in [#468](https://github.com/pengw0048/data-playground/issues/468); exact local DatasetViews remain incomplete in [#427](https://github.com/pengw0048/data-playground/issues/427). |
+| Exact reads | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before supported local execution. Installed provider Sources with explicit immutable revision evidence can preview and enter an exact admitted local run; mutable-only provider Sources remain bounded-inspection only and fail before full-run allocation. | A complete researcher-facing DatasetView/report model is [#311](https://github.com/pengw0048/data-playground/issues/311); a mutable-only provider must still be labeled and cannot be made reproducible by UI wording. |
 | Managed writes | Typed managed-local create and replace writes freeze destination, expected head, schema, provenance, and idempotency; managed Lance append is separately admitted. Receipts reconcile publication evidence. | Key-based upsert and sparse merge-columns require certified row identity and are intentionally deferred to [#310](https://github.com/pengw0048/data-playground/issues/310) and [#489](https://github.com/pengw0048/data-playground/issues/489). |
 | Durable work | Task/Attempt state supports managed local writes, external waits, checkpoints, bounded fan-out, restart/retry/cancel recovery, Jobs, and Inbox. [#485](https://github.com/pengw0048/data-playground/issues/485) certifies the current durable consistency set through backup and restore. The browser observes rather than owns durable work. | This is not yet a general scheduler or arbitrary provider-job platform. |
+| Transform definitions | Promoted Transforms have owner-scoped durable identities and append-only immutable versions. Canvases and execution manifests retain exact `id + version` references, and execution does not substitute latest or caller-supplied inline code. | The researcher-facing library, target chooser, version inspection, and explicit upgrade UX remain incomplete in [#482](https://github.com/pengw0048/data-playground/issues/482); typed run parameters and their admitted bindings remain incomplete in [#477](https://github.com/pengw0048/data-playground/issues/477). |
 | Extension boundary | Installed-wheel plugin contracts and conformance cover catalog composition, read-only mounts, adapters, nodes, destinations, runners, capabilities, and telemetry. | New SPIs need a real consumer and deterministic conformance; provider-specific operational behavior remains outside core. |
 | Research semantics | The catalog can retain bounded lineage, schemas, previews, relationships, and native revision facts where an adapter supplies them. | Exact DatasetViews/distribution reports, sparse sidecars, and compound temporal data remain the scoped tracks [#311](https://github.com/pengw0048/data-playground/issues/311), [#310](https://github.com/pengw0048/data-playground/issues/310), and [#312](https://github.com/pengw0048/data-playground/issues/312). |
 
@@ -124,10 +125,11 @@ This part is complete only when:
 
 Versioning is an identity model, not a label on a card.
 
-The current foundation covers native revision reads where an adapter provides them and exact admission
-for ordinary local files. The complete cross-provider model specified in this section remains future
-work; in particular, UI pinning, as-of resolution, retention, and history are not implied for an
-adapter that has no corresponding capability.
+The current foundation covers native revision reads where an adapter provides them, exact admission
+for ordinary local files, and installed provider Sources with explicit immutable revision evidence.
+The complete cross-provider model specified in this section remains future work; in particular, UI
+pinning, as-of resolution, retention, and history are not implied for an adapter that has no
+corresponding capability.
 
 ### Core types
 
