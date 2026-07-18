@@ -515,6 +515,7 @@ class WriteReceipt(Wire):
     partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
     publication: WritePublicationIdentity
     provenance: WriteProvenance
+    execution_manifest_sha256: PlanDigest | None = None
     durable: Literal[True] = True
 
     @property
@@ -547,6 +548,7 @@ class LineageFact(Wire):
     destination_uri: str = Field(min_length=1, max_length=8192)
     destination_version: str | None = Field(default=None, min_length=1, max_length=512)
     run_id: str | None = Field(default=None, min_length=1, max_length=512)
+    execution_manifest_sha256: PlanDigest | None = None
     attempt_id: str | None = Field(default=None, min_length=1, max_length=512)
     producer: str | None = Field(default=None, min_length=1, max_length=512)
     producer_version: int | None = Field(default=None, ge=0, le=MAX_SAFE_INTEGER)

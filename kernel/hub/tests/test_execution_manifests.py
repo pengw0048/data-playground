@@ -19,6 +19,7 @@ from hub.execution_manifest import (
 )
 from hub.models import (
     DatasetRevision,
+    ExactDatasetRef,
     Graph,
     LineagePublication,
     WorkspaceRunRecord,
@@ -431,7 +432,7 @@ def test_history_rejects_disagreeing_admission_and_state_manifest_owners():
         )
 
 
-def test_receipt_and_canvas_lineage_resolve_the_same_manifest_through_run_identity():
+def test_receipt_and_canvas_lineage_retain_manifest_after_run_owner_pruning(monkeypatch):
     _canvas("manifest-canvas")
     submission_id = str(uuid.uuid4())
     expected_run_id = metadb.local_run_submission_id(
@@ -448,15 +449,19 @@ def test_receipt_and_canvas_lineage_resolve_the_same_manifest_through_run_identi
 
     receipt = WriteReceipt(
         dataset_id="dataset-output", revision_id="revision-output",
+        parent_head=ExactDatasetRef(
+            kind="exact", dataset_id="dataset-output", revision_id="revision-parent"),
         head=DatasetRevision(
             dataset_id="dataset-output", revision_id="revision-output"),
         rows=1, bytes=8, schema=[],
         publication=WritePublicationIdentity(
-            logical_uri="file:///workspace/outputs/result.parquet",
-            artifact_uri="file:///workspace/outputs/result.parquet",
+            provider="managed-local-lance",
+            logical_uri="file:///workspace/outputs/result.lance",
+            artifact_uri="file:///workspace/outputs/result.lance",
             publish_sequence=1, idempotency_key="write-key",
         ),
         provenance=intent.provenance,
+        execution_manifest_sha256=digest,
     )
     with metadb.session() as session:
         lineage = metadb.CatalogLineageFact(
@@ -464,12 +469,28 @@ def test_receipt_and_canvas_lineage_resolve_the_same_manifest_through_run_identi
             fingerprint="manifest-fingerprint", source_key="source-key",
             destination_key="destination-key", source_uri="file:///source.parquet",
             destination_uri="file:///workspace/outputs/result.parquet",
-            source_key_hash="1" * 64, destination_key_hash="2" * 64,
-            source_uri_hash="3" * 64, destination_uri_hash="4" * 64,
-            run_id=run_id, producer="manifest-canvas", producer_version=7,
+            source_key_hash=metadb._catalog_lineage_identity_hash("source-key"),
+            destination_key_hash=metadb._catalog_lineage_identity_hash("destination-key"),
+            source_uri_hash=metadb._catalog_lineage_identity_hash("file:///source.parquet"),
+            destination_uri_hash=metadb._catalog_lineage_identity_hash(
+                "file:///workspace/outputs/result.parquet"),
+            run_id=run_id, execution_manifest_sha256=digest,
+            producer="manifest-canvas", producer_version=7,
             step_id="filter", provenance="run",
         )
         session.add(lineage)
+        session.add(metadb.ManagedLocalLanceWriteReceipt(
+            idempotency_key="write-key",
+            dataset_id=receipt.dataset_id,
+            logical_uri=receipt.publication.logical_uri,
+            revision_id=receipt.revision_id,
+            write_intent_doc="retained write intent",
+            write_receipt_doc=json.dumps(
+                receipt.model_dump(by_alias=True, mode="json"),
+                sort_keys=True, separators=(",", ":")),
+            run_id=run_id,
+            execution_manifest_sha256=digest,
+        ))
 
     assert receipt.provenance.publication.run_id == run_id
     with metadb.session() as session:
@@ -478,14 +499,43 @@ def test_receipt_and_canvas_lineage_resolve_the_same_manifest_through_run_identi
     assert lineage_run_id == run_id
     assert metadb.execution_manifest_sha256_for_run(run_id) == digest
 
+    # Exercise the real bounded-retention paths: terminal-state eviction removes RunState, then
+    # per-canvas history pruning removes both RunRecord and its RunInputAdmission owner.
+    metadb.save_run_state(
+        run_id,
+        {"run_id": run_id, "status": "failed", "target_node_id": "filter", "error": "expected"},
+        canvas_id="manifest-canvas",
+        execution_manifest_sha256=digest,
+        execution_manifest_doc=payload,
+    )
+    monkeypatch.setattr(metadb, "_RUN_STATE_MAX", 1)
+    metadb.save_run_state(
+        "replacement-run",
+        {"run_id": "replacement-run", "status": "failed", "error": "expected"},
+        canvas_id="manifest-canvas",
+    )
+    monkeypatch.setattr(metadb, "_RUN_HISTORY_MAX", 1)
+    metadb.record_run(
+        canvas_id="manifest-canvas", target_node_id=None, job_type="run",
+        status="failed", error="replacement", run_id="replacement-run",
+    )
     with metadb.session() as session:
-        history = session.query(metadb.RunRecord).filter_by(run_id=run_id).one()
-        history.execution_manifest_sha256 = "f" * 64
-    with pytest.raises(RuntimeError, match="disagree"):
-        metadb.execution_manifest_sha256_for_run(run_id)
+        assert session.get(metadb.RunInputAdmission, run_id) is None
+        assert session.get(metadb.RunState, run_id) is None
+        assert session.query(metadb.RunRecord).filter_by(run_id=run_id).one_or_none() is None
+    assert metadb.execution_manifest_sha256_for_run(run_id) == digest
+    assert metadb.execution_manifest(digest) is not None
+
+    # Once the receipt is gone, the existing catalog bulk-delete lifecycle removes the last lineage
+    # owner and reclaims its candidate manifest in the same transaction.
     with metadb.session() as session:
-        history = session.query(metadb.RunRecord).filter_by(run_id=run_id).one()
-        history.execution_manifest_sha256 = digest
+        session.delete(session.get(metadb.ManagedLocalLanceWriteReceipt, "write-key"))
+    with metadb.session() as session:
+        candidates = metadb._delete_catalog_children(session, ["file:///source.parquet"])
+        session.flush()
+        metadb._delete_unreferenced_execution_manifests(session, candidates)
+    assert metadb.execution_manifest_sha256_for_run(run_id) is None
+    assert metadb.execution_manifest(digest) is None
 
 
 def test_shared_manifest_survives_one_owner_and_legacy_history_is_explicit():

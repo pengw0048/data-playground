@@ -736,7 +736,9 @@ class CatalogLineageFact(Base):
     destination_uri_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     source_version: Mapped[str | None] = mapped_column(String, nullable=True)
     destination_version: Mapped[str | None] = mapped_column(String, nullable=True)
-    run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     attempt_id: Mapped[str | None] = mapped_column(String, nullable=True)
     producer: Mapped[str | None] = mapped_column(String, nullable=True)
     producer_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -1033,6 +1035,9 @@ class ManagedLocalFileRevision(Base):
     write_idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
     write_intent_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     write_receipt_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     committed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
@@ -1053,6 +1058,9 @@ class ManagedLocalLanceWriteReceipt(Base):
     revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
     write_intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
     write_receipt_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    execution_manifest_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True)
     committed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
@@ -5125,29 +5133,49 @@ def execution_manifest(sha256: str) -> dict | None:
         return {"sha256": row.sha256, "schema_version": row.schema_version, "document": doc}
 
 
-def execution_manifest_sha256_for_run(run_id: str) -> str | None:
-    """Resolve the existing run-id link used by receipts and Canvas lineage.
-
-    WriteReceipt provenance and CatalogLineageFact already retain the logical ``run_id``. While any
-    existing admission, live state, or history row is reconstructable, this join returns that exact
-    manifest identity without duplicating it into receipt JSON or creating a second retention lifecycle.
-    """
-    with session() as s:
-        identities = {
-            str(identity)
-            for identity in [
-                s.scalar(select(RunInputAdmission.execution_manifest_sha256).where(
-                    RunInputAdmission.run_id == str(run_id))),
-                s.scalar(select(RunState.execution_manifest_sha256).where(
-                    RunState.run_id == str(run_id))),
-                *s.scalars(select(RunRecord.execution_manifest_sha256).where(
-                    RunRecord.run_id == str(run_id))),
-            ]
-            if identity is not None
-        }
+def _execution_manifest_sha256_for_run_in_session(
+        s, run_id: str, *, lock: bool = False) -> str | None:
+    queries = [
+        select(RunInputAdmission.execution_manifest_sha256).where(
+            RunInputAdmission.run_id == str(run_id)),
+        select(RunState.execution_manifest_sha256).where(
+            RunState.run_id == str(run_id)),
+        select(RunRecord.execution_manifest_sha256).where(
+            RunRecord.run_id == str(run_id)),
+        select(CatalogLineageFact.execution_manifest_sha256).where(
+            CatalogLineageFact.run_id == str(run_id)),
+        select(ManagedLocalFileRevision.execution_manifest_sha256).where(
+            ManagedLocalFileRevision.run_id == str(run_id)),
+        select(ManagedLocalLanceWriteReceipt.execution_manifest_sha256).where(
+            ManagedLocalLanceWriteReceipt.run_id == str(run_id)),
+    ]
+    if lock:
+        queries = [query.with_for_update() for query in queries]
+    identities = {
+        str(identity)
+        for query in queries
+        for identity in s.scalars(query)
+        if identity is not None
+    }
     if len(identities) > 1:
-        raise RuntimeError("run records disagree on their execution manifest")
+        raise RuntimeError("run manifest owners disagree on their execution manifest")
     return next(iter(identities), None)
+
+
+def _retain_execution_manifest_for_run_in_session(s, run_id: str) -> str | None:
+    """Lock one run's existing owners before extending its manifest retention to a new owner."""
+    sha256 = _execution_manifest_sha256_for_run_in_session(s, str(run_id), lock=True)
+    if sha256 is None:
+        return None
+    if s.get(ExecutionManifest, sha256, with_for_update=True) is None:
+        raise RuntimeError("run manifest owner points to a missing execution manifest")
+    return sha256
+
+
+def execution_manifest_sha256_for_run(run_id: str) -> str | None:
+    """Resolve the retained manifest identity across live, history, receipt, and lineage owners."""
+    with session() as s:
+        return _execution_manifest_sha256_for_run_in_session(s, str(run_id))
 
 
 def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> None:
@@ -5162,6 +5190,9 @@ def _delete_unreferenced_execution_manifests(s, identities: set[str | None]) -> 
             RunInputAdmission.execution_manifest_sha256,
             RunState.execution_manifest_sha256,
             RunRecord.execution_manifest_sha256,
+            CatalogLineageFact.execution_manifest_sha256,
+            ManagedLocalFileRevision.execution_manifest_sha256,
+            ManagedLocalLanceWriteReceipt.execution_manifest_sha256,
         ))
         if not referenced:
             s.delete(row)
@@ -10099,6 +10130,7 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
         raise ValueError("storage namespace must be 1..80 UTF-8 bytes")
     if replacement == str(expected):
         raise ValueError("clone isolation requires a new storage namespace")
+    execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         row = _lock_object_attempt_registry(s)
         if row.storage_namespace != expected:
@@ -10123,11 +10155,13 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             for logical in logical_rows:
                 current_uri = logical.current_uri
                 if current_uri:
-                    _delete_catalog_children(s, [current_uri])
+                    execution_manifest_candidates.update(
+                        _delete_catalog_children(s, [current_uri]))
                     entry = s.get(CatalogEntry, current_uri, with_for_update=True)
                     if entry is not None:
                         s.delete(entry)
-                _delete_catalog_governance(s, logical.catalog_key)
+                execution_manifest_candidates.update(
+                    _delete_catalog_governance(s, logical.catalog_key))
                 logical.current_uri = None
                 logical.catalog_epoch += 1
                 logical.state = "unregistered"
@@ -10137,7 +10171,8 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             remaining_entries = list(s.scalars(select(CatalogEntry).where(
                 CatalogEntry.uri.in_(inherited_uris)).order_by(CatalogEntry.uri).with_for_update()))
             for entry in remaining_entries:
-                _delete_catalog_children(s, [entry.uri])
+                execution_manifest_candidates.update(
+                    _delete_catalog_children(s, [entry.uri]))
                 s.delete(entry)
 
             for lease in list(s.scalars(select(ObjectAttemptLease).where(
@@ -10153,7 +10188,10 @@ def isolate_cloned_object_storage(expected: str, replacement: str) -> str:
             s.delete(claim)
         row.owner_token = uuid.uuid4().hex
         row.storage_namespace = replacement
-        return replacement
+        s.flush()
+        _delete_unreferenced_execution_manifests(
+            s, execution_manifest_candidates)
+    return replacement
 
 
 def _validate_object_attempt_identity(row: ObjectAttempt, *, logical_uri: str, kind: str,
@@ -11907,6 +11945,10 @@ def _catalog_insert_lineage_fact(
     fact_key = "lineage-fact:v1:sha256:" + hashlib.sha256(
         (publication_key + "\0" + source["source_key"]).encode("utf-8")
     ).hexdigest()
+    execution_manifest_sha256 = (
+        _retain_execution_manifest_for_run_in_session(s, lineage["run_id"])
+        if lineage["run_id"] is not None else None
+    )
     semantic = {
         "schema_version": 1,
         "fact_key": fact_key,
@@ -11916,6 +11958,7 @@ def _catalog_insert_lineage_fact(
         "destination_uri": destination_uri,
         "destination_version": destination_version,
         "run_id": lineage["run_id"],
+        "execution_manifest_sha256": execution_manifest_sha256,
         "attempt_id": lineage["attempt_id"],
         "producer": lineage["producer"],
         "producer_version": lineage["producer_version"],
@@ -11949,6 +11992,7 @@ def _catalog_insert_lineage_fact(
         "destination_uri_hash": _catalog_lineage_identity_hash(destination_uri),
         "destination_version": destination_version,
         "run_id": lineage["run_id"],
+        "execution_manifest_sha256": execution_manifest_sha256,
         "attempt_id": lineage["attempt_id"],
         "producer": lineage["producer"],
         "producer_version": lineage["producer_version"],
@@ -12441,6 +12485,8 @@ def _managed_local_write_receipt_in_session(
             or receipt.publication.artifact_uri != revision.artifact_uri
             or receipt.publication.publish_sequence != revision.publish_seq
             or receipt.publication.idempotency_key != idempotency_key
+            or receipt.provenance.publication.run_id != revision.run_id
+            or receipt.execution_manifest_sha256 != revision.execution_manifest_sha256
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
@@ -12468,7 +12514,9 @@ def _managed_local_lance_write_receipt_in_session(
             or receipt.publication.provider != "managed-local-lance"
             or receipt.publication.logical_uri != row.logical_uri
             or receipt.publication.artifact_uri != row.logical_uri
-            or receipt.publication.idempotency_key != idempotency_key):
+            or receipt.publication.idempotency_key != idempotency_key
+            or receipt.provenance.publication.run_id != row.run_id
+            or receipt.execution_manifest_sha256 != row.execution_manifest_sha256):
         raise RuntimeError("managed local Lance write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
 
@@ -12635,6 +12683,16 @@ def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
         from hub.models import WriteReceipt
 
         receipt = WriteReceipt.model_validate(publish())
+        run_id = intent.provenance.publication.run_id
+        execution_manifest_sha256 = (
+            _retain_execution_manifest_for_run_in_session(s, run_id)
+            if run_id is not None else None
+        )
+        if receipt.execution_manifest_sha256 not in (None, execution_manifest_sha256):
+            raise RuntimeError("managed local Lance publication receipt changed its execution manifest")
+        receipt = receipt.model_copy(update={
+            "execution_manifest_sha256": execution_manifest_sha256,
+        })
         expected = intent.expected_head
         if (expected is None
                 or receipt.dataset_id != intent.destination.dataset_id
@@ -12660,6 +12718,8 @@ def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
             write_receipt_doc=json.dumps(
                 receipt.model_dump(by_alias=True, mode="json"),
                 sort_keys=True, separators=(",", ":")),
+            run_id=run_id,
+            execution_manifest_sha256=execution_manifest_sha256,
             committed_at=committed_at,
         ))
         return receipt.model_dump(by_alias=True, mode="json")
@@ -12717,6 +12777,7 @@ def catalog_publish_managed_local_file(
         if (isinstance(total_bytes, bool) or not isinstance(total_bytes, int)
                 or total_bytes < 0):
             raise ValueError("managed local write requires bounded non-negative bytes")
+    execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         # Take the lineage reservation before the managed output projection. This matches the
         # composite-publication ordering used by the other catalog writers and keeps both effects
@@ -12813,7 +12874,11 @@ def catalog_publish_managed_local_file(
             if not payload.get("tags"):
                 payload["tags"] = [tag.tag for tag in s.scalars(select(CatalogTag).where(
                     CatalogTag.uri == old.uri).order_by(CatalogTag.tag))]
-            _delete_catalog_children(s, [old.uri])
+            execution_manifest_candidates.update(
+                _delete_catalog_children(s, [old.uri]))
+            s.flush()
+            _delete_unreferenced_execution_manifests(
+                s, execution_manifest_candidates)
             s.delete(old)
             # ``logical_id`` is unique on the current catalog projection. Flush the retired head before
             # adding its replacement so SQLite and PostgreSQL observe the same one-head invariant.
@@ -12844,6 +12909,11 @@ def catalog_publish_managed_local_file(
                 dataset_id=prior_head["dataset_id"],
                 revision_id=prior_head["revision_id"],
             ) if prior_head is not None else None)
+            run_id = typed_intent.provenance.publication.run_id
+            execution_manifest_sha256 = (
+                _retain_execution_manifest_for_run_in_session(s, run_id)
+                if run_id is not None else None
+            )
             receipt = WriteReceipt(
                 dataset_id=logical.logical_id,
                 revision_id=revision_id,
@@ -12866,12 +12936,15 @@ def catalog_publish_managed_local_file(
                     catalog_version=payload.get("version"),
                 ),
                 provenance=typed_intent.provenance,
+                execution_manifest_sha256=execution_manifest_sha256,
             )
             revision.write_idempotency_key = typed_intent.idempotency_key
             revision.write_intent_doc = intent_doc
             revision.write_receipt_doc = json.dumps(
                 receipt.model_dump(by_alias=True, mode="json"),
                 sort_keys=True, separators=(",", ":"))
+            revision.run_id = run_id
+            revision.execution_manifest_sha256 = execution_manifest_sha256
         s.add(revision)
         logical.current_uri = artifact_uri
         logical.current_publish_seq = publish_seq
@@ -12911,13 +12984,15 @@ def catalog_publish_managed_local_file(
                 target_snapshots[1:], locked_logicals, locked_entries,
                 canonical_lineage, lineage_publication_key)
         if typed_intent is not None:
-            return receipt.model_dump(by_alias=True, mode="json")
-        return {
-            "dataset_id": logical.logical_id,
-            "revision_id": revision_id,
-            "committed_at": committed_at,
-            "table": payload,
-        }
+            result = receipt.model_dump(by_alias=True, mode="json")
+        else:
+            result = {
+                "dataset_id": logical.logical_id,
+                "revision_id": revision_id,
+                "committed_at": committed_at,
+                "table": payload,
+            }
+    return result
 
 
 def _managed_local_file_publication_receipt_in_session(
@@ -14239,7 +14314,7 @@ def catalog_entries() -> list[dict]:
         return [_row_to_doc(r, tag_map.get(r.uri, [])) for r in rows]
 
 
-def _delete_catalog_children(s, uris: list[str]) -> None:
+def _delete_catalog_children(s, uris: list[str]) -> set[str | None]:
     """Remove EVERY row keyed to `uris` alongside the entries themselves — tags/columns/embeddings,
     lineage facts (either endpoint), declared keys, and relationships. Otherwise a deleted table
     haunts lineage/ER as a ghost node, and a NEW dataset re-registered at the same uri silently
@@ -14248,7 +14323,7 @@ def _delete_catalog_children(s, uris: list[str]) -> None:
         for r in s.scalars(select(model).where(model.uri.in_(uris))):
             s.delete(r)
     identity_hashes = [_catalog_lineage_identity_hash(uri) for uri in uris]
-    s.execute(delete(CatalogLineageFact).where(or_(
+    lineage_predicate = or_(
         and_(
             CatalogLineageFact.source_uri_hash.in_(identity_hashes),
             CatalogLineageFact.source_uri.in_(uris)),
@@ -14261,7 +14336,11 @@ def _delete_catalog_children(s, uris: list[str]) -> None:
         and_(
             CatalogLineageFact.destination_key_hash.in_(identity_hashes),
             CatalogLineageFact.destination_key.in_(uris)),
-    )))
+    )
+    execution_manifest_candidates = set(s.scalars(select(
+        CatalogLineageFact.execution_manifest_sha256,
+    ).where(lineage_predicate)))
+    s.execute(delete(CatalogLineageFact).where(lineage_predicate))
     gone = set(uris)
     for r in s.scalars(select(CatalogRelationship)):
         try:
@@ -14271,15 +14350,16 @@ def _delete_catalog_children(s, uris: list[str]) -> None:
         if doc.get("leftUri") in gone or doc.get("rightUri") in gone \
                 or doc.get("left_uri") in gone or doc.get("right_uri") in gone:
             s.delete(r)
+    return execution_manifest_candidates
 
 
-def _delete_catalog_governance(s, catalog_key: str) -> None:
+def _delete_catalog_governance(s, catalog_key: str) -> set[str | None]:
     for model in (CatalogEmbedding, CatalogDeclaredKey):
         row = s.get(model, catalog_key)
         if row is not None:
             s.delete(row)
     identity_hash = _catalog_lineage_identity_hash(catalog_key)
-    s.execute(delete(CatalogLineageFact).where(or_(
+    lineage_predicate = or_(
         and_(CatalogLineageFact.source_key_hash == identity_hash,
              CatalogLineageFact.source_key == catalog_key),
         and_(CatalogLineageFact.destination_key_hash == identity_hash,
@@ -14288,7 +14368,11 @@ def _delete_catalog_governance(s, catalog_key: str) -> None:
              CatalogLineageFact.source_uri == catalog_key),
         and_(CatalogLineageFact.destination_uri_hash == identity_hash,
              CatalogLineageFact.destination_uri == catalog_key),
-    )))
+    )
+    execution_manifest_candidates = set(s.scalars(select(
+        CatalogLineageFact.execution_manifest_sha256,
+    ).where(lineage_predicate)))
+    s.execute(delete(CatalogLineageFact).where(lineage_predicate))
     for relationship in s.scalars(select(CatalogRelationship)):
         try:
             doc = json.loads(relationship.doc)
@@ -14298,6 +14382,7 @@ def _delete_catalog_governance(s, catalog_key: str) -> None:
                 doc.get("leftUri"), doc.get("left_uri"),
                 doc.get("rightUri"), doc.get("right_uri")):
             s.delete(relationship)
+    return execution_manifest_candidates
 
 
 def _catalog_logicals_have_backend_publication_refs(s, logical_ids: list[str]) -> bool:
@@ -14311,8 +14396,8 @@ def _catalog_logicals_have_backend_publication_refs(s, logical_ids: list[str]) -
 
 
 def _catalog_current_logical_ownership(
-        s, logical: CatalogLogicalDataset) -> str:
-    """Validate and classify one exact active logical head before unregistering it."""
+        s, logical: CatalogLogicalDataset, *, validate_managed_local: bool = True) -> str:
+    """Classify one exact head; optionally defer its final local-registry validation."""
     current_uri = logical.current_uri
     if not current_uri:
         raise RuntimeError("catalog unregister ownership changed concurrently")
@@ -14332,6 +14417,8 @@ def _catalog_current_logical_ownership(
             raise RuntimeError("catalog unregister ownership changed concurrently")
         return "object"
     if revision is not None:
+        if not validate_managed_local:
+            return "managed_local"
         # Local lifecycle rows are always locked behind the registry. Object attempts (including all
         # prefix members) must already be locked before entering this branch to preserve the global
         # object -> local-registry -> local-artifact order.
@@ -14351,6 +14438,7 @@ def _catalog_current_logical_ownership(
 def catalog_delete_entry(uri: str) -> None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
     declared key/relationships)."""
+    execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         token = str(uri).rstrip("/")
         attempt_identity = s.get(ObjectAttempt, token)
@@ -14374,7 +14462,6 @@ def catalog_delete_entry(uri: str) -> None:
                     and attempt_identity.catalog_epoch != logical.catalog_epoch):
                 raise RuntimeError("catalog governance request was fenced by unregister")
             current_uri = logical.current_uri
-            ownership = _catalog_current_logical_ownership(s, logical)
             if _catalog_logicals_have_backend_publication_refs(s, [logical.logical_id]):
                 raise RuntimeError(
                     "catalog unregister is blocked by an active backend publication")
@@ -14382,6 +14469,10 @@ def catalog_delete_entry(uri: str) -> None:
             if entry is None or entry.logical_id != logical.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")
             catalog_key = logical.catalog_key
+            # Lock object/revision ownership before manifest GC, but delay the managed-local registry
+            # lock until afterwards: local lifecycle locks are deliberately last in the global order.
+            ownership = _catalog_current_logical_ownership(
+                s, logical, validate_managed_local=False)
         else:
             entry_snapshot = s.get(CatalogEntry, token)
             if entry_snapshot is None:
@@ -14394,7 +14485,18 @@ def catalog_delete_entry(uri: str) -> None:
             if entry is None or entry.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")
             current_uri, catalog_key = entry.uri, entry.uri
+            ownership = None
+        execution_manifest_candidates.update(
+            _delete_catalog_governance(s, catalog_key))
+        if current_uri:
+            execution_manifest_candidates.update(
+                _delete_catalog_children(s, [current_uri]))
+        s.flush()
+        _delete_unreferenced_execution_manifests(
+            s, execution_manifest_candidates)
         if logical is not None:
+            if ownership == "managed_local":
+                _catalog_current_logical_ownership(s, logical)
             if ownership == "object":
                 _replace_attempt_ref(s, "catalog", logical.logical_id, None)
             logical.current_uri = None
@@ -14402,9 +14504,6 @@ def catalog_delete_entry(uri: str) -> None:
             logical.state = "unregistered"
             logical.metadata_version += 1
             logical.governance_doc = "{}"
-        _delete_catalog_governance(s, catalog_key)
-        if current_uri:
-            _delete_catalog_children(s, [current_uri])
         if entry is not None:
             s.delete(entry)
         # Object governance/ref mutations above always precede the local registry lock.
@@ -14415,6 +14514,7 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
     """Delete every entry (+ everything keyed to it) whose uri starts with `uri_prefix`. Returns the
     count removed. For bulk teardown of demo/scale entries; a no-op for a prefix that matches none."""
     like = _like_escape(uri_prefix) + "%"
+    execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         snapshot = list(s.execute(select(CatalogEntry.uri, CatalogEntry.logical_id).where(
             CatalogEntry.uri.like(like, escape="\\")).order_by(CatalogEntry.uri)).all())
@@ -14437,8 +14537,8 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
         if len(entries) != len(snapshot):
             raise RuntimeError("catalog prefix changed concurrently")
         ownerships: dict[str, str] = {}
-        # Validate every object-backed head before the first managed-local helper takes the final
-        # lifecycle registry lock. This matters when one prefix contains both ownership types.
+        # Lock every object/revision head before manifest GC. Managed-local artifact validation is
+        # deliberately delayed until afterwards so the local registry remains the final lifecycle lock.
         ordered_snapshot = sorted(snapshot, key=lambda item: (item[0] not in object_uris, item[0]))
         for uri, logical_id in ordered_snapshot:
             if logical_id:
@@ -14446,11 +14546,24 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
                 if (logical is None or logical.state != "active"
                         or logical.current_uri != uri):
                     raise RuntimeError("catalog prefix changed concurrently")
-                ownerships[logical_id] = _catalog_current_logical_ownership(s, logical)
+                ownerships[logical_id] = _catalog_current_logical_ownership(
+                    s, logical, validate_managed_local=False)
             elif entries[uri].logical_id:
                 raise RuntimeError("catalog prefix changed concurrently")
         current_uris = list(uris)
-        _delete_catalog_children(s, current_uris)
+        execution_manifest_candidates.update(
+            _delete_catalog_children(s, current_uris))
+        for uri, logical_id in snapshot:
+            logical = logical_rows.get(logical_id) if logical_id else None
+            if logical is not None:
+                execution_manifest_candidates.update(
+                    _delete_catalog_governance(s, logical.catalog_key))
+        s.flush()
+        _delete_unreferenced_execution_manifests(
+            s, execution_manifest_candidates)
+        for logical_id, ownership in ownerships.items():
+            if ownership == "managed_local":
+                _catalog_current_logical_ownership(s, logical_rows[logical_id])
         for uri, logical_id in snapshot:
             logical = logical_rows.get(logical_id) if logical_id else None
             if logical is not None:
@@ -14461,7 +14574,6 @@ def catalog_delete_prefix(uri_prefix: str) -> int:
                 logical.state = "unregistered"
                 logical.metadata_version += 1
                 logical.governance_doc = "{}"
-                _delete_catalog_governance(s, logical.catalog_key)
             s.delete(entries[uri])
         _lock_local_result_registry(s)
         for uri in current_uris:
@@ -14636,6 +14748,7 @@ def _catalog_lineage_fact_dict(row: CatalogLineageFact) -> dict:
         "destination_uri": row.destination_uri,
         "destination_version": row.destination_version,
         "run_id": row.run_id,
+        "execution_manifest_sha256": row.execution_manifest_sha256,
         "attempt_id": row.attempt_id,
         "producer": row.producer,
         "producer_version": row.producer_version,

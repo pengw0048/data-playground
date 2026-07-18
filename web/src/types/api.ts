@@ -281,6 +281,7 @@ export interface LineageFact {
   destinationUri: string
   destinationVersion: string | null
   runId: string | null
+  executionManifestSha256?: string | null
   attemptId: string | null
   producer: string | null
   producerVersion: number | null
@@ -440,6 +441,7 @@ export interface WriteReceipt {
   schema: { name: string; type: string; capabilities?: string[] }[]
   partitions: { field: string }[]
   publication: { provider: string; logicalUri: string; artifactUri: string; publishSequence: number; idempotencyKey: string; catalogVersion?: string | null; backendVersion?: string | null }
+  executionManifestSha256?: string | null
   durable: true
 }
 
