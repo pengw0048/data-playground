@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import time
@@ -219,3 +218,22 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
     assert counts["prefix"] == 1
     assert metadb.durable_task(task_id)["status"] == "done"
     deps.storage.close()
+
+
+def test_checkpoint_invalid_error_surfaces_as_jobs_diagnostic():
+    """A wrapped 'checkpoint_invalid' failure must reach the Jobs diagnosticCode."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    checkpoint = SimpleNamespace(
+        phase="committed", content_sha256="a" * 64, committed_bytes=10, committed_rows=5,
+        checkpoint_node_id="sel", output_port_id="out",
+        committed_at=datetime(2026, 7, 17, tzinfo=timezone.utc))
+    invalid = SimpleNamespace(
+        id="t1", status="failed", error="RuntimeError: checkpoint_invalid: OSError")
+    view = metadb._sanitized_checkpoint_jobs_view(invalid, checkpoint, {}, can_retry=False)
+    assert view["diagnosticCode"] == "checkpoint_invalid"
+
+    unrelated = SimpleNamespace(id="t2", status="failed", error="RuntimeError: disk full")
+    other = metadb._sanitized_checkpoint_jobs_view(unrelated, checkpoint, {}, can_retry=False)
+    assert other["diagnosticCode"] is None

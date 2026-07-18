@@ -84,7 +84,6 @@ def _wait_for_owned_worker(
 
 def _prefix_graph(graph: Graph, select_id: str) -> Graph:
     """Return only Source -> Select; Write is excluded from Phase 1 execution."""
-    select = next(node for node in graph.nodes if node.id == select_id)
     incoming = [edge for edge in graph.edges if edge.target == select_id]
     source_ids = {edge.source for edge in incoming}
     nodes = [node for node in graph.nodes if node.id in source_ids or node.id == select_id]

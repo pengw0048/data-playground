@@ -464,6 +464,16 @@ export const api = {
     if (params.q) query.set('q', params.q)
     return req<WorkspaceJobsPage>(`/jobs?${query}`)
   },
+  inboxList: (params: InboxListQuery = {}) => {
+    const query = new URLSearchParams()
+    if (params.limit != null) query.set('limit', String(params.limit))
+    if (params.cursor) query.set('cursor', params.cursor)
+    if (params.filter) query.set('filter', params.filter)
+    return req<InboxPage>(`/inbox?${query}`)
+  },
+  inboxUnreadCount: () => req<InboxUnreadCount>('/inbox/unread-count'),
+  inboxMarkRead: (itemId: string) =>
+    req<InboxItemDto>(`/inbox/${encodeURIComponent(itemId)}/read`, { method: 'POST' }),
   // named/versioned schema contracts (workspace artifacts a node can reference by name)
   listSchemas: () => req<SchemaContractDto[]>('/schemas'),
   saveSchema: (name: string, columns: ColumnSchema[]) =>
@@ -510,6 +520,21 @@ export interface CheckpointJobDto {
 export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
+export interface InboxItemDto {
+  id: string
+  taskId: string
+  canvasId: string
+  canvasName?: string | null
+  taskKind: 'managed_local_write' | 'external_wait'
+  outcome: 'completed' | 'failed' | 'cancelled'
+  diagnosticCode?: string | null
+  terminalAt: string
+  readAt?: string | null
+  jobAvailable: boolean
+}
+export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
+export interface InboxUnreadCount { count: number }
+export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }
 export interface SchemaContractDto { name: string; version: number; columns: ColumnSchema[]; versions?: number[] }
 export interface SchemaFieldCompatibilityDto { kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'; status: 'compatible' | 'breaking' | 'unknown'; reason: string; fieldId?: string | null; oldName?: string | null; newName?: string | null }
 export interface SchemaCompatibilityDto { status: 'compatible' | 'breaking' | 'unknown'; fields: SchemaFieldCompatibilityDto[] }

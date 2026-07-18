@@ -5,7 +5,6 @@ Revises: 0016_bounded_fanout_plan
 """
 
 from alembic import op
-import sqlalchemy as sa
 
 
 revision = "0017_linear_checkpoint_inbox"
