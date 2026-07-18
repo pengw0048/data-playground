@@ -318,9 +318,16 @@ with TestClient(app) as client:
     assert final is not None and final["status"] == "done", final
     assert final["totalRows"] == 2
 
-    history_response = client.get(f"/api/canvas/{canvas_id}/runs")
-    assert history_response.status_code == 200, history_response.text
-    history = next(item for item in history_response.json() if item.get("runId") == run_id)
+    history = None
+    while time.monotonic() < deadline:
+        history_response = client.get(f"/api/canvas/{canvas_id}/runs")
+        assert history_response.status_code == 200, history_response.text
+        history = next(
+            (item for item in history_response.json() if item.get("runId") == run_id), None)
+        if history is not None:
+            break
+        time.sleep(0.05)
+    assert history is not None, "terminal run was not projected into Canvas history"
     assert history["status"] == "done" and history["rows"] == 2
     assert history["inputManifest"] == inputs
     assert history["executionManifestAvailability"] == "available"
