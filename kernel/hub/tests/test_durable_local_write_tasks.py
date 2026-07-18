@@ -249,6 +249,46 @@ def test_response_loss_replay_adopts_task_after_source_deletion_without_resoluti
     deps.storage.close()
 
 
+def test_supplied_snapshot_manifest_keeps_task_graph_logical(tmp_path, monkeypatch):
+    deps, graph, source, uid = _ordinary_task_context(tmp_path)
+    candidates: list[dict[str, str]] = []
+    manifest = _resolve_local_run_manifest(
+        graph, "write", deps,
+        materialize_local_files=True,
+        local_file_candidates=candidates,
+    )
+    admission_id, created = metadb.admit_local_run_inputs(
+        uid=uid, canvas_id=str(graph.id), submission_id=str(uuid.uuid4()),
+        target_node_id="write", intent_sha256="f" * 64, manifest=manifest,
+        local_file_candidates=candidates,
+    )
+    assert created
+    local_run_inputs.finalize_local_file_candidates(
+        deps.storage, candidates, admission_id)
+    artifact_uri = metadb.local_file_input_revision_artifact(
+        manifest[0]["dataset_id"], manifest[0]["revision_id"])
+    assert artifact_uri is not None
+
+    monkeypatch.setattr(durable_tasks, "dispatch", lambda *_args: None)
+    status, _owner = runs.start_run(
+        deps, graph, "write", uid, confirmed=True,
+        submission_id=str(uuid.uuid4()), input_manifest=manifest)
+
+    task = metadb.durable_task(status.run_id)
+    assert task is not None
+    persisted_graph = json.dumps(task["graph_doc"])
+    assert task["graph_doc"]["nodes"][0]["data"]["config"]["uri"] == str(source)
+    assert artifact_uri not in persisted_graph
+    assert "_input_artifact_uri" not in persisted_graph
+    jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
+    assert artifact_uri not in json.dumps(jobs["items"])
+
+    assert metadb.request_durable_task_cancel(task["id"]) is not None
+    assert metadb.claim_durable_task(task["id"], "cancel-supplied-manifest") is None
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
 def test_restarted_worker_reads_snapshot_after_source_mutation(tmp_path, monkeypatch):
     deps, graph, source, uid = _ordinary_task_context(tmp_path)
     status, _dispatched = _start_without_dispatch(
