@@ -63,7 +63,7 @@ second issue tracker.
 | Workspace | A local Workspace composes canvases, datasets, folders, local placement, browse, search, and read-only provider mounts. | Complete provider dataset-to-Source and overlay workflow remains in [#468](https://github.com/pengw0048/data-playground/issues/468). |
 | Exact reads | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before supported local execution. Their bounded previews read the current file and are not revision-pinned. | A complete researcher-facing DatasetView/report model is [#311](https://github.com/pengw0048/data-playground/issues/311); a mutable-only provider must still be labeled and cannot be made reproducible by UI wording. |
 | Managed writes | Typed managed-local create and replace writes freeze destination, expected head, schema, provenance, and idempotency; managed Lance append is separately admitted. Receipts reconcile publication evidence. | Key-based upsert and sparse merge-columns require certified row identity and are intentionally deferred to [#310](https://github.com/pengw0048/data-playground/issues/310) and [#489](https://github.com/pengw0048/data-playground/issues/489). |
-| Durable work | Task/Attempt state supports managed local writes, external waits, checkpoints, bounded fan-out, restart/retry/cancel recovery, Jobs, and Inbox. The browser observes rather than owns durable work. | Backup/restore certification is active in [#485](https://github.com/pengw0048/data-playground/issues/485). This is not yet a general scheduler or arbitrary provider-job platform. |
+| Durable work | Task/Attempt state supports managed local writes, external waits, checkpoints, bounded fan-out, restart/retry/cancel recovery, Jobs, and Inbox. [#485](https://github.com/pengw0048/data-playground/issues/485) certifies the current durable consistency set through backup and restore. The browser observes rather than owns durable work. | This is not yet a general scheduler or arbitrary provider-job platform. |
 | Extension boundary | Installed-wheel plugin contracts and conformance cover catalog composition, read-only mounts, adapters, nodes, destinations, runners, capabilities, and telemetry. | New SPIs need a real consumer and deterministic conformance; provider-specific operational behavior remains outside core. |
 | Research semantics | The catalog can retain bounded lineage, schemas, previews, relationships, and native revision facts where an adapter supplies them. | Exact DatasetViews/distribution reports, sparse sidecars, and compound temporal data remain the scoped tracks [#311](https://github.com/pengw0048/data-playground/issues/311), [#310](https://github.com/pengw0048/data-playground/issues/310), and [#312](https://github.com/pengw0048/data-playground/issues/312). |
 
@@ -615,10 +615,10 @@ core support claim beyond the generic contract it exercised.
 The remaining phases are ordered by invariants, not calendar estimates. Completed foundations are
 [#277](https://github.com/pengw0048/data-playground/issues/277) (exact revisions/admission),
 [#308](https://github.com/pengw0048/data-playground/issues/308) (typed managed writes), and
-[#309](https://github.com/pengw0048/data-playground/issues/309) (durable Tasks/Attempts). The immediate
-release closeout is backup/restore certification [#485](https://github.com/pengw0048/data-playground/issues/485);
-it remains open and must not be inferred from the Task implementation alone. The current leaf order and
-cross-product dependencies belong to [#175](https://github.com/pengw0048/data-playground/issues/175).
+[#309](https://github.com/pengw0048/data-playground/issues/309) (durable Tasks/Attempts), and
+[#485](https://github.com/pengw0048/data-playground/issues/485) (backup/restore certification for the
+current durable consistency set). The current leaf order and cross-product dependencies belong to
+[#175](https://github.com/pengw0048/data-playground/issues/175).
 
 The phases below describe remaining completion work. Local resume depends on the durable task and
 checkpoint foundation. Distributed merge additionally depends on revisioned writes and local merge
