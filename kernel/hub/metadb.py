@@ -2872,20 +2872,45 @@ def _workspace_dataset_source_in_session(s, dataset_id: str) -> tuple[CatalogEnt
     }
 
 
+def _workspace_dataset_sources_in_session(s, dataset_ids: list[str]) -> list[dict]:
+    if len(dataset_ids) != len(set(dataset_ids)):
+        raise ValueError("dataset selection contains a duplicate identity")
+    # A canonical lock order keeps concurrent PostgreSQL batches from deadlocking while preserving the
+    # researcher's selection order in the resulting canvas.
+    sources = {
+        dataset_id: _workspace_dataset_source_in_session(s, dataset_id)[1]
+        for dataset_id in sorted(dataset_ids)
+    }
+    return [sources[dataset_id] for dataset_id in dataset_ids]
+
+
+def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
+    occupied = {(node.get("position", {}).get("x"), node.get("position", {}).get("y"))
+                for node in nodes if isinstance(node, dict)}
+    x, y = 160, 160
+    for source in sources:
+        while (x, y) in occupied:
+            x += 60
+            y += 40
+        source["position"] = {"x": x, "y": y}
+        occupied.add((x, y))
+        nodes.append(source)
+
+
 def workspace_create_canvas_action(*, uid: str, container_id: str,
                                    expected_container_version: int, name: str,
-                                   dataset_id: str | None = None) -> dict:
-    """Atomically create one canvas at an exact local container, optionally with one dataset source."""
+                                   dataset_ids: list[str] | None = None) -> dict:
+    """Atomically create one canvas at an exact local container with a bounded dataset selection."""
     canvas_name = _workspace_name(name)
     with _workspace_write_session() as s:
         container = _workspace_container_at_version(s, container_id, expected_container_version)
-        source = None
-        if dataset_id is not None:
-            _entry, source = _workspace_dataset_source_in_session(s, dataset_id)
+        sources = _workspace_dataset_sources_in_session(s, dataset_ids or [])
+        nodes: list[dict] = []
+        _workspace_place_sources(nodes, sources)
         canvas_id = _uid()
         doc = {
             "id": canvas_id, "name": canvas_name, "version": 1,
-            "nodes": [source] if source is not None else [], "edges": [],
+            "nodes": nodes, "edges": [],
         }
         canvas = Canvas(
             id=canvas_id, owner_id=uid, name=canvas_name, version=1, doc=json.dumps(doc))
@@ -2901,9 +2926,9 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         }
 
 
-def workspace_add_dataset_action(*, uid: str, canvas_id: str,
-                                 expected_canvas_version: int, dataset_id: str) -> dict:
-    """Append one source resolved from an exact registration identity without a provider write."""
+def workspace_add_datasets_action(*, uid: str, canvas_id: str,
+                                  expected_canvas_version: int, dataset_ids: list[str]) -> dict:
+    """Atomically append bounded sources resolved from exact registration identities."""
     with _workspace_write_session() as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
@@ -2913,7 +2938,7 @@ def workspace_add_dataset_action(*, uid: str, canvas_id: str,
         if canvas.version != expected_canvas_version:
             raise WorkspaceVersionConflict(
                 f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
-        _entry, source = _workspace_dataset_source_in_session(s, dataset_id)
+        sources = _workspace_dataset_sources_in_session(s, dataset_ids)
         try:
             doc = json.loads(canvas.doc)
         except (TypeError, ValueError) as exc:
@@ -2921,17 +2946,10 @@ def workspace_add_dataset_action(*, uid: str, canvas_id: str,
         nodes = doc.get("nodes")
         if not isinstance(nodes, list):
             raise ValueError(f"canvas '{canvas_id}' has invalid content")
-        occupied = {(node.get("position", {}).get("x"), node.get("position", {}).get("y"))
-                    for node in nodes if isinstance(node, dict)}
-        x, y = 160, 160
-        while (x, y) in occupied:
-            x += 60
-            y += 40
-        source["position"] = {"x": x, "y": y}
         _snapshot_canvas_in_session(
             s, canvas, canvas.doc, canvas.version, author_id=uid,
             label="before Workspace dataset add")
-        nodes.append(source)
+        _workspace_place_sources(nodes, sources)
         canvas.version += 1
         doc["version"] = canvas.version
         canvas.doc = json.dumps(doc)
@@ -13687,6 +13705,7 @@ def _row_to_doc(r: "CatalogEntry", tags: list[str]) -> dict:
     except (ValueError, TypeError):
         d = {"id": r.tbl_id or f"tbl_{r.name}", "name": r.name, "uri": r.uri}
     d["id"] = r.tbl_id or d.get("id") or f"tbl_{r.name}"
+    d["registrationId"] = r.registration_id
     d["folder"] = r.folder or ""
     d["owner"] = r.owner
     d["description"] = r.description
@@ -14319,28 +14338,34 @@ def _delete_catalog_children(s, uris: list[str]) -> set[str | None]:
     lineage facts (either endpoint), declared keys, and relationships. Otherwise a deleted table
     haunts lineage/ER as a ghost node, and a NEW dataset re-registered at the same uri silently
     inherits the old declared key + parents."""
-    for model in (CatalogTag, CatalogColumn):
-        for r in s.scalars(select(model).where(model.uri.in_(uris))):
-            s.delete(r)
-    identity_hashes = [_catalog_lineage_identity_hash(uri) for uri in uris]
-    lineage_predicate = or_(
-        and_(
-            CatalogLineageFact.source_uri_hash.in_(identity_hashes),
-            CatalogLineageFact.source_uri.in_(uris)),
-        and_(
-            CatalogLineageFact.destination_uri_hash.in_(identity_hashes),
-            CatalogLineageFact.destination_uri.in_(uris)),
-        and_(
-            CatalogLineageFact.source_key_hash.in_(identity_hashes),
-            CatalogLineageFact.source_key.in_(uris)),
-        and_(
-            CatalogLineageFact.destination_key_hash.in_(identity_hashes),
-            CatalogLineageFact.destination_key.in_(uris)),
-    )
-    execution_manifest_candidates = set(s.scalars(select(
-        CatalogLineageFact.execution_manifest_sha256,
-    ).where(lineage_predicate)))
-    s.execute(delete(CatalogLineageFact).where(lineage_predicate))
+    # The lineage predicate repeats the URI and digest lists across four endpoint shapes. Keep each
+    # statement under SQLite's conservative bind-variable ceiling while retaining the caller's one
+    # transaction and deterministic URI order.
+    execution_manifest_candidates: set[str | None] = set()
+    for offset in range(0, len(uris), 100):
+        batch = uris[offset:offset + 100]
+        for model in (CatalogTag, CatalogColumn):
+            for row in s.scalars(select(model).where(model.uri.in_(batch))):
+                s.delete(row)
+        identity_hashes = [_catalog_lineage_identity_hash(uri) for uri in batch]
+        lineage_predicate = or_(
+            and_(
+                CatalogLineageFact.source_uri_hash.in_(identity_hashes),
+                CatalogLineageFact.source_uri.in_(batch)),
+            and_(
+                CatalogLineageFact.destination_uri_hash.in_(identity_hashes),
+                CatalogLineageFact.destination_uri.in_(batch)),
+            and_(
+                CatalogLineageFact.source_key_hash.in_(identity_hashes),
+                CatalogLineageFact.source_key.in_(batch)),
+            and_(
+                CatalogLineageFact.destination_key_hash.in_(identity_hashes),
+                CatalogLineageFact.destination_key.in_(batch)),
+        )
+        execution_manifest_candidates.update(s.scalars(select(
+            CatalogLineageFact.execution_manifest_sha256,
+        ).where(lineage_predicate)))
+        s.execute(delete(CatalogLineageFact).where(lineage_predicate))
     gone = set(uris)
     for r in s.scalars(select(CatalogRelationship)):
         try:
@@ -14435,15 +14460,19 @@ def _catalog_current_logical_ownership(
     raise RuntimeError("catalog unregister ownership changed concurrently")
 
 
-def catalog_delete_entry(uri: str) -> None:
+def catalog_delete_entry(uri: str, *, expected_registration_id: str | None = None,
+                         expected_metadata_revision: str | None = None,
+                         report_result: bool = False) -> bool | None:
     """Remove a catalog entry (unregister) + everything keyed to it (tags/columns/embedding/facts/
-    declared key/relationships)."""
+    declared key/relationships). ``report_result`` lets the versioned HTTP mutation distinguish a
+    committed removal from a concurrent miss without changing the legacy fire-and-forget contract."""
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
         token = str(uri).rstrip("/")
         attempt_identity = s.get(ObjectAttempt, token)
         logical_id = attempt_identity.logical_id if attempt_identity is not None else None
         logical_snapshot = None
+        entry_snapshot = None
         if logical_id is None:
             logical_snapshot = s.get(CatalogLogicalDataset, token)
             if logical_snapshot is None:
@@ -14453,10 +14482,22 @@ def catalog_delete_entry(uri: str) -> None:
                     CatalogLogicalDataset.current_uri == token,
                 )).limit(1)).first()
             logical_id = logical_snapshot.logical_id if logical_snapshot is not None else None
+        if logical_id is None:
+            # Resolve the public table id/name alias before choosing the managed or unmanaged branch.
+            # Keep this read in the same transaction as the logical/entry locks and CAS below: a
+            # separate catalog GET would let unregister/re-register rebind the alias between calls.
+            entry_snapshot = s.get(CatalogEntry, token)
+            if entry_snapshot is None:
+                entry_snapshot = s.scalars(select(CatalogEntry).where(or_(
+                    CatalogEntry.tbl_id == token, CatalogEntry.name == token,
+                )).order_by(CatalogEntry.uri).limit(1)).first()
+            logical_id = entry_snapshot.logical_id if entry_snapshot is not None else None
         logical = s.get(CatalogLogicalDataset, logical_id, with_for_update=True) \
             if logical_id else None
         if logical is not None:
             if logical.state != "active" or not logical.current_uri:
+                if report_result and logical.state == "unregistered" and not logical.current_uri:
+                    return False
                 raise RuntimeError("catalog governance target is inactive")
             if (attempt_identity is not None
                     and attempt_identity.catalog_epoch != logical.catalog_epoch):
@@ -14474,18 +14515,27 @@ def catalog_delete_entry(uri: str) -> None:
             ownership = _catalog_current_logical_ownership(
                 s, logical, validate_managed_local=False)
         else:
-            entry_snapshot = s.get(CatalogEntry, token)
             if entry_snapshot is None:
-                entry_snapshot = s.scalars(select(CatalogEntry).where(or_(
-                    CatalogEntry.tbl_id == token, CatalogEntry.name == token,
-                )).order_by(CatalogEntry.uri).limit(1)).first()
-            if entry_snapshot is None:
-                return
+                return False if report_result else None
             entry = s.get(CatalogEntry, entry_snapshot.uri, with_for_update=True)
             if entry is None or entry.logical_id:
                 raise RuntimeError("catalog unregister entry changed concurrently")
             current_uri, catalog_key = entry.uri, entry.uri
             ownership = None
+        if (expected_registration_id is not None
+                and entry.registration_id != expected_registration_id):
+            raise CatalogMetadataConflict(
+                "catalog registration changed; reload before removing this dataset")
+        if expected_metadata_revision is not None:
+            declared = s.get(CatalogDeclaredKey, catalog_key, with_for_update=True)
+            declared_key = json.loads(declared.columns) if declared is not None else []
+            try:
+                current_doc = json.loads(entry.doc)
+            except (TypeError, ValueError):
+                current_doc = {}
+            if catalog_metadata_revision(current_doc, declared_key) != expected_metadata_revision:
+                raise CatalogMetadataConflict(
+                    "catalog metadata changed; reload before removing this dataset")
         execution_manifest_candidates.update(
             _delete_catalog_governance(s, catalog_key))
         if current_uri:
@@ -14508,6 +14558,7 @@ def catalog_delete_entry(uri: str) -> None:
             s.delete(entry)
         # Object governance/ref mutations above always precede the local registry lock.
         _drop_local_result_owner(s, "catalog_entry", current_uri)
+        return True if report_result else None
 
 
 def catalog_delete_prefix(uri_prefix: str) -> int:

@@ -120,6 +120,9 @@ class KeyInfo(Wire):
 
 class CatalogTable(Wire):
     id: str
+    # Stable Workspace identity for this exact registration. Unlike a URI/name/table id it is never
+    # rebound when a dataset is unregistered and later registered again.
+    registration_id: str | None = None
     name: str
     uri: str
     row_count: int | None = None

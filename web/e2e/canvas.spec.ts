@@ -1389,7 +1389,14 @@ test.describe('Data Playground canvas', () => {
       expect(body.keys.some((key: { confidence: string; columns: string[] }) =>
         key.confidence === 'declared' && key.columns.join(',') === 'id')).toBeTruthy()
     } finally {
-      await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+      const latest = await page.request.get(`/api/catalog/tables/${encodeURIComponent(original.id)}`)
+      if (latest.ok()) {
+        const table = await latest.json()
+        await page.request.delete(`/api/catalog/tables/${encodeURIComponent(original.id)}`, { params: {
+          expected_registration_id: table.registrationId,
+          expected_revision: table.metadataRevision,
+        } })
+      }
     }
   })
 })

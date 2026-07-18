@@ -18,7 +18,7 @@ from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from hub import db, graph as g, metadb
@@ -615,28 +615,87 @@ def lineage_facts(
 
 
 @router.delete("/catalog/tables/{table_id}")
-def unregister_table(table_id: str) -> dict:
-    """Remove a dataset from the catalog (e.g. a dead entry whose file was deleted)."""
-    if not get_deps().catalog.unregister(table_id):
+def unregister_table(
+    table_id: str,
+    expected_registration_id: str = Query(..., min_length=1, max_length=128),
+    expected_revision: str = Query(..., min_length=1, max_length=128),
+) -> dict:
+    """Remove one exact dataset only while its editable metadata still matches the caller's read."""
+    from hub.plugins.catalog import InMemoryCatalog
+
+    cat = get_deps().catalog
+    if type(cat) is not InMemoryCatalog:
+        raise HTTPException(501, "catalog provider does not support versioned unregister")
+    unregister = cat.unregister_if_revision
+    try:
+        removed = unregister(table_id, expected_registration_id, expected_revision)
+    except metadb.CatalogMetadataConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not removed:
         raise HTTPException(404, f"table '{table_id}' not found")
     return {"ok": True}
 
 
+class UnregisterTarget(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+    id: str = Field(min_length=1, max_length=512)
+    expected_registration_id: str = Field(min_length=1, max_length=128)
+    expected_revision: str = Field(min_length=1, max_length=128)
+
+
 class UnregisterManyRequest(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-    ids: list[str]
+    targets: list[UnregisterTarget] = Field(min_length=1, max_length=50)
 
 
-@router.post("/catalog/tables/delete")
-def unregister_tables(req: UnregisterManyRequest) -> dict:
-    """Batch-remove datasets from the catalog (the Tables view's multi-select delete). Returns which
-    ids were removed and which were already gone, so a partial result is reported honestly."""
+class UnregisterItemResult(BaseModel):
+    id: str
+    status: Literal["unregistered", "missing", "conflict", "failed"]
+    detail: str | None = None
+
+
+class UnregisterManyResult(BaseModel):
+    mode: Literal["best_effort"] = "best_effort"
+    limit: Literal[50] = 50
+    results: list[UnregisterItemResult] = Field(max_length=50)
+
+
+@router.post("/catalog/tables/delete", response_model=UnregisterManyResult)
+def unregister_tables(req: UnregisterManyRequest) -> UnregisterManyResult:
+    """Best-effort, bounded removal with one metadata CAS precondition per dataset.
+
+    Results are deliberately per-item: one stale or concurrently busy dataset never hides which
+    other removals committed. Providers without revision-aware unregister remain read-only here.
+    """
+    from hub.plugins.catalog import InMemoryCatalog
+
     cat = get_deps().catalog
-    deleted: list[str] = []
-    missing: list[str] = []
-    for tid in req.ids:
-        (deleted if cat.unregister(tid) else missing).append(tid)
-    return {"deleted": deleted, "missing": missing}
+    if type(cat) is not InMemoryCatalog:
+        raise HTTPException(501, "catalog provider does not support versioned unregister")
+    unregister = cat.unregister_if_revision
+    ids = [target.id for target in req.targets]
+    if len(ids) != len(set(ids)):
+        raise HTTPException(422, "unregister batch contains a duplicate dataset")
+    results = []
+    for target in req.targets:
+        try:
+            removed = unregister(
+                target.id, target.expected_registration_id, target.expected_revision)
+            results.append({
+                "id": target.id,
+                "status": "unregistered" if removed else "missing",
+                "detail": None if removed else "dataset was already unregistered",
+            })
+        except metadb.CatalogMetadataConflict as exc:
+            results.append({"id": target.id, "status": "conflict", "detail": str(exc)})
+        except Exception:  # noqa: BLE001 -- best-effort batches isolate provider failures per item
+            results.append({
+                "id": target.id, "status": "failed",
+                "detail": "dataset could not be removed; reload and retry",
+            })
+    return UnregisterManyResult.model_validate({
+        "mode": "best_effort", "limit": 50, "results": results,
+    })
 
 
 class JoinSuggestRequest(BaseModel):
@@ -749,9 +808,10 @@ def catalog_register(req: RegisterRequest) -> CatalogTable:
             deps.resolve_adapter(uri).schema(uri)  # validate readable
             # Retain the read guard through the catalog-entry transaction: its durable reference must
             # commit before the temporary reader disappears and makes the artifact reclaimable.
-            return deps.catalog.register_output(
+            registered = deps.catalog.register_output(
                 name=name, uri=uri, parents=[], folder=(req.folder or "").strip("/"),
                 tags=req.tags, owner=req.owner, description=req.description)
+            return deps.catalog.get_table(registered.id)
     except HTTPException:
         raise
     except ManagedSourceReadError as e:
@@ -805,7 +865,9 @@ def _finalize_upload(deps, tmp: str, target: str, name: str) -> CatalogTable:
         raise HTTPException(400, f"uploaded file is not readable: {e}")
     final = _land_upload(deps, tmp, target)
     with db.run_scope():  # own cursor — register's count(*) full-scan (CSV/JSON) must not hold the base lock
-        return deps.catalog.register_output(name=name, uri=final, parents=[])  # content-addressed version
+        registered = deps.catalog.register_output(
+            name=name, uri=final, parents=[])  # content-addressed version
+        return deps.catalog.get_table(registered.id)
 
 
 @router.post("/catalog/upload", response_model=CatalogTable)

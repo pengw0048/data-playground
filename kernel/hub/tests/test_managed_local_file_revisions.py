@@ -556,7 +556,11 @@ def test_managed_local_single_unregister_api_preserves_revision_retention(
 
     monkeypatch.setattr(metadb, "_lock_local_result_registry", track_registry)
     monkeypatch.setattr(Session, "get", track_session_get)
-    response = TestClient(app).delete(f"/api/catalog/tables/{table_id}")
+    table = catalog.get_table(table_id)
+    response = TestClient(app).delete(f"/api/catalog/tables/{table_id}", params={
+        "expected_registration_id": table.registration_id,
+        "expected_revision": table.metadata_revision,
+    })
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True}
@@ -594,13 +598,25 @@ def test_managed_local_prefix_and_batch_unregister_preserve_revision_retention(
     fourth_artifact, fourth = _publish(storage, catalog, str(tmp_path / "published" / "fourth.parquet"), 4)
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
         catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
+    third_table = catalog.get_table(third["table"].id)
+    fourth_table = catalog.get_table(fourth["table"].id)
     response = TestClient(app).post("/api/catalog/tables/delete", json={
-        "ids": [third["table"].id, fourth["table"].id, "missing"],
+        "targets": [
+            {"id": third_table.id, "expectedRegistrationId": third_table.registration_id,
+             "expectedRevision": third_table.metadata_revision},
+            {"id": fourth_table.id, "expectedRegistrationId": fourth_table.registration_id,
+             "expectedRevision": fourth_table.metadata_revision},
+            {"id": "missing", "expectedRegistrationId": "missing-registration",
+             "expectedRevision": "m1_missing"},
+        ],
     })
 
     assert response.status_code == 200, response.text
-    assert set(response.json()["deleted"]) == {third["table"].id, fourth["table"].id}
-    assert response.json()["missing"] == ["missing"]
+    assert {(item["id"], item["status"]) for item in response.json()["results"]} == {
+        (third_table.id, "unregistered"),
+        (fourth_table.id, "unregistered"),
+        ("missing", "missing"),
+    }
     with metadb.session() as session:
         for artifact, published in ((third_artifact, third), (fourth_artifact, fourth)):
             assert session.get(metadb.ManagedLocalFileRevision, published["revision_id"]) is not None

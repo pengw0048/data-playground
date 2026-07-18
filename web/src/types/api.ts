@@ -52,6 +52,7 @@ export interface KeyInfo { columns: string[]; confidence: 'declared' | 'verified
 
 export interface CatalogTable {
   id: string
+  registrationId?: string | null
   name: string
   uri: string
   rowCount?: number | null
@@ -224,6 +225,11 @@ export interface WorkspaceAddDatasetResult {
   ok: boolean
   id: string
   version: number
+}
+export interface CatalogUnregisterResult {
+  mode: 'best_effort'
+  limit: number
+  results: { id: string; status: 'unregistered' | 'missing' | 'conflict' | 'failed'; detail?: string | null }[]
 }
 export interface WorkspaceMoveCanvasResult {
   ok: boolean

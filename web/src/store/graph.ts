@@ -872,6 +872,11 @@ interface Store {
   setWorkspaceResource: (resourceId: string | null) => void
   workspaceSearchQuery: string
   setWorkspaceSearchQuery: (query: string) => void
+  workspaceScope: 'all' | 'datasets'
+  setWorkspaceScope: (scope: 'all' | 'datasets') => void
+  switchWorkspaceScope: (scope: 'all' | 'datasets') => void
+  workspaceDatasetQuery: string
+  setWorkspaceDatasetQuery: (query: string) => void
   jobsQuery: string
   setJobsQuery: (query: string) => void
   inboxQuery: string
@@ -1098,6 +1103,20 @@ export const useStore = create<Store>((set, get) => ({
   setWorkspaceSearchQuery: (query) => {
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceSearchQuery: query.trim().replace(/\s+/g, ' '), view: 'workspace' })
+  },
+  workspaceScope: 'all',
+  setWorkspaceScope: (workspaceScope) => {
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceScope, view: 'workspace' })
+  },
+  switchWorkspaceScope: (workspaceScope) => {
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceScope, workspaceResourceId: null, view: 'workspace' })
+  },
+  workspaceDatasetQuery: '',
+  setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {
+    if (get().view !== 'workspace') _fileNavigationGeneration += 1
+    set({ workspaceDatasetQuery, view: 'workspace' })
   },
   jobsQuery: '',
   setJobsQuery: (query) => {
@@ -2237,7 +2256,10 @@ export const useStore = create<Store>((set, get) => ({
         // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
         if (route.view === 'workspace') {
           get().setWorkspaceResource(route.workspaceResourceId ?? null)
-          get().setWorkspaceSearchQuery(route.workspaceQuery ?? '')
+          get().setWorkspaceScope(route.workspaceScope ?? 'all')
+          if ((route.workspaceScope ?? 'all') === 'datasets') {
+            get().setWorkspaceDatasetQuery(route.workspaceDatasetQuery ?? '')
+          } else get().setWorkspaceSearchQuery(route.workspaceQuery ?? '')
         }
         else if (route.view === 'jobs') get().setJobsQuery(route.jobsQuery ?? '')
         else if (route.view === 'inbox') get().setInboxQuery(route.inboxQuery ?? '')

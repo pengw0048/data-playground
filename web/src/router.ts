@@ -3,7 +3,9 @@
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
 
-export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; jobsQuery?: string; inboxQuery?: string }
+export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string }
+
+const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match'] as const
 
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')
@@ -15,10 +17,21 @@ export function parseHash(): Route {
     view: 'canvas', canvasId: decodeURIComponent(id),
     nodeId: params.get('node') || undefined,
   }
-  if (seg === 'workspace') return {
-    view: 'workspace',
-    workspaceResourceId: id ? decodeURIComponent(id) : undefined,
-    ...(workspaceQuery ? { workspaceQuery } : {}),
+  if (seg === 'workspace') {
+    const workspaceScope = params.get('scope') === 'datasets' ? 'datasets' : 'all'
+    const datasetParams = new URLSearchParams()
+    for (const key of DATASET_QUERY_KEYS) {
+      const value = params.get(key)
+      if (value) datasetParams.set(key, value)
+    }
+    const workspaceDatasetQuery = datasetParams.toString() || undefined
+    return {
+      view: 'workspace',
+      workspaceResourceId: id ? decodeURIComponent(id) : undefined,
+      ...(workspaceScope === 'datasets' ? { workspaceScope } : {}),
+      ...(workspaceScope === 'datasets' && workspaceDatasetQuery ? { workspaceDatasetQuery } : {}),
+      ...(workspaceScope === 'all' && workspaceQuery ? { workspaceQuery } : {}),
+    }
   }
   // Recents and Tables are intentionally redirected to the single local Workspace explorer.
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
@@ -29,11 +42,20 @@ export function parseHash(): Route {
   return { view: 'canvas' }
 }
 
-export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string): string {
+export function routeHash(view: DpView, canvasId?: string, workspaceResourceId?: string, workspaceQuery?: string, jobsQuery?: string, nodeId?: string, inboxQuery?: string, workspaceScope?: 'all' | 'datasets', workspaceDatasetQuery?: string): string {
   const path = view === 'canvas' && canvasId ? `#/canvas/${encodeURIComponent(canvasId)}` : `#/${view}`
     + (view === 'workspace' && workspaceResourceId ? `/${encodeURIComponent(workspaceResourceId)}` : '')
-  const query = view === 'workspace' && workspaceQuery?.trim()
-    ? `?${new URLSearchParams({ q: workspaceQuery.trim() })}`
+  const workspaceParams = new URLSearchParams()
+  if (view === 'workspace' && workspaceScope === 'datasets') {
+    workspaceParams.set('scope', 'datasets')
+    const datasetParams = new URLSearchParams(workspaceDatasetQuery)
+    for (const key of DATASET_QUERY_KEYS) {
+      const value = datasetParams.get(key)
+      if (value) workspaceParams.set(key, value)
+    }
+  } else if (view === 'workspace' && workspaceQuery?.trim()) workspaceParams.set('q', workspaceQuery.trim())
+  const query = view === 'workspace' && workspaceParams.size
+    ? `?${workspaceParams}`
     : view === 'jobs' && jobsQuery ? `?${jobsQuery}`
     : view === 'inbox' && inboxQuery ? `?${inboxQuery}`
     : view === 'canvas' && nodeId ? `?${new URLSearchParams({ node: nodeId })}` : ''
@@ -46,9 +68,9 @@ export function canvasLink(id: string): string {
 }
 
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
-interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; jobsQuery: string; inboxQuery: string }
+interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
+  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => void
 }
 
@@ -58,7 +80,9 @@ const hashFor = (s: RouterState) =>
     s.view === 'workspace' ? s.workspaceSearchQuery : undefined,
     s.view === 'jobs' ? s.jobsQuery : undefined,
     s.view === 'canvas' ? s.selectedId ?? undefined : undefined,
-    s.view === 'inbox' ? s.inboxQuery : undefined)
+    s.view === 'inbox' ? s.inboxQuery : undefined,
+    s.view === 'workspace' ? s.workspaceScope : undefined,
+    s.view === 'workspace' ? s.workspaceDatasetQuery : undefined)
 
 let _inited = false
 /** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
@@ -87,9 +111,15 @@ export function initRouter(store: RouterStore): void {
         if (r.nodeId && !nodeExists) history.replaceState(null, '', hashFor(store.getState()))
       } else if (r.view === 'workspace' && (st.view !== 'workspace'
           || st.workspaceResourceId !== (r.workspaceResourceId ?? null)
-          || st.workspaceSearchQuery !== (r.workspaceQuery ?? ''))) {
+          || st.workspaceScope !== (r.workspaceScope ?? 'all')
+          || ((r.workspaceScope ?? 'all') === 'all'
+            ? st.workspaceSearchQuery !== (r.workspaceQuery ?? '')
+            : st.workspaceDatasetQuery !== (r.workspaceDatasetQuery ?? '')))) {
         st.setWorkspaceResource(r.workspaceResourceId ?? null)
-        st.setWorkspaceSearchQuery(r.workspaceQuery ?? '')
+        st.setWorkspaceScope(r.workspaceScope ?? 'all')
+        if ((r.workspaceScope ?? 'all') === 'datasets') {
+          st.setWorkspaceDatasetQuery(r.workspaceDatasetQuery ?? '')
+        } else st.setWorkspaceSearchQuery(r.workspaceQuery ?? '')
       } else if (r.view === 'jobs' && (st.view !== 'jobs' || st.jobsQuery !== (r.jobsQuery ?? ''))) {
         st.setJobsQuery(r.jobsQuery ?? '')
       } else if (r.view === 'inbox' && (st.view !== 'inbox' || st.inboxQuery !== (r.inboxQuery ?? ''))) {

@@ -597,9 +597,14 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
     monkeypatch.setattr(provider, "search", controlled_search)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     bounded = workspace_providers.bounded_search
+
+    def search_with_controlled_timeout(provider_arg, mount, *args, **kwargs):
+        timeout = 0.001 if mount.id == "a-slow" else 1.0
+        return bounded(provider_arg, mount, *args, **kwargs, timeout=timeout)
+
     monkeypatch.setattr(
         workspace_providers, "bounded_search",
-        lambda *args, **kwargs: bounded(*args, **kwargs, timeout=0.001),
+        search_with_controlled_timeout,
     )
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
         {"id": "a-slow", "provider": "fixture"},
@@ -717,7 +722,7 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                     "containerId": folder["id"],
                     "expectedContainerVersion": folder["version"],
                     "name": "Duplicate exploration",
-                    "datasetId": workspace_scope["dataset_id"],
+                    "datasetIds": [workspace_scope["dataset_id"]],
                 })
                 assert response.status_code == 200, response.text
                 created_ids.append(response.json()["id"])
@@ -753,7 +758,7 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                 "containerId": folder["id"],
                 "expectedContainerVersion": renamed["version"],
                 "name": "Must not exist",
-                "datasetId": "missing-stable-dataset",
+                "datasetIds": ["missing-stable-dataset"],
             })
             assert missing.status_code == 404
     finally:
@@ -769,6 +774,14 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
 
 def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, monkeypatch):
     canvas_id = workspace_scope["canvas_id"]
+    token = canvas_id.removeprefix("workspace-canvas-")
+    second_uri = f"file:///workspace-second-{token}.parquet"
+    metadb.catalog_upsert_entry(second_uri, "Second dataset", {
+        "id": f"tbl_second_{token}", "name": "Second dataset", "uri": second_uri,
+        "version": "v1", "columns": [],
+    })
+    second_dataset_id = metadb.workspace_builtin_dataset_identity(second_uri)
+    selected_dataset_ids = [workspace_scope["dataset_id"], second_dataset_id]
     broadcasts: list[str] = []
 
     async def record_external_edit(changed_canvas_id: str) -> None:
@@ -793,7 +806,7 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
         hub_main._collab_rooms[canvas_id] = {cast(WebSocket, object())}
         try:
             concurrent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
-                "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+                "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
             })
             assert concurrent.status_code == 409
             assert "currently open" in concurrent.json()["detail"]
@@ -801,20 +814,32 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
             hub_main._collab_rooms.pop(canvas_id, None)
 
         added = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
-            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+            "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
         })
         assert added.status_code == 200, added.text
         assert added.json()["version"] == 8
 
         stale = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
-            "datasetId": workspace_scope["dataset_id"], "expectedCanvasVersion": 7,
+            "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
         })
         assert stale.status_code == 409
 
         missing = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
-            "datasetId": "missing-stable-dataset", "expectedCanvasVersion": 8,
+            "datasetIds": [workspace_scope["dataset_id"], "missing-stable-dataset"],
+            "expectedCanvasVersion": 8,
         })
         assert missing.status_code == 404
+
+        duplicate = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetIds": [second_dataset_id, second_dataset_id], "expectedCanvasVersion": 8,
+        })
+        assert duplicate.status_code == 422
+
+        oversized = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetIds": [f"dataset-{index}" for index in range(51)],
+            "expectedCanvasVersion": 8,
+        })
+        assert oversized.status_code == 422
 
     assert broadcasts == [canvas_id]
 
@@ -824,12 +849,14 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
         assert canvas.version == doc["version"] == 8
         assert doc["requirements"] == original_doc["requirements"]
         assert doc["nodes"][0] == original_node
-        assert len(doc["nodes"]) == 2
+        assert len(doc["nodes"]) == 3
         assert doc["nodes"][1]["data"]["config"]["uri"] == workspace_scope["uri"]
+        assert doc["nodes"][2]["data"]["config"]["uri"] == second_uri
         snapshots = list(session.scalars(select(metadb.CanvasVersion).where(
             metadb.CanvasVersion.canvas_id == canvas_id)))
         assert any(snapshot.label == "before Workspace dataset add" for snapshot in snapshots)
     metadb.delete_canvas_cascade(canvas_id)
+    metadb.catalog_delete_entry(second_uri)
 
 
 def test_workspace_add_guard_blocks_new_collab_admission_until_edit_finishes():
