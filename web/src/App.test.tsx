@@ -84,6 +84,17 @@ describe('App auth bootstrap', () => {
     expect(useStore.getState().authEnabled).toBe(true)
   })
 
+  it('boots normally for a confirmed authenticated session', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: true, userId: 'alice' })
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('canvas')).toBeVisible()
+    expect(screen.queryByTestId('login')).not.toBeInTheDocument()
+    expect(useStore.getState().authEnabled).toBe(true)
+  })
+
   it('recovers from an unavailable bootstrap when retry confirms local mode', async () => {
     const status = vi.spyOn(api, 'authStatus')
       .mockRejectedValueOnce(new TypeError('network unavailable'))
