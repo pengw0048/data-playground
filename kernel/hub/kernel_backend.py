@@ -135,6 +135,10 @@ class KernelBackend:
     def supports_admitted_input_manifests() -> bool:
         return True  # the persisted admission is matched before the kernel is ensured or dispatched
 
+    @staticmethod
+    def supports_named_multi_output_runs() -> bool:
+        return True  # both the warm runner and default isolated runner preserve the complete output set
+
     def supports_selected_destination_credentials(self) -> bool:
         # The default kernel offloads full runs to a metadata-isolated subprocess. Opting out keeps the
         # run in this long-lived process, where the authoritative Cred resolver is available.
@@ -169,14 +173,14 @@ class KernelBackend:
         from hub.local_run_inputs import (
             LocalRunInputError, validate_manifest, validate_manifest_graph,
         )
-        from hub.run_outputs import preflight_run_output_target, require_single_run_output
+        from hub.run_outputs import expected_run_outputs, preflight_run_output_target
         execution_target = target_node_id
         output_target = preflight_run_output_target(plan, execution_target)
-        # This seam is callable without the HTTP router. Fail before credential resolution, kernel
-        # lease claims, process spawn, or remote submission so unsupported multi-output work leaves no
-        # control-plane or storage side effects.
+        # This seam is callable without the HTTP router. Snapshot the declared collection before
+        # credential resolution, kernel lease claims, process spawn, or remote submission; the selected
+        # kernel runner preserves the same complete set through its durable status contract.
         if output_target is not None:
-            require_single_run_output(graph, output_target, self.base.node_specs)
+            expected_run_outputs(graph, output_target, self.base.node_specs)
         require_destination_credential_support(
             self, plan, graph, getattr(self.base, "workspace", ""))
         canvas_id = getattr(graph, "id", None) or "canvas"

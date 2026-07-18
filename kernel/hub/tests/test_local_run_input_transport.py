@@ -143,7 +143,18 @@ def test_kernel_backend_does_not_spawn_before_a_matching_admission(monkeypatch):
 
 
 def test_isolated_local_job_carries_and_revalidates_manifest_identity(tmp_path, monkeypatch):
-    runner = SubprocessRunner(str(tmp_path), str(tmp_path), storage=SimpleNamespace())
+    reservations: list[str] = []
+    storage = SimpleNamespace(
+        begin_result=lambda key, _run_id: reservations.append(key) or str(
+            tmp_path / f"result-{len(reservations)}.parquet"),
+        result_lock_fd=lambda *_args: None,
+        _read_lock_token=lambda *_args: None,
+        result_namespace_identity=lambda: (1, 2),
+        namespace_id="transport-test",
+        abort_result=lambda *_args: None,
+    )
+    runner = SubprocessRunner(str(tmp_path), str(tmp_path), storage=storage)
+    runner.on_status = lambda *_args: None
     graph = Graph(
         id="isolated", nodes=[GraphNode(id="check", type="assert", data={"config": {}})],
         edges=[],
@@ -168,6 +179,9 @@ def test_isolated_local_job_carries_and_revalidates_manifest_identity(tmp_path, 
         run_id="run-isolated", input_manifest=[],
     )
     assert isinstance(status, RunStatus)
+    assert reservations == [
+        "run-isolated:check:pass:0", "run-isolated:check:out:1"]
+    assert [result["portId"] for result in calls[0]["forcedResults"]] == ["pass", "out"]
     assert calls == [{
         "runId": "run-isolated",
         "inputManifest": [],
@@ -176,6 +190,16 @@ def test_isolated_local_job_carries_and_revalidates_manifest_identity(tmp_path, 
         },
         "managedSourceAttempts": {}, "managedLocalSources": {},
         "sinkTargets": {}, "sinkAttempts": {},
+        "forcedResults": [
+            {"nodeId": "check", "portId": "pass",
+             "uri": str(tmp_path / "result-1.parquet"),
+             "lockFd": None, "lockToken": None},
+            {"nodeId": "check", "portId": "out",
+             "uri": str(tmp_path / "result-2.parquet"),
+             "lockFd": None, "lockToken": None},
+        ],
+        "resultNamespaceId": "transport-test",
+        "resultNamespaceIdentity": [1, 2],
     }]
 
     stale = {**calls[0], "inputManifestIdentity": {

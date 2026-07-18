@@ -6732,6 +6732,89 @@ def test_kernel_backend_runs_a_canvas_end_to_end():
         dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)  # restore clean runners (pinned contract)
 
 
+@pytest.mark.parametrize("isolate", ["1", "0"])
+def test_kernel_backend_runs_check_named_outputs_end_to_end(monkeypatch, isolate):
+    from hub import deps as dm, kernel_backend, metadb
+    from hub import settings as sm
+    from hub.models import RunOutput, RunStatus
+
+    import duckdb
+
+    canvas_id = f"cv_kernel_check_{isolate}_{uuid.uuid4().hex}"
+    monkeypatch.setenv("DP_KERNEL_IDLE_TTL", "6")
+    monkeypatch.setenv("DP_KERNEL_ISOLATE_RUNS", isolate)
+    old = sm.settings.execution
+    sm.settings.execution = "kernel"
+    dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)
+    run_id = None
+    try:
+        source_uri = _uri("events")
+        connection = duckdb.connect(":memory:")
+        try:
+            expected_total, expected_violations = connection.execute(
+                "SELECT count(*), count(*) FILTER (WHERE (amount <= 100) IS NOT TRUE) "
+                "FROM read_parquet(?)", [source_uri]).fetchone()
+        finally:
+            connection.close()
+        with metadb.session() as session:
+            session.add(metadb.Canvas(
+                id=canvas_id, owner_id="local", name="kernel check named outputs"))
+        graph = {"id": canvas_id, "version": 1, "nodes": [
+            N("src", "source", {"uri": "events"}),
+            N("chk", "assert", {"predicate": "amount <= 100", "severity": "warn"}),
+        ], "edges": [E("src", "chk")]}
+        started = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": "chk", "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        run_id = started.json()["runId"]
+        final = _poll(run_id, tries=400)
+        assert final["status"] == "done", final.get("error")
+        assert final["totalRows"] is None
+        assert [(output["portId"], output["outcome"], output["rows"])
+                for output in final["outputs"]] == [
+                    ("pass", "committed", expected_total),
+                    ("out", "committed", expected_violations),
+                ]
+
+        sampled = {}
+        for port_id in ("pass", "out"):
+            response = client.post(
+                f"/api/run/{run_id}/sample",
+                json={"nodeId": "chk", "portId": port_id, "k": 10, "offset": 0},
+            )
+            assert response.status_code == 200, response.text
+            sampled[port_id] = response.json()["rows"]
+        assert len(sampled["pass"]) == 10
+        assert len(sampled["out"]) == min(10, expected_violations)
+        assert all(row["amount"] is None or row["amount"] > 100 for row in sampled["out"])
+
+        durable = metadb.get_run_state(run_id)
+        assert durable is not None
+        assert RunStatus.model_validate(durable).model_dump(
+            by_alias=True)["outputs"] == final["outputs"]
+        history = {record["runId"]: record for record in metadb.list_runs(canvas_id)}
+        assert [RunOutput.model_validate(output).model_dump(by_alias=True)
+                for output in history[run_id]["outputs"]] == final["outputs"]
+
+        # A fresh hub-side backend has no process-local run entry. It reopens the same complete status
+        # from the kernel-owned RunState, which remains the result collection's durable owner.
+        dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)
+        reattached = dm.get_deps().kernel_backend().status(run_id)
+        assert reattached.model_dump(by_alias=True)["outputs"] == final["outputs"]
+    finally:
+        k = metadb.get_kernel(canvas_id)
+        if k and k.get("endpoint"):
+            try:
+                kernel_backend._post(
+                    k["endpoint"], "/shutdown", k["token"], {}, timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+        sm.settings.execution = old
+        dm.set_workspace(sm.settings.workspace, sm.settings.data_dir)
+
+
 def test_catalog_entries_are_shared_across_instances(tmp_path):
     # a dataset/output registered on one instance's catalog is visible to ANOTHER instance (and after a
     # restart) via the shared DB — the catalog half of making the web tier stateless.

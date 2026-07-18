@@ -123,6 +123,17 @@ def test_subprocess_run_accepts_multi_output_before_claim_and_dispatch(
     runner = _runner(tmp_path)
     graph = Graph(id="g", nodes=[_node("check", "assert")], edges=[])
     calls: list[str] = []
+    allocations: list[str] = []
+    spawned: list[dict] = []
+    runner.storage = SimpleNamespace(
+        begin_result=lambda key, _run_id: allocations.append(key) or str(
+            tmp_path / f"result-{len(allocations)}.parquet"),
+        result_lock_fd=lambda *_a: None,
+        _read_lock_token=lambda *_a: None,
+        result_namespace_identity=lambda: (1, 2),
+        namespace_id="test",
+        abort_result=lambda *_a: None,
+    )
     monkeypatch.setattr(
         runner, "_claim_source_leases",
         lambda *_a: calls.append("source") or {
@@ -131,12 +142,21 @@ def test_subprocess_run_accepts_multi_output_before_claim_and_dispatch(
     monkeypatch.setattr(
         runner, "_claim_sink_contracts",
         lambda *_a: calls.append("sink") or ({}, {}, {}))
-    monkeypatch.setattr(runner, "_spawn", lambda *_a: calls.append("spawn"))
+    monkeypatch.setattr(
+        runner, "_spawn",
+        lambda _status, extra, _graph, _target: (
+            calls.append("spawn"), spawned.append(extra)))
     runner.on_status = lambda *_a: calls.append("emit")
 
     runner.run(_plan(("check", "assert"), target="check"), graph, "check", "local")
 
     assert calls == ["source", "sink", "spawn"]
+    assert [item["portId"] for item in spawned[0]["forcedResults"]] == ["pass", "out"]
+    allocation_parts = [item.split(":") for item in allocations]
+    assert allocation_parts[0][0] == allocation_parts[1][0]
+    assert allocation_parts[0][0].startswith("run_")
+    assert [parts[1:] for parts in allocation_parts] == [
+        ["check", "pass", "0"], ["check", "out", "1"]]
     assert runner.runs == {}
 
 
@@ -976,6 +996,66 @@ def test_subprocess_local_multi_output_commits_in_declaration_order(tmp_path):
         durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
         assert [output.uri for output in durable.outputs] == [
             output.uri for output in final.outputs]
+    finally:
+        runner._terminate_all()
+
+
+def test_subprocess_check_commits_parent_owned_named_outputs_and_reopens_them(tmp_path):
+    import duckdb
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub import compiler, metadb
+
+    metadb.migrate_db()
+    source = tmp_path / "input.parquet"
+    pq.write_table(pa.table({"value": [50, 101, 99, 120]}), source)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SubprocessRunner(
+        str(workspace), str(tmp_path / "data"), node_specs=NODE_SPECS,
+    )
+    runner.on_status = lambda _graph, status: metadb.save_run_state(
+        status.run_id, status.model_dump())
+    graph = Graph(**{"id": "check-multi-receipt", "nodes": [
+        {"id": "source", "type": "source", "data": {
+            "title": "source", "config": {"uri": str(source)}}},
+        {"id": "check", "type": "assert", "data": {"title": "quality", "config": {
+            "predicate": "value <= 100", "severity": "warn"}}},
+    ], "edges": [{"id": "source-to-check", "source": "source", "target": "check"}]})
+    status = runner.run(
+        compiler.compile_plan(graph, "check"), graph, "check", "local")
+    deadline = time.monotonic() + 15
+    try:
+        while (runner.status(status.run_id).status not in ("done", "failed", "cancelled")
+               and time.monotonic() < deadline):
+            time.sleep(0.02)
+        final = runner.status(status.run_id)
+        assert final.status == "done", final.error
+        assert final.total_rows is None
+        assert [(output.port_id, output.outcome, output.rows) for output in final.outputs] == [
+            ("pass", "committed", 4), ("out", "committed", 2)]
+
+        durable = RunStatus.model_validate(metadb.get_run_state(status.run_id))
+        assert durable.outputs == final.outputs
+        with metadb.session() as database:
+            for output in durable.outputs:
+                assert database.get(metadb.LocalResultReference, {
+                    "uri": output.uri, "owner_kind": "run_state", "owner_key": status.run_id,
+                }) is not None
+        reopened_rows = []
+        for output in durable.outputs:
+            assert output.uri is not None
+            with runner.storage.acquire_result_read(
+                    output.uri, f"check-reopen:{status.run_id}:{output.port_id}") as guard:
+                guard.check()
+                connection = duckdb.connect(":memory:")
+                try:
+                    reopened_rows.append(int(connection.execute(
+                        "SELECT count(*) FROM read_parquet(?)", [output.uri]).fetchone()[0]))
+                finally:
+                    connection.close()
+        assert reopened_rows == [4, 2]
     finally:
         runner._terminate_all()
 

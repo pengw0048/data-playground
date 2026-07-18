@@ -138,6 +138,10 @@ class SubprocessRunner:
         return True  # the parent validates and serializes the manifest before spawning the child
 
     @staticmethod
+    def supports_named_multi_output_runs() -> bool:
+        return True  # the parent owns an ordered reservation and terminal receipt for every target port
+
+    @staticmethod
     def supports_selected_destination_credentials() -> bool:
         return False  # the ephemeral child has ambient data identity only; it cannot resolve hub Creds
 
@@ -553,7 +557,7 @@ class SubprocessRunner:
                 step_id: item["uri"] for step_id, item in object_sinks.items()}
 
             target = next((node for node in graph.nodes if node.id == output_target), None)
-            if target is not None and target.type not in ("write", "assert"):
+            if target is not None and target.type != "write":
                 begin_local = getattr(self.storage, "begin_result", None)
                 if callable(begin_local):
                     if self.on_status is None:

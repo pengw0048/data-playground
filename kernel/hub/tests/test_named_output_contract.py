@@ -22,9 +22,11 @@ from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.profile_jobs import ProfileProcessRunner
 from hub.plugins.runner import LocalRunner, _CancelToken
 from hub.run_outputs import (
-    apply_cached_output, commit_output, initialize_run_outputs, require_single_run_output,
+    apply_cached_output, commit_output, expected_run_outputs, initialize_run_outputs,
+    require_single_run_output,
 )
 from hub.sampling import explicit_sample_provenance
+from hub.subprocess_runner import SubprocessRunner
 from hub.routers import runs as run_routes
 from hub.routers import workspace as workspace_routes
 from hub.security import current_user
@@ -81,6 +83,9 @@ def test_named_multi_output_backend_capability_is_explicit_and_fails_closed(tmp_
     local = LocalRunner(
         lambda _uri: None, {}, object(), str(tmp_path), node_specs=SPECS)
     assert backend_supports_named_multi_output_runs(local)
+    assert backend_supports_named_multi_output_runs(KernelBackend(local, SimpleNamespace()))
+    assert backend_supports_named_multi_output_runs(SubprocessRunner(
+        str(tmp_path), str(tmp_path), node_specs=SPECS))
 
     local.forced_results = [{
         "nodeId": "branches", "portId": "left", "uri": str(tmp_path / "forced.parquet"),
@@ -718,16 +723,38 @@ def test_multi_output_declared_schema_is_not_misattributed_to_every_port():
     assert port_result == {"branches": {"left": None, "right": None}}
 
 
-def test_kernel_backend_rejects_multi_output_before_kernel_claim(monkeypatch):
+def test_kernel_backend_dispatches_multi_output_with_persisted_admission(monkeypatch):
     base = SimpleNamespace(node_specs=SPECS, workspace="/tmp")
     backend = KernelBackend(base, SimpleNamespace())
-    ensured = []
-    monkeypatch.setattr(backend, "_ensure_kernel", lambda canvas_id: ensured.append(canvas_id))
+    submitted = []
+    monkeypatch.setattr(backend, "_ensure_kernel", lambda _canvas: ("endpoint", "token"))
+    monkeypatch.setattr(
+        "hub.kernel_backend.metadb.local_run_input_admission",
+        lambda run_id: {
+            "run_id": run_id, "canvas_id": "named-output-contract",
+            "target_node_id": "branches", "manifest": [],
+        },
+    )
+
+    def post(_endpoint, _path, _token, body):
+        submitted.append(body)
+        return {
+            "runId": body["run_id"], "status": "running", "targetNodeId": "branches",
+            "outputs": [output.model_dump(by_alias=True)
+                        for output in expected_run_outputs(_multi_graph(), "branches", SPECS)],
+        }
+
+    monkeypatch.setattr("hub.kernel_backend._post", post)
     plan = CompilePlan(target_node_id="branches", steps=[])
 
-    with pytest.raises(ValueError, match="does not yet support multi-output"):
-        backend.run(plan, _multi_graph(), "branches", "local")
-    assert ensured == []
+    status = backend.run(
+        plan, _multi_graph(), "branches", "local",
+        run_id="kernel-multi", input_manifest=[])
+
+    assert status.run_id == "kernel-multi"
+    assert [output.port_id for output in status.outputs] == ["left", "right"]
+    assert submitted[0]["target"] == "branches"
+    assert submitted[0]["input_manifest"] == []
 
 
 def test_kernel_backend_preserves_none_execution_target_for_full_graph(monkeypatch):
