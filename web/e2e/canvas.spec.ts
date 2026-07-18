@@ -930,6 +930,44 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('button', { name: 'Restore' }).first()).toBeVisible({ timeout: 8000 }) // a snapshot to restore
   })
 
+  test('reopening persisted transient badges settles them without an autosave loop', async ({ page }) => {
+    const canvasId = `settle-transient-${Date.now()}`
+    const persisted = {
+      id: canvasId, name: 'Persisted transient badges', version: 1, nodes: [
+        { id: 'queued', type: 'source', position: { x: 80, y: 80 }, data: {
+          title: 'Persisted queued', status: 'queued', config: {}, history: [],
+        } },
+        { id: 'running', type: 'filter', position: { x: 400, y: 80 }, data: {
+          title: 'Persisted running', status: 'running', config: {}, history: [],
+        } },
+      ], edges: [],
+    }
+    const created = await page.request.post('/api/canvas', { data: persisted })
+    expect(created.ok()).toBe(true)
+    let saves = 0
+    await page.route(`**/api/canvas/${canvasId}`, async (route) => {
+      if (route.request().method() === 'PUT') saves += 1
+      await route.continue()
+    })
+    try {
+      await page.goto(`/#/canvas/${canvasId}`)
+      const queued = page.locator('.react-flow__node', { hasText: 'Persisted queued' })
+      const running = page.locator('.react-flow__node', { hasText: 'Persisted running' })
+      await expect(queued.locator('[title="stale"]')).toBeVisible()
+      await expect(running.locator('[title="stale"]')).toBeVisible()
+      await expect(page.locator('.dp-running-glyph')).toHaveCount(0)
+      await page.waitForTimeout(900) // longer than the local autosave debounce
+      expect(saves).toBe(0)
+      const stored = await page.request.get(`/api/canvas/${canvasId}`)
+      expect((await stored.json()).nodes.map((node: { data: { status: string } }) => node.data.status)).toEqual([
+        'queued', 'running',
+      ])
+    } finally {
+      await page.unroute(`**/api/canvas/${canvasId}`)
+      await page.request.delete(`/api/canvas/${canvasId}`)
+    }
+  })
+
   test('the app menu opens persisted run history', async ({ page }) => {
     await fresh(page)
     await page.getByTestId('app-menu').click()

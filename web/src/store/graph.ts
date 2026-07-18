@@ -2537,7 +2537,10 @@ export const useStore = create<Store>((set, get) => ({
 
   loadDoc: (doc, role = get().canvasRole) => {
     _cfgEdit = { id: '', t: 0 }
-    const d = doc
+    // A canvas document is not execution authority. A queued/running badge saved in a snapshot can
+    // outlive its run, so settle it before the document is ever rendered. reattachRuns below may
+    // immediately replace these with the live run's authoritative per-node states.
+    const d = settleAnimatingDoc(doc)
     const agentLog = d.id === get().doc.id ? get().agentLog : []
     set({
       doc: d,
@@ -2747,14 +2750,22 @@ function cleanRunError(raw?: string | null): string {
 // Flip every still-animating node (queued/running) to a terminal 'stale' — for when a run ends WITHOUT
 // a final per-node snapshot to settle them: a user cancel (the optimistic pre-poll window) or the poll
 // giving up because the kernel became unreachable. Without it an intermediate node animates forever.
+function settleAnimatingDoc(doc: CanvasDoc): CanvasDoc {
+  let changed = false
+  const nodes = doc.nodes.map((n) => {
+    if (n.data.status === 'running' || n.data.status === 'queued') {
+      changed = true
+      return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
+    }
+    return n
+  })
+  return changed ? { ...doc, nodes } : doc
+}
+
 function settleAnimatingNodes(set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void) {
   set((s) => {
-    let changed = false
-    const nodes = s.doc.nodes.map((n) => {
-      if (n.data.status === 'running' || n.data.status === 'queued') { changed = true; return { ...n, data: { ...n.data, status: 'stale' as NodeStatus } } }
-      return n
-    })
-    return changed ? { doc: { ...s.doc, nodes } } : {}
+    const doc = settleAnimatingDoc(s.doc)
+    return doc === s.doc ? {} : { doc }
   })
 }
 
@@ -2999,6 +3010,10 @@ function reattachRuns(get: () => Store, set: (p: Partial<Store> | ((s: Store) =>
         if (_reattachRunsGeneration !== reattachGeneration || s.doc.id !== canvasId) return {}
         return { runs: { ...s.runs, [nodeId]: { phase: 'running' as const, status: st } } }
       })
+      // active-runs is already the backend's current per-node execution authority. Apply it now
+      // rather than waiting for the first poll, so a real reattached run replaces the settled
+      // snapshot state without a stale visual gap.
+      if (current()) applyPerNodeStatus(set, st.perNode)
       if (current()) pollRun(get, set, nodeId, st.runId, reattachGeneration)
     }
   }).catch(() => { /* profile projection may still recover; leave current state untouched */ })

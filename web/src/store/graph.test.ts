@@ -137,6 +137,84 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().agentLog).toEqual([])
   })
 
+  it('settles persisted transient badges on reopen and version restore when no run is active', async () => {
+    const snapshot = {
+      id: 'c', version: 1, name: 'restored', requirements: [], edges: [], nodes: [
+        { ...NODE('queued'), data: { ...NODE('queued').data, status: 'queued' as const } },
+        { ...NODE('running'), data: { ...NODE('running').data, status: 'running' as const } },
+        { ...NODE('draft'), data: { ...NODE('draft').data, status: 'draft' as const } },
+        { ...NODE('latest'), data: { ...NODE('latest').data, status: 'latest' as const } },
+        { ...NODE('stale'), data: { ...NODE('stale').data, status: 'stale' as const } },
+        { ...NODE('failed'), data: { ...NODE('failed').data, status: 'failed' as const } },
+      ],
+    }
+
+    useStore.getState().loadDoc(snapshot, 'owner') // ordinary reopen
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
+      'stale', 'stale', 'draft', 'latest', 'stale', 'failed',
+    ])
+    // The returned snapshot is not mutated; the same boundary can safely receive it from restore.
+    expect(snapshot.nodes.map((node) => node.data.status)).toEqual([
+      'queued', 'running', 'draft', 'latest', 'stale', 'failed',
+    ])
+
+    useStore.getState().loadDoc(snapshot, 'owner') // VersionHistoryModal restore
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
+      'stale', 'stale', 'draft', 'latest', 'stale', 'failed',
+    ])
+    await vi.waitFor(() => expect(apiMocks.activeRuns).toHaveBeenCalledTimes(2))
+  })
+
+  it('lets a delayed authoritative active-run response replace settled badges', async () => {
+    let finishActive!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
+    apiMocks.runStatus.mockImplementationOnce(() => new Promise(() => {}))
+    const snapshot = {
+      id: 'c', version: 1, name: 'reopen', requirements: [], edges: [], nodes: [
+        { ...NODE('source'), data: { ...NODE('source').data, status: 'queued' as const } },
+        { ...NODE('target', 'filter'), data: { ...NODE('target', 'filter').data, status: 'running' as const } },
+      ],
+    }
+
+    useStore.getState().loadDoc(snapshot, 'owner')
+    expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual(['stale', 'stale'])
+
+    finishActive([{
+      runId: 'live-recovered-run', status: 'running', jobType: 'run', targetNodeId: 'target',
+      rowsProcessed: 1, ms: 10, placement: 'local', outputs: [],
+      perNode: [{ nodeId: 'source', status: 'queued' }, { nodeId: 'target', status: 'running' }],
+    }])
+
+    await vi.waitFor(() => expect(useStore.getState().doc.nodes.map((node) => node.data.status)).toEqual([
+      'queued', 'running',
+    ]))
+    expect(useStore.getState().runs.target?.status?.runId).toBe('live-recovered-run')
+  })
+
+  it('does not let a delayed reattach repaint a newer canvas after navigation', async () => {
+    let finishActive!: (statuses: any[]) => void
+    apiMocks.activeRuns.mockImplementationOnce(() => new Promise((resolve) => { finishActive = resolve }))
+    const oldSnapshot = {
+      id: 'old', version: 1, name: 'old', requirements: [], edges: [], nodes: [
+        { ...NODE('old-node'), data: { ...NODE('old-node').data, status: 'running' as const } },
+      ],
+    }
+    const next = { id: 'next', version: 1, name: 'next', requirements: [], edges: [], nodes: [NODE('next-node')] }
+
+    useStore.getState().loadDoc(oldSnapshot, 'owner')
+    useStore.getState().loadDoc(next, 'owner')
+    finishActive([{
+      runId: 'late-old-run', status: 'running', jobType: 'run', targetNodeId: 'old-node',
+      rowsProcessed: 1, ms: 10, placement: 'local', outputs: [],
+      perNode: [{ nodeId: 'old-node', status: 'running' }],
+    }])
+
+    await Promise.resolve()
+    expect(useStore.getState().doc.id).toBe('next')
+    expect(useStore.getState().doc.nodes[0].data.status).toBe('draft')
+    expect(useStore.getState().runs['old-node']).toBeUndefined()
+  })
+
   it('undo restores the pre-apply doc', () => {
     useStore.getState().applyAgentGraph({ nodes: [NODE('a')], edges: [] })
     expect(useStore.getState().doc.nodes).toHaveLength(1)
