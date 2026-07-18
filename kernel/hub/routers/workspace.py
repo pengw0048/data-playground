@@ -752,7 +752,7 @@ def canvas_runs(canvas_id: str, uid: str = Depends(current_user)) -> list[RunHis
     response_model=ExecutionManifestDetail,
 )
 def execution_manifest_detail(
-        canvas_id: str,
+        canvas_id: str = Path(min_length=1, max_length=512),
         subject_id: str = Path(min_length=1, max_length=1024),
         uid: str = Depends(current_user)) -> ExecutionManifestDetail:
     """Inspect one immutable History/Jobs manifest under current Canvas visibility."""

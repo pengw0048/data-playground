@@ -8618,6 +8618,8 @@
             "name": "canvas_id",
             "required": true,
             "schema": {
+              "maxLength": 512,
+              "minLength": 1,
               "title": "Canvas Id",
               "type": "string"
             }

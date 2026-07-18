@@ -206,3 +206,17 @@ def test_history_and_jobs_lists_read_only_bounded_manifest_metadata(monkeypatch)
         assert row["executionManifestAvailability"] == "available"
         assert row["executionManifestReconstructable"] is True
         assert "document" not in row
+
+
+def test_manifest_detail_bounds_canvas_identity_in_api_and_openapi(monkeypatch):
+    _digest, identities = _fixture(monkeypatch)
+
+    response = _detail("c" * 513, "history", identities["owner"])
+
+    assert response.status_code == 422
+    parameters = app.openapi()["paths"][
+        "/api/canvas/{canvas_id}/runs/{subject_id}/manifest"
+    ]["get"]["parameters"]
+    canvas_parameter = next(item for item in parameters if item["name"] == "canvas_id")
+    assert canvas_parameter["schema"]["minLength"] == 1
+    assert canvas_parameter["schema"]["maxLength"] == 512
