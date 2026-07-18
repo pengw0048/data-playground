@@ -5964,6 +5964,43 @@
             ],
             "title": "Bindingid"
           },
+          "catalogFolderId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Catalogfolderid"
+          },
+          "catalogFolderPath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Catalogfolderpath"
+          },
+          "catalogFolderState": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "detached"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Catalogfolderstate"
+          },
           "detached": {
             "default": false,
             "title": "Detached",

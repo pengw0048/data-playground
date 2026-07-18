@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0023_catalog_folder_overlay", "0022_task_manifests"),
         ("0022_task_manifests", "0021_manifest_output_owners"),
         ("0021_manifest_output_owners", "0020_execution_manifests"),
         ("0020_execution_manifests", "0019_exact_local_inputs"),
@@ -77,8 +78,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0022_task_manifests"]
-    assert metadb.expected_schema_head() == "0022_task_manifests"
+    assert scripts.get_heads() == ["0023_catalog_folder_overlay"]
+    assert metadb.expected_schema_head() == "0023_catalog_folder_overlay"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -156,6 +157,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0022_task_manifests.py": (
             "105d5d314c0ab1a9faf250a6993a9608cf92d2c6a90ad495782f837425fe324f"
+        ),
+        "0023_catalog_folder_workspace_overlay.py": (
+            "2bcdbe3058e134fc943f043adcabc89fc8980831522ff3e3107ca1fcedc76917"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

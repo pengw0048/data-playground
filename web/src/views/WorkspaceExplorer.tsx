@@ -18,6 +18,7 @@ const PAGE_SIZE = 50
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
 const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
+const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
 const statusMessage = (status: WorkspaceSourceStatus) => status.error
   ?? (status.completeness === 'unavailable' ? 'source is offline'
     : status.completeness === 'unsupported' ? 'browse is not supported'
@@ -295,8 +296,9 @@ function WorkspaceMixedExplorer() {
           }}><Icon name="close" size={12} /></button>}
         </form>
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
-          <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading || isExternal(container)}
+          <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading || isExternal(container) || container.detached}
             title={isExternal(container) ? 'Read-only external mounts do not support creating canvases'
+              : container?.detached ? 'Deleted Catalog folder tombstones do not accept new canvases'
               : container ? `Create in ${container.name}` : 'Load a Workspace destination first'}
             className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New canvas here</button>
         </div>
@@ -693,7 +695,7 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
       const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
       if (!page.container) throw new Error(page.sources.map(statusMessage).find(Boolean) ?? 'Workspace destination is unavailable')
       setContainer(page.container)
-      const localContainers = page.items.filter((item) => item.kind === 'container' && !isExternal(item))
+      const localContainers = page.items.filter((item) => item.kind === 'container' && !isExternal(item) && !item.detached)
       setChildren((current) => nextCursor ? [...current, ...localContainers] : localContainers)
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
       if (!nextCursor) setPath(nextPath ?? [page.container])
@@ -726,7 +728,7 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
     {container && <p className="text-[12px]">Destination: <strong>{container.name}</strong></p>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
-      <button onClick={() => void move()} disabled={busy || !container || container.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
+      <button onClick={() => void move()} disabled={busy || !container || container.detached || container.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
   </Modal>
 }
 
@@ -741,8 +743,12 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
 
 function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
-  const kind = resource.kind === 'container' ? 'Container' : resource.kind === 'canvas' ? 'Canvas' : 'Dataset'
-  const source = isExternal(resource) ? `Mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}` : 'Local'
+  const kind = resource.kind === 'container' ? (isCatalogFolder(resource) ? 'Catalog folder' : 'Container') : resource.kind === 'canvas' ? 'Canvas' : 'Dataset'
+  const source = isExternal(resource) ? `Mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
+    : isCatalogFolder(resource) ? 'Local Catalog projection'
+      : resource.kind === 'dataset' ? 'Local Catalog'
+        : resource.kind === 'canvas' ? 'Local overlay'
+          : 'Local container'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   return <div className="flex min-w-0 items-center rounded-lg border border-border bg-card hover:border-primary/40 hover:bg-accent">
     <button type="button" onClick={onOpen} aria-label={openLabel}

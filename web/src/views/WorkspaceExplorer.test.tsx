@@ -88,6 +88,27 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText('observations')).toBeInTheDocument()
   })
 
+  it('labels same-name local resources by their Catalog or overlay authority', async () => {
+    const catalogFolder = { ...FOLDER, id: 'container:catalog-research', catalogFolderId: 'folder-stable-1', catalogFolderPath: 'research' }
+    const catalogDataset = { ...DATASET, name: 'Research' }
+    const overlayCanvas = { ...CANVAS, name: 'Research' }
+    const localContainer = { ...FOLDER, id: 'container:local-research' }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [catalogFolder, catalogDataset, overlayCanvas, localContainer],
+      nextCursor: null, hasMore: false, completeness: 'complete',
+    })
+    render(<WorkspaceExplorer />)
+
+    expect((await screen.findByRole('button', { name: 'Open catalog folder Research' })).parentElement)
+      .toHaveTextContent('Catalog folder · Local Catalog projection')
+    expect(screen.getByRole('button', { name: 'Open dataset Research' }).parentElement)
+      .toHaveTextContent('Dataset · Local Catalog')
+    expect(screen.getByRole('button', { name: 'Open canvas Research' }).parentElement)
+      .toHaveTextContent('Canvas · Local overlay')
+    expect(screen.getByRole('button', { name: 'Open container Research' }).parentElement)
+      .toHaveTextContent('Container · Local container')
+  })
+
   it('shows source-grouped partial search results and opens stable identities', async () => {
     store.workspaceSearchQuery = 'observations'
     mocks.workspaceSearch.mockResolvedValue({
