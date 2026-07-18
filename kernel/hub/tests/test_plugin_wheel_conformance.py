@@ -392,7 +392,10 @@ def edge(source, target, target_handle=None):
 
 with TestClient(app) as client:
     descriptors = {item["kind"]: item for item in client.get("/api/nodes").json()}
-    assert [descriptors[item["kind"]] for item in expected] == expected
+    expected_public = [
+        item | {"source": "plugin:dp-descriptor-contract"} for item in expected
+    ]
+    assert [descriptors[item["kind"]] for item in expected] == expected_public
     status = next(item for item in client.get("/api/plugins").json()
                   if item["name"] == "dp-descriptor-contract")
     assert status["state"] == "active"
