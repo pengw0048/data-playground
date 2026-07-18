@@ -153,6 +153,8 @@ def recover(deps) -> None:
     recover_external_waits(deps)
     from hub.linear_checkpoint_tasks import recover as recover_linear_checkpoints
     recover_linear_checkpoints(deps)
+    from hub.bounded_fanout_tasks import recover as recover_bounded_fanout
+    recover_bounded_fanout(deps)
 
 
 def recovery_loop(deps, stop: threading.Event) -> None:
@@ -187,6 +189,9 @@ def request_cancel(task_id: str) -> dict | None:
     if task.get("task_kind") == "linear_checkpoint_write":
         from hub.linear_checkpoint_tasks import request_cancel as cancel_linear
         cancel_linear(task_id)
+    elif task.get("task_kind") == "bounded_fanout_write":
+        from hub.bounded_fanout_tasks import request_cancel as cancel_fanout
+        cancel_fanout(task_id)
     return task
 
 
@@ -197,4 +202,7 @@ def retry(task_id: str, retry_request_id: str, deps) -> dict:
     elif task["task_kind"] == "linear_checkpoint_write":
         from hub.linear_checkpoint_tasks import dispatch as dispatch_linear
         dispatch_linear(task_id, deps)
+    elif task["task_kind"] == "bounded_fanout_write":
+        from hub.bounded_fanout_tasks import dispatch as dispatch_fanout
+        dispatch_fanout(task_id, deps)
     return task

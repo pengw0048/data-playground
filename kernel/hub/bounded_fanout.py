@@ -5,8 +5,9 @@ from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKe
 from sqlalchemy.orm import Mapped, mapped_column
 from hub.metadb import (
     Base, DurableCheckpoint, DurableTask, DurableTaskAttempt, LocalResultArtifact,
-    LocalResultReference, _durable_task_db_now, _linear_checkpoint_committed_doc,
-    _lock_durable_task_for_write, _lock_local_result_registry, _now, session,
+    LocalResultReference, _CHECKPOINT_PARENT_KINDS, _durable_task_db_now,
+    _linear_checkpoint_committed_doc, _lock_durable_task_for_write, _lock_local_result_registry,
+    _now, session,
 )
 CHILD_OWNER = "durable_fanout_child"
 GATHER_OWNER = "durable_fanout_gather"
@@ -132,7 +133,7 @@ def _fence_parent(s, parent_task_id, parent_attempt_id, owner_token):
     attempt = s.get(DurableTaskAttempt, parent_attempt_id, with_for_update=True)
     now = _durable_task_db_now(s)
     lease = _tz(attempt.lease_until if attempt is not None else None)
-    if (task is None or attempt is None or task.task_kind != "linear_checkpoint_write"
+    if (task is None or attempt is None or task.task_kind not in _CHECKPOINT_PARENT_KINDS
             or attempt.task_id != task.id or task.status != "running" or task.cancel_requested
             or attempt.status != "running" or attempt.owner_token != str(owner_token)
             or lease is None or lease <= now):
@@ -341,10 +342,12 @@ def _live_claim(s, attempt_id, claim_token, owner_token):
         raise RuntimeError("fan-out attempt does not exist")
     unit = s.get(BoundedFanoutUnit, attempt.unit_id, with_for_update=True)
     plan = s.get(BoundedFanoutPlan, unit.parent_task_id, with_for_update=True) if unit else None
+    parent = s.get(DurableTask, plan.parent_task_id, with_for_update=True) if plan else None
     lease = _tz(attempt.lease_until)
-    if (unit is None or plan is None or attempt.status != "running"
+    if (unit is None or plan is None or parent is None or attempt.status != "running"
             or attempt.owner_token != str(owner_token) or attempt.claim_token != str(claim_token)
-            or lease is None or lease <= now or attempt.slot_number is None or plan.paused):
+            or lease is None or lease <= now or attempt.slot_number is None or plan.paused
+            or parent.cancel_requested):
         raise RuntimeError("fan-out claim token is stale or fenced")
     slot = s.get(BoundedFanoutSlot, (SLOT_SCOPE, attempt.slot_number), with_for_update=True)
     if (slot is None or slot.holder_attempt_id != attempt.id
@@ -502,7 +505,7 @@ def restore_audit() -> list[dict]:
         _lock_local_result_registry(s)
         for plan in s.scalars(select(BoundedFanoutPlan).order_by(BoundedFanoutPlan.parent_task_id)):
             task = s.get(DurableTask, plan.parent_task_id)
-            if task is None or task.task_kind != "linear_checkpoint_write":
+            if task is None or task.task_kind not in _CHECKPOINT_PARENT_KINDS:
                 raise RuntimeError("restored fan-out plan has no owning parent task")
             units = list(s.scalars(select(BoundedFanoutUnit).where(
                 BoundedFanoutUnit.parent_task_id == plan.parent_task_id).order_by(

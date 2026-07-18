@@ -145,6 +145,65 @@ def _node_config(node) -> dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _bounded_fanout_write_shape(graph, target_node_id: str | None):
+    """Return (source, checkpoint_select, identity_select, write) for the exact four-node route.
+
+    Non-four-node graphs return None so the three-node linear route can handle them. A four-node
+    graph with checkpoint:true that does not match the exact topology/config is rejected with 409.
+    """
+    checkpoint_nodes = [
+        node for node in graph.nodes if _node_config(node).get("checkpoint") is True]
+    if not checkpoint_nodes:
+        return None
+    if len(graph.nodes) != 4 or len(graph.edges) != 3:
+        return None
+    by_id = {node.id: node for node in graph.nodes}
+    write = by_id.get(target_node_id)
+    if (write is None or write.type != "write" or len(checkpoint_nodes) != 1):
+        raise HTTPException(
+            409,
+            "bounded fan-out tasks require exactly "
+            "Source -> Select(checkpoint) -> Select(*) -> Write")
+    checkpoint_select = checkpoint_nodes[0]
+    if checkpoint_select.type != "select":
+        raise HTTPException(409, "bounded fan-out requires checkpoint:true on a Select node")
+    ck_cfg = _node_config(checkpoint_select)
+    if ck_cfg != {"select": "*", "checkpoint": True}:
+        raise HTTPException(
+            409, "bounded fan-out checkpoint Select requires exact "
+            "{\"select\":\"*\",\"checkpoint\":true}")
+    edges = list(graph.edges)
+    write_in = next((edge for edge in edges if edge.target == write.id), None)
+    if write_in is None:
+        raise HTTPException(409, "bounded fan-out Write requires one inbound edge")
+    identity_select = by_id.get(write_in.source)
+    if identity_select is None or identity_select.type != "select":
+        raise HTTPException(409, "bounded fan-out requires identity Select before Write")
+    id_cfg = _node_config(identity_select)
+    if id_cfg != {"select": "*"}:
+        raise HTTPException(
+            409, "bounded fan-out identity Select requires exact {\"select\":\"*\"}")
+    identity_in = next((edge for edge in edges if edge.target == identity_select.id), None)
+    if identity_in is None or identity_in.source != checkpoint_select.id:
+        raise HTTPException(
+            409, "bounded fan-out requires checkpoint Select feeding identity Select")
+    checkpoint_in = next((edge for edge in edges if edge.target == checkpoint_select.id), None)
+    if checkpoint_in is None:
+        raise HTTPException(409, "bounded fan-out checkpoint Select requires one inbound edge")
+    source = by_id.get(checkpoint_in.source)
+    if source is None or source.type != "source":
+        raise HTTPException(409, "bounded fan-out tasks require exactly one built-in Source")
+    for edge in (checkpoint_in, identity_in, write_in):
+        if (edge.source_handle not in (None, "out")
+                or edge.target_handle not in (None, "in")):
+            raise HTTPException(
+                409, "bounded fan-out edges must be source:out -> target:in")
+    expected = {source.id, checkpoint_select.id, identity_select.id, write.id}
+    if {node.id for node in graph.nodes} != expected:
+        raise HTTPException(409, "bounded fan-out tasks reject extra nodes")
+    return source, checkpoint_select, identity_select, write
+
+
 def _linear_checkpoint_shape(graph, target_node_id: str | None):
     """Return (source, select, write) for the exact three-node route, else None.
 
@@ -1735,6 +1794,63 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         recover(deps)
         return RunStatus.model_validate(task["status_doc"]), None
     # checkpoint:true routes to a durable task only with a submissionId, else it stays the in-run region-split marker.
+    fanout_shape = (
+        _bounded_fanout_write_shape(graph, target_node_id) if submission_id is not None else None)
+    if fanout_shape is not None:
+        _source, checkpoint_select, _identity_select, write = fanout_shape
+        graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+        _reject_invalid(graph, deps, target_node_id)
+        if input_manifest is not None:
+            graph = _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
+        _reject_invalid(graph, deps, target_node_id)
+        admission = _write_admission_for_graph(
+            deps, graph, str(write.id), uid, str(submission_id),
+            supplied=write_intent, direct_local=True)
+        if (not admission.managed or admission.intent is None
+                or admission.intent.mode not in ("create", "replace")
+                or admission.intent.destination.provider != "managed-local-file"
+                or admission.intent.partitions):
+            raise HTTPException(
+                409, admission.blocker or "bounded fan-out Write is not managed-local create/replace")
+        operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
+        if not operational_canvas or not metadb.canvas_exists(operational_canvas):
+            raise HTTPException(409, "bounded fan-out tasks require a saved canvas")
+        frozen = graph.model_copy(deep=True)
+        _inject_write_intent(frozen, write.id, admission.intent)
+        manifest = (input_manifest if input_manifest is not None
+                    else _resolve_local_run_manifest(frozen, write.id, deps))
+        if len(manifest) != 1:
+            raise HTTPException(409, "bounded fan-out tasks require exactly one Source revision")
+        stable_manifest = [{
+            **item, "resolved_at": "1970-01-01T00:00:00+00:00",
+        } for item in manifest]
+        intent_sha256 = _local_run_intent_sha256(
+            intent_graph, write.id, input_manifest, admission.intent)
+        from hub.linear_checkpoint_tasks import checkpoint_identity, graph_prefix_sha256
+        task_id = metadb.durable_task_submission_id(
+            uid, operational_canvas, str(submission_id))
+        port_id = "out"
+        manifest_payload = json.dumps(stable_manifest, sort_keys=True, separators=(",", ":"))
+        try:
+            task, _created = metadb.submit_linear_checkpoint_task(
+                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                final_target_node_id=str(write.id),
+                checkpoint_id=checkpoint_identity(task_id, checkpoint_select.id, port_id),
+                checkpoint_node_id=str(checkpoint_select.id), output_port_id=port_id,
+                task_intent_sha256=intent_sha256,
+                graph_prefix_sha256=graph_prefix_sha256(frozen, checkpoint_select.id),
+                input_manifest_sha256=hashlib.sha256(manifest_payload.encode()).hexdigest(),
+                graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+                input_manifest=stable_manifest,
+                write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
+                task_kind="bounded_fanout_write")
+        except metadb.DurableTaskSubmissionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        from hub.bounded_fanout_tasks import dispatch as dispatch_fanout
+        dispatch_fanout(task["task_id"], deps)
+        status = metadb.durable_task(task["task_id"], include_admission=False)
+        assert status is not None
+        return RunStatus.model_validate(status["status_doc"]), None
     linear_shape = (
         _linear_checkpoint_shape(graph, target_node_id) if submission_id is not None else None)
     if linear_shape is not None:
