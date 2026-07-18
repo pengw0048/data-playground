@@ -1356,6 +1356,21 @@ class DurableCheckpointView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableBoundedFanoutView(Wire):
+    """Sanitized parent-only bounded fan-out projection for Workspace Jobs."""
+
+    stage: Literal[
+        "checkpointing", "planning", "running_partitions", "gathering",
+        "publishing", "terminal",
+    ]
+    partition_count: int | None = Field(default=None, ge=1, le=4)
+    completed_partitions: int = Field(ge=0, le=4)
+    failed_partitions: int = Field(ge=0, le=4)
+    checkpoint: Literal["pending", "committed", "reused"]
+    gather: Literal["pending", "running", "committed"]
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
@@ -1417,6 +1432,7 @@ class WorkspaceRunRecord(Wire):
     output_receipt: WriteReceipt | None = None
     external_wait: DurableExternalWaitView | None = None
     checkpoint: DurableCheckpointView | None = None
+    bounded_fanout: DurableBoundedFanoutView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
@@ -1430,10 +1446,12 @@ class WorkspaceRunRecord(Wire):
 
     @model_serializer(mode="wrap")
     def _omit_null_checkpoint(self, handler):
-        # checkpoint is a linear-checkpoint-task projection; never emit it as null on other runs.
+        # Nested task projections are omitted when absent so other run kinds stay compact.
         data = handler(self)
         if self.checkpoint is None:
             data.pop("checkpoint", None)
+        if self.bounded_fanout is None:
+            data.pop("boundedFanout", None)
         return data
 
 

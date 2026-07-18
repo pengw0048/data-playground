@@ -3444,11 +3444,19 @@ _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
 _CHECKPOINT_PARENT_KINDS = frozenset({"linear_checkpoint_write", "bounded_fanout_write"})
-_JOBS_HIDDEN_TASK_KINDS = frozenset({"bounded_fanout_write"})
+# #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection.
+_JOBS_HIDDEN_TASK_KINDS: frozenset[str] = frozenset()
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write",
 })
+_FANOUT_PHASE_TO_STAGE = {
+    "checkpoint_pending": "checkpointing",
+    "planning": "planning",
+    "children": "running_partitions",
+    "gather": "gathering",
+    "publishing": "publishing",
+}
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
@@ -5528,6 +5536,69 @@ def _sanitized_checkpoint_jobs_view(
     }
 
 
+def _sanitized_bounded_fanout_jobs_view(
+        s, task: DurableTask, checkpoint: DurableCheckpoint | None,
+        status_doc: dict) -> dict:
+    """Parent-only Jobs surface for bounded_fanout_write — no child/plan internals."""
+    from hub import bounded_fanout as fanout
+
+    raw_phase = status_doc.get("fanout_phase")
+    if task.status in _TERMINAL_RUN:
+        stage = "terminal"
+    elif isinstance(raw_phase, str) and raw_phase in _FANOUT_PHASE_TO_STAGE:
+        stage = _FANOUT_PHASE_TO_STAGE[raw_phase]
+    else:
+        stage = "checkpointing"
+
+    plan = s.get(fanout.BoundedFanoutPlan, task.id)
+    units = list(s.scalars(select(fanout.BoundedFanoutUnit).where(
+        fanout.BoundedFanoutUnit.parent_task_id == task.id))) if plan is not None else []
+    children = [unit for unit in units if unit.kind == "child"]
+    gather = next((unit for unit in units if unit.kind == "gather"), None)
+
+    partition_count = int(plan.partition_count) if plan is not None else None
+    completed = sum(1 for unit in children if unit.status == "done")
+    failed = sum(1 for unit in children if unit.status in ("failed", "cancelled"))
+
+    if checkpoint is None or checkpoint.phase != "committed":
+        checkpoint_state = "pending"
+    elif stage in ("checkpointing",) and task.status not in _TERMINAL_RUN:
+        checkpoint_state = "committed"
+    else:
+        # Past checkpoint materialization (plan/children/gather/publish/terminal) reuses evidence.
+        checkpoint_state = "reused" if (
+            plan is not None or stage in (
+                "planning", "running_partitions", "gathering", "publishing", "terminal")
+        ) else "committed"
+
+    if gather is None:
+        gather_state = "pending"
+    elif gather.status == "done":
+        gather_state = "committed"
+    elif gather.status in ("claimed", "running"):
+        gather_state = "running"
+    else:
+        gather_state = "pending"
+
+    diagnosis = None
+    error = task.error or status_doc.get("error")
+    if isinstance(error, str):
+        if "checkpoint_invalid" in error:
+            diagnosis = "checkpoint_invalid"
+        elif "attempts_exhausted" in error or "exhausted" in error.lower():
+            diagnosis = "durable_task_attempts_exhausted"
+
+    return {
+        "stage": stage,
+        "partitionCount": partition_count,
+        "completedPartitions": completed,
+        "failedPartitions": failed,
+        "checkpoint": checkpoint_state,
+        "gather": gather_state,
+        "diagnosticCode": diagnosis,
+    }
+
+
 def resolve_checkpoint_full_result(task_id: str) -> dict | None:
     """Resolve an opaque checkpoint client key to the committed artifact under authorization."""
     with session() as s:
@@ -5765,14 +5836,20 @@ def list_workspace_runs(
                 and latest["attempt_number"] < task.max_attempts)
             can_cancel = can_mutate and task.status in ("queued", "running")
             checkpoint_view = None
+            fanout_view = None
             if task.task_kind == "linear_checkpoint_write":
                 checkpoint = s.get(DurableCheckpoint, task.id)
                 if checkpoint is not None:
                     checkpoint_view = _sanitized_checkpoint_jobs_view(
                         task, checkpoint, status_doc, can_retry=can_retry)
+            elif task.task_kind == "bounded_fanout_write":
+                checkpoint = s.get(DurableCheckpoint, task.id)
+                fanout_view = _sanitized_bounded_fanout_jobs_view(
+                    s, task, checkpoint, status_doc)
             # Final outputs stay reserved for the Write receipt; never surface checkpoint URIs.
             outputs = status_doc.get("outputs") or []
-            if task.task_kind == "linear_checkpoint_write" and task.status != "done":
+            if (task.task_kind in ("linear_checkpoint_write", "bounded_fanout_write")
+                    and task.status != "done"):
                 outputs = []
             candidates.append(((created_at, f"t:{task.id}"), {
                 "id": f"t:{task.id}", "runId": task.id, "requestId": None,
@@ -5809,6 +5886,7 @@ def list_workspace_runs(
                     "diagnosticCode": task_doc["external_wait"]["diagnostic_code"],
                 } if task.task_kind == "external_wait" and "external_wait" in task_doc else None),
                 **({"checkpoint": checkpoint_view} if checkpoint_view is not None else {}),
+                **({"boundedFanout": fanout_view} if fanout_view is not None else {}),
             }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]

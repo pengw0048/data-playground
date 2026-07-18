@@ -517,7 +517,16 @@ export interface CheckpointJobDto {
   clientKey: string
   diagnosticCode?: string | null
 }
-export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null }
+export interface BoundedFanoutJobDto {
+  stage: 'checkpointing' | 'planning' | 'running_partitions' | 'gathering' | 'publishing' | 'terminal'
+  partitionCount?: number | null
+  completedPartitions: number
+  failedPartitions: number
+  checkpoint: 'pending' | 'committed' | 'reused'
+  gather: 'pending' | 'running' | 'committed'
+  diagnosticCode?: string | null
+}
+export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {

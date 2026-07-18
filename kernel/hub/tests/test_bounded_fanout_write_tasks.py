@@ -171,20 +171,36 @@ def test_happy_path_rows_match_select_star(tmp_path, rows):
     assert observed["output_receipt"] is not None
     assert observed["output_receipt"]["rows"] == rows
 
-    # Jobs exclusion
+    # Parent-only Jobs projection (#423)
     page = metadb.list_workspace_runs(uid, run_id=task_id)
-    assert page["items"] == []
+    assert len(page["items"]) == 1
+    job = page["items"][0]
+    assert job["taskId"] == task_id
+    fanout = job["boundedFanout"]
+    assert fanout["stage"] == "terminal"
+    assert fanout["checkpoint"] == "reused"
+    assert fanout["gather"] == "committed"
+    assert fanout["partitionCount"] in (1, 2, 3, 4)
+    assert fanout["completedPartitions"] == fanout["partitionCount"]
+    assert fanout["failedPartitions"] == 0
+    forbidden = (
+        "planDigest", "plan_digest", "ranges", "unitId", "unit_id", "slot",
+        "lease", "token", "digest", "uri", "schema", "attempt_id",
+    )
+    encoded = json.dumps(fanout)
+    assert not any(key in encoded for key in forbidden)
+    assert "units" not in fanout
 
     # Direct lookup still works
     direct = metadb.durable_task(task_id)
     assert direct is not None and direct["status"] == "done"
 
-    # Inbox: one terminal item with job_available False
+    # Inbox: one terminal item with job_available True once Jobs-visible
     inbox = metadb.list_durable_task_inbox_items(uid, limit=50)
     items = [item for item in inbox["items"] if item["task_id"] == task_id]
     assert len(items) == 1
     assert items[0]["outcome"] == "completed"
-    assert items[0]["job_available"] is False
+    assert items[0]["job_available"] is True
     assert items[0]["task_kind"] == "bounded_fanout_write"
 
     # Arrow schema/values/order equal SELECT *
