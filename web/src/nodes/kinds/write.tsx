@@ -15,7 +15,10 @@ function Write({ id, data }: NodeComponentProps) {
     .find((output) => output.writeReceipt)?.writeReceipt)
   useEffect(() => {
     void prepareWrite(id).catch(() => { /* the Run panel surfaces actionable admission failures */ })
-  }, [id, data.config, prepareWrite])
+  // A terminal run deliberately drops its admission/submission identity so a later managed write
+  // cannot reuse a completed request. Re-run the existing preflight when that happens: config is
+  // unchanged, but the card still needs a truthful current destination summary.
+  }, [id, data.config, admission, prepareWrite])
   const semantics = receipt
     ? `revision ${receipt.revisionId}`
     : admission?.managed
