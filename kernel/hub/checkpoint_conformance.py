@@ -15,6 +15,7 @@ import contextlib
 import datetime
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -83,7 +84,13 @@ def _dispose_db() -> None:
 
 def _admit(canvas_id: str, submission: str) -> dict:
     """Construct canonical frozen documents and admit one hidden checkpoint through production APIs."""
+    from types import SimpleNamespace
+
     from hub import metadb
+    from hub.execution_manifest import build_execution_manifest, execution_manifest_admission
+    from hub.linear_checkpoint_tasks import graph_prefix_sha256
+    from hub.models import Graph, WriteIntent
+    from hub.nodespecs import BUILTIN_NODE_SPECS
 
     uid = metadb.DEFAULT_USER_ID
     task_id = metadb.durable_task_submission_id(uid, canvas_id, submission)
@@ -115,14 +122,26 @@ def _admit(canvas_id: str, submission: str) -> dict:
             "producerVersion": 1, "stepId": "final", "provenance": "run",
             "fieldMappings": []}, "parents": []},
     }
+    manifest_sha256, manifest_doc = build_execution_manifest(
+        Graph.model_validate(graph), target_node_id="final", target_port_id=None,
+        input_manifest=[], write_intent=WriteIntent.model_validate(intent),
+        deps=SimpleNamespace(
+            node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS}, plugins=[]))
+    manifest_admission = execution_manifest_admission(manifest_sha256, manifest_doc)
+    manifest_payload = json.dumps(
+        manifest_admission["input_manifest"], sort_keys=True, separators=(",", ":"))
     try:
         admission, created = metadb.submit_linear_checkpoint_task(
             uid=uid, canvas_id=canvas_id, submission_id=submission,
             final_target_node_id="final", checkpoint_id=f"cp:{submission}",
             checkpoint_node_id="checkpoint", output_port_id="out",
-            task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
-            input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
-            graph_doc=graph, input_manifest=[], write_intent=intent)
+            task_intent_sha256=manifest_sha256,
+            graph_prefix_sha256=graph_prefix_sha256(
+                Graph.model_validate(manifest_admission["graph_doc"]), "checkpoint"),
+            input_manifest_sha256=hashlib.sha256(manifest_payload.encode()).hexdigest(),
+            graph_doc=graph, input_manifest=[], write_intent=intent,
+            execution_manifest_sha256=manifest_sha256,
+            execution_manifest_doc=manifest_doc)
     except Exception:
         _fail("admission", "submit_failed")
     if not created or admission.get("task_id") != task_id:

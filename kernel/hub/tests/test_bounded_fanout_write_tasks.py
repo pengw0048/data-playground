@@ -17,6 +17,7 @@ from hub import metadb
 from hub.deps import Deps
 from hub.models import Graph
 from hub.routers.runs import _bounded_fanout_write_shape, start_run
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -370,7 +371,8 @@ def test_jobs_stage_follows_sql_when_fanout_phase_absent(tmp_path):
 
     values = {**_identity(), "task_kind": "bounded_fanout_write"}
     store = LocalStorage(str(tmp_path / "outputs"))
-    admission, _ = metadb.submit_linear_checkpoint_task(**values)
+    admission, _ = metadb.submit_linear_checkpoint_task(**with_task_manifest(
+        values, target_key="final_target_node_id"))
     task_id = admission["task_id"]
     claimed = metadb.claim_bounded_fanout_write_task(task_id, "jobs-owner")
     assert claimed is not None

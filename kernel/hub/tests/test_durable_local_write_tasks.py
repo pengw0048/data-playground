@@ -28,6 +28,7 @@ from hub.routers.runs import (
     _inject_write_intent, _local_run_intent_sha256, _resolve_local_run_manifest,
     _write_admission_for_graph,
 )
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,12 +85,12 @@ def task_identity():
 
 def _submit(identity):
     uid, canvas_id, submission, _task_id, graph, intent = identity
-    return metadb.submit_durable_local_write_task(
+    return metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write", intent_sha256="a" * 64,
         graph_doc=graph, input_manifest=[],
         write_intent=intent,
-    )
+    )))
 
 
 def _write_ordinary_source(path, values: list[int]) -> None:
@@ -171,7 +172,13 @@ def test_ordinary_local_formats_are_task_owned_before_dispatch(
     assert task is not None and task["status"] == "queued"
     assert len(task["attempts"]) == 1
     assert task["input_manifest"][0]["provider"] == LOCAL_FILE_INPUT_PROVIDER
-    assert task["graph_doc"]["nodes"][0]["data"]["config"]["uri"] == str(source)
+    assert task["graph_doc"]["nodes"][0]["data"]["config"]["datasetRef"] == {
+        "kind": "exact",
+        "datasetId": task["input_manifest"][0]["dataset_id"],
+        "revisionId": task["input_manifest"][0]["revision_id"],
+    }
+    source_config = task["graph_doc"]["nodes"][0]["data"]["config"]
+    assert "uri" not in source_config and "_inputArtifactUri" not in source_config
     ref = _task_input_ref(task["id"])
     assert ref is not None
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
@@ -276,10 +283,10 @@ def test_supplied_snapshot_manifest_keeps_task_graph_logical(tmp_path, monkeypat
 
     task = metadb.durable_task(status.run_id)
     assert task is not None
-    persisted_graph = json.dumps(task["graph_doc"])
-    assert task["graph_doc"]["nodes"][0]["data"]["config"]["uri"] == str(source)
-    assert artifact_uri not in persisted_graph
-    assert "_input_artifact_uri" not in persisted_graph
+    source_config = task["graph_doc"]["nodes"][0]["data"]["config"]
+    assert "uri" not in source_config
+    assert "_inputArtifactUri" not in source_config
+    assert "_input_artifact_uri" not in source_config
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert artifact_uri not in json.dumps(jobs["items"])
 
@@ -306,7 +313,8 @@ def test_restarted_worker_reads_snapshot_after_source_mutation(tmp_path, monkeyp
     receipt = task["output_receipt"]
     assert receipt is not None
     assert pq.read_table(receipt["publication"]["artifactUri"])["value"].to_pylist() == [1, 2]
-    assert task["graph_doc"]["nodes"][0]["data"]["config"]["uri"] == str(source)
+    source_config = task["graph_doc"]["nodes"][0]["data"]["config"]
+    assert "uri" not in source_config and "_inputArtifactUri" not in source_config
     restarted.storage.close()
 
 
@@ -472,12 +480,15 @@ def test_submission_is_atomic_idempotent_and_projects_into_jobs(task_identity):
 
     assert created is True and replay_created is False
     assert replay["id"] == first["id"] and len(replay["attempts"]) == 1
+    manifest_sha256 = first["execution_manifest_sha256"]
+    assert manifest_sha256 == first["intent_sha256"]
+    assert first["attempts"][0]["execution_manifest_sha256"] == manifest_sha256
     operational = json.loads(json.dumps(task_identity[4]))
     operational["nodes"][0]["data"]["status"] = "failed"
-    adopted, adopted_created = metadb.submit_durable_local_write_task(
+    adopted, adopted_created = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=task_identity[0], canvas_id=task_identity[1], submission_id=task_identity[2],
         target_node_id="write", intent_sha256="a" * 64, graph_doc=operational,
-        input_manifest=[], write_intent=task_identity[5])
+        input_manifest=[], write_intent=task_identity[5])))
     assert adopted_created is False
     assert adopted["id"] == first["id"]
     assert "status" not in adopted["graph_doc"]["nodes"][0]["data"]
@@ -486,15 +497,55 @@ def test_submission_is_atomic_idempotent_and_projects_into_jobs(task_identity):
     assert page["items"][0]["taskId"] == first["id"]
     assert page["items"][0]["inputManifest"] == []
     assert page["items"][0]["taskAttempts"][0]["status"] == "queued"
+    assert page["items"][0]["executionManifestSha256"] == manifest_sha256
+    assert page["items"][0]["taskAttempts"][0][
+        "executionManifestSha256"] == manifest_sha256
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, first["id"])
+        assert row.graph_doc is None and row.input_manifest is None and row.write_intent is None
 
     changed = dict(task_identity[5])
     changed["destination"] = {**changed["destination"], "name": "different"}
-    with pytest.raises(RuntimeError, match="frozen admission"):
-        metadb.submit_durable_local_write_task(
+    with pytest.raises(metadb.DurableTaskSubmissionConflict, match="frozen admission"):
+        metadb.submit_durable_local_write_task(**with_task_manifest(dict(
             uid=task_identity[0], canvas_id=task_identity[1],
             submission_id=task_identity[2], target_node_id="write",
             intent_sha256="b" * 64, graph_doc=task_identity[4],
-            input_manifest=[], write_intent=changed)
+            input_manifest=[], write_intent=changed)))
+
+
+def test_legacy_frozen_task_recovers_without_manifest_backfill(task_identity):
+    task, _ = _submit(task_identity)
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"], with_for_update=True)
+        row.execution_manifest_sha256 = None
+        row.intent_sha256 = "a" * 64
+        row.graph_doc = json.dumps(task["graph_doc"], sort_keys=True, separators=(",", ":"))
+        row.input_manifest = json.dumps(
+            task["input_manifest"], sort_keys=True, separators=(",", ":"))
+        row.write_intent = json.dumps(
+            task["write_intent"], sort_keys=True, separators=(",", ":"))
+        attempt = session.scalar(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == task["id"]))
+        attempt.execution_manifest_sha256 = None
+
+    claimed = metadb.claim_durable_task(task["id"], "legacy-owner")
+    assert claimed is not None
+    assert claimed["execution_manifest_sha256"] is None
+    assert claimed["execution_manifest_reconstructable"] is False
+    assert claimed["attempts"][-1]["execution_manifest_sha256"] is None
+    failed = RunStatus(
+        run_id=task["id"], status="failed", target_node_id="write", error="retry legacy")
+    assert metadb.finish_durable_task_attempt(
+        task["id"], claimed["attempts"][-1]["id"], "legacy-owner", failed.model_dump())
+    retried = metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    assert len(retried["attempts"]) == 2
+    assert all(item["execution_manifest_sha256"] is None for item in retried["attempts"])
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"])
+        assert row.execution_manifest_sha256 is None
+        assert row.graph_doc is not None and row.input_manifest is not None
+        assert row.write_intent is not None
 
 
 def test_concurrent_claim_has_one_owner_and_late_owner_is_fenced(task_identity):
@@ -711,14 +762,14 @@ def test_committed_response_loss_restarts_and_reconciles_one_receipt(tmp_path):
     frozen = graph.model_copy(deep=True)
     _inject_write_intent(frozen, "write", admission.intent)
     manifest = _resolve_local_run_manifest(frozen, "write", deps)
-    task, _ = metadb.submit_durable_local_write_task(
+    task, _ = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write",
         intent_sha256=_local_run_intent_sha256(graph, "write", write_intent=admission.intent),
-        graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+        graph_doc=graph.model_dump(by_alias=True, mode="json"),
         input_manifest=manifest,
         write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
-    )
+    )))
     from hub.durable_tasks import dispatch
     dispatch(task["id"], deps)
     deadline = datetime.datetime.now().timestamp() + 10
@@ -759,6 +810,7 @@ import pyarrow.parquet as pq
 import lance
 from hub import metadb
 from hub.deps import Deps
+from hub.execution_manifest import build_execution_manifest
 from hub.local_writes import write_managed_local_file
 from hub.models import Graph
 from hub.routers.runs import _inject_write_intent, _resolve_local_run_manifest, _write_admission_for_graph
@@ -789,13 +841,18 @@ admission = _write_admission_for_graph(
 frozen = graph.model_copy(deep=True)
 _inject_write_intent(frozen, "write", admission.intent)
 manifest = _resolve_local_run_manifest(frozen, "write", deps)
+execution_sha256, execution_doc = build_execution_manifest(
+    graph, target_node_id="write", target_port_id=None,
+    input_manifest=manifest, write_intent=admission.intent, deps=deps)
 task, _ = metadb.submit_durable_local_write_task(
     uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, submission_id=submission,
     target_node_id="write",
-    intent_sha256=_local_run_intent_sha256(graph, "write", write_intent=admission.intent),
-    graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+    intent_sha256=execution_sha256,
+    graph_doc=graph.model_dump(by_alias=True, mode="json"),
     input_manifest=manifest,
-    write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
+    write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
+    execution_manifest_sha256=execution_sha256,
+    execution_manifest_doc=execution_doc)
 claimed = metadb.claim_durable_task(task["id"], "crashed-hub-owner")
 receipt = write_managed_local_file(
     storage=deps.storage, catalog=deps.catalog, intent=admission.intent,

@@ -1508,6 +1508,25 @@
             ],
             "title": "Error"
           },
+          "executionManifestReconstructable": {
+            "default": false,
+            "title": "Executionmanifestreconstructable",
+            "type": "boolean"
+          },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -1591,6 +1610,25 @@
               }
             ],
             "title": "Diagnosticcode"
+          },
+          "executionManifestReconstructable": {
+            "default": false,
+            "title": "Executionmanifestreconstructable",
+            "type": "boolean"
+          },
+          "executionManifestSha256": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Executionmanifestsha256"
           },
           "id": {
             "title": "Id",

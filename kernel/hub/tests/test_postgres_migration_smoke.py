@@ -17,6 +17,7 @@ from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, text
 
 from hub import metadb
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 def _reset_postgres(url: str):
@@ -135,13 +136,14 @@ def test_postgres_linear_checkpoint_db_time_fencing_and_reservation_race(tmp_pat
         session.add(metadb.User(id=uid, name="Postgres checkpoint owner"))
         session.flush()
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Checkpoint", doc="{}"))
-    admission, _ = metadb.submit_linear_checkpoint_task(
+    admission, _ = metadb.submit_linear_checkpoint_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         final_target_node_id="final", checkpoint_id=f"cp:{suffix}",
         checkpoint_node_id="checkpoint", output_port_id="out",
         task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
         input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
-        graph_doc=graph, input_manifest=[], write_intent=intent)
+        graph_doc=graph, input_manifest=[], write_intent=intent),
+        target_key="final_target_node_id"))
     first = metadb.claim_linear_checkpoint_task(admission["task_id"], "expired-owner")
     old_attempt = first["attempts"][-1]
     with metadb.session() as session:
@@ -217,13 +219,14 @@ def test_postgres_linear_checkpoint_commit_is_single_owner_and_db_time_fenced(tm
         session.add(metadb.User(id=uid, name="Postgres checkpoint committer"))
         session.flush()
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Checkpoint", doc="{}"))
-    admission, _ = metadb.submit_linear_checkpoint_task(
+    admission, _ = metadb.submit_linear_checkpoint_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         final_target_node_id="final", checkpoint_id=f"cc:{suffix}",
         checkpoint_node_id="checkpoint", output_port_id="out",
         task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
         input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
-        graph_doc=graph, input_manifest=[], write_intent=intent)
+        graph_doc=graph, input_manifest=[], write_intent=intent),
+        target_key="final_target_node_id"))
 
     store = LocalStorage(str(tmp_path / "outputs"))
     claim = metadb.claim_linear_checkpoint_task(admission["task_id"], "current-owner")
@@ -310,13 +313,14 @@ def _admit_checkpoint(suffix: str):
         session.add(metadb.User(id=uid, name="Postgres lifecycle owner"))
         session.flush()
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Checkpoint", doc="{}"))
-    admission, _ = metadb.submit_linear_checkpoint_task(
+    admission, _ = metadb.submit_linear_checkpoint_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         final_target_node_id="final", checkpoint_id=f"lc:{suffix}",
         checkpoint_node_id="checkpoint", output_port_id="out",
         task_intent_sha256="a" * 64, graph_prefix_sha256="b" * 64,
         input_manifest_sha256=hashlib.sha256(b"[]").hexdigest(),
-        graph_doc=graph, input_manifest=[], write_intent=intent)
+        graph_doc=graph, input_manifest=[], write_intent=intent),
+        target_key="final_target_node_id"))
     return admission, canvas_id
 
 

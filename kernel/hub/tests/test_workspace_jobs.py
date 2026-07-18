@@ -7,6 +7,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from hub import metadb
+from hub.tests.task_manifest_helpers import with_task_manifest
 from hub.main import app
 from hub.models import RunStatus, WorkspaceRunPage
 
@@ -161,11 +162,11 @@ def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions
             "stepId": "write", "provenance": "run", "fieldMappings": [],
         }, "parents": []},
     }
-    task, _ = metadb.submit_durable_local_write_task(
+    task, _ = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write", intent_sha256="a" * 64,
         graph_doc=graph, input_manifest=[], write_intent=intent,
-    )
+    )))
     first = metadb.claim_durable_task(task["id"], "first-owner")["attempts"][-1]
     with metadb.session() as session:
         row = session.get(metadb.DurableTaskAttempt, first["id"])

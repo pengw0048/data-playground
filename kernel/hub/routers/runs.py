@@ -38,6 +38,7 @@ from hub.execution_manifest import (
     ExecutionManifestError,
     build_execution_manifest,
     execution_manifest_accepts_graph_replay,
+    execution_manifest_admission,
 )
 from hub.local_run_inputs import LocalRunInputError
 from hub.plugins.adapters import revision_adapter_for_uri
@@ -54,6 +55,7 @@ from hub.models import (
     ColumnSchema,
     EstimateRequest,
     ExactDatasetRef,
+    Graph,
     InputDrift,
     InputDriftRequest,
     InputDriftSource,
@@ -104,6 +106,68 @@ def _admitted_execution_manifest(*args, **kwargs) -> tuple[str, str]:
         raise APIError(
             400, str(exc), code=APIErrorCode.INVALID_REQUEST, retryable=False,
         ) from exc
+
+
+def _resume_durable_task(deps, task: dict) -> RunStatus:
+    """Dispatch one already-admitted graph-backed Task through its existing lifecycle."""
+    task_id = str(task["id"])
+    if task["task_kind"] == "managed_local_write":
+        from hub.durable_tasks import dispatch
+        dispatch(task_id, deps)
+    elif task["task_kind"] == "external_wait":
+        from hub.external_wait_tasks import recover
+        recover(deps)
+    elif task["task_kind"] == "linear_checkpoint_write":
+        from hub.linear_checkpoint_tasks import dispatch
+        dispatch(task_id, deps)
+    elif task["task_kind"] == "bounded_fanout_write":
+        from hub.bounded_fanout_tasks import dispatch
+        dispatch(task_id, deps)
+    else:  # pragma: no cover - schema constraint owns the closed task-kind set
+        raise RuntimeError("durable task kind is unsupported")
+    current = metadb.durable_task(task_id, include_admission=False)
+    if current is None:
+        raise RuntimeError("durable task disappeared during replay")
+    return RunStatus.model_validate(current["status_doc"])
+
+
+def _adopt_manifest_durable_task(
+        deps, task: dict, graph, target_node_id: str | None,
+        input_manifest: list[dict[str, str]] | None,
+        write_intent: WriteIntent | None) -> RunStatus:
+    """Validate response-loss replay from retained semantics before any mutable admission work."""
+    sha256 = task.get("execution_manifest_sha256")
+    if not isinstance(sha256, str):
+        raise RuntimeError("durable task has no execution manifest")
+    retained = metadb.execution_manifest(sha256)
+    if retained is None:
+        raise RuntimeError("durable task execution manifest is unavailable")
+    payload = json.dumps(
+        retained["document"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    try:
+        if not execution_manifest_accepts_graph_replay(
+                sha256, payload, graph,
+                target_node_id=target_node_id, target_port_id=None):
+            raise metadb.DurableTaskSubmissionConflict(
+                "durable task submission is bound to a different execution manifest")
+        admission = execution_manifest_admission(sha256, payload)
+    except ExecutionManifestError as exc:
+        raise RuntimeError("durable task execution manifest is invalid") from exc
+    retained_inputs = [{key: item[key] for key in (
+        "node_id", "dataset_id", "revision_id", "provider")}
+        for item in admission["input_manifest"]]
+    supplied_inputs = [{key: item[key] for key in (
+        "node_id", "dataset_id", "revision_id", "provider")}
+        for item in input_manifest or []]
+    if input_manifest is not None and supplied_inputs != retained_inputs:
+        raise metadb.DurableTaskSubmissionConflict(
+            "durable task submission is bound to different admitted inputs")
+    retained_write = WriteIntent.model_validate(admission["write_intent"])
+    if write_intent is not None and write_intent != retained_write:
+        raise metadb.DurableTaskSubmissionConflict(
+            "durable task submission is bound to a different write intent")
+
+    return _resume_durable_task(deps, task)
 
 
 def _local_run_intent_sha256(
@@ -1875,31 +1939,50 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
-    # A response-loss retry adopts its already-frozen managed-local Task before touching a Source,
-    # destination, or schema. The semantic digest still rejects a changed graph or supplied intent;
-    # only the mutable physical Source is deliberately absent from this replay path.
+    # A response-loss retry adopts its already-frozen Task before touching a Source, destination, or
+    # schema. Canonical rows compare the retained manifest; pre-0022 rows keep their original digest
+    # and frozen triple without being silently upgraded or reinterpreted.
     operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
     if (submission_id is not None and target is not None and target.type == "write"
             and operational_canvas is not None and metadb.canvas_exists(operational_canvas)):
         task_id = metadb.durable_task_submission_id(uid, operational_canvas, submission_id)
         existing_task = metadb.durable_task(task_id)
-        if existing_task is not None and existing_task["task_kind"] == "managed_local_write":
-            frozen_intent = WriteIntent.model_validate(existing_task["write_intent"])
-            if write_intent is not None and write_intent != frozen_intent:
-                raise metadb.DurableTaskSubmissionConflict(
-                    "durable task submission does not match its frozen admission")
-            replay_sha256 = _local_run_intent_sha256(
-                intent_graph, target_node_id, input_manifest, frozen_intent)
-            task, _created = metadb.submit_durable_local_write_task(
-                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-                target_node_id=str(target_node_id), intent_sha256=replay_sha256,
-                graph_doc=existing_task["graph_doc"],
-                input_manifest=existing_task["input_manifest"],
-                write_intent=existing_task["write_intent"],
-            )
-            from hub.durable_tasks import dispatch
-            dispatch(task["id"], deps)
-            return RunStatus.model_validate(task["status_doc"]), None
+        if (existing_task is not None
+                and existing_task.get("execution_manifest_sha256") is not None):
+            try:
+                status = _adopt_manifest_durable_task(
+                    deps, existing_task, intent_graph, target_node_id,
+                    input_manifest, write_intent)
+            except metadb.DurableTaskSubmissionConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return status, None
+        if existing_task is not None:
+            try:
+                frozen_intent = WriteIntent.model_validate(existing_task["write_intent"])
+                if write_intent is not None and write_intent != frozen_intent:
+                    raise metadb.DurableTaskSubmissionConflict(
+                        "durable task submission does not match its frozen admission")
+                if existing_task["task_kind"] == "external_wait":
+                    if input_manifest is not None:
+                        raise metadb.DurableTaskSubmissionConflict(
+                            "durable task submission does not match its frozen admission")
+                    request = _external_wait_request(deps, intent_graph, target_node_id)
+                    if request is None:
+                        raise metadb.DurableTaskSubmissionConflict(
+                            "durable task submission does not match its frozen admission")
+                    semantic = _local_run_intent_sha256(
+                        intent_graph, target_node_id, write_intent=frozen_intent)
+                    replay_sha256 = hashlib.sha256(
+                        f"{semantic}\0{request.model_dump_json()}".encode()).hexdigest()
+                else:
+                    replay_sha256 = _local_run_intent_sha256(
+                        intent_graph, target_node_id, input_manifest, frozen_intent)
+                if replay_sha256 != existing_task.get("intent_sha256"):
+                    raise metadb.DurableTaskSubmissionConflict(
+                        "durable task submission does not match its frozen admission")
+            except metadb.DurableTaskSubmissionConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return _resume_durable_task(deps, existing_task), None
     external_request = _external_wait_request(deps, graph, target_node_id)
     if external_request is not None:
         if input_manifest is not None or submission_id is None:
@@ -1916,17 +1999,18 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
         if not operational_canvas or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "durable external waits require a saved canvas")
-        semantic = _local_run_intent_sha256(
-            intent_graph, target_node_id, write_intent=admission.intent)
-        intent_sha256 = hashlib.sha256(
-            f"{semantic}\0{external_request.model_dump_json()}".encode()).hexdigest()
+        execution_sha256, execution_doc = _admitted_execution_manifest(
+            intent_graph, target_node_id=target_node_id, target_port_id=None,
+            input_manifest=[], write_intent=admission.intent, deps=deps)
         task, _created = metadb.submit_durable_external_wait_task(
             uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-            target_node_id=str(target_node_id), intent_sha256=intent_sha256,
-            graph_doc=graph.model_dump(by_alias=True, mode="json"),
+            target_node_id=str(target_node_id), intent_sha256=execution_sha256,
+            graph_doc=intent_graph.model_dump(by_alias=True, mode="json"),
             provider_kind=external_request.provider_kind,
             operation=external_request.operation, document_json=external_request.document_json,
-            write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
+            write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
+            execution_manifest_sha256=execution_sha256,
+            execution_manifest_doc=execution_doc)
         from hub.external_wait_tasks import recover
         recover(deps)
         return RunStatus.model_validate(task["status_doc"]), None
@@ -1952,34 +2036,38 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
         if not operational_canvas or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "bounded fan-out tasks require a saved canvas")
-        frozen = graph.model_copy(deep=True)
-        _inject_write_intent(frozen, write.id, admission.intent)
         manifest = (input_manifest if input_manifest is not None
-                    else _resolve_local_run_manifest(frozen, write.id, deps))
+                    else _resolve_local_run_manifest(graph, write.id, deps))
         if len(manifest) != 1:
             raise HTTPException(409, "bounded fan-out tasks require exactly one Source revision")
         stable_manifest = [{
             **item, "resolved_at": "1970-01-01T00:00:00+00:00",
         } for item in manifest]
-        intent_sha256 = _local_run_intent_sha256(
-            intent_graph, write.id, input_manifest, admission.intent)
+        execution_sha256, execution_doc = _admitted_execution_manifest(
+            intent_graph, target_node_id=write.id, target_port_id=None,
+            input_manifest=stable_manifest, write_intent=admission.intent, deps=deps)
+        manifest_admission = execution_manifest_admission(execution_sha256, execution_doc)
         from hub.linear_checkpoint_tasks import checkpoint_identity, graph_prefix_sha256
         task_id = metadb.durable_task_submission_id(
             uid, operational_canvas, str(submission_id))
         port_id = "out"
-        manifest_payload = json.dumps(stable_manifest, sort_keys=True, separators=(",", ":"))
+        manifest_payload = json.dumps(
+            manifest_admission["input_manifest"], sort_keys=True, separators=(",", ":"))
         try:
             task, _created = metadb.submit_linear_checkpoint_task(
                 uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
                 final_target_node_id=str(write.id),
                 checkpoint_id=checkpoint_identity(task_id, checkpoint_select.id, port_id),
                 checkpoint_node_id=str(checkpoint_select.id), output_port_id=port_id,
-                task_intent_sha256=intent_sha256,
-                graph_prefix_sha256=graph_prefix_sha256(frozen, checkpoint_select.id),
+                task_intent_sha256=execution_sha256,
+                graph_prefix_sha256=graph_prefix_sha256(
+                    Graph.model_validate(manifest_admission["graph_doc"]), checkpoint_select.id),
                 input_manifest_sha256=hashlib.sha256(manifest_payload.encode()).hexdigest(),
-                graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+                graph_doc=intent_graph.model_dump(by_alias=True, mode="json"),
                 input_manifest=stable_manifest,
                 write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
+                execution_manifest_sha256=execution_sha256,
+                execution_manifest_doc=execution_doc,
                 task_kind="bounded_fanout_write")
         except metadb.DurableTaskSubmissionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2009,35 +2097,39 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         operational_canvas = auth_canvas or str(getattr(graph, "id", "") or "")
         if not operational_canvas or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "linear checkpoint tasks require a saved canvas")
-        frozen = graph.model_copy(deep=True)
-        _inject_write_intent(frozen, write.id, admission.intent)
         manifest = (input_manifest if input_manifest is not None
-                    else _resolve_local_run_manifest(frozen, write.id, deps))
+                    else _resolve_local_run_manifest(graph, write.id, deps))
         if len(manifest) != 1:
             raise HTTPException(409, "linear checkpoint tasks require exactly one Source revision")
         # Wall-clock resolved_at must not fork the durable identity across response-loss replays.
         stable_manifest = [{
             **item, "resolved_at": "1970-01-01T00:00:00+00:00",
         } for item in manifest]
-        intent_sha256 = _local_run_intent_sha256(
-            intent_graph, write.id, input_manifest, admission.intent)
+        execution_sha256, execution_doc = _admitted_execution_manifest(
+            intent_graph, target_node_id=write.id, target_port_id=None,
+            input_manifest=stable_manifest, write_intent=admission.intent, deps=deps)
+        manifest_admission = execution_manifest_admission(execution_sha256, execution_doc)
         from hub.linear_checkpoint_tasks import checkpoint_identity, graph_prefix_sha256
         task_id = metadb.durable_task_submission_id(
             uid, operational_canvas, str(submission_id))
         port_id = "out"
-        manifest_payload = json.dumps(stable_manifest, sort_keys=True, separators=(",", ":"))
+        manifest_payload = json.dumps(
+            manifest_admission["input_manifest"], sort_keys=True, separators=(",", ":"))
         try:
             task, _created = metadb.submit_linear_checkpoint_task(
                 uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
                 final_target_node_id=str(write.id),
                 checkpoint_id=checkpoint_identity(task_id, select.id, port_id),
                 checkpoint_node_id=str(select.id), output_port_id=port_id,
-                task_intent_sha256=intent_sha256,
-                graph_prefix_sha256=graph_prefix_sha256(frozen, select.id),
+                task_intent_sha256=execution_sha256,
+                graph_prefix_sha256=graph_prefix_sha256(
+                    Graph.model_validate(manifest_admission["graph_doc"]), select.id),
                 input_manifest_sha256=hashlib.sha256(manifest_payload.encode()).hexdigest(),
-                graph_doc=frozen.model_dump(by_alias=True, mode="json"),
+                graph_doc=intent_graph.model_dump(by_alias=True, mode="json"),
                 input_manifest=stable_manifest,
-                write_intent=admission.intent.model_dump(by_alias=True, mode="json"))
+                write_intent=admission.intent.model_dump(by_alias=True, mode="json"),
+                execution_manifest_sha256=execution_sha256,
+                execution_manifest_doc=execution_doc)
         except metadb.DurableTaskSubmissionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
         from hub.linear_checkpoint_tasks import dispatch as dispatch_linear
@@ -2124,14 +2216,19 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                                 materialize_local_files=True,
                                 local_file_candidates=candidates,
                             ))
+                execution_sha256, execution_doc = _admitted_execution_manifest(
+                    intent_graph, target_node_id=target_node_id, target_port_id=None,
+                    input_manifest=manifest, write_intent=effective_write_intent, deps=deps)
                 task, _created = metadb.submit_durable_local_write_task(
                     uid=uid, canvas_id=operational_canvas,
                     submission_id=str(submission_id),
-                    target_node_id=str(target_node_id), intent_sha256=intent_sha256,
-                    graph_doc=durable_graph.model_dump(by_alias=True, mode="json"),
+                    target_node_id=str(target_node_id), intent_sha256=execution_sha256,
+                    graph_doc=intent_graph.model_dump(by_alias=True, mode="json"),
                     input_manifest=manifest,
                     write_intent=effective_write_intent.model_dump(
                         by_alias=True, mode="json"),
+                    execution_manifest_sha256=execution_sha256,
+                    execution_manifest_doc=execution_doc,
                     local_file_candidates=candidates,
                 )
                 break

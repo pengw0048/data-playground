@@ -38,6 +38,7 @@ from hub.plugins.adapters import (
 )
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
+from hub.tests.task_manifest_helpers import with_task_manifest
 
 
 def _switch_db(url: str) -> None:
@@ -321,7 +322,7 @@ def _checkpoint_admission(
     manifest_sha = hashlib.sha256(json.dumps(
         input_manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode()).hexdigest()
-    admission, created = metadb.submit_linear_checkpoint_task(
+    admission, created = metadb.submit_linear_checkpoint_task(**with_task_manifest(dict(
         uid=metadb.DEFAULT_USER_ID,
         canvas_id=canvas_id,
         submission_id=submission_id,
@@ -337,7 +338,7 @@ def _checkpoint_admission(
         input_manifest=input_manifest,
         write_intent=_task_write_intent(task_id, canvas_id, logical_uri),
         task_kind=task_kind,
-    )
+    ), target_key="final_target_node_id"))
     assert created is True
     return admission
 
@@ -438,7 +439,7 @@ def _seed_durable_tasks(
         ],
         "edges": [{"id": "ordinary-write", "source": "ordinary", "target": "write"}],
     }
-    managed, created = metadb.submit_durable_local_write_task(
+    managed, created = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=metadb.DEFAULT_USER_ID,
         canvas_id=canvas_id,
         submission_id=managed_submission,
@@ -448,7 +449,7 @@ def _seed_durable_tasks(
         input_manifest=manifest,
         write_intent=_task_write_intent(
             managed_task_id, canvas_id, str(logical_root / "managed-task.parquet")),
-    )
+    )))
     assert created is True
     managed_claim = metadb.claim_durable_task(managed["id"], "backup-managed-owner")
     assert managed_claim is not None
@@ -554,7 +555,7 @@ def _seed_durable_tasks(
         ],
         "edges": [{"id": "wait-write", "source": "wait", "target": "write"}],
     }
-    external, created = metadb.submit_durable_external_wait_task(
+    external, created = metadb.submit_durable_external_wait_task(**with_task_manifest(dict(
         uid=metadb.DEFAULT_USER_ID,
         canvas_id=canvas_id,
         submission_id=external_submission,
@@ -566,7 +567,7 @@ def _seed_durable_tasks(
         document_json="{}",
         write_intent=_task_write_intent(
             external_task_id, canvas_id, str(logical_root / "external-task.parquet")),
-    )
+    )))
     assert created is True
     submit_claim = metadb.claim_external_wait_transition(
         external["id"], "backup-external-submit")
@@ -619,7 +620,7 @@ def _seed_durable_tasks(
         "managed": {
             "task_id": managed["id"],
             "attempt_id": managed_attempt["id"],
-            "input_manifest": manifest,
+            "input_manifest": managed["input_manifest"],
             "input_artifact_uri": ordinary_input["artifact_uri"],
             "receipt": managed_receipt,
         },
@@ -1244,12 +1245,28 @@ def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
         check(f"{label} task kind", task["task_kind"], task_kind)
         check(f"{label} attempt identity", task["attempts"][-1]["id"],
               expected["attempt_id"])
+        manifest_sha256 = task["execution_manifest_sha256"]
+        check(f"{label} manifest retained",
+              isinstance(manifest_sha256, str) and len(manifest_sha256) == 64, True)
+        check(f"{label} attempt manifest identity",
+              task["attempts"][-1]["execution_manifest_sha256"], manifest_sha256)
+        jobs = metadb.list_workspace_runs(
+            metadb.DEFAULT_USER_ID, run_id=expected["task_id"])["items"]
+        check(f"{label} Jobs manifest identity",
+              jobs[0]["executionManifestSha256"] if jobs else None, manifest_sha256)
+        with metadb.session() as session:
+            row = session.get(metadb.DurableTask, expected["task_id"])
+            check(f"{label} canonical admission owns no legacy triple",
+                  (row.graph_doc, row.input_manifest, row.write_intent), (None, None, None))
         check(f"{label} status", task["status"],
               "running" if label == "external" else "done")
         check(f"{label} attempt status", task["attempts"][-1]["status"],
               "running" if label == "external" else "done")
         check(f"{label} receipt identity", task["output_receipt"],
               None if label == "external" else expected["receipt"])
+        if label != "external":
+            check(f"{label} receipt manifest identity",
+                  task["output_receipt"].get("executionManifestSha256"), manifest_sha256)
     managed = metadb.durable_task(fixture["managed"]["task_id"])
     if managed is not None:
         check("managed input manifest", managed["input_manifest"],
@@ -1336,6 +1353,10 @@ def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
               expected["id"])
         check(f"inbox read state {task_id}",
               item.get("read_at") is not None if item else None, expected["read"])
+        task = metadb.durable_task(task_id)
+        check(f"inbox manifest identity {task_id}",
+              item.get("execution_manifest_sha256") if item else None,
+              task["execution_manifest_sha256"] if task else None)
     check("external wait has no Inbox item",
           any(item["task_id"] == fixture["external"]["task_id"] for item in inbox), False)
 

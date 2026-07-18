@@ -8,6 +8,7 @@ import uuid
 from fastapi.testclient import TestClient
 
 from hub import metadb
+from hub.tests.task_manifest_helpers import with_task_manifest
 from hub.main import app
 from hub.models import (
     DurableTaskInboxItemView,
@@ -52,10 +53,10 @@ def _submit_local(uid: str, canvas_id: str):
             "fieldMappings": [],
         }, "parents": []},
     }
-    task, created = metadb.submit_durable_local_write_task(
+    task, created = metadb.submit_durable_local_write_task(**with_task_manifest(dict(
         uid=uid, canvas_id=canvas_id, submission_id=submission,
         target_node_id="write", intent_sha256="a" * 64,
-        graph_doc=graph, input_manifest=[], write_intent=intent)
+        graph_doc=graph, input_manifest=[], write_intent=intent)))
     assert created is True
     return task
 
