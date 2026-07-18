@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import json
+import os
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -12,11 +14,13 @@ import pytest
 from sqlalchemy import event, func, select
 
 from hub import db, metadb
-from hub.api_errors import APIError
+from hub.api_errors import APIError, APIErrorCode
 from hub.models import Graph, RunEstimate, RunStatus
-from hub.plugins.adapters import LanceAdapter
+from hub.local_run_inputs import finalize_local_file_candidates
+from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import runs
+from hub.storage import LocalStorage
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +30,8 @@ def _isolated_metadata(tmp_path):
     engine, session, url = metadb._engine, metadb._Session, settings.database_url
     if metadb._engine is not None:
         metadb._engine.dispose()
-    settings.database_url = f"sqlite:///{tmp_path / 'admission.db'}"
+    settings.database_url = (os.environ.get("DP_TEST_DATABASE_URL")
+                             or f"sqlite:///{tmp_path / 'admission.db'}")
     metadb._engine = metadb._Session = None
     metadb.init_db()
     try:
@@ -46,6 +51,194 @@ def _graph(uri: str) -> Graph:
             "data": {"config": {"uri": uri}},
         }], "edges": [],
     })
+
+
+def _write_ordinary_source(path, values: list[int]) -> None:
+    suffix = path.suffix.lower()
+    table = pa.table({"value": values})
+    if suffix == ".parquet":
+        import pyarrow.parquet as pq
+        pq.write_table(table, path)
+    elif suffix == ".csv":
+        import pyarrow.csv as pacsv
+        pacsv.write_csv(table, path)
+    elif suffix == ".json":
+        path.write_text("\n".join(
+            json.dumps({"value": value}) for value in values) + "\n")
+    elif suffix == ".arrow":
+        import pyarrow.ipc as ipc
+        with ipc.new_file(path, table.schema) as writer:
+            writer.write_table(table)
+    else:  # pragma: no cover - test helper contract
+        raise AssertionError(suffix)
+
+
+def test_ordinary_local_formats_keep_exact_rows_across_rename_restart_retry_and_cleanup(tmp_path):
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)
+    nodes = []
+    original_paths = []
+    for index, suffix in enumerate((".parquet", ".csv", ".json", ".arrow")):
+        source = tmp_path / f"ordinary-{index}{suffix}"
+        _write_ordinary_source(source, [1, 2])
+        catalog._add(name=f"ordinary-{index}", uri=str(source), strict_probe=True)
+        nodes.append({
+            "id": f"source-{index}", "type": "source", "position": {"x": 0, "y": index},
+            "data": {"config": {"uri": str(source)}},
+        })
+        original_paths.append(source)
+    nodes.append({
+        "id": "source-repeat", "type": "source", "position": {"x": 0, "y": 4},
+        "data": {"config": {"uri": str(original_paths[0])}},
+    })
+    graph = Graph.model_validate({
+        "id": "ordinary-local-formats", "version": 1, "nodes": nodes, "edges": [],
+    })
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=graph.id, owner_id="local", name="ordinary local formats"))
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: adapter, storage=storage)
+
+    candidates: list[dict[str, str]] = []
+    manifest = runs._resolve_local_run_manifest(
+        graph, None, deps, materialize_local_files=True,
+        local_file_candidates=candidates)
+    assert [item["node_id"] for item in manifest] == [node["id"] for node in nodes]
+    assert {item["provider"] for item in manifest} == {"local-file-snapshot"}
+    submission_id = str(uuid.uuid4())
+    run_id, created = metadb.admit_local_run_inputs(
+        uid="local", canvas_id=graph.id, submission_id=submission_id,
+        target_node_id=None, intent_sha256="e" * 64, manifest=manifest,
+        local_file_candidates=candidates)
+    assert created is True
+    finalize_local_file_candidates(storage, candidates, run_id)
+
+    retry_candidates: list[dict[str, str]] = []
+    retry_manifest = runs._resolve_local_run_manifest(
+        graph, None, deps, materialize_local_files=True,
+        local_file_candidates=retry_candidates)
+    assert retry_candidates == []
+    assert [(item["node_id"], item["dataset_id"], item["revision_id"])
+            for item in retry_manifest] == [
+                (item["node_id"], item["dataset_id"], item["revision_id"])
+                for item in manifest]
+    adopted_id, created = metadb.admit_local_run_inputs(
+        uid="local", canvas_id=graph.id, submission_id=submission_id,
+        target_node_id=None, intent_sha256="e" * 64, manifest=retry_manifest)
+    assert (adopted_id, created) == (run_id, False)
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.LocalFileInputRevision)) == 4
+        assert session.scalar(select(func.count()).select_from(
+            metadb.LocalResultArtifact)) == 4
+
+    for source in original_paths:
+        renamed = source.with_name(f"renamed-{source.name}")
+        os.replace(source, renamed)
+        _write_ordinary_source(renamed, [99])
+    restarted_storage = LocalStorage(str(tmp_path / "outputs"))
+    bound = runs._bind_local_run_manifest(graph, manifest, deps, None)
+    assert [DuckDBAdapter().scan(node.data["config"]["uri"]).fetchall()
+            for node in bound.nodes] == [[(1,), (2,)]] * 5
+    for artifact in bound._input_artifact_uris.values():
+        with restarted_storage.acquire_result_read(artifact, "restart-test") as guard:
+            guard.check()
+
+    metadb.delete_canvas_cascade(graph.id)
+    restarted_storage.prune_results(limit=50)
+    for item in manifest:
+        assert metadb.local_file_input_revision_artifact(
+            item["dataset_id"], item["revision_id"]) is None
+
+
+def test_local_file_mutation_during_snapshot_fails_before_admission(tmp_path, monkeypatch):
+    from hub import local_run_inputs
+
+    source = tmp_path / "moving.csv"
+    source.write_text("value\n" + "1\n" * (1024 * 1024))
+    source_identity = os.stat(source)
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)
+    catalog._add(name="moving", uri=str(source), strict_probe=True)
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: adapter, storage=storage)
+    original_read = os.read
+    changed = False
+
+    def mutate_after_first_source_chunk(fd: int, size: int) -> bytes:
+        nonlocal changed
+        data = original_read(fd, size)
+        current = os.fstat(fd)
+        if (data and not changed
+                and (current.st_dev, current.st_ino) == (
+                    source_identity.st_dev, source_identity.st_ino)):
+            changed = True
+            with source.open("ab") as stream:
+                stream.write(b"2\n")
+        return data
+
+    monkeypatch.setattr(local_run_inputs.os, "read", mutate_after_first_source_chunk)
+    with pytest.raises(APIError) as exc:
+        runs._resolve_local_run_manifest(
+            _graph(str(source)), "source", deps,
+            materialize_local_files=True, local_file_candidates=[])
+    assert exc.value.status_code == 409
+    assert exc.value.code == APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED
+    assert exc.value.detail == "ordinary local input changed while its exact binding was created"
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.RunInputAdmission)) == 0
+        assert session.scalar(select(func.count()).select_from(
+            metadb.LocalResultArtifact)) == 0
+
+
+def test_postgres_ordinary_local_admission_publishes_mapping_and_owner(tmp_path):
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("PostgreSQL admission contract")
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    source = tmp_path / "postgres-input.parquet"
+    _write_ordinary_source(source, [7])
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)
+    catalog._add(name=f"postgres-{uuid.uuid4().hex}", uri=str(source), strict_probe=True)
+    graph = Graph.model_validate({
+        "id": f"postgres-local-input-{uuid.uuid4().hex}",
+        "version": 1,
+        "nodes": [
+            {"id": node_id, "type": "source", "position": {"x": 0, "y": index},
+             "data": {"config": {"uri": str(source)}}}
+            for index, node_id in enumerate(("first", "repeat"))
+        ],
+        "edges": [],
+    })
+    with metadb.session() as session:
+        session.add(metadb.Canvas(id=graph.id, owner_id="local", name="postgres local input"))
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: adapter, storage=storage)
+    candidates: list[dict[str, str]] = []
+    manifest = runs._resolve_local_run_manifest(
+        graph, None, deps, materialize_local_files=True,
+        local_file_candidates=candidates)
+    run_id, created = metadb.admit_local_run_inputs(
+        uid="local", canvas_id=graph.id, submission_id=str(uuid.uuid4()),
+        target_node_id=None, intent_sha256="f" * 64, manifest=manifest,
+        local_file_candidates=candidates)
+    assert created is True
+    finalize_local_file_candidates(storage, candidates, run_id)
+    artifact = metadb.local_file_input_revision_artifact(
+        manifest[0]["dataset_id"], manifest[0]["revision_id"])
+    assert artifact is not None
+    with metadb.session() as session:
+        assert session.get(metadb.LocalResultReference, {
+            "uri": artifact, "owner_kind": "run_input_admission", "owner_key": run_id,
+        }) is not None
+    assert [row[0] for row in adapter.scan(artifact).fetchall()] == [7]
+
+    metadb.delete_canvas_cascade(graph.id)
+    metadb.catalog_delete_entry(str(source))
+    storage.prune_results(limit=10)
+    assert metadb.local_file_input_revision_artifact(
+        manifest[0]["dataset_id"], manifest[0]["revision_id"]) is None
 
 
 def test_manifest_is_ordered_secret_free_and_reopens_the_original_lance_head(tmp_path):
@@ -268,7 +461,7 @@ def _local_start_context(monkeypatch):
     monkeypatch.setattr(runs, "_route_by_capability", lambda *_args: runner)
     monkeypatch.setattr(runs, "_require_destination_credential_preflight", lambda *_args: None)
     monkeypatch.setattr(runs, "_cone_size", lambda *_args: (1, 1, {}))
-    monkeypatch.setattr(runs, "_resolve_local_run_manifest", lambda *_args: manifest)
+    monkeypatch.setattr(runs, "_resolve_local_run_manifest", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(runs, "_bind_local_run_manifest", lambda graph, *_args: graph)
     return deps, _graph("lance://admission")
 

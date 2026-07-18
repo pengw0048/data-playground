@@ -15,6 +15,7 @@
           "canvas_not_found",
           "method_not_allowed",
           "conflict",
+          "local_run_input_binding_failed",
           "resource_gone",
           "payload_too_large",
           "validation_error",

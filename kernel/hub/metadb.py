@@ -28,7 +28,8 @@ from urllib.parse import unquote, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String,
-    Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select, update,
+    Text, UniqueConstraint, and_, cast, create_engine, delete, exists, func, literal, or_, select,
+    tuple_, update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
@@ -270,6 +271,17 @@ class RunInputAdmission(Base):
     __table_args__ = (
         UniqueConstraint("creator_id", "canvas_id", "submission_id", name="uq_run_input_admission_submission"),
     )
+
+
+class LocalFileInputRevision(Base):
+    """Content-identified immutable Parquet binding for one ordinary local-file input."""
+    __tablename__ = "local_file_input_revisions"
+    dataset_id: Mapped[str] = mapped_column(String, primary_key=True)
+    revision_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    artifact_uri: Mapped[str] = mapped_column(
+        Text, ForeignKey("local_result_artifacts.uri"), nullable=False, unique=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
 
 
 class DurableTask(Base):
@@ -4923,9 +4935,66 @@ def local_run_submission_id(uid: str, canvas_id: str | None, submission_id: str)
     return f"run_{hashlib.sha256(canonical.encode()).hexdigest()[:48]}"
 
 
+_LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
+
+
+def _admit_local_file_input_revisions(
+        s, manifest: list[dict[str, str]], candidates: list[dict[str, str]]) -> None:
+    """Publish candidate snapshot mappings and prove every local-file manifest binding."""
+    if any(
+            not isinstance(item, dict)
+            or set(item) != {"dataset_id", "revision_id", "artifact_uri"}
+            or any(not isinstance(value, str) or not value for value in item.values())
+            for item in candidates):
+        raise ValueError("local file input candidates are invalid")
+    candidate_by_identity = {
+        (item["dataset_id"], item["revision_id"]): item for item in candidates}
+    required = [
+        (item["dataset_id"], item["revision_id"])
+        for item in manifest if item["provider"] == _LOCAL_FILE_INPUT_PROVIDER]
+    if any(identity not in required for identity in candidate_by_identity):
+        raise ValueError("local file input candidate is absent from the manifest")
+    for dataset_id, revision_id in required:
+        candidate = candidate_by_identity.get((dataset_id, revision_id))
+        if candidate is not None:
+            artifact = s.get(LocalResultArtifact, candidate["artifact_uri"], with_for_update=True)
+            if artifact is None or artifact.state != "ready":
+                raise RuntimeError("local file input candidate is not an immutable ready artifact")
+            values = {
+                "dataset_id": dataset_id,
+                "revision_id": revision_id,
+                "artifact_uri": candidate["artifact_uri"],
+                "created_at": _db_now(s),
+            }
+            if s.get_bind().dialect.name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert as dialect_insert
+            else:
+                from sqlalchemy.dialects.sqlite import insert as dialect_insert
+            s.execute(dialect_insert(LocalFileInputRevision).values(
+                **values,
+            ).on_conflict_do_nothing(
+                index_elements=[
+                    LocalFileInputRevision.dataset_id,
+                    LocalFileInputRevision.revision_id,
+                ]))
+        binding = s.get(
+            LocalFileInputRevision,
+            {"dataset_id": dataset_id, "revision_id": revision_id},
+            with_for_update=True,
+        )
+        if binding is None:
+            raise RuntimeError("local file input revision is unavailable")
+        registration = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.registration_id == dataset_id).limit(1)).first()
+        if registration is None:
+            raise RuntimeError("local file input registration is unavailable")
+
+
 def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: str,
                            target_node_id: str | None, intent_sha256: str,
-                           manifest: list[dict[str, str]]) -> tuple[str, bool]:
+                           manifest: list[dict[str, str]],
+                           local_file_candidates: list[dict[str, str]] | None = None,
+                           ) -> tuple[str, bool]:
     """Atomically retain one exact local admission, or adopt the identical prior submission.
 
     The manifest is validated as secret-free, ordered primitive evidence before it crosses the durable
@@ -4959,6 +5028,8 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
                     or existing.intent_sha256 != intent_sha256):
                 raise RuntimeError("local run submission does not match its persisted admission")
             return run_id, False
+        _admit_local_file_input_revisions(
+            s, manifest, list(local_file_candidates or []))
         s.add(RunInputAdmission(
             run_id=run_id, creator_id=uid, canvas_id=canvas,
             submission_id=str(submission_id).lower(), target_node_id=target_node_id,
@@ -4967,6 +5038,33 @@ def admit_local_run_inputs(*, uid: str, canvas_id: str | None, submission_id: st
         s.flush()
         sync_local_result_owner(s, "run_input_admission", run_id, manifest)
         return run_id, True
+
+
+def local_file_input_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
+    """Return the immutable artifact for one content-identified ordinary local input."""
+    with session() as s:
+        row = s.get(LocalFileInputRevision, {
+            "dataset_id": str(dataset_id), "revision_id": str(revision_id),
+        })
+        return row.artifact_uri if row is not None else None
+
+
+def local_file_input_revision_for_artifact(uri: str) -> dict | None:
+    """Resolve a private snapshot artifact to its exact dataset/revision identity."""
+    with session() as s:
+        row = s.scalars(select(LocalFileInputRevision).where(
+            LocalFileInputRevision.artifact_uri == str(uri)).limit(1)).first()
+        if row is None:
+            return None
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            return None
+        return {
+            "dataset_id": row.dataset_id,
+            "revision_id": row.revision_id,
+            "artifact_uri": row.artifact_uri,
+            "created_at": row.created_at,
+        }
 
 
 def local_run_input_manifest(run_id: str) -> list[dict[str, str]] | None:
@@ -8195,6 +8293,35 @@ def _manifest_revision_identities(value: object) -> set[tuple[str, str]]:
     return identities
 
 
+def _manifest_local_file_input_identities(value: object) -> set[tuple[str, str]]:
+    """Extract content-identified ordinary local-file bindings from a manifest surface."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return set()
+    if isinstance(value, dict):
+        identities: set[tuple[str, str]] = set()
+        for key in ("input_manifest", "inputManifest"):
+            if key in value:
+                identities.update(_manifest_local_file_input_identities(value[key]))
+        profile = value.get("profile")
+        if isinstance(profile, dict):
+            identities.update(_manifest_local_file_input_identities(profile))
+        return identities
+    if not isinstance(value, list):
+        return set()
+    identities = set()
+    for item in value:
+        if not isinstance(item, dict) or item.get("provider") != _LOCAL_FILE_INPUT_PROVIDER:
+            continue
+        dataset_id = item.get("dataset_id")
+        revision_id = item.get("revision_id")
+        if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
+            identities.add((dataset_id, revision_id))
+    return identities
+
+
 def _canvas_revision_identities(value: object) -> set[tuple[str, str]]:
     """Extract exact core-revision selections from one canonical canvas document."""
     if not isinstance(value, dict):
@@ -8229,6 +8356,14 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))
+    return sorted(identities)
+
+
+def _local_result_input_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    if owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
+        for value in values:
+            identities.update(_manifest_local_file_input_identities(value))
     return sorted(identities)
 
 
@@ -8276,7 +8411,9 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
     candidates = _local_result_owner_candidates(owner_kind, values)
     revision_identities = _local_result_revision_identities(owner_kind, values)
-    if not candidates and not revision_identities and s.scalar(select(LocalResultReference.uri).where(
+    input_identities = _local_result_input_identities(owner_kind, values)
+    input_artifact_uris: set[str] = set()
+    if not candidates and not revision_identities and not input_identities and s.scalar(select(LocalResultReference.uri).where(
             LocalResultReference.owner_kind == owner_kind,
             LocalResultReference.owner_key == str(owner_key)).limit(1)) is None:
         # The durable owner row/key is already serialized by its caller. Avoid turning every ordinary
@@ -8303,6 +8440,24 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
                 raise RuntimeError("core-managed revision reference does not match its dataset")
             candidates.append(revision.artifact_uri)
         candidates = sorted(set(candidates))
+    if input_identities:
+        bindings = {
+            (row.dataset_id, row.revision_id): row for row in s.scalars(
+                select(LocalFileInputRevision).where(
+                    tuple_(
+                        LocalFileInputRevision.dataset_id,
+                        LocalFileInputRevision.revision_id,
+                    ).in_(input_identities))
+                .order_by(
+                    LocalFileInputRevision.dataset_id,
+                    LocalFileInputRevision.revision_id,
+                ).with_for_update())
+        }
+        if set(bindings) != set(input_identities):
+            raise RuntimeError("local file input revision reference is unavailable")
+        input_artifact_uris = {binding.artifact_uri for binding in bindings.values()}
+        candidates.extend(input_artifact_uris)
+        candidates = sorted(set(candidates))
     artifacts: list[LocalResultArtifact] = []
     for start in range(0, len(candidates), _LOCAL_RESULT_QUERY_CHUNK):
         chunk = candidates[start:start + _LOCAL_RESULT_QUERY_CHUNK]
@@ -8318,7 +8473,11 @@ def sync_local_result_owner(s, owner_kind: str, owner_key: str, *values) -> None
             raise RuntimeError("managed local result is not ready for durable publication")
         if artifact.writer_run_id is not None or artifact.writer_token is not None:
             if (owner_kind not in ("run_state", "managed_file_revision")
-                    or (owner_kind == "run_state" and str(owner_key) != artifact.writer_run_id)):
+                    or (owner_kind == "run_state" and str(owner_key) != artifact.writer_run_id)) \
+                    and not (
+                        owner_kind == "run_input_admission"
+                        and artifact.uri in input_artifact_uris
+                    ):
                 # Only the exact writer's RunState transaction may establish the primary ref and clear
                 # its writer pair. Secondary owners cannot pin a guessed/provisional URI before that.
                 raise RuntimeError(
@@ -9286,6 +9445,9 @@ def delete_local_result(uri: str, namespace_id: str, delete_token: str, delete_f
         if _uri_bound_as_checkpoint_candidate(s, uri):
             raise RuntimeError("cannot delete a checkpoint-bound local result")
         delete_file()
+        for binding in s.scalars(select(LocalFileInputRevision).where(
+                LocalFileInputRevision.artifact_uri == uri).with_for_update()):
+            s.delete(binding)
         s.delete(row)
         return True
 

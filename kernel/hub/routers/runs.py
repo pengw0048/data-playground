@@ -34,6 +34,7 @@ from hub.executors.engine import declared_schema
 from hub.executors.preview import preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
+from hub.local_run_inputs import LocalRunInputError
 from hub.plugins.adapters import revision_adapter_for_uri
 from hub.run_outputs import (
     UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
@@ -259,7 +260,10 @@ def _local_run_source_nodes(graph, target_node_id: str | None):
     return [node for node in cone if node.type == "source"]
 
 
-def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list[dict[str, str]]:
+def _resolve_local_run_manifest(
+        graph, target_node_id: str | None, deps, *, materialize_local_files: bool = False,
+        local_file_candidates: list[dict[str, str]] | None = None,
+        ) -> list[dict[str, str]]:
     """Resolve every local-run Source once through its registered exact-revision provider."""
     resolved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     manifest: list[dict[str, str]] = []
@@ -268,24 +272,49 @@ def _resolve_local_run_manifest(graph, target_node_id: str | None, deps) -> list
         uri = str(cfg.get("uri") or "")
         binding = metadb.catalog_revision_binding_for_uri(uri)
         adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
-        if binding is None or not isinstance(adapter, DatasetRevisionAdapter):
+        if binding is None:
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         dataset_ref = cfg.get("datasetRef")
         try:
-            if isinstance(dataset_ref, dict):
+            if not isinstance(adapter, DatasetRevisionAdapter):
+                if isinstance(dataset_ref, dict) or not materialize_local_files:
+                    raise RuntimeError("source has no provider-native exact revision")
+                from hub.local_run_inputs import (
+                    LOCAL_FILE_INPUT_PROVIDER,
+                    snapshot_local_file_input,
+                )
+                revision_id, candidate = snapshot_local_file_input(
+                    uri=uri,
+                    config=cfg if isinstance(cfg, dict) else {},
+                    dataset_id=str(binding["dataset_id"]),
+                    adapter=adapter,
+                    storage=deps.storage,
+                )
+                if candidate is not None:
+                    if local_file_candidates is None:
+                        raise RuntimeError("local file snapshot candidate has no admission owner")
+                    local_file_candidates.append(candidate)
+                provider = LOCAL_FILE_INPUT_PROVIDER
+            elif isinstance(dataset_ref, dict):
                 dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                 if str(binding["dataset_id"]) != dataset_id:
                     raise ValueError("selected dataset identity does not match the current registration")
                 with db.base_guard():
                     adapter.open_revision(uri, revision_id)
+                provider = str(getattr(adapter, "name", "") or "")
             else:
                 resolved = adapter.resolve_revision(uri)
                 revision_id = str(resolved.get("revision_id") or "")
+                provider = str(getattr(adapter, "name", "") or "")
+        except LocalRunInputError as exc:
+            raise APIError(
+                409, str(exc), code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
+                retryable=False,
+            ) from exc
         except Exception as exc:  # missing pins and provider errors never permit a fallback to head
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
-        provider = str(getattr(adapter, "name", "") or "")
         if not revision_id or not provider:
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
@@ -2005,26 +2034,53 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     from hub.subprocess_runner import SubprocessRunner
 
     transport_requires_admission = isinstance(runner, (KernelBackend, SubprocessRunner))
-    if transport_requires_admission and submission_id is None:
+    local_sources = _local_run_source_nodes(graph, target_node_id)
+    registered_local_sources = bool(local_sources) and all(
+        isinstance(node.data, dict)
+        and isinstance(node.data.get("config"), dict)
+        and metadb.catalog_revision_binding_for_uri(str(
+            node.data["config"].get("uri") or "")) is not None
+        for node in local_sources
+    )
+    local_runner_admission = bool(
+        runner is deps.runner
+        and (submission_id is not None or registered_local_sources))
+    built_in_local_transport = transport_requires_admission or local_runner_admission
+    if built_in_local_transport and not controller_regions and submission_id is None:
         submission_id = str(uuid.uuid4())
     local_admission = bool(
         not controller_regions
-        and (transport_requires_admission or (submission_id and runner is deps.runner))
+        and built_in_local_transport
     )
     dispatch_graph = graph
     dispatch_manifest: list[dict[str, str]] | None = None
     prebound_local_run_id: str | None = None
     if local_admission:
         assert submission_id is not None
-        manifest = (input_manifest if input_manifest is not None
-                    else _resolve_local_run_manifest(graph, target_node_id, deps))
         operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
         if operational_canvas is None:
             raise RuntimeError("local run admission requires a persisted canvas")
-        prebound_local_run_id, _created = metadb.admit_local_run_inputs(
-            uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
-            target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
-        )
+        prebound_local_run_id = metadb.local_run_submission_id(
+            uid, operational_canvas, str(submission_id))
+        candidates: list[dict[str, str]] = []
+        try:
+            prior_manifest = metadb.local_run_input_manifest(prebound_local_run_id)
+            manifest = (input_manifest if input_manifest is not None
+                        else prior_manifest if prior_manifest is not None
+                        else _resolve_local_run_manifest(
+                            graph, target_node_id, deps,
+                            materialize_local_files=True,
+                            local_file_candidates=candidates,
+                        ))
+            prebound_local_run_id, _created = metadb.admit_local_run_inputs(
+                uid=uid, canvas_id=operational_canvas, submission_id=str(submission_id),
+                target_node_id=target_node_id, intent_sha256=str(intent_sha256), manifest=manifest,
+                local_file_candidates=candidates,
+            )
+        finally:
+            from hub.local_run_inputs import finalize_local_file_candidates
+            if candidates:
+                finalize_local_file_candidates(deps.storage, candidates, prebound_local_run_id)
         persisted = metadb.local_run_input_manifest(prebound_local_run_id)
         if persisted is None:
             raise RuntimeError("local run admission was not persisted")
