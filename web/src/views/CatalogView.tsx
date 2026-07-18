@@ -918,7 +918,9 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
       pushToast('This catalog entry cannot be removed with a version precondition', 'error')
       return
     }
-    if (!window.confirm(`Remove "${table.name}" from the catalog?`)) return
+    if (!window.confirm(
+      `Unregister "${table.name}"? This removes the catalog registration, not underlying data.`,
+    )) return
     setDeleting(true)
     try { await api.unregisterTable(table.id, base.registrationId, base.metadataRevision); pushToast('Removed from catalog', 'success'); onDeleted() }
     catch (e) { pushToast(errorMessage(e), 'error') }

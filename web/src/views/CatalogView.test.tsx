@@ -192,7 +192,7 @@ describe('CatalogView request and mutation truth', () => {
     mocks.saveTableEdit
       .mockRejectedValueOnce(new Error('HTTP 409: concurrent edit'))
       .mockResolvedValueOnce({ ...TABLE, folder: 'curated/sales' })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<CatalogView />)
     fireEvent.click(await screen.findByText('orders'))
 
@@ -216,6 +216,7 @@ describe('CatalogView request and mutation truth', () => {
     fireEvent.click(screen.getByTestId('detail-save'))
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(2))
     fireEvent.click(screen.getByTestId('detail-unregister'))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('not underlying data'))
     await waitFor(() => expect(mocks.catalogTree).toHaveBeenCalledTimes(3))
   })
 
