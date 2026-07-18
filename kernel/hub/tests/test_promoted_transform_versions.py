@@ -235,6 +235,73 @@ def test_promoted_exact_version_runs_across_metadata_isolated_subprocess() -> No
         metadb.set_setting("backend", "", "user", uid)
 
 
+def test_promoted_nested_section_child_runs_across_isolated_subprocess() -> None:
+    uid = _user("promoted-section-subprocess")
+    promoted = _promotion(uid, code=(
+        "def fn(row):\n    row['section_marker'] = 'nested-exact'\n    return row"))
+    canvas_id = f"promoted-section-{uuid.uuid4().hex}"
+    uri = get_deps().catalog.get_table("tbl_events").uri
+    graph = {
+        "id": canvas_id, "name": "promoted nested Section", "version": 1,
+        "requirements": [],
+        "nodes": [
+            {
+                "id": "source", "type": "source", "position": {"x": 0, "y": 0},
+                "data": {"config": {"uri": uri}},
+            },
+            {
+                "id": "outer", "type": "section", "position": {"x": 100, "y": 0},
+                "data": {"title": "outer", "config": {
+                    "script": "emit(run('inner', data=inputs['in']))\n",
+                    "params": {}, "maxRuns": 10,
+                }},
+            },
+            {
+                "id": "inner", "type": "section", "parentId": "outer",
+                "position": {"x": 0, "y": 0},
+                "data": {"title": "inner", "config": {
+                    "script": "emit(run('exact', data=inputs['in']))\n",
+                    "params": {}, "maxRuns": 10,
+                }},
+            },
+            {
+                "id": "exact", "type": "transform", "parentId": "inner",
+                "position": {"x": 0, "y": 0},
+                "data": {"title": "exact", "config": {
+                    "source": "library", "processor": promoted["id"],
+                    "version": promoted["version"], "mode": promoted["mode"], "code": None,
+                }},
+            },
+        ],
+        "edges": [{
+            "id": "source-outer", "source": "source", "target": "outer",
+            "data": {"wire": "dataset"},
+        }],
+    }
+    created = client.post("/api/canvas", headers=_headers(uid), json=graph)
+    assert created.status_code == 200, created.text
+    metadb.set_setting("backend", "local-subprocess", "user", uid)
+    try:
+        started = client.post("/api/run", headers=_headers(uid), json={
+            "graph": graph, "targetNodeId": "outer", "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        status = _poll_run(uid, started.json()["runId"])
+        assert status["status"] == "done", status.get("error")
+        assert len(status["outputs"]) == 1
+        output = status["outputs"][0]
+        sampled = client.post(
+            f"/api/run/{started.json()['runId']}/sample", headers=_headers(uid), json={
+                "nodeId": output["nodeId"], "portId": output["portId"], "k": 5, "offset": 0,
+            },
+        )
+        assert sampled.status_code == 200, sampled.text
+        assert {row["section_marker"] for row in sampled.json()["rows"]} == {"nested-exact"}
+    finally:
+        metadb.set_setting("backend", "", "user", uid)
+
+
 def test_promoted_workload_sidecar_rejects_missing_extra_and_tampered_definitions() -> None:
     from hub.workload_env import prepare_workload_graph, restore_workload_graph
 
@@ -361,6 +428,56 @@ def test_owner_scope_plugin_namespace_and_canvas_capability_authorization() -> N
     )
     assert allowed.status_code == 200
     assert allowed.json()["notPreviewable"] is False
+
+
+def test_missing_future_version_never_becomes_a_canvas_capability_after_publish() -> None:
+    bob, alice = _user("future-transform-bob"), _user("future-transform-alice")
+    key = f"user.future-{uuid.uuid4().hex}"
+    first = _promotion(bob, key=key, blurb="version one")
+    future = {**first, "version": "v2"}
+    canvas = _graph(f"future-transform-{uuid.uuid4().hex}", future)
+
+    # Missing exact versions remain saveable so the Canvas truthfully preserves its intent, but no
+    # active retention row exists and therefore no cross-user capability has been granted.
+    created = client.post("/api/canvas", headers=_headers(alice), json=canvas)
+    assert created.status_code == 200, created.text
+    with metadb.session() as session:
+        refs = list(session.scalars(metadb.select(
+            metadb.PromotedTransformVersionRef).where(
+                metadb.PromotedTransformVersionRef.owner_kind == "canvas",
+                metadb.PromotedTransformVersionRef.owner_key == canvas["id"],
+            )))
+    assert refs == []
+    unavailable = client.post(
+        "/api/run/preview", headers=_headers(alice),
+        json={"graph": canvas, "nodeId": "transform", "k": 1},
+    )
+    assert unavailable.status_code == 200
+    assert unavailable.json()["notPreviewable"] is True
+
+    second = _promotion(bob, key=key, blurb="version two")
+    assert second["id"] == first["id"] and second["version"] == "v2"
+
+    execute_denied = client.post(
+        "/api/run/preview", headers=_headers(alice),
+        json={"graph": canvas, "nodeId": "transform", "k": 1},
+    )
+    assert execute_denied.status_code == 403
+    save_denied = client.put(
+        f"/api/canvas/{canvas['id']}?expectedVersion=1",
+        headers=_headers(alice), json=canvas,
+    )
+    assert save_denied.status_code == 403
+    imported = {**canvas, "id": f"future-import-{uuid.uuid4().hex}"}
+    import_denied = client.post("/api/canvas", headers=_headers(alice), json=imported)
+    assert import_denied.status_code == 403
+
+    with metadb.session() as session:
+        assert session.scalar(metadb.select(
+            metadb.PromotedTransformVersionRef).where(
+                metadb.PromotedTransformVersionRef.owner_kind == "canvas",
+                metadb.PromotedTransformVersionRef.owner_key == canvas["id"],
+            ).limit(1)) is None
 
 
 def test_canvas_snapshot_and_manifest_holds_block_deletion_then_release() -> None:

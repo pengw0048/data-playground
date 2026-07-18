@@ -223,8 +223,9 @@ def _reachable_promoted_transform_nodes(
     from hub.promoted_transforms import (
         PROMOTED_TRANSFORM_ID, promoted_transform_version_number)
 
-    nodes = (graph_mod.upstream_chain(graph, target)
+    roots = (graph_mod.upstream_chain(graph, target)
              if target is not None else graph_mod.topo_order(graph))
+    nodes = graph_mod.execution_nodes(graph, roots)
     result: dict[str, tuple[str, str]] = {}
     for node in nodes:
         data = node.data if isinstance(node.data, dict) else {}

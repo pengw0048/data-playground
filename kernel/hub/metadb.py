@@ -5724,7 +5724,24 @@ def require_promoted_transform_use(
             canvas = s.get(Canvas, str(canvas_id))
             if (canvas is not None
                     and _workspace_canvas_role_in_session(s, canvas, str(uid)) is not None):
-                retained = _promoted_transform_refs(canvas.doc)
+                # Authorization comes only from a hold that was durably established while the exact
+                # version existed and the Canvas writer was authorized. A raw missing-version ref in
+                # ``canvas.doc`` is intentionally not retained; otherwise a future owner promotion
+                # would silently turn that old document into a new cross-user capability.
+                retained = {(str(transform_id), int(version))
+                            for transform_id, version in s.execute(select(
+                                PromotedTransformVersionRef.transform_id,
+                                PromotedTransformVersionRef.version,
+                            ).join(PromotedTransformVersion, and_(
+                                PromotedTransformVersion.transform_id
+                                == PromotedTransformVersionRef.transform_id,
+                                PromotedTransformVersion.version
+                                == PromotedTransformVersionRef.version,
+                            )).where(
+                                PromotedTransformVersionRef.owner_kind == "canvas",
+                                PromotedTransformVersionRef.owner_key == str(canvas_id),
+                                PromotedTransformVersion.deleted_at.is_(None),
+                            ))}
         for transform_id, version in sorted(requested):
             row = s.get(PromotedTransformVersion, (transform_id, version))
             if row is None or row.deleted_at is not None:
