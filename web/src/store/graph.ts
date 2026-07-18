@@ -839,7 +839,7 @@ interface Store {
   // -- kernel + catalog --
   // `catalog` is a bounded WORKING SET — the tables referenced by the open canvas + recently
   // fetched/searched ones — NOT the whole catalog (which can be thousands of tables and is browsed
-  // server-side, paginated, in the Tables view). It exists so canvas source nodes can resolve their
+  // server-side, paginated, in the Workspace dataset scope). It exists so canvas source nodes can resolve their
   // columns and pickers have a warm cache; it is never assumed to be complete.
   bootstrap: () => Promise<void>
   refreshCatalog: () => Promise<void>
@@ -914,7 +914,7 @@ interface Store {
 }
 
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
-export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'tables' | 'transforms' | 'relationships'
+export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'transforms' | 'relationships'
 
 function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
@@ -2217,7 +2217,7 @@ export const useStore = create<Store>((set, get) => ({
     setApiUser(localStorage.getItem(USER_KEY))  // restore chosen user (server defaults to 'local')
     try {
       // NOTE: we deliberately do NOT load the whole catalog here — it can be thousands of tables. The
-      // Tables view browses it server-side (paginated + faceted); the working set is filled on demand
+      // Workspace browses it server-side (paginated + faceted); the working set is filled on demand
       // (ensureCanvasTables when a canvas opens, search results, uploads).
       const [kernelInfo, processors, nodes] = await Promise.all([
         api.kernel(), api.processors(), api.nodes(),
@@ -2488,7 +2488,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   // Refresh the WORKING SET (not the whole catalog): re-fetch the tables the open canvas references,
-  // so declared-key / schema / organization edits made elsewhere show up. The Tables view + ER view
+  // so declared-key / schema / organization edits made elsewhere show up. The Workspace dataset scope + ER view
   // do their own server-side paginated fetches — they don't depend on this.
   refreshCatalog: async () => {
     await get().ensureCanvasTables(get().doc, { force: true })

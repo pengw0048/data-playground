@@ -19,7 +19,7 @@ const store = vi.hoisted(() => ({
 
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
-vi.mock('./CatalogView', () => ({
+vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
   CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId }: {

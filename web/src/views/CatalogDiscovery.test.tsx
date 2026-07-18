@@ -32,7 +32,7 @@ vi.mock('../ui/VirtualList', () => ({
   </div>,
 }))
 
-import { CatalogDiscovery, CatalogView } from './CatalogView'
+import { CatalogDiscovery } from './CatalogDiscovery'
 
 const TABLE: CatalogTable = {
   id: 't1', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
@@ -56,7 +56,12 @@ function deferred<T>() {
 const folder = (path: string) => ({ name: path.split('/').pop()!, path, tableCount: 0 })
 const tree = (prefix: string, paths: string[]) => ({ prefix, folders: paths.map(folder), tables: [] })
 
-describe('CatalogView request and mutation truth', () => {
+function CatalogDiscoveryFixture() {
+  return <CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+    onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />
+}
+
+describe('Catalog discovery request and mutation truth', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.tablesPage.mockResolvedValue({ items: [TABLE], total: 1, hasMore: false })
@@ -122,7 +127,7 @@ describe('CatalogView request and mutation truth', () => {
       .mockResolvedValueOnce({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
       .mockRejectedValueOnce(new Error('HTTP 502: branch failed'))
       .mockResolvedValueOnce({ prefix: 'sales', folders: [{ name: 'daily', path: 'sales/daily', tableCount: 1 }], tables: [] })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     expect(await screen.findByText(/Couldn't load folders: HTTP 500/i)).toBeInTheDocument()
     expect(screen.queryByText('No folders yet')).toBeNull()
@@ -140,7 +145,7 @@ describe('CatalogView request and mutation truth', () => {
       .mockResolvedValueOnce({ items: [TABLE], total: 2, hasMore: true })
       .mockRejectedValueOnce(new Error('Failed to fetch'))
       .mockResolvedValueOnce({ items: [TABLE_2], total: 2, hasMore: false })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     expect(await screen.findByText('orders')).toBeInTheDocument()
 
     fireEvent.click(screen.getByTestId('request-next-page'))
@@ -166,7 +171,7 @@ describe('CatalogView request and mutation truth', () => {
       ],
     })
 
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByText('raw_orders')).toBeInTheDocument()
@@ -193,7 +198,7 @@ describe('CatalogView request and mutation truth', () => {
       .mockRejectedValueOnce(new Error('HTTP 409: concurrent edit'))
       .mockResolvedValueOnce({ ...TABLE, folder: 'curated/sales' })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
 
     expect(await screen.findByText(/Couldn't load lineage: HTTP 503/i)).toBeInTheDocument()
@@ -227,7 +232,7 @@ describe('CatalogView request and mutation truth', () => {
       hasMore: false, truncated: false, completeness: 'complete',
       notPreviewable: false, wire: 'dataset',
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
@@ -245,7 +250,7 @@ describe('CatalogView request and mutation truth', () => {
         identity: 'a'.repeat(64), limitations: ['This is a prefix preview, not representative or random.'],
       },
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
@@ -260,7 +265,7 @@ describe('CatalogView request and mutation truth', () => {
       hasMore: null, truncated: true, completeness: 'unknown',
       notPreviewable: false, wire: 'dataset',
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
@@ -274,7 +279,7 @@ describe('CatalogView request and mutation truth', () => {
       hasMore: true, truncated: true, completeness: 'page',
       notPreviewable: false, wire: 'dataset',
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.click(screen.getByTestId('detail-preview'))
 
@@ -284,7 +289,7 @@ describe('CatalogView request and mutation truth', () => {
   })
 })
 
-describe('CatalogView selection, register modal, and rename', () => {
+describe('Catalog discovery selection, register modal, and rename', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.tablesPage.mockResolvedValue({ items: [TABLE, TABLE_2], total: 2, hasMore: false })
@@ -312,7 +317,7 @@ describe('CatalogView selection, register modal, and rename', () => {
 
   it('multi-selects rows and batch-unregisters them without implying data deletion', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByLabelText('Select orders'))
     fireEvent.click(screen.getByLabelText('Select customers'))
     expect(screen.getByText('2 selected')).toBeInTheDocument()
@@ -330,7 +335,7 @@ describe('CatalogView selection, register modal, and rename', () => {
   })
 
   it('registers a dataset through the modal with the full payload', async () => {
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByTestId('register-dataset'))
     fireEvent.change(screen.getByTestId('register-uri'), { target: { value: '/data/events.parquet' } })
     fireEvent.click(screen.getByTestId('register-submit'))
@@ -339,7 +344,7 @@ describe('CatalogView selection, register modal, and rename', () => {
   })
 
   it('renames a dataset from the detail drawer', async () => {
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'daily orders' } })
     fireEvent.click(screen.getByTestId('detail-save'))
@@ -351,7 +356,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     const conflict = Object.assign(new Error('catalog metadata changed'), { status: 409 })
     mocks.saveTableEdit.mockRejectedValueOnce(conflict).mockResolvedValueOnce({ ...TABLE, name: 'reapplied', metadataRevision: 'm1_new' })
     mocks.table.mockResolvedValue({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'reapplied' } })
     fireEvent.click(screen.getByTestId('detail-pk-order_id'))
@@ -369,7 +374,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     mocks.table.mockRejectedValueOnce(new Error('network down'))
       .mockResolvedValueOnce({ ...TABLE, name: 'other editor', metadataRevision: 'm1_other' })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
     fireEvent.change(screen.getByTestId('detail-name'), { target: { value: 'my draft' } })
 
@@ -387,7 +392,7 @@ describe('CatalogView selection, register modal, and rename', () => {
 
   it('creates an empty folder from the tree', async () => {
     vi.spyOn(window, 'prompt').mockReturnValue('archive')
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByTestId('folder-new'))
     await waitFor(() => expect(mocks.createFolder).toHaveBeenCalledWith('archive'))
   })
@@ -395,7 +400,7 @@ describe('CatalogView selection, register modal, and rename', () => {
   it('renames a folder from the tree and moves the selected filter with it', async () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
     vi.spyOn(window, 'prompt').mockReturnValue('revenue')
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     // select the folder first, then rename it — the filter must follow the rename, not strand
     fireEvent.click(await screen.findByText('📁 sales'))
     fireEvent.click(screen.getByTestId('folder-rename-sales'))
@@ -415,7 +420,7 @@ describe('CatalogView selection, register modal, and rename', () => {
     })
     mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
     vi.spyOn(window, 'prompt').mockReturnValue('revenue')
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder sales' }))
     expect(await screen.findByTestId('folder-rename-sales/daily')).toBeInTheDocument()
@@ -429,14 +434,14 @@ describe('CatalogView selection, register modal, and rename', () => {
   it('deletes a folder from the tree after confirming where its datasets go', async () => {
     mocks.catalogTree.mockResolvedValue({ prefix: '', folders: [{ name: 'sales', path: 'sales', tableCount: 1 }], tables: [] })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByTestId('folder-delete-sales'))
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining('the top level'))
     await waitFor(() => expect(mocks.deleteFolder).toHaveBeenCalledWith('sales'))
   })
 })
 
-describe('CatalogView folder child request identity', () => {
+describe('Catalog discovery folder child request identity', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     vi.clearAllMocks()
@@ -460,7 +465,7 @@ describe('CatalogView folder child request identity', () => {
       if (!prefix) return Promise.resolve(tree('', ['A', 'B']))
       return prefix === 'A' ? a.promise : b.promise
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand folder B' }))
@@ -491,7 +496,7 @@ describe('CatalogView folder child request identity', () => {
       }
       return secondA.promise
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(firstSignal).toBeDefined())
@@ -525,7 +530,7 @@ describe('CatalogView folder child request identity', () => {
       if (calls === 2) return second.promise
       return Promise.resolve(tree('A', ['A/recovered']))
     })
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     expect(await screen.findByText('Loading…')).toBeInTheDocument()
@@ -558,7 +563,7 @@ describe('CatalogView folder child request identity', () => {
       return branchCalls === 2 ? revisionOne.promise : revisionTwo.promise
     })
     vi.spyOn(window, 'prompt').mockReturnValue('created')
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     expect(await screen.findByText('📁 initial')).toBeInTheDocument()
@@ -591,12 +596,12 @@ describe('CatalogView folder child request identity', () => {
       }
       return Promise.resolve(tree('A', ['A/new-provider']))
     })
-    const view = render(<CatalogView />)
+    const view = render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(oldSignal).toBeDefined())
     store.kernelInfo = { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit'] }
-    view.rerender(<CatalogView />)
+    view.rerender(<CatalogDiscoveryFixture />)
 
     await waitFor(() => expect(oldSignal?.aborted).toBe(true))
     expect(await screen.findByText('📁 new-provider')).toBeInTheDocument()
@@ -619,7 +624,7 @@ describe('CatalogView folder child request identity', () => {
     }
     function Shell({ version }: { version: number }) {
       return <Suspense fallback={<div data-testid="blocked-provider-render">blocked {version}</div>}>
-        <CatalogView />
+        <CatalogDiscoveryFixture />
         <BlockAfterCatalog />
       </Suspense>
     }
@@ -656,7 +661,7 @@ describe('CatalogView folder child request identity', () => {
     })
     mocks.renameFolder.mockImplementation(async () => { renamed = true; return { ok: true } })
     vi.spyOn(window, 'prompt').mockReturnValue('B')
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByText('📁 A'))
     fireEvent.click(screen.getByRole('button', { name: 'Expand folder A' }))
@@ -682,7 +687,7 @@ describe('CatalogView folder child request identity', () => {
     })
     mocks.deleteFolder.mockImplementation(async () => { deleted = true; return { ok: true } })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    render(<CatalogView />)
+    render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(signal).toBeDefined())
@@ -702,7 +707,7 @@ describe('CatalogView folder child request identity', () => {
       signal = options?.signal
       return pending.promise
     })
-    const view = render(<CatalogView />)
+    const view = render(<CatalogDiscoveryFixture />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand folder A' }))
     await waitFor(() => expect(signal).toBeDefined())

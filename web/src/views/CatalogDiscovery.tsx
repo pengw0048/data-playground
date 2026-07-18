@@ -8,7 +8,7 @@ import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 import type { CatalogQueryParams, CatalogTable, CatalogUnregisterResult, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
 
-// The Tables catalog — built to browse thousands of datasets. Nothing is loaded up front: a left
+// The Workspace dataset discovery surface is built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
 // (infinite scroll), and a right FACET RAIL (tags/owners with counts). A search box (debounced) and a
 // sort control drive the same query; clicking a row opens a detail drawer to inspect columns + lineage
@@ -22,8 +22,7 @@ const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 
 /**
  * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
- * The standalone adapter below can still supply the current Canvas, while Workspace supplies an explicit
- * target in #497 without copying its query, paging, selection, or curation behavior.
+ * Workspace supplies an explicit target without copying its query, paging, selection, or curation behavior.
  */
 export interface CatalogDiscoveryProps {
   sourceIdentity: KernelInfo | null
@@ -51,24 +50,6 @@ export interface CatalogDiscoveryQueryState {
 export const emptyCatalogDiscoveryQuery = (): CatalogDiscoveryQueryState => ({
   q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text',
 })
-
-export function CatalogView() {
-  const addToCanvas = useStore((s) => s.addToCanvas)
-  const rememberTables = useStore((s) => s.rememberTables)
-  const uploadDataset = useStore((s) => s.uploadDataset)
-  // folder create/rename/delete only mean something when the active catalog provider owns the local
-  // folder store; a read-only/external provider omits this capability and we hide the affordances.
-  const catalogSource = useStore((s) => s.kernelInfo)
-  const foldersMutable = catalogSource?.capabilities?.includes('catalog.folder_mutation') ?? false
-
-  const useTables = useCallback((tables: CatalogTable[]) => {
-    rememberTables(tables)
-    tables.forEach((t) => addToCanvas('source', { uri: t.uri, tableId: t.id }, t.name))
-  }, [addToCanvas, rememberTables])
-
-  return <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
-    onUseTables={useTables} onUploadDataset={uploadDataset} />
-}
 
 export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',

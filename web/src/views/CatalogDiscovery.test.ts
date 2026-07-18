@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { CatalogTable } from '../types/api'
-import { rankedResultFacets } from './CatalogView'
+import { rankedResultFacets } from './CatalogDiscovery'
 
 const table = (name: string, folder: string, tags: string[], owner: string): CatalogTable => ({
   id: `tbl_${name}`, name, uri: `mem://${name}`, columns: [], folder, tags, owner,

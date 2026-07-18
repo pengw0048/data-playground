@@ -9,7 +9,7 @@ import { Icon } from '../ui/Icon'
 import {
   CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
   type CatalogDiscoveryQueryState,
-} from './CatalogView'
+} from './CatalogDiscovery'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50

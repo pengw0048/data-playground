@@ -96,7 +96,7 @@ const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
 export function ERDiagram() {
   const pushToast = useStore((s) => s.pushToast)
   const erFocusUri = useStore((s) => s.erFocusUri)
-  const openTables = useStore((s) => s.setView)
+  const openWorkspace = useStore((s) => s.setView)
 
   // focus === null → the global / folder view; otherwise the neighbourhood of that uri
   const [focus, setFocus] = useState<string | null>(erFocusUri)
@@ -324,7 +324,7 @@ export function ERDiagram() {
         {showHelp && (
           <div className="rounded-md border border-border bg-muted/40 p-2 text-[10.5px] leading-relaxed">
             Drag from one entity to another to declare a join. Click a solid edge to remove it. Click an entity title to
-            re-focus the graph on it. Declare a primary key from a table's detail drawer (Tables → open a dataset).
+            re-focus the graph on it. Declare a primary key from a dataset detail drawer in Workspace.
           </div>
         )}
 
@@ -347,7 +347,7 @@ export function ERDiagram() {
       {!loading && !error && visible.length === 0 && (
         <div className="pointer-events-none absolute inset-0 z-[5] grid place-items-center text-[13px] text-muted-foreground">
           {focus ? 'No neighbours at this hop distance.' : total === 0 ? (
-            <span className="pointer-events-auto">No datasets registered yet — add some in <button onClick={() => openTables('tables')} className="underline">Tables</button>.</span>
+            <span className="pointer-events-auto">No datasets registered yet — add some in <button onClick={() => openWorkspace('workspace')} className="underline">Workspace</button>.</span>
           ) : 'No datasets in this folder.'}
         </div>
       )}
