@@ -54,7 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
-        ("0014_linear_checkpoint_materialization_identity", "0013_linear_checkpoint_commit"),
+        ("0014_checkpoint_mat_identity", "0013_linear_checkpoint_commit"),
         ("0013_linear_checkpoint_commit", "0012_linear_checkpoint_admission"),
         ("0012_linear_checkpoint_admission", "0011_external_wait_publication"),
         ("0011_external_wait_publication", "0010_durable_external_waits"),
@@ -69,8 +69,17 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0014_linear_checkpoint_materialization_identity"]
-    assert metadb.expected_schema_head() == "0014_linear_checkpoint_materialization_identity"
+    assert scripts.get_heads() == ["0014_checkpoint_mat_identity"]
+    assert metadb.expected_schema_head() == "0014_checkpoint_mat_identity"
+
+
+def test_migration_revision_ids_fit_alembic_version_num():
+    """PostgreSQL stores alembic_version.version_num as varchar(32); SQLite hides overflows."""
+    scripts = ScriptDirectory.from_config(metadb._alembic_cfg())
+    for revision in scripts.walk_revisions():
+        assert len(revision.revision) <= 32, (
+            f"revision id {revision.revision!r} exceeds alembic_version.version_num "
+            f"varchar(32) and cannot apply on PostgreSQL")
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -113,8 +122,8 @@ def test_committed_migration_revisions_are_immutable():
         "0013_linear_checkpoint_commit.py": (
             "628fda9d102d6ad024054139552ad9d83123081694bb967443843e8aad19aea4"
         ),
-        "0014_linear_checkpoint_materialization_identity.py": (
-            "290c99b7e951bc9e1cfa7d152b0503459b49498d1b16c4951e543426911c9ce2"
+        "0014_checkpoint_mat_identity.py": (
+            "34a3986d904368437e6735291fb9f947604b72dcbd6f481f020872e6a8485337"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}

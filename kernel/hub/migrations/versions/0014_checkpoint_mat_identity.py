@@ -1,6 +1,6 @@
 """Allow reserved checkpoints to bind materialized candidate_dev/ino before commit.
 
-Revision ID: 0014_linear_checkpoint_materialization_identity
+Revision ID: 0014_checkpoint_mat_identity
 Revises: 0013_linear_checkpoint_commit
 """
 
@@ -8,7 +8,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0014_linear_checkpoint_materialization_identity"
+revision = "0014_checkpoint_mat_identity"
 down_revision = "0013_linear_checkpoint_commit"
 branch_labels = None
 depends_on = None
