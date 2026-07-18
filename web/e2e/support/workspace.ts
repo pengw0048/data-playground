@@ -13,7 +13,7 @@ export async function backToWorkspace(page: Page) {
 
 export async function workspaceResource(
   page: Page,
-  kind: 'canvas' | 'dataset' | 'container',
+  kind: 'canvas' | 'dataset' | 'container' | 'catalog folder',
   name: string,
 ): Promise<Locator> {
   const resource = page.getByRole('button', { name: `Open ${kind} ${name}`, exact: true })

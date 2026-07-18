@@ -79,10 +79,19 @@ def downgrade() -> None:
     connection = op.get_bind()
     retained = connection.execute(sa.text(
         "SELECT 1 FROM workspace_placements p JOIN workspace_containers c "
-        "ON c.id = p.container_id WHERE c.catalog_folder_id IS NOT NULL LIMIT 1"
+        "ON c.id = p.container_id WHERE c.catalog_folder_id IS NOT NULL "
+        "AND p.target_kind != 'dataset' LIMIT 1"
     )).first()
     if retained is not None:
         raise RuntimeError("cannot downgrade while Catalog folder overlays contain placements")
+    # Dataset placement is Catalog-owned and existed before this migration at the local root. Move it
+    # back there so a database with ordinary registered datasets can round-trip through this revision;
+    # only independently owned overlays require an explicit move-out before downgrade.
+    connection.execute(sa.text(
+        "UPDATE workspace_placements SET container_id = 'workspace-local-root' "
+        "WHERE target_kind = 'dataset' AND container_id IN "
+        "(SELECT id FROM workspace_containers WHERE catalog_folder_id IS NOT NULL)"
+    ))
     connection.execute(sa.text(
         "DELETE FROM workspace_containers WHERE catalog_folder_id IS NOT NULL"
     ))

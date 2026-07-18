@@ -200,6 +200,7 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
     created = metadb.workspace_create_canvas_action(
         uid=metadb.DEFAULT_USER_ID, container_id=projection_id,
         expected_container_version=projection_version, name="Folder overlay")
+    nested = metadb.workspace_create_container(projection_id, f"workspace-{token}-nested-overlay")
     metadb.catalog_folder_rename(original.rsplit("/", 1)[0], renamed.rsplit("/", 1)[0])
     with metadb.session() as session:
         renamed_folder = session.scalar(select(metadb.CatalogFolder).where(
@@ -230,6 +231,17 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
         metadb.workspace_create_canvas_action(
             uid=metadb.DEFAULT_USER_ID, container_id=projection_id,
             expected_container_version=tombstone_version, name="Blocked")
+    with pytest.raises(ValueError, match="read-only Workspace tombstone"):
+        metadb.workspace_create_container(nested["id"], f"workspace-{token}-blocked-child")
+    with pytest.raises(ValueError, match="read-only Workspace tombstone"):
+        metadb.workspace_update_placement(
+            created["resource"]["placementId"],
+            expected_version=created["resource"]["version"],
+            container_id=nested["id"])
+    escaped = metadb.workspace_update_container(
+        nested["id"], expected_version=nested["version"],
+        parent_id=metadb.LOCAL_WORKSPACE_ROOT_ID)
+    assert escaped["parentId"] == metadb.LOCAL_WORKSPACE_ROOT_ID
     moved = metadb.workspace_move_canvas_action(
         uid=metadb.DEFAULT_USER_ID, placement_id=created["resource"]["placementId"],
         expected_version=created["resource"]["version"],
@@ -247,6 +259,58 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
             metadb.WorkspaceContainer.catalog_folder_id == replacement_folder.id)) if replacement_folder else None
         assert replacement_folder is not None and replacement_folder.id != folder_id
         assert replacement_projection is not None and replacement_projection.id != projection_id
+
+
+def test_catalog_projection_partial_uniqueness_serializes_local_name_collisions(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    name = f"workspace-{token}-authority-collision"
+    root_id = metadb.LOCAL_WORKSPACE_ROOT_ID
+    metadb.catalog_folder_create(name)
+    start = threading.Barrier(3)
+    results = []
+
+    def create_local_container():
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_create_container(root_id, name))
+        except Exception as exc:  # noqa: BLE001 - assert the public conflict type below
+            results.append(exc)
+
+    threads = [threading.Thread(target=create_local_container) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        winners = [result for result in results if isinstance(result, dict)]
+        conflicts = [result for result in results if isinstance(result, metadb.WorkspaceNameConflict)]
+        assert len(winners) == len(conflicts) == 1
+        with metadb.session() as session:
+            siblings = list(session.scalars(select(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.parent_id == root_id,
+                metadb.WorkspaceContainer.name == name)))
+        assert len(siblings) == 2
+        assert {row.catalog_folder_id is None for row in siblings} == {False, True}
+    finally:
+        for thread in threads:
+            thread.join(timeout=10)
+        with metadb.session() as session:
+            local = session.scalar(select(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.parent_id == root_id,
+                metadb.WorkspaceContainer.name == name,
+                metadb.WorkspaceContainer.catalog_folder_id.is_(None)))
+            if local is not None:
+                session.delete(local)
+        try:
+            metadb.catalog_folder_delete(name)
+        except ValueError:
+            pass
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceContainer).where(
+                metadb.WorkspaceContainer.catalog_folder_path == name))
 
 
 def test_workspace_api_mixes_keyset_pages_resolves_ancestors_and_never_writes_catalog(workspace_scope):

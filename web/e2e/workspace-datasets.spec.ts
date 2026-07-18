@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test'
 import { unlink, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { workspaceResource } from './support/workspace'
 
 type RegisteredDataset = {
   id: string
@@ -12,6 +13,7 @@ type RegisteredDataset = {
 test('discovers, previews, batch-uses, runs, and safely unregisters local datasets @ux-smoke', async ({ page }) => {
   const suffix = Date.now()
   const registeredName = `issue497_registered_${suffix}`
+  const registeredFolder = `research/issue-497-${suffix}`
   const uploadedFilename = `issue497_uploaded_${suffix}.csv`
   const registeredPath = resolve('.e2e-workspace/data', `${registeredName}.csv`)
   const canvasName = `Issue 497 dataset exploration ${suffix}`
@@ -29,7 +31,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByTestId('register-dataset').click()
     await page.getByTestId('register-uri').fill(registeredPath)
     await page.getByLabel('Name (optional)').fill(registeredName)
-    await page.getByLabel('Folder (optional)').fill('research/issue-497')
+    await page.getByLabel('Folder (optional)').fill(registeredFolder)
     await page.getByLabel('Tags (optional)').fill('robotics, acceptance')
     await page.getByLabel('Owner (optional)').fill('research-data')
     const registeredResponse = page.waitForResponse((response) => response.url().endsWith('/api/catalog/register') && response.request().method() === 'POST')
@@ -37,6 +39,18 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     registered = await (await registeredResponse).json() as RegisteredDataset
     expect(registered.registrationId).toBeTruthy()
     expect(registered.metadataRevision).toBeTruthy()
+
+    await page.getByRole('tab', { name: 'All Workspace' }).click()
+    const catalogRoot = await workspaceResource(page, 'catalog folder', 'research')
+    await expect(catalogRoot.locator('..')).toContainText('Catalog folder · Local Catalog projection')
+    await catalogRoot.click()
+    const projectedFolder = await workspaceResource(page, 'catalog folder', `issue-497-${suffix}`)
+    await projectedFolder.click()
+    await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
+    await expect(page).toHaveURL(/#\/workspace\/container%3A/)
+    await page.reload()
+    await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
+    await page.getByRole('tab', { name: 'Datasets' }).click()
 
     const uploadedResponse = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upload') && response.request().method() === 'POST')
     await page.locator('input[type="file"]').setInputFiles({

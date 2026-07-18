@@ -159,7 +159,7 @@ def test_committed_migration_revisions_are_immutable():
             "105d5d314c0ab1a9faf250a6993a9608cf92d2c6a90ad495782f837425fe324f"
         ),
         "0023_catalog_folder_workspace_overlay.py": (
-            "2bcdbe3058e134fc943f043adcabc89fc8980831522ff3e3107ca1fcedc76917"
+            "4aa7f207cd122847253bb5f40a6c9a8eab454434d1a14a3c0b5415f95aba6de7"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
@@ -317,6 +317,50 @@ def test_historical_baseline_upgrade_repairs_workspace_metadata_without_data_los
             assert compare_metadata(context, metadb.Base.metadata) == []
 
         assert metadb.migrate_db() == metadb.expected_schema_head()
+
+
+def test_catalog_folder_overlay_upgrade_and_dataset_only_downgrade_round_trip(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'catalog-folder-overlay.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0022_task_manifests")
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO catalog_folders (path, created_at) "
+                "VALUES ('research', CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO catalog_entries "
+                "(uri, registration_id, name, doc, folder, usage, updated_at) VALUES "
+                "('file:///migration-dataset.parquet', 'migration-dataset-000000000001', "
+                "'Migration dataset', '{}', 'research', 0, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO workspace_placements "
+                "(id, container_id, target_kind, target_id, name, ordinal, version) VALUES "
+                "('migration-placement', 'workspace-local-root', 'dataset', "
+                "'migration-dataset-000000000001', 'Migration dataset', 0, 1)"))
+
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert connection.execute(sa.text(
+                "SELECT c.catalog_folder_path FROM workspace_placements p "
+                "JOIN workspace_containers c ON c.id = p.container_id "
+                "WHERE p.id = 'migration-placement'"
+            )).scalar_one() == "research"
+
+            command.downgrade(metadb._alembic_cfg(connection), "0022_task_manifests")
+            assert connection.execute(sa.text(
+                "SELECT container_id FROM workspace_placements "
+                "WHERE id = 'migration-placement'"
+            )).scalar_one() == "workspace-local-root"
+            assert "catalog_folder_id" not in {
+                column["name"] for column in inspect(connection).get_columns("workspace_containers")
+            }
+
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert connection.execute(sa.text(
+                "SELECT c.catalog_folder_path FROM workspace_placements p "
+                "JOIN workspace_containers c ON c.id = p.container_id "
+                "WHERE p.id = 'migration-placement'"
+            )).scalar_one() == "research"
 
 
 def test_fresh_sqlite_baseline_matches_runtime_metadata(tmp_path):

@@ -2633,6 +2633,22 @@ def _workspace_container_locked(s, container_id: str) -> WorkspaceContainer:
     return row
 
 
+def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceContainer:
+    """Lock a destination and reject writes anywhere below a detached Catalog tombstone."""
+    destination = _workspace_container_locked(s, container_id)
+    current: WorkspaceContainer | None = destination
+    visited: set[str] = set()
+    while current is not None:
+        if current.id in visited:
+            raise RuntimeError("Workspace container hierarchy contains a cycle")
+        visited.add(current.id)
+        if current.catalog_folder_state == "detached":
+            raise ValueError("a deleted Catalog folder subtree is a read-only Workspace tombstone")
+        current = (s.get(WorkspaceContainer, current.parent_id, with_for_update=True)
+                   if current.parent_id is not None else None)
+    return destination
+
+
 def _workspace_placement_locked(s, placement_id: str) -> WorkspacePlacement:
     row = s.get(WorkspacePlacement, placement_id, with_for_update=True)
     if row is None:
@@ -2666,7 +2682,7 @@ def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -
     """Create one local overlay container beneath a stable parent identity."""
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
     with _workspace_write_session() as s:
-        _workspace_container_locked(s, parent_id)
+        _workspace_writable_destination_locked(s, parent_id)
         if s.scalar(select(WorkspaceContainer.id).where(
                 WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name,
                 WorkspaceContainer.catalog_folder_id.is_(None))) is not None:
@@ -2705,6 +2721,7 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
             raise ValueError("an overlay container requires a parent")
         if _workspace_parent_is_descendant(s, target_parent, container_id):
             raise ValueError("a workspace container cannot become its own descendant")
+        _workspace_writable_destination_locked(s, target_parent)
         target_name = _workspace_name(name) if name is not None else row.name
         target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
         sibling = s.scalar(select(WorkspaceContainer.id).where(
@@ -2909,9 +2926,7 @@ def workspace_create_placement(container_id: str, *, target_kind: str, target_id
         raise ValueError("workspace placement target kind must be 'canvas' or 'dataset'")
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
     with _workspace_write_session() as s:
-        container = _workspace_container_locked(s, container_id)
-        if container.catalog_folder_state == "detached":
-            raise ValueError("a deleted Catalog folder is a read-only Workspace tombstone")
+        _workspace_writable_destination_locked(s, container_id)
         if target_kind == "canvas":
             if s.get(Canvas, target_id, with_for_update=True) is None:
                 raise KeyError(f"canvas '{target_id}' not found")
@@ -2942,10 +2957,7 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
         if row.target_kind == "dataset":
             raise ValueError("built-in datasets are placed by the Catalog")
         target_container = container_id if container_id is not None else row.container_id
-        if container_id is not None:
-            destination = _workspace_container_locked(s, target_container)
-            if destination.catalog_folder_state == "detached":
-                raise ValueError("a deleted Catalog folder is a read-only Workspace tombstone")
+        _workspace_writable_destination_locked(s, target_container)
         target_name = _workspace_name(name) if name is not None else row.name
         target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
         changed = s.execute(update(WorkspacePlacement).where(
@@ -2965,11 +2977,9 @@ def workspace_update_placement(placement_id: str, *, expected_version: int,
 
 def _workspace_container_at_version(s, container_id: str,
                                     expected_version: int) -> WorkspaceContainer:
-    row = _workspace_container_locked(s, container_id)
+    row = _workspace_writable_destination_locked(s, container_id)
     if row.version != expected_version:
         _workspace_version_conflict("container", container_id, expected_version)
-    if row.catalog_folder_state == "detached":
-        raise ValueError("a deleted Catalog folder is a read-only Workspace tombstone")
     return row
 
 
