@@ -12,7 +12,12 @@ import uuid
 from hub import db, graph as graph_mod, metadb
 from hub.backends import DatasetRevisionAdapter
 from hub.models import dataset_ref_identity
-from hub.plugins.adapters import DuckDBAdapter, revision_adapter_for_uri
+from hub.plugins.adapters import (
+    DuckDBAdapter,
+    RevisionPermissionLost,
+    RevisionProviderOffline,
+    revision_adapter_for_uri,
+)
 
 _MANIFEST_FIELDS = {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
 LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
@@ -276,7 +281,10 @@ def validate_manifest_graph(graph, target_node_id: str | None, manifest: object,
     return admitted
 
 
-def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_adapter):
+def bind_manifest(
+    graph, target_node_id: str | None, manifest: object, resolve_adapter, *,
+    allow_prebound_provider: bool = False,
+):
     """Reopen admitted provider revisions and bind them only to a private dispatch graph."""
     admitted = validate_manifest_graph(
         graph, target_node_id, manifest, require_bound_revisions=False)
@@ -285,7 +293,21 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
     for node, item in zip(sources, admitted, strict=True):
         config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         source_uri = str(config.get("uri") or "") if isinstance(config, dict) else ""
-        source_binding = metadb.catalog_revision_binding_for_uri(source_uri)
+        from hub import workspace_providers
+        prebound_provider_uri = (
+            str(config.get("_input_provider_uri"))
+            if (allow_prebound_provider and isinstance(config, dict)
+                and isinstance(config.get("_input_provider_uri"), str)
+                and config.get("_input_dataset_id") == item["dataset_id"]
+                and config.get("_input_provider") == item["provider"]
+                and config.get("_input_revision_id") == item["revision_id"])
+            else ""
+        )
+        provider_dataset_id = (
+            item["dataset_id"] if prebound_provider_uri
+            else workspace_providers.provider_dataset_identity(source_uri) if source_uri else None)
+        source_binding = (metadb.catalog_revision_binding_for_uri(source_uri)
+                          if provider_dataset_id is None else None)
         dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
         try:
             selected_identity = (dataset_ref_identity(dataset_ref)
@@ -311,11 +333,14 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             if artifact_uri is None:
                 raise LocalRunInputError("local run input revision is unavailable")
             revision_uri = artifact_uri
-        elif (source_binding is None
-                or str(source_binding["dataset_id"]) != item["dataset_id"]
+        elif ((provider_dataset_id is None and source_binding is None)
+                or (provider_dataset_id if provider_dataset_id is not None
+                    else str(source_binding["dataset_id"])) != item["dataset_id"]
                 or (selected_identity is not None and selected_identity != (
                     item["dataset_id"], item["revision_id"]))):
             raise LocalRunInputError("local run input manifest does not match the graph")
+        elif provider_dataset_id is not None:
+            revision_uri = prebound_provider_uri or source_uri
         else:
             try:
                 binding = metadb.catalog_revision_binding(item["dataset_id"])
@@ -327,16 +352,38 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
             revision_uri = uri
         try:
             adapter = revision_adapter_for_uri(revision_uri, resolve_adapter)
+        except (PermissionError, RevisionPermissionLost, RevisionProviderOffline,
+                ConnectionError, TimeoutError, OSError,
+                workspace_providers.ProviderDatasetUnavailable):
+            raise
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
-        if (not isinstance(adapter, DatasetRevisionAdapter)
+        exact_adapter = (isinstance(adapter, DatasetRevisionAdapter)
+                         if prebound_provider_uri
+                         else workspace_providers.provider_dataset_supports_exact(adapter)
+                         if provider_dataset_id is not None
+                         else isinstance(adapter, DatasetRevisionAdapter))
+        if provider_dataset_id is not None and not exact_adapter:
+            raise LocalRunInputError(
+                "provider dataset is mutable-only and cannot enter an immutable run manifest")
+        if (not exact_adapter
                 or str(getattr(adapter, "name", "") or "") != item["provider"]):
             raise LocalRunInputError("local run input revision is unavailable")
         try:
             with db.base_guard():
                 adapter.open_revision(revision_uri, item["revision_id"])
+        except (PermissionError, RevisionPermissionLost, RevisionProviderOffline,
+                ConnectionError, TimeoutError, OSError,
+                workspace_providers.ProviderDatasetUnavailable):
+            raise
         except Exception as exc:
             raise LocalRunInputError("local run input revision is unavailable") from exc
+        provider_dispatch_uri = (
+            prebound_provider_uri
+            if prebound_provider_uri else
+            workspace_providers.provider_dataset_dispatch_uri(adapter, source_uri)
+            if provider_dataset_id is not None else revision_uri
+        )
         config = node.data.setdefault("config", {})
         # The exact DatasetRef is the canonical persisted identity. Once it has been checked against
         # the manifest above, the private dispatch fields below are the execution binding; leaving
@@ -345,7 +392,13 @@ def bind_manifest(graph, target_node_id: str | None, manifest: object, resolve_a
         # Source planning still requires a logical URI even when execution will open the retained
         # local snapshot below. This is a private dispatch copy, so restoring the catalog URI does
         # not weaken or leak into the canonical manifest identity.
-        config["uri"] = source_uri if item["provider"] == LOCAL_FILE_INPUT_PROVIDER else uri
+        config["uri"] = (source_uri if item["provider"] == LOCAL_FILE_INPUT_PROVIDER
+                         or provider_dataset_id is not None else revision_uri)
+        if provider_dataset_id is not None:
+            # One-shot dispatch capability: child kernels need the already-authorized physical URI,
+            # never mount config. Canonical Canvas/history/manifest documents retain only the stable
+            # synthetic identity and exact tuple.
+            config["_input_provider_uri"] = provider_dispatch_uri
         # Keep the complete manifest identity on the private dispatch copy. Revision ids are only
         # provider-local and can restart after a dataset is unregistered/replaced at the same URI;
         # cache/profile keys must therefore include dataset and provider identity as well.

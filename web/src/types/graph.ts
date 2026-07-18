@@ -41,6 +41,10 @@ export interface NodeConfig {
   uri?: string
   tableId?: string
   datasetRef?: DatasetRef
+  providerResourceRef?: string
+  providerMountId?: string
+  providerName?: string
+  providerReadMode?: 'exact' | 'mutable'
   // sample
   n?: number
   seed?: number

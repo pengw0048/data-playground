@@ -24,6 +24,16 @@ function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle
   return 'error'
 }
 
+const localDatasetBinding = (table: CatalogTable) => ({
+  uri: table.uri,
+  tableId: table.id,
+  datasetRef: undefined,
+  providerResourceRef: undefined,
+  providerMountId: undefined,
+  providerName: undefined,
+  providerReadMode: undefined,
+})
+
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
@@ -46,6 +56,11 @@ function Source({ id, data }: NodeComponentProps) {
   const tid = data.config.tableId
   const ref = String(data.config.uri ?? '')
   const table = catalog.find((t) => (tid && t.id === tid) || t.uri === ref || t.name === ref)
+  const providerDataset = !!data.config.providerResourceRef
+  const providerRevision = providerDataset && data.config.datasetRef
+    ? datasetRefIdentity(data.config.datasetRef).revisionId : undefined
+  const providerRevisionLabel = providerRevision && providerRevision.length > 24
+    ? `${providerRevision.slice(0, 12)}…${providerRevision.slice(-8)}` : providerRevision
 
   useEffect(() => {
     if (!canEdit) { setOpen(false); setDialog(false) }
@@ -79,7 +94,7 @@ function Source({ id, data }: NodeComponentProps) {
   const pick = (t: CatalogTable) => {
     if (!canEdit) return
     rememberTables([t])  // warm the cache so the card resolves this immediately
-    updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined })
+    updateConfig(id, localDatasetBinding(t))
     rename(id, t.name)
     setOpen(false); setQ('')
   }
@@ -90,35 +105,37 @@ function Source({ id, data }: NodeComponentProps) {
     setOpen(false); setUploading(true)
     const t = await uploadDataset(f)  // uploads + refreshes catalog; toasts on failure
     setUploading(false)
-    if (t) { updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined }); rename(id, t.name) }
+    if (t) { updateConfig(id, localDatasetBinding(t)); rename(id, t.name) }
   }
 
   // pick a file from a destination (local dir / object store) → register it + use it as this source
   const pickFile = async (uri: string) => {
     if (!canEdit) return
     const t = await api.registerFile(uri)
-    rememberTables([t]); updateConfig(id, { uri: t.uri, tableId: t.id, datasetRef: undefined }); rename(id, t.name)
+    rememberTables([t]); updateConfig(id, localDatasetBinding(t)); rename(id, t.name)
     setDialog(false); setOpen(false)
   }
 
   const meta = table
     // an UNKNOWN count (null/undefined) shows "—", not a fake "0 rows" (UX-14)
     ? `${table.rowCount == null ? '—' : table.rowCount.toLocaleString()} rows · ${table.columns.length} cols · ${table.version ?? 'v1'}`
-    : 'pick a table'
+    : providerDataset
+      ? `${data.config.providerReadMode === 'exact' ? 'exact revision' : 'mutable preview only'} · ${data.config.providerName ?? 'provider'}`
+      : 'pick a table'
 
   return (
     <NodeCard id={id} data={data} metaOverride={meta}>
-      {table ? (
+      {table || providerDataset ? (
         // show the BOUND dataset name (the node title is separately editable, so it can't be relied on
         // to say what's bound); the row itself is the "change" affordance, uri in the tooltip
         <button
           ref={btnRef}
-          title={`${table.name} · ${String(data.config.uri ?? '')}\nClick to change dataset`}
+          title={`${table?.name ?? data.title} · ${String(data.config.uri ?? '')}\nClick to change dataset`}
           onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
           className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
           <Icon name="db" size={13} />
-          <span className="flex-1 truncate text-left font-medium text-foreground">{table.name}</span>
+          <span className="flex-1 truncate text-left font-medium text-foreground">{table?.name ?? data.title}</span>
           <Icon name="chevronDown" size={12} />
         </button>
       ) : (
@@ -182,7 +199,10 @@ function Source({ id, data }: NodeComponentProps) {
         </button>
       </Popover>
       {uploading && <div className="mt-1 text-[10.5px] text-muted-foreground">Uploading…</div>}
-      {(table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
+      {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
+        Pinned provider revision {providerRevisionLabel}
+      </div>}
+      {!providerDataset && (table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />

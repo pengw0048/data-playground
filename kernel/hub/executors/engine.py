@@ -583,6 +583,10 @@ class BuildEngine:
             uri = cfg.get("uri")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            provider_dispatch_uri = cfg.get("_input_provider_uri")
+            if (cfg.get("_input_revision_id") is not None
+                    and isinstance(provider_dispatch_uri, str) and provider_dispatch_uri):
+                uri = provider_dispatch_uri
             from hub import paths
             paths.ensure_local_uri_allowed(uri)  # multi-user: a source can't read an arbitrary local file
             # CSV parse overrides (delimiter/header), already normalized + nested under 'options' by the
@@ -594,16 +598,18 @@ class BuildEngine:
                 # A persisted Source pin is path-independent. Re-resolve the current catalog binding
                 # before every interactive read so unregister/re-register at the same URI cannot
                 # retarget an old reference to a numerically identical provider version.
-                from hub import metadb
+                from hub import metadb, workspace_providers
                 binding = metadb.catalog_revision_binding_for_uri(uri)
+                provider_dataset_id = workspace_providers.provider_dataset_identity(uri)
                 revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
                 try:
                     dataset_id, revision_id = dataset_ref_identity(dataset_ref)
                 except ValueError as exc:
                     raise NotPreviewable(node, "selected revision reference is invalid") from exc
                 open_revision = getattr(revision_adapter, "open_revision", None)
-                if (binding is None
-                        or str(binding.get("dataset_id") or "") != dataset_id
+                if ((provider_dataset_id is None and binding is None)
+                        or (provider_dataset_id if provider_dataset_id is not None
+                            else str(binding.get("dataset_id") or "")) != dataset_id
                         or not callable(open_revision)):
                     raise NotPreviewable(node, "selected revision is unavailable; choose another revision or follow latest")
                 try:

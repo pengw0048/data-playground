@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import sqlite3
 import threading
@@ -25,6 +26,8 @@ from hub.catalog_provider import (
     ProviderSearchPage,
 )
 from hub.main import app
+from hub.deps import get_deps
+from hub.plugins.adapters import DuckDBAdapter, RevisionProviderOffline, RevisionUnavailable
 
 
 @pytest.fixture
@@ -434,6 +437,237 @@ class _WorkspaceFixtureProvider:
                 freshness="stale")
         next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
         return ProviderSearchPage(items=items, next_cursor=next_cursor)
+
+
+class _ExactFixtureAdapter:
+    name = "fixture-exact"
+
+    def __init__(self, path: str):
+        self.path = path
+        self.failure: str | None = None
+
+    def matches(self, _uri):
+        return True
+
+    def scan(self, _uri, columns=None, predicate=None, limit=None, options=None):
+        return DuckDBAdapter().scan(
+            self.path, columns=columns, predicate=predicate, limit=limit, options=options)
+
+    def preview_scan(self, _uri, columns=None, limit=2000, options=None):
+        return DuckDBAdapter().preview_scan(
+            self.path, columns=columns, limit=limit, options=options)
+
+    def schema(self, _uri):
+        return DuckDBAdapter().schema(self.path)
+
+    def count(self, _uri):
+        return DuckDBAdapter().count(self.path)
+
+    def fingerprint(self, _uri):
+        return "fixture-metadata"
+
+    def write(self, _uri, _rel, mode="overwrite"):
+        del mode
+        raise PermissionError("read-only fixture")
+
+    def revision_history(self, _uri, *, limit, cursor=None):
+        del limit, cursor
+        return [self.resolve_revision(_uri)], None
+
+    def resolve_revision(self, _uri, *, as_of=None):
+        del as_of
+        if self.failure == "permission":
+            raise PermissionError("secret provider detail")
+        if self.failure == "offline":
+            raise RevisionProviderOffline("secret provider detail")
+        return {
+            "revision_id": "fixture-revision-1",
+            "committed_at": datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc),
+        }
+
+    def open_revision(self, _uri, revision_id):
+        if self.failure == "permission":
+            raise PermissionError("secret provider detail")
+        if self.failure == "offline":
+            raise RevisionProviderOffline("secret provider detail")
+        if revision_id != "fixture-revision-1":
+            raise RevisionUnavailable("revision_unavailable")
+        return self.scan(_uri)
+
+    def revision_detail(self, _uri, revision_id, *, preview_limit):
+        del preview_limit
+        relation = self.open_revision(_uri, revision_id)
+        return {"revision_id": revision_id, "columns": [], "preview_table": relation.limit(1).arrow()}
+
+
+def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
+        workspace_scope, tmp_path, monkeypatch):
+    path = tmp_path / "provider.csv"
+    path.write_text("value\n1\n2\n")
+    provider = _WorkspaceFixtureProvider()
+    resource = CatalogResource(
+        id="dataset-a", kind="dataset", name="Provider observations", uri=str(path))
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: [resource])
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": "provider-use", "provider": "fixture"},
+    ]))
+    deps = get_deps()
+    exact_adapter = _ExactFixtureAdapter(str(path))
+    monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: exact_adapter)
+    normal_resolve_adapter = deps.resolve_adapter
+    monkeypatch.setattr(
+        deps, "resolve_adapter",
+        lambda uri: exact_adapter if uri == str(path) else normal_resolve_adapter(uri),
+    )
+
+    with TestClient(app) as client:
+        root = client.get(
+            f"/api/workspace/containers/{metadb.LOCAL_WORKSPACE_ROOT_ID}",
+            params={"limit": 50},
+        ).json()
+        provider_resource = next(
+            item for item in root["items"] if item.get("mountId") == "provider-use")
+        created = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider exact",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert created.status_code == 200, created.text
+        graph = client.get(f"/api/canvas/{created.json()['id']}").json()
+        source = graph["nodes"][0]
+        config = source["data"]["config"]
+        assert config["uri"].startswith("workspace-provider://")
+        assert str(path) not in json.dumps(graph)
+        assert config["providerReadMode"] == "exact"
+        assert config["datasetRef"]["revisionId"] == "fixture-revision-1"
+
+        preview = client.post("/api/run/preview", json={
+            "graph": graph, "nodeId": source["id"], "k": 10,
+        })
+        assert preview.status_code == 200, preview.text
+        assert [row["value"] for row in preview.json()["rows"]] == [1, 2]
+        assert preview.json()["inputManifest"][0] == {
+            "node_id": source["id"],
+            "dataset_id": config["datasetRef"]["datasetId"],
+            "revision_id": "fixture-revision-1",
+            "provider": "fixture-exact",
+            "resolved_at": preview.json()["inputManifest"][0]["resolved_at"],
+        }
+        dispatched = False
+
+        def reject_dispatch(*_args, **_kwargs):
+            nonlocal dispatched
+            dispatched = True
+            raise AssertionError("provider source reached the runner before exact validation")
+
+        monkeypatch.setattr(deps.runner, "run", reject_dispatch)
+        run_index_before = set(deps.run_index)
+        exact_adapter.failure = "permission"
+        denied = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": source["id"],
+            "inputManifest": preview.json()["inputManifest"],
+        })
+        assert denied.status_code == 403
+        assert denied.json()["detail"] == "permission to read an exact input revision was lost"
+        exact_adapter.failure = "offline"
+        offline = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": source["id"],
+            "inputManifest": preview.json()["inputManifest"],
+        })
+        assert offline.status_code == 503
+        assert offline.json()["detail"] == "exact input revision provider is offline"
+        assert dispatched is False
+        assert set(deps.run_index) == run_index_before
+        exact_adapter.failure = None
+
+        def missing_provider_adapter(_uri):
+            raise LookupError("secret package activation detail")
+
+        monkeypatch.setattr(deps, "resolve_physical_adapter", missing_provider_adapter)
+        unavailable = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": source["id"],
+            "inputManifest": preview.json()["inputManifest"],
+        })
+        assert unavailable.status_code == 409, unavailable.text
+        assert unavailable.json()["detail"] == (
+            "provider dataset binding is unavailable; install or restore a compatible provider "
+            "and dataset adapter")
+        assert "offline" not in unavailable.text
+        assert "secret" not in unavailable.text
+        assert dispatched is False
+        assert set(deps.run_index) == run_index_before
+        monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: exact_adapter)
+
+        normal_resolve = provider.resolve
+        monkeypatch.setattr(provider, "resolve", lambda *_args, **_kwargs: ProviderResourceResult(
+            state="unavailable", reason="secret upstream tenant detail", failure="offline"))
+        sanitized = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider unavailable",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert sanitized.status_code == 503
+        assert sanitized.json()["detail"] == "provider dataset is offline"
+        assert "tenant" not in sanitized.text
+        monkeypatch.setattr(provider, "resolve", normal_resolve)
+
+        monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: DuckDBAdapter())
+        monkeypatch.setattr(deps, "resolve_adapter", normal_resolve_adapter)
+        mutable = client.post("/api/workspace/canvases", json={
+            "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
+            "expectedContainerVersion": root["container"]["version"],
+            "name": "Provider mutable",
+            "providerDatasetRefs": [provider_resource["id"]],
+        })
+        assert mutable.status_code == 200, mutable.text
+        mutable_graph = client.get(f"/api/canvas/{mutable.json()['id']}").json()
+        mutable_source = mutable_graph["nodes"][0]
+        assert mutable_source["data"]["config"]["providerReadMode"] == "mutable"
+        assert "datasetRef" not in mutable_source["data"]["config"]
+        mutable_preview = client.post("/api/run/preview", json={
+            "graph": mutable_graph, "nodeId": mutable_source["id"], "k": 1,
+        })
+        assert mutable_preview.status_code == 200, mutable_preview.text
+        assert mutable_preview.json()["rows"] == [{"value": 1}]
+        rejected = client.post("/api/run", json={
+            "graph": mutable_graph, "targetNodeId": mutable_source["id"],
+        })
+        assert rejected.status_code == 409, rejected.text
+        assert "mutable-only" in rejected.json()["detail"]
+        assert dispatched is False
+        assert set(deps.run_index) == run_index_before
+        fabricated = client.post("/api/run", json={
+            "graph": mutable_graph, "targetNodeId": mutable_source["id"],
+            "inputManifest": [{
+                "node_id": mutable_source["id"],
+                "dataset_id": workspace_providers.provider_dataset_identity(
+                    mutable_source["data"]["config"]["uri"]),
+                "revision_id": "fabricated-revision",
+                "provider": "duckdb", "resolved_at": "2026-07-18T00:00:00Z",
+            }],
+        })
+        assert fabricated.status_code == 409, fabricated.text
+        assert "mutable-only" in fabricated.json()["detail"]
+        assert dispatched is False
+        assert set(deps.run_index) == run_index_before
+
+        monkeypatch.setattr(provider, "resolve", lambda *_args, **_kwargs: ProviderResourceResult(
+            state="unavailable", reason="secret deleted-resource detail", failure="not_found"))
+        detached = client.get(f"/api/workspace/resources/{provider_resource['id']}")
+        assert detached.status_code == 200, detached.text
+        assert detached.json()["resource"]["referenceState"] == "detached"
+        monkeypatch.setattr(provider, "resolve", normal_resolve)
+        gone = client.post("/api/run", json={
+            "graph": graph, "targetNodeId": source["id"],
+        })
+        assert gone.status_code == 410, gone.text
+        assert gone.json()["detail"] == "local_run_input_revision_unavailable"
+        assert "secret" not in gone.text
+        assert dispatched is False
+        assert set(deps.run_index) == run_index_before
 
 
 @pytest.mark.parametrize("config", [[], "", 0, False])

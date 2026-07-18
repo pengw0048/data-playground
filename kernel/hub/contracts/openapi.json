@@ -5770,7 +5770,6 @@
               "type": "string"
             },
             "maxItems": 50,
-            "minItems": 1,
             "title": "Datasetids",
             "type": "array"
           },
@@ -5778,10 +5777,17 @@
             "minimum": 1.0,
             "title": "Expectedcanvasversion",
             "type": "integer"
+          },
+          "providerDatasetRefs": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1,
+            "title": "Providerdatasetrefs",
+            "type": "array"
           }
         },
         "required": [
-          "datasetIds",
           "expectedCanvasVersion"
         ],
         "title": "WorkspaceAddDatasetBody",
@@ -5872,6 +5878,14 @@
             "default": "untitled",
             "title": "Name",
             "type": "string"
+          },
+          "providerDatasetRefs": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 1,
+            "title": "Providerdatasetrefs",
+            "type": "array"
           }
         },
         "required": [

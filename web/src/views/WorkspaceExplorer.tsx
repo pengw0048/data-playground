@@ -96,6 +96,7 @@ function WorkspaceMixedExplorer() {
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
+  const [providerDatasetAction, setProviderDatasetAction] = useState<WorkspaceResource | null>(null)
   const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
   const [relinkResource, setRelinkResource] = useState<WorkspaceResource | null>(null)
   const [undoMove, setUndoMove] = useState<{
@@ -342,13 +343,18 @@ function WorkspaceMixedExplorer() {
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
         onOpenTable={setSelectedTable} onFolder={() => pushToast('Dataset folders are not Workspace containers.', 'info')}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
-      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} />}
+      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} onUse={() => setProviderDatasetAction(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && container?.version != null && <NewCanvasDialog container={container} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
         files={files} onClose={() => setDatasetAction(null)}
         onOpened={(canvasId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openFile(canvasId) }} />}
+      {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
+        container={container} files={files} onClose={() => setProviderDatasetAction(null)}
+        onOpened={(canvasId) => {
+          setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
+        }} />}
       {moveResource && container && <MoveCanvasDialog resource={moveResource} sourceContainer={container} onClose={() => setMoveResource(null)}
         onMoved={(result) => {
           setMoveResource(null)
@@ -762,9 +768,9 @@ function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink }: {
+function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink, onUse }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
-  onRetry: () => void; onRelink: () => void
+  onRetry: () => void; onRelink: () => void; onUse: () => void
 }) {
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
@@ -780,10 +786,59 @@ function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink }:
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
       </div>
       <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
-        This mount is read-only. Create, move, delete, and dataset-use actions are unavailable, so browsing this resource never writes to the provider.
+        This mount is read-only. Using the dataset creates only a local Source; it never writes to the provider.
+        <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown}
+          className="mt-3 block w-full rounded-md bg-foreground px-3 py-2 font-semibold text-background disabled:opacity-50">Use in canvas</button>
       </div>
     </div>
   </div>
+}
+
+function ProviderDatasetActionDialog({ resource, container, files, onClose, onOpened }: {
+  resource: WorkspaceResource; container: WorkspaceResource | null; files: CanvasFile[]
+  onClose: () => void; onOpened: (canvasId: string) => void
+}) {
+  const editable = files.filter((file) => file.role === 'owner' || file.role === 'editor')
+  const [mode, setMode] = useState<'explore' | 'add'>('explore')
+  const [name, setName] = useState(`${resource.name} exploration`)
+  const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try {
+      if (mode === 'explore') {
+        if (!container || container.version == null) throw new Error('Load an exact local Workspace destination first')
+        if (!name.trim()) return
+        const created = await api.workspaceCreateCanvas({
+          containerId: identity(container), expectedContainerVersion: container.version,
+          name: name.trim(), providerDatasetRefs: [resource.id],
+        })
+        onOpened(created.id)
+      } else {
+        const target = editable.find((file) => file.id === canvasId)
+        if (!target) throw new Error('Choose an editable target canvas')
+        await api.workspaceAddDatasets(target.id, {
+          providerDatasetRefs: [resource.id], expectedCanvasVersion: target.version,
+        })
+        onOpened(target.id)
+      }
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Use ${resource.name}`} onClose={onClose}>
+    <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated.</p>
+    <div className="grid grid-cols-2 gap-2">
+      <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in new canvas</span></button>
+      <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to canvas</span></button>
+    </div>
+    {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Target canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
+        : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available.</div>}
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
+  </Modal>
 }
 
 function RelinkResourceDialog({ resource, onClose, onRelinked }: {

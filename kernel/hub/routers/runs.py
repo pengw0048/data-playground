@@ -21,7 +21,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import auth, compiler, db, destinations, metadb, placement
+from hub import auth, compiler, db, destinations, metadb, placement, workspace_providers
 from hub import graph as graph_mod
 from hub.agent import AgentCredentialError, agent_credential_error_status, agent_status, run_agent
 from hub.api_errors import APIError, APIErrorCode
@@ -41,7 +41,11 @@ from hub.execution_manifest import (
     execution_manifest_admission,
 )
 from hub.local_run_inputs import LocalRunInputError
-from hub.plugins.adapters import revision_adapter_for_uri
+from hub.plugins.adapters import (
+    RevisionPermissionLost,
+    RevisionProviderOffline,
+    revision_adapter_for_uri,
+)
 from hub.run_outputs import (
     UnsupportedRunOutputs, expected_run_outputs, preflight_run_output_target,
     require_single_run_output,
@@ -343,13 +347,19 @@ def _source_supports_automatic_local_admission(node, deps) -> bool:
     data = node.data if isinstance(node.data, dict) else {}
     config = data.get("config") if isinstance(data.get("config"), dict) else {}
     uri = str(config.get("uri") or "")
-    if not uri or metadb.catalog_revision_binding_for_uri(uri) is None:
+    from hub import workspace_providers
+    provider_dataset_id = workspace_providers.provider_dataset_identity(uri) if uri else None
+    if (not uri or (provider_dataset_id is None
+                    and metadb.catalog_revision_binding_for_uri(uri) is None)):
         return False
     try:
         scan_adapter = deps.resolve_adapter(uri)
         revision_adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
         from hub.local_run_inputs import supports_local_file_snapshot
-        return (isinstance(revision_adapter, DatasetRevisionAdapter)
+        exact = (workspace_providers.provider_dataset_supports_exact(revision_adapter)
+                 if provider_dataset_id is not None
+                 else isinstance(revision_adapter, DatasetRevisionAdapter))
+        return (exact
                 or supports_local_file_snapshot(uri, scan_adapter))
     except Exception:
         return False
@@ -365,14 +375,44 @@ def _resolve_local_run_manifest(
     for node in _local_run_source_nodes(graph, target_node_id):
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         uri = str(cfg.get("uri") or "")
-        binding = metadb.catalog_revision_binding_for_uri(uri)
-        adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
-        if binding is None:
+        from hub import workspace_providers
+        provider_dataset_id = workspace_providers.provider_dataset_identity(uri) if uri else None
+        binding = metadb.catalog_revision_binding_for_uri(uri) if provider_dataset_id is None else None
+        try:
+            adapter = revision_adapter_for_uri(uri, deps.resolve_adapter)
+        except PermissionError as exc:
+            raise APIError(
+                403, "permission to read the provider dataset was lost",
+                code=APIErrorCode.PERMISSION_DENIED, retryable=False,
+            ) from exc
+        except workspace_providers.ProviderDatasetGone as exc:
+            raise APIError(
+                410, "local_run_input_revision_unavailable",
+                code=APIErrorCode.RESOURCE_GONE, retryable=False,
+            ) from exc
+        except workspace_providers.ProviderDatasetOffline as exc:
+            raise APIError(
+                503, "provider dataset is offline",
+                code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
+            ) from exc
+        except workspace_providers.ProviderDatasetUnavailable as exc:
+            raise APIError(
+                409, ("provider dataset binding is unavailable; install or restore a compatible "
+                      "provider and dataset adapter"),
+                code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
+            ) from exc
+        if binding is None and provider_dataset_id is None:
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         dataset_ref = cfg.get("datasetRef")
         try:
-            if not isinstance(adapter, DatasetRevisionAdapter):
+            exact = (workspace_providers.provider_dataset_supports_exact(adapter)
+                     if provider_dataset_id is not None
+                     else isinstance(adapter, DatasetRevisionAdapter))
+            if not exact:
+                if provider_dataset_id is not None:
+                    raise LocalRunInputError(
+                        "provider dataset is mutable-only and cannot enter an immutable run manifest")
                 if isinstance(dataset_ref, dict) or not materialize_local_files:
                     raise RuntimeError("source has no provider-native exact revision")
                 from hub.local_run_inputs import (
@@ -393,7 +433,10 @@ def _resolve_local_run_manifest(
                 provider = LOCAL_FILE_INPUT_PROVIDER
             elif isinstance(dataset_ref, dict):
                 dataset_id, revision_id = dataset_ref_identity(dataset_ref)
-                if str(binding["dataset_id"]) != dataset_id:
+                current_dataset_id = (provider_dataset_id
+                                      if provider_dataset_id is not None
+                                      else str(binding["dataset_id"]))
+                if current_dataset_id != dataset_id:
                     raise ValueError("selected dataset identity does not match the current registration")
                 with db.base_guard():
                     adapter.open_revision(uri, revision_id)
@@ -407,6 +450,16 @@ def _resolve_local_run_manifest(
                 409, str(exc), code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
                 retryable=False,
             ) from exc
+        except (PermissionError, RevisionPermissionLost) as exc:
+            raise APIError(
+                403, "permission to read an exact input revision was lost",
+                code=APIErrorCode.PERMISSION_DENIED, retryable=False,
+            ) from exc
+        except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError) as exc:
+            raise APIError(
+                503, "exact input revision provider is offline",
+                code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
+            ) from exc
         except Exception as exc:  # missing pins and provider errors never permit a fallback to head
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
@@ -414,7 +467,9 @@ def _resolve_local_run_manifest(
             raise APIError(410, "local_run_input_revision_unavailable",
                            code=APIErrorCode.RESOURCE_GONE, retryable=False)
         manifest.append({
-            "node_id": str(node.id), "dataset_id": str(binding["dataset_id"]),
+            "node_id": str(node.id),
+            "dataset_id": (provider_dataset_id
+                           if provider_dataset_id is not None else str(binding["dataset_id"])),
             "revision_id": revision_id, "provider": provider, "resolved_at": resolved_at,
         })
     return manifest
@@ -427,7 +482,34 @@ def _bind_local_run_manifest(
 
     try:
         return bind_manifest(graph, target_node_id, manifest, deps.resolve_adapter)
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise APIError(
+            403, "permission to read an exact input revision was lost",
+            code=APIErrorCode.PERMISSION_DENIED, retryable=False,
+        ) from exc
+    except workspace_providers.ProviderDatasetGone as exc:
+        raise APIError(
+            410, "local_run_input_revision_unavailable",
+            code=APIErrorCode.RESOURCE_GONE, retryable=False,
+        ) from exc
+    except (RevisionProviderOffline, ConnectionError, TimeoutError, OSError,
+            workspace_providers.ProviderDatasetOffline) as exc:
+        raise APIError(
+            503, "exact input revision provider is offline",
+            code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True,
+        ) from exc
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise APIError(
+            409, ("provider dataset binding is unavailable; install or restore a compatible "
+                  "provider and dataset adapter"),
+            code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
+        ) from exc
     except LocalRunInputError as exc:
+        if "mutable-only" in str(exc):
+            raise APIError(
+                409, "provider dataset is mutable-only and cannot enter an immutable run manifest",
+                code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED, retryable=False,
+            ) from exc
         unavailable = "unavailable" in str(exc)
         raise APIError(
             410 if unavailable else 409,
@@ -1983,6 +2065,21 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             except metadb.DurableTaskSubmissionConflict as exc:
                 raise HTTPException(409, str(exc)) from exc
             return _resume_durable_task(deps, existing_task), None
+    # Every provider Source must cross exact admission before any backend/controller may allocate.
+    # This guard is backend-wide and independent of a caller-supplied submissionId: mutable-only
+    # providers can still serve bounded previews, but they never reach a runner.
+    _reject_invalid(graph, deps, target_node_id)
+    provider_sources = [
+        node for node in _local_run_source_nodes(graph, target_node_id)
+        if workspace_providers.provider_dataset_identity(str(
+            node.data.get("config", {}).get("uri") or "")) is not None
+    ]
+    if provider_sources:
+        if input_manifest is None:
+            input_manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
+        else:
+            _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
+
     external_request = _external_wait_request(deps, graph, target_node_id)
     if external_request is not None:
         if input_manifest is not None or submission_id is None:

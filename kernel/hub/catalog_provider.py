@@ -130,6 +130,7 @@ def _bounded_provider_read(
     unavailable: Callable[[str], _R],
     unsupported: Callable[[], _R],
     timeout: float,
+    failed: Callable[[], _R] | None = None,
 ) -> _R:
     if timeout <= 0:
         return unavailable("deadline exceeded")
@@ -155,7 +156,7 @@ def _bounded_provider_read(
     except OSError:
         return unavailable("provider unavailable")
     except Exception:  # noqa: BLE001 -- provider failures must not take down local browse
-        return unavailable("provider read failed")
+        return failed() if failed is not None else unavailable("provider read failed")
 
 
 def bounded_list_children(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
@@ -186,6 +187,32 @@ def bounded_resolve(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
             state="unavailable", reason=reason, failure="offline"),
         unsupported=lambda: ProviderResourceResult(
             state="unsupported", reason="resolve is unsupported", failure="provider_error"),
+        timeout=timeout,
+    )
+
+
+def bounded_dataset_detail(provider: ReadOnlyCatalogProvider, mount: CatalogMount,
+                           resource_id: str, *, timeout: float = 1.0) -> ProviderResourceResult:
+    """Resolve one bounded dataset read binding without trusting an unvalidated plugin result."""
+
+    def read() -> ProviderResourceResult:
+        raw = provider.dataset_detail(mount, resource_id)
+        if isinstance(raw, ProviderResourceResult):
+            # Pydantic trusts an existing instance by default. Flatten it first so plugins cannot use
+            # model_copy/model_construct to bypass this public boundary's nested resource limits.
+            raw = raw.model_dump(mode="python")
+        return ProviderResourceResult.model_validate(raw)
+
+    return _bounded_provider_read(
+        read,
+        unavailable=lambda reason: ProviderResourceResult(
+            state="unavailable", reason=reason, failure="offline"),
+        unsupported=lambda: ProviderResourceResult(
+            state="unsupported", reason="dataset_detail is unsupported",
+            failure="provider_error"),
+        failed=lambda: ProviderResourceResult(
+            state="unavailable", reason="provider dataset detail is invalid",
+            failure="provider_error"),
         timeout=timeout,
     )
 

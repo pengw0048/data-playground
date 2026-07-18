@@ -21,12 +21,14 @@ from hub.catalog_provider import (
     ProviderSearchPage,
     ReadOnlyCatalogProvider,
     bounded_ancestors,
+    bounded_dataset_detail,
     bounded_list_children,
     bounded_resolve,
     bounded_search,
 )
 
 _EXTERNAL_PREFIX = "external."
+_PROVIDER_DATASET_URI_PREFIX = "workspace-provider://"
 _CURSOR_VERSION = 1
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
@@ -39,6 +41,18 @@ _ERROR_STATES = {"partial", "unavailable", "unsupported"}
 
 class ProviderRelinkUnavailable(RuntimeError):
     """The explicitly selected replacement could not be resolved right now."""
+
+
+class ProviderDatasetUnavailable(RuntimeError):
+    """A stable provider dataset binding cannot currently authorize a physical read."""
+
+
+class ProviderDatasetGone(ProviderDatasetUnavailable):
+    """A stable provider dataset binding is terminally absent and must be explicitly relinked."""
+
+
+class ProviderDatasetOffline(ProviderDatasetUnavailable):
+    """A valid provider dataset binding could not be read because its provider is offline."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,198 @@ def _decode_external_identity(identity: str) -> tuple[str, str, str]:
             or any(char not in "0123456789abcdef" for char in binding_id)):
         raise KeyError("invalid external Workspace resource reference")
     return mount_id, resource_id, binding_id
+
+
+def provider_dataset_uri(binding_id: str) -> str:
+    """Return the only provider Source identity persisted in a Canvas document."""
+    if (len(binding_id) != 32
+            or any(char not in "0123456789abcdef" for char in binding_id)):
+        raise ValueError("invalid Workspace provider dataset binding")
+    return f"{_PROVIDER_DATASET_URI_PREFIX}{binding_id}"
+
+
+def is_provider_dataset_uri(uri: str) -> bool:
+    return uri.startswith(_PROVIDER_DATASET_URI_PREFIX)
+
+
+def provider_dataset_identity(uri: str) -> str | None:
+    """Map one synthetic Source URI to its ABA-fenced Workspace dataset identity."""
+    if not is_provider_dataset_uri(uri):
+        return None
+    binding_id = uri.removeprefix(_PROVIDER_DATASET_URI_PREFIX)
+    if (len(binding_id) != 32
+            or any(char not in "0123456789abcdef" for char in binding_id)):
+        raise ProviderDatasetUnavailable("provider dataset binding is invalid")
+    binding = metadb.workspace_provider_binding(binding_id)
+    if binding is None or binding["kind"] != "dataset":
+        raise ProviderDatasetGone("provider dataset binding is unavailable")
+    return f"workspace-provider:{binding_id}"
+
+
+class _BoundProviderDatasetAdapter:
+    """Translate one synthetic stable URI into a provider-owned physical adapter binding.
+
+    Optional adapter capabilities remain feature-detected through ``__getattr__``: a mutable-only
+    adapter does not accidentally satisfy ``DatasetRevisionAdapter`` or ``DatasetPreviewAdapter``.
+    """
+
+    _URI_METHODS = {
+        "scan", "preview_scan", "schema", "count", "metadata_count", "fingerprint",
+        "resolve_revision", "open_revision",
+    }
+
+    def __init__(self, source_uri: str, physical_uri: str, adapter: object):
+        self.source_uri = source_uri
+        self.physical_uri = physical_uri
+        self.adapter = adapter
+        self.name = str(getattr(adapter, "name", "") or "")
+
+    def matches(self, uri: str) -> bool:
+        return uri == self.source_uri
+
+    def __getattr__(self, name: str):
+        if name in {"write", "revision_history", "revision_detail", "nearest"}:
+            raise AttributeError(f"read-only provider dataset adapter does not expose {name}")
+        value = getattr(self.adapter, name)
+        if name not in self._URI_METHODS or not callable(value):
+            return value
+
+        def invoke(uri: str, *args, **kwargs):
+            if uri != self.source_uri:
+                raise ValueError("provider dataset adapter received a mismatched binding")
+            return value(self.physical_uri, *args, **kwargs)
+
+        return invoke
+
+
+def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]) -> object:
+    """Authorize and bind one stable Workspace identity to its installed DatasetAdapter."""
+    dataset_id = provider_dataset_identity(uri)
+    if dataset_id is None:
+        raise LookupError("not a Workspace provider dataset URI")
+    binding_id = dataset_id.removeprefix("workspace-provider:")
+    binding = metadb.workspace_provider_binding(binding_id)
+    assert binding is not None
+    if binding["referenceState"] == "detached":
+        raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
+    mounts, _invalid = _configured_mounts()
+    mounted = next((item for item in mounts if item.mount.id == binding["mountId"]), None)
+    if mounted is None or mounted.mount.provider != binding["provider"]:
+        metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error", error="catalog mount is not configured")
+        raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
+    try:
+        provider = _load_provider(mounted.mount.provider)
+    except Exception as exc:  # noqa: BLE001 -- activation details/configuration stay sanitized
+        metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error", error=_activation_error())
+        raise ProviderDatasetUnavailable(_activation_error()) from exc
+    result = bounded_dataset_detail(provider, mounted.mount, binding["resourceId"])
+    if result.state != "ready" or result.item is None:
+        state = _reference_state(result.failure, result.state)
+        metadb.workspace_provider_mark_binding(
+            binding_id, state=state, error=result.reason)
+        if state == "permission_lost":
+            raise PermissionError("permission to read provider dataset was lost")
+        if state == "detached":
+            raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
+        if state == "offline":
+            raise ProviderDatasetOffline("provider dataset is offline")
+        raise ProviderDatasetUnavailable("provider dataset detail is invalid")
+    item = result.item
+    if item.id != binding["resourceId"] or item.kind != "dataset" or not item.uri:
+        metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error",
+            error="catalog provider returned a mismatched dataset binding")
+        raise ProviderDatasetUnavailable("provider returned a mismatched dataset binding")
+    cached = metadb.workspace_provider_cache_resource(
+        mount_id=mounted.mount.id, provider=mounted.mount.provider,
+        container_id=mounted.container_id, resource_id=item.id, kind=item.kind,
+        name=item.name, parent_binding_id=binding.get("parentBindingId"),
+    )
+    if cached["bindingId"] != binding_id or cached["referenceState"] != "current":
+        raise ProviderDatasetUnavailable("provider dataset binding is no longer current")
+    try:
+        adapter = resolve_physical(item.uri)
+    except Exception as exc:
+        raise ProviderDatasetUnavailable("provider dataset adapter is unavailable") from exc
+    return _BoundProviderDatasetAdapter(uri, item.uri, adapter)
+
+
+def provider_dataset_supports_exact(adapter: object) -> bool:
+    """Feature-detect exact evidence on the physical adapter hidden by a read-only binding."""
+    from hub.backends import DatasetRevisionAdapter
+
+    physical = adapter.adapter if isinstance(adapter, _BoundProviderDatasetAdapter) else adapter
+    return isinstance(physical, DatasetRevisionAdapter)
+
+
+def provider_dataset_dispatch_uri(adapter: object, source_uri: str) -> str:
+    """Return the request-local physical URI only from an already authorized stable binding."""
+    if (not isinstance(adapter, _BoundProviderDatasetAdapter)
+            or adapter.source_uri != source_uri):
+        raise ProviderDatasetUnavailable("provider dataset dispatch binding is unavailable")
+    return adapter.physical_uri
+
+
+def provider_dataset_source(resource_ref: str, *, uid: str,
+                            resolve_physical: Callable[[str], object]) -> dict:
+    """Create one minimal Source config from a live stable provider dataset reference."""
+    resolution = resolve(resource_ref, uid=uid)
+    resource = resolution.get("resource")
+    source = resolution.get("source") or {}
+    if (not isinstance(resource, dict) or resource.get("kind") != "dataset"
+            or resource.get("source") != "provider"):
+        raise ValueError("only a provider dataset can be used as a Source")
+    if source.get("completeness") != "complete" or resource.get("lastKnown"):
+        state = resource.get("referenceState") or source.get("referenceState")
+        if state == "permission_lost":
+            raise PermissionError("permission to read provider dataset was lost")
+        if state == "detached":
+            raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
+        if state == "provider_error":
+            raise ProviderDatasetUnavailable("provider dataset metadata is invalid")
+        raise ProviderDatasetOffline("provider dataset is offline")
+    binding_id = str(resource.get("bindingId") or "")
+    uri = provider_dataset_uri(binding_id)
+    adapter = provider_dataset_adapter(uri, resolve_physical)
+    dataset_id = provider_dataset_identity(uri)
+    assert dataset_id is not None
+    config: dict[str, object] = {
+        "uri": uri,
+        "providerResourceRef": resource_ref,
+        "providerMountId": resource.get("mountId"),
+        "providerName": resource.get("provider"),
+    }
+    from hub.models import ExactDatasetRef
+    from hub.plugins.adapters import RevisionPermissionLost, RevisionProviderOffline
+    read_mode = "mutable"
+    if provider_dataset_supports_exact(adapter):
+        try:
+            evidence = adapter.resolve_revision(uri)
+            revision_id = str(evidence.get("revision_id") or "")
+            config["datasetRef"] = ExactDatasetRef(
+                kind="exact", dataset_id=dataset_id, revision_id=revision_id,
+                last_known={"committedAt": evidence.get("committed_at")},
+            ).model_dump(by_alias=True, mode="json", exclude_none=True)
+        except (PermissionError, RevisionPermissionLost) as exc:
+            raise PermissionError(
+                "permission to read the provider dataset was lost") from exc
+        except (ConnectionError, TimeoutError, OSError, RevisionProviderOffline) as exc:
+            raise ProviderDatasetOffline("provider dataset is offline") from exc
+        except Exception as exc:
+            raise ProviderDatasetUnavailable(
+                "provider could not prove one readable exact dataset revision") from exc
+        read_mode = "exact"
+    config["providerReadMode"] = read_mode
+    return {
+        "id": f"source-{os.urandom(16).hex()}",
+        "type": "source",
+        "position": {"x": 160, "y": 160},
+        "data": {
+            "title": resource["name"], "status": "draft", "config": config,
+        },
+    }
 
 
 def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
