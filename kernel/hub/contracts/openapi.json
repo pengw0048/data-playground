@@ -1186,6 +1186,87 @@
         "title": "DriverStep",
         "type": "object"
       },
+      "DurableBoundedFanoutView": {
+        "description": "Sanitized parent-only bounded fan-out projection for Workspace Jobs.",
+        "properties": {
+          "checkpoint": {
+            "enum": [
+              "pending",
+              "committed",
+              "reused"
+            ],
+            "title": "Checkpoint",
+            "type": "string"
+          },
+          "completedPartitions": {
+            "maximum": 4.0,
+            "minimum": 0.0,
+            "title": "Completedpartitions",
+            "type": "integer"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "failedPartitions": {
+            "maximum": 4.0,
+            "minimum": 0.0,
+            "title": "Failedpartitions",
+            "type": "integer"
+          },
+          "gather": {
+            "enum": [
+              "pending",
+              "running",
+              "committed"
+            ],
+            "title": "Gather",
+            "type": "string"
+          },
+          "partitionCount": {
+            "anyOf": [
+              {
+                "maximum": 4.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Partitioncount"
+          },
+          "stage": {
+            "enum": [
+              "checkpointing",
+              "planning",
+              "running_partitions",
+              "gathering",
+              "publishing",
+              "terminal"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage",
+          "completedPartitions",
+          "failedPartitions",
+          "checkpoint",
+          "gather"
+        ],
+        "title": "DurableBoundedFanoutView",
+        "type": "object"
+      },
       "DurableCheckpointView": {
         "description": "Sanitized, path-free checkpoint projection for Workspace Jobs.",
         "properties": {
@@ -5827,6 +5908,16 @@
           "backend": {
             "title": "Backend",
             "type": "string"
+          },
+          "boundedFanout": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableBoundedFanoutView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "canCancel": {
             "default": false,

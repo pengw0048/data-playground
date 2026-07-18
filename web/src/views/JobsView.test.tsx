@@ -134,4 +134,27 @@ describe('JobsView', () => {
     await waitFor(() => expect(mocks.retryRun).toHaveBeenCalledTimes(2))
     expect(mocks.retryRun.mock.calls[1]).toEqual(['task-2', actionId])
   })
+
+  it('renders parent-only bounded fan-out stage and partition progress', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'fan-1', taskId: 'fan-1', status: 'running', error: null,
+      boundedFanout: {
+        stage: 'running_partitions',
+        partitionCount: 4,
+        completedPartitions: 2,
+        failedPartitions: 0,
+        checkpoint: 'reused',
+        gather: 'pending',
+        diagnosticCode: null,
+      },
+      canCancel: true,
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', {
+      name: 'Open run fan-1 in Alpha research', expanded: false,
+    }))
+    const fanout = screen.getByText('Fan-out:').closest('div')
+    expect(fanout).toHaveTextContent('Fan-out: running partitions · 2/4 partitions')
+    expect(screen.queryByText(/unitId|planDigest|range/i)).not.toBeInTheDocument()
+  })
 })
