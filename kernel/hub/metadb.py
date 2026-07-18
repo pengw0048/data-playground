@@ -4087,6 +4087,42 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
 
 
+def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
+    """Reconcile a write-bearing task to done when its receipt already landed, so dead-owner
+    recovery, cancel, or attempt exhaustion never misreports a committed write as failed/cancelled."""
+    if not task.write_intent:
+        return False
+    from hub.models import RunOutput, RunStatus, WriteReceipt
+    try:
+        intent, _payload, canonical = _canonical_managed_local_write_intent(
+            json.loads(task.write_intent))
+        prior = _managed_local_write_receipt_in_session(s, intent.idempotency_key, canonical)
+        if prior is None:
+            prior = _managed_local_lance_write_receipt_in_session(
+                s, intent.idempotency_key, canonical)
+    except Exception:
+        return False
+    if prior is None:
+        return False
+    receipt = WriteReceipt.model_validate(prior)
+    output = RunOutput(
+        node_id=task.target_node_id, port_id="out", wire="dataset",
+        publication_kind="catalog", outcome="committed", uri=receipt.publication.artifact_uri,
+        table=intent.destination.name, version=receipt.publication.catalog_version,
+        rows=receipt.rows, write_receipt=receipt)
+    status = RunStatus(
+        run_id=task.id, status="done", target_node_id=task.target_node_id,
+        outputs=[output], total_rows=receipt.rows).model_dump()
+    receipt_json = json.dumps(receipt.model_dump(by_alias=True, mode="json"), sort_keys=True)
+    task.status = attempt.status = "done"
+    task.error = attempt.error = None
+    task.status_doc = json.dumps(status, default=str)
+    task.output_receipt = attempt.output_receipt = receipt_json
+    task.completed_at = attempt.completed_at = task.updated_at = now
+    _emit_durable_task_inbox_item(s, task=task, attempt=attempt, task_status="done", now=now)
+    return True
+
+
 def _claim_durable_task_kind(
         task_id: str, owner_token: str, task_kind: str) -> dict | None:
     """Claim queued work or fence one expired owner and create the next bounded attempt."""
@@ -4111,6 +4147,8 @@ def _claim_durable_task_kind(
             attempt.error = "attempt owner lease expired"
             attempt.completed_at = now
             if attempt.attempt_number >= task.max_attempts:
+                if _finish_task_with_landed_write_receipt(s, task, attempt, now):
+                    return None
                 task.status = "failed"
                 task.error = "durable task exhausted recovery attempts"
                 task.completed_at = now
@@ -4128,6 +4166,8 @@ def _claim_durable_task_kind(
             s.add(attempt)
             s.flush()
         if task.cancel_requested:
+            if _finish_task_with_landed_write_receipt(s, task, attempt, now):
+                return None
             attempt.status = "cancelled"
             attempt.cancel_requested_at = now
             attempt.completed_at = now
