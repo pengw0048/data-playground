@@ -1363,7 +1363,10 @@ class DurableTaskInboxItemView(Wire):
     task_id: str
     canvas_id: str
     canvas_name: str | None = None
-    task_kind: Literal["managed_local_write", "external_wait", "linear_checkpoint_write"]
+    task_kind: Literal[
+        "managed_local_write", "external_wait", "linear_checkpoint_write",
+        "bounded_fanout_write",
+    ]
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)
     terminal_at: datetime.datetime

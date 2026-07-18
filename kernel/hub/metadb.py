@@ -302,8 +302,10 @@ class DurableTask(Base):
     completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     __table_args__ = (
         UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
-        CheckConstraint("task_kind IN ('managed_local_write','external_wait','linear_checkpoint_write')",
-                        name="ck_durable_task_kind"),
+        CheckConstraint(
+            "task_kind IN ('managed_local_write','external_wait',"
+            "'linear_checkpoint_write','bounded_fanout_write')",
+            name="ck_durable_task_kind"),
         CheckConstraint("backend_kind = 'local'", name="ck_durable_task_backend"),
         CheckConstraint("status IN ('queued','running','done','failed','cancelled')", name="ck_durable_task_status"),
         CheckConstraint("retry_count >= 0 AND max_attempts >= 1 AND retry_count < max_attempts", name="ck_durable_task_retry_bounds"),
@@ -389,7 +391,8 @@ class DurableTaskInboxItem(Base):
     __table_args__ = (
         UniqueConstraint("task_id", "task_attempt_id", name="uq_durable_task_inbox_attempt"),
         CheckConstraint(
-            "task_kind IN ('managed_local_write','external_wait','linear_checkpoint_write')",
+            "task_kind IN ('managed_local_write','external_wait',"
+            "'linear_checkpoint_write','bounded_fanout_write')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "outcome IN ('completed','failed','cancelled')",
@@ -3440,8 +3443,11 @@ _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
+_CHECKPOINT_PARENT_KINDS = frozenset({"linear_checkpoint_write", "bounded_fanout_write"})
+_JOBS_HIDDEN_TASK_KINDS = frozenset({"bounded_fanout_write"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
+    "bounded_fanout_write",
 })
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
@@ -3472,11 +3478,16 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "durable_task_attempts_exhausted",
         "checkpoint_invalid",
     }),
+    "bounded_fanout_write": frozenset({
+        "durable_task_attempts_exhausted",
+        "checkpoint_invalid",
+    }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
     "managed_local_write": "managed_local_write_failed",
     "external_wait": "external_wait_failed",
     "linear_checkpoint_write": "linear_checkpoint_write_failed",
+    "bounded_fanout_write": "bounded_fanout_write_failed",
 }
 
 
@@ -3583,7 +3594,8 @@ def _inbox_public_doc(
         "diagnostic_code": item.diagnostic_code,
         "terminal_at": _inbox_stamp(item.terminal_at),
         "read_at": _inbox_stamp(item.read_at),
-        "job_available": canvas_name is not None,
+        "job_available": (
+            canvas_name is not None and item.task_kind not in _JOBS_HIDDEN_TASK_KINDS),
     }
 
 
@@ -3861,8 +3873,11 @@ def submit_linear_checkpoint_task(
         final_target_node_id: str, checkpoint_id: str, checkpoint_node_id: str,
         output_port_id: str, task_intent_sha256: str, graph_prefix_sha256: str,
         input_manifest_sha256: str, graph_doc: dict,
-        input_manifest: list[dict[str, str]], write_intent: dict) -> tuple[dict, bool]:
+        input_manifest: list[dict[str, str]], write_intent: dict,
+        task_kind: str = "linear_checkpoint_write") -> tuple[dict, bool]:
     """Atomically persist one complete hidden Task, first Attempt, and checkpoint."""
+    if task_kind not in _CHECKPOINT_PARENT_KINDS:
+        raise ValueError("checkpoint parent task_kind is not supported")
     graph, manifest, intent, final_id, node_id, port_id = _linear_checkpoint_payloads(
         graph_doc, input_manifest, write_intent, final_target_node_id,
         checkpoint_node_id, output_port_id)
@@ -3897,7 +3912,7 @@ def submit_linear_checkpoint_task(
                 checkpoint.checkpoint_id, checkpoint.checkpoint_node_id,
                 checkpoint.output_port_id, checkpoint.task_intent_sha256,
                 checkpoint.graph_prefix_sha256, checkpoint.input_manifest_sha256)
-            if task.task_kind != "linear_checkpoint_write" or actual != frozen:
+            if task.task_kind != task_kind or actual != frozen:
                 raise DurableTaskSubmissionConflict(
                     "checkpoint submission does not match its frozen admission")
             _lock_local_result_registry(s)
@@ -3912,7 +3927,7 @@ def submit_linear_checkpoint_task(
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id,
             submission_id=normalized_submission, intent_sha256=digests[0],
-            target_node_id=final_id, task_kind="linear_checkpoint_write",
+            target_node_id=final_id, task_kind=task_kind,
             backend_kind="local", graph_doc=graph, input_manifest=manifest,
             write_intent=intent, status="queued",
             status_doc=json.dumps(_task_status_doc(task_id, final_id), default=str),
@@ -3941,7 +3956,7 @@ def linear_checkpoint_admission(task_id: str) -> dict | None:
         if task is None and checkpoint is None:
             return None
         if (task is None or checkpoint is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise DurableTaskSubmissionConflict("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         _linear_checkpoint_candidate_doc(s, task, checkpoint)
@@ -4196,6 +4211,11 @@ def claim_durable_task(task_id: str, owner_token: str) -> dict | None:
 def claim_linear_checkpoint_task(task_id: str, owner_token: str) -> dict | None:
     """Claim one linear-checkpoint Task under its dedicated recovery/worker path."""
     return _claim_durable_task_kind(task_id, owner_token, "linear_checkpoint_write")
+
+
+def claim_bounded_fanout_write_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim one bounded fan-out parent Task under its dedicated recovery/worker path."""
+    return _claim_durable_task_kind(task_id, owner_token, "bounded_fanout_write")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -4866,6 +4886,29 @@ def recoverable_linear_checkpoint_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "linear_checkpoint_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_bounded_fanout_write_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired running bounded fan-out parents for the dedicated worker."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "bounded_fanout_write",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -5651,7 +5694,10 @@ def list_workspace_runs(
                 backend=backend_name, backend_attempt=backend_attempt, source="state"))
 
         task_identity = literal("t:") + DurableTask.id
-        task_predicates = [visible_canvas]
+        task_predicates = [
+            visible_canvas,
+            DurableTask.task_kind.notin_(_JOBS_HIDDEN_TASK_KINDS),
+        ]
         if canvas_id:
             task_predicates.append(DurableTask.canvas_id == canvas_id)
         if run_id:
@@ -8264,7 +8310,7 @@ def linear_checkpoint_candidate(task_id: str) -> dict | None:
         if task is None and checkpoint is None:
             return None
         if (task is None or checkpoint is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         return _linear_checkpoint_candidate_doc(s, task, checkpoint)
@@ -8298,7 +8344,7 @@ def reserve_linear_checkpoint_candidate(
         lease = latest.lease_until
         if lease is not None and lease.tzinfo is None:
             lease = lease.replace(tzinfo=datetime.timezone.utc)
-        if (task.task_kind != "linear_checkpoint_write" or task.status != "running"
+        if (task.task_kind not in _CHECKPOINT_PARENT_KINDS or task.status != "running"
                 or task.cancel_requested or latest.id != str(attempt_id)
                 or latest.status != "running" or latest.owner_token != owner_token
                 or lease is None or lease <= now):
@@ -8437,7 +8483,7 @@ def commit_linear_checkpoint(
             DurableTaskAttempt.task_id == task_id).order_by(
                 DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
         if (task is None or checkpoint is None or latest is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
@@ -8520,7 +8566,7 @@ def bind_linear_checkpoint_materialization(
         checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
         latest = _linear_checkpoint_latest_attempt(s, task_id)
         if (task is None or checkpoint is None or latest is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
@@ -8558,7 +8604,7 @@ def reconcile_linear_checkpoint(task_id: str) -> dict | None:
         if task is None and checkpoint is None:
             return None
         if (task is None or checkpoint is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
@@ -8573,7 +8619,7 @@ def linear_checkpoint_committed(task_id: str) -> dict | None:
         task = _lock_durable_task_for_write(s, str(task_id))
         checkpoint = s.get(DurableCheckpoint, str(task_id), with_for_update=True)
         if (task is None or checkpoint is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         if checkpoint.phase != "committed":
             return None
@@ -8618,7 +8664,7 @@ def abort_linear_checkpoint_candidate(
         checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
         latest = _linear_checkpoint_latest_attempt(s, task_id)
         if (task is None or checkpoint is None or latest is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
@@ -8661,7 +8707,7 @@ def reattach_or_retire_linear_checkpoint(
         checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
         latest = _linear_checkpoint_latest_attempt(s, task_id)
         if (task is None or checkpoint is None or latest is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
@@ -8702,7 +8748,7 @@ def release_linear_checkpoint(task_id: str) -> dict | None:
         if task is None and checkpoint is None:
             return None
         if (task is None or checkpoint is None
-                or task.task_kind != "linear_checkpoint_write"):
+                or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
         latest = _linear_checkpoint_latest_attempt(s, task_id)
         _lock_local_result_registry(s)
@@ -8742,7 +8788,7 @@ def _purge_linear_checkpoint_for_delete(
     candidate is retired and abandoned. Only exact owner/writer state is touched, and any disagreement
     with committed/candidate truth raises so a canvas is never deleted over inconsistent state.
     """
-    if task.task_kind != "linear_checkpoint_write":
+    if task.task_kind not in _CHECKPOINT_PARENT_KINDS:
         return
     if checkpoint.phase == "committed":
         committed = _linear_checkpoint_committed_doc(s, task, checkpoint)
@@ -8774,7 +8820,7 @@ def linear_checkpoint_restore_audit() -> list[dict]:
     report: list[dict] = []
     with session() as s:
         tasks = {t.id: t for t in s.scalars(select(DurableTask).where(
-            DurableTask.task_kind == "linear_checkpoint_write").order_by(DurableTask.id))}
+            DurableTask.task_kind.in_(_CHECKPOINT_PARENT_KINDS)).order_by(DurableTask.id))}
         checkpoints = list(s.scalars(
             select(DurableCheckpoint).order_by(DurableCheckpoint.task_id)))
         _lock_local_result_registry(s)

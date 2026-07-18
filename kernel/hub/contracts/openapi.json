@@ -1531,7 +1531,8 @@
             "enum": [
               "managed_local_write",
               "external_wait",
-              "linear_checkpoint_write"
+              "linear_checkpoint_write",
+              "bounded_fanout_write"
             ],
             "title": "Taskkind",
             "type": "string"
