@@ -21,7 +21,7 @@ Standard commands live in the root `Makefile`, `web/package.json`, and `kernel/p
 - Web type-check: `cd web && npm run typecheck` (`tsc -b`).
 - Browser E2E: `make e2e` (Playwright; needs `make e2e-install` once to fetch the chromium browser).
 - Seed sample data: `make seed`.
-- **Before opening/updating a PR: `make preflight`.** It mirrors the required CI checks (artifact hygiene, ruff, basedpyright, OpenAPI contract, migrations/fresh-baseline, full kernel pytest, and web + PostgreSQL when their toolchain is present) and fails on the mechanical misses a targeted local subset hides. `make preflight-fast` is a ~1-minute static-only tier for iteration; run the full `make preflight` before submitting.
+- **Before opening/updating a PR: `make preflight`** (~15s). A fast static gate — artifact hygiene, ruff, basedpyright, the OpenAPI contract, and migrations/core-contract — that catches the mechanical CI misses cheaply. It intentionally does NOT run the full kernel suite, web, or PostgreSQL; push and let CI run those heavy suites.
 
 ### Non-obvious caveats
 

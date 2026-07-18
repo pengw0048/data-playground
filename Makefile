@@ -1,4 +1,4 @@
-.PHONY: setup run dev-kernel dev-web build test lint openapi check-openapi preflight preflight-fast e2e e2e-install seed clean
+.PHONY: setup run dev-kernel dev-web build test lint openapi check-openapi preflight e2e e2e-install seed clean
 
 # One-time setup: kernel deps + sample data + web deps.
 # web/dist is gitignored so a fresh clone lacks it; the kernel wheel force-includes ../web/dist, so
@@ -39,16 +39,11 @@ openapi:
 check-openapi:
 	cd kernel && uv run python -m hub.contracts.openapi --check
 
-# Pre-submission gate mirroring the required CI checks. Run before opening/updating a PR — it fails on
-# the mechanical misses (lint, types, OpenAPI drift, migration/schema drift, cross-file regressions,
-# committed runtime artifacts) that a green local subset hides but CI blocks on. PostgreSQL and web
-# steps run only when their toolchain is present.
+# Fast (~15s) pre-submission gate: artifact hygiene + ruff + basedpyright + OpenAPI contract +
+# migrations/core-contract — the mechanical CI misses that are cheap to catch locally. It intentionally
+# skips the full kernel suite, web, and PostgreSQL; push and let CI run those heavy suites.
 preflight:
 	./scripts/preflight.sh
-
-# Fast tier for iteration: lint + types + OpenAPI + core-contract only (no full pytest / web / PG).
-preflight-fast:
-	./scripts/preflight.sh --fast
 
 # One-time: download the Playwright browser used by the E2E suite.
 e2e-install:
