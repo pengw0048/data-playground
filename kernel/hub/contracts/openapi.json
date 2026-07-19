@@ -5248,6 +5248,361 @@
         "title": "InputDriftSource",
         "type": "object"
       },
+      "InspectionWindowEvidenceV1": {
+        "additionalProperties": false,
+        "description": "Redacted #441 evidence; server-owned DatasetView identities are intentionally omitted.",
+        "properties": {
+          "approximation": {
+            "$ref": "#/components/schemas/TemporalEvidenceApproximationV1"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidencePairEvidenceV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "streams": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceStreamV1"
+            },
+            "title": "Streams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "complete",
+          "approximation",
+          "streams",
+          "pair"
+        ],
+        "title": "InspectionWindowEvidenceV1",
+        "type": "object"
+      },
+      "InspectionWindowIdentityV1": {
+        "additionalProperties": false,
+        "description": "Only opaque compound identity and reference-clock facts cross the API boundary.",
+        "properties": {
+          "compoundDatasetId": {
+            "title": "Compounddatasetid",
+            "type": "string"
+          },
+          "compoundRevision": {
+            "title": "Compoundrevision",
+            "type": "string"
+          },
+          "endTick": {
+            "title": "Endtick",
+            "type": "integer"
+          },
+          "episodeId": {
+            "title": "Episodeid",
+            "type": "string"
+          },
+          "referenceClockId": {
+            "title": "Referenceclockid",
+            "type": "string"
+          },
+          "startTick": {
+            "title": "Starttick",
+            "type": "integer"
+          },
+          "streamIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Streamids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "compoundDatasetId",
+          "compoundRevision",
+          "episodeId",
+          "referenceClockId",
+          "startTick",
+          "endTick",
+          "streamIds"
+        ],
+        "title": "InspectionWindowIdentityV1",
+        "type": "object"
+      },
+      "InspectionWindowLimitsV1": {
+        "additionalProperties": false,
+        "description": "Server-fixed admission limits for one raw stream; clients cannot raise them.",
+        "properties": {
+          "maxRawBytesPerStream": {
+            "title": "Maxrawbytesperstream",
+            "type": "integer"
+          },
+          "maxRowsPerStream": {
+            "title": "Maxrowsperstream",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "maxRowsPerStream",
+          "maxRawBytesPerStream"
+        ],
+        "title": "InspectionWindowLimitsV1",
+        "type": "object"
+      },
+      "InspectionWindowObservationV1": {
+        "additionalProperties": false,
+        "description": "A point or half-open interval mapped onto the requested reference clock.",
+        "properties": {
+          "assets": {
+            "items": {
+              "$ref": "#/components/schemas/CompoundFixtureAssetV1"
+            },
+            "title": "Assets",
+            "type": "array"
+          },
+          "endTick": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endtick"
+          },
+          "kind": {
+            "enum": [
+              "point",
+              "interval"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "observationId": {
+            "title": "Observationid",
+            "type": "string"
+          },
+          "startTick": {
+            "title": "Starttick",
+            "type": "integer"
+          },
+          "values": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "required": [
+          "observationId",
+          "kind",
+          "startTick",
+          "values"
+        ],
+        "title": "InspectionWindowObservationV1",
+        "type": "object"
+      },
+      "InspectionWindowRequestV1": {
+        "additionalProperties": false,
+        "description": "One bounded reference-clock read over an opaque exact compound revision.",
+        "properties": {
+          "endTick": {
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|-?[1-9][0-9]*)$",
+            "title": "Endtick",
+            "type": "string"
+          },
+          "episodeId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Episodeid",
+            "type": "string"
+          },
+          "gapThresholdTicks": {
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:[1-9][0-9]*)$",
+            "title": "Gapthresholdticks",
+            "type": "string"
+          },
+          "pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidencePairV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "startTick": {
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|-?[1-9][0-9]*)$",
+            "title": "Starttick",
+            "type": "string"
+          },
+          "streamIds": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Streamids",
+            "type": "array"
+          },
+          "toleranceTicks": {
+            "default": "0",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*)$",
+            "title": "Toleranceticks",
+            "type": "string"
+          }
+        },
+        "required": [
+          "episodeId",
+          "startTick",
+          "endTick",
+          "streamIds",
+          "gapThresholdTicks"
+        ],
+        "title": "InspectionWindowRequestV1",
+        "type": "object"
+      },
+      "InspectionWindowResponseV1": {
+        "additionalProperties": false,
+        "description": "One exact bounded inspection read with no manifest or physical authority.",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/InspectionWindowEvidenceV1"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/InspectionWindowIdentityV1"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/InspectionWindowLimitsV1"
+          },
+          "observations": {
+            "items": {
+              "$ref": "#/components/schemas/InspectionWindowStreamV1"
+            },
+            "title": "Observations",
+            "type": "array"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity",
+          "complete",
+          "limits",
+          "evidence",
+          "observations"
+        ],
+        "title": "InspectionWindowResponseV1",
+        "type": "object"
+      },
+      "InspectionWindowStreamV1": {
+        "additionalProperties": false,
+        "description": "Bounded raw observations and their truth state for one selected stream.",
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Columns",
+            "type": "array"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "corruptCount": {
+            "default": 0,
+            "title": "Corruptcount",
+            "type": "integer"
+          },
+          "observations": {
+            "items": {
+              "$ref": "#/components/schemas/InspectionWindowObservationV1"
+            },
+            "title": "Observations",
+            "type": "array"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "present",
+              "absent",
+              "partial",
+              "truncated",
+              "unavailable",
+              "permission",
+              "corrupt",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "streamId": {
+            "title": "Streamid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "streamId",
+          "state",
+          "complete",
+          "columns"
+        ],
+        "title": "InspectionWindowStreamV1",
+        "type": "object"
+      },
       "JoinAnalysis": {
         "description": "Everything the join node's inspector needs: ranked key suggestions for its two inputs, and a\nfan-out warning when the join isn't 1:1 (the result lands at the finer grain — a later\nparent-grain metric would double-count unless you aggregate).",
         "properties": {
@@ -17735,6 +18090,107 @@
           }
         },
         "summary": "Compound Asset Head"
+      }
+    },
+    "/api/compound-datasets/{dataset_id}/revisions/{revision_id}/inspection-window": {
+      "post": {
+        "description": "Return redacted evidence plus capped raw points/intervals for one exact fixture revision.",
+        "operationId": "inspection_window_api_compound_datasets__dataset_id__revisions__revision_id__inspection_window_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "dataset_id",
+            "required": true,
+            "schema": {
+              "title": "Dataset Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "title": "Revision Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InspectionWindowRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InspectionWindowResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Inspection Window"
       }
     },
     "/api/creds": {
