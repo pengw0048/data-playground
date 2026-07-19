@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Literal, NoReturn
 
@@ -10,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from hub import distribution_reports
 from hub.api_errors import APIError, APIErrorCode
+from hub.distribution_report_insights import (
+    DistributionReportCompareRequestV1,
+    DistributionReportComparisonV1,
+    compare_reports,
+)
 from hub.distribution_report_tasks import (
     COMPUTATION_VERSION,
     dispatch,
@@ -148,6 +154,39 @@ def get_report(
     if envelope is None:
         raise HTTPException(404, "Distribution report not found")
     return distribution_reports.public_distribution_report(envelope)
+
+
+def _completed_document(uid: str, report_id: str) -> tuple[
+    distribution_reports.DistributionReportDocumentV1,
+    DatasetViewDefinitionV1,
+]:
+    envelope = distribution_reports.distribution_report_by_id(
+        owner_id=uid, report_id=report_id)
+    if envelope is None:
+        raise HTTPException(404, "Distribution report not found")
+    if envelope["report"] is None:
+        raise APIError(
+            409, "Distribution report is not complete",
+            code=APIErrorCode.CONFLICT, retryable=True)
+    return (
+        distribution_reports.DistributionReportDocumentV1.model_validate_json(
+            json.dumps(envelope["report"])),
+        DatasetViewDefinitionV1.model_validate(envelope["view_snapshot"]),
+    )
+
+
+@router.post(
+    "/distribution-reports/compare",
+    response_model=DistributionReportComparisonV1,
+)
+def compare_distribution_reports(
+    request: DistributionReportCompareRequestV1,
+    uid: str = Depends(current_user),
+) -> DistributionReportComparisonV1:
+    """Compare two retained documents without rescanning either measured population."""
+    left, _left_view = _completed_document(uid, request.left_report_id)
+    right, _right_view = _completed_document(uid, request.right_report_id)
+    return compare_reports(left, right)
 
 
 @router.get(

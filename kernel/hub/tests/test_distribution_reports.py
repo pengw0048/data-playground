@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import os
 import sys
@@ -20,14 +19,31 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from hub import auth, db, distribution_report_tasks, distribution_reports, metadb
+from hub import (
+    auth,
+    db,
+    distribution_report_insights,
+    distribution_report_tasks,
+    distribution_reports,
+    metadb,
+)
 from hub.main import app
-from hub.models import DatasetViewDefinitionV1
+from hub.models import ColumnSchema, DatasetViewDefinitionV1
 from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import dataset_views as dataset_view_routes
 from hub.routers import runs as run_routes
 from hub.storage import LocalStorage
+
+
+class _DeclaredIdentityDuckDBAdapter(DuckDBAdapter):
+    """Test provider that supplies one stable field identity independently of its name."""
+
+    def schema(self, uri: str) -> list[ColumnSchema]:
+        columns = super().schema(uri)
+        return [column.model_copy(update={
+            "field_id": f"declared-field-{index}", "provenance": "provider",
+        }) for index, column in enumerate(columns)]
 
 
 @pytest.fixture(autouse=True)
@@ -111,12 +127,8 @@ def core_view_factory(tmp_path):
             "semanticSha256": "a" * 64,
             "definitionSha256": "b" * 64,
         })
-        digest_payload = definition.model_dump(by_alias=True, mode="json")
-        digest_payload.pop("definitionSha256")
-        digest_payload.pop("temporalWindow")
         definition = definition.model_copy(update={
-            "definition_sha256": hashlib.sha256(json.dumps(
-                digest_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "definition_sha256": distribution_reports._view_definition_digest(definition),
         })
         document = json.dumps(
             definition.model_dump(by_alias=True, mode="json"),
@@ -203,6 +215,23 @@ def _expire_latest_attempt(task_id: str) -> None:
         assert attempt is not None
         attempt.lease_until = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
             seconds=30)
+
+
+def _complete_computed_report(view: dict) -> dict:
+    admitted, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(view))
+    owner_token = f"test-compute-{uuid.uuid4().hex}"
+    claim = distribution_reports.claim_distribution_report(
+        admitted["task"]["id"], owner_token)
+    assert claim is not None
+    attempt = claim["task"]["attempts"][-1]
+    document = distribution_report_tasks.compute_distribution_report(
+        claim, distribution_report_tasks._LeaseState(time.monotonic() + 30))
+    completed = distribution_reports.complete_distribution_report(
+        task_id=claim["task"]["id"], attempt_id=attempt["id"],
+        owner_token=owner_token, report=document)
+    assert completed is not None and completed["report"] is not None
+    return completed
 
 
 def test_atomic_admission_replay_conflict_and_persistence_rollback(
@@ -646,6 +675,200 @@ def test_reservoir_report_is_exact_only_over_its_deterministic_sample(
     assert any("no full-population claim" in item for item in parsed.limitations)
     numeric = next(section for section in parsed.sections if section.kind == "numeric")
     assert numeric.count == sum(bucket.count for bucket in numeric.histogram) == 10
+
+
+def test_ephemeral_compare_never_invents_incompatible_deltas(core_view_factory):
+    view = core_view_factory()
+    admitted, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(view))
+    claim = distribution_reports.claim_distribution_report(
+        admitted["task"]["id"], "compare-owner")
+    assert claim is not None
+    base = distribution_reports.DistributionReportDocumentV1.model_validate(_report(claim))
+
+    equal = distribution_report_insights.compare_reports(base, base)
+    assert equal.coverage.reason == "compatible_full_coverage"
+    equal_column = equal.columns[0]
+    assert equal_column.missing_count_delta == 0
+    assert equal_column.metric_delta is not None
+    equal_delta = equal_column.metric_delta.model_dump(by_alias=True)
+    assert equal_delta["countDelta"] == 0
+    assert equal_delta["meanDelta"] == 0
+    assert equal_delta["histogramReason"] == "equal_edges"
+    assert equal_delta["histogram"][0]["countDelta"] == 0
+
+    unequal_edges_payload = base.model_dump(by_alias=True, mode="json")
+    unequal_edges_payload["sections"][-1]["histogram"] = [{
+        "bucketId": "right-0", "lower": 1.0, "upper": 2.0,
+        "count": 1, "upperInclusive": False,
+    }, {
+        "bucketId": "right-1", "lower": 2.0, "upper": 3.0,
+        "count": 2, "upperInclusive": True,
+    }]
+    unequal_edges = distribution_report_insights.compare_reports(
+        base,
+        distribution_reports.DistributionReportDocumentV1.model_validate(
+            unequal_edges_payload),
+    )
+    unequal_delta = unequal_edges.columns[0].metric_delta
+    assert unequal_delta is not None
+    assert unequal_delta.model_dump(by_alias=True)["histogram"] is None
+    assert unequal_delta.model_dump(by_alias=True)["histogramReason"] == "unequal_edges"
+
+    incompatible_payload = base.model_dump(by_alias=True, mode="json")
+    incompatible_payload["computationVersion"] = "distribution-v2"
+    incompatible = distribution_report_insights.compare_reports(
+        base,
+        distribution_reports.DistributionReportDocumentV1.model_validate(
+            incompatible_payload),
+    )
+    assert incompatible.columns[0].reason == "computation_version_mismatch"
+    assert incompatible.columns[0].metric_delta is None
+
+    sample_payload = base.model_dump(by_alias=True, mode="json")
+    sample_payload["complete"] = False
+    sample_payload["sampleProvenance"] = {
+        "strategy": "reservoir", "seed": 7, "requestedRows": 3,
+        "scannedRows": 3, "returnedRows": 3, "totalRows": 3,
+        "datasetIdentity": base.dataset_id, "datasetRevision": base.revision_id,
+        "identity": "e" * 64, "limitations": ["test sample"],
+    }
+    sampled = distribution_report_insights.compare_reports(
+        base,
+        distribution_reports.DistributionReportDocumentV1.model_validate(sample_payload),
+    )
+    assert sampled.coverage.reason == "full_sample_coverage_mismatch"
+    assert sampled.columns[0].reason == "coverage_mismatch"
+    assert sampled.columns[0].metric_delta is None
+
+    left_category = base.model_dump(by_alias=True, mode="json")
+    left_category["sections"] = [{
+        "kind": "coverage_schema", "sectionId": "coverage-schema",
+        "selectedColumnCount": 1, "reportedColumnCount": 1,
+        "columns": [{"name": "category", "type": "string"}],
+    }, {
+        "kind": "missingness", "sectionId": "left-missing",
+        "columnName": "category", "missingCount": 0,
+    }, {
+        "kind": "categorical", "sectionId": "left-category",
+        "columnName": "category", "top": [
+            {"bucketId": "left-a", "label": "a", "count": 1},
+            {"bucketId": "left-b", "label": "b", "count": 1},
+        ], "otherCount": 1, "distinctCount": 3, "distinctCountApproximate": True,
+    }]
+    right_category = json.loads(json.dumps(left_category))
+    right_category["sections"][2].update({
+        "top": [
+            {"bucketId": "right-a", "label": "a", "count": 1},
+            {"bucketId": "right-c", "label": "c", "count": 1},
+        ],
+    })
+    categorical = distribution_report_insights.compare_reports(
+        distribution_reports.DistributionReportDocumentV1.model_validate(left_category),
+        distribution_reports.DistributionReportDocumentV1.model_validate(right_category),
+    )
+    assert categorical.columns[0].match_reason == "name_and_logical_type"
+    category_delta = categorical.columns[0].metric_delta
+    assert category_delta is not None
+    categories = {
+        item["label"]: item
+        for item in category_delta.model_dump(by_alias=True)["categories"]
+    }
+    assert categories["b"]["rightCount"] is None
+    assert categories["b"]["countDelta"] is None
+    assert categories["b"]["reason"] == "outside_right_top_k"
+
+    attempt = claim["task"]["attempts"][-1]
+    completed = distribution_reports.complete_distribution_report(
+        task_id=claim["task"]["id"], attempt_id=attempt["id"],
+        owner_token="compare-owner", report=base.model_dump(by_alias=True, mode="json"))
+    assert completed is not None
+    other = f"compare-other-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=other, name="Other"))
+    request = {"leftReportId": base.report_id, "rightReportId": base.report_id}
+    with TestClient(app) as client:
+        compared = client.post("/api/distribution-reports/compare", json=request)
+        assert compared.status_code == 200, compared.text
+        assert compared.json()["coverage"]["reason"] == "compatible_full_coverage"
+        assert client.post(
+            "/api/distribution-reports/compare", json=request,
+            headers={"X-DP-User": other},
+        ).status_code == 404
+
+
+def test_retained_revision_field_identity_matches_a_real_cross_revision_rename(
+    tmp_path, monkeypatch,
+):
+    storage = LocalStorage(str(tmp_path / "identity-outputs"))
+    catalog = InMemoryCatalog(
+        str(tmp_path / "identity-data"), lambda _uri: _DeclaredIdentityDuckDBAdapter())
+    logical_uri = str(tmp_path / "identity-published" / "renamed.parquet")
+
+    def publish(column: str, values: list[int]) -> dict:
+        run_id = uuid.uuid4().hex
+        artifact = storage.begin_result(f"managed-file:{logical_uri}", run_id)
+        pq.write_table(pa.table({column: values}), artifact)
+        storage.commit_result(artifact, run_id)
+        published = catalog.publish_managed_local_file_output(
+            name=f"identity-{column}", logical_uri=logical_uri, artifact_uri=artifact)
+        assert storage.release_result(artifact, run_id) is True
+        return published
+
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=storage, resolve_adapter=deps.resolve_adapter))
+    try:
+        first_revision = publish("old_name", [1, 2, 3])
+        with TestClient(app) as client:
+            first_view_response = client.post("/api/dataset-views", json={
+                "submissionId": uuid.uuid4().hex,
+                "name": "Before rename",
+                "datasetRef": {
+                    "kind": "exact", "datasetId": first_revision["dataset_id"],
+                    "revisionId": first_revision["revision_id"],
+                },
+                "selectedColumns": ["old_name"],
+                "sampling": {"kind": "all"},
+            })
+            assert first_view_response.status_code == 201, first_view_response.text
+            second_revision = publish("new_name", [1, 2, 3])
+            assert second_revision["dataset_id"] == first_revision["dataset_id"]
+            second_view_response = client.post("/api/dataset-views", json={
+                "submissionId": uuid.uuid4().hex,
+                "name": "After rename",
+                "datasetRef": {
+                    "kind": "exact", "datasetId": second_revision["dataset_id"],
+                    "revisionId": second_revision["revision_id"],
+                },
+                "selectedColumns": ["new_name"],
+                "sampling": {"kind": "all"},
+            })
+            assert second_view_response.status_code == 201, second_view_response.text
+
+        first_definition = DatasetViewDefinitionV1.model_validate(first_view_response.json())
+        assert first_definition.definition_sha256 == distribution_reports._view_definition_digest(
+            first_definition), first_definition.model_dump(by_alias=True, mode="json")
+        left = _complete_computed_report(first_view_response.json())
+        right = _complete_computed_report(second_view_response.json())
+        left_document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+            json.dumps(left["report"]))
+        right_document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+            json.dumps(right["report"]))
+        left_column = distribution_report_insights._coverage(left_document)[0]
+        right_column = distribution_report_insights._coverage(right_document)[0]
+        assert (left_column.name, right_column.name) == ("old_name", "new_name")
+        assert left_column.field_id == right_column.field_id == "declared-field-0"
+        comparison = distribution_report_insights.compare_reports(
+            left_document, right_document)
+        assert len(comparison.columns) == 1
+        assert comparison.columns[0].match_reason == "stable_field_identity"
+        assert comparison.columns[0].metric_delta is not None
+        assert comparison.columns[0].metric_delta.model_dump(
+            by_alias=True)["meanDelta"] == 0
+    finally:
+        storage.close()
 
 
 def test_numeric_float_wire_boundaries_fail_closed_and_reconcile(core_view_factory, monkeypatch):
