@@ -4969,7 +4969,7 @@ def _workspace_external_identity(binding: WorkspaceProviderBinding) -> str:
 
 
 def _workspace_provider_container_resource(
-        s, binding: WorkspaceProviderBinding) -> dict:
+        s, binding: WorkspaceProviderBinding, *, local_placement: dict | None = None) -> dict:
     """Project cached provider facts only; action responses must never consult a live provider."""
     parent = (s.get(WorkspaceProviderBinding, binding.parent_binding_id)
               if binding.parent_binding_id is not None else None)
@@ -4985,8 +4985,7 @@ def _workspace_provider_container_resource(
         "resourceId": binding.resource_id, "bindingId": binding.id,
         "referenceState": binding.state, "lastKnown": binding.state != "current",
         "lastResolvedAt": binding.last_resolved_at,
-        # Deliberately omit localPlacement: this projection is a navigation parent, not the
-        # capability response that originally disclosed the opaque local destination.
+        "localPlacement": local_placement,
         "providerMutation": False,
     }
 
@@ -4998,7 +4997,14 @@ def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
     binding = s.get(WorkspaceProviderBinding, anchor.binding_id)
     if binding is None or binding.kind != "container":  # pragma: no cover - FK-protected invariant
         raise RuntimeError("external Workspace overlay anchor binding is missing")
-    return _workspace_provider_container_resource(s, binding)
+    return _workspace_provider_container_resource(s, binding, local_placement={
+        "writable": True,
+        "canCreateCanvas": True,
+        "canMoveCanvas": True,
+        "containerId": row.id,
+        "containerVersion": row.version,
+        "recoveryState": "ready",
+    })
 
 
 def _workspace_public_placement_resource(

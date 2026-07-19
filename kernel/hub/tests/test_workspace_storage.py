@@ -1086,8 +1086,8 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             editor_move_doc = editor_move.json()
             assert editor_move_doc["resource"]["parentId"] == remote["id"]
             assert editor_move_doc["container"]["id"] == remote["id"]
-            assert anchor_id not in json.dumps(editor_move_doc)
-            assert "External overlay" not in json.dumps(editor_move_doc)
+            assert editor_move_doc["container"]["name"] == remote["name"]
+            assert editor_move_doc["container"]["localPlacement"] == capability
             denied_move = client.put(
                 f"/api/workspace/placements/{source_placement['id']}/canvas",
                 headers={"X-DP-User": viewer_id}, json={
@@ -1145,8 +1145,18 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             moved_away_doc = moved_away.json()
             assert moved_away_doc["resource"]["parentId"] == f"container:{root['id']}"
             assert moved_away_doc["previousContainer"]["id"] == remote["id"]
-            assert anchor_id not in json.dumps(moved_away_doc)
-            assert "External overlay" not in json.dumps(moved_away_doc)
+            assert moved_away_doc["previousContainer"]["name"] == remote["name"]
+            previous_capability = moved_away_doc["previousContainer"]["localPlacement"]
+            assert previous_capability == capability
+            undo = client.put(
+                f"/api/workspace/placements/{source_placement['id']}/canvas", json={
+                    "containerId": previous_capability["containerId"],
+                    "expectedContainerVersion": previous_capability["containerVersion"],
+                    "expectedVersion": moved_away_doc["resource"]["version"],
+                })
+            assert undo.status_code == 200, undo.text
+            assert undo.json()["resource"]["parentId"] == remote["id"]
+            assert undo.json()["container"]["id"] == remote["id"]
 
             # Both PostgreSQL (root-row lock) and SQLite (writer lock) serialize the final replay
             # lookup with the Canvas insert.  The replay table's composite primary key remains the
