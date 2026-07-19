@@ -8852,6 +8852,826 @@
         "title": "SettingsSnapshot",
         "type": "object"
       },
+      "TemporalEvidenceApproximationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "pairwise": {
+            "title": "Pairwise",
+            "type": "string"
+          },
+          "pointCoverage": {
+            "title": "Pointcoverage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pointCoverage",
+          "pairwise"
+        ],
+        "title": "TemporalEvidenceApproximationV1",
+        "type": "object"
+      },
+      "TemporalEvidenceDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "maximum": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum"
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum"
+          },
+          "rightReuse": {
+            "title": "Rightreuse",
+            "type": "boolean"
+          },
+          "tieBreak": {
+            "title": "Tiebreak",
+            "type": "string"
+          }
+        },
+        "required": [
+          "count",
+          "minimum",
+          "maximum",
+          "tieBreak",
+          "rightReuse"
+        ],
+        "title": "TemporalEvidenceDeltaV1",
+        "type": "object"
+      },
+      "TemporalEvidenceGapV1": {
+        "additionalProperties": false,
+        "properties": {
+          "afterObservationId": {
+            "title": "Afterobservationid",
+            "type": "string"
+          },
+          "beforeObservationId": {
+            "title": "Beforeobservationid",
+            "type": "string"
+          },
+          "durationTicks": {
+            "title": "Durationticks",
+            "type": "integer"
+          },
+          "thresholdTicks": {
+            "title": "Thresholdticks",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "afterObservationId",
+          "beforeObservationId",
+          "durationTicks",
+          "thresholdTicks"
+        ],
+        "title": "TemporalEvidenceGapV1",
+        "type": "object"
+      },
+      "TemporalEvidenceIdentityV1": {
+        "additionalProperties": false,
+        "properties": {
+          "compoundDatasetId": {
+            "title": "Compounddatasetid",
+            "type": "string"
+          },
+          "compoundRevision": {
+            "title": "Compoundrevision",
+            "type": "string"
+          },
+          "computationVersion": {
+            "title": "Computationversion",
+            "type": "string"
+          },
+          "datasetViews": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceViewIdentityV1"
+            },
+            "title": "Datasetviews",
+            "type": "array"
+          },
+          "episodeId": {
+            "title": "Episodeid",
+            "type": "string"
+          },
+          "evidenceId": {
+            "title": "Evidenceid",
+            "type": "string"
+          },
+          "gapThresholdTicks": {
+            "title": "Gapthresholdticks",
+            "type": "integer"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceMemberIdentityV1"
+            },
+            "title": "Members",
+            "type": "array"
+          },
+          "pair": {
+            "anyOf": [
+              {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pair"
+          },
+          "streams": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Streams",
+            "type": "array"
+          },
+          "toleranceTicks": {
+            "title": "Toleranceticks",
+            "type": "integer"
+          },
+          "window": {
+            "$ref": "#/components/schemas/TemporalEvidenceWindowEvidenceV1"
+          }
+        },
+        "required": [
+          "computationVersion",
+          "compoundDatasetId",
+          "compoundRevision",
+          "episodeId",
+          "streams",
+          "window",
+          "pair",
+          "toleranceTicks",
+          "gapThresholdTicks",
+          "members",
+          "datasetViews",
+          "evidenceId"
+        ],
+        "title": "TemporalEvidenceIdentityV1",
+        "type": "object"
+      },
+      "TemporalEvidenceMappingV1": {
+        "additionalProperties": false,
+        "properties": {
+          "offsetTick": {
+            "title": "Offsettick",
+            "type": "integer"
+          },
+          "scaleDenominator": {
+            "title": "Scaledenominator",
+            "type": "integer"
+          },
+          "scaleNumerator": {
+            "title": "Scalenumerator",
+            "type": "integer"
+          },
+          "sourceClockId": {
+            "title": "Sourceclockid",
+            "type": "string"
+          },
+          "targetClockId": {
+            "title": "Targetclockid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sourceClockId",
+          "targetClockId",
+          "scaleNumerator",
+          "scaleDenominator",
+          "offsetTick"
+        ],
+        "title": "TemporalEvidenceMappingV1",
+        "type": "object"
+      },
+      "TemporalEvidenceMemberIdentityV1": {
+        "additionalProperties": false,
+        "properties": {
+          "datasetId": {
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "revisionId": {
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "streamId": {
+            "title": "Streamid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "streamId",
+          "datasetId",
+          "revisionId"
+        ],
+        "title": "TemporalEvidenceMemberIdentityV1",
+        "type": "object"
+      },
+      "TemporalEvidencePairEvidenceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "leftStreamId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftstreamid"
+          },
+          "matchedCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matchedcount"
+          },
+          "nearestDelta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidenceDeltaV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "overlapApproximation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overlapapproximation"
+          },
+          "overlapTicks": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overlapticks"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "rightStreamId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightstreamid"
+          },
+          "state": {
+            "enum": [
+              "available",
+              "truncated",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "toleranceTicks": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Toleranceticks"
+          },
+          "unknownCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unknowncount"
+          },
+          "unmatchedLeftCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unmatchedleftcount"
+          },
+          "unmatchedRightCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unmatchedrightcount"
+          }
+        },
+        "required": [
+          "state",
+          "complete"
+        ],
+        "title": "TemporalEvidencePairEvidenceV1",
+        "type": "object"
+      },
+      "TemporalEvidencePairV1": {
+        "additionalProperties": false,
+        "description": "The only pairwise comparison allowed in one bounded evidence request.",
+        "properties": {
+          "leftStreamId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Leftstreamid",
+            "type": "string"
+          },
+          "rightStreamId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Rightstreamid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "leftStreamId",
+          "rightStreamId"
+        ],
+        "title": "TemporalEvidencePairV1",
+        "type": "object"
+      },
+      "TemporalEvidenceRateV1": {
+        "additionalProperties": false,
+        "properties": {
+          "denominator": {
+            "title": "Denominator",
+            "type": "integer"
+          },
+          "numerator": {
+            "title": "Numerator",
+            "type": "integer"
+          },
+          "physicalUnit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Physicalunit"
+          },
+          "unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unit"
+          }
+        },
+        "required": [
+          "numerator",
+          "denominator"
+        ],
+        "title": "TemporalEvidenceRateV1",
+        "type": "object"
+      },
+      "TemporalEvidenceRequestV1": {
+        "additionalProperties": false,
+        "description": "One exact compound calculation over stored, bounded DatasetViews only.",
+        "properties": {
+          "episodeId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Episodeid",
+            "type": "string"
+          },
+          "gapThresholdTicks": {
+            "description": "Canonical positive signed-int64 decimal string.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:[1-9][0-9]*)$",
+            "title": "Gapthresholdticks",
+            "type": "string"
+          },
+          "manifestJson": {
+            "maxLength": 131072,
+            "minLength": 2,
+            "title": "Manifestjson",
+            "type": "string"
+          },
+          "pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidencePairV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "referenceViewId": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Referenceviewid",
+            "type": "string"
+          },
+          "streamIds": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Streamids",
+            "type": "array"
+          },
+          "streamViews": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceStreamViewBindingV1"
+            },
+            "maxItems": 8,
+            "title": "Streamviews",
+            "type": "array"
+          },
+          "toleranceTicks": {
+            "default": "0",
+            "description": "Canonical nonnegative signed-int64 decimal string.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*)$",
+            "title": "Toleranceticks",
+            "type": "string"
+          }
+        },
+        "required": [
+          "manifestJson",
+          "episodeId",
+          "streamIds",
+          "referenceViewId",
+          "gapThresholdTicks"
+        ],
+        "title": "TemporalEvidenceRequestV1",
+        "type": "object"
+      },
+      "TemporalEvidenceResponseV1": {
+        "additionalProperties": false,
+        "description": "Versioned redacted evidence record; it never exposes raw observations or locators.",
+        "properties": {
+          "approximation": {
+            "$ref": "#/components/schemas/TemporalEvidenceApproximationV1"
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/TemporalEvidenceIdentityV1"
+          },
+          "pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidencePairEvidenceV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "streams": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceStreamV1"
+            },
+            "title": "Streams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "identity",
+          "complete",
+          "approximation",
+          "streams",
+          "pair"
+        ],
+        "title": "TemporalEvidenceResponseV1",
+        "type": "object"
+      },
+      "TemporalEvidenceStreamV1": {
+        "additionalProperties": false,
+        "properties": {
+          "boundedReadCount": {
+            "title": "Boundedreadcount",
+            "type": "integer"
+          },
+          "clockMapping": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidenceMappingV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "corruptCount": {
+            "title": "Corruptcount",
+            "type": "integer"
+          },
+          "coverageIntervals": {
+            "items": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                }
+              ],
+              "type": "array"
+            },
+            "title": "Coverageintervals",
+            "type": "array"
+          },
+          "firstTick": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Firsttick"
+          },
+          "gapThresholdTicks": {
+            "title": "Gapthresholdticks",
+            "type": "integer"
+          },
+          "gaps": {
+            "items": {
+              "$ref": "#/components/schemas/TemporalEvidenceGapV1"
+            },
+            "title": "Gaps",
+            "type": "array"
+          },
+          "lastTick": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lasttick"
+          },
+          "measuredRate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidenceRateV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "nominalRate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalEvidenceRateV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "observedCount": {
+            "title": "Observedcount",
+            "type": "integer"
+          },
+          "providerCoverage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Providercoverage"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "state": {
+            "enum": [
+              "available",
+              "absent",
+              "unavailable",
+              "permission",
+              "corrupt",
+              "truncated",
+              "unknown"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "streamId": {
+            "title": "Streamid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "streamId",
+          "state",
+          "providerCoverage",
+          "nominalRate",
+          "measuredRate",
+          "corruptCount",
+          "observedCount",
+          "boundedReadCount",
+          "coverageIntervals",
+          "gaps",
+          "firstTick",
+          "lastTick",
+          "clockMapping",
+          "gapThresholdTicks",
+          "complete"
+        ],
+        "title": "TemporalEvidenceStreamV1",
+        "type": "object"
+      },
+      "TemporalEvidenceStreamViewBindingV1": {
+        "additionalProperties": false,
+        "description": "One server-owned bounded DatasetView bound to one requested stream.",
+        "properties": {
+          "datasetViewId": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "streamId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Streamid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "streamId",
+          "datasetViewId"
+        ],
+        "title": "TemporalEvidenceStreamViewBindingV1",
+        "type": "object"
+      },
+      "TemporalEvidenceViewIdentityV1": {
+        "additionalProperties": false,
+        "properties": {
+          "definitionSha256": {
+            "title": "Definitionsha256",
+            "type": "string"
+          },
+          "semanticSha256": {
+            "title": "Semanticsha256",
+            "type": "string"
+          },
+          "streamId": {
+            "title": "Streamid",
+            "type": "string"
+          },
+          "viewId": {
+            "title": "Viewid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "streamId",
+          "viewId",
+          "definitionSha256",
+          "semanticSha256"
+        ],
+        "title": "TemporalEvidenceViewIdentityV1",
+        "type": "object"
+      },
+      "TemporalEvidenceWindowEvidenceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "endTick": {
+            "title": "Endtick",
+            "type": "integer"
+          },
+          "startTick": {
+            "title": "Starttick",
+            "type": "integer"
+          },
+          "timeDomain": {
+            "title": "Timedomain",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timeDomain",
+          "startTick",
+          "endTick"
+        ],
+        "title": "TemporalEvidenceWindowEvidenceV1",
+        "type": "object"
+      },
       "TemporalWindowV1": {
         "additionalProperties": false,
         "description": "One bounded half-open interval over an integer field in a named time domain.",
@@ -21484,6 +22304,89 @@
           }
         },
         "summary": "Put Settings Batch"
+      }
+    },
+    "/api/temporal-evidence": {
+      "post": {
+        "description": "Return evidence only; raw observations and physical member locations stay private.",
+        "operationId": "temporal_evidence_api_temporal_evidence_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemporalEvidenceRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemporalEvidenceResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Temporal Evidence"
       }
     },
     "/api/transform-library": {
