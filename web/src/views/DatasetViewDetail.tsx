@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { api, KernelError } from '../api/client'
 import type { DatasetViewDefinition, DatasetViewPreview } from '../types/api'
 import { Icon } from '../ui/Icon'
+import { DistributionReportLauncher } from './DistributionReports'
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const cell = (value: unknown) => value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
@@ -105,6 +106,7 @@ export function DatasetViewDetail({ definition, onClose, onDeleted }: {
               : error ? <div role="alert" className="rounded-md border border-destructive/30 p-3 text-destructive"><div>{error}</div><button onClick={() => void load()} className="mt-2 font-semibold underline">Retry</button></div>
                 : preview ? <PreviewTable preview={preview} /> : null}
           </section>
+          <DistributionReportLauncher definition={definition} />
           <section className="grid gap-1 text-[9.5px] text-muted-foreground">
             <div>Created {new Date(definition.createdAt).toLocaleString()} by {definition.creatorId}</div>
             <div className="break-all font-mono">semantic:{definition.semanticSha256}</div>

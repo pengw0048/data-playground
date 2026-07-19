@@ -189,6 +189,65 @@ export interface DatasetViewPreview {
   sampleProvenance?: SampleProvenance | null
 }
 
+export interface DistributionReportEstimate {
+  schemaVersion: 1
+  datasetViewId: string
+  viewDefinitionSha256: string
+  estimatedScanRows?: number | null
+  estimatedScanBytes?: number | null
+  selectedColumnCount: number
+  needsConfirmation: boolean
+  reason?: 'unknown_size' | 'large_scan' | null
+  limits: { reportedColumns: number; topCategories: number; histogramBuckets: number; deadlineSeconds: number }
+}
+
+export interface DistributionReportTask {
+  id: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  progress?: number | null
+  error?: string | null
+  cancelRequested: boolean
+  maxAttempts: number
+  attempts: Array<{ id: string; attemptNumber: number; status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled' | 'fenced'; progress?: number | null; error?: string | null; startedAt?: string | null; completedAt?: string | null }>
+}
+
+export type DistributionReportSection =
+  | { kind: 'coverage_schema'; sectionId: string; selectedColumnCount: number; reportedColumnCount: number; columns: ColumnSchema[] }
+  | { kind: 'missingness'; sectionId: string; columnName: string; missingCount: number }
+  | { kind: 'numeric'; sectionId: string; columnName: string; count: number; nonFiniteCount: number; min?: number | null; max?: number | null; mean?: number | null; stddev?: number | null; quantiles: Array<{ probability: number; value: number }>; histogram: Array<{ bucketId: string; lower: number; upper: number; count: number; upperInclusive: boolean }> }
+  | { kind: 'categorical'; sectionId: string; columnName: string; top: Array<{ bucketId: string; label: string | boolean; count: number }>; otherCount: number; distinctCount: number; distinctCountApproximate: boolean }
+  | { kind: 'temporal'; sectionId: string; columnName: string; min?: string | null; max?: string | null; buckets: Array<{ bucketId: string; start: string; end: string; count: number; endInclusive: boolean }> }
+  | { kind: 'unsupported'; sectionId: string; columnName?: string | null; reason: string; omittedCount?: number | null; partial: boolean }
+
+export interface DistributionReportDocument {
+  schemaVersion: 1
+  reportId: string
+  taskId: string
+  datasetViewId: string
+  datasetId: string
+  revisionId: string
+  viewDefinitionSha256: string
+  computationVersion: string
+  measuredRows: number
+  complete: boolean
+  sampleProvenance?: SampleProvenance | null
+  limitations: string[]
+  sections: DistributionReportSection[]
+}
+
+export interface DistributionReportEnvelope {
+  schemaVersion: 1
+  reportId: string
+  task: DistributionReportTask
+  intent: { submissionId: string; datasetViewId: string; viewDefinitionSha256: string; computationVersion: string; maxAttempts: number }
+  viewSnapshot: DatasetViewDefinition
+  revisionRetentionOwner: 'core'
+  report?: DistributionReportDocument | null
+  createdAt: string
+  updatedAt: string
+  completedAt?: string | null
+}
+
 export type SchemaCompatibilityStatus = 'compatible' | 'breaking' | 'unknown'
 export interface SchemaFieldCompatibility {
   kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'
