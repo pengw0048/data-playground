@@ -1097,15 +1097,87 @@ class TemporalResampleFieldV1(Wire):
     unit: str = Field(min_length=1, max_length=256)
 
 
+class TemporalFixedGridTargetV1(Wire):
+    """One exact rational target grid in the target clock's physical time unit."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    target_clock_id: str = Field(min_length=1, max_length=128)
+    time_domain: str = Field(min_length=1, max_length=512)
+    start_tick: str = Field(
+        min_length=1, max_length=20, pattern=r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        description="Canonical signed-int64 inclusive target-clock start tick.",
+    )
+    end_tick: str = Field(
+        min_length=1, max_length=20, pattern=r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        description="Canonical signed-int64 exclusive target-clock end tick.",
+    )
+    rate_numerator: str = Field(
+        min_length=1, max_length=19, pattern=r"^[1-9][0-9]*$",
+        description="Positive rational observations-per-second numerator.",
+    )
+    rate_denominator: str = Field(
+        min_length=1, max_length=19, pattern=r"^[1-9][0-9]*$",
+        description="Positive rational observations-per-second denominator.",
+    )
+    phase_tick: str = Field(
+        min_length=1, max_length=20,
+        pattern=r"^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+        description="Canonical signed-int64 target-clock phase/origin tick.",
+    )
+
+    @field_validator("target_clock_id", "time_domain")
+    @classmethod
+    def canonical_clock_id(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("fixed-grid target clock id must be trimmed and NUL-free")
+        return value
+
+    @model_validator(mode="after")
+    def _bounded_integers(self) -> "TemporalFixedGridTargetV1":
+        limit = (1 << 63) - 1
+        if int(self.rate_numerator) > limit or int(self.rate_denominator) > limit:
+            raise ValueError("fixed-grid rate must use positive signed 64-bit integers")
+        for value in (self.start_tick, self.end_tick, self.phase_tick):
+            if not (-(1 << 63) <= int(value) <= limit):
+                raise ValueError("fixed-grid ticks must be signed 64-bit integers")
+        if int(self.start_tick) >= int(self.end_tick):
+            raise ValueError("fixed-grid bounds must be a non-empty half-open interval")
+        return self
+
+
 class TemporalResampleWriteRequestV1(Wire):
     """One bounded, exact temporal-resample submission.
 
-    The compound identity and DatasetViews name immutable identities only.  The server
-    reopens both views during admission and again under the durable lease; raw
-    observations, provider URIs, and credentials never enter this envelope.
+    The source DatasetView is always reopened during admission and under the durable
+    lease.  Stream-timestamp targets also reopen their exact target DatasetView; a
+    fixed-grid target instead binds the exact target stream, clock, and mapping
+    authority and scans no target view.  Raw observations, provider URIs, and
+    credentials never enter this envelope.
     """
 
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True,
+        json_schema_extra={"oneOf": [
+            {
+                "title": "Stream timestamp target",
+                "required": ["window", "targetViewId"],
+                "properties": {
+                    "window": {"not": {"type": "null"}},
+                    "targetViewId": {"not": {"type": "null"}},
+                    "fixedGrid": {"type": "null"},
+                },
+            },
+            {
+                "title": "Fixed rational-grid target",
+                "required": ["fixedGrid"],
+                "properties": {
+                    "fixedGrid": {"not": {"type": "null"}},
+                    "window": {"type": "null"},
+                    "targetViewId": {"type": "null"},
+                },
+            },
+        ]},
+    )
     submission_id: str = Field(min_length=1, max_length=256)
     compound_dataset_id: str = Field(min_length=1, max_length=128)
     compound_revision_id: str = Field(min_length=1, max_length=128)
@@ -1117,8 +1189,9 @@ class TemporalResampleWriteRequestV1(Wire):
     output_member_id: str = Field(
         min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
     source_view_id: str = Field(min_length=1, max_length=32)
-    target_view_id: str = Field(min_length=1, max_length=32)
-    window: TemporalWindowV1
+    target_view_id: str | None = Field(default=None, min_length=1, max_length=32)
+    window: TemporalWindowV1 | None = None
+    fixed_grid: TemporalFixedGridTargetV1 | None = None
     tolerance_ticks: str = Field(
         default="0", min_length=1, max_length=20, pattern=r"^(?:0|[1-9][0-9]*)$")
     selected_fields: list[TemporalResampleFieldV1] = Field(min_length=1, max_length=32)
@@ -1139,6 +1212,11 @@ class TemporalResampleWriteRequestV1(Wire):
             raise ValueError("source and target streams must differ")
         if len({item.field for item in self.selected_fields}) != len(self.selected_fields):
             raise ValueError("selected fields must be unique")
+        if self.fixed_grid is None:
+            if self.window is None or self.target_view_id is None:
+                raise ValueError("stream timestamp targets require a window and target DatasetView")
+        elif self.window is not None or self.target_view_id is not None:
+            raise ValueError("fixed-grid targets must not name an unused target DatasetView or stream window")
         if not (0 <= int(self.tolerance_ticks) <= (1 << 63) - 1):
             raise ValueError("tolerance ticks must be a nonnegative signed 64-bit integer")
         if self.write_intent.mode not in ("create", "replace"):

@@ -56,6 +56,17 @@ class FieldSelection:
 
 
 @dataclass(frozen=True)
+class FixedGridTarget:
+    """An exact, phase-aligned rational grid in one declared target clock."""
+
+    target_clock_id: str
+    rate_numerator: int
+    rate_denominator: int
+    phase_tick: int
+    period_ticks: int = 0
+
+
+@dataclass(frozen=True)
 class TemporalResampleSpecV1:
     """Semantic identity for one point-to-point nearest resampling request."""
 
@@ -66,18 +77,21 @@ class TemporalResampleSpecV1:
     target_stream_id: str
     output_stream_id: str
     source_view: DatasetViewIdentity
-    target_view: DatasetViewIdentity
+    target_view: DatasetViewIdentity | None
     mapping: ClockMapping
     window: ResampleWindow
     tolerance_ticks: int
     selected_fields: tuple[FieldSelection, ...]
     candidate_cap: int
     output_cap: int
+    fixed_grid: FixedGridTarget | None = None
     computation_version: str = COMPUTATION_VERSION
 
     def identity_document(self) -> dict[str, object]:
         """Return the canonical semantic identity, independent of input ordering."""
         _validate_spec_shape(self)
+        if self.fixed_grid is not None and self.fixed_grid.period_ticks <= 0:
+            raise TemporalResampleError("fixed grid must be preflight canonicalized before identity")
         return _spec_document(self)
 
     @property
@@ -132,12 +146,16 @@ def build_resample_candidate(
 ) -> ResampleCandidate:
     """Validate all facts, then build bounded rows with source reuse and earlier-tick ties."""
     _validate_exact_manifest(manifest)
-    _validate_contract(manifest, spec)
+    spec = _validate_contract(manifest, spec)
     spec = replace(spec, selected_fields=tuple(sorted(spec.selected_fields, key=lambda item: item.field)))
     if not isinstance(source_points, (tuple, list)) or not isinstance(target_points, (tuple, list)):
         raise TemporalResampleError("point collections are invalid")
     if len(source_points) > MAX_POINTS or len(target_points) > MAX_POINTS:
         raise TemporalResampleError("point cap exceeded")
+    if spec.fixed_grid is not None and target_points:
+        generated = _fixed_grid_points(spec)
+        if tuple(target_points) != generated:
+            raise TemporalResampleError("fixed grid target observations are not canonical")
     if len(target_points) > spec.candidate_cap or len(target_points) > spec.output_cap:
         raise TemporalResampleError("candidate or output cap exceeded")
     source_stream = next(item for item in manifest.streams if item.id == spec.source_stream_id)
@@ -145,7 +163,10 @@ def build_resample_candidate(
     source = tuple(sorted(_normalize_points(
         source_points, spec.selected_fields, "source", source_schema),
         key=lambda item: (item.tick, item.observation_id)))
-    target = _normalize_points(target_points, (), "target", {})
+    target = (_fixed_grid_points(spec) if spec.fixed_grid is not None
+              else _normalize_points(target_points, (), "target", {}))
+    if len(target) > spec.candidate_cap or len(target) > spec.output_cap:
+        raise TemporalResampleError("fixed grid exceeds candidate or output cap")
     if any(not (spec.window.start_tick <= item.tick < spec.window.end_tick) for item in target):
         raise TemporalResampleError("target point lies outside the exact window")
     mapped = _mapped_sources(source, spec.mapping)
@@ -165,6 +186,14 @@ def build_resample_candidate(
     digest = _digest({"spec": spec.identity_document(), "evidence": evidence,
                       "rows": [_materialization_row(spec, row) for row in rows]})
     return ResampleCandidate(spec, source, targets, rows, evidence, digest)
+
+
+def preflight_fixed_grid(manifest: RevisionManifest, spec: TemporalResampleSpecV1) -> TemporalResampleSpecV1:
+    """Validate and canonicalize a fixed grid before source/target observations are read."""
+    _validate_exact_manifest(manifest)
+    if spec.fixed_grid is None:
+        raise TemporalResampleError("fixed grid target is unavailable")
+    return _validate_contract(manifest, spec)
 
 
 def compose_child_manifest(
@@ -221,7 +250,7 @@ def _validate_exact_manifest(manifest: RevisionManifest) -> None:
         raise TemporalResampleError("parent manifest semantics do not match its exact revision")
 
 
-def _validate_contract(manifest: RevisionManifest, spec: TemporalResampleSpecV1) -> None:
+def _validate_contract(manifest: RevisionManifest, spec: TemporalResampleSpecV1) -> TemporalResampleSpecV1:
     _validate_spec_shape(spec)
     if (spec.compound_dataset_id, spec.compound_revision_id) != (
             manifest.ref.dataset_id, manifest.ref.revision_id):
@@ -234,13 +263,17 @@ def _validate_contract(manifest: RevisionManifest, spec: TemporalResampleSpecV1)
             item not in streams for item in (spec.source_stream_id, spec.target_stream_id)):
         raise TemporalResampleError("source and target streams must be distinct declared streams")
     source_binding = bindings[(spec.episode_id, spec.source_stream_id)]
-    target_binding = bindings[(spec.episode_id, spec.target_stream_id)]
-    if any(item.state != "present" or item.observation_index is None or item.observation_index.tick_field is None
-           for item in (source_binding, target_binding)):
-        raise TemporalResampleError("resampling requires two present point streams")
+    target_binding = bindings.get((spec.episode_id, spec.target_stream_id))
+    if source_binding.state != "present" or source_binding.observation_index is None or source_binding.observation_index.tick_field is None:
+        raise TemporalResampleError("resampling requires a present source point stream")
     _validate_view(source_binding.member_id, spec.source_view, manifest, "source")
-    _validate_view(target_binding.member_id, spec.target_view, manifest, "target")
     source_stream, target_stream = streams[spec.source_stream_id], streams[spec.target_stream_id]
+    if spec.fixed_grid is None:
+        if (target_binding is None or target_binding.state != "present"
+                or target_binding.observation_index is None or target_binding.observation_index.tick_field is None):
+            raise TemporalResampleError("stream timestamp resampling requires two present point streams")
+        assert spec.target_view is not None
+        _validate_view(target_binding.member_id, spec.target_view, manifest, "target")
     if spec.window.time_domain != target_stream.clock.time_domain:
         raise TemporalResampleError("window time domain must equal the target stream clock domain")
     if spec.output_stream_id in streams:
@@ -260,6 +293,13 @@ def _validate_contract(manifest: RevisionManifest, spec: TemporalResampleSpecV1)
         raise TemporalResampleError("selected field or unit is not declared by the source stream")
     if any(schema[item.field].type not in _SCALAR_TYPES for item in spec.selected_fields):
         raise TemporalResampleError("selected field type is unsupported by resample v1")
+    if spec.fixed_grid is not None:
+        spec = replace(spec, fixed_grid=_canonical_fixed_grid(spec.fixed_grid, target_stream.clock))
+        # Generate before a source scan or any publication path can begin.  This proves
+        # the rate, phase, bounds, and caps are exact and bounded from the immutable
+        # manifest contract alone.
+        _fixed_grid_points(spec)
+    return spec
 
 
 def _validate_view(member_id: str | None, view: DatasetViewIdentity,
@@ -279,7 +319,13 @@ def _validate_spec_shape(spec: TemporalResampleSpecV1) -> None:
         raise TemporalResampleError("output stream identity is invalid")
     if spec.computation_version != COMPUTATION_VERSION:
         raise TemporalResampleError("computation version is unsupported")
+    if spec.fixed_grid is None and spec.target_view is None:
+        raise TemporalResampleError("stream timestamp target DatasetView is invalid")
+    if spec.fixed_grid is not None and spec.target_view is not None:
+        raise TemporalResampleError("fixed grid must not bind a target DatasetView")
     for view in (spec.source_view, spec.target_view):
+        if view is None:
+            continue
         if not isinstance(view, DatasetViewIdentity):
             raise TemporalResampleError("DatasetView identity is invalid")
         for value in (view.dataset_id, view.revision_id, view.view_id, view.definition_sha256,
@@ -309,6 +355,63 @@ def _validate_spec_shape(spec: TemporalResampleSpecV1) -> None:
             raise TemporalResampleError("selected field is invalid")
         _text(item.field, "selected field"); _text(item.unit, "selected unit")
     _validate_mapping(spec.mapping)
+    if spec.fixed_grid is not None:
+        _validate_fixed_grid_shape(spec.fixed_grid)
+
+
+def _validate_fixed_grid_shape(grid: FixedGridTarget) -> None:
+    if not isinstance(grid, FixedGridTarget):
+        raise TemporalResampleError("fixed grid target is invalid")
+    _text(grid.target_clock_id, "fixed grid target clock")
+    for value in (grid.rate_numerator, grid.rate_denominator, grid.phase_tick):
+        _int64(value)
+    if grid.rate_numerator <= 0 or grid.rate_denominator <= 0:
+        raise TemporalResampleError("fixed grid rate must be positive")
+
+
+def _canonical_fixed_grid(grid: FixedGridTarget, clock) -> FixedGridTarget:
+    """Normalize semantically equivalent rates and phases without float arithmetic."""
+    _validate_fixed_grid_shape(grid)
+    if grid.target_clock_id != clock.id:
+        raise TemporalResampleError("fixed grid target clock is not the target stream clock")
+    numerator_gcd = math.gcd(grid.rate_numerator, grid.rate_denominator)
+    rate_numerator = grid.rate_numerator // numerator_gcd
+    rate_denominator = grid.rate_denominator // numerator_gcd
+    period_numerator = rate_denominator * clock.tick_unit.denominator
+    period_denominator = rate_numerator * clock.tick_unit.numerator
+    if period_numerator % period_denominator:
+        raise TemporalResampleError("fixed grid rate does not yield an integral target-clock period")
+    period = period_numerator // period_denominator
+    if not 0 < period <= INT64_MAX:
+        raise TemporalResampleError("fixed grid period is invalid or overflows signed-int64")
+    return FixedGridTarget(
+        grid.target_clock_id, rate_numerator, rate_denominator, grid.phase_tick % period, period)
+
+
+def _fixed_grid_points(spec: TemporalResampleSpecV1) -> tuple[PointObservation, ...]:
+    """Emit phase-aligned target-clock ticks in ``[start, end)`` without rounding."""
+    grid = spec.fixed_grid
+    if grid is None:
+        raise TemporalResampleError("fixed grid target is unavailable")
+    period = grid.period_ticks
+    if type(period) is not int or not 0 < period <= INT64_MAX:
+        raise TemporalResampleError("fixed grid period is unavailable")
+    # ceil((start - phase) / period) stays exact for negative ticks too.  The
+    # first tick is the phase-aligned grid point in the half-open window.
+    first = grid.phase_tick + _ceil_div(spec.window.start_tick - grid.phase_tick, period) * period
+    if first >= spec.window.end_tick:
+        return ()
+    _int64(first)
+    count = ((spec.window.end_tick - 1 - first) // period) + 1
+    if count > spec.candidate_cap or count > spec.output_cap or count > MAX_POINTS:
+        raise TemporalResampleError("fixed grid exceeds candidate or output cap")
+    return tuple(PointObservation(
+        f"fixed-grid:{grid.target_clock_id}:{first + index * period}", first + index * period, {})
+        for index in range(count))
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return -((-numerator) // denominator)
 
 
 def _validate_mapping(mapping: ClockMapping) -> None:
@@ -397,13 +500,12 @@ def _spec_document(spec: TemporalResampleSpecV1) -> dict[str, object]:
         return {"datasetId": value.dataset_id, "revisionId": value.revision_id, "viewId": value.view_id,
                 "definitionSha256": value.definition_sha256, "semanticSha256": value.semantic_sha256}
     mapping = spec.mapping
-    return {
+    document: dict[str, object] = {
         "schemaVersion": 1, "computationVersion": spec.computation_version,
         "compoundDatasetId": spec.compound_dataset_id, "compoundRevisionId": spec.compound_revision_id,
         "episodeId": spec.episode_id, "sourceStreamId": spec.source_stream_id,
         "targetStreamId": spec.target_stream_id, "outputStreamId": spec.output_stream_id,
         "sourceView": view(spec.source_view),
-        "targetView": view(spec.target_view),
         "mapping": {"sourceClockId": mapping.source_clock_id, "targetClockId": mapping.target_clock_id,
                     "scaleNumerator": mapping.scale_numerator, "scaleDenominator": mapping.scale_denominator,
                     "offsetTick": mapping.offset_tick},
@@ -414,6 +516,17 @@ def _spec_document(spec: TemporalResampleSpecV1) -> dict[str, object]:
         "candidateCap": spec.candidate_cap, "outputCap": spec.output_cap,
         "method": "nearest", "tieBreak": "earlier-source-tick", "gapPolicy": "null-plus-evidence",
     }
+    if spec.target_view is not None:
+        document["targetView"] = view(spec.target_view)
+    if spec.fixed_grid is not None:
+        grid = spec.fixed_grid
+        document["fixedGrid"] = {
+            "targetClockId": grid.target_clock_id,
+            "rateNumerator": grid.rate_numerator,
+            "rateDenominator": grid.rate_denominator,
+            "phaseTick": grid.phase_tick,
+        }
+    return document
 
 
 def _points_document(points: tuple[PointObservation, ...]) -> list[dict[str, object]]:
@@ -484,8 +597,12 @@ def _output_stream(parent: RevisionManifest, spec: TemporalResampleSpecV1, schem
                    evidence_digest: str, candidate_digest: str) -> dict[str, object]:
     target = next(item for item in parent.streams if item.id == spec.target_stream_id)
     clock = target.clock
+    fixed = spec.fixed_grid
     return {"id": spec.output_stream_id, "kind": "derived-point-resample", "observationSchema": schema,
-        "timing": "irregular", "nominalRate": None, "clock": {"id": clock.id,
+        "timing": "regular" if fixed is not None else "irregular",
+        "nominalRate": None if fixed is None else {
+            "numerator": fixed.rate_numerator, "denominator": fixed.rate_denominator,
+            "physicalUnit": "second"}, "clock": {"id": clock.id,
         "timeDomain": clock.time_domain, "tickUnit": {"numerator": clock.tick_unit.numerator,
         "denominator": clock.tick_unit.denominator, "physicalUnit": clock.tick_unit.physical_unit}},
         "units": [{"field": item.field, "unit": item.unit} for item in spec.selected_fields],

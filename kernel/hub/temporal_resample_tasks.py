@@ -29,9 +29,9 @@ from hub.temporal_resample_diagnostics import (
     TemporalResampleDiagnosticCode, temporal_failure_retryable,
 )
 from hub.temporal_resample import (
-    DatasetViewIdentity, FieldSelection, PointObservation, ResampleWindow,
+    DatasetViewIdentity, FieldSelection, FixedGridTarget, PointObservation, ResampleWindow,
     TemporalResampleError, TemporalResampleSpecV1, _materialization_row,
-    _output_schema, build_resample_candidate,
+    _output_schema, build_resample_candidate, preflight_fixed_grid,
 )
 
 
@@ -171,47 +171,76 @@ def candidate_for_request(uid: str, request: TemporalResampleWriteRequestV1):
         bindings = {(item.episode_id, item.stream_id): item for item in manifest.bindings}
         source, target = streams[request.source_stream_id], streams[request.target_stream_id]
         source_binding = bindings[(request.episode_id, request.source_stream_id)]
-        target_binding = bindings[(request.episode_id, request.target_stream_id)]
-        if source_binding.state != "present" or target_binding.state != "present":
+        target_binding = bindings.get((request.episode_id, request.target_stream_id))
+        if source_binding.state != "present":
             raise _admission("temporal_input_partial")
-        if (not source_binding.member_id or not target_binding.member_id
-                or source_binding.observation_index is None or target_binding.observation_index is None):
+        if not source_binding.member_id or source_binding.observation_index is None:
             raise _admission("temporal_spec_invalid")
+        if request.fixed_grid is None and (
+                target_binding is None or target_binding.state != "present"
+                or not target_binding.member_id or target_binding.observation_index is None):
+            raise _admission("temporal_input_partial")
         members = {item.id: item for item in manifest.members}
         if request.output_member_id in members:
             raise _admission("temporal_spec_invalid")
         mapping = next(item for item in manifest.clock_mappings if (
             item.source_clock_id, item.target_clock_id) == (source.clock.id, target.clock.id))
-        start, end = int(request.window.start_tick), int(request.window.end_tick)
-        if request.window.time_domain != target.clock.time_domain:
+        if request.fixed_grid is None:
+            assert request.window is not None
+            time_domain = request.window.time_domain
+            start, end = int(request.window.start_tick), int(request.window.end_tick)
+        else:
+            time_domain = request.fixed_grid.time_domain
+            start, end = int(request.fixed_grid.start_tick), int(request.fixed_grid.end_tick)
+        if time_domain != target.clock.time_domain:
             raise _admission("temporal_spec_invalid")
-        if request.window.time_field != target_binding.observation_index.tick_field:
+        if (request.fixed_grid is None and target_binding is not None
+                and request.window is not None
+                and request.window.time_field != target_binding.observation_index.tick_field):
             raise _admission("temporal_missing_field")
         source_start, source_end = _source_bounds(mapping, EvidenceWindow(target.clock.id, start, end))
         source_view = _view(uid, request.source_view_id, member=members[source_binding.member_id],
                             stream=source, index=source_binding.observation_index,
                             start=source_start, end=source_end)
-        target_view = _view(uid, request.target_view_id, member=members[target_binding.member_id],
-                            stream=target, index=target_binding.observation_index, start=start, end=end)
+        target_view = None
+        if request.fixed_grid is None:
+            assert target_binding is not None and target_binding.member_id is not None
+            assert target_binding.observation_index is not None and request.target_view_id is not None
+            target_view = _view(uid, request.target_view_id, member=members[target_binding.member_id],
+                                stream=target, index=target_binding.observation_index, start=start, end=end)
         selected = tuple(FieldSelection(item.field, item.unit) for item in request.selected_fields)
-        source_points = _points(view=source_view, member=members[source_binding.member_id],
-                                index=source_binding.observation_index, episode_id=request.episode_id,
-                                start=source_start, end=source_end,
-                                selected=tuple(item.field for item in selected))
-        target_points = _points(view=target_view, member=members[target_binding.member_id],
-                                index=target_binding.observation_index, episode_id=request.episode_id,
-                                start=start, end=end, selected=())
         spec = TemporalResampleSpecV1(
             compound_dataset_id=manifest.ref.dataset_id, compound_revision_id=manifest.ref.revision_id,
             episode_id=request.episode_id, source_stream_id=request.source_stream_id,
             target_stream_id=request.target_stream_id, output_stream_id=request.output_stream_id,
             source_view=DatasetViewIdentity(source_view.dataset_ref.dataset_id, source_view.dataset_ref.revision_id,
                                             source_view.id, source_view.definition_sha256, source_view.semantic_sha256),
-            target_view=DatasetViewIdentity(target_view.dataset_ref.dataset_id, target_view.dataset_ref.revision_id,
-                                            target_view.id, target_view.definition_sha256, target_view.semantic_sha256),
-            mapping=mapping, window=ResampleWindow(request.window.time_domain, start, end),
+            target_view=(None if target_view is None else DatasetViewIdentity(
+                target_view.dataset_ref.dataset_id, target_view.dataset_ref.revision_id,
+                target_view.id, target_view.definition_sha256, target_view.semantic_sha256)),
+            mapping=mapping, window=ResampleWindow(time_domain, start, end),
             tolerance_ticks=int(request.tolerance_ticks), selected_fields=selected,
-            candidate_cap=request.candidate_cap, output_cap=request.output_cap)
+            candidate_cap=request.candidate_cap, output_cap=request.output_cap,
+            fixed_grid=(None if request.fixed_grid is None else FixedGridTarget(
+                request.fixed_grid.target_clock_id, int(request.fixed_grid.rate_numerator),
+                int(request.fixed_grid.rate_denominator), int(request.fixed_grid.phase_tick))))
+        if spec.fixed_grid is not None:
+            # This runs before either DatasetView is scanned, so impossible grids
+            # cannot consume a read budget or create a durable publication attempt.
+            spec = preflight_fixed_grid(manifest, spec)
+        source_points = _points(view=source_view, member=members[source_binding.member_id],
+                                index=source_binding.observation_index, episode_id=request.episode_id,
+                                start=source_start, end=source_end,
+                                selected=tuple(item.field for item in selected))
+        if spec.fixed_grid is not None:
+            target_points = ()
+        else:
+            assert target_view is not None and target_binding is not None
+            assert target_binding.member_id is not None and target_binding.observation_index is not None
+            target_points = _points(
+                view=target_view, member=members[target_binding.member_id],
+                index=target_binding.observation_index, episode_id=request.episode_id,
+                start=start, end=end, selected=())
         candidate = build_resample_candidate(manifest, spec, source_points, target_points)
         expected = metadb._temporal_expected_output_schema_for(manifest, candidate.spec)
         write = WriteIntent.model_validate(request.write_intent)
