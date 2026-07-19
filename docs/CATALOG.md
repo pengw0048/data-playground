@@ -101,22 +101,32 @@ a local `sentence-transformers` implementation.
 
 ## Lineage evidence and external catalogs
 
-Larger orgs often already have a central metadata service. Data Playground can sit in front of one
-without forking core, because two seams line up on purpose.
+Larger orgs often already have a central metadata service. Data Playground offers two deliberately
+separate integration models, so reading an external catalog never silently grants permission to change
+it.
 
-The catalog API is served by one selected `CatalogProvider`. The built-in catalog is itself a first-party
-plugin (`hub/plugins/default_catalog.py`) that calls `reg.set_catalog(InMemoryCatalog(...))` before
-workspace plugins load. A later plugin replaces it with anything implementing the protocol in
-`kernel/hub/backends.py`. The discovery surface — `list_page`, `facets`, `browse`, `search`,
-`lineage`, `get_table`, `resolve_ref` — matches bounded remote metadata APIs, so a provider maps each
-call onto paginated backend endpoints (`resolve_ref` runs on every preview and run). A read-only
-external catalog can subclass the built-in provider, but it must deliberately choose whether lineage
-stays in the core metadata side store or moves to the external authority.
+- A [`ReadOnlyCatalogProvider` Workspace mount](PLUGINS.md#read-only-external-catalog-mounts) adds one
+  bounded external source to the mixed Workspace browse surface. Multiple mounts can coexist with local
+  data and with each other. They are discovery-only: they do not write, curate, or publish lineage into
+  their source system. A run using a mounted source continues to publish through its separately selected
+  managed destination and execution backend.
+- `reg.set_catalog(CatalogProvider)` replaces the one application-wide catalog. The selected provider
+  serves both discovery and the write-back/curation contract used by enabled execution paths. A provider
+  may fetch discovery rows from an external service while inheriting `InMemoryCatalog`'s core-managed
+  publication and lineage behavior; that preserves local output handling and does not write to the
+  external service. Provider-native write-back is a deliberate implementation responsibility, not a
+  capability inferred from external discovery.
 
-The effective catalog is selected during startup before catalog-dependent runners are constructed.
-`reg.add_runner_factory(factory)` is the public seam for a runner that needs the selected catalog or
-the local runner; its factory receives the finished dependency set. `reg.set_catalog(...)` is therefore
-startup composition, not a live catalog hot-swap. A fully replacing provider must implement the
+The built-in catalog is itself a first-party plugin (`hub/plugins/default_catalog.py`) that calls
+`reg.set_catalog(InMemoryCatalog(...))` before workspace plugins load. A later plugin can replace it
+with an implementation of the protocol in `kernel/hub/backends.py`. The discovery surface —
+`list_page`, `facets`, `browse`, `search`, `lineage`, `get_table`, `resolve_ref` — maps onto bounded
+remote metadata APIs (`resolve_ref` runs on every preview and run).
+
+The effective application-wide catalog is selected during startup before catalog-dependent runners are
+constructed. `reg.add_runner_factory(factory)` is the public seam for a runner that needs the selected
+catalog or the local runner; its factory receives the finished dependency set. `reg.set_catalog(...)` is
+therefore startup composition, not a live catalog hot-swap. A fully replacing provider must implement the
 write-back and lineage authority required by the execution paths it enables; inheriting
 `InMemoryCatalog` remains a practical way to retain the built-in behavior. The composition order is
 covered by the installed-plugin and kernel contract tests.

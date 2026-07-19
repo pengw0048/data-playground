@@ -173,9 +173,11 @@ the source of truth: bounded discovery via `list_page(CatalogQuery)`, `facets`, 
 Every discovery implementation must push its filters and finite window into the backing store;
 `search` must apply the supplied structured query before ranking. `get_table` must raise `KeyError` on
 a miss. `reg.set_catalog` validates the complete protocol during registration and rejects an incomplete
-provider with the missing method names. A read-only external catalog can subclass `InMemoryCatalog` and
-override the reads (`dp_sql_catalog` overrides `get_table`, `list_page`, `facets`, `browse`, and `search`
-so SQL rows appear on every read surface).
+provider with the missing method names. An application-wide replacement can read discovery rows from an
+external service while subclassing `InMemoryCatalog`: `dp_sql_catalog` overrides `get_table`,
+`list_page`, `facets`, `browse`, and `search` so SQL rows appear on every read surface. In that pattern,
+the inherited managed-local publication, curation, and lineage methods remain core behavior; they do
+not write back into the external SQL source.
 
 `lineage` returns a `LineageResult` whose `root_uri` is the canonical identity used by every returned
 node and edge. A provider that accepts aliases must resolve the requested alias into this field; clients
@@ -185,8 +187,10 @@ use it to identify the root and do not guess from names or provider-specific ide
 plugin registration before constructing catalog-dependent runners, profile supervision, and run control,
 so catalog reads and execution publication use that same object. Registration happens once at startup;
 calling `set_catalog` later is not a hot-swap mechanism. A fully replacing provider must therefore
-implement its write-back contract as well as its reads; subclassing `InMemoryCatalog` remains a practical
-way to retain the built-in lineage and publication behavior.
+implement its write-back contract as well as its reads. It may retain `InMemoryCatalog`'s built-in
+managed-local lineage and publication behavior, or deliberately implement provider-native write-back;
+the latter is never implied merely by external discovery. This is a different boundary from the
+read-only Workspace mounts below.
 
 Immutable fact export and cache-reuse recording are optional, runtime-checkable protocols rather than
 members of the required `CatalogProvider` contract:
@@ -211,8 +215,11 @@ retaining only the last cursor will miss deletions.
 `hub.catalog_provider` is the public contract for a provider package that can be placed more than
 once in the local/trusted-team Workspace. It is intentionally separate from `reg.set_catalog`: the
 existing catalog SPI selects one application-wide, writable catalog, while a mount provider supplies
-only bounded reads. Workspace persistence and mixed Workspace browse are consumers of this contract,
-not responsibilities of a provider wheel.
+only bounded reads. Multiple mounts compose with the local Workspace browse surface. A mount is not a
+destination: it never writes, curates, or otherwise mutates its source catalog, and a run using a mounted
+source still publishes through the separately configured managed destination and execution backend.
+Workspace persistence and mixed Workspace browse are consumers of this contract, not responsibilities
+of a provider wheel.
 
 Import only these public types: `CatalogMount`, `CatalogResource`, `ProviderCapabilities`, `ProviderPage`,
 `ProviderSearchPage`, `ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`,
