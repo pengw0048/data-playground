@@ -1590,6 +1590,18 @@ class DurableBoundedFanoutView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableDistributionReportView(Wire):
+    """Sanitized exact-report identity and coverage summary for Workspace Jobs."""
+
+    report_id: str = Field(min_length=32, max_length=32)
+    dataset_view_id: str = Field(min_length=1, max_length=32)
+    computation_version: str = Field(min_length=1, max_length=64)
+    measured_rows: int | None = Field(default=None, ge=0)
+    complete: bool | None = None
+    reported_column_count: int | None = Field(default=None, ge=0, le=64)
+    deep_link: str = Field(min_length=1, max_length=256)
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
@@ -1633,7 +1645,7 @@ class WorkspaceRunRecord(Wire):
     id: str
     run_id: str | None = None
     request_id: str | None = None
-    job_type: Literal["run", "profile"]
+    job_type: Literal["run", "profile", "distribution_report"]
     status: Literal["queued", "running", "done", "failed", "cancelled"]
     target_node_id: str | None = None
     target_port_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -1653,8 +1665,8 @@ class WorkspaceRunRecord(Wire):
     per_node: list[PerNodeStatus] | None = None
     created_at: str | None = None
     updated_at: str | None = None
-    canvas_id: str
-    canvas_name: str
+    canvas_id: str | None = None
+    canvas_name: str | None = None
     node_label: str | None = None
     backend: str
     placement: Placement
@@ -1669,6 +1681,7 @@ class WorkspaceRunRecord(Wire):
     external_wait: DurableExternalWaitView | None = None
     checkpoint: DurableCheckpointView | None = None
     bounded_fanout: DurableBoundedFanoutView | None = None
+    distribution_report: DurableDistributionReportView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
@@ -1690,6 +1703,11 @@ class WorkspaceRunRecord(Wire):
         if self.status in ("done", "failed", "cancelled") and any(
                 output.outcome == "pending" for output in self.outputs):
             raise ValueError("terminal workspace runs cannot retain pending outputs")
+        if self.job_type == "distribution_report":
+            if self.distribution_report is None or self.canvas_id is not None:
+                raise ValueError("distribution report Jobs rows require their report projection only")
+        elif self.distribution_report is not None:
+            raise ValueError("ordinary Jobs rows cannot carry a distribution report projection")
         return self
 
     @model_serializer(mode="wrap")
@@ -1700,6 +1718,8 @@ class WorkspaceRunRecord(Wire):
             data.pop("checkpoint", None)
         if self.bounded_fanout is None:
             data.pop("boundedFanout", None)
+        if self.distribution_report is None:
+            data.pop("distributionReport", None)
         return data
 
 

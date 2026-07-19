@@ -7,13 +7,13 @@ import hashlib
 import json
 import re
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import exists, or_, select, update
 
 from hub import metadb
-from hub.models import DatasetViewDefinitionV1, to_camel
+from hub.models import ColumnSchema, DatasetViewDefinitionV1, SampleProvenance, to_camel
 
 
 _REPORT_DOC_MAX_BYTES = 256 * 1024
@@ -52,10 +52,22 @@ class DistributionReportIntentV1(BaseModel):
         return value
 
 
+class _DistributionReportModel(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+
 def _bounded_json(value: Any, *, depth: int = 0) -> int:
     if depth > _REPORT_CONTENT_MAX_DEPTH:
         raise ValueError("distribution report content is nested too deeply")
     if value is None or isinstance(value, (str, bool, int, float)):
+        if isinstance(value, str):
+            try:
+                encoded = value.encode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise ValueError("distribution report strings must be valid UTF-8") from exc
+            if len(encoded) > 4096 or "\x00" in value:
+                raise ValueError("distribution report strings must be bounded valid text")
         if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
             raise ValueError("distribution report content requires finite numbers")
         return 1
@@ -78,25 +90,254 @@ def _bounded_json(value: Any, *, depth: int = 0) -> int:
     raise ValueError("distribution report content must be JSON data")
 
 
-class DistributionReportDocumentV1(BaseModel):
-    """Bounded algorithm-owned content sealed to one report admission."""
+class DistributionCoverageSchemaSectionV1(_DistributionReportModel):
+    kind: Literal["coverage_schema"] = "coverage_schema"
+    section_id: str = Field(min_length=1, max_length=64)
+    selected_column_count: int = Field(ge=1, le=500)
+    reported_column_count: int = Field(ge=0, le=64)
+    columns: list[ColumnSchema] = Field(max_length=64)
 
-    model_config = ConfigDict(
-        alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+class DistributionMissingnessSectionV1(_DistributionReportModel):
+    kind: Literal["missingness"] = "missingness"
+    section_id: str = Field(min_length=1, max_length=64)
+    column_name: str = Field(min_length=1, max_length=512)
+    missing_count: int = Field(ge=0)
+
+
+class DistributionQuantileV1(_DistributionReportModel):
+    probability: float = Field(ge=0, le=1)
+    value: float
+
+
+class DistributionHistogramBucketV1(_DistributionReportModel):
+    bucket_id: str = Field(min_length=1, max_length=64)
+    lower: float
+    upper: float
+    count: int = Field(ge=0)
+    upper_inclusive: bool
+
+
+class DistributionNumericSectionV1(_DistributionReportModel):
+    kind: Literal["numeric"] = "numeric"
+    section_id: str = Field(min_length=1, max_length=64)
+    column_name: str = Field(min_length=1, max_length=512)
+    count: int = Field(ge=0)
+    non_finite_count: int = Field(ge=0)
+    min: float | None = None
+    max: float | None = None
+    mean: float | None = None
+    stddev: float | None = None
+    quantiles: list[DistributionQuantileV1] = Field(max_length=5)
+    histogram: list[DistributionHistogramBucketV1] = Field(max_length=20)
+
+
+class DistributionCategoryV1(_DistributionReportModel):
+    bucket_id: str = Field(min_length=1, max_length=64)
+    label: str | bool
+    count: int = Field(ge=1)
+
+
+class DistributionCategoricalSectionV1(_DistributionReportModel):
+    kind: Literal["categorical"] = "categorical"
+    section_id: str = Field(min_length=1, max_length=64)
+    column_name: str = Field(min_length=1, max_length=512)
+    top: list[DistributionCategoryV1] = Field(max_length=20)
+    other_count: int = Field(ge=0)
+    distinct_count: int = Field(ge=0)
+    distinct_count_approximate: bool
+
+
+class DistributionTemporalBucketV1(_DistributionReportModel):
+    bucket_id: str = Field(min_length=1, max_length=64)
+    start: datetime.datetime
+    end: datetime.datetime
+    count: int = Field(ge=0)
+    end_inclusive: bool
+
+    @model_validator(mode="after")
+    def validate_utc_bounds(self) -> "DistributionTemporalBucketV1":
+        for value in (self.start, self.end):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("temporal report buckets require timezone-aware UTC bounds")
+            if value.utcoffset() != datetime.timedelta(0):
+                raise ValueError("temporal report buckets require UTC bounds")
+        if self.end < self.start:
+            raise ValueError("temporal report bucket bounds are reversed")
+        return self
+
+
+class DistributionTemporalSectionV1(_DistributionReportModel):
+    kind: Literal["temporal"] = "temporal"
+    section_id: str = Field(min_length=1, max_length=64)
+    column_name: str = Field(min_length=1, max_length=512)
+    min: datetime.datetime | None = None
+    max: datetime.datetime | None = None
+    buckets: list[DistributionTemporalBucketV1] = Field(max_length=20)
+
+    @model_validator(mode="after")
+    def validate_utc_bounds(self) -> "DistributionTemporalSectionV1":
+        for value in (self.min, self.max):
+            if value is None:
+                continue
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("temporal report sections require timezone-aware UTC bounds")
+            if value.utcoffset() != datetime.timedelta(0):
+                raise ValueError("temporal report sections require UTC bounds")
+        if self.min is not None and self.max is not None and self.max < self.min:
+            raise ValueError("temporal report section bounds are reversed")
+        return self
+
+
+class DistributionUnsupportedSectionV1(_DistributionReportModel):
+    kind: Literal["unsupported"] = "unsupported"
+    section_id: str = Field(min_length=1, max_length=64)
+    column_name: str | None = Field(default=None, min_length=1, max_length=512)
+    reason: Literal[
+        "unsupported_type", "column_limit", "oversized_label", "empty_finite_population",
+        "non_finite_values", "numeric_precision_unsupported", "numeric_range_unsupported",
+    ]
+    omitted_count: int | None = Field(default=None, ge=1, le=500)
+    partial: bool
+
+
+DistributionReportSectionV1 = Annotated[
+    DistributionCoverageSchemaSectionV1
+    | DistributionMissingnessSectionV1
+    | DistributionNumericSectionV1
+    | DistributionCategoricalSectionV1
+    | DistributionTemporalSectionV1
+    | DistributionUnsupportedSectionV1,
+    Field(discriminator="kind"),
+]
+
+
+class DistributionReportDocumentV1(_DistributionReportModel):
+    """One closed, bounded built-in report sealed to an exact DatasetView admission."""
 
     schema_version: Literal[1] = 1
     report_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
     task_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     dataset_view_id: str = Field(min_length=1, max_length=32)
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
     view_definition_sha256: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     computation_version: str = Field(min_length=1, max_length=64)
-    content: dict[str, Any]
+    measured_rows: int = Field(ge=0)
+    complete: bool
+    sample_provenance: SampleProvenance | None = None
+    limitations: list[str] = Field(max_length=32)
+    sections: list[DistributionReportSectionV1] = Field(min_length=1, max_length=256)
 
     @model_validator(mode="after")
     def validate_content(self) -> "DistributionReportDocumentV1":
-        _bounded_json(self.content)
+        payload = self.model_dump(by_alias=True, mode="json")
+        _bounded_json(payload)
+        coverage = [section for section in self.sections if section.kind == "coverage_schema"]
+        if len(coverage) != 1:
+            raise ValueError("distribution report requires exactly one coverage/schema section")
+        ids = [section.section_id for section in self.sections]
+        if len(ids) != len(set(ids)):
+            raise ValueError("distribution report section ids must be unique")
+        missing = {
+            section.column_name: section.missing_count
+            for section in self.sections if section.kind == "missingness"
+        }
+        expected_quantiles = [0.0, 0.25, 0.5, 0.75, 1.0]
+        for section in self.sections:
+            column = getattr(section, "column_name", None)
+            if column is None:
+                continue
+            nulls = missing.get(column)
+            if nulls is None and section.kind not in ("missingness", "unsupported"):
+                raise ValueError("measured report sections require matching missingness")
+            if nulls is not None and nulls > self.measured_rows:
+                raise ValueError("missing count exceeds measured rows")
+            if section.kind == "numeric":
+                if [item.probability for item in section.quantiles] != expected_quantiles:
+                    raise ValueError("numeric report requires the fixed bounded quantiles")
+                if section.count + section.non_finite_count + int(nulls or 0) != self.measured_rows:
+                    raise ValueError("numeric counts do not reconcile with measured rows")
+                if sum(bucket.count for bucket in section.histogram) != section.count:
+                    raise ValueError("numeric histogram does not reconcile with finite rows")
+            elif section.kind == "categorical":
+                if (sum(item.count for item in section.top)
+                        + section.other_count + int(nulls or 0) != self.measured_rows):
+                    raise ValueError("categorical counts do not reconcile with measured rows")
+            elif section.kind == "temporal":
+                if sum(bucket.count for bucket in section.buckets) + int(nulls or 0) != self.measured_rows:
+                    raise ValueError("temporal counts do not reconcile with measured rows")
         return self
+
+
+class DistributionReportAttemptViewV1(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    id: str
+    attempt_number: int = Field(ge=1, le=3)
+    status: Literal["queued", "running", "done", "failed", "cancelled", "fenced"]
+    progress: float | None = Field(default=None, ge=0, le=1)
+    error: str | None = Field(default=None, max_length=4096)
+    started_at: datetime.datetime | None = None
+    completed_at: datetime.datetime | None = None
+
+
+class DistributionReportTaskViewV1(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    id: str
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    progress: float | None = Field(default=None, ge=0, le=1)
+    error: str | None = Field(default=None, max_length=4096)
+    cancel_requested: bool
+    max_attempts: int = Field(ge=1, le=3)
+    attempts: list[DistributionReportAttemptViewV1] = Field(min_length=1, max_length=3)
+
+
+class DistributionReportEnvelopeViewV1(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    report_id: str = Field(min_length=32, max_length=32)
+    task: DistributionReportTaskViewV1
+    intent: DistributionReportIntentV1
+    view_snapshot: DatasetViewDefinitionV1
+    revision_retention_owner: Literal["core"]
+    report: DistributionReportDocumentV1 | None = None
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+    completed_at: datetime.datetime | None = None
+
+
+def public_distribution_report(envelope: dict) -> DistributionReportEnvelopeViewV1:
+    """Drop private leases/tokens/docs from the algorithm-owned lifecycle projection."""
+    task = envelope["task"]
+    report = (DistributionReportDocumentV1.model_validate_json(json.dumps(envelope["report"]))
+              if envelope["report"] is not None else None)
+    attempts = [{
+        key: attempt.get(key) for key in (
+            "id", "attempt_number", "status", "progress", "error",
+            "started_at", "completed_at",
+        )
+    } for attempt in task["attempts"]]
+    return DistributionReportEnvelopeViewV1.model_validate({
+        "schema_version": envelope["schema_version"],
+        "report_id": envelope["report_id"],
+        "task": {
+            "id": task["id"], "status": task["status"],
+            "progress": task.get("progress"), "error": task.get("error"),
+            "cancel_requested": task["cancel_requested"],
+            "max_attempts": task["max_attempts"], "attempts": attempts,
+        },
+        "intent": envelope["intent"],
+        "view_snapshot": envelope["view_snapshot"],
+        "revision_retention_owner": envelope["revision_retention_owner"],
+        "report": report,
+        "created_at": envelope["created_at"],
+        "updated_at": envelope["updated_at"],
+        "completed_at": envelope["completed_at"],
+    })
 
 
 def _canonical(model: BaseModel) -> str:
@@ -227,8 +468,12 @@ def _envelope_doc(
         or report.report_id != row.report_id
         or report.task_id != task.id
         or report.dataset_view_id != row.dataset_view_id
+        or report.dataset_id != view.dataset_ref.dataset_id
+        or report.revision_id != view.dataset_ref.revision_id
         or report.view_definition_sha256 != row.view_definition_sha256
         or report.computation_version != row.computation_version
+        or report.sample_provenance != view.sample_provenance
+        or report.complete != (view.sampling.kind == "all")
     ):
         raise DistributionReportUnavailable("distribution report terminal document is corrupt")
     if (task.status == "done") != (report is not None):
@@ -365,6 +610,33 @@ def distribution_report(*, owner_id: str, task_id: str) -> dict | None:
             raise
 
 
+def distribution_report_by_id(*, owner_id: str, report_id: str) -> dict | None:
+    with metadb.session() as s:
+        task_id = s.scalar(select(metadb.DistributionReportEnvelope.task_id).where(
+            metadb.DistributionReportEnvelope.report_id == str(report_id)))
+    return (distribution_report(owner_id=owner_id, task_id=str(task_id))
+            if task_id is not None else None)
+
+
+def list_distribution_reports(
+    *, owner_id: str, dataset_view_id: str, limit: int = 50,
+) -> list[dict]:
+    bounded = max(1, min(int(limit), 100))
+    with metadb.session() as s:
+        task_ids = list(s.scalars(select(metadb.DistributionReportEnvelope.task_id).join(
+            metadb.DurableTask,
+            metadb.DurableTask.id == metadb.DistributionReportEnvelope.task_id,
+        ).where(
+            metadb.DurableTask.owner_id == str(owner_id),
+            metadb.DistributionReportEnvelope.dataset_view_id == str(dataset_view_id),
+        ).order_by(
+            metadb.DistributionReportEnvelope.created_at.desc(),
+            metadb.DistributionReportEnvelope.task_id.desc(),
+        ).limit(bounded)))
+    return [doc for task_id in task_ids if (
+        doc := distribution_report(owner_id=owner_id, task_id=str(task_id))) is not None]
+
+
 def _terminal_failure(
     s, task: metadb.DurableTask, attempt: metadb.DurableTaskAttempt,
     row: metadb.DistributionReportEnvelope, *, code: str,
@@ -386,6 +658,24 @@ def _terminal_failure(
     metadb._emit_durable_task_inbox_item(
         s, task=task, attempt=attempt, task_status="failed",
         diagnostic_code=code, now=now)
+
+
+def _terminal_cancel(
+    s, task: metadb.DurableTask, attempt: metadb.DurableTaskAttempt,
+    row: metadb.DistributionReportEnvelope,
+) -> None:
+    now = metadb._durable_task_db_now(s)
+    attempt.status = task.status = "cancelled"
+    attempt.error = task.error = None
+    attempt.completed_at = now
+    attempt.lease_until = now
+    task.completed_at = task.updated_at = now
+    task.status_doc = json.dumps(
+        metadb._task_status_doc(task.id, None, "cancelled"), default=str)
+    row.report_doc = None
+    row.updated_at = row.completed_at = now
+    metadb._emit_durable_task_inbox_item(
+        s, task=task, attempt=attempt, task_status="cancelled", now=now)
 
 
 def claim_distribution_report(task_id: str, owner_token: str) -> dict | None:
@@ -487,6 +777,9 @@ def _finish(
         ):
             return None
         _envelope_doc(s, task, row, attempts=attempts)
+        if task.cancel_requested:
+            _terminal_cancel(s, task, attempt, row)
+            return _envelope_doc(s, task, row, attempts=attempts)
         if failure_code is not None:
             _terminal_failure(s, task, attempt, row, code=failure_code)
             return _envelope_doc(s, task, row, attempts=attempts)
@@ -495,6 +788,10 @@ def _finish(
             parsed.report_id != row.report_id
             or parsed.task_id != task.id
             or parsed.dataset_view_id != row.dataset_view_id
+            or parsed.dataset_id != DatasetViewDefinitionV1.model_validate_json(
+                row.view_snapshot_doc).dataset_ref.dataset_id
+            or parsed.revision_id != DatasetViewDefinitionV1.model_validate_json(
+                row.view_snapshot_doc).dataset_ref.revision_id
             or parsed.view_definition_sha256 != row.view_definition_sha256
             or parsed.computation_version != row.computation_version
         ):
@@ -504,8 +801,10 @@ def _finish(
         attempt.completed_at = now
         attempt.lease_until = now
         task.completed_at = task.updated_at = now
-        task.status_doc = json.dumps(
-            metadb._task_status_doc(task.id, None, "done"), default=str)
+        status = metadb._task_status_doc(task.id, None, "done")
+        status["rows_processed"] = parsed.measured_rows
+        status["progress"] = 1.0
+        task.status_doc = json.dumps(status, default=str)
         row.report_doc = report_doc
         row.updated_at = row.completed_at = now
         metadb._emit_durable_task_inbox_item(
@@ -524,10 +823,15 @@ def complete_distribution_report(
 
 def fail_distribution_report(
     *, task_id: str, attempt_id: str, owner_token: str,
+    failure_code: Literal[
+        "distribution_report_computation_failed",
+        "distribution_report_revision_unavailable",
+        "distribution_report_deadline",
+    ] = "distribution_report_computation_failed",
 ) -> dict | None:
     return _finish(
         task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,
-        report=None, failure_code="distribution_report_computation_failed")
+        report=None, failure_code=failure_code)
 
 
 def request_distribution_report_cancel(*, owner_id: str, task_id: str) -> dict | None:

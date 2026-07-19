@@ -2892,6 +2892,8 @@ def _run_read_access(run_id: str, uid: str | None) -> bool:
     task_auth = metadb.durable_task_auth(run_id)
     if task_auth is not None:
         creator, canvas_id = task_auth
+        if canvas_id is None:
+            return creator == uid
         return creator == uid or metadb.canvas_role(canvas_id, uid) is not None
     creator, auth_canvas = metadb.run_auth(run_id)
     if creator is not None:
@@ -2930,6 +2932,8 @@ def _run_mutate_access(run_id: str, uid: str | None) -> bool:
     task_auth = metadb.durable_task_auth(run_id)
     if task_auth is not None:
         creator, canvas_id = task_auth
+        if canvas_id is None:
+            return creator == uid
         return (creator == uid and metadb.canvas_role(canvas_id, uid) is not None) \
             or metadb.canvas_role(canvas_id, uid) in _RUN_MUTATE_ROLES
     creator, auth_canvas = metadb.run_auth(run_id)

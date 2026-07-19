@@ -1597,6 +1597,1028 @@
         "title": "DeclareKeyRequest",
         "type": "object"
       },
+      "DistributionCategoricalSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columnName": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Columnname",
+            "type": "string"
+          },
+          "distinctCount": {
+            "minimum": 0.0,
+            "title": "Distinctcount",
+            "type": "integer"
+          },
+          "distinctCountApproximate": {
+            "title": "Distinctcountapproximate",
+            "type": "boolean"
+          },
+          "kind": {
+            "const": "categorical",
+            "default": "categorical",
+            "title": "Kind",
+            "type": "string"
+          },
+          "otherCount": {
+            "minimum": 0.0,
+            "title": "Othercount",
+            "type": "integer"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          },
+          "top": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionCategoryV1"
+            },
+            "maxItems": 20,
+            "title": "Top",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sectionId",
+          "columnName",
+          "top",
+          "otherCount",
+          "distinctCount",
+          "distinctCountApproximate"
+        ],
+        "title": "DistributionCategoricalSectionV1",
+        "type": "object"
+      },
+      "DistributionCategoryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bucketId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Bucketid",
+            "type": "string"
+          },
+          "count": {
+            "minimum": 1.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Label"
+          }
+        },
+        "required": [
+          "bucketId",
+          "label",
+          "count"
+        ],
+        "title": "DistributionCategoryV1",
+        "type": "object"
+      },
+      "DistributionCoverageSchemaSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 64,
+            "title": "Columns",
+            "type": "array"
+          },
+          "kind": {
+            "const": "coverage_schema",
+            "default": "coverage_schema",
+            "title": "Kind",
+            "type": "string"
+          },
+          "reportedColumnCount": {
+            "maximum": 64.0,
+            "minimum": 0.0,
+            "title": "Reportedcolumncount",
+            "type": "integer"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          },
+          "selectedColumnCount": {
+            "maximum": 500.0,
+            "minimum": 1.0,
+            "title": "Selectedcolumncount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sectionId",
+          "selectedColumnCount",
+          "reportedColumnCount",
+          "columns"
+        ],
+        "title": "DistributionCoverageSchemaSectionV1",
+        "type": "object"
+      },
+      "DistributionHistogramBucketV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bucketId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Bucketid",
+            "type": "string"
+          },
+          "count": {
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "lower": {
+            "title": "Lower",
+            "type": "number"
+          },
+          "upper": {
+            "title": "Upper",
+            "type": "number"
+          },
+          "upperInclusive": {
+            "title": "Upperinclusive",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "bucketId",
+          "lower",
+          "upper",
+          "count",
+          "upperInclusive"
+        ],
+        "title": "DistributionHistogramBucketV1",
+        "type": "object"
+      },
+      "DistributionMissingnessSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columnName": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Columnname",
+            "type": "string"
+          },
+          "kind": {
+            "const": "missingness",
+            "default": "missingness",
+            "title": "Kind",
+            "type": "string"
+          },
+          "missingCount": {
+            "minimum": 0.0,
+            "title": "Missingcount",
+            "type": "integer"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sectionId",
+          "columnName",
+          "missingCount"
+        ],
+        "title": "DistributionMissingnessSectionV1",
+        "type": "object"
+      },
+      "DistributionNumericSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columnName": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Columnname",
+            "type": "string"
+          },
+          "count": {
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "histogram": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionHistogramBucketV1"
+            },
+            "maxItems": 20,
+            "title": "Histogram",
+            "type": "array"
+          },
+          "kind": {
+            "const": "numeric",
+            "default": "numeric",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          },
+          "mean": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean"
+          },
+          "min": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min"
+          },
+          "nonFiniteCount": {
+            "minimum": 0.0,
+            "title": "Nonfinitecount",
+            "type": "integer"
+          },
+          "quantiles": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionQuantileV1"
+            },
+            "maxItems": 5,
+            "title": "Quantiles",
+            "type": "array"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          },
+          "stddev": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stddev"
+          }
+        },
+        "required": [
+          "sectionId",
+          "columnName",
+          "count",
+          "nonFiniteCount",
+          "quantiles",
+          "histogram"
+        ],
+        "title": "DistributionNumericSectionV1",
+        "type": "object"
+      },
+      "DistributionQuantileV1": {
+        "additionalProperties": false,
+        "properties": {
+          "probability": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Probability",
+            "type": "number"
+          },
+          "value": {
+            "title": "Value",
+            "type": "number"
+          }
+        },
+        "required": [
+          "probability",
+          "value"
+        ],
+        "title": "DistributionQuantileV1",
+        "type": "object"
+      },
+      "DistributionReportAttemptViewV1": {
+        "additionalProperties": false,
+        "properties": {
+          "attemptNumber": {
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Attemptnumber",
+            "type": "integer"
+          },
+          "completedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completedat"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startedat"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed",
+              "cancelled",
+              "fenced"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "attemptNumber",
+          "status"
+        ],
+        "title": "DistributionReportAttemptViewV1",
+        "type": "object"
+      },
+      "DistributionReportDocumentV1": {
+        "additionalProperties": false,
+        "description": "One closed, bounded built-in report sealed to an exact DatasetView admission.",
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "computationVersion": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Computationversion",
+            "type": "string"
+          },
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "datasetViewId": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "limitations": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Limitations",
+            "type": "array"
+          },
+          "measuredRows": {
+            "minimum": 0.0,
+            "title": "Measuredrows",
+            "type": "integer"
+          },
+          "reportId": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Reportid",
+            "type": "string"
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "sections": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "categorical": "#/components/schemas/DistributionCategoricalSectionV1",
+                  "coverage_schema": "#/components/schemas/DistributionCoverageSchemaSectionV1",
+                  "missingness": "#/components/schemas/DistributionMissingnessSectionV1",
+                  "numeric": "#/components/schemas/DistributionNumericSectionV1",
+                  "temporal": "#/components/schemas/DistributionTemporalSectionV1",
+                  "unsupported": "#/components/schemas/DistributionUnsupportedSectionV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/DistributionCoverageSchemaSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionMissingnessSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionNumericSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionCategoricalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionTemporalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionUnsupportedSectionV1"
+                }
+              ]
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Sections",
+            "type": "array"
+          },
+          "taskId": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Taskid",
+            "type": "string"
+          },
+          "viewDefinitionSha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Viewdefinitionsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reportId",
+          "taskId",
+          "datasetViewId",
+          "datasetId",
+          "revisionId",
+          "viewDefinitionSha256",
+          "computationVersion",
+          "measuredRows",
+          "complete",
+          "limitations",
+          "sections"
+        ],
+        "title": "DistributionReportDocumentV1",
+        "type": "object"
+      },
+      "DistributionReportEnvelopeViewV1": {
+        "additionalProperties": false,
+        "properties": {
+          "completedAt": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completedat"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "title": "Createdat",
+            "type": "string"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/DistributionReportIntentV1"
+          },
+          "report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DistributionReportDocumentV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reportId": {
+            "maxLength": 32,
+            "minLength": 32,
+            "title": "Reportid",
+            "type": "string"
+          },
+          "revisionRetentionOwner": {
+            "const": "core",
+            "title": "Revisionretentionowner",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "task": {
+            "$ref": "#/components/schemas/DistributionReportTaskViewV1"
+          },
+          "updatedAt": {
+            "format": "date-time",
+            "title": "Updatedat",
+            "type": "string"
+          },
+          "viewSnapshot": {
+            "$ref": "#/components/schemas/DatasetViewDefinitionV1"
+          }
+        },
+        "required": [
+          "reportId",
+          "task",
+          "intent",
+          "viewSnapshot",
+          "revisionRetentionOwner",
+          "createdAt",
+          "updatedAt"
+        ],
+        "title": "DistributionReportEnvelopeViewV1",
+        "type": "object"
+      },
+      "DistributionReportEstimateV1": {
+        "additionalProperties": false,
+        "properties": {
+          "datasetViewId": {
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "estimatedScanBytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimatedscanbytes"
+          },
+          "estimatedScanRows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimatedscanrows"
+          },
+          "limits": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Limits",
+            "type": "object"
+          },
+          "needsConfirmation": {
+            "title": "Needsconfirmation",
+            "type": "boolean"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unknown_size",
+                  "large_scan"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "selectedColumnCount": {
+            "maximum": 500.0,
+            "minimum": 1.0,
+            "title": "Selectedcolumncount",
+            "type": "integer"
+          },
+          "viewDefinitionSha256": {
+            "title": "Viewdefinitionsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "datasetViewId",
+          "viewDefinitionSha256",
+          "selectedColumnCount",
+          "needsConfirmation",
+          "limits"
+        ],
+        "title": "DistributionReportEstimateV1",
+        "type": "object"
+      },
+      "DistributionReportIntentV1": {
+        "additionalProperties": false,
+        "description": "One strict owner-scoped request against an exact immutable DatasetView snapshot.",
+        "properties": {
+          "computationVersion": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Computationversion",
+            "type": "string"
+          },
+          "datasetViewId": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "maxAttempts": {
+            "default": 3,
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Maxattempts",
+            "type": "integer"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "submissionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Submissionid",
+            "type": "string"
+          },
+          "viewDefinitionSha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Viewdefinitionsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "submissionId",
+          "datasetViewId",
+          "viewDefinitionSha256",
+          "computationVersion"
+        ],
+        "title": "DistributionReportIntentV1",
+        "type": "object"
+      },
+      "DistributionReportSubmitRequestV1": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmed": {
+            "default": false,
+            "title": "Confirmed",
+            "type": "boolean"
+          },
+          "submissionId": {
+            "format": "uuid",
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "submissionId"
+        ],
+        "title": "DistributionReportSubmitRequestV1",
+        "type": "object"
+      },
+      "DistributionReportTaskViewV1": {
+        "additionalProperties": false,
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionReportAttemptViewV1"
+            },
+            "maxItems": 3,
+            "minItems": 1,
+            "title": "Attempts",
+            "type": "array"
+          },
+          "cancelRequested": {
+            "title": "Cancelrequested",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "maxAttempts": {
+            "maximum": 3.0,
+            "minimum": 1.0,
+            "title": "Maxattempts",
+            "type": "integer"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "cancelRequested",
+          "maxAttempts",
+          "attempts"
+        ],
+        "title": "DistributionReportTaskViewV1",
+        "type": "object"
+      },
+      "DistributionTemporalBucketV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bucketId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Bucketid",
+            "type": "string"
+          },
+          "count": {
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "end": {
+            "format": "date-time",
+            "title": "End",
+            "type": "string"
+          },
+          "endInclusive": {
+            "title": "Endinclusive",
+            "type": "boolean"
+          },
+          "start": {
+            "format": "date-time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucketId",
+          "start",
+          "end",
+          "count",
+          "endInclusive"
+        ],
+        "title": "DistributionTemporalBucketV1",
+        "type": "object"
+      },
+      "DistributionTemporalSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "buckets": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionTemporalBucketV1"
+            },
+            "maxItems": 20,
+            "title": "Buckets",
+            "type": "array"
+          },
+          "columnName": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Columnname",
+            "type": "string"
+          },
+          "kind": {
+            "const": "temporal",
+            "default": "temporal",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max"
+          },
+          "min": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sectionId",
+          "columnName",
+          "buckets"
+        ],
+        "title": "DistributionTemporalSectionV1",
+        "type": "object"
+      },
+      "DistributionUnsupportedSectionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columnName": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Columnname"
+          },
+          "kind": {
+            "const": "unsupported",
+            "default": "unsupported",
+            "title": "Kind",
+            "type": "string"
+          },
+          "omittedCount": {
+            "anyOf": [
+              {
+                "maximum": 500.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Omittedcount"
+          },
+          "partial": {
+            "title": "Partial",
+            "type": "boolean"
+          },
+          "reason": {
+            "enum": [
+              "unsupported_type",
+              "column_limit",
+              "oversized_label",
+              "empty_finite_population",
+              "non_finite_values",
+              "numeric_precision_unsupported",
+              "numeric_range_unsupported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "sectionId": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Sectionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sectionId",
+          "reason",
+          "partial"
+        ],
+        "title": "DistributionUnsupportedSectionV1",
+        "type": "object"
+      },
       "DriverStep": {
         "properties": {
           "kind": {
@@ -1823,6 +2845,79 @@
           "clientKey"
         ],
         "title": "DurableCheckpointView",
+        "type": "object"
+      },
+      "DurableDistributionReportView": {
+        "description": "Sanitized exact-report identity and coverage summary for Workspace Jobs.",
+        "properties": {
+          "complete": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Complete"
+          },
+          "computationVersion": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Computationversion",
+            "type": "string"
+          },
+          "datasetViewId": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "deepLink": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Deeplink",
+            "type": "string"
+          },
+          "measuredRows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measuredrows"
+          },
+          "reportId": {
+            "maxLength": 32,
+            "minLength": 32,
+            "title": "Reportid",
+            "type": "string"
+          },
+          "reportedColumnCount": {
+            "anyOf": [
+              {
+                "maximum": 64.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reportedcolumncount"
+          }
+        },
+        "required": [
+          "reportId",
+          "datasetViewId",
+          "computationVersion",
+          "deepLink"
+        ],
+        "title": "DurableDistributionReportView",
         "type": "object"
       },
       "DurableExternalWaitView": {
@@ -7641,12 +8736,26 @@
             "type": "boolean"
           },
           "canvasId": {
-            "title": "Canvasid",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvasid"
           },
           "canvasName": {
-            "title": "Canvasname",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvasname"
           },
           "checkpoint": {
             "anyOf": [
@@ -7668,6 +8777,16 @@
               }
             ],
             "title": "Createdat"
+          },
+          "distributionReport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableDistributionReportView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "error": {
             "anyOf": [
@@ -7757,7 +8876,8 @@
           "jobType": {
             "enum": [
               "run",
-              "profile"
+              "profile",
+              "distribution_report"
             ],
             "title": "Jobtype",
             "type": "string"
@@ -7962,8 +9082,6 @@
           "id",
           "jobType",
           "status",
-          "canvasId",
-          "canvasName",
           "backend",
           "placement",
           "attempt"
@@ -14436,6 +15554,284 @@
         "summary": "Get Dataset View"
       }
     },
+    "/api/dataset-views/{view_id}/distribution-reports": {
+      "get": {
+        "operationId": "list_reports_api_dataset_views__view_id__distribution_reports_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DistributionReportEnvelopeViewV1"
+                  },
+                  "title": "Response List Reports Api Dataset Views  View Id  Distribution Reports Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "List Reports"
+      },
+      "post": {
+        "operationId": "submit_report_api_dataset_views__view_id__distribution_reports_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DistributionReportSubmitRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistributionReportEnvelopeViewV1"
+                }
+              }
+            },
+            "description": "Identical submission replayed from its durable report identity."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistributionReportEnvelopeViewV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Submit Report"
+      }
+    },
+    "/api/dataset-views/{view_id}/distribution-reports/estimate": {
+      "post": {
+        "description": "Return retained metadata signals without scanning source rows.",
+        "operationId": "estimate_report_api_dataset_views__view_id__distribution_reports_estimate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "view_id",
+            "required": true,
+            "schema": {
+              "title": "View Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistributionReportEstimateV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Estimate Report"
+      }
+    },
     "/api/dataset-views/{view_id}/preview": {
       "post": {
         "description": "Replay the immutable exact definition and return at most 100 rows.",
@@ -14758,6 +16154,87 @@
           }
         },
         "summary": "Mkdir Destination"
+      }
+    },
+    "/api/distribution-reports/{report_id}": {
+      "get": {
+        "operationId": "get_report_api_distribution_reports__report_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "report_id",
+            "required": true,
+            "schema": {
+              "title": "Report Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistributionReportEnvelopeViewV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Get Report"
       }
     },
     "/api/graph/compile": {

@@ -6,19 +6,27 @@ import datetime
 import hashlib
 import json
 import os
+import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from hub import distribution_reports, metadb
+from hub import auth, db, distribution_report_tasks, distribution_reports, metadb
+from hub.main import app
 from hub.models import DatasetViewDefinitionV1
 from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
+from hub.routers import dataset_views as dataset_view_routes
+from hub.routers import runs as run_routes
 from hub.storage import LocalStorage
 
 
@@ -47,7 +55,12 @@ def _isolated_metadata(tmp_path):
 def core_view_factory(tmp_path):
     stores: list[LocalStorage] = []
 
-    def create() -> dict:
+    def create(
+        data: dict[str, list] | None = None,
+        sampling: dict | None = None,
+    ) -> dict:
+        data = data or {"value": [1, 2, 3]}
+        sampling = sampling or {"kind": "all"}
         token = uuid.uuid4().hex
         storage = LocalStorage(str(tmp_path / f"outputs-{token}"))
         stores.append(storage)
@@ -56,13 +69,24 @@ def core_view_factory(tmp_path):
         logical_uri = str(tmp_path / "published" / f"{token}.parquet")
         run_id = uuid.uuid4().hex
         artifact = storage.begin_result(f"managed-file:{logical_uri}", run_id)
-        pq.write_table(pa.table({"value": [1, 2, 3]}), artifact)
+        pq.write_table(pa.table(data), artifact)
         storage.commit_result(artifact, run_id)
         published = catalog.publish_managed_local_file_output(
             name=f"report-source-{token}", logical_uri=logical_uri, artifact_uri=artifact)
         assert storage.release_result(artifact, run_id) is True
         workspace = metadb.dataset_view_source_workspace(published["dataset_id"])
         view_id, placement_id = uuid.uuid4().hex, uuid.uuid4().hex
+        provenance = None
+        if sampling["kind"] == "reservoir":
+            returned = min(int(sampling["size"]), len(next(iter(data.values()))))
+            provenance = {
+                "strategy": "reservoir", "seed": sampling["seed"],
+                "requestedRows": sampling["size"], "scannedRows": len(next(iter(data.values()))),
+                "returnedRows": returned, "totalRows": len(next(iter(data.values()))),
+                "datasetIdentity": published["dataset_id"],
+                "datasetRevision": published["revision_id"], "identity": "d" * 64,
+                "limitations": ["The deterministic reservoir scanned the complete exact revision."],
+            }
         definition = DatasetViewDefinitionV1.model_validate({
             "schemaVersion": 1,
             "id": view_id,
@@ -78,10 +102,10 @@ def core_view_factory(tmp_path):
                 "placementId": placement_id,
                 "sourceRegistrationId": workspace["sourceRegistrationId"],
             },
-            "selectedColumns": ["value"],
+            "selectedColumns": list(data),
             "predicate": None,
-            "sampling": {"kind": "all"},
-            "sampleProvenance": None,
+            "sampling": sampling,
+            "sampleProvenance": provenance,
             "retentionOwner": "core",
             "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "semanticSha256": "a" * 64,
@@ -110,6 +134,7 @@ def core_view_factory(tmp_path):
             expected_container_id=workspace["containerId"],
         )
         assert created is True
+        create.storage = storage
         return stored
 
     yield create
@@ -130,16 +155,44 @@ def _intent(view: dict, submission_id: str | None = None, **changes) -> dict:
     return value
 
 
-def _report(claim: dict, **content) -> dict:
-    return {
+def _report(claim: dict, **changes) -> dict:
+    measured = int(changes.pop("rowCount", 3))
+    document = {
         "schemaVersion": 1,
         "reportId": claim["report_id"],
         "taskId": claim["task"]["id"],
         "datasetViewId": claim["intent"]["datasetViewId"],
+        "datasetId": claim["view_snapshot"]["datasetRef"]["datasetId"],
+        "revisionId": claim["view_snapshot"]["datasetRef"]["revisionId"],
         "viewDefinitionSha256": claim["intent"]["viewDefinitionSha256"],
         "computationVersion": claim["intent"]["computationVersion"],
-        "content": content or {"rowCount": 3},
+        "measuredRows": measured,
+        "complete": True,
+        "sampleProvenance": None,
+        "limitations": ["test fixture"],
+        "sections": [{
+            "kind": "coverage_schema", "sectionId": "coverage-schema",
+            "selectedColumnCount": 1, "reportedColumnCount": 1,
+            "columns": [{"name": "value", "type": "int"}],
+        }, {
+            "kind": "missingness", "sectionId": "column-000-missingness",
+            "columnName": "value", "missingCount": 0,
+        }, {
+            "kind": "numeric", "sectionId": "column-000-numeric",
+            "columnName": "value", "count": measured, "nonFiniteCount": 0,
+            "min": 1.0, "max": 3.0, "mean": 2.0, "stddev": 0.0,
+            "quantiles": [
+                {"probability": value, "value": 2.0}
+                for value in (0.0, 0.25, 0.5, 0.75, 1.0)
+            ],
+            "histogram": [{
+                "bucketId": "column-000-numeric-000", "lower": 1.0, "upper": 3.0,
+                "count": measured, "upperInclusive": True,
+            }],
+        }],
     }
+    document.update(changes)
+    return document
 
 
 def _expire_latest_attempt(task_id: str) -> None:
@@ -222,7 +275,7 @@ def test_db_time_duplicate_owner_fencing_terminal_atomicity_and_response_loss(
         task_id=task_id, attempt_id=first_attempt, owner_token="owner-one",
         report=_report(second)) is None
 
-    document = _report(second, rowCount=3, columns=[])
+    document = _report(second, rowCount=3)
     completed = distribution_reports.complete_distribution_report(
         task_id=task_id, attempt_id=second_attempt, owner_token="owner-two",
         report=document)
@@ -234,7 +287,7 @@ def test_db_time_duplicate_owner_fencing_terminal_atomicity_and_response_loss(
     assert task_id not in distribution_reports.due_distribution_report_task_ids()
     assert distribution_reports.complete_distribution_report(
         task_id=task_id, attempt_id=second_attempt, owner_token="owner-two",
-        report={**document, "content": {"rowCount": 4}}) is None
+        report={**document, "limitations": ["changed response-loss payload"]}) is None
     with metadb.session() as session:
         task = session.get(metadb.DurableTask, task_id)
         row = session.get(metadb.DistributionReportEnvelope, task_id)
@@ -252,8 +305,19 @@ def test_db_time_duplicate_owner_fencing_terminal_atomicity_and_response_loss(
     assert metadb.durable_task_inbox_item(metadb.DEFAULT_USER_ID, inbox_id) is None
     assert metadb.mark_durable_task_inbox_item_read(
         metadb.DEFAULT_USER_ID, inbox_id) is None
-    assert metadb.list_workspace_runs(
-        metadb.DEFAULT_USER_ID, run_id=task_id)["items"] == []
+    job = metadb.list_workspace_runs(
+        metadb.DEFAULT_USER_ID, run_id=task_id)["items"][0]
+    assert job["jobType"] == "distribution_report"
+    assert job["distributionReport"] == {
+        "reportId": completed["report_id"],
+        "datasetViewId": view["id"],
+        "computationVersion": "distribution-v1",
+        "measuredRows": 3,
+        "complete": True,
+        "reportedColumnCount": 1,
+        "deepLink": f"/distribution-reports/{completed['report_id']}",
+    }
+    assert "ownerToken" not in json.dumps(job)
     with metadb.session() as session:
         internal = session.get(metadb.DurableTaskInboxItem, inbox_id)
         assert internal is not None and internal.read_at is None
@@ -381,6 +445,220 @@ def test_missing_report_owned_revision_hold_fails_closed_and_terminalizes(
         assert row.report_doc is None and row.completed_at == task.completed_at
         assert inbox is not None
         assert inbox.diagnostic_code == "distribution_report_snapshot_invalid"
+
+
+def test_api_computes_closed_bounded_sections_and_replays_submission(
+    core_view_factory, monkeypatch,
+):
+    view = core_view_factory({
+        "number": [1.0, None, float("nan"), 3.0],
+        "category": ["a", "b", "a", None],
+        "flag": [True, False, True, None],
+        "observed_at": [
+            datetime.datetime(2025, 1, 1), datetime.datetime(2025, 1, 2),
+            None, datetime.datetime(2025, 1, 4),
+        ],
+        "payload": [b"a", b"b", b"c", None],
+    })
+    other = f"report-other-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=other, name="Other"))
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    submission = str(uuid.uuid4())
+    with TestClient(app) as client:
+        estimate = client.post(
+            f"/api/dataset-views/{view['id']}/distribution-reports/estimate")
+        assert estimate.status_code == 200, estimate.text
+        assert estimate.json()["estimatedScanRows"] == 4
+        assert estimate.json()["needsConfirmation"] is False
+
+        submitted = client.post(
+            f"/api/dataset-views/{view['id']}/distribution-reports",
+            json={"submissionId": submission, "confirmed": False})
+        assert submitted.status_code == 201, submitted.text
+        report_id = submitted.json()["reportId"]
+        task_id = submitted.json()["task"]["id"]
+        listed = client.get(
+            f"/api/dataset-views/{view['id']}/distribution-reports")
+        assert listed.status_code == 200
+        assert [item["reportId"] for item in listed.json()] == [report_id]
+        terminal = None
+        for _ in range(100):
+            response = client.get(f"/api/distribution-reports/{report_id}")
+            assert response.status_code == 200, response.text
+            terminal = response.json()
+            if terminal["task"]["status"] in ("done", "failed", "cancelled"):
+                break
+            time.sleep(.02)
+        assert terminal is not None and terminal["task"]["status"] == "done", terminal
+        document = terminal["report"]
+        assert document["measuredRows"] == 4 and document["complete"] is True
+        assert document["datasetViewId"] == view["id"]
+        sections = {section["kind"] + ":" + section.get("columnName", ""): section
+                    for section in document["sections"]}
+        assert sections["missingness:number"]["missingCount"] == 1
+        numeric = sections["numeric:number"]
+        assert numeric["count"] == 2 and numeric["nonFiniteCount"] == 1
+        assert sum(bucket["count"] for bucket in numeric["histogram"]) == 2
+        categorical = sections["categorical:category"]
+        assert sum(item["count"] for item in categorical["top"]) == 3
+        assert categorical["otherCount"] == 0
+        assert sections["categorical:flag"]["distinctCountApproximate"] is False
+        temporal = sections["temporal:observed_at"]
+        assert sum(bucket["count"] for bucket in temporal["buckets"]) == 3
+        assert sections["unsupported:payload"]["reason"] == "unsupported_type"
+
+        replay = client.post(
+            f"/api/dataset-views/{view['id']}/distribution-reports",
+            json={"submissionId": submission, "confirmed": False})
+        assert replay.status_code == 200 and replay.json()["reportId"] == report_id
+        assert client.get(f"/api/run/{task_id}").json()["status"] == "done"
+        jobs = client.get("/api/jobs", params={"run_id": task_id})
+        assert jobs.status_code == 200, jobs.text
+        assert jobs.json()["items"][0]["distributionReport"]["reportId"] == report_id
+        headers = {"X-DP-User": other}
+        assert client.get(
+            f"/api/distribution-reports/{report_id}", headers=headers).status_code == 404
+        assert client.get(
+            "/api/jobs", params={"run_id": task_id}, headers=headers).json()["items"] == []
+
+        monkeypatch.setenv(
+            "DP_AUTH_SECRET", "distribution-report-auth-test-secret-0123456789")
+        assert run_routes._run_read_access(task_id, metadb.DEFAULT_USER_ID) is True
+        assert run_routes._run_mutate_access(task_id, metadb.DEFAULT_USER_ID) is True
+        assert run_routes._run_read_access(task_id, other) is False
+        assert run_routes._run_mutate_access(task_id, other) is False
+        other_session = {"Cookie": f"dp_session={auth.sign(other)}"}
+        assert client.get(f"/api/run/{task_id}", headers=other_session).status_code == 404
+        assert client.post(
+            f"/api/run/{task_id}/cancel", headers=other_session).status_code == 404
+        assert client.post(
+            f"/api/run/{task_id}/retry", headers=other_session,
+            json={"actionId": str(uuid.uuid4())}).status_code == 404
+        monkeypatch.delenv("DP_AUTH_SECRET")
+
+        monkeypatch.setattr(distribution_report_tasks, "CONFIRM_ROWS", 1)
+        confirmation = client.post(
+            f"/api/dataset-views/{view['id']}/distribution-reports",
+            json={"submissionId": str(uuid.uuid4()), "confirmed": False})
+        assert confirmation.status_code == 409
+
+
+def test_reservoir_report_is_exact_only_over_its_deterministic_sample(
+    core_view_factory, monkeypatch,
+):
+    view = core_view_factory(
+        {"value": list(range(100))},
+        sampling={"kind": "reservoir", "size": 10, "seed": 42})
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    admitted, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(view))
+    claim = distribution_reports.claim_distribution_report(
+        admitted["task"]["id"], "sample-owner")
+    assert claim is not None
+    document = distribution_report_tasks.compute_distribution_report(
+        claim, distribution_report_tasks._LeaseState(time.monotonic() + 30))
+    parsed = distribution_reports.DistributionReportDocumentV1.model_validate(document)
+    assert parsed.measured_rows == 10 and parsed.complete is False
+    assert parsed.sample_provenance is not None
+    assert parsed.sample_provenance.identity == view["sampleProvenance"]["identity"]
+    assert any("no full-population claim" in item for item in parsed.limitations)
+    numeric = next(section for section in parsed.sections if section.kind == "numeric")
+    assert numeric.count == sum(bucket.count for bucket in numeric.histogram) == 10
+
+
+def test_numeric_float_wire_boundaries_fail_closed_and_reconcile(core_view_factory, monkeypatch):
+    hugeint_table = db.unique_view("numeric_boundary")
+    con = db.conn()
+    con.execute(f'CREATE TEMP TABLE "{hugeint_table}" (value HUGEINT)')
+    try:
+        con.execute(
+            f'INSERT INTO "{hugeint_table}" VALUES (0), ({2**53 + 1}), (NULL)')
+        hugeint = distribution_report_tasks._numeric_section(
+            con, hugeint_table, "value", "HUGEINT", 0, 1)[0]
+        assert hugeint == {
+            "kind": "unsupported", "sectionId": "column-000-numeric",
+            "columnName": "value", "reason": "numeric_precision_unsupported",
+            "partial": True,
+        }
+    finally:
+        con.execute(f'DROP TABLE "{hugeint_table}"')
+
+    view = core_view_factory({
+        "safe_bigint": [-(2**53), 0, 2**53, None],
+        "unsafe_bigint": [0, 1, 2**53 + 1, None],
+        "decimal_value": [Decimal("0.1"), Decimal("0.5"), Decimal("1.0"), None],
+        "constant_extreme": [sys.float_info.max, sys.float_info.max, sys.float_info.max, None],
+        "extreme_span": [-sys.float_info.max, 0.0, sys.float_info.max, None],
+        "stddev_overflow": [0.0, 1e200, 1e200, None],
+        "subnormal_width": [0.0, 0.0, 5e-324, None],
+    })
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    admitted, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(view))
+    claim = distribution_reports.claim_distribution_report(
+        admitted["task"]["id"], "numeric-boundary-owner")
+    assert claim is not None
+    document = distribution_report_tasks.compute_distribution_report(
+        claim, distribution_report_tasks._LeaseState(time.monotonic() + 30))
+    parsed = distribution_reports.DistributionReportDocumentV1.model_validate(document)
+
+    by_column = {
+        section.column_name: section
+        for section in parsed.sections if getattr(section, "column_name", None) is not None
+    }
+    safe = by_column["safe_bigint"]
+    assert safe.kind == "numeric"
+    assert safe.count + safe.non_finite_count + 1 == parsed.measured_rows
+    assert sum(bucket.count for bucket in safe.histogram) == safe.count
+    constant = by_column["constant_extreme"]
+    assert constant.kind == "numeric"
+    assert constant.min == constant.max == constant.mean == sys.float_info.max
+    assert constant.stddev == 0
+    expected_reasons = {
+        "unsafe_bigint": "numeric_precision_unsupported",
+        "decimal_value": "numeric_precision_unsupported",
+        "extreme_span": "numeric_range_unsupported",
+        "stddev_overflow": "numeric_range_unsupported",
+        "subnormal_width": "numeric_range_unsupported",
+    }
+    for column, reason in expected_reasons.items():
+        section = by_column[column]
+        assert section.kind == "unsupported"
+        assert section.reason == reason and section.partial is True
+        missing = next(
+            item for item in parsed.sections
+            if item.kind == "missingness" and item.column_name == column)
+        assert missing.missing_count == 1
+
+
+def test_deadline_monitor_interrupts_an_active_query(monkeypatch):
+    interrupted = threading.Event()
+    done = threading.Event()
+    state = distribution_report_tasks._LeaseState(
+        deadline_at=time.monotonic() - 1, interrupt=interrupted.set)
+    monkeypatch.setattr(
+        distribution_reports, "heartbeat_distribution_report", lambda *_args: True)
+    monkeypatch.setattr(
+        distribution_reports, "distribution_report_should_stop", lambda *_args: False)
+    monitor = threading.Thread(
+        target=distribution_report_tasks._lease_monitor,
+        args=("task", "attempt", "owner", state, done), daemon=True)
+    monitor.start()
+    assert interrupted.wait(timeout=2)
+    assert state.deadline is True
+    done.set()
+    monitor.join(timeout=2)
+    assert monitor.is_alive() is False
 
 
 def test_postgres_read_and_terminal_commit_observe_one_locked_report_version(
