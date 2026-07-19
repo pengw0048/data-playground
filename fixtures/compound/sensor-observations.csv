@@ -1,0 +1,11 @@
+observation_id,episode_id,device_tick,value
+episode-1-sensor-001,episode-1,1000000,0.125
+episode-1-sensor-002,episode-1,2000000,0.250
+episode-1-sensor-003,episode-1,3000000,0.375
+episode-1-sensor-004,episode-1,7000000,0.625
+episode-1-sensor-005,episode-1,8000000,0.750
+episode-1-sensor-006,episode-1,9000000,0.875
+episode-2-sensor-001,episode-2,21000000,1.125
+episode-2-sensor-002,episode-2,22000000,1.250
+episode-2-sensor-003,episode-2,25000000,1.625
+episode-2-sensor-004,episode-2,26000000,1.750

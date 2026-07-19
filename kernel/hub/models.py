@@ -1087,6 +1087,51 @@ class TemporalEvidenceResponseV1(Wire):
     pair: TemporalEvidencePairEvidenceV1 | None
 
 
+class CompoundFixtureAssetV1(Wire):
+    """One declared immutable fixture asset without a physical locator."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+    id: str
+    media_type: str
+    byte_length: int
+    sha256: str
+    status: Literal["available", "unavailable"]
+
+
+class CompoundFixtureStreamV1(Wire):
+    """One generic stream and its explicit state in an exact fixture episode."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+    id: str
+    kind: str
+    clock_id: str
+    state: Literal["present", "absent"]
+    asset_ids: list[str]
+
+
+class CompoundFixtureEpisodeV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+    id: str
+    reference_clock_id: str
+    start_tick: str
+    end_tick: str
+    streams: list[CompoundFixtureStreamV1]
+
+
+class CompoundFixtureDetailV1(Wire):
+    """Read-only redacted detail for the one server-owned public compound fixture."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+
+    dataset_id: str
+    revision_id: str
+    episodes: list[CompoundFixtureEpisodeV1]
+    assets: list[CompoundFixtureAssetV1]
+
+
 class DatasetViewCreateRequest(Wire):
     """Immutable DatasetView intent. Workspace placement is derived by the server."""
 
