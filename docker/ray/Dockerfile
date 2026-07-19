@@ -20,6 +20,7 @@ RUN groupadd --gid 10001 dataplay \
 WORKDIR /app
 RUN mkdir -p ./web/dist && chown -R 10001:10001 /app
 COPY --chown=10001:10001 kernel/ ./kernel/
+COPY --chown=10001:10001 fixtures/compound/ ./fixtures/compound/
 # the dp_ray reference backend the driver loads (+ its multi-node check script)
 COPY --chown=10001:10001 examples/ ./examples/
 # the wheel force-includes ../web/dist into hub/_web; a Ray node never serves the SPA, so a stub is enough

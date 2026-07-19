@@ -29,6 +29,7 @@ ENV DP_GIT_SHA=${DP_GIT_SHA}
 RUN pip install --no-cache-dir uv==0.11.28
 WORKDIR /app
 COPY kernel/ ./kernel/
+COPY fixtures/compound/ ./fixtures/compound/
 # the SPA at ../web/dist relative to kernel/ — where pyproject's force-include bundles it into
 # hub/_web at build time (so the served SPA matches the packaged kernel)
 COPY --from=web /web/dist ./web/dist
