@@ -1048,9 +1048,29 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
     principal_ids: list[str] = []
     try:
         with TestClient(app) as client:
-            page = client.get(f"/api/workspace/containers/{root['id']}")
-            assert page.status_code == 200, page.text
-            remote = next(item for item in page.json()["items"] if item.get("resourceId") == "container-a")
+            response = client.get(
+                f"/api/workspace/containers/{root['id']}", params={"limit": 50})
+            assert response.status_code == 200, response.text
+            page = response.json()
+            remote = next(
+                (item for item in page["items"] if item.get("resourceId") == "container-a"),
+                None,
+            )
+            cursor = page["nextCursor"]
+            while remote is None and cursor is not None:
+                response = client.get(
+                    f"/api/workspace/containers/{root['id']}",
+                    params={"limit": 50, "cursor": cursor},
+                )
+                assert response.status_code == 200, response.text
+                page = response.json()
+                remote = next(
+                    (item for item in page["items"]
+                     if item.get("resourceId") == "container-a"),
+                    None,
+                )
+                cursor = page["nextCursor"]
+            assert remote is not None
             binding_ids.append(remote["bindingId"])
             capability = remote["localPlacement"]
             assert remote["providerMutation"] is False
