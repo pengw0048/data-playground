@@ -11749,6 +11749,18 @@
             "title": "Providerdatasetrefs",
             "type": "array"
           },
+          "requestId": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requestid"
+          },
           "transformId": {
             "anyOf": [
               {
@@ -11781,6 +11793,61 @@
           "expectedContainerVersion"
         ],
         "title": "WorkspaceCreateCanvasBody",
+        "type": "object"
+      },
+      "WorkspaceLocalPlacementCapability": {
+        "description": "A local-only mutation destination paired with a provider resource read reference.",
+        "properties": {
+          "canCreateCanvas": {
+            "title": "Cancreatecanvas",
+            "type": "boolean"
+          },
+          "canMoveCanvas": {
+            "title": "Canmovecanvas",
+            "type": "boolean"
+          },
+          "containerId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Containerid"
+          },
+          "containerVersion": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Containerversion"
+          },
+          "recoveryState": {
+            "enum": [
+              "ready",
+              "unavailable"
+            ],
+            "title": "Recoverystate",
+            "type": "string"
+          },
+          "writable": {
+            "title": "Writable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "writable",
+          "canCreateCanvas",
+          "canMoveCanvas",
+          "recoveryState"
+        ],
+        "title": "WorkspaceLocalPlacementCapability",
         "type": "object"
       },
       "WorkspaceMoveCanvasBody": {
@@ -11939,6 +12006,16 @@
             ],
             "title": "Lastresolvedat"
           },
+          "localPlacement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceLocalPlacementCapability"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "mountId": {
             "anyOf": [
               {
@@ -11986,6 +12063,11 @@
               }
             ],
             "title": "Provider"
+          },
+          "providerMutation": {
+            "default": false,
+            "title": "Providermutation",
+            "type": "boolean"
           },
           "referenceState": {
             "default": "current",

@@ -154,6 +154,36 @@ class WorkspacePlacement(Base):
     )
 
 
+class WorkspaceExternalOverlayAnchor(Base):
+    """One hidden, writable local destination fenced by one provider binding generation."""
+    __tablename__ = "workspace_external_overlay_anchors"
+    binding_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspace_provider_bindings.id"), primary_key=True)
+    container_id: Mapped[str] = mapped_column(
+        String, ForeignKey("workspace_containers.id"), nullable=False)
+    # Mount/resource are immutable identity evidence retained beside the binding generation.  They
+    # must never become a pair-unique adoption key because providers are allowed to recycle IDs.
+    mount_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        UniqueConstraint("container_id", name="uq_workspace_external_overlay_container"),
+    )
+
+
+class WorkspaceCanvasCreateReplay(Base):
+    """Durable one-intent/one-result record for client-retried Canvas creation."""
+    __tablename__ = "workspace_canvas_create_replays"
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint("length(intent_sha256) = 64", name="ck_workspace_canvas_create_replay_sha"),
+    )
+
+
 class DatasetView(Base):
     """One owner-scoped immutable DatasetView plus a retained submission tombstone."""
 
@@ -3039,6 +3069,12 @@ def _workspace_container_locked(s, container_id: str) -> WorkspaceContainer:
     return row
 
 
+def _workspace_external_overlay_anchor_for_container(
+        s, container_id: str) -> WorkspaceExternalOverlayAnchor | None:
+    return s.scalar(select(WorkspaceExternalOverlayAnchor).where(
+        WorkspaceExternalOverlayAnchor.container_id == container_id))
+
+
 def _workspace_writable_destination_locked(s, container_id: str) -> WorkspaceContainer:
     """Lock a destination and reject writes anywhere below a detached Catalog tombstone."""
     destination = _workspace_container_locked(s, container_id)
@@ -3089,6 +3125,8 @@ def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -
     name, ordinal = _workspace_name(name), _workspace_ordinal(ordinal)
     with _workspace_write_session() as s:
         _workspace_writable_destination_locked(s, parent_id)
+        if _workspace_external_overlay_anchor_for_container(s, parent_id) is not None:
+            raise ValueError("an external overlay anchor only accepts Canvas placements")
         if s.scalar(select(WorkspaceContainer.id).where(
                 WorkspaceContainer.parent_id == parent_id, WorkspaceContainer.name == name,
                 WorkspaceContainer.catalog_folder_id.is_(None))) is not None:
@@ -3118,6 +3156,8 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be edited")
+        if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
+            raise ValueError("an external overlay anchor cannot be edited")
         if row.catalog_folder_id is not None:
             raise ValueError("a projected Catalog folder is managed by the Catalog")
         if row.version != expected_version:
@@ -3128,6 +3168,8 @@ def workspace_update_container(container_id: str, *, expected_version: int, name
         if _workspace_parent_is_descendant(s, target_parent, container_id):
             raise ValueError("a workspace container cannot become its own descendant")
         _workspace_writable_destination_locked(s, target_parent)
+        if _workspace_external_overlay_anchor_for_container(s, target_parent) is not None:
+            raise ValueError("an external overlay anchor only accepts Canvas placements")
         target_name = _workspace_name(name) if name is not None else row.name
         target_ordinal = _workspace_ordinal(ordinal) if ordinal is not None else row.ordinal
         sibling = s.scalar(select(WorkspaceContainer.id).where(
@@ -3159,6 +3201,8 @@ def workspace_delete_container(container_id: str, *, expected_version: int) -> N
         row = _workspace_container_locked(s, container_id)
         if row.is_root:
             raise ValueError("the local Workspace root cannot be deleted")
+        if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
+            raise ValueError("an external overlay anchor cannot be deleted")
         if row.catalog_folder_id is not None:
             raise ValueError("a projected Catalog folder is managed by the Catalog")
         if row.version != expected_version:
@@ -3585,6 +3629,44 @@ def _workspace_place_sources(nodes: list[dict], sources: list[dict]) -> None:
         nodes.append(source)
 
 
+def _workspace_canvas_create_intent_sha256(intent: dict) -> str:
+    """Hash the client-visible semantic request, never generated node IDs or provider handles."""
+    payload = json.dumps(intent, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _workspace_canvas_create_request_id(request_id: str) -> str:
+    normalized = str(request_id).strip()
+    if not normalized or normalized != request_id or "\x00" in normalized or len(normalized) > 128:
+        raise ValueError("Canvas create request id must be a trimmed, NUL-free value of at most 128 characters")
+    return normalized
+
+
+def _workspace_canvas_create_replay_in_session(
+        s, *, uid: str, request_id: str, intent_sha256: str) -> dict | None:
+    replay = s.get(WorkspaceCanvasCreateReplay, (uid, request_id), with_for_update=True)
+    if replay is None:
+        return None
+    if replay.intent_sha256 != intent_sha256:
+        raise ValueError("Canvas create request id was reused for a different semantic request")
+    try:
+        result = json.loads(replay.result_doc)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - committed server record
+        raise RuntimeError("Canvas create replay record is corrupt") from exc
+    if not isinstance(result, dict):  # pragma: no cover - committed server record
+        raise RuntimeError("Canvas create replay record is corrupt")
+    return result
+
+
+def workspace_canvas_create_replay(*, uid: str, request_id: str, intent: dict) -> dict | None:
+    """Return a committed create result before retrying mutable provider admission work."""
+    normalized = _workspace_canvas_create_request_id(request_id)
+    intent_sha256 = _workspace_canvas_create_intent_sha256(intent)
+    with session() as s:
+        return _workspace_canvas_create_replay_in_session(
+            s, uid=uid, request_id=normalized, intent_sha256=intent_sha256)
+
+
 def _workspace_transform_node_in_session(
         s, *, uid: str, transform: dict, canvas_id: str | None = None) -> dict:
     processor = str(transform.get("id", ""))
@@ -3663,10 +3745,24 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
                                    expected_container_version: int, name: str,
                                    dataset_ids: list[str] | None = None,
                                    provider_sources: list[dict] | None = None,
-                                   transform: dict | None = None) -> dict:
+                                   transform: dict | None = None,
+                                   request_id: str | None = None,
+                                   request_intent: dict | None = None) -> dict:
     """Atomically create one canvas at an exact local container with a bounded dataset selection."""
     canvas_name = _workspace_name(name)
+    if (request_id is None) != (request_intent is None):
+        raise ValueError("Canvas create replay requires both a request id and request intent")
+    normalized_request_id = (
+        _workspace_canvas_create_request_id(request_id) if request_id is not None else None)
+    intent_sha256 = (
+        _workspace_canvas_create_intent_sha256(request_intent)
+        if request_intent is not None else None)
     with _workspace_write_session() as s:
+        if normalized_request_id is not None and intent_sha256 is not None:
+            replay = _workspace_canvas_create_replay_in_session(
+                s, uid=uid, request_id=normalized_request_id, intent_sha256=intent_sha256)
+            if replay is not None:
+                return replay
         container = _workspace_container_at_version(s, container_id, expected_container_version)
         sources = [*_workspace_dataset_sources_in_session(s, dataset_ids or []),
                    *(provider_sources or [])]
@@ -3691,11 +3787,19 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         s.flush()
         sync_local_result_owner(s, "canvas", canvas_id, doc)
         _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
-        return {
+        result = {
             "ok": True, "id": canvas_id, "created": True,
             "nodeId": nodes[0]["id"] if transform is not None else None,
-            "resource": _workspace_placement_resource(placement, detached=False),
+            "resource": _workspace_public_placement_resource(s, placement, detached=False),
         }
+        if normalized_request_id is not None and intent_sha256 is not None:
+            s.add(WorkspaceCanvasCreateReplay(
+                owner_id=uid, request_id=normalized_request_id,
+                intent_sha256=intent_sha256,
+                result_doc=json.dumps(result, separators=(",", ":")),
+            ))
+            s.flush()
+        return result
 
 
 def workspace_add_datasets_action(*, uid: str, canvas_id: str,
@@ -3843,9 +3947,9 @@ def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_versio
         s.refresh(placement)
         return {
             "ok": True,
-            "resource": _workspace_placement_resource(placement, detached=False),
-            "previousContainer": _workspace_container_resource(previous),
-            "container": _workspace_container_resource(destination),
+            "resource": _workspace_public_placement_resource(s, placement, detached=False),
+            "previousContainer": _workspace_public_container_resource(s, previous),
+            "container": _workspace_public_container_resource(s, destination),
         }
 
 
@@ -4857,6 +4961,62 @@ def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) ->
     }
 
 
+def _workspace_external_identity(binding: WorkspaceProviderBinding) -> str:
+    payload = json.dumps(
+        [binding.mount_id, binding.resource_id, binding.id], separators=(",", ":"),
+    ).encode()
+    return "external." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _workspace_provider_container_resource(
+        s, binding: WorkspaceProviderBinding, *, local_placement: dict | None = None) -> dict:
+    """Project cached provider facts only; action responses must never consult a live provider."""
+    parent = (s.get(WorkspaceProviderBinding, binding.parent_binding_id)
+              if binding.parent_binding_id is not None else None)
+    parent_id = (
+        f"container:{_workspace_external_identity(parent)}"
+        if parent is not None else _workspace_ref("container", binding.container_id)
+    )
+    return {
+        "id": f"container:{_workspace_external_identity(binding)}",
+        "kind": "container", "name": binding.name, "parentId": parent_id,
+        "detached": binding.state == "detached", "source": "provider",
+        "mountId": binding.mount_id, "provider": binding.provider,
+        "resourceId": binding.resource_id, "bindingId": binding.id,
+        "referenceState": binding.state, "lastKnown": binding.state != "current",
+        "lastResolvedAt": binding.last_resolved_at,
+        "localPlacement": local_placement,
+        "providerMutation": False,
+    }
+
+
+def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
+    anchor = _workspace_external_overlay_anchor_for_container(s, row.id)
+    if anchor is None:
+        return _workspace_container_resource(row)
+    binding = s.get(WorkspaceProviderBinding, anchor.binding_id)
+    if binding is None or binding.kind != "container":  # pragma: no cover - FK-protected invariant
+        raise RuntimeError("external Workspace overlay anchor binding is missing")
+    return _workspace_provider_container_resource(s, binding, local_placement={
+        "writable": True,
+        "canCreateCanvas": True,
+        "canMoveCanvas": True,
+        "containerId": row.id,
+        "containerVersion": row.version,
+        "recoveryState": "ready",
+    })
+
+
+def _workspace_public_placement_resource(
+        s, row: WorkspacePlacement, *, detached: bool) -> dict:
+    resource = _workspace_placement_resource(row, detached=detached)
+    container = s.get(WorkspaceContainer, row.container_id)
+    if container is None:  # pragma: no cover - foreign key protected invariant
+        raise RuntimeError("Workspace placement parent is missing")
+    resource["parentId"] = _workspace_public_container_resource(s, container)["id"]
+    return resource
+
+
 _WORKSPACE_PROVIDER_STATES = {
     "current", "offline", "permission_lost", "detached", "provider_error",
 }
@@ -4878,6 +5038,64 @@ def _workspace_provider_binding_doc(row: WorkspaceProviderBinding) -> dict:
         "relinkedFromId": row.relinked_from_id,
         "lastResolvedAt": row.last_resolved_at,
     }
+
+
+def _workspace_external_overlay_anchor_doc(
+        anchor: WorkspaceExternalOverlayAnchor, container: WorkspaceContainer) -> dict:
+    return {
+        "bindingId": anchor.binding_id,
+        "containerId": container.id,
+        "containerVersion": container.version,
+        "mountId": anchor.mount_id,
+        "resourceId": anchor.resource_id,
+        "recoveryState": "ready",
+    }
+
+
+def workspace_provider_overlay_anchor(binding_id: str) -> dict | None:
+    """Read an existing hidden anchor without making a provider binding eligible for writes."""
+    with session() as s:
+        anchor = s.get(WorkspaceExternalOverlayAnchor, binding_id)
+        if anchor is None:
+            return None
+        container = s.get(WorkspaceContainer, anchor.container_id)
+        if container is None:  # pragma: no cover - foreign key protected invariant
+            raise RuntimeError("external Workspace overlay anchor container is missing")
+        return _workspace_external_overlay_anchor_doc(anchor, container)
+
+
+def workspace_is_external_overlay_anchor(container_id: str) -> bool:
+    """Tell the public action boundary whether a local destination needs overlay replay fencing."""
+    with session() as s:
+        return _workspace_external_overlay_anchor_for_container(s, container_id) is not None
+
+
+def workspace_provider_ensure_overlay_anchor(binding_id: str) -> dict:
+    """Create or reuse one non-browsable local Canvas destination for an exact binding generation."""
+    with _workspace_write_session() as s:
+        binding = s.get(WorkspaceProviderBinding, binding_id, with_for_update=True)
+        if binding is None:
+            raise KeyError("Workspace provider binding not found")
+        if binding.kind != "container":
+            raise ValueError("only provider containers can own an external overlay anchor")
+        anchor = s.get(WorkspaceExternalOverlayAnchor, binding_id, with_for_update=True)
+        if anchor is None:
+            # A hidden anchor deliberately has no local Workspace parent.  It can only be reached
+            # through the external resource's local-placement capability, never local navigation.
+            container = WorkspaceContainer(name="External overlay", ordinal=0)
+            s.add(container)
+            s.flush()
+            anchor = WorkspaceExternalOverlayAnchor(
+                binding_id=binding.id, container_id=container.id,
+                mount_id=binding.mount_id, resource_id=binding.resource_id,
+            )
+            s.add(anchor)
+            s.flush()
+        else:
+            container = _workspace_container_locked(s, anchor.container_id)
+            if (anchor.mount_id != binding.mount_id or anchor.resource_id != binding.resource_id):
+                raise RuntimeError("external Workspace overlay anchor identity no longer matches its binding")
+        return _workspace_external_overlay_anchor_doc(anchor, container)
 
 
 def _workspace_provider_initial_binding_id(
@@ -5076,6 +5294,12 @@ def _workspace_canvas_exists_clause():
     return exists(select(Canvas.id).where(Canvas.id == WorkspacePlacement.target_id))
 
 
+def _workspace_local_placement_visible_clause():
+    """Keep hidden external anchors and all of their placements out of ordinary local navigation."""
+    return ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+        WorkspaceExternalOverlayAnchor.container_id == WorkspacePlacement.container_id))
+
+
 def _workspace_dataset_view_visible_clause(uid: str):
     return exists(select(DatasetView.id).where(
         DatasetView.id == WorkspacePlacement.target_id,
@@ -5093,10 +5317,14 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         container = s.get(WorkspaceContainer, container_id)
         if container is None:
             raise KeyError(f"workspace container '{container_id}' not found")
+        if _workspace_external_overlay_anchor_for_container(s, container_id) is not None:
+            raise KeyError(f"workspace container '{container_id}' not found")
         container_after = _workspace_after(
             WorkspaceContainer.ordinal, WorkspaceContainer.name, WorkspaceContainer.id, 0, decoded)
         containers = list(s.scalars(select(WorkspaceContainer).where(
             WorkspaceContainer.parent_id == container_id,
+            ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+                WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
             *([container_after] if container_after is not None else []),
         ).order_by(
             WorkspaceContainer.ordinal,
@@ -5115,6 +5343,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            _workspace_local_placement_visible_clause(),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5124,6 +5353,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "dataset",
+            _workspace_local_placement_visible_clause(),
             *([dataset_after] if dataset_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5134,6 +5364,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "dataset_view",
             _workspace_dataset_view_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             *([view_after] if view_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5183,6 +5414,8 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             WorkspaceContainer.name, WorkspaceContainer.id, 0, decoded)
         containers = list(s.scalars(select(WorkspaceContainer).where(
             _workspace_search_matches(WorkspaceContainer.name, tokens),
+            ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+                WorkspaceExternalOverlayAnchor.container_id == WorkspaceContainer.id)),
             *([container_after] if container_after is not None else []),
         ).order_by(
             _workspace_name_order(func.lower(WorkspaceContainer.name)),
@@ -5198,6 +5431,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "canvas",
             _workspace_canvas_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
@@ -5206,6 +5440,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         ).limit(limit + 1)))
         dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "dataset",
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([dataset_after] if dataset_after is not None else []),
         ).order_by(
@@ -5215,6 +5450,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         view_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "dataset_view",
             _workspace_dataset_view_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([view_after] if view_after is not None else []),
         ).order_by(
@@ -5284,12 +5520,13 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
     with session() as s:
         if kind == "container":
             row = s.get(WorkspaceContainer, identity)
-            if row is None:
+            if row is None or _workspace_external_overlay_anchor_for_container(s, identity) is not None:
                 raise KeyError(f"Workspace resource '{resource_id}' not found")
             return {"resource": _workspace_container_resource(row),
                     "ancestors": _workspace_ancestors(s, row.parent_id) if row.parent_id else []}
         placement = s.scalar(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity))
+            WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity,
+            _workspace_local_placement_visible_clause()))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "canvas" and s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
