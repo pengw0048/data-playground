@@ -95,6 +95,8 @@ def test_editor_preflights_without_side_effect_then_submits_and_replays(tmp_path
         assert session.scalar(select(func.count()).select_from(metadb.SparseOutput)) == 0
 
     submitted = api.submit(request, "editor")
+    durable = metadb.durable_task(submitted.task_id, include_admission=False)
+    assert durable is not None and durable["target_node_id"] == "write"
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         current = api.status(submitted.task_id, "editor")
@@ -103,7 +105,17 @@ def test_editor_preflights_without_side_effect_then_submits_and_replays(tmp_path
         time.sleep(0.02)
     assert current.status == "done"
     assert "sparseOutputId" not in current.model_dump_json(by_alias=True)
-    assert api.submit(request, "editor").task_id == submitted.task_id
+    durable = metadb.durable_task(submitted.task_id, include_admission=False)
+    assert durable is not None
+    assert durable["status_doc"]["target_node_id"] == "write"
+    assert durable["status_doc"]["outputs"][0]["node_id"] == "write"
+    job = next(item for item in metadb.list_workspace_runs(
+        "editor", run_id=submitted.task_id)["items"] if item["taskId"] == submitted.task_id)
+    assert job["outputs"][0]["node_id"] == "write"
+    replayed = api.submit(request, "editor")
+    assert replayed.task_id == submitted.task_id
+    durable = metadb.durable_task(replayed.task_id, include_admission=False)
+    assert durable is not None and durable["target_node_id"] == "write"
 
     presentation_replay = request.model_copy(deep=True)
     presentation_replay.graph.version = 99
@@ -142,6 +154,12 @@ def test_editor_preflights_without_side_effect_then_submits_and_replays(tmp_path
     with pytest.raises(APIError) as write_error:
         api.submit(changed_write, "editor")
     assert write_error.value.status_code == 409
+    changed_target = request.model_copy(deep=True)
+    changed_target.graph.nodes[2].id = "other-write"
+    changed_target.graph.edges[1].target = "other-write"
+    with pytest.raises(APIError) as target_error:
+        api.submit(changed_target, "editor")
+    assert target_error.value.status_code == 409
 
 
 def test_add_mapping_preflights_and_publishes_full_schema(tmp_path, monkeypatch):
@@ -355,6 +373,63 @@ def test_owner_and_editor_can_cancel_and_idempotently_retry_their_own_merge_task
     with metadb.session() as session:
         assert session.scalar(select(func.count()).select_from(metadb.DurableTaskAttempt).where(
             metadb.DurableTaskAttempt.task_id == editor_task.task_id)) == 2
+
+
+def test_merge_task_observation_is_shared_but_actions_remain_with_original_owner(tmp_path, monkeypatch):
+    request = _request(tmp_path, monkeypatch)
+    with metadb.session() as session:
+        session.add_all((
+            metadb.User(id="viewer", name="Viewer"),
+            metadb.User(id="stranger", name="Stranger"),
+            metadb.CanvasShare(canvas_id="canvas", user_id="viewer", role="viewer"),
+        ))
+
+    task = _queued(request, "editor", monkeypatch)
+    assert metadb.durable_task(task.task_id, include_admission=False)["target_node_id"] == "write"
+
+    owner_view = api.status(task.task_id, "owner")
+    editor_view = api.status(task.task_id, "editor")
+    viewer_view = api.status(task.task_id, "viewer")
+    assert owner_view.task_id == editor_view.task_id == viewer_view.task_id == task.task_id
+    assert (editor_view.can_cancel, editor_view.can_retry) == (True, False)
+    assert (owner_view.can_cancel, owner_view.can_retry) == (False, False)
+    assert (viewer_view.can_cancel, viewer_view.can_retry) == (False, False)
+    assert editor_view.merge_columns is not None
+    assert owner_view.merge_columns is not None
+    assert viewer_view.merge_columns is not None
+    assert editor_view.merge_columns.can_cancel is True
+    assert owner_view.merge_columns.can_cancel is False
+    assert viewer_view.merge_columns.can_cancel is False
+
+    for uid, expected in (("editor", True), ("owner", False), ("viewer", False)):
+        job = next(item for item in metadb.list_workspace_runs(uid, run_id=task.task_id)["items"]
+                   if item["taskId"] == task.task_id)
+        assert job["targetNodeId"] == "write"
+        assert job["canCancel"] is expected and job["canRetry"] is False
+        assert job["mergeColumns"]["canCancel"] is expected
+        assert job["mergeColumns"]["canRetry"] is False
+
+    for uid in ("owner", "viewer", "stranger"):
+        with pytest.raises(APIError) as cancel_error:
+            api.cancel(task.task_id, uid)
+        assert cancel_error.value.status_code == 404
+    _cancelled(task.task_id)
+    for uid in ("owner", "viewer", "stranger"):
+        with pytest.raises(APIError) as retry_error:
+            api.retry(task.task_id, api._RetryRequest(retry_request_id=f"{uid}-retry"), uid)
+        assert retry_error.value.status_code == 404
+    assert api.retry(task.task_id, api._RetryRequest(retry_request_id="editor-retry"), "editor").task_id == task.task_id
+
+    with metadb.session() as session:
+        share = session.scalar(select(metadb.CanvasShare).where(
+            metadb.CanvasShare.canvas_id == "canvas", metadb.CanvasShare.user_id == "editor"))
+        assert share is not None
+        session.delete(share)
+    for uid in ("editor", "stranger"):
+        with pytest.raises(APIError) as status_error:
+            api.status(task.task_id, uid)
+        assert status_error.value.status_code == 404
+        assert not metadb.list_workspace_runs(uid, run_id=task.task_id)["items"]
 
 
 def test_revoked_editor_cannot_cancel_or_retry_and_leaves_task_state_unchanged(tmp_path, monkeypatch):

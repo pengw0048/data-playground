@@ -5935,7 +5935,7 @@ def _linear_checkpoint_admission_doc(
 
 
 def submit_merge_columns_task(
-        *, uid: str, canvas_id: str, submission_id: str, intent: object,
+        *, uid: str, canvas_id: str, submission_id: str, target_node_id: str, intent: object,
         sparse_owner_id: str | None = None, request_sha256: str | None = None,
         max_attempts: int = 3) -> tuple[dict, bool]:
     """Atomically admit one frozen certified SparseOutput merge and its checkpoint owner."""
@@ -5946,6 +5946,10 @@ def submit_merge_columns_task(
     frozen = MergeColumnsIntentV1.model_validate(intent)
     normalized_submission = str(submission_id).lower()
     _linear_checkpoint_identity(normalized_submission, "submission", 256)
+    target_node_id = str(target_node_id)
+    if (not target_node_id or len(target_node_id) > 256
+            or target_node_id != target_node_id.strip() or "\x00" in target_node_id):
+        raise ValueError("merge columns target node is invalid")
     if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 3:
         raise ValueError("merge columns task max attempts is invalid")
     intent_doc = json.dumps(
@@ -5991,7 +5995,7 @@ def submit_merge_columns_task(
                 raise DurableTaskSubmissionConflict("merge columns durable admission is incomplete")
             if (task.task_kind != "merge_columns_write" or task.owner_id != uid
                     or task.canvas_id != canvas_id or task.submission_id != normalized_submission
-                    or task.intent_sha256 != intent_sha or task.target_node_id != "merge-columns"
+                    or task.intent_sha256 != intent_sha or task.target_node_id != target_node_id
                     or checkpoint.checkpoint_id != checkpoint_id
                     or checkpoint.task_intent_sha256 != intent_sha
                     or checkpoint.graph_prefix_sha256 != merge_sha
@@ -6026,12 +6030,12 @@ def submit_merge_columns_task(
         now = _durable_task_db_now(s)
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id, submission_id=normalized_submission,
-            intent_sha256=intent_sha, target_node_id="merge-columns",
+            intent_sha256=intent_sha, target_node_id=target_node_id,
             task_kind="merge_columns_write", backend_kind="local", graph_doc=None,
             input_manifest=(json.dumps({"requestSha256": request_sha256})
                             if request_sha256 is not None else None),
             write_intent=json.dumps(write, sort_keys=True, separators=(",", ":")),
-            status="queued", status_doc=json.dumps(_task_status_doc(task_id, "merge-columns")),
+            status="queued", status_doc=json.dumps(_task_status_doc(task_id, target_node_id)),
             max_attempts=max_attempts, created_at=now, updated_at=now)
         attempt = DurableTaskAttempt(
             id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
@@ -9109,12 +9113,21 @@ def _sanitized_merge_columns_jobs_view(
 
 
 def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
-    """Return one owner-scoped sanitized merge Task view without paging through Jobs."""
+    """Return one sanitized merge Task view to a current Canvas collaborator."""
     with session() as s:
         task = s.get(DurableTask, str(task_id))
-        if task is None or task.task_kind != "merge_columns_write" or task.owner_id != str(uid):
+        if task is None or task.task_kind != "merge_columns_write":
             return None
-        role = canvas_role(task.canvas_id, str(uid))
+        canvas = s.get(Canvas, task.canvas_id)
+        if canvas is None:
+            return None
+        share_role = None
+        if canvas.owner_id != str(uid):
+            share_role = s.scalar(select(CanvasShare.role).where(
+                CanvasShare.canvas_id == task.canvas_id,
+                CanvasShare.user_id == str(uid),
+            ))
+        role = _effective_canvas_role(canvas, str(uid), share_role)
         if role is None:
             return None
         task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
@@ -9122,7 +9135,10 @@ def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
         latest = attempts[-1] if attempts else {
             "id": "missing", "attempt_number": task.retry_count + 1,
         }
-        can_mutate = role in ("owner", "editor")
+        # Observation follows the Canvas read boundary.  Merge mutation deliberately remains
+        # non-transferable: a collaborator can inspect the certified work but cannot take over
+        # its original owner's submission or lifecycle.
+        can_mutate = task.owner_id == str(uid) and role in ("owner", "editor")
         can_retry = (can_mutate and task.status in ("failed", "cancelled")
                      and latest["attempt_number"] < task.max_attempts
                      and task.error != "stale_expected_head")
@@ -9519,6 +9535,10 @@ def list_workspace_runs(
                 SimpleNamespace(owner_id=canvas_owner_id, visibility=canvas_visibility),
                 str(uid), share_roles.get(task.canvas_id))
             can_mutate = role in ("owner", "editor")
+            if task.task_kind == "merge_columns_write":
+                # Keep Jobs action affordances identical to the merge action routes.  Other
+                # durable task kinds retain their established Canvas-role semantics.
+                can_mutate = can_mutate and task.owner_id == str(uid)
             can_retry = (
                 can_mutate and task.status in ("failed", "cancelled")
                 and latest["attempt_number"] < task.max_attempts)
