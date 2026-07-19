@@ -432,7 +432,12 @@ def test_missing_report_owned_revision_hold_fails_closed_and_terminalizes(
         if entrypoint == "read"
         else distribution_reports.claim_distribution_report(task_id, "missing-hold-owner")
     )
-    assert result is None
+    if entrypoint == "read":
+        assert result is not None
+        assert result["task"]["status"] == "failed"
+        assert result["task"]["error"] == "distribution report revision unavailable"
+    else:
+        assert result is None
     with metadb.session() as session:
         task = session.get(metadb.DurableTask, task_id)
         attempt = session.scalar(select(metadb.DurableTaskAttempt).where(
@@ -444,7 +449,77 @@ def test_missing_report_owned_revision_hold_fails_closed_and_terminalizes(
         assert task.status == attempt.status == "failed"
         assert row.report_doc is None and row.completed_at == task.completed_at
         assert inbox is not None
-        assert inbox.diagnostic_code == "distribution_report_snapshot_invalid"
+        assert inbox.diagnostic_code == "distribution_report_revision_unavailable"
+
+
+def test_report_read_truth_after_revision_loss_and_corruption(core_view_factory):
+    active_view = core_view_factory()
+    active, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(active_view))
+    active_report_id = active["report_id"]
+
+    completed_view = core_view_factory()
+    completed, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(completed_view))
+    completed_task_id, completed_report_id = (
+        completed["task"]["id"], completed["report_id"])
+    completed_claim = distribution_reports.claim_distribution_report(
+        completed_task_id, "completed-owner")
+    assert completed_claim is not None
+    completed_attempt_id = completed_claim["task"]["attempts"][-1]["id"]
+    terminal = distribution_reports.complete_distribution_report(
+        task_id=completed_task_id, attempt_id=completed_attempt_id,
+        owner_token="completed-owner", report=_report(completed_claim))
+    assert terminal is not None and terminal["task"]["status"] == "done"
+
+    corrupt_view = core_view_factory()
+    corrupt, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(corrupt_view))
+    corrupt_task_id, corrupt_report_id = corrupt["task"]["id"], corrupt["report_id"]
+    corrupt_claim = distribution_reports.claim_distribution_report(
+        corrupt_task_id, "corrupt-owner")
+    assert corrupt_claim is not None
+    corrupt_attempt_id = corrupt_claim["task"]["attempts"][-1]["id"]
+    assert distribution_reports.complete_distribution_report(
+        task_id=corrupt_task_id, attempt_id=corrupt_attempt_id,
+        owner_token="corrupt-owner", report=_report(corrupt_claim)) is not None
+
+    other = f"report-read-other-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=other, name="Other"))
+        for report_id in (active_report_id, completed_report_id):
+            reference = session.scalar(select(metadb.LocalResultReference).where(
+                metadb.LocalResultReference.owner_kind == "distribution_report",
+                metadb.LocalResultReference.owner_key == report_id))
+            assert reference is not None
+            session.delete(reference)
+        corrupt_row = session.get(metadb.DistributionReportEnvelope, corrupt_task_id)
+        assert corrupt_row is not None
+        corrupt_row.report_doc = "{}"
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        active_response = client.get(f"/api/distribution-reports/{active_report_id}")
+        assert active_response.status_code == 200, active_response.text
+        assert active_response.json()["task"]["status"] == "failed"
+        assert active_response.json()["task"]["error"] == (
+            "distribution report revision unavailable")
+
+        retained_response = client.get(
+            f"/api/distribution-reports/{completed_report_id}")
+        assert retained_response.status_code == 200, retained_response.text
+        assert retained_response.json()["task"]["status"] == "done"
+        assert retained_response.json()["report"]["reportId"] == completed_report_id
+
+        corrupt_response = client.get(f"/api/distribution-reports/{corrupt_report_id}")
+        assert corrupt_response.status_code == 500, corrupt_response.text
+        assert corrupt_response.json() == {
+            "detail": "Retained distribution report state is corrupt",
+            "code": "internal_error",
+            "retryable": False,
+        }
+        assert client.get(
+            f"/api/distribution-reports/{corrupt_report_id}",
+            headers={"X-DP-User": other}).status_code == 404
 
 
 def test_api_computes_closed_bounded_sections_and_replays_submission(
