@@ -16,7 +16,7 @@ test('inspects one exact compound episode with linked truthful timeline states @
   await expect(page.getByTestId('compound-inspector')).toBeVisible()
   await expect(page.getByTestId('compound-revision-identity')).toContainText('revision')
   await expect(page.getByTestId('compound-video')).toBeVisible()
-  await expect(page.getByTestId('nearest-observation')).toContainText('not interpolated')
+  await expect(page.getByTestId('compound-stream-numeric-sensor').getByTestId('nearest-observation')).toContainText('not interpolated')
   await expect(page.getByTestId('coverage-numeric-sensor')).toContainText(/gap 4004 ticks/)
   await expect(page.getByTestId('clock-mapping-numeric-sensor')).toContainText('sensor-device-us → reference-ms (reference reference-ms)')
   await expect(page.getByTestId('clock-mapping-numeric-sensor')).toContainText('scale 1001/1000000 · offset -125')

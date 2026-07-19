@@ -1,6 +1,7 @@
 """Golden and adversarial checks for the private #588 candidate contract."""
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import random
@@ -9,15 +10,7 @@ from dataclasses import replace
 import pyarrow as pa
 import pytest
 
-from hub.compound_datasets import (
-    ClockDescriptor,
-    ObservationIndexDescriptor,
-    ObservationSchemaField,
-    RationalUnit,
-    StreamDescriptor,
-    TabularMemberRef,
-    open_compound_manifest,
-)
+from hub.compound_datasets import open_compound_manifest
 from hub.temporal_resample import (
     INT64_MAX,
     INT64_MIN,
@@ -46,7 +39,7 @@ def _canonical_manifest(manifest, mutate=None):
 
 
 def _fixture_manifest(tmp_path):
-    # This calls the existing #440 writer only; its public fixture is never edited.
+    """Build the canonical public fixture; no test-only target stream is synthesized."""
     from pathlib import Path
     import subprocess
     import sys
@@ -54,25 +47,7 @@ def _fixture_manifest(tmp_path):
     root = Path(__file__).parents[3]
     subprocess.run([sys.executable, "scripts/build_ux_fixtures.py", "--output", str(tmp_path)],
                    cwd=root, check=True)
-    source = open_compound_manifest((tmp_path / "compound" / "manifest.json").read_bytes())
-    target_member = TabularMemberRef("test-target-points", "test.target", "test-target-r1", "b" * 64)
-    target_stream = StreamDescriptor(
-        id="test-target", kind="test-point", observation_schema=(
-            ObservationSchemaField("observation_id", "string", False),
-            ObservationSchemaField("episode_id", "string", False),
-            ObservationSchemaField("reference_tick", "int64", False),
-        ), timing="irregular", nominal_rate=None,
-        clock=ClockDescriptor("reference-ms", "reference", RationalUnit(1, 1000, "second")),
-        units=(), missing_data="not-recorded", provider_coverage=None, transform_chain=(),
-    )
-    index = ObservationIndexDescriptor("observation_id", "episode_id", "reference_tick", None, None, ())
-    bindings = tuple(list(source.bindings) + [
-        replace(item, stream_id="test-target", member_id="test-target-points", observation_index=index)
-        for item in source.bindings if item.stream_id == "numeric-sensor"
-    ])
-    synthetic = replace(source, members=tuple(list(source.members) + [target_member]),
-                        streams=tuple(list(source.streams) + [target_stream]), bindings=bindings)
-    return _canonical_manifest(synthetic)
+    return open_compound_manifest((tmp_path / "compound" / "manifest.json").read_bytes())
 
 
 def _source_type_manifest(manifest, field_type, *, nullable=False):
@@ -88,12 +63,12 @@ def _source_type_manifest(manifest, field_type, *, nullable=False):
 
 def _spec(manifest, *, tolerance=1, candidate_cap=10, output_cap=10):
     source_member = next(item for item in manifest.members if item.id == "sensor-observations")
-    target_member = next(item for item in manifest.members if item.id == "test-target-points")
+    target_member = next(item for item in manifest.members if item.id == "target-observations")
     mapping = next(item for item in manifest.clock_mappings
                    if item.source_clock_id == "sensor-device-us")
     return TemporalResampleSpecV1(
         compound_dataset_id=manifest.ref.dataset_id, compound_revision_id=manifest.ref.revision_id,
-        episode_id="episode-1", source_stream_id="numeric-sensor", target_stream_id="test-target",
+        episode_id="episode-1", source_stream_id="numeric-sensor", target_stream_id="target-observations",
         output_stream_id="derived-resample",
         source_view=DatasetViewIdentity(source_member.dataset_id, source_member.revision_id, "source-view",
                                         "a" * 64, "c" * 64),
@@ -106,7 +81,7 @@ def _spec(manifest, *, tolerance=1, candidate_cap=10, output_cap=10):
 
 
 def _source_points():
-    # Exact #440 source observations; the target timeline below is deliberately test-only.
+    # Small exact-row subset for contract adversarial cases.
     return [
         PointObservation("episode-1-sensor-003", 3_000_000, {"value": 0.375}),
         PointObservation("episode-1-sensor-001", 1_000_000, {"value": 0.125}),
@@ -115,26 +90,42 @@ def _source_points():
 
 
 def _target_points():
-    return [PointObservation("target-gap", 5_000, {}), PointObservation("target-early", 876, {}),
-            PointObservation("target-tie", 1_376, {})]
+    return [PointObservation("episode-1-target-007", 9_999, {}),
+            PointObservation("episode-1-target-001", 876, {}),
+            PointObservation("episode-1-target-002", 1_877, {})]
+
+
+def _fixture_episode_points(tmp_path, episode_id="episode-1"):
+    def rows(member_id, tick_field, value_fields):
+        with (tmp_path / "compound" / f"{member_id}.csv").open(newline="", encoding="utf-8") as source:
+            return [PointObservation(row["observation_id"], int(row[tick_field]), {
+                field: float(row[field]) for field in value_fields
+            }) for row in csv.DictReader(source) if row["episode_id"] == episode_id]
+
+    return (rows("sensor-observations", "device_tick", ("value",)),
+            rows("target-observations", "reference_tick", ()))
 
 
 def test_fixture_source_facts_produce_sorted_nearest_rows_and_null_gap(tmp_path):
     manifest = _fixture_manifest(tmp_path)
-    first = build_resample_candidate(manifest, _spec(manifest, tolerance=500), _source_points(), _target_points())
-    second = build_resample_candidate(manifest, _spec(manifest, tolerance=500),
-                                      list(reversed(_source_points())), list(reversed(_target_points())))
+    source, target = _fixture_episode_points(tmp_path)
+    first = build_resample_candidate(manifest, _spec(manifest), source, target)
+    second = build_resample_candidate(manifest, _spec(manifest), list(reversed(source)), list(reversed(target)))
 
     assert first == second
     assert first.spec.idempotency_digest == second.spec.idempotency_digest
     assert [(row.target_observation_id, row.source_observation_id, row.signed_delta_ticks,
              row.absolute_delta_ticks, dict(row.values)) for row in first.rows] == [
-        ("target-early", "episode-1-sensor-001", 0, 0, {"value": 0.125}),
-        ("target-tie", "episode-1-sensor-001", 500, 500, {"value": 0.125}),
-        ("target-gap", None, None, None, {"value": None}),
+        ("episode-1-target-001", "episode-1-sensor-001", 0, 0, {"value": 0.125}),
+        ("episode-1-target-002", "episode-1-sensor-002", 0, 0, {"value": 0.25}),
+        ("episode-1-target-003", "episode-1-sensor-003", 0, 0, {"value": 0.375}),
+        ("episode-1-target-004", "episode-1-sensor-004", 0, 0, {"value": 0.625}),
+        ("episode-1-target-005", "episode-1-sensor-005", 0, 0, {"value": 0.75}),
+        ("episode-1-target-006", "episode-1-sensor-006", 0, 0, {"value": 0.875}),
+        ("episode-1-target-007", None, None, None, {"value": None}),
     ]
-    assert first.evidence["gapTargetObservationIds"] == ["target-gap"]
-    assert first.evidence["signedDeltaTicks"] == {"count": 2, "minimum": 0, "maximum": 500}
+    assert first.evidence["gapTargetObservationIds"] == ["episode-1-target-007"]
+    assert first.evidence["signedDeltaTicks"] == {"count": 6, "minimum": 0, "maximum": 0}
     assert first.evidence["complete"] is True
 
 

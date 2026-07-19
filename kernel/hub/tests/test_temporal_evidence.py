@@ -154,25 +154,40 @@ def test_interval_evidence_is_clipped_and_nearest_is_half_open_interval_aware():
 def test_fixture_named_mapping_alignment_matches_frozen_ground_truth(fixture_compound):
     from hub.temporal_evidence import _nearest, _normalize_rows
     root, manifest, ground_truth = fixture_compound
-    binding = next(item for item in manifest.bindings
-                   if item.episode_id == "episode-1" and item.stream_id == "numeric-sensor")
-    member = next(item for item in manifest.members if item.id == binding.member_id)
-    index = binding.observation_index
-    assert index is not None
+    source_binding = next(item for item in manifest.bindings
+                          if item.episode_id == "episode-1" and item.stream_id == "numeric-sensor")
+    target_binding = next(item for item in manifest.bindings
+                          if item.episode_id == "episode-1" and item.stream_id == "target-observations")
+    source_member = next(item for item in manifest.members if item.id == source_binding.member_id)
+    target_member = next(item for item in manifest.members if item.id == target_binding.member_id)
+    source_index, target_index = source_binding.observation_index, target_binding.observation_index
+    assert source_index is not None and target_index is not None
     facts, corrupt = [], 0
+    targets = []
     for episode_id in ("episode-1", "episode-2"):
         rows = _FixtureReader(root).read(
-            dataset_id=member.dataset_id, revision_id=member.revision_id,
-            fields=(index.observation_id_field, index.tick_field), stream_id="numeric-sensor",
-            episode_id=episode_id, episode_id_field=index.episode_id_field, tick_field=index.tick_field,
+            dataset_id=source_member.dataset_id, revision_id=source_member.revision_id,
+            fields=(source_index.observation_id_field, source_index.tick_field), stream_id="numeric-sensor",
+            episode_id=episode_id, episode_id_field=source_index.episode_id_field, tick_field=source_index.tick_field,
             start_tick_field=None, end_tick_field=None, source_start=0, source_end=10**12, limit=10_001)
         episode_facts, episode_corrupt = _normalize_rows(
-            rows, index.observation_id_field, index.tick_field, None, None, manifest.clock_mappings[0],
+            rows, source_index.observation_id_field, source_index.tick_field, None, None, manifest.clock_mappings[0],
             EvidenceWindow("reference-ms", 0, 27_001))
         facts.extend(episode_facts)
         corrupt += episode_corrupt
+        target_rows = _FixtureReader(root).read(
+            dataset_id=target_member.dataset_id, revision_id=target_member.revision_id,
+            fields=(target_index.observation_id_field, target_index.tick_field), stream_id="target-observations",
+            episode_id=episode_id, episode_id_field=target_index.episode_id_field, tick_field=target_index.tick_field,
+            start_tick_field=None, end_tick_field=None, source_start=0, source_end=27_001, limit=10_001)
+        episode_targets, target_corrupt = _normalize_rows(
+            target_rows, target_index.observation_id_field, target_index.tick_field, None, None, None,
+            EvidenceWindow("reference-ms", 0, 27_001))
+        targets.extend(episode_targets)
+        corrupt += target_corrupt
     facts.sort(key=lambda item: (item[1], item[2], item[0]))
-    targets = [(f"reference-{tick}", tick, tick) for tick in ground_truth["alignment"]["referenceTicks"]]
+    targets.sort(key=lambda item: (item[1], item[2], item[0]))
+    assert [item[1] for item in targets] == ground_truth["alignment"]["referenceTicks"]
     matched, unmatched_left, unmatched_right, summary, _comparisons = _nearest(facts, targets, 1)
     assert corrupt == 0
     assert (matched, unmatched_left, unmatched_right) == (

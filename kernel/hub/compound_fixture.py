@@ -26,11 +26,12 @@ FIXTURE_URI_PREFIX = "fixture://compound-timeline/"
 MAX_FIXTURE_MEMBER_BYTES = 128 * 1024
 _TARGET = "compound-fixture-v1"
 _SOURCE_DATASET_ID = "fixture-compound-timeline"
-_SOURCE_REVISION_ID = "24fe23dddf87e41016499e356bed5d3c8f00eee7cf0e9edbca86bd352ce0edb0"
-_MEMBERS = ("episodes", "sensor-observations", "interval-annotations", "video-observations")
+_SOURCE_REVISION_ID = "c88b1964fb3f569bb6bdb822853a181ca8cff66a1ba5d3411be7a848f35cd9ae"
+_MEMBERS = ("episodes", "sensor-observations", "target-observations", "interval-annotations", "video-observations")
 _MEMBER_DIGESTS = {
     "episodes": "a651b2ad709d2317a018303341f16dd8a0a47208e3b776774db7b18211d391ee",
     "sensor-observations": "fc2fff3a709949c8e7375cbfd301e47dbc0c862cfd446b09eb07620bbd8540a6",
+    "target-observations": "609d54cce992b0fb38345e8a0384a2cacbc3b8fd039f26c6be739d9b92c91031",
     "interval-annotations": "b6c71de7d85ab28fd796bf579421144ff2bd90c4ad6ee8706ec1b01e319942d4",
     "video-observations": "4e703e9b5c582682bc0ded5a0707c3b4b111eb82827a653441362e4ce27f97ee",
 }
@@ -38,6 +39,7 @@ _FLOWER_BYTES = 554_058
 _FLOWER_SHA256 = "c6f8a348953395598a9a73b9bab1676436410797bce9f398f4be1531d6e76dda"
 _VIEW_SPECS = {
     "numeric-sensor": ("sensor-observations", "device_tick", "sensor-device-us", "0", "27100000", ["value"]),
+    "target-observations": ("target-observations", "reference_tick", "reference-ms", "0", "27001", []),
     "interval-annotation": ("interval-annotations", "start_tick", "reference-ms", "0", "27001", ["end_tick", "fixture_phase"]),
     "video": ("video-observations", "start_tick", "reference-ms", "0", "27001", ["end_tick", "asset_id"]),
 }
