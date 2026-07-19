@@ -959,6 +959,14 @@ class DatasetViewDefinitionV1(Wire):
     semantic_sha256: PlanDigest
     definition_sha256: PlanDigest
 
+    def definition_digest_payload(self) -> dict[str, Any]:
+        """Return the one canonical wire payload covered by definitionSha256."""
+        payload = self.model_dump(by_alias=True, mode="json")
+        payload.pop("definitionSha256")
+        if payload.get("temporalWindow") is None:
+            payload.pop("temporalWindow", None)
+        return payload
+
     @model_validator(mode="after")
     def validate_sampling_evidence(self) -> "DatasetViewDefinitionV1":
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
