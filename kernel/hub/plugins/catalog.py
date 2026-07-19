@@ -613,7 +613,8 @@ class InMemoryCatalog:
 
     def publish_managed_local_write(
             self, intent: WriteIntent, artifact_uri: str, *, total_bytes: int,
-            merge_publication: metadb.MergeColumnsPublicationContext | None = None) -> WriteReceipt:
+            merge_publication: metadb.MergeColumnsPublicationContext | None = None,
+            temporal_publication: metadb.TemporalResamplePublicationContext | None = None) -> WriteReceipt:
         """Publish one admitted local create/replace and return its exact durable receipt."""
         frozen = WriteIntent.model_validate(intent)
         table = self._add(
@@ -635,11 +636,13 @@ class InMemoryCatalog:
                 write_intent=frozen.model_dump(by_alias=True, mode="json"),
                 total_bytes=total_bytes,
                 merge_publication=merge_publication,
+                temporal_publication=temporal_publication,
             )
         except Exception:
             published = metadb.catalog_managed_local_write_receipt(
                 frozen.model_dump(by_alias=True, mode="json"),
-                merge_publication=merge_publication)
+                merge_publication=merge_publication,
+                temporal_publication=temporal_publication)
             if published is None:
                 raise
         receipt = WriteReceipt.model_validate(published)

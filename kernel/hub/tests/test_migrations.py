@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0032_temporal_pub", "0031_durable_merge"),
         ("0031_durable_merge", "0030_merge_columns_pub"),
         ("0030_merge_columns_pub", "0029_sparse_output_mat"),
         ("0029_sparse_output_mat", "0028_sparse_output_admission"),
@@ -86,8 +87,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0031_durable_merge"]
-    assert metadb.expected_schema_head() == "0031_durable_merge"
+    assert scripts.get_heads() == ["0032_temporal_pub"]
+    assert metadb.expected_schema_head() == "0032_temporal_pub"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -97,6 +98,35 @@ def test_migration_revision_ids_fit_alembic_version_num():
         assert len(revision.revision) <= 32, (
             f"revision id {revision.revision!r} exceeds alembic_version.version_num "
             f"varchar(32) and cannot apply on PostgreSQL")
+
+
+def test_temporal_parent_blocks_downgrade_without_partial_schema_loss(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'temporal-downgrade.db'}"):
+        metadb.migrate_db()
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO compound_dataset_revisions "
+                "(owner_id, dataset_id, revision_id, manifest_doc, created_at) VALUES "
+                "('local', 'compound', :revision, '{}', CURRENT_TIMESTAMP)"),
+                {"revision": "a" * 64})
+            connection.execute(sa.text(
+                "INSERT INTO compound_dataset_heads (owner_id, dataset_id, revision_id, updated_at) "
+                "VALUES ('local', 'compound', :revision, CURRENT_TIMESTAMP)"),
+                {"revision": "a" * 64})
+        with metadb.engine().connect() as connection:
+            with pytest.raises(RuntimeError, match="cannot downgrade"):
+                command.downgrade(metadb._alembic_cfg(connection), "0031_durable_merge")
+            tables = set(inspect(connection).get_table_names())
+            assert {"temporal_resample_publications", "compound_dataset_heads",
+                    "compound_dataset_revisions"} <= tables
+            assert connection.execute(sa.text(
+                "SELECT version_num FROM alembic_version")).scalar_one() == "0032_temporal_pub"
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text("DELETE FROM compound_dataset_heads"))
+            connection.execute(sa.text("DELETE FROM compound_dataset_revisions"))
+        with metadb.engine().connect() as connection:
+            command.downgrade(metadb._alembic_cfg(connection), "0031_durable_merge")
+            command.upgrade(metadb._alembic_cfg(connection), "head")
 
 
 def test_committed_migration_revisions_are_immutable():
@@ -192,6 +222,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0031_durable_merge_columns.py": (
             "3262058f6dd3b5091c91d2ad241c9051fb1e7dc9afb9ac35118aaa8577eb2f37"
+        ),
+        "0032_temporal_publication.py": (
+            "be5f868b1ab1936a21773771c18d312cbf2e2f13bc5d94450664dff2f551cbeb"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
