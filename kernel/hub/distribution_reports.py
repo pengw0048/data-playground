@@ -30,6 +30,18 @@ class DistributionReportUnavailable(RuntimeError):
     pass
 
 
+class DistributionReportRevisionUnavailable(DistributionReportUnavailable):
+    """The retained definition is valid, but its exact source hold is unavailable."""
+
+
+def _invalid_snapshot_code(exc: DistributionReportUnavailable) -> str:
+    return (
+        "distribution_report_revision_unavailable"
+        if isinstance(exc, DistributionReportRevisionUnavailable)
+        else "distribution_report_snapshot_invalid"
+    )
+
+
 class DistributionReportIntentV1(BaseModel):
     """One strict owner-scoped request against an exact immutable DatasetView snapshot."""
 
@@ -422,13 +434,14 @@ def _validate_revision_hold(
         or len(references) != 1
         or references[0].uri != revision.artifact_uri
     ):
-        raise DistributionReportUnavailable(
+        raise DistributionReportRevisionUnavailable(
             "distribution report exact revision hold is unavailable")
 
 
 def _envelope_doc(
         s, task: metadb.DurableTask, row: metadb.DistributionReportEnvelope,
         *, attempts: list[metadb.DurableTaskAttempt] | None = None,
+        validate_revision_hold: bool = True,
 ) -> dict:
     try:
         intent = DistributionReportIntentV1.model_validate_json(row.intent_doc)
@@ -481,7 +494,8 @@ def _envelope_doc(
     terminal = task.status in metadb._TERMINAL_RUN
     if terminal != (task.completed_at is not None) or terminal != (row.completed_at is not None):
         raise DistributionReportUnavailable("distribution report terminal facts disagree")
-    _validate_revision_hold(s, row, view)
+    if validate_revision_hold:
+        _validate_revision_hold(s, row, view)
     task_doc = metadb._durable_task_doc(
         s, task, include_admission=False, attempts=attempts)
     if not task_doc["attempts"] or (
@@ -589,6 +603,7 @@ def admit_distribution_report(
 
 
 def distribution_report(*, owner_id: str, task_id: str) -> dict | None:
+    corruption: DistributionReportUnavailable | None = None
     with metadb.session() as s:
         task, attempts, row = _locked_report_rows(s, str(task_id))
         if task is None and row is None:
@@ -597,7 +612,7 @@ def distribution_report(*, owner_id: str, task_id: str) -> dict | None:
             return None
         try:
             return _envelope_doc(s, task, row, attempts=attempts)
-        except DistributionReportUnavailable:
+        except DistributionReportUnavailable as exc:
             if task.status not in metadb._TERMINAL_RUN:
                 attempt = _latest_attempt(s, task.id, attempts)
                 if attempt is None:
@@ -605,15 +620,25 @@ def distribution_report(*, owner_id: str, task_id: str) -> dict | None:
                         "distribution report has no Attempt")
                 _terminal_failure(
                     s, task, attempt, row,
-                    code="distribution_report_snapshot_invalid")
-                return None
-            raise
+                    code=_invalid_snapshot_code(exc))
+            if isinstance(exc, DistributionReportRevisionUnavailable):
+                return _envelope_doc(
+                    s, task, row, attempts=attempts, validate_revision_hold=False)
+            corruption = exc
+    if corruption is not None:
+        raise corruption
+    return None  # pragma: no cover - all in-session branches return or classify the envelope
 
 
 def distribution_report_by_id(*, owner_id: str, report_id: str) -> dict | None:
     with metadb.session() as s:
-        task_id = s.scalar(select(metadb.DistributionReportEnvelope.task_id).where(
-            metadb.DistributionReportEnvelope.report_id == str(report_id)))
+        task_id = s.scalar(select(metadb.DistributionReportEnvelope.task_id).join(
+            metadb.DurableTask,
+            metadb.DurableTask.id == metadb.DistributionReportEnvelope.task_id,
+        ).where(
+            metadb.DistributionReportEnvelope.report_id == str(report_id),
+            metadb.DurableTask.owner_id == str(owner_id),
+        ))
     return (distribution_report(owner_id=owner_id, task_id=str(task_id))
             if task_id is not None else None)
 
@@ -691,11 +716,11 @@ def claim_distribution_report(task_id: str, owner_token: str) -> dict | None:
             raise DistributionReportUnavailable("distribution report has no Attempt")
         try:
             _envelope_doc(s, task, row, attempts=attempts)
-        except DistributionReportUnavailable:
+        except DistributionReportUnavailable as exc:
             if task.status not in metadb._TERMINAL_RUN:
                 _terminal_failure(
                     s, task, attempt, row,
-                    code="distribution_report_snapshot_invalid")
+                    code=_invalid_snapshot_code(exc))
             return None
     if metadb._claim_durable_task_kind(
             str(task_id), str(owner_token), "distribution_report") is None:
@@ -706,7 +731,7 @@ def claim_distribution_report(task_id: str, owner_token: str) -> dict | None:
             raise DistributionReportUnavailable("distribution report disappeared after claim")
         try:
             return _envelope_doc(s, task, row, attempts=attempts)
-        except DistributionReportUnavailable:
+        except DistributionReportUnavailable as exc:
             if task.status not in metadb._TERMINAL_RUN:
                 attempt = _latest_attempt(s, task.id, attempts)
                 if attempt is None:  # pragma: no cover - claim guarantees one Attempt
@@ -714,7 +739,7 @@ def claim_distribution_report(task_id: str, owner_token: str) -> dict | None:
                         "distribution report has no Attempt")
                 _terminal_failure(
                     s, task, attempt, row,
-                    code="distribution_report_snapshot_invalid")
+                    code=_invalid_snapshot_code(exc))
             return None
 
 

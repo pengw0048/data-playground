@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Literal
+from typing import Literal, NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +54,13 @@ def _report_view(uid: str, view_id: str) -> DatasetViewDefinitionV1:
     return view
 
 
+def _raise_corrupt_report(
+        exc: distribution_reports.DistributionReportUnavailable) -> NoReturn:
+    raise APIError(
+        500, "Retained distribution report state is corrupt",
+        code=APIErrorCode.INTERNAL_ERROR, retryable=False) from exc
+
+
 @router.post(
     "/dataset-views/{view_id}/distribution-reports/estimate",
     response_model=DistributionReportEstimateV1,
@@ -87,7 +94,10 @@ def submit_report(
     view = _report_view(uid, view_id)
     submission_id = str(request.submission_id)
     task_id = distribution_reports._task_id(uid, submission_id)
-    prior = distribution_reports.distribution_report(owner_id=uid, task_id=task_id)
+    try:
+        prior = distribution_reports.distribution_report(owner_id=uid, task_id=task_id)
+    except distribution_reports.DistributionReportUnavailable as exc:
+        _raise_corrupt_report(exc)
     if prior is not None:
         if prior["intent"]["datasetViewId"] != view.id:
             raise APIError(
@@ -130,8 +140,11 @@ def get_report(
     report_id: str,
     uid: str = Depends(current_user),
 ) -> distribution_reports.DistributionReportEnvelopeViewV1:
-    envelope = distribution_reports.distribution_report_by_id(
-        owner_id=uid, report_id=report_id)
+    try:
+        envelope = distribution_reports.distribution_report_by_id(
+            owner_id=uid, report_id=report_id)
+    except distribution_reports.DistributionReportUnavailable as exc:
+        _raise_corrupt_report(exc)
     if envelope is None:
         raise HTTPException(404, "Distribution report not found")
     return distribution_reports.public_distribution_report(envelope)
@@ -147,7 +160,10 @@ def list_reports(
     uid: str = Depends(current_user),
 ) -> list[distribution_reports.DistributionReportEnvelopeViewV1]:
     _stored_definition(uid, view_id)
-    items = [distribution_reports.public_distribution_report(item) for item in
-             distribution_reports.list_distribution_reports(
-                 owner_id=uid, dataset_view_id=view_id, limit=limit)]
+    try:
+        items = [distribution_reports.public_distribution_report(item) for item in
+                 distribution_reports.list_distribution_reports(
+                     owner_id=uid, dataset_view_id=view_id, limit=limit)]
+    except distribution_reports.DistributionReportUnavailable as exc:
+        _raise_corrupt_report(exc)
     return items
