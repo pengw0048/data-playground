@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "profile": "sqlite-local-managed",
+  "fixtures": {
+    "full_width_add_replace": {
+      "identity_columns": ["id"],
+      "base": {
+        "rows": 3,
+        "columns": ["id", "untouched_text", "untouched_numeric", "replace_me"],
+        "sha256": "c42744b916ec3963ed30a3ba0b7282f9d005c8a9d959db4cf927d2fc5edd143e"
+      },
+      "sidecar": {
+        "rows": 3,
+        "columns": ["id", "replacement", "addition"],
+        "sha256": "8523ef43472e75b3ad764b684321e9a21c3b37961c062bd966fff410ad4e0323"
+      },
+      "final": {
+        "rows": 3,
+        "columns": ["id", "untouched_text", "untouched_numeric", "replace_me", "added_numeric"],
+        "sha256": "d479d0a323b865ca47c82383d3050990fa57370fcb31f10fdcfcaac7fa580373"
+      }
+    }
+  },
+  "checksum_encoding": "sha256 of canonical JSON table.to_pydict(), sorted keys and compact separators",
+  "sanitization": "Logical fixture values and counts only; no local paths, raw storage keys, tokens, or artifact URIs."
+}
