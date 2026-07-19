@@ -84,7 +84,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
   const mergeJob = {
     id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
-    canvasId: 'canvas-merge', canvasName: 'Column enrichment', targetNodeId: 'merge-columns',
+    canvasId: 'canvas-merge', canvasName: 'Column enrichment', targetNodeId: 'write',
     nodeLabel: 'Write enrichment', backend: 'local', placement: 'local', attempt: 'merge-task-1',
     rows: null, ms: 20, outputs: [], taskAttempts: [], canRetry: false, canCancel: false,
     mergeColumns: { phase: 'done', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-base', candidate: 'committed', reused: false, candidateRows: 2, candidateBytes: 120, canRetry: false, canCancel: false },

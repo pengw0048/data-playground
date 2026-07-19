@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, toMergeColumnsGraph } from '../api/client'
+import { api, KernelError, toMergeColumnsGraph } from '../api/client'
 import { roleCanEdit, useStore } from '../store/graph'
 import type { DatasetRevisionDetail, MergeColumnRule, MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, WriteReceipt } from '../types/api'
 import type { NodeConfig } from '../types/graph'
@@ -41,6 +41,12 @@ function cleanError(caught: unknown): string {
   const message = caught instanceof Error ? caught.message : String(caught)
   // API diagnostics are already sanitized.  Do not decorate them with request or storage detail.
   return message || 'Column merge could not be admitted.'
+}
+
+function submissionDefinitelyRejected(caught: unknown): boolean {
+  // A normal 4xx response proves that this POST did not create the requested Task. Network errors
+  // and 5xx responses do not: the server may have committed before the response was lost.
+  return caught instanceof KernelError && caught.status >= 400 && caught.status < 500
 }
 
 function phaseLabel(task?: MergeColumnsTask | null): string {
@@ -119,7 +125,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
   const [task, setTask] = useState<MergeColumnsTask | null>(null)
   const [receipt, setReceipt] = useState<WriteReceipt | null>(null)
   const [error, setError] = useState('')
-  const [busy, setBusy] = useState<'preflight' | 'submit' | 'cancel' | 'retry' | null>(null)
+  const [busy, setBusy] = useState<'preflight' | 'submit' | 'cancel' | 'retry' | 'retarget' | null>(null)
   const actionGeneration = useRef(0)
   const taskGeneration = useRef(0)
   const actionBusy = useRef(false)
@@ -145,7 +151,8 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     const currentSemanticKey = semanticKey(candidate)
     // A response-loss retry keeps precisely the same frozen consumer meaning and submission id.
     // Any Source/Select/Write or merge-rule change gets a new id before it reaches the API.
-    if (config.submissionId && config.semanticKey === currentSemanticKey) return config
+    if (config.submissionState === 'response_unknown'
+        || config.submissionId && config.semanticKey === currentSemanticKey) return config
     const next = {
       ...config,
       submissionId: newSubmissionId(),
@@ -178,6 +185,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     try {
       const result = await api.mergeColumnsTask(taskId)
       if (sequence !== taskGeneration.current || actionBusy.current) return
+      setError('')
       setTask(result)
       if (result.status === 'done') {
         // Dedicated task status intentionally excludes receipt.  The existing, authorized Jobs
@@ -226,7 +234,15 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
       if (sequence !== actionGeneration.current) return
       setTask(result)
       persist({ ...next, taskId: result.taskId, submissionState: undefined })
-    } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
+    } catch (caught) {
+      if (sequence === actionGeneration.current) {
+        if (submissionDefinitelyRejected(caught)) {
+          persist({ ...next, submissionState: undefined })
+          setPreflight(null); setPreflightKey(null)
+        }
+        setError(cleanError(caught))
+      }
+    } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const recover = async () => {
     const request = requestFor(config)
@@ -241,7 +257,15 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
       if (sequence !== actionGeneration.current) return
       setTask(result)
       persist({ ...config, taskId: result.taskId, submissionState: undefined })
-    } catch (caught) { if (sequence === actionGeneration.current) setError(cleanError(caught)) } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
+    } catch (caught) {
+      if (sequence === actionGeneration.current) {
+        if (submissionDefinitelyRejected(caught)) {
+          persist({ ...config, submissionState: undefined })
+          setPreflight(null); setPreflightKey(null)
+        }
+        setError(cleanError(caught))
+      }
+    } finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const cancel = async () => {
     if (!config.taskId) return
@@ -277,7 +301,7 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     const sequence = ++actionGeneration.current
     taskGeneration.current += 1
     actionBusy.current = true
-    setBusy('preflight'); setError('')
+    setBusy('retarget'); setError('')
     try {
       // This is deliberately user-triggered.  RevisionControl alone changes only datasetRef; a
       // managed-local exact Source also needs the catalog’s current artifact URI to become an
@@ -296,6 +320,9 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
     finally { if (sequence === actionGeneration.current) { actionBusy.current = false; setBusy(null) } }
   }
   const changed = (next: MergeColumnsConfig) => {
+    // Every mounted surface observes this persisted fence. Do not let another Inspector/Run panel
+    // abandon an in-flight submission whose response may still establish a durable Task.
+    if (actionBusy.current || config.submissionState === 'response_unknown') return
     actionGeneration.current += 1
     taskGeneration.current += 1
     // Changed intent cannot replay a prior submission.  A response-loss retry is the only path
@@ -316,42 +343,59 @@ export function MergeColumnsControl({ nodeId, compact = false }: { nodeId: strin
   const addRule = () => changed({ ...config, rules: [...(config.rules ?? []), { source: '', target: '', mode: 'add' }] })
   const removeRule = (index: number) => changed({ ...config, rules: (config.rules ?? []).filter((_, item) => item !== index) })
   const taskTerminal = task && ['done', 'failed', 'cancelled'].includes(task.status)
+  // The durable diagnostic is authoritative. The current #583 preflight contract has no
+  // operation-specific code, so recognize only its exact public head-mismatch detail; never infer
+  // a destination move from an unrelated message that merely contains "stale".
   const staleHead = task?.mergeColumns?.diagnosticCode === 'stale_expected_head'
-    || error.toLowerCase().includes('destination head') || error.toLowerCase().includes('stale')
-  const recoveryAvailable = !task && config.submissionState === 'response_unknown'
+    || error === 'merge-columns destination head must equal the exact Source revision'
+  const responseUnknown = !task && config.submissionState === 'response_unknown'
+  const recoveryAvailable = responseUnknown
     && !!config.submissionId && config.semanticKey === currentSemanticKey
+  const trackedTaskPending = !!config.taskId && !task
+  const intentLocked = (busy !== null && busy !== 'preflight') || responseUnknown || trackedTaskPending
+    || (!!task && !taskTerminal)
 
   if (!node) return null
   return <div aria-label="Certified column merge" className={compact ? 'mt-2 text-[10.5px]' : 'mt-3 rounded-md border border-border bg-muted/30 p-2'}>
     {!compact && <div className="font-semibold text-[11px] text-foreground">Add or replace columns</div>}
     {!compact && <div className="mt-0.5 text-[10.5px] leading-snug text-muted-foreground">Exact local Source → Select → Write only. Preflight proves identity coverage and the current head.</div>}
     {!compact && <label className="mt-2 block text-[10.5px] text-muted-foreground">Identity columns
-      <input aria-label="Merge identity columns" value={(config.identityColumns ?? []).join(', ')} disabled={!canEdit || !!task && !taskTerminal}
+      <input aria-label="Merge identity columns" value={(config.identityColumns ?? []).join(', ')} disabled={!canEdit || intentLocked}
         onChange={(event) => changeIdentities(event.target.value)} placeholder="id, frame_id" className="mt-1 h-7 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" />
     </label>}
     {!compact && <div className="mt-2 space-y-1">
       <div className="text-[10.5px] text-muted-foreground">Selected payload → destination column</div>
       {(config.rules ?? []).map((rule, index) => <div key={index} className="grid grid-cols-[1fr_74px_1fr_24px] gap-1">
-        <input aria-label={`Merge source column ${index + 1}`} value={rule.source} disabled={!canEdit || !!task && !taskTerminal} onChange={(event) => changeRule(index, { source: event.target.value })} placeholder="source" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" />
-        <select aria-label={`Merge mode ${index + 1}`} value={rule.mode} disabled={!canEdit || !!task && !taskTerminal} onChange={(event) => changeRule(index, { mode: event.target.value as MergeColumnRule['mode'] })} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select>
-        <input aria-label={`Merge target column ${index + 1}`} value={rule.target} disabled={!canEdit || !!task && !taskTerminal} onChange={(event) => changeRule(index, { target: event.target.value })} placeholder="target" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" />
-        <button aria-label={`Remove merge rule ${index + 1}`} disabled={!canEdit || !!task && !taskTerminal} onClick={() => removeRule(index)} className="text-muted-foreground hover:text-destructive">×</button>
+        <input aria-label={`Merge source column ${index + 1}`} value={rule.source} disabled={!canEdit || intentLocked} onChange={(event) => changeRule(index, { source: event.target.value })} placeholder="source" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" />
+        <select aria-label={`Merge mode ${index + 1}`} value={rule.mode} disabled={!canEdit || intentLocked} onChange={(event) => changeRule(index, { mode: event.target.value as MergeColumnRule['mode'] })} className="h-7 rounded border border-border bg-background px-1 text-[10px]"><option value="add">add</option><option value="replace">replace</option></select>
+        <input aria-label={`Merge target column ${index + 1}`} value={rule.target} disabled={!canEdit || intentLocked} onChange={(event) => changeRule(index, { target: event.target.value })} placeholder="target" className="h-7 min-w-0 rounded border border-border bg-background px-1.5 text-[10.5px]" />
+        <button aria-label={`Remove merge rule ${index + 1}`} disabled={!canEdit || intentLocked} onClick={() => removeRule(index)} className="text-muted-foreground hover:text-destructive">×</button>
       </div>)}
-      <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={addRule} disabled={!canEdit || !!task && !taskTerminal}>Add mapping</Button>
+      <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={addRule} disabled={!canEdit || intentLocked}>Add mapping</Button>
     </div>}
     {preflight && <PreflightSummary value={preflight} />}
     {task && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
       <div className="font-semibold text-foreground">{phaseLabel(task)}</div>
       {task.mergeColumns && <div className="mt-0.5">Candidate {task.mergeColumns.candidate}{task.mergeColumns.reused ? ' · reused' : ''}{task.mergeColumns.candidateRows != null ? ` · ${countLabel(task.mergeColumns.candidateRows)} rows` : ''}</div>}
       {!compact && <div className="mt-1 flex gap-1"><Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: task.taskId }).toString())}>Open in Jobs</Button>
-        {task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={busy !== null}>Cancel</Button>}
-        {task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={busy !== null}>Retry</Button>}</div>}
+        {task.canCancel && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void cancel()} disabled={!canEdit || busy !== null}>Cancel</Button>}
+        {task.canRetry && <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => void retry()} disabled={!canEdit || busy !== null}>Retry</Button>}</div>}
     </div>}
     {receipt && <ExactReceipt receipt={receipt} />}
+    {trackedTaskPending && <div className="mt-2 rounded border border-border bg-background p-2 text-[10.5px] text-muted-foreground">
+      <div className="font-semibold text-foreground">Tracked durable Task</div>
+      <div className="mt-0.5">Its current state is loading or temporarily unavailable. This is not treated as a new admission.</div>
+      <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery(new URLSearchParams({ run: config.taskId! }).toString())}>Open in Jobs</Button>
+    </div>}
+    {responseUnknown && !recoveryAvailable && <div className="mt-2 rounded border border-amber-500/30 bg-amber-500/5 p-2 text-[10.5px] text-muted-foreground">
+      <div className="font-semibold text-foreground">Previous submission outcome is unresolved</div>
+      <div className="mt-0.5">The graph changed after submission. A second admission is blocked; undo those edits to recover the same submission, or inspect Jobs for its durable outcome.</div>
+      <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[10px]" onClick={() => setJobsQuery('')}>Open Jobs</Button>
+    </div>}
     {error && <div role="alert" className="mt-2 text-[10.5px] leading-snug text-destructive">{error}</div>}
     {!compact && <div className="mt-2 flex gap-1">
-      {!task && !recoveryAvailable && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null}>{busy === 'preflight' ? 'Checking…' : 'Check eligibility'}</Button>}
-      {!task && !recoveryAvailable && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Run column merge'}</Button>}
+      {!task && !config.taskId && !responseUnknown && <Button size="sm" variant="outline" className="h-7 flex-1 text-[10.5px]" onClick={() => void check()} disabled={!canEdit || busy !== null}>{busy === 'preflight' ? 'Checking…' : 'Check eligibility'}</Button>}
+      {!task && !config.taskId && !responseUnknown && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void submit()} disabled={!canEdit || busy !== null || preflight?.eligible !== true || preflightKey !== currentRequestKey}>{busy === 'submit' ? 'Submitting…' : 'Run column merge'}</Button>}
       {recoveryAvailable && <Button size="sm" className="h-7 flex-1 text-[10.5px]" onClick={() => void recover()} disabled={!canEdit || busy !== null}>{busy === 'submit' ? 'Recovering…' : 'Recover previous submission'}</Button>}
       {taskTerminal && <Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Start new admission</Button>}
       {staleHead && <div className="flex flex-col gap-1"><span className="text-[10px] text-muted-foreground">The destination moved. Nothing has been retargeted. Choose one of the explicit actions below, then check again; this never rebases automatically.</span><div className="flex gap-1"><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={() => void useCurrentHead()} disabled={!canEdit || busy !== null}>Use current head and recompute</Button><Button size="sm" variant="outline" className="h-7 text-[10.5px]" onClick={reAdmit} disabled={!canEdit || busy !== null}>Reset for a new admission</Button></div></div>}

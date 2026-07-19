@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit,
+  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -107,6 +107,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
+  const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, nodeId))
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
@@ -191,7 +192,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       </EditOnly>
 
       {/* a write node's output destination lives here in the panel, not cluttering the card */}
-      {kind === 'write' && <EditOnly enabled={canEdit}><WriteDestination nodeId={nodeId} /></EditOnly>}
+      {kind === 'write' && <>
+        <EditOnly enabled={canEdit}><WriteDestination nodeId={nodeId} /></EditOnly>
+        {/* Observation and exact navigation remain available to viewers. MergeColumnsControl owns
+            its own edit/action guards; wrapping it in the destination fieldset would also disable
+            the read-only Jobs and receipt links. */}
+        <MergeColumnsControl nodeId={nodeId} />
+      </>}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
       {codeParams.map((p) => {
@@ -265,7 +272,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredMerge ? 'Review column merge' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />
@@ -399,7 +406,6 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
           {receipt.publication?.backendVersion && <div className="mt-0.5">backend {receipt.publication.backendVersion}</div>}
         </div>
       )}
-      <MergeColumnsControl nodeId={nodeId} />
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />

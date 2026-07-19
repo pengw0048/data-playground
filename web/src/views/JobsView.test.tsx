@@ -290,6 +290,19 @@ describe('JobsView', () => {
     expect(mocks.cancelRun).not.toHaveBeenCalledWith('merge-1')
   })
 
+  it('routes a stale merge Task back to its real Write node for explicit re-admission', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'merge-stale', taskId: 'merge-stale', targetNodeId: 'write-merge', status: 'failed',
+      error: 'stale_expected_head', canCancel: false, canRetry: false,
+      mergeColumns: { phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: false, canRetry: false, canCancel: false, diagnosticCode: 'stale_expected_head' },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-stale in Alpha research', expanded: false }))
+
+    expect(screen.getByRole('link', { name: 'Re-admit in Canvas' })).toHaveAttribute('href', '#/canvas/canvas-1?node=write-merge')
+    expect(screen.queryByRole('link', { name: 'Open node' })).not.toBeInTheDocument()
+  })
+
   it('keeps a compacted exact merge receipt unavailable instead of opening latest', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'merge-done', taskId: 'merge-done', status: 'done', error: null,

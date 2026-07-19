@@ -19,9 +19,13 @@ vi.mock('../api/client', () => ({
     cancelMergeColumnsTask: mocks.cancel, retryMergeColumnsTask: mocks.retry,
   },
   toMergeColumnsGraph: (doc: any, writeId: string) => ({ id: doc.id, version: doc.version, requirements: [], parameters: [], nodes: doc.nodes.filter((node: any) => ['source', 'select', writeId].includes(node.id)), edges: doc.edges }),
-  KernelError: class KernelError extends Error {},
+  KernelError: class KernelError extends Error {
+    status: number
+    constructor(status: number, message: string) { super(message); this.status = status }
+  },
 }))
 
+import { KernelError } from '../api/client'
 import { MergeColumnsControl } from './MergeColumnsControl'
 
 const preflight = {
@@ -73,7 +77,7 @@ describe('MergeColumnsControl', () => {
     expect(value.taskId).toBeUndefined()
   })
 
-  it('rotates the id when the Source exact revision changes, but keeps it for response-loss replay', async () => {
+  it('blocks a second admission after response loss until the same semantic request can be recovered', async () => {
     const view = render(<MergeColumnsControl nodeId="write" />)
     fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
     await screen.findByText('Eligible exact merge')
@@ -83,12 +87,19 @@ describe('MergeColumnsControl', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     await waitFor(() => expect(mocks.submit).toHaveBeenCalled())
     expect(mocks.submit.mock.calls[0][0].submissionId).toBe(first)
-    // A user-selected new exact Source revision is a new admission, never a replay of prior work.
+    // A changed graph must not rotate the id and admit new work while the old POST may have committed.
     mocks.state.doc.nodes.find((node: any) => node.id === 'source').data.config.datasetRef.revisionId = 'rev-2'
     view.rerender(<MergeColumnsControl nodeId="write" />)
-    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
-    await waitFor(() => expect(mocks.preflight).toHaveBeenCalledTimes(2))
-    expect(mocks.preflight.mock.calls[1][0].submissionId).not.toBe(first)
+    expect(screen.getByText('Previous submission outcome is unresolved')).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Check eligibility' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run column merge' })).not.toBeInTheDocument()
+    expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionId).toBe(first)
+
+    // Undoing the semantic edit restores the only safe replay path and does not re-preflight.
+    mocks.state.doc.nodes.find((node: any) => node.id === 'source').data.config.datasetRef.revisionId = 'rev-1'
+    view.rerender(<MergeColumnsControl nodeId="write" />)
+    expect(screen.getByRole('button', { name: 'Recover previous submission' })).toBeVisible()
+    expect(mocks.preflight).toHaveBeenCalledTimes(1)
   })
 
   it('fences an old preflight response after an edit and explains stale heads without auto-rebase', async () => {
@@ -100,7 +111,7 @@ describe('MergeColumnsControl', () => {
     resolve?.(preflight)
     await waitFor(() => expect(screen.queryByText('Eligible exact merge')).not.toBeInTheDocument())
 
-    mocks.preflight.mockRejectedValueOnce(new Error('destination head must equal the exact Source revision'))
+    mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
     fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
     expect(await screen.findByText(/Nothing has been retargeted/)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Reset for a new admission' })).toBeVisible()
@@ -109,7 +120,7 @@ describe('MergeColumnsControl', () => {
   })
 
   it('retargets Source uri and exact revision only after the explicit current-head action', async () => {
-    mocks.preflight.mockRejectedValueOnce(new Error('destination head must equal the exact Source revision'))
+    mocks.preflight.mockRejectedValueOnce(new Error('merge-columns destination head must equal the exact Source revision'))
     render(<MergeColumnsControl nodeId="write" />)
     fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
     await screen.findByText(/Nothing has been retargeted/)
@@ -122,16 +133,54 @@ describe('MergeColumnsControl', () => {
     expect(mocks.state.updateConfig).toHaveBeenCalledWith('write', expect.objectContaining({ mergeColumns: expect.objectContaining({ taskId: undefined }) }))
   })
 
-  it('fences a late submit response after a config edit', async () => {
+  it('does not infer a moved destination from unrelated stale error prose', async () => {
+    mocks.preflight.mockRejectedValueOnce(new Error('source metadata cache is stale'))
+    render(<MergeColumnsControl nodeId="write" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('source metadata cache is stale')
+    expect(screen.queryByRole('button', { name: 'Use current head and recompute' })).not.toBeInTheDocument()
+  })
+
+  it('freezes merge inputs while a submit outcome is unresolved and retains the returned Task', async () => {
     let resolve: ((value: any) => void) | undefined
     mocks.submit.mockImplementationOnce(() => new Promise((done) => { resolve = done }))
     render(<MergeColumnsControl nodeId="write" />)
     fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
     await screen.findByText('Eligible exact merge')
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
+    expect(screen.getByLabelText('Merge identity columns')).toBeDisabled()
     fireEvent.change(screen.getByLabelText('Merge identity columns'), { target: { value: 'id, frame' } })
     resolve?.({ taskId: 'late-task', status: 'done', canRetry: false, canCancel: false, mergeColumns: null })
-    await waitFor(() => expect(mocks.state.updateConfig.mock.calls.some(([, patch]: any[]) => patch.mergeColumns?.taskId === 'late-task')).toBe(false))
+    await waitFor(() => expect(mocks.state.updateConfig.mock.calls.some(([, patch]: any[]) => patch.mergeColumns?.taskId === 'late-task')).toBe(true))
+    expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.identityColumns).toEqual(['id'])
+  })
+
+  it('clears response-unknown state after a definitive 4xx rejection and requires a fresh preflight', async () => {
+    render(<MergeColumnsControl nodeId="write" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    await screen.findByText('Eligible exact merge')
+    mocks.submit.mockRejectedValueOnce(new KernelError(409, 'merge-columns destination head must equal the exact Source revision'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('destination head')
+    expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns.submissionState).toBeUndefined()
+    expect(screen.getByRole('button', { name: 'Check eligibility' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Run column merge' })).toBeDisabled()
+  })
+
+  it('never treats an unresolved persisted task id as permission to submit again', async () => {
+    const merge = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns
+    merge.taskId = 'shared-task'
+    mocks.task.mockRejectedValueOnce(new KernelError(404, 'merge-columns task not found'))
+    render(<MergeColumnsControl nodeId="write" />)
+
+    expect(await screen.findByText('Tracked durable Task')).toBeVisible()
+    expect(await screen.findByRole('alert')).toHaveTextContent('task not found')
+    expect(screen.queryByRole('button', { name: 'Check eligibility' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Run column merge' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open in Jobs' }))
+    expect(mocks.state.setJobsQuery).toHaveBeenCalledWith('run=shared-task')
   })
 
   it('settles an immediate done replay without leaving submit busy', async () => {
