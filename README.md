@@ -67,6 +67,7 @@ it into a second pipeline definition.
 | **Inspect** | Bounded real-row previews, schemas, profiles, media cells, charts, scope-labeled page/sample exports, native full-result streaming, and per-node errors; operations that cannot be sampled truthfully request a full pass |
 | **Transform** | Relational filtering, projection, joins, unions, pivots, aggregates, sorting, deduplication, windows, null filling, unnesting, SQL, and Python transforms fed from Arrow batches in row, pandas, or PyArrow modes |
 | **Validate** | Schema-aware column warnings, row-level assertions that expose violating rows, and named/versioned schema contracts that can fail a run on drift |
+| **Publish** | The default managed-local destination creates or replaces file outputs and appends to managed Lance datasets; successful managed writes publish a revision with catalog and lineage evidence |
 | **Discover** | Server-paginated catalog browse, folders, facets, lexical search, optional semantic search, keys, join suggestions, relationships, and bounded lineage |
 | **Execute** | Local DuckDB execution that streams and spills relational work, warm per-canvas kernels, progress, cancellation, persisted run history, and headless runs |
 | **Extend** | Public Python ports for nodes, datasets, catalogs, search, destinations, importers, viewers, telemetry, kernel substrates, and execution backends |
@@ -74,6 +75,10 @@ it into a second pipeline definition.
 Preview and full execution intentionally share the same node-building path. A preview bounds source
 reads only when that preserves the operation's meaning; a write, global aggregate, or other full-pass
 operation says so instead of returning a misleading sample.
+
+Publication is capability-specific: a different destination, dataset adapter, or execution backend may
+support fewer write modes. Do not infer provider-native write-back from the fact that a source can be
+browsed or run through a canvas.
 
 ## How it works
 
@@ -117,7 +122,8 @@ with `DP_PLUGINS`.
 | --- | --- |
 | `NodeSpec` + `NodeBuilder` | A typed operation rendered by the existing frontend |
 | `DatasetAdapter` | A file format, table format, warehouse, or data service |
-| `CatalogProvider` | An external catalog, namespace, lineage, or catalog-search implementation |
+| `CatalogProvider` | A replacement for the one application-wide catalog, including its supported write-back, curation, and lineage behavior |
+| `ReadOnlyCatalogProvider` mount | One or more bounded external sources in Workspace browse; the mount cannot modify its source catalog |
 | `ExecutionBackend` / `PlaceableBackend` | A queue, scheduler, cluster, or other compute plane |
 | `KernelSpawner` | Another per-canvas runtime substrate, such as Kubernetes Pods |
 | Registry hooks | Destinations, pipeline importers, embedders, viewers, processors, managed-object providers, and telemetry sinks |
@@ -126,7 +132,9 @@ These ports are also the intended boundary for external services: keep catalog/s
 compute-specific clients in optional adapter packages while the open-source core remains offline-first
 and provider-agnostic. Identity and policy integrations should extend generic contracts instead of adding
 provider-specific branches to core. A typed plugin node is rendered and wired without custom frontend
-code.
+code. A read-only Workspace mount leaves managed-local publication in core; use the global
+`CatalogProvider` boundary only when a package is prepared to replace the application catalog and own
+its enabled write-back contract.
 
 Start with the [plugin guide](docs/PLUGINS.md) and the tested reference packages in
 [`examples/plugins/`](examples/plugins/).
