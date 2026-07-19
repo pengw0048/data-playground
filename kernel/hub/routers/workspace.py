@@ -391,6 +391,7 @@ def whoami(uid: str = Depends(current_user)) -> dict:
 
 
 class WorkspaceCreateCanvasBody(_StrictAuthBody):
+    request_id: UUID | None = Field(default=None, strict=False)
     container_id: str
     expected_container_version: int = Field(ge=1)
     name: str = "untitled"
@@ -780,6 +781,23 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
                             uid: str = Depends(current_user)) -> dict:
     """Create at one exact local destination; an optional dataset is resolved by stable identity."""
     try:
+        request_intent = {
+            "containerId": body.container_id,
+            "expectedContainerVersion": body.expected_container_version,
+            "name": body.name.strip(),
+            "datasetIds": body.dataset_ids,
+            "providerDatasetRefs": body.provider_dataset_refs,
+            "transform": ({"id": body.transform_id, "version": body.transform_version}
+                          if body.transform_id is not None else None),
+        }
+        is_external_overlay = metadb.workspace_is_external_overlay_anchor(body.container_id)
+        if is_external_overlay and body.request_id is None:
+            raise ValueError("an external overlay Canvas create requires a client requestId")
+        if body.request_id is not None:
+            replay = metadb.workspace_canvas_create_replay(
+                uid=uid, request_id=str(body.request_id), intent=request_intent)
+            if replay is not None:
+                return replay
         provider_sources = _provider_dataset_sources(body.provider_dataset_refs, uid)
         transform = (_exact_transform_descriptor(body.transform_id, body.transform_version)
                      if body.transform_id is not None and body.transform_version is not None else None)
@@ -787,7 +805,9 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
             uid=uid, container_id=body.container_id,
             expected_container_version=body.expected_container_version,
             name=body.name, dataset_ids=body.dataset_ids,
-            provider_sources=provider_sources, transform=transform)
+            provider_sources=provider_sources, transform=transform,
+            request_id=str(body.request_id) if body.request_id is not None else None,
+            request_intent=request_intent if body.request_id is not None else None)
     except HTTPException:
         raise
     except metadb.WorkspaceTransformUnavailable as exc:

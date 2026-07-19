@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0034_external_overlay", "0033_temporal_task"),
         ("0033_temporal_task", "0032_temporal_pub"),
         ("0032_temporal_pub", "0031_durable_merge"),
         ("0031_durable_merge", "0030_merge_columns_pub"),
@@ -88,8 +89,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0033_temporal_task"]
-    assert metadb.expected_schema_head() == "0033_temporal_task"
+    assert scripts.get_heads() == ["0034_external_overlay"]
+    assert metadb.expected_schema_head() == "0034_external_overlay"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -133,6 +134,9 @@ def test_temporal_parent_blocks_downgrade_without_partial_schema_loss(tmp_path):
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0034_external_overlay_anchor.py": (
+            "e9040678c38e06c4c60c623c621afd16664842bb30472ab0b49bbd8cb87ae960"
+        ),
         "0001_schema_baseline.py": "f8a793dd0af47e189939f1ce41ec39ae336009bf353e8ac8147fd961386c1e96",
         "0002_managed_local_file_revisions.py": (
             "c69ae2c9e2b6311261b694ecdd057008d5d6ffccd7e88bd3cbadfe04af7095f5"

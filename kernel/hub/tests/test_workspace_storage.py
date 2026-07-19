@@ -1029,6 +1029,197 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
     time.sleep(0.03)
 
 
+def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
+        workspace_scope, monkeypatch):
+    """A provider container lends a local destination without ever gaining write authority."""
+    root = metadb.local_workspace_root()
+    provider = _WorkspaceFixtureProvider()
+    mount_id = f"overlay-{uuid.uuid4().hex}"
+    resources = [CatalogResource(id="container-a", kind="container", name="Provider folder")]
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": root["id"],
+    }]))
+
+    created_ids: list[str] = []
+    binding_ids: list[str] = []
+    principal_ids: list[str] = []
+    try:
+        with TestClient(app) as client:
+            page = client.get(f"/api/workspace/containers/{root['id']}")
+            assert page.status_code == 200, page.text
+            remote = next(item for item in page.json()["items"] if item.get("resourceId") == "container-a")
+            binding_ids.append(remote["bindingId"])
+            capability = remote["localPlacement"]
+            assert remote["providerMutation"] is False
+            assert capability == {
+                "writable": True, "canCreateCanvas": True, "canMoveCanvas": True,
+                "containerId": capability["containerId"],
+                "containerVersion": capability["containerVersion"], "recoveryState": "ready",
+            }
+            anchor_id = capability["containerId"]
+
+            # Moving an existing Canvas remains a local placement operation. Editors retain the
+            # same authority; a user without an owner/editor role cannot use the anchor as a bypass.
+            source_placement = metadb.workspace_create_placement(
+                root["id"], target_kind="canvas", target_id=workspace_scope["canvas_id"],
+                name="Shared Canvas")
+            editor_id, viewer_id = f"overlay-editor-{uuid.uuid4().hex}", f"overlay-viewer-{uuid.uuid4().hex}"
+            principal_ids.extend([editor_id, viewer_id])
+            with metadb.session() as session:
+                session.add_all([
+                    metadb.User(id=editor_id, name="Overlay editor"),
+                    metadb.User(id=viewer_id, name="Overlay viewer"),
+                    metadb.CanvasShare(
+                        canvas_id=workspace_scope["canvas_id"], user_id=editor_id, role="editor"),
+                ])
+            editor_move = client.put(
+                f"/api/workspace/placements/{source_placement['id']}/canvas",
+                headers={"X-DP-User": editor_id}, json={
+                    "containerId": anchor_id,
+                    "expectedContainerVersion": capability["containerVersion"],
+                    "expectedVersion": source_placement["version"],
+                })
+            assert editor_move.status_code == 200, editor_move.text
+            denied_move = client.put(
+                f"/api/workspace/placements/{source_placement['id']}/canvas",
+                headers={"X-DP-User": viewer_id}, json={
+                    "containerId": root["id"], "expectedContainerVersion": root["version"],
+                    "expectedVersion": editor_move.json()["resource"]["version"],
+                })
+            assert denied_move.status_code == 403
+
+            # The anchor is an opaque local placement target, never an ordinary local folder.
+            assert client.get(f"/api/workspace/containers/{anchor_id}").status_code == 404
+            search = client.get("/api/workspace/search", params={"q": "External overlay"})
+            assert search.status_code == 200
+            assert all(item["id"] != f"container:{anchor_id}"
+                       for group in search.json()["groups"] for item in group["items"])
+
+            request_id = str(uuid.uuid4())
+            create_body = {
+                "requestId": request_id,
+                "containerId": anchor_id,
+                "expectedContainerVersion": capability["containerVersion"],
+                "name": "Local overlay canvas",
+            }
+            missing_request = client.post("/api/workspace/canvases", json={
+                key: value for key, value in create_body.items() if key != "requestId"
+            })
+            assert missing_request.status_code == 422
+            assert "requires a client requestId" in missing_request.json()["detail"]
+            created = client.post("/api/workspace/canvases", json=create_body)
+            assert created.status_code == 200, created.text
+            created_doc = created.json()
+            created_ids.append(created_doc["id"])
+            replay = client.post("/api/workspace/canvases", json=create_body)
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == created_doc
+            conflict = client.post("/api/workspace/canvases", json={
+                **create_body, "name": "A different intent",
+            })
+            assert conflict.status_code == 422
+            assert "different semantic request" in conflict.json()["detail"]
+
+            # Both PostgreSQL (root-row lock) and SQLite (writer lock) serialize the final replay
+            # lookup with the Canvas insert.  The replay table's composite primary key remains the
+            # durable fence: a future lock regression rolls back the losing whole transaction.
+            parallel_request = str(uuid.uuid4())
+            parallel_intent = {
+                "containerId": anchor_id,
+                "expectedContainerVersion": capability["containerVersion"],
+                "name": "Concurrent local overlay canvas",
+                "datasetIds": [], "providerDatasetRefs": [], "transform": None,
+            }
+            start = threading.Barrier(3)
+            parallel_results: list[dict] = []
+
+            def submit_once() -> None:
+                start.wait(timeout=5)
+                parallel_results.append(metadb.workspace_create_canvas_action(
+                    uid=metadb.DEFAULT_USER_ID, container_id=anchor_id,
+                    expected_container_version=capability["containerVersion"],
+                    name="Concurrent local overlay canvas", request_id=parallel_request,
+                    request_intent=parallel_intent,
+                ))
+
+            workers = [threading.Thread(target=submit_once) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            start.wait(timeout=5)
+            for worker in workers:
+                worker.join(timeout=5)
+                assert not worker.is_alive()
+            assert len(parallel_results) == 2
+            assert parallel_results[0] == parallel_results[1]
+            created_ids.append(parallel_results[0]["id"])
+            with metadb.session() as session:
+                assert len(list(session.scalars(select(metadb.Canvas.id).where(
+                    metadb.Canvas.id == parallel_results[0]["id"])))) == 1
+
+            # Provider display rename/move only refreshes binding snapshots; the local placement
+            # stays on this binding generation's anchor.
+            parent = CatalogResource(id="parent-a", kind="container", name="New provider parent")
+            resources[:] = [
+                parent,
+                CatalogResource(
+                    id="container-a", kind="container", name="Renamed folder", parent_id="parent-a"),
+            ]
+            monkeypatch.setattr(
+                provider, "ancestors",
+                lambda _mount, resource_id: ProviderAncestors(items=[parent])
+                if resource_id == "container-a" else ProviderAncestors(),
+            )
+            renamed = client.get(f"/api/workspace/resources/{remote['id']}")
+            assert renamed.status_code == 200, renamed.text
+            assert renamed.json()["resource"]["name"] == "Renamed folder"
+            assert renamed.json()["resource"]["localPlacement"]["containerId"] == anchor_id
+            metadb.engine().dispose()
+            assert metadb.workspace_provider_overlay_anchor(remote["bindingId"])["containerId"] == anchor_id
+            assert client.get(f"/api/canvas/{created_doc['id']}").status_code == 200
+
+            # A delete/recreate with the same provider ID is terminally detached until explicit relink.
+            resources[:] = []
+            detached = client.get(f"/api/workspace/resources/{remote['id']}")
+            assert detached.status_code == 200, detached.text
+            assert detached.json()["resource"]["referenceState"] == "detached"
+            resources[:] = [CatalogResource(id="container-a", kind="container", name="Recreated folder")]
+            still_detached = client.get(f"/api/workspace/resources/{remote['id']}")
+            assert still_detached.json()["resource"]["referenceState"] == "detached"
+            assert still_detached.json()["resource"]["localPlacement"]["containerId"] == anchor_id
+            relinked = client.post(f"/api/workspace/resources/{remote['id']}/relink", json={
+                "mountId": mount_id, "resourceId": "container-a",
+            })
+            assert relinked.status_code == 200, relinked.text
+            replacement = relinked.json()["resource"]
+            binding_ids.append(replacement["bindingId"])
+            assert replacement["bindingId"] != remote["bindingId"]
+            assert replacement["localPlacement"]["containerId"] != anchor_id
+    finally:
+        with metadb.session() as session:
+            if created_ids:
+                placement_ids = list(session.scalars(select(metadb.WorkspacePlacement.id).where(
+                    metadb.WorkspacePlacement.target_kind == "canvas",
+                    metadb.WorkspacePlacement.target_id.in_(created_ids),
+                )))
+                if placement_ids:
+                    session.execute(delete(metadb.WorkspacePlacement).where(
+                        metadb.WorkspacePlacement.id.in_(placement_ids)))
+                session.execute(delete(metadb.Canvas).where(metadb.Canvas.id.in_(created_ids)))
+            anchors = list(session.scalars(select(metadb.WorkspaceExternalOverlayAnchor).where(
+                metadb.WorkspaceExternalOverlayAnchor.mount_id == mount_id)))
+            session.execute(delete(metadb.WorkspaceExternalOverlayAnchor).where(
+                metadb.WorkspaceExternalOverlayAnchor.mount_id == mount_id))
+            for anchor in anchors:
+                session.execute(delete(metadb.WorkspaceContainer).where(
+                    metadb.WorkspaceContainer.id == anchor.container_id))
+            if principal_ids:
+                session.execute(delete(metadb.CanvasShare).where(
+                    metadb.CanvasShare.user_id.in_(principal_ids)))
+                session.execute(delete(metadb.User).where(metadb.User.id.in_(principal_ids)))
+
+
 def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
         workspace_scope, monkeypatch):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")

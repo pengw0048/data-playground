@@ -680,6 +680,16 @@ class CatalogBrowse(Wire):
     truncated: bool = False
 
 
+class WorkspaceLocalPlacementCapability(Wire):
+    """A local-only mutation destination paired with a provider resource read reference."""
+    writable: bool
+    can_create_canvas: bool
+    can_move_canvas: bool
+    container_id: str | None = None
+    container_version: int | None = None
+    recovery_state: Literal["ready", "unavailable"]
+
+
 class WorkspaceResource(Wire):
     """One Workspace child addressed by an opaque, path-independent reference."""
     id: str
@@ -702,6 +712,10 @@ class WorkspaceResource(Wire):
     ] = "current"
     last_known: bool = False
     last_resolved_at: datetime.datetime | None = None
+    local_placement: WorkspaceLocalPlacementCapability | None = None
+    # Provider mounts stay source-only.  This explicit false is intentionally independent of the
+    # local placement capability so clients cannot mistake a local Canvas move for provider writeback.
+    provider_mutation: bool = False
 
 
 class WorkspaceSourceStatus(Wire):
