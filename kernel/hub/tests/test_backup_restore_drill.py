@@ -1755,7 +1755,8 @@ def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
     external_wait_tasks.recover(online_deps)
     online = _wait_for(lambda: (
         task if (task := metadb.durable_task(external_id))
-        and task["external_wait"]["poll_count"] > poll_count else None
+        and task["external_wait"]["poll_count"] > poll_count
+        and adapter.status_calls >= 1 else None
     ))
     time.sleep(.05)
     assert adapter.submit_calls == 0
