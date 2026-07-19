@@ -68,6 +68,25 @@ describe('MergeColumnsControl', () => {
     expect(mocks.submit.mock.calls[0][0].graph.nodes.map((node: any) => node.id)).toEqual(['source', 'select', 'write'])
   })
 
+  it('invalidates preflight when a destination-fallback Write title changes', async () => {
+    const write = mocks.state.doc.nodes.find((node: any) => node.id === 'write')
+    delete write.data.config.filename
+    const view = render(<MergeColumnsControl nodeId="write" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    await screen.findByText('Eligible exact merge')
+    const run = screen.getByRole('button', { name: 'Run column merge' })
+    await waitFor(() => expect(run).toBeEnabled())
+    const priorSubmission = write.data.config.mergeColumns.submissionId
+
+    write.data.title = 'renamed destination'
+    view.rerender(<MergeColumnsControl nodeId="write" />)
+    await waitFor(() => expect(run).toBeDisabled())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    await waitFor(() => expect(mocks.preflight).toHaveBeenCalledTimes(2))
+    expect(write.data.config.mergeColumns.submissionId).not.toBe(priorSubmission)
+  })
+
   it('rotates the submission identity when an identity column changes', () => {
     render(<MergeColumnsControl nodeId="write" />)
     fireEvent.change(screen.getByLabelText('Merge identity columns'), { target: { value: 'id, frame' } })

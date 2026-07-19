@@ -60,14 +60,20 @@ function countLabel(value: number): string { return value.toLocaleString() }
 function semanticKey(request: MergeColumnsRequest): string {
   // Matches the consumer-visible admission meaning while excluding Write-card UI bookkeeping.
   // This is a fence, not a replacement for the server's canonical semantics.
-  const graph = request.graph as { id: string; nodes: Array<{ id: string; type: string; data?: { config?: Record<string, unknown>; bypassed?: boolean; disabled?: boolean } }>; edges: Array<{ source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null }> }
+  const graph = request.graph as { id: string; nodes: Array<{ id: string; type: string; data?: { title?: string; config?: Record<string, unknown>; bypassed?: boolean; disabled?: boolean } }>; edges: Array<{ source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null }> }
   return JSON.stringify({
     graph: {
       id: graph.id,
       nodes: graph.nodes.map((node) => {
         const config = { ...(node.data?.config ?? {}) }
         delete config.mergeColumns
-        return { id: node.id, type: node.type, config, bypassed: !!node.data?.bypassed, disabled: !!node.data?.disabled }
+        // SinkSpec uses the Write title only when neither filename nor name is configured. Keep
+        // that exact fallback in the client fence so a rename cannot reuse an eligible preflight
+        // or submission id for a different destination, without treating unrelated card titles as
+        // execution semantics.
+        const fallbackTitle = node.type === 'write' && !config.filename && !config.name
+          ? node.data?.title ?? '' : undefined
+        return { id: node.id, type: node.type, config, ...(fallbackTitle !== undefined ? { title: fallbackTitle } : {}), bypassed: !!node.data?.bypassed, disabled: !!node.data?.disabled }
       }),
       edges: graph.edges.map((edge) => [edge.source, edge.target, edge.sourceHandle ?? null, edge.targetHandle ?? null]),
     },
