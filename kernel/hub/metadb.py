@@ -3790,7 +3790,7 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         result = {
             "ok": True, "id": canvas_id, "created": True,
             "nodeId": nodes[0]["id"] if transform is not None else None,
-            "resource": _workspace_placement_resource(placement, detached=False),
+            "resource": _workspace_public_placement_resource(s, placement, detached=False),
         }
         if normalized_request_id is not None and intent_sha256 is not None:
             s.add(WorkspaceCanvasCreateReplay(
@@ -3947,9 +3947,9 @@ def workspace_move_canvas_action(*, uid: str, placement_id: str, expected_versio
         s.refresh(placement)
         return {
             "ok": True,
-            "resource": _workspace_placement_resource(placement, detached=False),
-            "previousContainer": _workspace_container_resource(previous),
-            "container": _workspace_container_resource(destination),
+            "resource": _workspace_public_placement_resource(s, placement, detached=False),
+            "previousContainer": _workspace_public_container_resource(s, previous),
+            "container": _workspace_public_container_resource(s, destination),
         }
 
 
@@ -4959,6 +4959,56 @@ def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) ->
         "name": row.name, "parentId": _workspace_ref("container", row.container_id),
         "placementId": row.id, "version": row.version, "detached": detached,
     }
+
+
+def _workspace_external_identity(binding: WorkspaceProviderBinding) -> str:
+    payload = json.dumps(
+        [binding.mount_id, binding.resource_id, binding.id], separators=(",", ":"),
+    ).encode()
+    return "external." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _workspace_provider_container_resource(
+        s, binding: WorkspaceProviderBinding) -> dict:
+    """Project cached provider facts only; action responses must never consult a live provider."""
+    parent = (s.get(WorkspaceProviderBinding, binding.parent_binding_id)
+              if binding.parent_binding_id is not None else None)
+    parent_id = (
+        f"container:{_workspace_external_identity(parent)}"
+        if parent is not None else _workspace_ref("container", binding.container_id)
+    )
+    return {
+        "id": f"container:{_workspace_external_identity(binding)}",
+        "kind": "container", "name": binding.name, "parentId": parent_id,
+        "detached": binding.state == "detached", "source": "provider",
+        "mountId": binding.mount_id, "provider": binding.provider,
+        "resourceId": binding.resource_id, "bindingId": binding.id,
+        "referenceState": binding.state, "lastKnown": binding.state != "current",
+        "lastResolvedAt": binding.last_resolved_at,
+        # Deliberately omit localPlacement: this projection is a navigation parent, not the
+        # capability response that originally disclosed the opaque local destination.
+        "providerMutation": False,
+    }
+
+
+def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
+    anchor = _workspace_external_overlay_anchor_for_container(s, row.id)
+    if anchor is None:
+        return _workspace_container_resource(row)
+    binding = s.get(WorkspaceProviderBinding, anchor.binding_id)
+    if binding is None or binding.kind != "container":  # pragma: no cover - FK-protected invariant
+        raise RuntimeError("external Workspace overlay anchor binding is missing")
+    return _workspace_provider_container_resource(s, binding)
+
+
+def _workspace_public_placement_resource(
+        s, row: WorkspacePlacement, *, detached: bool) -> dict:
+    resource = _workspace_placement_resource(row, detached=detached)
+    container = s.get(WorkspaceContainer, row.container_id)
+    if container is None:  # pragma: no cover - foreign key protected invariant
+        raise RuntimeError("Workspace placement parent is missing")
+    resource["parentId"] = _workspace_public_container_resource(s, container)["id"]
+    return resource
 
 
 _WORKSPACE_PROVIDER_STATES = {

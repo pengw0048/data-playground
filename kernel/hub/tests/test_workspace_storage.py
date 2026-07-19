@@ -1083,6 +1083,11 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
                     "expectedVersion": source_placement["version"],
                 })
             assert editor_move.status_code == 200, editor_move.text
+            editor_move_doc = editor_move.json()
+            assert editor_move_doc["resource"]["parentId"] == remote["id"]
+            assert editor_move_doc["container"]["id"] == remote["id"]
+            assert anchor_id not in json.dumps(editor_move_doc)
+            assert "External overlay" not in json.dumps(editor_move_doc)
             denied_move = client.put(
                 f"/api/workspace/placements/{source_placement['id']}/canvas",
                 headers={"X-DP-User": viewer_id}, json={
@@ -1114,6 +1119,9 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert created.status_code == 200, created.text
             created_doc = created.json()
             created_ids.append(created_doc["id"])
+            assert created_doc["resource"]["parentId"] == remote["id"]
+            assert anchor_id not in json.dumps(created_doc)
+            assert "External overlay" not in json.dumps(created_doc)
             hidden_search = client.get("/api/workspace/search", params={"q": "Local overlay canvas"})
             assert hidden_search.status_code == 200, hidden_search.text
             assert all(item["id"] != f"canvas:{created_doc['id']}"
@@ -1127,6 +1135,18 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             })
             assert conflict.status_code == 422
             assert "different semantic request" in conflict.json()["detail"]
+
+            moved_away = client.put(
+                f"/api/workspace/placements/{source_placement['id']}/canvas", json={
+                    "containerId": root["id"], "expectedContainerVersion": root["version"],
+                    "expectedVersion": editor_move_doc["resource"]["version"],
+                })
+            assert moved_away.status_code == 200, moved_away.text
+            moved_away_doc = moved_away.json()
+            assert moved_away_doc["resource"]["parentId"] == f"container:{root['id']}"
+            assert moved_away_doc["previousContainer"]["id"] == remote["id"]
+            assert anchor_id not in json.dumps(moved_away_doc)
+            assert "External overlay" not in json.dumps(moved_away_doc)
 
             # Both PostgreSQL (root-row lock) and SQLite (writer lock) serialize the final replay
             # lookup with the Canvas insert.  The replay table's composite primary key remains the
