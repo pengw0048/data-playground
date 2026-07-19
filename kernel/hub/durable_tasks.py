@@ -153,6 +153,8 @@ def recover(deps) -> None:
     recover_external_waits(deps)
     from hub.linear_checkpoint_tasks import recover as recover_linear_checkpoints
     recover_linear_checkpoints(deps)
+    from hub.merge_columns_tasks import recover as recover_merge_columns
+    recover_merge_columns(deps)
     from hub.bounded_fanout_tasks import recover as recover_bounded_fanout
     recover_bounded_fanout(deps)
     from hub.distribution_report_tasks import recover as recover_distribution_reports
@@ -191,6 +193,9 @@ def request_cancel(task_id: str) -> dict | None:
     if task.get("task_kind") == "linear_checkpoint_write":
         from hub.linear_checkpoint_tasks import request_cancel as cancel_linear
         cancel_linear(task_id)
+    elif task.get("task_kind") == "merge_columns_write":
+        from hub.merge_columns_tasks import request_cancel as cancel_merge
+        cancel_merge(task_id)
     return task
 
 
@@ -204,6 +209,9 @@ def retry(task_id: str, retry_request_id: str, deps) -> dict:
     elif task["task_kind"] == "bounded_fanout_write":
         from hub.bounded_fanout_tasks import dispatch as dispatch_fanout
         dispatch_fanout(task_id, deps)
+    elif task["task_kind"] == "merge_columns_write":
+        from hub.merge_columns_tasks import dispatch as dispatch_merge
+        dispatch_merge(task_id, deps)
     elif task["task_kind"] == "distribution_report":
         from hub.distribution_report_tasks import dispatch as dispatch_report
         dispatch_report(task_id)

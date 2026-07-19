@@ -546,7 +546,8 @@ class DurableTask(Base):
         UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
-            "'linear_checkpoint_write','bounded_fanout_write','distribution_report')",
+            "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
+            "'distribution_report')",
             name="ck_durable_task_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
@@ -652,7 +653,8 @@ class DurableTaskInboxItem(Base):
         UniqueConstraint("task_id", "task_attempt_id", name="uq_durable_task_inbox_attempt"),
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
-            "'linear_checkpoint_write','bounded_fanout_write','distribution_report')",
+            "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
+            "'distribution_report')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
@@ -699,6 +701,32 @@ class DistributionReportEnvelope(Base):
             "revision_retention_owner = 'core'",
             name="ck_distribution_report_retention_owner"),
         Index("ix_distribution_reports_dataset_view", "dataset_view_id", "created_at"),
+    )
+
+
+class MergeColumnsTaskEnvelope(Base):
+    """Immutable #436 admission and SQL-authoritative resume point for one merge Task."""
+    __tablename__ = "merge_columns_task_envelopes"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    merge_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    merge_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    sparse_output_id: Mapped[str] = mapped_column(
+        String(128), ForeignKey("sparse_outputs.id"), nullable=False)
+    base_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    base_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    phase: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="validating", server_default="validating")
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        CheckConstraint("length(intent_sha256) = 64", name="ck_merge_task_intent_sha"),
+        CheckConstraint("length(merge_sha256) = 64", name="ck_merge_task_merge_sha"),
+        CheckConstraint(
+            "phase IN ('validating','merging','candidate_committed','publishing',"
+            "'done','failed','cancelled')", name="ck_merge_task_phase"),
     )
 
 
@@ -5194,18 +5222,23 @@ _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
-_CHECKPOINT_PARENT_KINDS = frozenset({"linear_checkpoint_write", "bounded_fanout_write"})
+_CHECKPOINT_PARENT_KINDS = frozenset({
+    "linear_checkpoint_write", "bounded_fanout_write", "merge_columns_write",
+})
 # #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. The hidden
 # distribution-report lifecycle has no Jobs projection until its own product surface exists.
 _JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
-    "bounded_fanout_write", "distribution_report",
+    "bounded_fanout_write", "merge_columns_write", "distribution_report",
 })
 _INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
 }
+_MERGE_COLUMNS_JOB_DIAGNOSTICS = frozenset({
+    "checkpoint_invalid", "merge_columns_write_failed", "stale_expected_head",
+})
 _INBOX_DIAGNOSTIC_ALLOWLIST = {
     "managed_local_write": frozenset({
         "durable_task_attempts_exhausted",
@@ -5236,6 +5269,8 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "durable_task_attempts_exhausted",
         "checkpoint_invalid",
     }),
+    "merge_columns_write": (
+        _MERGE_COLUMNS_JOB_DIAGNOSTICS | {"durable_task_attempts_exhausted"}),
     "distribution_report": frozenset({
         "durable_task_attempts_exhausted",
         "distribution_report_snapshot_invalid",
@@ -5249,6 +5284,7 @@ _INBOX_DIAGNOSTIC_FALLBACK = {
     "external_wait": "external_wait_failed",
     "linear_checkpoint_write": "linear_checkpoint_write_failed",
     "bounded_fanout_write": "bounded_fanout_write_failed",
+    "merge_columns_write": "merge_columns_write_failed",
     "distribution_report": "distribution_report_failed",
 }
 
@@ -5520,6 +5556,38 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
     """Load one Task's immutable definition from its canonical manifest or legacy frozen columns."""
     if task.task_kind == "distribution_report":
         return {}
+    if task.task_kind == "merge_columns_write":
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+        if envelope is None or task.write_intent is None:
+            raise RuntimeError("merge columns durable admission is incomplete")
+        try:
+            from hub.merge_columns import MergeColumnsIntentV1, merge_columns_document
+            from hub.models import WriteIntent
+            intent = MergeColumnsIntentV1.model_validate_json(envelope.intent_doc)
+            canonical_intent = json.dumps(
+                intent.model_dump(by_alias=True, mode="json"), sort_keys=True,
+                separators=(",", ":"))
+            if (hashlib.sha256(canonical_intent.encode()).hexdigest() != envelope.intent_sha256
+                    or envelope.intent_sha256 != task.intent_sha256
+                    or merge_columns_document(intent) != envelope.merge_doc
+                    or hashlib.sha256(envelope.merge_doc.encode()).hexdigest()
+                    != envelope.merge_sha256
+                    or intent.sparse_output_id != envelope.sparse_output_id
+                    or intent.base.dataset_id != envelope.base_dataset_id
+                    or intent.base.revision_id != envelope.base_revision_id):
+                raise ValueError
+            write = WriteIntent.model_validate_json(task.write_intent)
+            if write != intent.write_intent:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("merge columns durable admission is invalid") from exc
+        return {
+            "merge_columns_intent": intent.model_dump(by_alias=True, mode="json"),
+            "merge_columns_phase": envelope.phase,
+            "graph_doc": None, "input_manifest": [],
+            "write_intent": write.model_dump(by_alias=True, mode="json"),
+            "target_node_id": task.target_node_id, "target_port_id": None,
+        }
     if task.execution_manifest_sha256 is not None:
         from hub.execution_manifest import execution_manifest_admission
 
@@ -5747,6 +5815,103 @@ def _linear_checkpoint_admission_doc(
         "input_manifest_sha256": checkpoint.input_manifest_sha256,
         "phase": checkpoint.phase,
     }
+
+
+def submit_merge_columns_task(
+        *, uid: str, canvas_id: str, submission_id: str, intent: object,
+        max_attempts: int = 3) -> tuple[dict, bool]:
+    """Atomically admit one frozen certified SparseOutput merge and its checkpoint owner."""
+    from hub.merge_columns import (
+        MergeColumnsIntentV1, merge_columns_document, sparse_output_merge_evidence,
+    )
+
+    frozen = MergeColumnsIntentV1.model_validate(intent)
+    normalized_submission = str(submission_id).lower()
+    _linear_checkpoint_identity(normalized_submission, "submission", 256)
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 3:
+        raise ValueError("merge columns task max attempts is invalid")
+    intent_doc = json.dumps(
+        frozen.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":"))
+    merge_doc = merge_columns_document(frozen)
+    intent_sha = hashlib.sha256(intent_doc.encode()).hexdigest()
+    merge_sha = hashlib.sha256(merge_doc.encode()).hexdigest()
+    sparse_sha = hashlib.sha256(json.dumps({
+        "base": frozen.base.model_dump(by_alias=True, mode="json"),
+        "sparseOutputId": frozen.sparse_output_id,
+        "sparseEvidence": frozen.sparse_evidence.model_dump(by_alias=True, mode="json"),
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    uid, canvas_id = str(uid), str(canvas_id)
+    task_id = durable_task_submission_id(uid, canvas_id, normalized_submission)
+    checkpoint_id = "mcp:" + hashlib.sha256(
+        f"merge-columns-checkpoint-v1\0{task_id}\0{intent_sha}".encode()).hexdigest()
+    with session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            raise RuntimeError("merge columns task canvas does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+                updated_at=Canvas.updated_at))
+        task = s.get(DurableTask, task_id, with_for_update=True)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        envelope = s.get(MergeColumnsTaskEnvelope, task_id, with_for_update=True)
+        if task is not None or checkpoint is not None or envelope is not None:
+            if task is None or checkpoint is None or envelope is None:
+                raise DurableTaskSubmissionConflict("merge columns durable admission is incomplete")
+            if (task.task_kind != "merge_columns_write" or task.owner_id != uid
+                    or task.canvas_id != canvas_id or task.submission_id != normalized_submission
+                    or task.intent_sha256 != intent_sha or task.target_node_id != "merge-columns"
+                    or checkpoint.checkpoint_id != checkpoint_id
+                    or checkpoint.task_intent_sha256 != intent_sha
+                    or checkpoint.graph_prefix_sha256 != merge_sha
+                    or checkpoint.input_manifest_sha256 != sparse_sha
+                    or envelope.intent_doc != intent_doc or envelope.intent_sha256 != intent_sha
+                    or envelope.merge_doc != merge_doc or envelope.merge_sha256 != merge_sha):
+                raise DurableTaskSubmissionConflict(
+                    "merge columns submission does not match its frozen admission")
+            _lock_local_result_registry(s)
+            return _durable_task_doc(s, task), False
+
+        sparse = s.get(SparseOutput, frozen.sparse_output_id, with_for_update=True)
+        materialization = s.get(
+            SparseOutputMaterialization, frozen.sparse_output_id, with_for_update=True)
+        if (sparse is None or sparse.owner_id != uid or sparse.canvas_id != canvas_id
+                or sparse.input_dataset_id != frozen.base.dataset_id
+                or sparse.input_revision_id != frozen.base.revision_id
+                or materialization is None or materialization.phase != "committed"):
+            raise DurableTaskSubmissionConflict("merge columns SparseOutput is unavailable")
+        _validate_sparse_output_documents(sparse)
+        _validate_sparse_output_reference(s, sparse)
+        committed = _sparse_materialization_doc(s, materialization)
+        if sparse_output_merge_evidence(_sparse_output_doc(sparse), committed) != frozen.sparse_evidence:
+            raise DurableTaskSubmissionConflict("merge columns SparseOutput evidence changed")
+        write = frozen.write_intent.model_dump(by_alias=True, mode="json")
+        now = _durable_task_db_now(s)
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=canvas_id, submission_id=normalized_submission,
+            intent_sha256=intent_sha, target_node_id="merge-columns",
+            task_kind="merge_columns_write", backend_kind="local", graph_doc=None,
+            input_manifest=None, write_intent=json.dumps(write, sort_keys=True, separators=(",", ":")),
+            status="queued", status_doc=json.dumps(_task_status_doc(task_id, "merge-columns")),
+            max_attempts=max_attempts, created_at=now, updated_at=now)
+        attempt = DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            execution_manifest_sha256=None, status="queued", created_at=now)
+        checkpoint = DurableCheckpoint(
+            task_id=task_id, checkpoint_id=checkpoint_id, checkpoint_node_id="merge-columns",
+            output_port_id="out", task_intent_sha256=intent_sha,
+            graph_prefix_sha256=merge_sha, input_manifest_sha256=sparse_sha,
+            phase="pending", created_at=now, updated_at=now)
+        envelope = MergeColumnsTaskEnvelope(
+            task_id=task_id, intent_doc=intent_doc, intent_sha256=intent_sha,
+            merge_doc=merge_doc, merge_sha256=merge_sha,
+            sparse_output_id=frozen.sparse_output_id, base_dataset_id=frozen.base.dataset_id,
+            base_revision_id=frozen.base.revision_id, phase="validating",
+            created_at=now, updated_at=now)
+        s.add(task)
+        s.flush()
+        s.add_all((attempt, checkpoint, envelope))
+        s.flush()
+        return _durable_task_doc(s, task), True
 
 
 def submit_linear_checkpoint_task(
@@ -6078,8 +6243,17 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
         admission = _durable_task_admission(s, task)
         intent, _payload, canonical = _canonical_managed_local_write_intent(
             admission["write_intent"])
-        prior = _managed_local_write_receipt_in_session(s, intent.idempotency_key, canonical)
-        if prior is None:
+        if task.task_kind == "merge_columns_write":
+            envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+            if envelope is None:
+                return False
+            prior = _managed_local_merge_replay_in_session(
+                s, intent.idempotency_key, canonical,
+                MergeColumnsPublicationContext(
+                    merge_doc=envelope.merge_doc, merge_sha256=envelope.merge_sha256), lock=True)
+        else:
+            prior = _managed_local_write_receipt_in_session(s, intent.idempotency_key, canonical)
+        if prior is None and task.task_kind != "merge_columns_write":
             prior = _managed_local_lance_write_receipt_in_session(
                 s, intent.idempotency_key, canonical)
     except Exception:
@@ -6101,17 +6275,25 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     task.status_doc = json.dumps(status, default=str)
     task.output_receipt = attempt.output_receipt = receipt_json
     task.completed_at = attempt.completed_at = task.updated_at = now
+    _terminalize_hidden_task_envelope(s, task, now)
     _emit_durable_task_inbox_item(s, task=task, attempt=attempt, task_status="done", now=now)
     return True
 
 
 def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.datetime) -> None:
-    if task.task_kind != "distribution_report":
-        return
-    report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
-    if report is None:
-        raise RuntimeError("distribution report envelope is unavailable")
-    report.updated_at = report.completed_at = now
+    if task.task_kind == "distribution_report":
+        report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
+        if report is None:
+            raise RuntimeError("distribution report envelope is unavailable")
+        report.updated_at = report.completed_at = now
+    elif task.task_kind == "merge_columns_write":
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+        if envelope is None:
+            raise RuntimeError("merge columns task envelope is unavailable")
+        if task.status not in _TERMINAL_RUN:
+            raise RuntimeError("merge columns envelope has no terminal task state")
+        envelope.phase = task.status
+        envelope.updated_at = now
 
 
 def _claim_durable_task_kind(
@@ -6198,6 +6380,11 @@ def claim_bounded_fanout_write_task(task_id: str, owner_token: str) -> dict | No
     return _claim_durable_task_kind(task_id, owner_token, "bounded_fanout_write")
 
 
+def claim_merge_columns_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim the one exact durable SparseOutput merge Task."""
+    return _claim_durable_task_kind(task_id, owner_token, "merge_columns_write")
+
+
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
     with session() as s:
         now = _durable_task_db_now(s)
@@ -6260,6 +6447,37 @@ def update_durable_task_status(
         return True
 
 
+def update_merge_columns_task_phase(
+        task_id: str, attempt_id: str, owner_token: str, *, phase: str,
+        status_doc: dict) -> bool:
+    """Fence one visible phase/status transition with the merge envelope resume point."""
+    from hub.models import RunStatus
+    if phase not in ("validating", "merging", "publishing"):
+        raise ValueError("merge columns task phase is invalid")
+    status = RunStatus.model_validate(status_doc)
+    if status.status != "running" or status.run_id != str(task_id):
+        raise ValueError("merge columns task phase requires a running status")
+    payload = json.dumps(status.model_dump(), default=str)
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        envelope = s.get(MergeColumnsTaskEnvelope, str(task_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until if attempt is not None else None
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task is None or attempt is None or envelope is None
+                or task.task_kind != "merge_columns_write" or task.status in _TERMINAL_RUN
+                or attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        task.status_doc = payload
+        task.progress = attempt.progress = status.progress
+        task.updated_at = envelope.updated_at = now
+        envelope.phase = phase
+        return True
+
+
 def finish_durable_task_attempt(
         task_id: str, attempt_id: str, owner_token: str, status_doc: dict) -> bool:
     from hub.models import RunStatus, WriteReceipt
@@ -6314,8 +6532,11 @@ def finish_durable_task_attempt(
         task.output_receipt = receipt_payload
         task.completed_at = now
         task.updated_at = now
+        _terminalize_hidden_task_envelope(s, task, now)
         _emit_durable_task_inbox_item(
-            s, task=task, attempt=attempt, task_status=status.status, now=now)
+            s, task=task, attempt=attempt, task_status=status.status,
+            diagnostic_code=(status.error if task.task_kind == "merge_columns_write" else None),
+            now=now)
         return True
 
 
@@ -6791,6 +7012,8 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
             return _durable_task_doc(s, task)
         if task.status not in ("failed", "cancelled"):
             raise ValueError("only a failed or cancelled durable task can be retried")
+        if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
+            raise ValueError("stale merge columns head requires a new submission")
         last = s.scalar(select(DurableTaskAttempt).where(
             DurableTaskAttempt.task_id == task.id,
         ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
@@ -6839,6 +7062,14 @@ def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
             report.report_doc = None
             report.completed_at = None
             report.updated_at = now
+        elif task.task_kind == "merge_columns_write":
+            envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+            checkpoint = s.get(DurableCheckpoint, task.id, with_for_update=True)
+            if envelope is None or checkpoint is None:
+                raise RuntimeError("merge columns retry evidence is unavailable")
+            envelope.phase = (
+                "candidate_committed" if checkpoint.phase == "committed" else "validating")
+            envelope.updated_at = now
         s.flush()
         return _durable_task_doc(s, task)
 
@@ -6904,6 +7135,29 @@ def recoverable_bounded_fanout_write_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "bounded_fanout_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_merge_columns_task_ids(limit: int = 100) -> list[str]:
+    """Return recoverable exact merge Tasks; a live DB-time lease remains authoritative."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "merge_columns_write",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -8171,6 +8425,9 @@ def delete_canvas_cascade(canvas_id: str) -> None:
         durable_waits = list(s.scalars(select(DurableExternalWait).where(
             DurableExternalWait.task_id.in_([task.id for task in durable_tasks]),
         ).order_by(DurableExternalWait.task_id).with_for_update())) if durable_tasks else []
+        merge_envelopes = list(s.scalars(select(MergeColumnsTaskEnvelope).where(
+            MergeColumnsTaskEnvelope.task_id.in_([task.id for task in durable_tasks]),
+        ).order_by(MergeColumnsTaskEnvelope.task_id).with_for_update())) if durable_tasks else []
         durable_inbox = list(s.scalars(select(DurableTaskInboxItem).where(
             DurableTaskInboxItem.task_id.in_([task.id for task in durable_tasks]),
         ).order_by(DurableTaskInboxItem.task_id, DurableTaskInboxItem.id).with_for_update())
@@ -8207,6 +8464,8 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             s.delete(admission)
         for wait in durable_waits:
             s.delete(wait)
+        for envelope in merge_envelopes:
+            s.delete(envelope)
         for item in durable_inbox:
             s.delete(item)
         if durable_inbox:
@@ -8480,6 +8739,30 @@ def _sanitized_checkpoint_jobs_view(
         "retryLabel": ("Retry from checkpoint" if can_retry and resume_eligible else None),
         "clientKey": f"checkpoint:{task.id}",
         "diagnosticCode": diagnosis,
+    }
+
+
+def _sanitized_merge_columns_jobs_view(
+        task: DurableTask, checkpoint: DurableCheckpoint | None,
+        envelope: MergeColumnsTaskEnvelope, *, current_attempt_id: str | None,
+        can_retry: bool, can_cancel: bool) -> dict:
+    """Return only #436's task identity and committed-candidate facts, never merge authority."""
+    committed = checkpoint is not None and checkpoint.phase == "committed"
+    digest = checkpoint.content_sha256 if committed else None
+    diagnostic = task.error if task.error in _MERGE_COLUMNS_JOB_DIAGNOSTICS else None
+    return {
+        "phase": envelope.phase,
+        "baseDatasetId": envelope.base_dataset_id,
+        "baseRevisionId": envelope.base_revision_id,
+        "sparseOutputId": envelope.sparse_output_id,
+        "candidate": "committed" if committed else "pending",
+        "reused": bool(committed and checkpoint.candidate_attempt_id != current_attempt_id),
+        "candidateRows": checkpoint.committed_rows if committed else None,
+        "candidateBytes": checkpoint.committed_bytes if committed else None,
+        "candidateDigest": digest[:12] if isinstance(digest, str) and len(digest) == 64 else None,
+        "canRetry": can_retry,
+        "canCancel": can_cancel,
+        "diagnosticCode": diagnostic,
     }
 
 
@@ -8798,10 +9081,13 @@ def list_workspace_runs(
             can_retry = (
                 can_mutate and task.status in ("failed", "cancelled")
                 and latest["attempt_number"] < task.max_attempts)
+            if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
+                can_retry = False
             can_cancel = can_mutate and task.status in ("queued", "running")
 
             checkpoint_view = None
             fanout_view = None
+            merge_view = None
             if task.task_kind == "linear_checkpoint_write":
                 checkpoint = s.get(DurableCheckpoint, task.id)
                 if checkpoint is not None:
@@ -8811,9 +9097,18 @@ def list_workspace_runs(
                 checkpoint = s.get(DurableCheckpoint, task.id)
                 fanout_view = _sanitized_bounded_fanout_jobs_view(
                     s, task, checkpoint, status_doc)
+            elif task.task_kind == "merge_columns_write":
+                checkpoint = s.get(DurableCheckpoint, task.id)
+                envelope = s.get(MergeColumnsTaskEnvelope, task.id)
+                if envelope is None:
+                    raise RuntimeError("merge columns Jobs envelope is unavailable")
+                merge_view = _sanitized_merge_columns_jobs_view(
+                    task, checkpoint, envelope, current_attempt_id=latest["id"],
+                    can_retry=can_retry, can_cancel=can_cancel)
             # Final outputs stay reserved for the Write receipt; never surface checkpoint URIs.
             outputs = status_doc.get("outputs") or []
-            if (task.task_kind in ("linear_checkpoint_write", "bounded_fanout_write")
+            if (task.task_kind in (
+                    "linear_checkpoint_write", "bounded_fanout_write", "merge_columns_write")
                     and task.status != "done"):
                 outputs = []
             candidates.append(((created_at, f"t:{task.id}"), {
@@ -8822,7 +9117,11 @@ def list_workspace_runs(
                 "targetNodeId": task.target_node_id, "targetPortId": None,
                 "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
                 "progress": _workspace_progress(task.progress),
-                "error": task.error, "inputManifest": task_doc["input_manifest"],
+                "error": (task.error if task.task_kind == "merge_columns_write"
+                          and task.error in _MERGE_COLUMNS_JOB_DIAGNOSTICS
+                          else None if task.task_kind == "merge_columns_write" else task.error),
+                "inputManifest": ([] if task.task_kind == "merge_columns_write"
+                                  else task_doc["input_manifest"]),
                 "executionManifestSha256": task.execution_manifest_sha256,
                 "executionManifestReconstructable": task.execution_manifest_sha256 is not None,
                 "outputs": outputs, "profile": None,
@@ -8837,7 +9136,10 @@ def list_workspace_runs(
                     "executionManifestReconstructable": (
                         item["execution_manifest_sha256"] is not None),
                     "status": item["status"], "progress": _workspace_progress(item["progress"]),
-                    "error": item["error"],
+                    "error": (item["error"] if task.task_kind == "merge_columns_write"
+                              and item["error"] in _MERGE_COLUMNS_JOB_DIAGNOSTICS
+                              else None if task.task_kind == "merge_columns_write"
+                              else item["error"]),
                     "startedAt": item["started_at"].isoformat() if item["started_at"] else None,
                     "completedAt": item["completed_at"].isoformat() if item["completed_at"] else None,
                     "updatedAt": _workspace_utc_iso(item["updated_at"]),
@@ -8845,7 +9147,8 @@ def list_workspace_runs(
                 "cancelRequested": task.cancel_requested,
                 "canRetry": can_retry,
                 "canCancel": can_cancel,
-                "writeIntent": task_doc["write_intent"],
+                "writeIntent": (None if task.task_kind == "merge_columns_write"
+                                else task_doc["write_intent"]),
                 "outputReceipt": task_doc["output_receipt"],
                 "externalWait": ({
                     "providerKind": task_doc["external_wait"]["provider_kind"],
@@ -8860,6 +9163,7 @@ def list_workspace_runs(
                 } if task.task_kind == "external_wait" and "external_wait" in task_doc else None),
                 **({"checkpoint": checkpoint_view} if checkpoint_view is not None else {}),
                 **({"boundedFanout": fanout_view} if fanout_view is not None else {}),
+                **({"mergeColumns": merge_view} if merge_view is not None else {}),
             }))
 
         # DatasetView reports are owner-scoped and deliberately have no Canvas. Project them through
@@ -11787,6 +12091,10 @@ def commit_linear_checkpoint(
         if (task is None or checkpoint is None or latest is None
                 or task.task_kind not in _CHECKPOINT_PARENT_KINDS):
             raise RuntimeError("checkpoint admission is incomplete")
+        envelope = (s.get(MergeColumnsTaskEnvelope, task_id, with_for_update=True)
+                    if task.task_kind == "merge_columns_write" else None)
+        if task.task_kind == "merge_columns_write" and envelope is None:
+            raise RuntimeError("merge columns checkpoint envelope is unavailable")
         _lock_local_result_registry(s)
         if checkpoint.phase == "committed":
             # Commit-before-response-loss: return the original evidence, never a fabricated one.
@@ -11846,6 +12154,9 @@ def commit_linear_checkpoint(
         checkpoint.schema_sha256 = schema_sha256
         checkpoint.committed_at = now
         checkpoint.updated_at = now
+        if envelope is not None:
+            envelope.phase = "candidate_committed"
+            envelope.updated_at = now
         s.flush()
         return _linear_checkpoint_committed_doc(s, task, checkpoint)
 
@@ -12076,6 +12387,12 @@ def release_linear_checkpoint(task_id: str) -> dict | None:
                 DurableTaskAttempt.task_id == task.id).with_for_update()):
             s.delete(attempt)
         s.flush()
+        if task.task_kind == "merge_columns_write":
+            envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+            if envelope is None:
+                raise RuntimeError("merge columns release envelope is unavailable")
+            s.delete(envelope)
+            s.flush()
         s.delete(task)
         return {"released": True, "uri": committed["uri"],
                 "namespace_id": committed["namespace_id"],
@@ -12131,6 +12448,18 @@ def linear_checkpoint_restore_audit() -> list[dict]:
             task = tasks.get(checkpoint.task_id)
             if task is None:
                 raise RuntimeError("restored checkpoint has no owning hidden task")
+            if task.task_kind == "merge_columns_write":
+                envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+                if envelope is None:
+                    raise RuntimeError("restored merge checkpoint has no immutable envelope")
+                _durable_task_admission(s, task)
+                if (checkpoint.phase == "committed"
+                        and envelope.phase not in (
+                            "candidate_committed", "publishing", "done", "failed", "cancelled")):
+                    raise RuntimeError("restored merge checkpoint phase is inconsistent")
+                if (checkpoint.phase != "committed"
+                        and envelope.phase in ("candidate_committed", "publishing", "done")):
+                    raise RuntimeError("restored merge envelope claims an absent candidate")
             if checkpoint.phase == "committed":
                 doc = _linear_checkpoint_committed_doc(s, task, checkpoint)
                 committed_keys.add(checkpoint.checkpoint_id)
@@ -15201,6 +15530,9 @@ class MergeColumnsPublicationContext:
 
     merge_doc: str
     merge_sha256: str
+    task_id: str | None = None
+    attempt_id: str | None = None
+    owner_token: str | None = None
 
 
 def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, str]:
@@ -15226,7 +15558,39 @@ def _canonical_merge_publication_context(
     if (canonical != merge_doc or not isinstance(merge_sha256, str)
             or hashlib.sha256(merge_doc.encode()).hexdigest() != merge_sha256):
         raise ValueError("merge publication context is invalid")
+    authority = (value.task_id, value.attempt_id, value.owner_token)
+    if any(item is None for item in authority) != all(item is None for item in authority):
+        raise ValueError("merge publication fence is incomplete")
+    if authority[0] is not None and any(
+            not isinstance(item, str) or not item or len(item) > 512 or "\x00" in item
+            for item in authority):
+        raise ValueError("merge publication fence is invalid")
     return value
+
+
+def _lock_merge_columns_publication_fence(
+        s, context: MergeColumnsPublicationContext) -> None:
+    """Hold the exact Task/Attempt fence through the catalog transaction's commit."""
+    if context.task_id is None:
+        return
+    task = _lock_durable_task_for_write(s, context.task_id)
+    attempt = s.get(DurableTaskAttempt, context.attempt_id, with_for_update=True)
+    envelope = s.get(MergeColumnsTaskEnvelope, context.task_id, with_for_update=True)
+    checkpoint = s.get(DurableCheckpoint, context.task_id, with_for_update=True)
+    now = _durable_task_db_now(s)
+    lease = attempt.lease_until if attempt is not None else None
+    if lease is not None and lease.tzinfo is None:
+        lease = lease.replace(tzinfo=datetime.timezone.utc)
+    if (task is None or attempt is None or envelope is None or checkpoint is None
+            or task.task_kind != "merge_columns_write" or task.status != "running"
+            or task.cancel_requested or attempt.task_id != task.id
+            or attempt.attempt_number != task.retry_count + 1
+            or attempt.status != "running" or attempt.owner_token != context.owner_token
+            or lease is None or lease <= now or envelope.phase != "publishing"
+            or checkpoint.phase != "committed" or envelope.merge_doc != context.merge_doc
+            or envelope.merge_sha256 != context.merge_sha256):
+        raise ManagedLocalWriteConflict(
+            "merge columns publication owner is stale or fenced")
 
 
 def _managed_local_write_receipt_in_session(
@@ -15600,6 +15964,11 @@ def catalog_publish_managed_local_file(
             raise ValueError("managed local write requires bounded non-negative bytes")
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
+        if merge_context is not None:
+            # The durable owner lock comes before every catalog/lineage lock and remains held until
+            # this transaction commits. A replacement claim therefore linearizes either wholly
+            # before this publication (which is rejected) or wholly after it.
+            _lock_merge_columns_publication_fence(s, merge_context)
         # Take the lineage reservation before the managed output projection. This matches the
         # composite-publication ordering used by the other catalog writers and keeps both effects
         # in this transaction: a lineage failure must roll back the new head and revision receipt.

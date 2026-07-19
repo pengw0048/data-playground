@@ -4083,6 +4083,123 @@
         "title": "DurableExternalWaitView",
         "type": "object"
       },
+      "DurableMergeColumnsView": {
+        "description": "Sanitized exact-candidate merge projection for Workspace Jobs.",
+        "properties": {
+          "baseDatasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Basedatasetid",
+            "type": "string"
+          },
+          "baseRevisionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Baserevisionid",
+            "type": "string"
+          },
+          "canCancel": {
+            "title": "Cancancel",
+            "type": "boolean"
+          },
+          "canRetry": {
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "candidate": {
+            "enum": [
+              "pending",
+              "committed"
+            ],
+            "title": "Candidate",
+            "type": "string"
+          },
+          "candidateBytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidatebytes"
+          },
+          "candidateDigest": {
+            "anyOf": [
+              {
+                "maxLength": 12,
+                "minLength": 12,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidatedigest"
+          },
+          "candidateRows": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidaterows"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "phase": {
+            "enum": [
+              "validating",
+              "merging",
+              "candidate_committed",
+              "publishing",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "reused": {
+            "title": "Reused",
+            "type": "boolean"
+          },
+          "sparseOutputId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Sparseoutputid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phase",
+          "baseDatasetId",
+          "baseRevisionId",
+          "sparseOutputId",
+          "candidate",
+          "reused",
+          "canRetry",
+          "canCancel"
+        ],
+        "title": "DurableMergeColumnsView",
+        "type": "object"
+      },
       "DurableTaskAttemptView": {
         "properties": {
           "attemptNumber": {
@@ -4272,7 +4389,8 @@
               "managed_local_write",
               "external_wait",
               "linear_checkpoint_write",
-              "bounded_fanout_write"
+              "bounded_fanout_write",
+              "merge_columns_write"
             ],
             "title": "Taskkind",
             "type": "string"
@@ -9962,6 +10080,16 @@
             ],
             "title": "Jobtype",
             "type": "string"
+          },
+          "mergeColumns": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableMergeColumnsView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "ms": {
             "anyOf": [

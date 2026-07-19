@@ -1598,6 +1598,26 @@ class DurableBoundedFanoutView(Wire):
     diagnostic_code: str | None = Field(default=None, max_length=64)
 
 
+class DurableMergeColumnsView(Wire):
+    """Sanitized exact-candidate merge projection for Workspace Jobs."""
+
+    phase: Literal[
+        "validating", "merging", "candidate_committed", "publishing",
+        "done", "failed", "cancelled",
+    ]
+    base_dataset_id: str = Field(min_length=1, max_length=128)
+    base_revision_id: str = Field(min_length=1, max_length=128)
+    sparse_output_id: str = Field(min_length=1, max_length=128)
+    candidate: Literal["pending", "committed"]
+    reused: bool
+    candidate_rows: int | None = Field(default=None, ge=0)
+    candidate_bytes: int | None = Field(default=None, ge=0)
+    candidate_digest: str | None = Field(default=None, min_length=12, max_length=12)
+    can_retry: bool
+    can_cancel: bool
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+
+
 class DurableDistributionReportView(Wire):
     """Sanitized exact-report identity and coverage summary for Workspace Jobs."""
 
@@ -1619,7 +1639,7 @@ class DurableTaskInboxItemView(Wire):
     canvas_name: str | None = None
     task_kind: Literal[
         "managed_local_write", "external_wait", "linear_checkpoint_write",
-        "bounded_fanout_write",
+        "bounded_fanout_write", "merge_columns_write",
     ]
     execution_manifest_sha256: PlanDigest | None = None
     execution_manifest_reconstructable: bool = False
@@ -1689,6 +1709,7 @@ class WorkspaceRunRecord(Wire):
     external_wait: DurableExternalWaitView | None = None
     checkpoint: DurableCheckpointView | None = None
     bounded_fanout: DurableBoundedFanoutView | None = None
+    merge_columns: DurableMergeColumnsView | None = None
     distribution_report: DurableDistributionReportView | None = None
 
     @model_validator(mode="after")
@@ -1726,6 +1747,8 @@ class WorkspaceRunRecord(Wire):
             data.pop("checkpoint", None)
         if self.bounded_fanout is None:
             data.pop("boundedFanout", None)
+        if self.merge_columns is None:
+            data.pop("mergeColumns", None)
         if self.distribution_report is None:
             data.pop("distributionReport", None)
         return data
