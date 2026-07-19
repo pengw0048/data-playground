@@ -48,6 +48,12 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: query })
   })
 
+  it('opens an exact retained distribution-report link in Jobs detail', () => {
+    const reportId = 'a'.repeat(32)
+    window.location.hash = `#/distribution-reports/${reportId}`
+    expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: `report=${reportId}` })
+  })
+
   it('round-trips Inbox filter query', () => {
     const query = new URLSearchParams({ filter: 'unread' }).toString()
     window.location.hash = routeHash('inbox', undefined, undefined, undefined, undefined, undefined, query)

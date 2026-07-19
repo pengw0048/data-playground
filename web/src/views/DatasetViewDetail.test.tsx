@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetViewDefinition, DatasetViewPreview, TemporalWindowV1 } from '../types/api'
 
-const mocks = vi.hoisted(() => ({ previewDatasetView: vi.fn(), deleteDatasetView: vi.fn() }))
+const mocks = vi.hoisted(() => ({ previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(), distributionReports: vi.fn(), estimateDistributionReport: vi.fn(), submitDistributionReport: vi.fn() }))
 vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
@@ -46,6 +46,7 @@ describe('DatasetViewDetail', () => {
       rows: [{ frame_id: 9, interaction: 'grasp' }], rowCount: 1000, hasMore: true, rowLimit: 100,
       sampleProvenance: DEFINITION.sampleProvenance,
     })
+    mocks.distributionReports.mockResolvedValue([])
   })
   afterEach(() => cleanup())
 

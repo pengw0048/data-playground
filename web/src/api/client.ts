@@ -1,7 +1,7 @@
 // Kernel HTTP client. The canvas builds fine with no kernel; data/preview/run need it.
 import type {
   CanvasKernelStatus,
-  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, Facets,
+  CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
@@ -290,6 +290,16 @@ export const api = {
     req<{ ok: boolean; deleted: boolean }>(`/dataset-views/${encodeURIComponent(viewId)}`, {
       method: 'DELETE',
     }),
+  estimateDistributionReport: (viewId: string) =>
+    req<DistributionReportEstimate>(`/dataset-views/${encodeURIComponent(viewId)}/distribution-reports/estimate`, { method: 'POST' }),
+  submitDistributionReport: (viewId: string, submissionId: string, confirmed = false) =>
+    req<DistributionReportEnvelope>(`/dataset-views/${encodeURIComponent(viewId)}/distribution-reports`, {
+      method: 'POST', body: JSON.stringify({ submissionId, confirmed }),
+    }),
+  distributionReports: (viewId: string) =>
+    req<DistributionReportEnvelope[]>(`/dataset-views/${encodeURIComponent(viewId)}/distribution-reports`),
+  distributionReport: (reportId: string) =>
+    req<DistributionReportEnvelope>(`/distribution-reports/${encodeURIComponent(reportId)}`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
@@ -635,7 +645,8 @@ export interface BoundedFanoutJobDto {
   gather: 'pending' | 'running' | 'committed'
   diagnosticCode?: string | null
 }
-export interface WorkspaceJobDto extends RunRecordDto { canvasId: string; canvasName: string; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null }
+export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
+export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; distributionReport?: DistributionReportJobDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {

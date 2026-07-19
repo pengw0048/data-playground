@@ -10,6 +10,7 @@ import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { CanvasCopyModal, type CanvasCopySource } from '../panels/CanvasCopyModal'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { DistributionReportPage } from './DistributionReports'
 
 const PAGE_SIZE = 50
 const STATUSES = ['', 'queued', 'running', 'done', 'failed', 'cancelled'] as const
@@ -62,7 +63,7 @@ export function JobsView() {
   const params = useMemo(() => new URLSearchParams(jobsQuery), [jobsQuery])
   const filterKey = useMemo(() => {
     const copy = new URLSearchParams(params)
-    copy.delete('run'); copy.delete('output')
+    copy.delete('run'); copy.delete('output'); copy.delete('report')
     return copy.toString()
   }, [params])
   const [items, setItems] = useState<WorkspaceJobDto[]>([])
@@ -152,13 +153,14 @@ export function JobsView() {
   const update = (name: string, value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set(name, value); else next.delete(name)
-    next.delete('run'); next.delete('output')
+    next.delete('run'); next.delete('output'); next.delete('report')
     setJobsQuery(next.toString())
   }
   const selectRun = (runId: string | null, output?: string) => {
     const next = new URLSearchParams(params)
     if (runId) next.set('run', runId); else next.delete('run')
     if (output) next.set('output', output); else next.delete('output')
+    next.delete('report')
     setJobsQuery(next.toString())
   }
   const selected = items.find((item) => jobKey(item) === params.get('run'))
@@ -200,7 +202,7 @@ export function JobsView() {
     const next = new URLSearchParams(params)
     next.set('canvas', canvasId)
     next.set('node', nodeId)
-    next.delete('run'); next.delete('output')
+    next.delete('run'); next.delete('output'); next.delete('report')
     setJobsQuery(next.toString())
   }
   const selectCanvas = (value: string) => {
@@ -209,7 +211,7 @@ export function JobsView() {
     // A node identity is scoped to its canvas. Do not leave an invisible stale node filter
     // behind when choosing a different canvas (or returning to all accessible canvases).
     next.delete('node')
-    next.delete('run'); next.delete('output')
+    next.delete('run'); next.delete('output'); next.delete('report')
     setJobsQuery(next.toString())
   }
   const freshness = lastSuccessfulRefresh == null
@@ -223,6 +225,13 @@ export function JobsView() {
         : hasActiveFirstPage
           ? `Live first page. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
           : `Snapshot; no active Jobs. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
+
+  const reportId = params.get('report')
+  if (reportId) return <DistributionReportPage reportId={reportId} onClose={() => {
+    const next = new URLSearchParams(params)
+    next.delete('report')
+    setJobsQuery(next.toString())
+  }} />
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -279,7 +288,7 @@ export function JobsView() {
           <div className="grid grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 border-b border-border bg-muted/40 px-3 py-2 text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
             <span>State</span><span>Canvas / node</span><span>Attempt / output</span><span>Backend</span><span>Timing</span><span>Recorded</span>
           </div>
-          {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={() => setCopySource({ canvasId: item.canvasId, subjectId: item.id, name: item.canvasName })} />)}
+          {items.map((item) => <JobRow key={item.id} item={item} expanded={selected?.id === item.id} onSelect={() => selectRun(selected?.id === item.id ? null : item.runId ?? item.id)} onOutput={(key) => selectRun(item.runId ?? item.id, key)} selectedOutput={params.get('output')} onAction={(action) => void act(item, action)} acting={acting.startsWith(`${item.runId ?? item.id}:`)} onClone={item.canvasId ? () => setCopySource({ canvasId: item.canvasId!, subjectId: item.id, name: item.canvasName || 'Untitled canvas' }) : undefined} />)}
         </div>}
         {loadMoreError && <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[12px] text-destructive">Couldn’t load more Jobs: {loadMoreError} <button className="ml-2 font-semibold underline" onClick={() => cursor && void load(cursor)}>Retry load more</button></div>}
         {hasMore && !loadMoreError && <Button variant="outline" className="mt-3 w-full" disabled={loadingMore || !cursor} onClick={() => cursor && void load(cursor)}>{loadingMore ? 'Loading…' : 'Load more'}</Button>}
@@ -323,7 +332,7 @@ function nodeChoiceValue(canvasId: string | null, nodeId: string | null): string
 function currentPageNodeChoices(items: WorkspaceJobDto[]) {
   const choices = new Map<string, { value: string; label: string }>()
   for (const item of items) {
-    if (!item.targetNodeId) continue
+    if (!item.targetNodeId || !item.canvasId) continue
     const value = nodeChoiceValue(item.canvasId, item.targetNodeId)
     if (choices.has(value)) continue
     const node = item.nodeLabel || `Node ${item.targetNodeId}`
@@ -341,18 +350,20 @@ function Filter({ label, name, value, onChange, placeholder }: { label: string; 
   return <label className="grid gap-1 text-[10.5px] text-muted-foreground">{label}<input aria-label={`Filter jobs by ${label.toLowerCase()}`} value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onBlur={() => onChange(name, draft.trim())} onKeyDown={(event) => { if (event.key === 'Enter') onChange(name, draft.trim()) }} className="h-8 min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
 }
 
-function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone: () => void }) {
+function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void }) {
   const token = statusTok[item.status as keyof typeof statusTok] ?? statusTok.draft
   const committed = item.outputs.filter((output) => output.outcome === 'committed')
   const rows = item.rows ?? item.profile?.rowCount ?? null
   const phase = jobPhase(item)
+  const report = item.distributionReport
+  const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}` : item.canvasName || 'Unavailable canvas'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
-      aria-label={`Open run ${item.runId ?? item.id} in ${item.canvasName}`}
+      aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
       className="grid w-full grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
       <span className="flex flex-wrap items-center gap-1.5"><span style={{ color: token.color }}>{token.glyph}</span><Badge variant="secondary" className="capitalize">{item.status}</Badge>{item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}</span>
-      <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{item.canvasName}</span><span className="block truncate text-muted-foreground">{item.nodeLabel || item.targetNodeId || 'Whole canvas'}</span></span>
-      <span className="min-w-0"><span className="block truncate font-mono text-[10.5px] text-muted-foreground" title={item.attempt}>{item.attempt}</span><span>{committed.length ? `${committed.length} retained output${committed.length === 1 ? '' : 's'}` : rows != null ? `${rows.toLocaleString()} rows` : 'No retained output'}</span></span>
+      <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{subject}</span><span className="block truncate text-muted-foreground">{report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report' : item.nodeLabel || item.targetNodeId || 'Whole canvas'}</span></span>
+      <span className="min-w-0"><span className="block truncate font-mono text-[10.5px] text-muted-foreground" title={item.attempt}>{item.attempt}</span><span>{report ? report.measuredRows == null ? 'Report pending' : `${report.measuredRows.toLocaleString()} measured rows` : committed.length ? `${committed.length} retained output${committed.length === 1 ? '' : 's'}` : rows != null ? `${rows.toLocaleString()} rows` : 'No retained output'}</span></span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
       <span className="text-muted-foreground">{item.ms != null ? fmtMs(item.ms) : 'In progress'}{rows != null && <span className="block">{rows.toLocaleString()} rows</span>}</span>
       <span className="text-[10.5px] text-muted-foreground">{item.createdAt ? new Date(item.createdAt).toLocaleString() : '—'}</span>
@@ -360,15 +371,16 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
     {expanded && <div className="grid gap-2 border-t border-border bg-muted/20 px-4 py-3 text-[11.5px] sm:grid-cols-2">
       <div className="grid gap-1"><div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
       <div className="flex flex-wrap content-start gap-2">
-        <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>
-        {item.targetNodeId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
+        {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
+        {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
+        {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
       </div>
-      <div className="sm:col-span-2">
+      {item.canvasId && <div className="sm:col-span-2">
         <ExecutionManifestDetail canvasId={item.canvasId} subjectId={item.id} summary={item} onClone={onClone} />
-      </div>
+      </div>}
       {item.taskId && <div className="grid gap-2 sm:col-span-2">
         {item.taskAttempts?.length ? <div><strong>Attempts:</strong><ol className="mt-1 grid gap-1">{item.taskAttempts.map((attempt) => <li key={attempt.id} className="rounded border border-border bg-background px-2 py-1"><span className="font-semibold">#{attempt.attemptNumber} {readable(attempt.status)}</span> · Progress {progressLabel(attempt.progress)} · Updated {updateLabel(attempt.updatedAt)}</li>)}</ol></div> : null}
         {item.externalWait && <div><strong>External provider:</strong> {item.externalWait.providerKind} · provider attempt #{item.externalWait.attemptNumber}</div>}
