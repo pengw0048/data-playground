@@ -97,6 +97,19 @@ async function openTerminalReport(page: Page, reportId: string, viewName: string
   await expect(page.getByText('Coverage before distributions')).toBeVisible()
 }
 
+async function waitForCompletedReport(page: Page, reportId: string) {
+  let report: ReportEnvelope | null = null
+  await expect.poll(async () => {
+    report = await json<ReportEnvelope>(
+      await page.request.get(`/api/distribution-reports/${encodeURIComponent(reportId)}`),
+      'load retained report',
+    )
+    if (report.task.status === 'failed') throw new Error('retained report failed')
+    return report.task.status
+  }, { timeout: 20_000 }).toBe('done')
+  return report!
+}
+
 test('runs known-small and confirmed retained reports, then reopens the exact terminal deep link', async ({ page }) => {
   test.setTimeout(60_000)
   const viewName = `Issue 430 exact distributions ${Date.now()}`
@@ -135,6 +148,49 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     expect(JSON.parse(knownSmallResponse.request().postData() ?? '{}')).toMatchObject({ confirmed: false })
     await expect(page.getByRole('dialog', { name: 'Confirm distribution report' })).toHaveCount(0)
     await openTerminalReport(page, knownSmall.reportId, viewName)
+
+    const secondKnownSmall = await json<ReportEnvelope>(
+      await page.request.post(`/api/dataset-views/${encodeURIComponent(view.id)}/distribution-reports`, { data: {
+        submissionId: randomUUID(), confirmed: false,
+      } }),
+      'submit second retained report',
+    )
+    await waitForCompletedReport(page, secondKnownSmall.reportId)
+    const compareUrl = `/#/distribution-reports/${encodeURIComponent(knownSmall.reportId)}?compare=${encodeURIComponent(secondKnownSmall.reportId)}`
+    await page.goto(compareUrl)
+    await expect(page.getByLabel('Compare with retained report')).toHaveValue(secondKnownSmall.reportId)
+    await expect(page.getByText('Coverage and identity before comparison')).toBeVisible()
+    await expect(page.getByText('Server-authorized deltas (comparison − current)').first()).toBeVisible()
+
+    const examplesResponse = page.waitForResponse((response) =>
+      response.url().startsWith(`${new URL(page.url()).origin}/api/distribution-reports/${knownSmall.reportId}/sections/`)
+      && response.url().endsWith('/examples'),
+    )
+    await page.getByRole('button', { name: 'View examples' }).first().click()
+    const examples = await json<{
+      reportId: string; datasetViewId: string; datasetId: string; revisionId: string
+      sectionId: string; bucketId: string; bucketKind: string; returnedRows: number; rowLimit: number; rows: unknown[]
+    }>(await examplesResponse, 'load bucket examples')
+    const drawer = page.getByRole('dialog', { name: 'Bucket examples' })
+    await expect(drawer).toContainText(knownSmall.reportId)
+    await expect(drawer).toContainText(view.id)
+    await expect(drawer).toContainText(`${examples.datasetId}@${examples.revisionId}`)
+    await expect(drawer).toContainText(`${examples.bucketKind} bucket`)
+    await expect(drawer).toContainText(`${examples.sectionId}/${examples.bucketId}`)
+    await expect(drawer).toContainText(`${examples.returnedRows} of ${examples.rowLimit} returned`)
+    expect(examples.rows.length).toBeLessThanOrEqual(examples.rowLimit)
+    await drawer.getByRole('button', { name: 'Close' }).click()
+
+    await page.reload()
+    await expect(page).toHaveURL(new RegExp(`#\\/distribution-reports\\/${knownSmall.reportId}\\?compare=${secondKnownSmall.reportId}$`))
+    await expect(page.getByText('Coverage and identity before comparison')).toBeVisible()
+    await page.getByRole('button', { name: 'Close' }).click()
+    await expect(page).toHaveURL(/#\/jobs$/)
+    await page.goBack()
+    await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?report=${knownSmall.reportId}&compare=${secondKnownSmall.reportId}$`))
+    await expect(page.getByText('Coverage and identity before comparison')).toBeVisible()
+    await page.goForward()
+    await expect(page).toHaveURL(/#\/jobs$/)
 
     largeSource = await json<RegisteredDataset>(await page.request.post('/api/catalog/upload', {
       headers: {
@@ -179,6 +235,11 @@ test('runs known-small and confirmed retained reports, then reopens the exact te
     const confirmed = await json<ReportEnvelope>(confirmedResponse, 'submit confirmed report')
     expect(JSON.parse(confirmedResponse.request().postData() ?? '{}')).toMatchObject({ confirmed: true })
     await openTerminalReport(page, confirmed.reportId, largeViewName)
+    await page.goto(`/#/distribution-reports/${encodeURIComponent(knownSmall.reportId)}?compare=${encodeURIComponent(confirmed.reportId)}`)
+    const crossViewSelect = page.getByLabel('Compare with retained report')
+    await expect(crossViewSelect).toHaveValue(confirmed.reportId)
+    await expect(crossViewSelect.locator('option:checked')).toHaveText(/^Linked report · /)
+    await expect(page.getByText('Coverage and identity before comparison')).toBeVisible()
   } finally {
     if (view) await page.request.delete(`/api/dataset-views/${encodeURIComponent(view.id)}`)
     if (largeView) await page.request.delete(`/api/dataset-views/${encodeURIComponent(largeView.id)}`)

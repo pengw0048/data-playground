@@ -248,6 +248,51 @@ export interface DistributionReportEnvelope {
   completedAt?: string | null
 }
 
+export interface DistributionReportIdentity {
+  reportId: string
+  datasetViewId: string
+  datasetId: string
+  revisionId: string
+  viewDefinitionSha256: string
+  computationVersion: string
+  measuredRows: number
+  complete: boolean
+  samplingIdentity: string
+  sampleProvenance?: SampleProvenance | null
+}
+export type DistributionMetricDelta =
+  | { kind: 'numeric'; countDelta: number; nonFiniteCountDelta: number; minDelta?: number | null; maxDelta?: number | null; meanDelta?: number | null; stddevDelta?: number | null; quantiles: Array<{ probability: number; valueDelta?: number | null }>; histogram?: Array<{ leftBucketId: string; rightBucketId: string; lower: number; upper: number; upperInclusive: boolean; countDelta: number }> | null; histogramReason: 'equal_edges' | 'unequal_edges' }
+  | { kind: 'categorical'; categories: Array<{ label: string | boolean; leftCount?: number | null; rightCount?: number | null; countDelta?: number | null; reason: 'present_in_both_top_k' | 'outside_left_top_k' | 'outside_right_top_k' }>; otherCountDelta?: number | null; otherCountReason: 'same_top_k' | 'different_top_k'; distinctCountDelta?: number | null; distinctCountReason: 'exact' | 'approximate' }
+  | { kind: 'temporal'; buckets?: Array<{ leftBucketId: string; rightBucketId: string; start: string; end: string; endInclusive: boolean; countDelta: number }> | null; bucketReason: 'equal_edges' | 'unequal_edges' }
+export interface DistributionReportComparison {
+  schemaVersion: 1
+  coverage: { left: DistributionReportIdentity; right: DistributionReportIdentity; comparable: boolean; reason: 'compatible_full_coverage' | 'same_deterministic_sample' | 'full_sample_coverage_mismatch' | 'different_deterministic_samples' }
+  columns: Array<{ matchReason: 'stable_field_identity' | 'name_and_logical_type'; fieldId?: string | null; leftColumn: ColumnSchema; rightColumn: ColumnSchema; leftSections: DistributionReportSection[]; rightSections: DistributionReportSection[]; comparable: boolean; reason: 'compatible' | 'coverage_mismatch' | 'computation_version_mismatch' | 'logical_type_mismatch' | 'section_kind_mismatch' | 'unsupported_section'; missingCountDelta?: number | null; metricDelta?: DistributionMetricDelta | null }>
+  unmatchedLeftColumns: ColumnSchema[]
+  unmatchedRightColumns: ColumnSchema[]
+}
+export interface DistributionReportBucketExamples {
+  schemaVersion: 1
+  reportId: string
+  datasetViewId: string
+  datasetId: string
+  revisionId: string
+  viewDefinitionSha256: string
+  computationVersion: string
+  samplingIdentity: string
+  sampleProvenance?: SampleProvenance | null
+  sectionId: string
+  bucketId: string
+  bucketKind: 'numeric' | 'categorical' | 'temporal'
+  columnName: string
+  bucketCount: number
+  exampleSemantics: 'bounded_examples_from_measured_bucket'
+  rowLimit: 100
+  returnedRows: number
+  truncated: boolean
+  rows: Array<Record<string, unknown>>
+}
+
 export type SchemaCompatibilityStatus = 'compatible' | 'breaking' | 'unknown'
 export interface SchemaFieldCompatibility {
   kind: 'unchanged' | 'renamed' | 'added' | 'removed' | 'changed'

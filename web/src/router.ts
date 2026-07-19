@@ -37,8 +37,14 @@ export function parseHash(): Route {
   if (seg === 'files' || seg === 'tables') return { view: 'workspace' }
   // Distribution reports are a Jobs detail, not a second navigation system. Preserve the exact
   // report identity in the Jobs route so browser reopen/back follows the same authorized surface.
-  if (seg === 'distribution-reports' && id) return {
-    view: 'jobs', jobsQuery: new URLSearchParams({ report: decodeURIComponent(id) }).toString(),
+  if (seg === 'distribution-reports') {
+    const report = id ? decodeURIComponent(id) : params.get('report')
+    if (report) {
+      const query = new URLSearchParams({ report })
+      const compare = params.get('compare')
+      if (compare) query.set('compare', compare)
+      return { view: 'jobs', jobsQuery: query.toString() }
+    }
   }
   if (seg === 'jobs') return { view: 'jobs', jobsQuery: params.toString() }
   if (seg === 'inbox') return { view: 'inbox', inboxQuery: params.toString() }
