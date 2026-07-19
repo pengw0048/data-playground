@@ -3935,8 +3935,10 @@ def sparse_output_admit(*, owner_id: str, canvas_id: str, submission_id: str,
         ).limit(1).with_for_update())
         inserted = False
         if existing is None:
-            result = s.execute(dialect_insert(SparseOutput).values(**values).on_conflict_do_nothing())
-            inserted = result.rowcount == 1
+            inserted = s.scalar(
+                dialect_insert(SparseOutput).values(**values).on_conflict_do_nothing()
+                .returning(SparseOutput.id)
+            ) is not None
         row = s.scalar(select(SparseOutput).where(
             SparseOutput.owner_id == owner_id,
             SparseOutput.canvas_id == canvas_id,
