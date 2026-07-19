@@ -113,6 +113,9 @@ def _case(local_catalog, tmp_path, table: pa.Table, *, projection: str,
     owner, canvas = f"u-{uuid.uuid4().hex}", f"c-{uuid.uuid4().hex}"
     with metadb.session() as s:
         s.add(metadb.User(id=owner, name=owner))
+        # The models intentionally have no ORM relationship. Flush the FK parent explicitly so the
+        # PostgreSQL acceptance path cannot depend on SQLAlchemy's order for unrelated pending mappers.
+        s.flush()
         s.add(metadb.Canvas(id=canvas, owner_id=owner, name=canvas, doc="{}"))
     exact = ExactDatasetRef(
         kind="exact", dataset_id=published["dataset_id"], revision_id=published["revision_id"])
