@@ -5238,6 +5238,12 @@ def _workspace_canvas_exists_clause():
     return exists(select(Canvas.id).where(Canvas.id == WorkspacePlacement.target_id))
 
 
+def _workspace_local_placement_visible_clause():
+    """Keep hidden external anchors and all of their placements out of ordinary local navigation."""
+    return ~exists(select(WorkspaceExternalOverlayAnchor.binding_id).where(
+        WorkspaceExternalOverlayAnchor.container_id == WorkspacePlacement.container_id))
+
+
 def _workspace_dataset_view_visible_clause(uid: str):
     return exists(select(DatasetView.id).where(
         DatasetView.id == WorkspacePlacement.target_id,
@@ -5281,6 +5287,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            _workspace_local_placement_visible_clause(),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5290,6 +5297,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "dataset",
+            _workspace_local_placement_visible_clause(),
             *([dataset_after] if dataset_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5300,6 +5308,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
             WorkspacePlacement.container_id == container_id,
             WorkspacePlacement.target_kind == "dataset_view",
             _workspace_dataset_view_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             *([view_after] if view_after is not None else []),
         ).order_by(
             WorkspacePlacement.ordinal,
@@ -5366,6 +5375,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         canvas_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "canvas",
             _workspace_canvas_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([canvas_after] if canvas_after is not None else []),
         ).order_by(
@@ -5374,6 +5384,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         ).limit(limit + 1)))
         dataset_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "dataset",
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([dataset_after] if dataset_after is not None else []),
         ).order_by(
@@ -5383,6 +5394,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
         view_placements = list(s.scalars(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == "dataset_view",
             _workspace_dataset_view_visible_clause(uid),
+            _workspace_local_placement_visible_clause(),
             _workspace_search_matches(WorkspacePlacement.name, tokens),
             *([view_after] if view_after is not None else []),
         ).order_by(
@@ -5457,7 +5469,8 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
             return {"resource": _workspace_container_resource(row),
                     "ancestors": _workspace_ancestors(s, row.parent_id) if row.parent_id else []}
         placement = s.scalar(select(WorkspacePlacement).where(
-            WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity))
+            WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity,
+            _workspace_local_placement_visible_clause()))
         if placement is None:
             raise KeyError(f"Workspace resource '{resource_id}' not found")
         if kind == "canvas" and s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:

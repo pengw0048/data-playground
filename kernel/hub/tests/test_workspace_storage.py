@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 import sqlite3
@@ -14,7 +15,7 @@ from typing import cast
 import pytest
 from fastapi import WebSocket
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, event, select
+from sqlalchemy import delete, event, select, update
 
 from hub import db, main as hub_main, metadb, workspace_providers
 from hub.catalog_provider import (
@@ -1113,6 +1114,11 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert created.status_code == 200, created.text
             created_doc = created.json()
             created_ids.append(created_doc["id"])
+            hidden_search = client.get("/api/workspace/search", params={"q": "Local overlay canvas"})
+            assert hidden_search.status_code == 200, hidden_search.text
+            assert all(item["id"] != f"canvas:{created_doc['id']}"
+                       for group in hidden_search.json()["groups"] for item in group["items"])
+            assert client.get(f"/api/workspace/resources/canvas:{created_doc['id']}").status_code == 404
             replay = client.post("/api/workspace/canvases", json=create_body)
             assert replay.status_code == 200, replay.text
             assert replay.json() == created_doc
@@ -1158,6 +1164,29 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
                 assert len(list(session.scalars(select(metadb.Canvas.id).where(
                     metadb.Canvas.id == parallel_results[0]["id"])))) == 1
 
+            ensure_calls: list[str] = []
+            ensure_anchor = metadb.workspace_provider_ensure_overlay_anchor
+            write_sessions = 0
+            workspace_write_session = metadb._workspace_write_session
+
+            def counted_ensure(binding_id: str) -> dict:
+                ensure_calls.append(binding_id)
+                return ensure_anchor(binding_id)
+
+            @contextlib.contextmanager
+            def counted_write_session():
+                nonlocal write_sessions
+                write_sessions += 1
+                with workspace_write_session() as session:
+                    yield session
+
+            monkeypatch.setattr(metadb, "workspace_provider_ensure_overlay_anchor", counted_ensure)
+            monkeypatch.setattr(metadb, "_workspace_write_session", counted_write_session)
+            assert client.get(f"/api/workspace/resources/{remote['id']}").status_code == 200
+            assert client.get(f"/api/workspace/resources/{remote['id']}").status_code == 200
+            assert ensure_calls == []
+            assert write_sessions == 0
+
             # Provider display rename/move only refreshes binding snapshots; the local placement
             # stays on this binding generation's anchor.
             parent = CatalogResource(id="parent-a", kind="container", name="New provider parent")
@@ -1198,6 +1227,17 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert replacement["localPlacement"]["containerId"] != anchor_id
     finally:
         with metadb.session() as session:
+            if metadb._is_sqlite_database():
+                session.connection().exec_driver_sql("PRAGMA foreign_keys = ON")
+            anchors = list(session.scalars(select(metadb.WorkspaceExternalOverlayAnchor).where(
+                metadb.WorkspaceExternalOverlayAnchor.mount_id == mount_id)))
+            anchor_ids = [anchor.container_id for anchor in anchors]
+            if anchor_ids:
+                # A moved pre-existing Canvas is not test-owned. Restore its visible parent before
+                # deleting the hidden container so this cleanup exercises real FK enforcement.
+                session.execute(update(metadb.WorkspacePlacement).where(
+                    metadb.WorkspacePlacement.container_id.in_(anchor_ids)).values(
+                    container_id=root["id"], version=metadb.WorkspacePlacement.version + 1))
             if created_ids:
                 placement_ids = list(session.scalars(select(metadb.WorkspacePlacement.id).where(
                     metadb.WorkspacePlacement.target_kind == "canvas",
@@ -1207,8 +1247,6 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
                     session.execute(delete(metadb.WorkspacePlacement).where(
                         metadb.WorkspacePlacement.id.in_(placement_ids)))
                 session.execute(delete(metadb.Canvas).where(metadb.Canvas.id.in_(created_ids)))
-            anchors = list(session.scalars(select(metadb.WorkspaceExternalOverlayAnchor).where(
-                metadb.WorkspaceExternalOverlayAnchor.mount_id == mount_id)))
             session.execute(delete(metadb.WorkspaceExternalOverlayAnchor).where(
                 metadb.WorkspaceExternalOverlayAnchor.mount_id == mount_id))
             for anchor in anchors:
@@ -1218,6 +1256,42 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
                 session.execute(delete(metadb.CanvasShare).where(
                     metadb.CanvasShare.user_id.in_(principal_ids)))
                 session.execute(delete(metadb.User).where(metadb.User.id.in_(principal_ids)))
+
+
+def test_workspace_degraded_container_binding_lazily_installs_anchor(workspace_scope, monkeypatch):
+    """A pre-0034 cached binding gets a local capability even when its provider cannot activate."""
+    root = metadb.local_workspace_root()
+    mount_id = f"overlay-degraded-{uuid.uuid4().hex}"
+    binding = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id, provider="fixture", container_id=root["id"], resource_id="container-a",
+        kind="container", name="Cached container")
+    assert metadb.workspace_provider_overlay_anchor(binding["bindingId"]) is None
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": root["id"],
+    }]))
+
+    def unavailable_provider(_name):
+        raise LookupError("adapter unavailable")
+
+    monkeypatch.setattr(workspace_providers, "_load_provider", unavailable_provider)
+    ref = f"container:{workspace_providers._external_identity(mount_id, 'container-a', binding['bindingId'])}"
+    try:
+        with TestClient(app) as client:
+            response = client.get(f"/api/workspace/resources/{ref}")
+            assert response.status_code == 200, response.text
+            resource = response.json()["resource"]
+            assert resource["referenceState"] == "provider_error"
+            assert resource["localPlacement"]["writable"] is True
+            assert resource["localPlacement"]["recoveryState"] == "ready"
+        anchor = metadb.workspace_provider_overlay_anchor(binding["bindingId"])
+        assert anchor is not None
+        assert (anchor["mountId"], anchor["resourceId"]) == (mount_id, "container-a")
+    finally:
+        with metadb.session() as session:
+            anchor = session.get(metadb.WorkspaceExternalOverlayAnchor, binding["bindingId"])
+            if anchor is not None:
+                session.delete(anchor)
+                session.delete(session.get(metadb.WorkspaceContainer, anchor.container_id))
 
 
 def test_workspace_provider_reference_recovery_detach_and_explicit_relink(

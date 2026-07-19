@@ -388,7 +388,7 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     }
 
 
-def _binding_resource(binding: dict, mounted: _MountedProvider, *, ensure_anchor: bool = False) -> dict:
+def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
     identity = _external_identity(
         binding["mountId"], binding["resourceId"], binding["bindingId"])
     parent = (
@@ -400,12 +400,13 @@ def _binding_resource(binding: dict, mounted: _MountedProvider, *, ensure_anchor
         if parent is not None else f"container:{binding['containerId']}"
     )
     state = binding["referenceState"]
-    anchor = (
-        metadb.workspace_provider_ensure_overlay_anchor(binding["bindingId"])
-        if ensure_anchor and binding["kind"] == "container"
-        else metadb.workspace_provider_overlay_anchor(binding["bindingId"])
-        if binding["kind"] == "container" else None
-    )
+    anchor = (metadb.workspace_provider_overlay_anchor(binding["bindingId"])
+              if binding["kind"] == "container" else None)
+    if anchor is None and binding["kind"] == "container":
+        # The normal path is a pure metadata read.  A legacy 0033 binding has no anchor until its
+        # first display, including when its provider is currently unavailable, so only that miss
+        # takes the narrow Workspace write lock to install the durable local capability.
+        anchor = metadb.workspace_provider_ensure_overlay_anchor(binding["bindingId"])
     local_placement = None
     if anchor is not None:
         local_placement = {
@@ -457,7 +458,7 @@ def _workspace_resource(
         parent_binding_id=parent_binding_id,
         parent_is_known=parent_is_known,
     )
-    return _binding_resource(binding, mounted, ensure_anchor=item.kind == "container")
+    return _binding_resource(binding, mounted)
 
 
 def _source_status(
@@ -951,8 +952,6 @@ def relink(
         name=resolved.item.name,
         parent_binding_id=parent_binding_id,
     )
-    if fresh["kind"] == "container":
-        metadb.workspace_provider_ensure_overlay_anchor(fresh["bindingId"])
     return {
         "ok": True,
         "resource": _binding_resource(fresh, mounted),
