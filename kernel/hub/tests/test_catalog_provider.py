@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -33,6 +34,14 @@ def _resources(uri: str) -> list[dict]:
         {"id": "nested-dataset", "kind": "dataset", "name": "nested", "parentId": "container-a",
          "uri": uri + "/nested", "columns": [{"name": "id", "type": "int64"}]},
     ]
+
+
+def _provider_root_snapshot(root: Path) -> dict[str, str]:
+    """Tripwire the provider-owned fixture bytes around Data Playground actions."""
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*")) if path.is_file()
+    }
 
 
 def test_file_provider_keeps_mount_config_identity_and_duplicate_names_isolated(tmp_path, monkeypatch):
@@ -244,6 +253,7 @@ print('installed provider Workspace composition passed')
     assert composed.stdout.strip().endswith("installed provider Workspace composition passed")
 
     acceptance_state = tmp_path / "provider-acceptance.json"
+    provider_root_before_actions = _provider_root_snapshot(root)
     journey = _run([str(python), "-c", r'''
 import json
 import os
@@ -252,6 +262,7 @@ import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from hub import metadb
 from hub.main import app
@@ -263,18 +274,50 @@ with TestClient(app) as client:
     )
     assert root.status_code == 200, root.text
     page = root.json()
+    remote = next(
+        item for item in page["items"]
+        if item.get("mountId") == "wheel-a" and item.get("resourceId") == "container-a"
+    )
+    assert remote["providerMutation"] is False
+    capability = remote["localPlacement"]
+    assert capability["recoveryState"] == "ready"
+    remote_id = remote["id"].removeprefix("container:")
+    nested = client.get(f"/api/workspace/containers/{remote_id}", params={"limit": 100})
+    assert nested.status_code == 200, nested.text
+    assert any(item.get("resourceId") == "nested-dataset" for item in nested.json()["items"])
     resource = next(
         item for item in page["items"]
         if item.get("mountId") == "wheel-a" and item.get("resourceId") == "dataset-a"
     )
-    created = client.post("/api/workspace/canvases", json={
-        "containerId": metadb.LOCAL_WORKSPACE_ROOT_ID,
-        "expectedContainerVersion": page["container"]["version"],
+    create_body = {
+        "requestId": "00000000-0000-4000-8000-000000000615",
+        "containerId": capability["containerId"],
+        "expectedContainerVersion": capability["containerVersion"],
         "name": "Installed provider exact journey",
         "providerDatasetRefs": [resource["id"]],
-    })
+    }
+    created = client.post("/api/workspace/canvases", json=create_body)
     assert created.status_code == 200, created.text
-    canvas_id = created.json()["id"]
+    created_doc = created.json()
+    replay = client.post("/api/workspace/canvases", json=create_body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == created_doc
+    canvas_id = created_doc["id"]
+    assert created_doc["resource"]["parentId"] == remote["id"]
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(metadb.Canvas).where(
+            metadb.Canvas.owner_id == metadb.DEFAULT_USER_ID,
+            metadb.Canvas.name == create_body["name"],
+        )) == 1
+        assert session.scalar(select(func.count()).select_from(metadb.WorkspacePlacement).where(
+            metadb.WorkspacePlacement.target_kind == "canvas",
+            metadb.WorkspacePlacement.target_id == canvas_id,
+        )) == 1
+        assert session.scalar(select(func.count()).select_from(
+            metadb.WorkspaceCanvasCreateReplay).where(
+                metadb.WorkspaceCanvasCreateReplay.owner_id == metadb.DEFAULT_USER_ID,
+                metadb.WorkspaceCanvasCreateReplay.request_id == create_body["requestId"],
+            )) == 1
     graph_response = client.get(f"/api/canvas/{canvas_id}")
     assert graph_response.status_code == 200, graph_response.text
     graph = graph_response.json()
@@ -285,6 +328,61 @@ with TestClient(app) as client:
     assert config["datasetRef"]["revisionId"] == "provider-dataset-a-v1"
     assert os.environ["DP_CATALOG_MOUNTS"] not in json.dumps(graph)
     assert str(Path(os.environ["DP_WORKSPACE"]).parent / "catalog") not in json.dumps(graph)
+
+    # A stale destination version is rejected before the placement can move.  Then prove a local
+    # move and undo preserve the overlay's opaque capability rather than touching the provider.
+    destination = metadb.workspace_create_container(
+        metadb.LOCAL_WORKSPACE_ROOT_ID, "Installed wheel stale marker")
+    current_destination = metadb.workspace_update_container(
+        destination["id"], expected_version=destination["version"],
+        name="Installed wheel move destination")
+    stale_move = client.put(
+        f"/api/workspace/placements/{created_doc['resource']['placementId']}/canvas", json={
+            "containerId": destination["id"],
+            "expectedContainerVersion": destination["version"],
+            "expectedVersion": created_doc["resource"]["version"],
+        })
+    assert stale_move.status_code == 409, stale_move.text
+    unchanged = client.get(f"/api/workspace/resources/canvas:{canvas_id}")
+    assert unchanged.status_code == 200, unchanged.text
+    assert unchanged.json()["resource"]["parentId"] == remote["id"]
+    moved = client.put(
+        f"/api/workspace/placements/{created_doc['resource']['placementId']}/canvas", json={
+            "containerId": destination["id"],
+            "expectedContainerVersion": current_destination["version"],
+            "expectedVersion": unchanged.json()["resource"]["version"],
+        })
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["resource"]["parentId"] == f"container:{destination['id']}"
+    placement_destination = metadb.workspace_create_container(
+        metadb.LOCAL_WORKSPACE_ROOT_ID, "Installed wheel placement CAS target")
+    stale_placement = client.put(
+        f"/api/workspace/placements/{created_doc['resource']['placementId']}/canvas", json={
+            "containerId": placement_destination["id"],
+            "expectedContainerVersion": placement_destination["version"],
+            "expectedVersion": created_doc["resource"]["version"],
+        })
+    assert stale_placement.status_code == 409, stale_placement.text
+    after_stale_placement = client.get(f"/api/workspace/resources/canvas:{canvas_id}")
+    assert after_stale_placement.status_code == 200, after_stale_placement.text
+    assert after_stale_placement.json()["resource"]["parentId"] == \
+        f"container:{destination['id']}"
+    assert after_stale_placement.json()["resource"]["version"] == \
+        moved.json()["resource"]["version"]
+    with metadb.session() as session:
+        placement = session.get(
+            metadb.WorkspacePlacement, created_doc["resource"]["placementId"])
+        assert placement is not None
+        assert placement.container_id == destination["id"]
+        assert placement.version == moved.json()["resource"]["version"]
+    undo = client.put(
+        f"/api/workspace/placements/{created_doc['resource']['placementId']}/canvas", json={
+            "containerId": capability["containerId"],
+            "expectedContainerVersion": capability["containerVersion"],
+            "expectedVersion": moved.json()["resource"]["version"],
+        })
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["resource"]["parentId"] == remote["id"]
 
     from hub.deps import get_deps
     physical = get_deps().resolve_adapter(config["uri"])
@@ -371,13 +469,15 @@ with TestClient(app) as client:
     assert "dp-file-catalog://" not in json.dumps(manifest)
     Path(os.environ["ACCEPTANCE_STATE"]).write_text(json.dumps({
         "canvas_id": canvas_id, "run_id": run_id, "source_id": source["id"],
-        "input_manifest": inputs,
+        "input_manifest": inputs, "remote_resource_id": remote["id"],
+        "remote_binding_id": remote["bindingId"], "anchor": capability,
     }))
 print("installed provider exact run passed")
 '''], cwd=tmp_path, env={**mixed_env, "ACCEPTANCE_STATE": str(acceptance_state)})
     assert journey.returncode == 0, journey.stderr
     assert journey.stdout.strip().endswith("installed provider exact run passed")
     assert "dp-file-catalog://" not in journey.stdout + journey.stderr
+    assert _provider_root_snapshot(root) == provider_root_before_actions
 
     restarted = _run([str(python), "-c", r'''
 import json
@@ -386,6 +486,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from hub import metadb
 from hub.main import app
 
 state = json.loads(Path(os.environ["ACCEPTANCE_STATE"]).read_text())
@@ -411,10 +512,93 @@ with TestClient(app) as client:
         f"/api/canvas/{state['canvas_id']}/runs/{history['id']}/manifest")
     assert manifest.status_code == 200, manifest.text
     assert manifest.json()["availability"] == "available"
+    reopened = client.get(f"/api/workspace/resources/canvas:{state['canvas_id']}")
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["resource"]["parentId"] == state["remote_resource_id"]
+    assert reopened.json()["ancestors"][-1]["id"] == state["remote_resource_id"]
+    remote = client.get(f"/api/workspace/resources/{state['remote_resource_id']}")
+    assert remote.status_code == 200, remote.text
+    assert remote.json()["resource"]["bindingId"] == state["remote_binding_id"]
+    assert remote.json()["resource"]["localPlacement"] == state["anchor"]
+    anchor = metadb.workspace_provider_overlay_anchor(state["remote_binding_id"])
+    assert anchor is not None
+    assert {
+        key: anchor[key] for key in ("containerId", "containerVersion", "recoveryState")
+    } == {
+        key: state["anchor"][key] for key in ("containerId", "containerVersion", "recoveryState")
+    }
 print("installed provider restart evidence passed")
 '''], cwd=tmp_path, env={**mixed_env, "ACCEPTANCE_STATE": str(acceptance_state)})
     assert restarted.returncode == 0, restarted.stderr
     assert restarted.stdout.strip().endswith("installed provider restart evidence passed")
+    assert _provider_root_snapshot(root) == provider_root_before_actions
+
+    # Fixture-directed provider rewrites are deliberately outside the provider-byte baseline above.
+    # They certify the ABA fence: a same-ID recreation stays detached until an explicit relink.
+    relink = _run([str(python), "-c", r'''
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from hub import metadb
+from hub.main import app
+
+state = json.loads(Path(os.environ["ACCEPTANCE_STATE"]).read_text())
+catalog = Path(os.environ["PROVIDER_CATALOG"])
+
+def provider_snapshot(root):
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*")) if path.is_file()
+    }
+
+with TestClient(app) as client:
+    catalog.write_text(json.dumps({"resources": []}))
+    empty_baseline = provider_snapshot(catalog.parent)
+    detached = client.get(f"/api/workspace/resources/{state['remote_resource_id']}")
+    assert detached.status_code == 200, detached.text
+    assert detached.json()["resource"]["referenceState"] == "detached"
+    assert detached.json()["resource"]["localPlacement"] == state["anchor"]
+    assert provider_snapshot(catalog.parent) == empty_baseline
+
+    catalog.write_text(json.dumps({"resources": [{
+        "id": "container-a", "kind": "container", "name": "shared",
+    }]}))
+    recreated_baseline = provider_snapshot(catalog.parent)
+    still_detached = client.get(f"/api/workspace/resources/{state['remote_resource_id']}")
+    assert still_detached.status_code == 200, still_detached.text
+    assert still_detached.json()["resource"]["referenceState"] == "detached"
+    assert still_detached.json()["resource"]["bindingId"] == state["remote_binding_id"]
+
+    relinked = client.post(f"/api/workspace/resources/{state['remote_resource_id']}/relink", json={
+        "mountId": "wheel-a", "resourceId": "container-a",
+    })
+    assert relinked.status_code == 200, relinked.text
+    replacement = relinked.json()["resource"]
+    assert replacement["bindingId"] != state["remote_binding_id"]
+    assert replacement["localPlacement"]["containerId"] != state["anchor"]["containerId"]
+    replacement_binding = metadb.workspace_provider_binding(replacement["bindingId"])
+    assert replacement_binding is not None
+    assert replacement_binding["relinkedFromId"] == state["remote_binding_id"]
+    assert provider_snapshot(catalog.parent) == recreated_baseline
+print("installed provider explicit relink passed")
+'''], cwd=tmp_path, env={
+        **mixed_env, "ACCEPTANCE_STATE": str(acceptance_state),
+        "PROVIDER_CATALOG": str(root / "catalog.json"),
+    })
+    assert relink.returncode == 0, relink.stderr
+    assert relink.stdout.strip().endswith("installed provider explicit relink passed")
+    print("PROVIDER_OVERLAY_ACCEPTANCE: " + json.dumps({
+        "installed_wheel": "passed",
+        "create_replay_rows": 1,
+        "cas_fences": ["container_version", "placement_version"],
+        "provider_mutations": 0,
+        "relink": "new_binding_and_anchor",
+        "restart": "reopenable",
+    }, sort_keys=True))
 
     mutable = _run([str(python), "-c", r'''
 import os

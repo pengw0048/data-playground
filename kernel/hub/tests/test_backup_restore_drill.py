@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 import pytest
 import pyarrow as pa
 import pyarrow.parquet as pq
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.engine.url import make_url
 
@@ -27,6 +28,7 @@ from hub import bounded_fanout, external_wait_tasks, handoff, linear_checkpoint,
 from hub.execution_manifest import build_execution_manifest
 from hub.external_wait import ExternalWaitCheckpoint, ExternalWaitPollOutcome
 from hub.local_run_inputs import finalize_local_file_candidates, snapshot_local_file_input
+from hub.main import app
 from hub.models import (
     CatalogTable,
     Graph,
@@ -737,6 +739,53 @@ def _seed_durable_tasks(
     }
 
 
+def _seed_overlay_recovery_fixture() -> dict:
+    """Seed only durable overlay metadata; no provider bytes or configuration are retained."""
+    root = metadb.local_workspace_root()
+    overlays: dict[str, dict] = {}
+    for label, state in (("active", "current"), ("detached", "detached")):
+        binding = metadb.workspace_provider_cache_resource(
+            mount_id="backup-drill-overlay",
+            provider="backup-drill-provider",
+            container_id=root["id"],
+            resource_id=f"overlay-{label}",
+            kind="container",
+            name=f"Backup {label} overlay",
+        )
+        anchor = metadb.workspace_provider_ensure_overlay_anchor(binding["bindingId"])
+        request_id = f"backup-drill-overlay-{label}"
+        intent = {
+            "containerId": anchor["containerId"],
+            "expectedContainerVersion": anchor["containerVersion"],
+            "name": f"Backup {label} overlay Canvas",
+            "datasetIds": [],
+            "providerDatasetRefs": [],
+            "transform": None,
+        }
+        created = metadb.workspace_create_canvas_action(
+            uid=metadb.DEFAULT_USER_ID,
+            container_id=anchor["containerId"],
+            expected_container_version=anchor["containerVersion"],
+            name=intent["name"],
+            request_id=request_id,
+            request_intent=intent,
+        )
+        if state == "detached":
+            binding = metadb.workspace_provider_mark_binding(
+                binding["bindingId"], state="detached", error="fixture resource removed")
+        overlays[label] = {
+            "binding_id": binding["bindingId"],
+            "binding_state": state,
+            "anchor": anchor,
+            "canvas_id": created["id"],
+            "placement_id": created["resource"]["placementId"],
+            "request_id": request_id,
+            "intent": intent,
+            "replay": created,
+        }
+    return overlays
+
+
 def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
                   provider: _ClaimProvider) -> dict:
     metadb.init_db()
@@ -771,6 +820,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     workspace_placement = metadb.workspace_create_placement(
         workspace_container["id"], target_kind="canvas", target_id=canvas_id,
         name="backup-restore-drill")
+    overlays = _seed_overlay_recovery_fixture()
 
     metadb.catalog_upsert_entry(
         parent_uri, "drill-parent",
@@ -994,6 +1044,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "canvas_id": canvas_id,
         "workspace_container_id": workspace_container["id"],
         "workspace_placement_id": workspace_placement["id"],
+        "overlays": overlays,
         "parent_uri": parent_uri,
         "child_uri": child_uri,
         "lineage_publication_key": lineage_publication_key,
@@ -1086,6 +1137,54 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
     restored_file = outputs_root / info["artifact_rel"]
     assert restored_file.is_file()
     assert restored_file.read_bytes() == info["artifact_bytes"]
+
+
+def _assert_overlay_recovery(info: dict) -> None:
+    """The backup retains only local overlay identities, not provider bytes or configuration."""
+    observed_states: dict[str, dict[str, str]] = {}
+    for label, expected in info["overlays"].items():
+        binding = metadb.workspace_provider_binding(expected["binding_id"])
+        assert binding is not None
+        assert binding["referenceState"] == expected["binding_state"]
+        assert binding["mountId"] == "backup-drill-overlay"
+        assert binding["resourceId"] == f"overlay-{label}"
+        serialized = json.dumps(binding, sort_keys=True, default=str)
+        assert "config" not in serialized.lower()
+        assert "uri" not in serialized.lower()
+
+        anchor = metadb.workspace_provider_overlay_anchor(expected["binding_id"])
+        assert anchor == expected["anchor"]
+        replay = metadb.workspace_canvas_create_replay(
+            uid=metadb.DEFAULT_USER_ID,
+            request_id=expected["request_id"],
+            intent=expected["intent"],
+        )
+        assert replay == expected["replay"]
+        with metadb.session() as session:
+            canvas = session.get(metadb.Canvas, expected["canvas_id"])
+            placement = session.get(metadb.WorkspacePlacement, expected["placement_id"])
+            assert canvas is not None and canvas.name == expected["intent"]["name"]
+            assert placement is not None
+            assert placement.target_id == expected["canvas_id"]
+            assert placement.container_id == expected["anchor"]["containerId"]
+
+        # Canvas reopen stays local.  The resource deep link also survives without restoring an
+        # external provider mount; its provider source may honestly report unavailable.
+        with TestClient(app) as client:
+            reopened = client.get(f"/api/canvas/{expected['canvas_id']}")
+            assert reopened.status_code == 200, reopened.text
+            deep_link = client.get(f"/api/workspace/resources/canvas:{expected['canvas_id']}")
+            assert deep_link.status_code == 200, deep_link.text
+            assert deep_link.json()["resource"]["placementId"] == expected["placement_id"]
+        reopened_binding = metadb.workspace_provider_binding(expected["binding_id"])
+        assert reopened_binding is not None
+        if label == "detached":
+            assert reopened_binding["referenceState"] == "detached"
+        observed_states[label] = {
+            "restored_state": binding["referenceState"],
+            "post_reopen_state": reopened_binding["referenceState"],
+        }
+    info["overlay_recovery_evidence"] = observed_states
 
 
 def _assert_revision_recovery(
@@ -1731,6 +1830,23 @@ def _emit_evidence(info: dict, rto_ms: int) -> None:
         f"alembic={info['alembic_head']} release_sha={info['release_sha']}",
         flush=True,
     )
+    print(
+        "BACKUP_RESTORE_OVERLAY_EVIDENCE: "
+        + json.dumps({
+            label: {
+                "binding": "preserved",
+                "anchor": "preserved",
+                "placement": "preserved",
+                "canvas": "reopenable",
+                "replay": "preserved",
+                "restored_state": info["overlay_recovery_evidence"][label]["restored_state"],
+                "post_reopen_state": info["overlay_recovery_evidence"][label][
+                    "post_reopen_state"],
+            }
+            for label in info["overlays"]
+        }, sort_keys=True),
+        flush=True,
+    )
     print(f"BACKUP_RESTORE_DRILL RTO_MS: {rto_ms}", flush=True)
 
 
@@ -1915,6 +2031,7 @@ def test_sqlite_isolated_restore_drill(tmp_path, monkeypatch):
                 exact_storage = LocalStorage(str(source_outputs))
                 try:
                     _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
+                    _assert_overlay_recovery(info)
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
@@ -1995,7 +2112,9 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
                           metadb.RunInputAdmission, metadb.DurableTask,
                           metadb.DurableTaskAttempt, metadb.DurableTaskInboxItem,
-                          metadb.ObjectAttempt):
+                          metadb.ObjectAttempt, metadb.WorkspaceProviderBinding,
+                          metadb.WorkspaceExternalOverlayAnchor,
+                          metadb.WorkspaceCanvasCreateReplay):
                 source_row_counts[model.__tablename__] = session.scalar(
                     select(func.count()).select_from(model))
         source_outputs_fp = _tree_fingerprint(source_outputs)
@@ -2049,6 +2168,14 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
 
         _switch_db(restore_url)
         metadb.init_db()
+        # Compare the restored database before TestClient deep links can truthfully degrade an
+        # active binding whose provider configuration is intentionally outside the backup.
+        with metadb.session() as session:
+            for model in (metadb.WorkspaceProviderBinding,
+                          metadb.WorkspaceExternalOverlayAnchor,
+                          metadb.WorkspaceCanvasCreateReplay):
+                assert session.scalar(select(func.count()).select_from(model)) == \
+                    source_row_counts[model.__tablename__]
         _assert_backup_identity(
             restore_ws / "version.json", info, db="postgresql", storage="s3")
         assert metadb.object_storage_namespace() == info["namespace"]
@@ -2062,6 +2189,7 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                 try:
                     assert Path(info["artifact_uri"]).is_file()
                     _assert_fixture_readable(info, outputs_root=restore_ws / "outputs")
+                    _assert_overlay_recovery(info)
                     _assert_revision_recovery(
                         info, outputs_root=restore_ws / "outputs",
                         exact_storage=exact_storage)
@@ -2089,7 +2217,9 @@ def test_postgres_object_store_isolated_restore_drill(tmp_path, monkeypatch):
                           metadb.CatalogLogicalDataset, metadb.ManagedLocalFileRevision,
                           metadb.RunInputAdmission, metadb.DurableTask,
                           metadb.DurableTaskAttempt, metadb.DurableTaskInboxItem,
-                          metadb.ObjectAttempt):
+                          metadb.ObjectAttempt, metadb.WorkspaceProviderBinding,
+                          metadb.WorkspaceExternalOverlayAnchor,
+                          metadb.WorkspaceCanvasCreateReplay):
                 assert session.scalar(select(func.count()).select_from(model)) == \
                     source_row_counts[model.__tablename__]
             assert _lineage_receipt_identity(
