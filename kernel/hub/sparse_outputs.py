@@ -247,6 +247,88 @@ def reopen_sparse_output(storage, sparse_id: str):
         raise
 
 
+def _reclaim_retired(storage, outcome: dict) -> None:
+    """Promptly reclaim one DB-retired candidate; ordinary GC remains the durable fallback."""
+    if outcome.get("uri") is None:
+        return
+    with contextlib.suppress(OSError, RuntimeError):
+        storage.discard_checkpoint_artifact(
+            outcome["uri"], outcome["delete_token"], outcome.get("lock_token"))
+
+
+def recover_sparse_output(
+        storage, sparse_id: str, owner_token: str, *, lease_seconds: int = 300,
+) -> SparseOutputMaterialization | dict:
+    """Claim one expired candidate, then reattach it or retire that exact generation.
+
+    Recovery is deliberately not a scheduler: it only establishes the current owner in metadata and
+    verifies the recorded held-file proof.  A successful reattach leaves the candidate intact for a
+    later :func:`materialize_sparse_output` call with the same owner token.
+    """
+    token = _token(owner_token)
+    if not getattr(storage, "lock_supported", False):
+        raise SparseOutputMaterializationConflict("SparseOutput materialization requires OS locks")
+    try:
+        outcome = metadb.claim_sparse_output_materialization(
+            sparse_id=str(sparse_id), owner_token=token, lease_seconds=lease_seconds,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root)
+        if outcome["action"] == "committed":
+            return _revalidated_materialization_result(storage, str(sparse_id), outcome["committed"])
+        candidate = outcome["candidate"]
+        lock_fd = None
+        proof = None
+        try:
+            lock_fd, proof = storage.reattach_checkpoint(candidate)
+            proof.recheck()
+        except (OSError, RuntimeError):
+            # The held proof/lock must be gone before DB retirement can make this exact generation
+            # reclaimable.  A final recheck failure is the same fail-closed outcome as open failure.
+            if proof is not None:
+                with contextlib.suppress(OSError, RuntimeError):
+                    proof.close()
+                proof = None
+            if lock_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(lock_fd)
+                lock_fd = None
+            retired = metadb.retire_sparse_output_materialization(
+                sparse_id=str(sparse_id), owner_token=token,
+                expected_generation=candidate["generation"])
+            _reclaim_retired(storage, retired)
+            return {"action": "retired"}
+        finally:
+            if proof is not None:
+                proof.close()
+            if lock_fd is not None:
+                os.close(lock_fd)
+        return {"action": "reattach", "candidate": candidate}
+    except SparseOutputError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SparseOutputMaterializationConflict("SparseOutput recovery is unavailable") from exc
+
+
+def abort_sparse_output(storage, sparse_id: str, owner_token: str, expected_generation: str) -> None:
+    """Abort only the current uncommitted candidate; a response-loss replay is a no-op."""
+    try:
+        outcome = metadb.abort_sparse_output_materialization(
+            sparse_id=str(sparse_id), owner_token=_token(owner_token),
+            expected_generation=str(expected_generation))
+        _reclaim_retired(storage, outcome)
+    except SparseOutputError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SparseOutputMaterializationConflict("SparseOutput abort is unavailable") from exc
+
+
+def release_sparse_output(sparse_id: str) -> bool:
+    """Release an admitted or complete committed SparseOutput without directly deleting bytes."""
+    try:
+        return metadb.release_sparse_output(str(sparse_id)) is not None
+    except (RuntimeError, ValueError) as exc:
+        raise SparseOutputMaterializationConflict("SparseOutput release is unavailable") from exc
+
+
 def _write_frozen_select(storage, admission: dict, output) -> None:
     exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
                             revision_id=admission["inputRevisionId"])

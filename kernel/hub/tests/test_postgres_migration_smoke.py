@@ -229,6 +229,41 @@ def test_postgres_sparse_output_admission_replays_one_exact_base_reference(tmp_p
             candidate["uri"], storage.namespace_id, candidate["lock_name"])
         assert metadb.claim_local_result_reclaims(storage.namespace_id) == []
 
+        # Recovery claims use the same SparseOutput -> registry -> materialization/artifact lock
+        # order as materialization.  PostgreSQL must fence the old owner and converge every replay
+        # of the new owner on this exact generation rather than inventing a replacement candidate.
+        claimant_a, claimant_b = uuid.uuid4().hex, uuid.uuid4().hex
+        raced = admit_sparse_output(storage, SparseOutputAdmissionRequest(
+            **{**request.__dict__, "submission_id": "Postgres-Recovery-Race"}))
+        old = metadb.reserve_sparse_output_materialization(
+            sparse_id=raced.id, owner_token=claimant_a, lease_seconds=1,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=uuid.uuid4().hex)
+        with metadb.session() as session:
+            session.get(metadb.SparseOutputMaterialization, raced.id).lease_until = (
+                datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(
+                metadb.claim_sparse_output_materialization,
+                sparse_id=raced.id, owner_token=token, lease_seconds=30,
+                namespace_id=storage.namespace_id, storage_root=storage.result_root)
+                for token in [claimant_b] * 4 + [claimant_a] * 4]
+        claims, fenced = [], 0
+        for future in futures:
+            try:
+                claims.append(future.result(timeout=10))
+            except RuntimeError as exc:
+                assert "stale or fenced" in str(exc)
+                fenced += 1
+        assert fenced == 4
+        assert {claim["candidate"]["generation"] for claim in claims} == {old["generation"]}
+        with metadb.session() as session:
+            row = session.get(metadb.SparseOutputMaterialization, raced.id)
+            artifact_row = session.get(metadb.LocalResultArtifact, old["uri"])
+            assert row.owner_token == claimant_b and artifact_row.writer_token == claimant_b
+        metadb.abort_sparse_output_materialization(
+            sparse_id=raced.id, owner_token=claimant_b, expected_generation=old["generation"])
+
         locked = admit_sparse_output(storage, SparseOutputAdmissionRequest(
             **{**request.__dict__, "submission_id": "Postgres-Locked-Expiry"}))
         locked_token = uuid.uuid4().hex

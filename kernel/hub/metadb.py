@@ -4416,6 +4416,172 @@ def sparse_output_materialization_input(sparse_id: str) -> dict:
         return _sparse_output_doc(row)
 
 
+def _detach_sparse_output_candidate(
+        s, row: SparseOutputMaterialization, artifact: LocalResultArtifact, now) -> dict:
+    """Retire one exact uncommitted sidecar without guessing or deleting its bytes."""
+    candidate = _sparse_candidate_doc(row, artifact)
+    artifact.state = "deleting"
+    artifact.writer_run_id = artifact.writer_token = None
+    artifact.delete_token = uuid.uuid4().hex
+    artifact.delete_attempted_at = now
+    artifact.updated_at = now
+    s.delete(row)
+    s.flush()
+    return {
+        "uri": candidate["uri"], "delete_token": artifact.delete_token,
+        "lock_token": candidate["lock_token"], "namespace_id": candidate["namespace_id"],
+        "lock_name": candidate["lock_name"],
+    }
+
+
+def claim_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, lease_seconds: int,
+        namespace_id: str, storage_root: str) -> dict:
+    """Fence an expired reserved candidate to one new owner without changing its generation."""
+    sparse_id, owner_token, namespace_id, storage_root = map(
+        str, (sparse_id, owner_token, namespace_id, storage_root))
+    if (re.fullmatch(r"[0-9a-f]{32}", owner_token) is None
+            or not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600 or not os.path.isabs(storage_root)
+            or os.path.basename(storage_root) != _LOCAL_RESULT_DIR):
+        raise ValueError("SparseOutput recovery owner is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, sparse_id, with_for_update=True)
+        if output is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _validate_sparse_output_documents(output)
+        # The SparseOutput row is always acquired before the registry, matching reserve/bind/commit
+        # and preventing a PostgreSQL lock-order cycle with an in-flight materializer.
+        _lock_local_result_registry(s)
+        row = s.get(SparseOutputMaterialization, sparse_id, with_for_update=True)
+        if row is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _validate_sparse_output_reference(s, output)
+        if row.phase == "committed":
+            artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+            if (artifact is None or artifact.namespace_id != namespace_id
+                    or artifact.storage_root != storage_root):
+                raise RuntimeError("SparseOutput recovery candidate belongs to a different namespace")
+            return {"action": "committed", "committed": _sparse_materialization_doc(s, row)}
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        if artifact is None:
+            raise RuntimeError("SparseOutput candidate binding is incomplete")
+        candidate = _sparse_candidate_doc(row, artifact)
+        if artifact.namespace_id != namespace_id or artifact.storage_root != storage_root:
+            raise RuntimeError("SparseOutput recovery candidate belongs to a different namespace")
+        now = _sparse_materialization_db_now(s)
+        if _sparse_materialization_lease_current(row, now):
+            if row.owner_token != owner_token:
+                raise RuntimeError("SparseOutput recovery owner is stale or fenced")
+            return {"action": "reattach", "candidate": candidate}
+        if row.owner_token == owner_token:
+            raise RuntimeError("SparseOutput recovery owner is stale or fenced; use a new owner token")
+        # Candidate generation/URI and lock authority are immutable.  Only the writer authority and
+        # database-time lease move, so every operation bearing the old token is immediately fenced.
+        row.owner_token = owner_token
+        row.lease_until = now + datetime.timedelta(seconds=lease_seconds)
+        artifact.writer_token = owner_token
+        artifact.updated_at = now
+        s.flush()
+        return {"action": "reattach", "candidate": _sparse_candidate_doc(row, artifact)}
+
+
+def retire_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, expected_generation: str) -> dict:
+    """Retire only the caller's current uncommitted generation after failed reattachment."""
+    sparse_id, owner_token, expected_generation = map(
+        str, (sparse_id, owner_token, expected_generation))
+    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
+        raise ValueError("SparseOutput retire generation is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, sparse_id, with_for_update=True)
+        if output is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _validate_sparse_output_documents(output)
+        _lock_local_result_registry(s)
+        row = s.get(SparseOutputMaterialization, sparse_id, with_for_update=True)
+        if row is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _validate_sparse_output_reference(s, output)
+        if row.phase == "committed":
+            raise RuntimeError("cannot retire a committed SparseOutput")
+        now = _sparse_materialization_db_now(s)
+        if (row.owner_token != owner_token or row.generation != expected_generation
+                or not _sparse_materialization_lease_current(row, now)):
+            raise RuntimeError("SparseOutput retire owner is stale or fenced")
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        if artifact is None:
+            raise RuntimeError("SparseOutput candidate binding is incomplete")
+        return _detach_sparse_output_candidate(s, row, artifact, now)
+
+
+def abort_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, expected_generation: str) -> dict:
+    """Abort the exact current uncommitted generation; replay is idempotent after response loss."""
+    sparse_id, owner_token, expected_generation = map(
+        str, (sparse_id, owner_token, expected_generation))
+    if re.fullmatch(r"[0-9a-f]{64}", expected_generation) is None:
+        raise ValueError("SparseOutput abort generation is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, sparse_id, with_for_update=True)
+        if output is None:
+            raise RuntimeError("SparseOutput admission is unavailable")
+        _validate_sparse_output_documents(output)
+        _lock_local_result_registry(s)
+        row = s.get(SparseOutputMaterialization, sparse_id, with_for_update=True)
+        if row is None:
+            _validate_sparse_output_reference(s, output)
+            return {"uri": None, "delete_token": None, "lock_token": None,
+                    "namespace_id": None, "lock_name": None}
+        _validate_sparse_output_reference(s, output)
+        if row.phase == "committed":
+            raise RuntimeError("cannot abort a committed SparseOutput")
+        now = _sparse_materialization_db_now(s)
+        if (row.owner_token != owner_token or row.generation != expected_generation
+                or not _sparse_materialization_lease_current(row, now)):
+            raise RuntimeError("SparseOutput abort owner is stale or fenced")
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        if artifact is None:
+            raise RuntimeError("SparseOutput candidate binding is incomplete")
+        return _detach_sparse_output_candidate(s, row, artifact, now)
+
+
+def _release_sparse_output_in_session(s, output: SparseOutput) -> dict:
+    """Validate and atomically remove a terminal SparseOutput's complete retention set."""
+    _validate_sparse_output_documents(output)
+    _lock_local_result_registry(s)
+    row = s.get(SparseOutputMaterialization, output.id, with_for_update=True)
+    _validate_sparse_output_reference(s, output)
+    if row is not None and row.phase == "reserved":
+        raise RuntimeError("cannot release an active SparseOutput materialization")
+    if row is not None:
+        # This proves terminal sidecar evidence/authority in addition to the two-reference set.
+        _sparse_materialization_doc(s, row)
+    refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.owner_kind == "sparse_output",
+        LocalResultReference.owner_key == output.id,
+    ).order_by(LocalResultReference.uri).with_for_update()))
+    expected = 2 if row is not None else 1
+    if len(refs) != expected:
+        raise RuntimeError("SparseOutput exact retention is incomplete")
+    uris = [ref.uri for ref in refs]
+    for ref in refs:
+        s.delete(ref)
+    if row is not None:
+        s.delete(row)
+    s.delete(output)
+    return {"released": True, "uris": uris}
+
+
+def release_sparse_output(sparse_id: str) -> dict | None:
+    """Release an admitted or fully committed SparseOutput; never delete bytes in this transaction."""
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        if output is None:
+            return None
+        return _release_sparse_output_in_session(s, output)
+
+
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
 _WORKSPACE_ANCESTOR_LIMIT = 32
 _WORKSPACE_SEARCH_CURSOR_VERSION = 1
@@ -7930,6 +8096,18 @@ def delete_canvas_cascade(canvas_id: str) -> None:
             raise ActiveBackendJobsError(
                 f"canvas '{canvas_id}' has active durable task '{active_task}'; "
                 "cancel it and wait for terminal status")
+        sparse_outputs = list(s.scalars(select(SparseOutput).where(
+            SparseOutput.canvas_id == canvas_id,
+        ).order_by(SparseOutput.id).with_for_update()))
+        # SparseOutput is not a durable task: its reserved sidecar has an independent DB-time
+        # materialization lease.  Never turn lease expiry into implicit deletion; terminal rows use
+        # the same validated two-reference release path as an explicit release.
+        for sparse_output in sparse_outputs:
+            _release_sparse_output_in_session(s, sparse_output)
+        if sparse_outputs:
+            # Make reference/materialization removals reach the database before Canvas's FK delete;
+            # SQLite's usual FK mode hides this ordering requirement that PostgreSQL enforces.
+            s.flush()
         shares = list(s.scalars(select(CanvasShare).where(
             CanvasShare.canvas_id == canvas_id
         ).order_by(CanvasShare.user_id).with_for_update()))

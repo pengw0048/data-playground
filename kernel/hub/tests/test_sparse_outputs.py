@@ -33,8 +33,11 @@ from hub.sparse_outputs import (
     SparseOutputMaterializationConflict,
     SparseOutputSubmissionConflict,
     SparseOutputValidationError,
+    abort_sparse_output,
     admit_sparse_output,
     materialize_sparse_output,
+    recover_sparse_output,
+    release_sparse_output,
     reopen_sparse_output,
 )
 from hub.storage import LocalStorage
@@ -110,6 +113,12 @@ def _sparse_refs(sparse_id: str) -> list[metadb.LocalResultReference]:
             metadb.LocalResultReference.owner_kind == "sparse_output",
             metadb.LocalResultReference.owner_key == sparse_id,
         )))
+
+
+def _expire_sparse_lease(sparse_id: str) -> None:
+    with metadb.session() as session:
+        session.get(metadb.SparseOutputMaterialization, sparse_id).lease_until = (
+            metadb._now() - datetime.timedelta(seconds=30))
 
 
 def test_admission_retains_only_existing_exact_base_and_replays_atomically(local_catalog, tmp_path):
@@ -258,6 +267,287 @@ def test_commit_response_loss_reconciles_the_one_committed_sidecar(local_catalog
         assert session.scalar(select(func.count()).select_from(metadb.LocalResultReference).where(
             metadb.LocalResultReference.owner_kind == "sparse_output",
             metadb.LocalResultReference.owner_key == admitted.id)) == 2
+
+
+def test_expired_candidate_is_fenced_to_one_new_owner_and_reattached(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "recover.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="recover"))
+    owner_a, owner_b = uuid.uuid4().hex, uuid.uuid4().hex
+    original = metadb.commit_sparse_output_materialization
+
+    def lose_before_commit(**_kwargs):
+        raise ConnectionError("producer lost before commit")
+
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", lose_before_commit)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, owner_a)
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", original)
+    with metadb.session() as session:
+        before = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        generation, uri = before.generation, before.candidate_uri
+    _expire_sparse_lease(admitted.id)
+
+    recovered = recover_sparse_output(storage, admitted.id, owner_b)
+    assert recovered["action"] == "reattach"
+    assert recovered["candidate"]["generation"] == generation
+    assert recovered["candidate"]["uri"] == uri
+    with pytest.raises(SparseOutputMaterializationConflict):
+        abort_sparse_output(storage, admitted.id, owner_a, generation)
+    assert materialize_sparse_output(storage, admitted.id, owner_b).committed is True
+
+
+def test_recovery_retires_only_an_unreattachable_exact_candidate(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "retire.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="retire"))
+    owner_a, owner_b = uuid.uuid4().hex, uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=owner_a, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    _expire_sparse_lease(admitted.id)
+    assert recover_sparse_output(storage, admitted.id, owner_b) == {"action": "retired"}
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id) is None
+        artifact = session.get(metadb.LocalResultArtifact, candidate["uri"])
+        assert artifact is None or artifact.state == "deleting"
+    replacement = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=uuid.uuid4().hex, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    assert replacement["generation"] != candidate["generation"]
+
+
+def test_recovery_from_a_different_storage_root_fails_without_retiring(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "wrong-root.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="wrong-root"))
+    owner_a, owner_b = uuid.uuid4().hex, uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=owner_a, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    _expire_sparse_lease(admitted.id)
+    other = LocalStorage(str(tmp_path / "other"))
+    try:
+        with pytest.raises(SparseOutputMaterializationConflict):
+            recover_sparse_output(other, admitted.id, owner_b)
+    finally:
+        other.close()
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        assert row is not None and row.generation == candidate["generation"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "wrong-root"])
+def test_committed_recovery_revalidates_sidecar_bytes(local_catalog, tmp_path, damage):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / f"committed-{damage}.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission=f"committed-{damage}"))
+    token = uuid.uuid4().hex
+    materialize_sparse_output(storage, admitted.id, token)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        uri, generation = row.candidate_uri, row.generation
+    other = None
+    if damage == "missing":
+        os.unlink(uri)
+    elif damage == "corrupt":
+        pq.write_table(pa.table({"id": pa.array([1], type=pa.int32()),
+                                 "score": pa.array(["changed"])}), uri)
+    else:
+        other = LocalStorage(str(tmp_path / "wrong-root"))
+    try:
+        with pytest.raises(SparseOutputMaterializationConflict):
+            recover_sparse_output(other or storage, admitted.id, token)
+    finally:
+        if other is not None:
+            other.close()
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        assert row is not None and row.phase == "committed" and row.generation == generation
+
+
+def test_reattach_recheck_failure_retires_the_claimed_generation(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "recheck-failure.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="recheck-failure"))
+    owner_a, owner_b = uuid.uuid4().hex, uuid.uuid4().hex
+    original_commit = metadb.commit_sparse_output_materialization
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization",
+                        lambda **_kwargs: (_ for _ in ()).throw(ConnectionError("lost")))
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, owner_a)
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", original_commit)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        uri = row.candidate_uri
+    _expire_sparse_lease(admitted.id)
+    original_reattach = storage.reattach_checkpoint
+
+    def reattach_with_late_failure(candidate):
+        lock_fd, proof = original_reattach(candidate)
+        monkeypatch.setattr(proof, "recheck", lambda: (_ for _ in ()).throw(RuntimeError("swapped")))
+        return lock_fd, proof
+
+    monkeypatch.setattr(storage, "reattach_checkpoint", reattach_with_late_failure)
+    assert recover_sparse_output(storage, admitted.id, owner_b) == {"action": "retired"}
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id) is None
+        artifact = session.get(metadb.LocalResultArtifact, uri)
+        assert artifact is None or artifact.state == "deleting"
+
+
+def test_delayed_generation_scoped_abort_and_retire_cannot_touch_replacement(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "generation-fence.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="generation-fence"))
+    token = uuid.uuid4().hex
+    first = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    abort_sparse_output(storage, admitted.id, token, first["generation"])
+    second = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        abort_sparse_output(storage, admitted.id, token, first["generation"])
+    with pytest.raises(RuntimeError, match="stale or fenced"):
+        metadb.retire_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=token, expected_generation=first["generation"])
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        assert row is not None and row.generation == second["generation"]
+
+
+def test_concurrent_expired_claims_fence_old_owner_on_sqlite(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "claim-race.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="claim-race"))
+    owner_a, owner_b = uuid.uuid4().hex, uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=owner_a, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    _expire_sparse_lease(admitted.id)
+
+    def claim(token):
+        return metadb.claim_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=token, lease_seconds=30,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(claim, token) for token in [owner_b] * 4 + [owner_a] * 4]
+    outcomes, fenced = [], 0
+    for future in futures:
+        try:
+            outcomes.append(future.result())
+        except RuntimeError as exc:
+            assert "stale or fenced" in str(exc)
+            fenced += 1
+    assert fenced == 4
+    assert {item["candidate"]["generation"] for item in outcomes} == {candidate["generation"]}
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        artifact = session.get(metadb.LocalResultArtifact, candidate["uri"])
+        assert row.owner_token == owner_b and artifact.writer_token == owner_b
+
+
+def test_abort_replay_and_release_remove_exact_retention_without_deleting_bytes(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "release.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="release"))
+    token = uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    abort_sparse_output(storage, admitted.id, token, candidate["generation"])
+    abort_sparse_output(storage, admitted.id, token, candidate["generation"])  # response-loss replay
+    assert len(_sparse_refs(admitted.id)) == 1
+    assert release_sparse_output(admitted.id) is True
+    assert release_sparse_output(admitted.id) is False
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutput, admitted.id) is None
+    assert os.path.exists(metadb.managed_local_file_revision_artifact(
+        published["dataset_id"], published["revision_id"]))
+
+
+def test_committed_release_and_canvas_delete_drop_both_sparse_references(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "canvas-release.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="canvas-release"))
+    materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        sidecar = row.candidate_uri
+        assert len(_sparse_refs(admitted.id)) == 2
+    metadb.delete_canvas_cascade(canvas)
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutput, admitted.id) is None
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id) is None
+        assert not list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "sparse_output")))
+    assert os.path.exists(sidecar), "canvas deletion releases metadata; GC owns byte reclamation"
+
+
+def test_reserved_sparse_output_blocks_canvas_delete(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "canvas-block.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="canvas-block"))
+    metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=uuid.uuid4().hex, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    with pytest.raises(RuntimeError, match="active SparseOutput"):
+        metadb.delete_canvas_cascade(canvas)
+    with metadb.session() as session:
+        assert session.get(metadb.Canvas, canvas) is not None
 
 
 def test_committed_commit_replay_rejects_a_different_generation(local_catalog, tmp_path):
