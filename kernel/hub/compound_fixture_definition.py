@@ -103,6 +103,19 @@ def build_compound_timeline(output: Path) -> None:
         {"observation_id": "episode-2-sensor-003", "episode_id": "episode-2", "device_tick": 25_000_000, "value": "1.625"},
         {"observation_id": "episode-2-sensor-004", "episode_id": "episode-2", "device_tick": 26_000_000, "value": "1.750"},
     ]
+    target_rows = [
+        {"observation_id": "episode-1-target-001", "episode_id": "episode-1", "reference_tick": 876},
+        {"observation_id": "episode-1-target-002", "episode_id": "episode-1", "reference_tick": 1877},
+        {"observation_id": "episode-1-target-003", "episode_id": "episode-1", "reference_tick": 2878},
+        {"observation_id": "episode-1-target-004", "episode_id": "episode-1", "reference_tick": 6882},
+        {"observation_id": "episode-1-target-005", "episode_id": "episode-1", "reference_tick": 7883},
+        {"observation_id": "episode-1-target-006", "episode_id": "episode-1", "reference_tick": 8884},
+        {"observation_id": "episode-1-target-007", "episode_id": "episode-1", "reference_tick": 9999},
+        {"observation_id": "episode-2-target-001", "episode_id": "episode-2", "reference_tick": 20896},
+        {"observation_id": "episode-2-target-002", "episode_id": "episode-2", "reference_tick": 21897},
+        {"observation_id": "episode-2-target-003", "episode_id": "episode-2", "reference_tick": 24900},
+        {"observation_id": "episode-2-target-004", "episode_id": "episode-2", "reference_tick": 25901},
+    ]
     annotation_rows = [
         {"observation_id": "episode-1-annotation-001", "episode_id": "episode-1", "start_tick": 1_000, "end_tick": 2_500, "fixture_phase": "protocol-a"},
         {"observation_id": "episode-1-annotation-002", "episode_id": "episode-1", "start_tick": 6_000, "end_tick": 8_000, "fixture_phase": "protocol-b"},
@@ -116,6 +129,8 @@ def build_compound_timeline(output: Path) -> None:
                      [("episode_id", "string"), ("reference_start_tick", "int64"), ("reference_end_tick", "int64")]),
         "sensor-observations": (["observation_id", "episode_id", "device_tick", "value"], sensor_rows,
                                 [("observation_id", "string"), ("episode_id", "string"), ("device_tick", "int64"), ("value", "float64")]),
+        "target-observations": (["observation_id", "episode_id", "reference_tick"], target_rows,
+                                [("observation_id", "string"), ("episode_id", "string"), ("reference_tick", "int64")]),
         "interval-annotations": (["observation_id", "episode_id", "start_tick", "end_tick", "fixture_phase"], annotation_rows,
                                  [("observation_id", "string"), ("episode_id", "string"), ("start_tick", "int64"), ("end_tick", "int64"), ("fixture_phase", "string")]),
         "video-observations": (["observation_id", "episode_id", "start_tick", "end_tick", "asset_id"], video_rows,
@@ -143,6 +158,9 @@ def build_compound_timeline(output: Path) -> None:
     point_index = {"observationIdField": "observation_id", "episodeIdField": "episode_id",
                    "tickField": "device_tick", "startTickField": None, "endTickField": None,
                    "valueRefs": ["value"]}
+    target_point_index = {"observationIdField": "observation_id", "episodeIdField": "episode_id",
+                          "tickField": "reference_tick", "startTickField": None, "endTickField": None,
+                          "valueRefs": []}
     interval_index = {"observationIdField": "observation_id", "episodeIdField": "episode_id",
                       "tickField": None, "startTickField": "start_tick", "endTickField": "end_tick",
                       "valueRefs": ["fixture_phase"]}
@@ -162,6 +180,12 @@ def build_compound_timeline(output: Path) -> None:
             ], "timing": "irregular", "nominalRate": None, "clock": sensor_clock,
              "units": [{"field": "value", "unit": "arbitrary fixture units"}],
              "missingData": "not-recorded", "providerCoverage": None, "transformChain": []},
+            {"id": "target-observations", "kind": "reference-target", "observationSchema": [
+                {"name": "observation_id", "type": "string", "nullable": False},
+                {"name": "episode_id", "type": "string", "nullable": False},
+                {"name": "reference_tick", "type": "int64", "nullable": False},
+            ], "timing": "irregular", "nominalRate": None, "clock": reference_clock,
+             "units": [], "missingData": "not-recorded", "providerCoverage": None, "transformChain": ["fixture-authored"]},
             {"id": "interval-annotation", "kind": "interval-annotation", "observationSchema": [
                 {"name": "observation_id", "type": "string", "nullable": False},
                 {"name": "episode_id", "type": "string", "nullable": False},
@@ -184,6 +208,8 @@ def build_compound_timeline(output: Path) -> None:
         "bindings": [
             {"episodeId": "episode-1", "streamId": "numeric-sensor", "state": "present", "memberId": "sensor-observations", "assetIds": [], "observationIndex": point_index},
             {"episodeId": "episode-2", "streamId": "numeric-sensor", "state": "present", "memberId": "sensor-observations", "assetIds": [], "observationIndex": point_index},
+            {"episodeId": "episode-1", "streamId": "target-observations", "state": "present", "memberId": "target-observations", "assetIds": [], "observationIndex": target_point_index},
+            {"episodeId": "episode-2", "streamId": "target-observations", "state": "present", "memberId": "target-observations", "assetIds": [], "observationIndex": target_point_index},
             {"episodeId": "episode-1", "streamId": "interval-annotation", "state": "present", "memberId": "interval-annotations", "assetIds": [], "observationIndex": interval_index},
             {"episodeId": "episode-2", "streamId": "interval-annotation", "state": "present", "memberId": "interval-annotations", "assetIds": [], "observationIndex": interval_index},
             {"episodeId": "episode-1", "streamId": "video", "state": "present", "memberId": "video-observations", "assetIds": ["flower-webm"], "observationIndex": video_index},
@@ -215,6 +241,8 @@ def build_compound_timeline(output: Path) -> None:
         "coverage": [
             {"episodeId": "episode-1", "streamId": "numeric-sensor", "state": "present", "observationCount": 6, "firstReferenceTick": 876, "lastReferenceTick": 8884, "observations": [{"observationId": "episode-1-sensor-001", "referenceTick": 876}, {"observationId": "episode-1-sensor-002", "referenceTick": 1877}, {"observationId": "episode-1-sensor-003", "referenceTick": 2878}, {"observationId": "episode-1-sensor-004", "referenceTick": 6882}, {"observationId": "episode-1-sensor-005", "referenceTick": 7883}, {"observationId": "episode-1-sensor-006", "referenceTick": 8884}], "gaps": [{"afterObservationId": "episode-1-sensor-003", "beforeObservationId": "episode-1-sensor-004", "durationReferenceTicks": 4004}]},
             {"episodeId": "episode-2", "streamId": "numeric-sensor", "state": "present", "observationCount": 4, "firstReferenceTick": 20896, "lastReferenceTick": 25901, "observations": [{"observationId": "episode-2-sensor-001", "referenceTick": 20896}, {"observationId": "episode-2-sensor-002", "referenceTick": 21897}, {"observationId": "episode-2-sensor-003", "referenceTick": 24900}, {"observationId": "episode-2-sensor-004", "referenceTick": 25901}], "gaps": []},
+            {"episodeId": "episode-1", "streamId": "target-observations", "state": "present", "observationCount": 7, "firstReferenceTick": 876, "lastReferenceTick": 9999, "observations": [{"observationId": "episode-1-target-001", "referenceTick": 876}, {"observationId": "episode-1-target-002", "referenceTick": 1877}, {"observationId": "episode-1-target-003", "referenceTick": 2878}, {"observationId": "episode-1-target-004", "referenceTick": 6882}, {"observationId": "episode-1-target-005", "referenceTick": 7883}, {"observationId": "episode-1-target-006", "referenceTick": 8884}, {"observationId": "episode-1-target-007", "referenceTick": 9999}], "gaps": [{"afterObservationId": "episode-1-target-003", "beforeObservationId": "episode-1-target-004", "durationReferenceTicks": 4004}]},
+            {"episodeId": "episode-2", "streamId": "target-observations", "state": "present", "observationCount": 4, "firstReferenceTick": 20896, "lastReferenceTick": 25901, "observations": [{"observationId": "episode-2-target-001", "referenceTick": 20896}, {"observationId": "episode-2-target-002", "referenceTick": 21897}, {"observationId": "episode-2-target-003", "referenceTick": 24900}, {"observationId": "episode-2-target-004", "referenceTick": 25901}], "gaps": []},
             {"episodeId": "episode-1", "streamId": "interval-annotation", "state": "present", "observationCount": 2, "firstReferenceTick": 1000, "lastReferenceTick": 8000, "observations": [{"observationId": "episode-1-annotation-001", "startTick": 1000, "endTick": 2500}, {"observationId": "episode-1-annotation-002", "startTick": 6000, "endTick": 8000}], "gaps": []},
             {"episodeId": "episode-2", "streamId": "interval-annotation", "state": "present", "observationCount": 1, "firstReferenceTick": 21000, "lastReferenceTick": 24000, "observations": [{"observationId": "episode-2-annotation-001", "startTick": 21000, "endTick": 24000}], "gaps": []},
             {"episodeId": "episode-1", "streamId": "video", "state": "present", "observationCount": 1, "firstReferenceTick": 1000, "lastReferenceTick": 3000, "observations": [{"observationId": "episode-1-video-001", "startTick": 1000, "endTick": 3000}], "gaps": []},
@@ -231,7 +259,7 @@ def build_compound_timeline(output: Path) -> None:
                 "episode-2-sensor-001", "episode-2-sensor-002", "episode-2-sensor-003",
                 "episode-2-sensor-004",
             ],
-            "referenceTicks": [*mapped_ticks, 27_000], "matchedCount": 10,
+            "referenceTicks": [*mapped_ticks[:6], 9_999, *mapped_ticks[6:]], "matchedCount": 10,
             "unmatchedSensorCount": 0, "unmatchedReferenceCount": 1,
         },
         "annotationProvenance": "Fixture-authored protocol markers; no semantic label is inferred from pixels.",

@@ -22,6 +22,15 @@ def test_shared_builder_matches_the_ux_fixture_delegate(tmp_path):
         path.relative_to(delegated): path.read_bytes() for path in delegated.rglob("*") if path.is_file()}
 
 
+def test_canonical_target_member_is_the_packaged_immutable_bytes():
+    from pathlib import Path
+
+    from hub.compound_fixture import _canonical_member_bytes
+
+    source = Path(__file__).resolve().parents[3] / "fixtures" / "compound" / "target-observations.csv"
+    assert _canonical_member_bytes("target-observations") == source.read_bytes()
+
+
 def test_oversized_canonical_member_fails_before_csv_parsing_without_path_leak(tmp_path, monkeypatch):
     import pyarrow.csv as pacsv
     import pytest
@@ -61,8 +70,8 @@ def _fixture_evidence_request(root, authority):
     return TemporalEvidenceRequestV1(
         manifestJson=json.dumps(document), episodeId="episode-1",
         streamIds=["numeric-sensor", "interval-annotation", "video"],
-        streamViews=[{"streamId": key, "datasetViewId": value.id}
-                     for key, value in authority.views.items()],
+        streamViews=[{"streamId": key, "datasetViewId": authority.views[key].id}
+                     for key in ("numeric-sensor", "interval-annotation", "video")],
         referenceViewId=authority.views["interval-annotation"].id,
         pair={"leftStreamId": "numeric-sensor", "rightStreamId": "video"},
         gapThresholdTicks="1", toleranceTicks="1",
@@ -108,7 +117,8 @@ def test_reference_authority_ignores_selected_external_catalog_and_restarts(tmp_
         assert deps.catalog is external
         assert external.fixture_writes == 0
         assert all(metadb.catalog_revision_binding_for_uri(fixture_uri(member)) is not None
-                   for member in ("episodes", "sensor-observations", "interval-annotations", "video-observations"))
+                   for member in ("episodes", "sensor-observations", "target-observations",
+                                  "interval-annotations", "video-observations"))
         first = current_user_fixture_reference("external-user")
         assert temporal_evidence(_fixture_evidence_request(root, first), "external-user").complete is True
 
@@ -164,8 +174,16 @@ def test_fixture_survives_restart_and_detail_and_range_are_redacted(tmp_path, mo
         first_views = {stream_id: view.id for stream_id, view in first.views.items()}
         assert (root / "data" / "compound-fixture-v1" / "manifest.json").is_file()
         assert all(view.dataset_ref.revision_id for view in first.views.values())
+        assert {stream_id: view.sampling.kind for stream_id, view in first.views.items()} == {
+            "numeric-sensor": "all", "target-observations": "all",
+            "interval-annotation": "all", "video": "all",
+        }
+        assert first.views["target-observations"].selected_columns == [
+            "reference_tick", "observation_id", "episode_id",
+        ]
         assert {member.id for member in first.manifest.members} == {
-            "episodes", "sensor-observations", "interval-annotations", "video-observations"}
+            "episodes", "sensor-observations", "target-observations", "interval-annotations",
+            "video-observations"}
         from hub.models import ExactDatasetRef
         from hub.routers.dataset_views import _open_exact
         from hub.compound_fixture import fixture_uri
@@ -197,7 +215,8 @@ def test_fixture_survives_restart_and_detail_and_range_are_redacted(tmp_path, mo
         with TestClient(app) as client:
             detail = client.get(base)
             assert detail.status_code == 200
-            assert detail.json()["episodes"][1]["streams"][2]["state"] == "absent"
+            episode_two_streams = {stream["id"]: stream for stream in detail.json()["episodes"][1]["streams"]}
+            assert episode_two_streams["video"]["state"] == "absent"
             assert detail.json()["episodes"][0]["referenceClockId"] == "reference-ms"
             assert detail.json()["episodes"][0]["endTick"] == "10000"
             assert str(root) not in detail.text

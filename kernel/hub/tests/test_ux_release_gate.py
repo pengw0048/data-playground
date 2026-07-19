@@ -181,6 +181,7 @@ def test_compound_fixture_uses_the_public_contract_and_exact_ground_truth(tmp_pa
 
     calculated_coverage = []
     sensor_points: dict[str, list[tuple[str, int]]] = {}
+    target_points: dict[str, list[tuple[str, int]]] = {}
     video_intervals: dict[str, list[tuple[int, int]]] = {}
     for binding in manifest.bindings:
         entry = {"episodeId": binding.episode_id, "streamId": binding.stream_id, "state": binding.state}
@@ -192,10 +193,15 @@ def test_compound_fixture_uses_the_public_contract_and_exact_ground_truth(tmp_pa
         assert index is not None
         rows = binding_rows[(binding.episode_id, binding.stream_id)]
         if index.tick_field is not None:
-            points = [(row[index.observation_id_field], map_tick(mapping, int(row[index.tick_field])))
+            stream_mapping = mapping if streams[binding.stream_id].clock.id == mapping.source_clock_id else None
+            points = [(row[index.observation_id_field], map_tick(stream_mapping, int(row[index.tick_field]))
+                       if stream_mapping else int(row[index.tick_field]))
                       for row in rows]
             points.sort(key=lambda item: (item[1], item[0]))
-            sensor_points[binding.episode_id] = points
+            if binding.stream_id == "numeric-sensor":
+                sensor_points[binding.episode_id] = points
+            if binding.stream_id == "target-observations":
+                target_points[binding.episode_id] = points
             intervals = [
                 (before, after, after[1] - before[1]) for before, after in zip(points, points[1:])]
             baseline = min((duration for _, _, duration in intervals), default=0)
@@ -223,7 +229,11 @@ def test_compound_fixture_uses_the_public_contract_and_exact_ground_truth(tmp_pa
     expected_coverage = sorted(ground_truth["coverage"], key=lambda item: (item["episodeId"], item["streamId"]))
     assert sorted(calculated_coverage, key=lambda item: (item["episodeId"], item["streamId"])) == expected_coverage
     declared_gaps = [gap for coverage in calculated_coverage for gap in coverage["gaps"]]
-    assert len(declared_gaps) == 1
+    assert {(item["afterObservationId"], item["beforeObservationId"], item["durationReferenceTicks"])
+            for item in declared_gaps} == {
+        ("episode-1-sensor-003", "episode-1-sensor-004", 4004),
+        ("episode-1-target-003", "episode-1-target-004", 4004),
+    }
 
     overlap = ground_truth["overlap"]
     sensor_start, sensor_end = sensor_points[overlap["episodeId"]][0][1], sensor_points[overlap["episodeId"]][-1][1]
@@ -232,12 +242,16 @@ def test_compound_fixture_uses_the_public_contract_and_exact_ground_truth(tmp_pa
     assert duration == overlap["durationReferenceTicks"]
 
     tolerance = alignment["toleranceReferenceTicks"]
-    remaining = list(enumerate(alignment["referenceTicks"]))
+    target_facts = sorted((point for points in target_points.values() for point in points),
+                          key=lambda item: (item[1], item[0]))
+    assert [tick for _, tick in target_facts] == alignment["referenceTicks"]
+    remaining = list(enumerate(target_facts))
     matched_ids = []
     for observation_id, tick in sorted(
             (point for points in sensor_points.values() for point in points), key=lambda item: (item[1], item[0])):
         candidates = [(abs(tick - reference_tick), reference_tick, index)
-                      for index, reference_tick in remaining if abs(tick - reference_tick) <= tolerance]
+                      for index, (_target_id, reference_tick) in remaining
+                      if abs(tick - reference_tick) <= tolerance]
         if not candidates:
             continue
         _, _, chosen = min(candidates)
