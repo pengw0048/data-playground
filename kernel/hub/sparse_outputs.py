@@ -80,6 +80,21 @@ class SparseOutputMaterialization:
     evidence: dict | None
 
 
+@dataclass
+class HeldSparseOutput:
+    """One held sidecar plus the exact admission/materialization authority it revalidated."""
+
+    guard: object
+    admission: dict
+    committed: dict
+
+    def __enter__(self) -> "HeldSparseOutput":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.guard.close()
+
+
 def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> SparseOutputAdmission:
     """Atomically admit/replay a sparse output and retain exactly its ready exact base artifact.
 
@@ -220,14 +235,16 @@ def materialize_sparse_output(
         raise SparseOutputMaterializationConflict("SparseOutput materialization is unavailable") from exc
 
 
-def reopen_sparse_output(storage, sparse_id: str):
-    """Return a held, fully revalidated read guard for committed sidecar truth only."""
+def reopen_sparse_output_context(storage, sparse_id: str) -> HeldSparseOutput:
+    """Return a guard atomically bound to the admission/materialization truth it validated."""
     committed = metadb.reconcile_sparse_output_materialization(str(sparse_id))
     if not committed or committed.get("phase") != "committed":
         raise SparseOutputUnavailable("SparseOutput materialization is unavailable")
     guard = storage.reopen_checkpoint(committed)
     try:
-        admission = metadb.sparse_output_materialization_input(str(sparse_id))
+        bound = metadb.sparse_output_held_context(
+            str(sparse_id), str(committed["generation"]))
+        admission, committed = bound["admission"], bound["committed"]
         _validate_held_schema(guard.artifact_fileno(), admission)
         exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
                                 revision_id=admission["inputRevisionId"])
@@ -241,10 +258,15 @@ def reopen_sparse_output(storage, sparse_id: str):
         if serialize_row_identity_coverage(coverage, exact, frozen.digest) != committed["coverage"]:
             raise SparseOutputUnavailable("SparseOutput materialization is unavailable")
         guard.check()
-        return guard
+        return HeldSparseOutput(guard=guard, admission=admission, committed=committed)
     except Exception:
         guard.close()
         raise
+
+
+def reopen_sparse_output(storage, sparse_id: str):
+    """Return the legacy held guard after generation-bound context validation."""
+    return reopen_sparse_output_context(storage, sparse_id).guard
 
 
 def _reclaim_retired(storage, outcome: dict) -> None:

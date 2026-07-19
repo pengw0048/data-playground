@@ -1346,6 +1346,26 @@ class ManagedLocalLanceWriteReceipt(Base):
     )
 
 
+class MergeColumnsPublication(Base):
+    """Private immutable semantic truth for one SparseOutput merge publication.
+
+    This deliberately stores no result-artifact authority.  The normal immutable revision ledger
+    owns that; this row only binds the replay key to the evidence that made the merge meaningful.
+    """
+    __tablename__ = "merge_columns_publications"
+    idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
+    merge_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    merge_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    revision_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("managed_local_file_revisions.revision_id"), nullable=False,
+        unique=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        CheckConstraint("length(merge_sha256) = 64", name="ck_merge_columns_publication_sha"),
+    )
+
+
 class SettingRevision(Base):
     """One optimistic-concurrency counter per independently editable settings scope."""
     __tablename__ = "setting_revisions"
@@ -4414,6 +4434,27 @@ def sparse_output_materialization_input(sparse_id: str) -> dict:
         _validate_sparse_output_documents(row)
         _validate_sparse_output_reference(s, row)
         return _sparse_output_doc(row)
+
+
+def sparse_output_held_context(sparse_id: str, expected_generation: str) -> dict:
+    """Bind one already-held candidate generation to its admission and committed DB truth.
+
+    The caller opens the candidate from an earlier committed snapshot before entering this lock
+    boundary.  If release/rebuild replaced the deterministic SparseOutput ID in that window, its new
+    random generation cannot be mistaken for the held file.
+    """
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        if output is None:
+            raise RuntimeError("SparseOutput admission is unavailable")
+        _lock_local_result_registry(s)
+        row = s.get(SparseOutputMaterialization, str(sparse_id), with_for_update=True)
+        if row is None or row.phase != "committed":
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        committed = _sparse_materialization_doc(s, row)
+        if committed["generation"] != str(expected_generation):
+            raise RuntimeError("SparseOutput materialization generation changed")
+        return {"admission": _sparse_output_doc(output), "committed": committed}
 
 
 def _detach_sparse_output_candidate(
@@ -15154,6 +15195,14 @@ class ManagedLocalWriteConflict(RuntimeError):
     """A typed local-write precondition no longer matches its durable destination head."""
 
 
+@dataclass(frozen=True)
+class MergeColumnsPublicationContext:
+    """Private typed semantic companion for one managed-local merge publication."""
+
+    merge_doc: str
+    merge_sha256: str
+
+
 def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, str]:
     from hub.models import WriteIntent
 
@@ -15161,6 +15210,23 @@ def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, 
     payload = intent.model_dump(by_alias=True, mode="json")
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return intent, payload, canonical
+
+
+def _canonical_merge_publication_context(
+        value: MergeColumnsPublicationContext | None) -> MergeColumnsPublicationContext | None:
+    if value is None:
+        return None
+    if not isinstance(value, MergeColumnsPublicationContext):
+        raise ValueError("merge publication context is invalid")
+    merge_doc, merge_sha256 = value.merge_doc, value.merge_sha256
+    try:
+        canonical = json.dumps(json.loads(merge_doc), sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("merge publication context is invalid") from exc
+    if (canonical != merge_doc or not isinstance(merge_sha256, str)
+            or hashlib.sha256(merge_doc.encode()).hexdigest() != merge_sha256):
+        raise ValueError("merge publication context is invalid")
+    return value
 
 
 def _managed_local_write_receipt_in_session(
@@ -15195,6 +15261,33 @@ def _managed_local_write_receipt_in_session(
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
+
+
+def _managed_local_merge_replay_in_session(
+        s, idempotency_key: str, intent_doc: str,
+        merge_context: MergeColumnsPublicationContext, *,
+        lock: bool = False) -> dict | None:
+    """Require the generic receipt and private merge truth to exist and agree atomically."""
+    receipt = _managed_local_write_receipt_in_session(
+        s, idempotency_key, intent_doc, lock=lock)
+    query = select(MergeColumnsPublication).where(
+        MergeColumnsPublication.idempotency_key == idempotency_key).limit(1)
+    if lock:
+        query = query.with_for_update()
+    row = s.scalars(query).first()
+    if receipt is None:
+        if row is not None:
+            raise RuntimeError("merge publication lost its exact write receipt")
+        return None
+    if row is None:
+        raise ManagedLocalWriteConflict(
+            "managed local write key is already owned by a non-merge publication")
+    if (row.merge_doc != merge_context.merge_doc
+            or row.merge_sha256 != merge_context.merge_sha256
+            or row.merge_sha256 != hashlib.sha256(row.merge_doc.encode()).hexdigest()
+            or row.revision_id != receipt["revisionId"]):
+        raise ManagedLocalWriteConflict("merge idempotency key changed its immutable meaning")
+    return receipt
 
 
 def _managed_local_lance_write_receipt_in_session(
@@ -15308,34 +15401,53 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
         return _managed_local_write_head_in_session(s, normalized)
 
 
-def catalog_admit_managed_local_write(value: object) -> dict | None:
+def catalog_admit_managed_local_write(
+        value: object, *,
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict | None:
     """Validate a frozen intent before artifact allocation, returning a prior durable receipt."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    merge_context = _canonical_merge_publication_context(merge_publication)
     if intent.mode not in ("create", "replace"):
         raise ValueError("managed local-file writes support create/replace only")
     if intent.partitions:
         raise ValueError("managed local-file create/replace does not support partitions")
     with session() as s:
-        prior = _managed_local_write_receipt_in_session(
-            s, intent.idempotency_key, canonical)
+        prior = (_managed_local_merge_replay_in_session(
+            s, intent.idempotency_key, canonical, merge_context)
+            if merge_context is not None else _managed_local_write_receipt_in_session(
+                s, intent.idempotency_key, canonical))
         if prior is not None:
             return prior
         prior = _managed_local_lance_write_receipt_in_session(
             s, intent.idempotency_key, canonical)
         if prior is not None:
+            if merge_context is not None:
+                raise ManagedLocalWriteConflict(
+                    "managed local write key is already owned by a non-merge publication")
             return prior
         _validate_managed_local_write_precondition(s, intent, lock=False)
         return None
 
 
-def catalog_managed_local_write_receipt(value: object) -> dict | None:
+def catalog_managed_local_write_receipt(
+        value: object, *,
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict | None:
     """Recover an exact typed write receipt by idempotency key after response loss."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
+    merge_context = _canonical_merge_publication_context(merge_publication)
     with session() as s:
-        prior = _managed_local_write_receipt_in_session(
+        prior = (_managed_local_merge_replay_in_session(
+            s, intent.idempotency_key, canonical, merge_context)
+            if merge_context is not None else _managed_local_write_receipt_in_session(
+                s, intent.idempotency_key, canonical))
+        if prior is not None:
+            return prior
+        lance = _managed_local_lance_write_receipt_in_session(
             s, intent.idempotency_key, canonical)
-        return prior if prior is not None else _managed_local_lance_write_receipt_in_session(
-            s, intent.idempotency_key, canonical)
+        if lance is not None and merge_context is not None:
+            raise ManagedLocalWriteConflict(
+                "managed local write key is already owned by a non-merge publication")
+        return lance
 
 
 def catalog_admit_managed_local_lance_write(value: object) -> dict | None:
@@ -15433,7 +15545,8 @@ def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
 def catalog_publish_managed_local_file(
         logical_uri: str, artifact_uri: str, name: str, doc: dict, *,
         parents: list[str] | None = None, lineage: dict | None = None,
-        write_intent: object | None = None, total_bytes: int | None = None) -> dict:
+        write_intent: object | None = None, total_bytes: int | None = None,
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict:
     """Atomically publish one already-validated local artifact as a new immutable revision.
 
     The catalog retains only the current physical projection; the revision ledger owns every physical
@@ -15451,6 +15564,9 @@ def catalog_publish_managed_local_file(
     parent_tokens = catalog_lineage_parent_tokens(parents)
     canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
     typed_intent = intent_payload = intent_doc = None
+    merge_context = _canonical_merge_publication_context(merge_publication)
+    if merge_context is not None and write_intent is None:
+        raise ValueError("merge publication context requires a typed local write")
     if write_intent is not None:
         typed_intent, intent_payload, intent_doc = _canonical_managed_local_write_intent(write_intent)
         if typed_intent.mode not in ("create", "replace"):
@@ -15504,6 +15620,14 @@ def catalog_publish_managed_local_file(
                     parent_tokens=parent_tokens,
                     lineage=canonical_lineage,
                 )
+            if typed_intent is not None:
+                typed_replay = (_managed_local_merge_replay_in_session(
+                    s, typed_intent.idempotency_key, intent_doc, merge_context)
+                    if merge_context is not None else _managed_local_write_receipt_in_session(
+                        s, typed_intent.idempotency_key, intent_doc))
+                if typed_replay is None or typed_replay["revisionId"] != receipt["revision_id"]:
+                    raise RuntimeError("managed local publication has no exact typed receipt")
+                return typed_replay
             return receipt
         if canonical_lineage is not None:
             lineage_publication_key, lineage_applied = _catalog_reserve_lineage_publication(
@@ -15524,8 +15648,10 @@ def catalog_publish_managed_local_file(
                 f"managed-local-write:{typed_intent.idempotency_key}")
         _lock_catalog_namespace_tokens(s, namespace_tokens)
         if typed_intent is not None:
-            prior_write = _managed_local_write_receipt_in_session(
-                s, typed_intent.idempotency_key, intent_doc, lock=True)
+            prior_write = (_managed_local_merge_replay_in_session(
+                s, typed_intent.idempotency_key, intent_doc, merge_context, lock=True)
+                if merge_context is not None else _managed_local_write_receipt_in_session(
+                    s, typed_intent.idempotency_key, intent_doc, lock=True))
             if prior_write is not None:
                 _catalog_require_lineage_publication(
                     s,
@@ -15538,6 +15664,9 @@ def catalog_publish_managed_local_file(
             prior_lance_write = _managed_local_lance_write_receipt_in_session(
                 s, typed_intent.idempotency_key, intent_doc, lock=True)
             if prior_lance_write is not None:  # pragma: no cover - mode validation forbids this replay
+                if merge_context is not None:
+                    raise ManagedLocalWriteConflict(
+                        "managed local write key is already owned by a non-merge publication")
                 return prior_lance_write
         prior_head = (_validate_managed_local_write_precondition(
             s, typed_intent, lock=True) if typed_intent is not None else None)
@@ -15555,6 +15684,14 @@ def catalog_publish_managed_local_file(
                 if lineage_applied:
                     raise RuntimeError(
                         "managed local publication receipt belongs to another lineage request")
+            if typed_intent is not None:
+                typed_replay = (_managed_local_merge_replay_in_session(
+                    s, typed_intent.idempotency_key, intent_doc, merge_context, lock=True)
+                    if merge_context is not None else _managed_local_write_receipt_in_session(
+                        s, typed_intent.idempotency_key, intent_doc, lock=True))
+                if typed_replay is None or typed_replay["revisionId"] != receipt["revision_id"]:
+                    raise RuntimeError("managed local publication has no exact typed receipt")
+                return typed_replay
             return receipt
         if canonical_lineage is not None and not lineage_applied:
             raise RuntimeError("managed local publication lineage reservation has no receipt")
@@ -15662,6 +15799,15 @@ def catalog_publish_managed_local_file(
                 s, dataset_id=entry.registration_id, name=entry.name, folder=entry.folder or "")
         # The revision ledger, rather than the replaceable head projection, retains every artifact.
         sync_local_result_owner(s, "managed_file_revision", revision_id, artifact_uri)
+        if merge_context is not None:
+            if typed_intent is None or revision.write_receipt_doc is None:
+                raise RuntimeError("merge publication has no exact typed receipt")
+            s.add(MergeColumnsPublication(
+                idempotency_key=typed_intent.idempotency_key,
+                merge_doc=merge_context.merge_doc,
+                merge_sha256=merge_context.merge_sha256,
+                revision_id=revision.revision_id,
+            ))
         if canonical_lineage is not None:
             destination_snapshot = _catalog_lineage_parent_snapshot(s, artifact_uri)
             target_snapshots = [destination_snapshot, *parent_snapshots]
@@ -16950,6 +17096,9 @@ def managed_local_file_revision_gc_batch(
                 LocalResultReference.owner_key != ManagedLocalFileRevision.revision_id,
             ),
         ).exists()
+        merge_reference = select(MergeColumnsPublication.revision_id).where(
+            MergeColumnsPublication.revision_id == ManagedLocalFileRevision.revision_id,
+        ).exists()
         statement = (select(ManagedLocalFileRevision)
             .join(CatalogLogicalDataset,
                   CatalogLogicalDataset.logical_id == ManagedLocalFileRevision.logical_id)
@@ -16960,6 +17109,7 @@ def managed_local_file_revision_gc_batch(
                     CatalogLogicalDataset.current_uri != ManagedLocalFileRevision.artifact_uri,
                 ),
                 ~external_reference,
+                ~merge_reference,
             )
             .order_by(
                 ManagedLocalFileRevision.committed_at,
@@ -16972,6 +17122,11 @@ def managed_local_file_revision_gc_batch(
         for revision in rows[:bounded]:
             logical = s.get(CatalogLogicalDataset, revision.logical_id)
             if logical is not None and logical.current_uri == revision.artifact_uri:
+                continue
+            merge_ref = s.scalar(select(MergeColumnsPublication.revision_id).where(
+                MergeColumnsPublication.revision_id == revision.revision_id,
+            ).limit(1).with_for_update())
+            if merge_ref is not None:
                 continue
             artifact = s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
             retention_ref = s.get(LocalResultReference, {

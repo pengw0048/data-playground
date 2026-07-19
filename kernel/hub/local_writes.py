@@ -29,7 +29,8 @@ def _finish_candidate(storage, artifact_uri: str, run_id: str, receipt: WriteRec
 def write_managed_local_file(
         *, storage, catalog, intent: WriteIntent,
         write_artifact: Callable[[str], object],
-        before_publish: Callable[[], None] | None = None) -> WriteReceipt:
+        before_publish: Callable[[], None] | None = None,
+        merge_publication: metadb.MergeColumnsPublicationContext | None = None) -> WriteReceipt:
     """Execute one frozen local write with abortable staging and receipt-based recovery.
 
     Admission touches no artifact. Once publication starts, a successful receipt read distinguishes a
@@ -38,7 +39,8 @@ def write_managed_local_file(
     """
     frozen = WriteIntent.model_validate(intent)
     frozen_doc = frozen.model_dump(by_alias=True, mode="json")
-    prior = metadb.catalog_admit_managed_local_write(frozen_doc)
+    prior = metadb.catalog_admit_managed_local_write(
+        frozen_doc, merge_publication=merge_publication)
     if prior is not None:
         return WriteReceipt.model_validate(prior)
 
@@ -55,11 +57,19 @@ def write_managed_local_file(
         total_bytes = os.stat(artifact_uri, follow_symlinks=True).st_size
         publication_started = True
         receipt = catalog.publish_managed_local_write(
-            frozen, artifact_uri, total_bytes=total_bytes)
+            frozen, artifact_uri, total_bytes=total_bytes,
+            merge_publication=merge_publication)
+        if merge_publication is not None:
+            semantic = metadb.catalog_managed_local_write_receipt(
+                frozen_doc, merge_publication=merge_publication)
+            if semantic is None:
+                raise RuntimeError("merge publication has no durable semantic receipt")
+            receipt = WriteReceipt.model_validate(semantic)
     except Exception:
         if publication_started:
             try:
-                recovered = metadb.catalog_managed_local_write_receipt(frozen_doc)
+                recovered = metadb.catalog_managed_local_write_receipt(
+                    frozen_doc, merge_publication=merge_publication)
             except Exception:
                 # Commit outcome is unknown. Retain the exact writer fence until a retry/restart can
                 # discover either the durable receipt or an unreferenced ready artifact.
