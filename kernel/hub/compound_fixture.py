@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 
 FIXTURE_URI_PREFIX = "fixture://compound-timeline/"
+MAX_FIXTURE_MEMBER_BYTES = 128 * 1024
 _TARGET = "compound-fixture-v1"
 _SOURCE_DATASET_ID = "fixture-compound-timeline"
 _SOURCE_REVISION_ID = "24fe23dddf87e41016499e356bed5d3c8f00eee7cf0e9edbca86bd352ce0edb0"
@@ -60,9 +61,12 @@ def _resource(member_id: str):
 
 def _canonical_member_bytes(member_id: str) -> bytes:
     try:
-        payload = _resource(member_id).read_bytes()
+        with _resource(member_id).open("rb") as source:
+            payload = source.read(MAX_FIXTURE_MEMBER_BYTES + 1)
     except (FileNotFoundError, ModuleNotFoundError, OSError) as exc:
         raise FixtureUnavailable("canonical fixture member is unavailable") from exc
+    if len(payload) > MAX_FIXTURE_MEMBER_BYTES:
+        raise FixtureUnavailable("canonical fixture member exceeds its byte cap")
     if hashlib.sha256(payload).hexdigest() != _MEMBER_DIGESTS[member_id]:
         raise FixtureUnavailable("canonical fixture member is corrupt")
     return payload

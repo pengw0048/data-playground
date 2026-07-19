@@ -1087,6 +1087,108 @@ class TemporalEvidenceResponseV1(Wire):
     pair: TemporalEvidencePairEvidenceV1 | None
 
 
+class InspectionWindowRequestV1(Wire):
+    """One bounded reference-clock read over an opaque exact compound revision."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    episode_id: str = Field(min_length=1, max_length=128)
+    start_tick: str = Field(min_length=1, max_length=20, pattern=r"^(?:0|-?[1-9][0-9]*)$")
+    end_tick: str = Field(min_length=1, max_length=20, pattern=r"^(?:0|-?[1-9][0-9]*)$")
+    stream_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        min_length=1, max_length=8)
+    pair: TemporalEvidencePairV1 | None = None
+    gap_threshold_ticks: str = Field(min_length=1, max_length=20, pattern=r"^(?:[1-9][0-9]*)$")
+    tolerance_ticks: str = Field(default="0", min_length=1, max_length=20,
+                                 pattern=r"^(?:0|[1-9][0-9]*)$")
+
+    @model_validator(mode="after")
+    def validate_window_and_streams(self) -> "InspectionWindowRequestV1":
+        start, end = int(self.start_tick), int(self.end_tick)
+        maximum = (1 << 63) - 1
+        if not (-maximum - 1 <= start <= maximum and -maximum - 1 <= end <= maximum):
+            raise ValueError("inspection window ticks must be signed 64-bit")
+        if start >= end:
+            raise ValueError("inspection window must be half-open with positive length")
+        if len(set(self.stream_ids)) != len(self.stream_ids):
+            raise ValueError("inspection window stream ids must be unique")
+        if self.pair is not None and ({self.pair.left_stream_id, self.pair.right_stream_id}
+                                      - set(self.stream_ids)):
+            raise ValueError("inspection window pair must be selected from stream ids")
+        if not (0 < int(self.gap_threshold_ticks) <= maximum):
+            raise ValueError("inspection window gap threshold must be positive signed 64-bit")
+        if not (0 <= int(self.tolerance_ticks) <= maximum):
+            raise ValueError("inspection window tolerance must be nonnegative signed 64-bit")
+        return self
+
+
+class InspectionWindowIdentityV1(Wire):
+    """Only opaque compound identity and reference-clock facts cross the API boundary."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    compound_dataset_id: str
+    compound_revision: str
+    episode_id: str
+    reference_clock_id: str
+    start_tick: int
+    end_tick: int
+    stream_ids: list[str]
+
+
+class InspectionWindowObservationV1(Wire):
+    """A point or half-open interval mapped onto the requested reference clock."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    observation_id: str
+    kind: Literal["point", "interval"]
+    start_tick: int
+    end_tick: int | None = None
+    values: dict[str, str | int | float | bool | None]
+    assets: list[CompoundFixtureAssetV1] = Field(default_factory=list)
+
+
+class InspectionWindowStreamV1(Wire):
+    """Bounded raw observations and their truth state for one selected stream."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    stream_id: str
+    state: Literal["present", "absent", "partial", "truncated", "unavailable", "permission", "corrupt", "unknown"]
+    complete: bool
+    reason: str | None = None
+    corrupt_count: int = 0
+    columns: list[ColumnSchema]
+    observations: list[InspectionWindowObservationV1] = Field(default_factory=list)
+
+
+class InspectionWindowEvidenceV1(Wire):
+    """Redacted #441 evidence; server-owned DatasetView identities are intentionally omitted."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    complete: bool
+    approximation: TemporalEvidenceApproximationV1
+    streams: list[TemporalEvidenceStreamV1]
+    pair: TemporalEvidencePairEvidenceV1 | None
+
+
+class InspectionWindowLimitsV1(Wire):
+    """Server-fixed admission limits for one raw stream; clients cannot raise them."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    max_rows_per_stream: int
+    max_raw_bytes_per_stream: int
+
+
+class InspectionWindowResponseV1(Wire):
+    """One exact bounded inspection read with no manifest or physical authority."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    schema_version: Literal[1] = 1
+    identity: InspectionWindowIdentityV1
+    complete: bool
+    limits: InspectionWindowLimitsV1
+    evidence: InspectionWindowEvidenceV1
+    observations: list[InspectionWindowStreamV1]
+
+
 class CompoundFixtureAssetV1(Wire):
     """One declared immutable fixture asset without a physical locator."""
 

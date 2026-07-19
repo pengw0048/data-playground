@@ -22,6 +22,31 @@ def test_shared_builder_matches_the_ux_fixture_delegate(tmp_path):
         path.relative_to(delegated): path.read_bytes() for path in delegated.rglob("*") if path.is_file()}
 
 
+def test_oversized_canonical_member_fails_before_csv_parsing_without_path_leak(tmp_path, monkeypatch):
+    import pyarrow.csv as pacsv
+    import pytest
+
+    from hub import compound_fixture
+
+    replacement = tmp_path / "private-oversized-member.csv"
+    replacement.write_bytes(b"x" * (compound_fixture.MAX_FIXTURE_MEMBER_BYTES + 1))
+    monkeypatch.setattr(compound_fixture, "_resource", lambda _member_id: replacement)
+    parser_calls = 0
+
+    def forbidden_parser(*_args, **_kwargs):
+        nonlocal parser_calls
+        parser_calls += 1
+        raise AssertionError("CSV parser must not see an oversized canonical member")
+
+    monkeypatch.setattr(pacsv, "read_csv", forbidden_parser)
+    with pytest.raises(compound_fixture.FixtureUnavailable) as raised:
+        compound_fixture.CompoundFixtureAdapter()._table(
+            compound_fixture.fixture_uri("episodes"))
+    assert parser_calls == 0
+    assert "byte cap" in str(raised.value)
+    assert str(replacement) not in str(raised.value)
+
+
 def _fixture_evidence_request(root, authority):
     import json
     from hub.compound_fixture_definition import _compound_manifest_revision
