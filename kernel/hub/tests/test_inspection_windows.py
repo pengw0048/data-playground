@@ -85,6 +85,10 @@ def test_inspection_window_returns_exact_mapped_points_intervals_and_asset_refs(
         "afterObservationId": "episode-1-sensor-003", "beforeObservationId": "episode-1-sensor-004",
         "durationTicks": 4004, "thresholdTicks": 3000,
     }]
+    assert sensor_evidence["clockMapping"] == {
+        "sourceClockId": "sensor-device-us", "targetClockId": "reference-ms",
+        "scaleNumerator": 1001, "scaleDenominator": 1_000_000, "offsetTick": -125,
+    }
     assert document["evidence"]["pair"]["nearestDelta"]["tieBreak"] == "distance,startTick,endTick,observationId"
     rendered = json.dumps(document)
     assert str(inspection_workspace) not in rendered
