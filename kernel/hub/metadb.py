@@ -178,6 +178,51 @@ class DatasetView(Base):
     )
 
 
+class SparseOutput(Base):
+    """Immutable metadata admission for one not-yet-materialized sparse output."""
+
+    __tablename__ = "sparse_outputs"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
+    canvas_id: Mapped[str] = mapped_column(String, ForeignKey("canvases.id"), nullable=False)
+    submission_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    input_dataset_id: Mapped[str] = mapped_column(
+        String, ForeignKey("catalog_logical_datasets.logical_id"), nullable=False)
+    input_revision_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("managed_local_file_revisions.revision_id"), nullable=False)
+    row_identity_spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    input_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    producer_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    producer_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    schema_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    provenance_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    provenance_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now)
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "canvas_id", "submission_id",
+            name="uq_sparse_output_owner_canvas_submission"),
+        CheckConstraint("length(input_sha256) = 64", name="ck_sparse_output_input_sha256"),
+        CheckConstraint("length(row_identity_spec_sha256) = 64", name="ck_sparse_output_spec_sha256"),
+        CheckConstraint("length(producer_sha256) = 64", name="ck_sparse_output_producer_sha256"),
+        CheckConstraint("length(config_sha256) = 64", name="ck_sparse_output_config_sha256"),
+        CheckConstraint("length(schema_sha256) = 64", name="ck_sparse_output_schema_sha256"),
+        CheckConstraint("length(provenance_sha256) = 64", name="ck_sparse_output_provenance_sha256"),
+        CheckConstraint("length(evidence_sha256) = 64", name="ck_sparse_output_evidence_sha256"),
+        CheckConstraint("length(intent_sha256) = 64", name="ck_sparse_output_intent_sha256"),
+        Index("ix_sparse_outputs_owner_canvas_created", "owner_id", "canvas_id", "created_at"),
+    )
+
+
 class WorkspaceProviderBinding(Base):
     """Durable, non-sensitive display snapshot for one explicit external resource binding.
 
@@ -2778,6 +2823,10 @@ class DatasetViewSubmissionConflict(RuntimeError):
     """A DatasetView submission id was reused for a different immutable intent."""
 
 
+class SparseOutputSubmissionConflict(RuntimeError):
+    """A sparse admission identity is bound to different immutable facts."""
+
+
 class DatasetViewGone(RuntimeError):
     """A retained DatasetView tombstone forbids replay or exact access."""
 
@@ -3796,6 +3845,229 @@ def dataset_view_delete(uid: str, view_id: str) -> bool | None:
         _drop_local_result_owner(s, "dataset_view", row.id)
         row.deleted_at = _now()
         return True
+
+
+_SPARSE_OUTPUT_DOCUMENT_COLUMNS = (
+    "input_doc", "producer_doc", "config_doc", "schema_doc", "provenance_doc",
+    "evidence_doc", "intent_doc",
+)
+_SPARSE_OUTPUT_DIGEST_COLUMNS = tuple(
+    column.replace("_doc", "_sha256") for column in _SPARSE_OUTPUT_DOCUMENT_COLUMNS)
+
+
+def _sparse_output_doc(row: SparseOutput) -> dict:
+    try:
+        documents = {
+            column.removesuffix("_doc"): json.loads(getattr(row, column))
+            for column in _SPARSE_OUTPUT_DOCUMENT_COLUMNS
+        }
+    except (TypeError, ValueError) as exc:  # pragma: no cover - rows are server-authored
+        raise RuntimeError("SparseOutput immutable document is corrupt") from exc
+    return {
+        "id": row.id,
+        "ownerId": row.owner_id,
+        "canvasId": row.canvas_id,
+        "submissionId": row.submission_id,
+        "inputDatasetId": row.input_dataset_id,
+        "inputRevisionId": row.input_revision_id,
+        "rowIdentitySpecSha256": row.row_identity_spec_sha256,
+        "createdAt": row.created_at,
+        "documents": documents,
+        "digests": {
+            column.removesuffix("_sha256"): getattr(row, column)
+            for column in _SPARSE_OUTPUT_DIGEST_COLUMNS
+        },
+    }
+
+
+def sparse_output_admit(*, owner_id: str, canvas_id: str, submission_id: str,
+                        sparse_id: str, input_dataset_id: str, input_revision_id: str,
+                        documents: dict[str, str], digests: dict[str, str],
+                        row_identity_spec_sha256: str) -> tuple[dict, bool]:
+    """Atomically retain an already-ready exact base beside one immutable sparse admission.
+
+    This deliberately bypasses artifact allocation.  The only local lifecycle write is the one
+    ``sparse_output`` reference to the managed revision's existing ready artifact.
+    """
+    expected_documents = {column.removesuffix("_doc") for column in _SPARSE_OUTPUT_DOCUMENT_COLUMNS}
+    expected_digests = {column.removesuffix("_sha256") for column in _SPARSE_OUTPUT_DIGEST_COLUMNS}
+    if (set(documents) != expected_documents or set(digests) != expected_digests
+            or any(type(value) is not str or not value for value in documents.values())
+            or any(len(value.encode()) > 65_536 for value in documents.values())
+            or any(type(value) is not str or len(value) != 64 for value in digests.values())
+            or type(row_identity_spec_sha256) is not str or len(row_identity_spec_sha256) != 64):
+        raise ValueError("SparseOutput immutable admission is invalid")
+    if (not all(type(value) is str and value for value in (
+            owner_id, canvas_id, submission_id, sparse_id, input_dataset_id, input_revision_id))
+            or len(sparse_id) > 32 or len(submission_id) > 128):
+        raise ValueError("SparseOutput identity is invalid")
+    with session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None or canvas.owner_id != owner_id:
+            raise PermissionError("SparseOutput canvas is unavailable")
+        if s.get_bind().dialect.name == "sqlite":
+            # SQLite needs a real write before its ignored FOR UPDATE can serialize first admission.
+            s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+                updated_at=Canvas.updated_at))
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+            raise RuntimeError("unsupported metadata database dialect")
+        values = {
+            "id": sparse_id,
+            "owner_id": owner_id,
+            "canvas_id": canvas_id,
+            "submission_id": submission_id,
+            "input_dataset_id": input_dataset_id,
+            "input_revision_id": input_revision_id,
+            "row_identity_spec_sha256": row_identity_spec_sha256,
+            **{f"{name}_doc": value for name, value in documents.items()},
+            **{f"{name}_sha256": value for name, value in digests.items()},
+            "created_at": _now(),
+        }
+        existing = s.scalar(select(SparseOutput).where(
+            SparseOutput.owner_id == owner_id,
+            SparseOutput.canvas_id == canvas_id,
+            SparseOutput.submission_id == submission_id,
+        ).limit(1).with_for_update())
+        inserted = False
+        if existing is None:
+            result = s.execute(dialect_insert(SparseOutput).values(**values).on_conflict_do_nothing())
+            inserted = result.rowcount == 1
+        row = s.scalar(select(SparseOutput).where(
+            SparseOutput.owner_id == owner_id,
+            SparseOutput.canvas_id == canvas_id,
+            SparseOutput.submission_id == submission_id,
+        ).limit(1).with_for_update())
+        if row is None:  # pragma: no cover - only a random primary-key collision can reach this
+            raise RuntimeError("SparseOutput identity allocation collided")
+        immutable_fields = (
+            "id", "owner_id", "canvas_id", "submission_id", "input_dataset_id",
+            "input_revision_id", "row_identity_spec_sha256", *_SPARSE_OUTPUT_DOCUMENT_COLUMNS,
+            *_SPARSE_OUTPUT_DIGEST_COLUMNS,
+        )
+        if any(getattr(row, field) != values[field] for field in immutable_fields):
+            raise SparseOutputSubmissionConflict(
+                "SparseOutput submission belongs to a different immutable admission")
+        _validate_sparse_output_documents(row)
+        if not inserted:
+            _validate_sparse_output_reference(s, row)
+            return _sparse_output_doc(row), False
+
+        # The local registry is the lifecycle mutex. Keep the caller's read guard alive through this
+        # transaction; sync rechecks the exact ready ledger binding before adding its sole durable hold.
+        sync_local_result_owner(s, "sparse_output", sparse_id, documents["input"])
+        _validate_sparse_output_reference(s, row)
+        return _sparse_output_doc(row), True
+
+
+def sparse_output_get(owner_id: str, sparse_id: str) -> dict | None:
+    """Return immutable internal admission facts without exposing local artifact authority."""
+    with session() as s:
+        row = s.get(SparseOutput, str(sparse_id))
+        if row is None or row.owner_id != owner_id:
+            return None
+        _validate_sparse_output_documents(row)
+        _validate_sparse_output_reference(s, row)
+        return _sparse_output_doc(row)
+
+
+def _validate_sparse_output_documents(row: SparseOutput) -> None:
+    """Treat any non-canonical/corrupt persisted immutable fact as an unreadable half-state."""
+    documents: dict[str, object] = {}
+    try:
+        for column in _SPARSE_OUTPUT_DOCUMENT_COLUMNS:
+            name = column.removesuffix("_doc")
+            stored = getattr(row, column)
+            value = json.loads(stored)
+            if json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != stored:
+                raise ValueError
+            if hashlib.sha256(stored.encode()).hexdigest() != getattr(row, f"{name}_sha256"):
+                raise ValueError
+            documents[name] = value
+        input_doc = documents["input"]
+        if (not isinstance(input_doc, dict)
+                or input_doc != {"kind": "exact", "datasetId": row.input_dataset_id,
+                                 "revisionId": row.input_revision_id}):
+            raise ValueError
+        producer = documents["producer"]
+        if producer != {"kind": "source_to_select", "source": "exact",
+                        "select": {"kind": "builtin", "version": 1}} \
+                or type(producer.get("select", {}).get("version")) is not int:
+            raise ValueError
+        config, schema, provenance, evidence, intent = (
+            documents[name] for name in ("config", "schema", "provenance", "evidence", "intent"))
+        if (not isinstance(config, dict) or set(config) != {"expr"}
+                or type(config["expr"]) is not str or not config["expr"]
+                or not isinstance(schema, dict) or set(schema) != {"version", "identity", "payload"}
+                or type(schema.get("version")) is not int or schema["version"] != 1
+                or not isinstance(schema["identity"], list)
+                or not isinstance(schema["payload"], list) or not schema["payload"]
+                or not isinstance(provenance, dict) or not isinstance(evidence, dict)
+                or not isinstance(intent, dict)):
+            raise ValueError
+        from hub.models import ExactDatasetRef
+        from hub.models import LineagePublication
+        from hub.row_identity import decode_row_identity_coverage
+        if LineagePublication.model_validate(provenance).model_dump(by_alias=True, mode="json") != provenance:
+            raise ValueError
+        expected = ExactDatasetRef(
+            kind="exact", dataset_id=row.input_dataset_id, revision_id=row.input_revision_id)
+        certificate = decode_row_identity_coverage(
+            evidence, expected, row.row_identity_spec_sha256)
+        from hub.sqlpolicy import identifier_key
+
+        def schema_fields(value):
+            if not isinstance(value, list):
+                raise ValueError
+            fields = []
+            for field in value:
+                if (not isinstance(field, dict)
+                        or set(field) != {"name", "arrowType", "nullable"}
+                        or type(field["name"]) is not str or not field["name"]
+                        or type(field["arrowType"]) is not str or not field["arrowType"]
+                        or type(field["nullable"]) is not bool):
+                    raise ValueError
+                fields.append((field["name"], field["arrowType"]))
+            if len({identifier_key(name) for name, _arrow_type in fields}) != len(fields):
+                raise ValueError
+            return fields
+
+        identity_fields, payload_fields = schema_fields(schema["identity"]), schema_fields(schema["payload"])
+        if ({identifier_key(name) for name, _arrow_type in identity_fields}
+                & {identifier_key(name) for name, _arrow_type in payload_fields}):
+            raise ValueError
+        if identity_fields != [(field.name, field.arrow_type) for field in certificate.spec.fields]:
+            raise ValueError
+        expected_intent = {
+            "version": 1, "ownerId": row.owner_id, "canvasId": row.canvas_id,
+            "submissionId": row.submission_id,
+            "rowIdentitySpecSha256": row.row_identity_spec_sha256,
+            **{f"{name}Sha256": getattr(row, f"{name}_sha256")
+               for name in sorted({"input", "producer", "config", "schema", "provenance", "evidence"})},
+        }
+        if type(intent.get("version")) is not int or intent != expected_intent:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("SparseOutput immutable admission is corrupt") from exc
+
+
+def _validate_sparse_output_reference(s, row: SparseOutput) -> None:
+    """Fail closed on a retained admission whose one immutable base hold is missing or wrong."""
+    revision = s.get(ManagedLocalFileRevision, row.input_revision_id, with_for_update=True)
+    refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.owner_kind == "sparse_output",
+        LocalResultReference.owner_key == row.id,
+    ).order_by(LocalResultReference.uri).with_for_update()))
+    if revision is None or revision.logical_id != row.input_dataset_id or len(refs) != 1:
+        raise RuntimeError("SparseOutput exact base retention is incomplete")
+    artifact = s.get(LocalResultArtifact, refs[0].uri, with_for_update=True)
+    if (artifact is None or artifact.state != "ready" or refs[0].uri != revision.artifact_uri
+            or artifact.writer_run_id is not None or artifact.writer_token is not None):
+        raise RuntimeError("SparseOutput exact base retention is incomplete")
 
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
@@ -10345,7 +10617,7 @@ _LOCAL_RESULT_REGISTRY_ID = 1
 _LOCAL_RESULT_OWNER_KINDS = {
     "canvas", "canvas_version", "catalog_entry", "managed_file_revision", "result_cache",
     "dataset_view", "distribution_report", "durable_task", "profile_job",
-    "run_input_admission", "run_record", "run_state",
+    "run_input_admission", "run_record", "run_state", "sparse_output",
 }
 _LOCAL_RESULT_EPHEMERAL_OWNER_KIND = "read_lease"
 _LINEAR_CHECKPOINT_OWNER_KIND = "durable_checkpoint"
@@ -10425,7 +10697,7 @@ def _local_result_owner_candidates(owner_kind: str, values: tuple) -> list[str]:
             candidates.update(_canvas_local_result_candidates(value))
     elif owner_kind in (
             "dataset_view", "distribution_report", "durable_task", "profile_job",
-            "run_input_admission"):
+            "run_input_admission", "sparse_output"):
         pass
     else:
         raise ValueError(f"unknown local-result owner kind {owner_kind!r}")
@@ -10539,6 +10811,23 @@ def _dataset_view_revision_identities(value: object) -> set[tuple[str, str]]:
     return set()
 
 
+def _sparse_output_revision_identities(value: object) -> set[tuple[str, str]]:
+    """Extract the only allowed SparseOutput input: one exact core-managed revision."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return set()
+    if (not isinstance(value, dict)
+            or set(value) != {"kind", "datasetId", "revisionId"}
+            or value.get("kind") != "exact"):
+        return set()
+    dataset_id, revision_id = value.get("datasetId"), value.get("revisionId")
+    if isinstance(dataset_id, str) and dataset_id and isinstance(revision_id, str) and revision_id:
+        return {(dataset_id, revision_id)}
+    return set()
+
+
 def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if owner_kind in ("canvas", "canvas_version"):
@@ -10547,6 +10836,9 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
     elif owner_kind in ("dataset_view", "distribution_report"):
         for value in values:
             identities.update(_dataset_view_revision_identities(value))
+    elif owner_kind == "sparse_output":
+        for value in values:
+            identities.update(_sparse_output_revision_identities(value))
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))

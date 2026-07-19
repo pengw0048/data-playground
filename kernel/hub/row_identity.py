@@ -92,9 +92,115 @@ class RowIdentityCoverageV1:
     status: Literal["complete", "partial", "invalid"]
 
 
+def serialize_row_identity_coverage(
+        certificate: RowIdentityCoverageV1, expected_dataset_ref: ExactDatasetRef,
+        expected_spec_digest: str) -> dict:
+    """Return the complete canonical V1 certificate document for durable admission.
+
+    The document is intentionally an explicit whitelist rather than a dataclass dump: persisted
+    evidence must not acquire unaudited fields as this hand-off moves between later sparse leaves.
+    """
+    validate_row_identity_coverage(certificate, expected_dataset_ref, expected_spec_digest)
+    return {
+        "version": 1,
+        "spec": {
+            "datasetId": certificate.spec.dataset_id,
+            "revisionId": certificate.spec.revision_id,
+            "fields": [{"name": field.name, "arrowType": field.arrow_type}
+                       for field in certificate.spec.fields],
+            "schemaDigest": certificate.spec.schema_digest,
+            "encodingVersion": certificate.spec.encoding_version,
+            "nullPolicy": certificate.spec.null_policy,
+            "digest": certificate.spec.digest,
+        },
+        "base": _scan_document(certificate.base),
+        "candidate": _scan_document(certificate.candidate),
+        "matchedIdentities": certificate.matched_identities,
+        "missingIdentities": certificate.missing_identities,
+        "extraIdentities": certificate.extra_identities,
+        "status": certificate.status,
+    }
+
+
+def decode_row_identity_coverage(
+        document: object, expected_dataset_ref: ExactDatasetRef,
+        expected_spec_digest: str) -> RowIdentityCoverageV1:
+    """Decode only the exact V1 certificate shape and revalidate frozen authority.
+
+    This is deliberately stricter than JSON schema coercion: booleans never become counts and an
+    extra field is corruption, not a future-compatible extension of immutable evidence.
+    """
+    try:
+        document = _exact_keys(document, {
+            "version", "spec", "base", "candidate", "matchedIdentities",
+            "missingIdentities", "extraIdentities", "status",
+        })
+        if type(document["version"]) is not int or document["version"] != 1:
+            raise ValueError
+        spec_doc = _exact_keys(document["spec"], {
+            "datasetId", "revisionId", "fields", "schemaDigest", "encodingVersion",
+            "nullPolicy", "digest",
+        })
+        fields_doc = spec_doc["fields"]
+        if not isinstance(fields_doc, list):
+            raise ValueError
+        fields: list[RowIdentityFieldV1] = []
+        for field in fields_doc:
+            field = _exact_keys(field, {"name", "arrowType"})
+            fields.append(RowIdentityFieldV1(name=field["name"], arrow_type=field["arrowType"]))
+        certificate = RowIdentityCoverageV1(
+            spec=RowIdentitySpecV1(
+                dataset_id=spec_doc["datasetId"], revision_id=spec_doc["revisionId"],
+                fields=tuple(fields), schema_digest=spec_doc["schemaDigest"],
+                encoding_version=spec_doc["encodingVersion"], null_policy=spec_doc["nullPolicy"],
+                digest=spec_doc["digest"],
+            ),
+            base=_scan_from_document(document["base"]),
+            candidate=_scan_from_document(document["candidate"]),
+            matched_identities=document["matchedIdentities"],
+            missing_identities=document["missingIdentities"],
+            extra_identities=document["extraIdentities"],
+            status=document["status"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RowIdentityValidationError("row identity evidence is invalid") from exc
+    validate_row_identity_coverage(certificate, expected_dataset_ref, expected_spec_digest)
+    return certificate
+
+
+def _scan_document(scan: RowIdentityScanEvidenceV1) -> dict:
+    return {
+        "rows": scan.rows,
+        "uniqueIdentities": scan.unique_identities,
+        "nullRows": scan.null_rows,
+        "duplicateGroups": scan.duplicate_groups,
+        "duplicateRows": scan.duplicate_rows,
+        "keySetDigest": scan.key_set_digest,
+    }
+
+
+def _scan_from_document(document: object) -> RowIdentityScanEvidenceV1:
+    document = _exact_keys(document, {
+        "rows", "uniqueIdentities", "nullRows", "duplicateGroups", "duplicateRows",
+        "keySetDigest",
+    })
+    return RowIdentityScanEvidenceV1(
+        rows=document["rows"], unique_identities=document["uniqueIdentities"],
+        null_rows=document["nullRows"], duplicate_groups=document["duplicateGroups"],
+        duplicate_rows=document["duplicateRows"], key_set_digest=document["keySetDigest"],
+    )
+
+
+def _exact_keys(document: object, expected: set[str]) -> dict[str, object]:
+    if not isinstance(document, dict) or set(document) != expected:
+        raise ValueError
+    return document
+
+
 def certify_row_identity_coverage(
         storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], candidate,
-        *, owner: str = "row-identity") -> RowIdentityCoverageV1:
+        *, owner: str = "row-identity", frozen_spec: RowIdentitySpecV1 | None = None,
+) -> RowIdentityCoverageV1:
     """Certify raw-key coverage for one *exact* core-owned managed-local revision.
 
     ``candidate`` must be a DuckDB relation built on the caller's current connection.  Keeping
@@ -114,6 +220,10 @@ def certify_row_identity_coverage(
             base_schema = _relation_schema(base)
             fields = _key_fields(base_schema, declared)
             spec = _spec(exact, fields, base_schema)
+            if frozen_spec is not None:
+                _validate_frozen_spec(frozen_spec, dataset_ref)
+                if spec != frozen_spec:
+                    raise RowIdentityValidationError("row identity evidence is invalid")
             _require_candidate_schema(candidate, declared, fields)
 
             base_keys = _key_relation(base, declared)
@@ -146,6 +256,26 @@ def certify_row_identity_coverage(
         extra_identities=extra, status=status)
     validate_row_identity_coverage(certificate, dataset_ref, spec.digest)
     return certificate
+
+
+def freeze_row_identity_spec(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], base_relation,
+) -> RowIdentitySpecV1:
+    """Freeze V1 key/type/schema facts from the caller's already-guarded exact base relation."""
+    exact = _exact_ref(dataset_ref)
+    declared = _declared_keys(key_columns)
+    spec = _spec(exact, _key_fields(_relation_schema(base_relation), declared),
+                 _relation_schema(base_relation))
+    _validate_frozen_spec(spec, dataset_ref)
+    return spec
+
+
+def _validate_frozen_spec(spec: RowIdentitySpecV1, dataset_ref: ExactDatasetRef) -> None:
+    expected = _exact_ref(dataset_ref)
+    if (not isinstance(spec, RowIdentitySpecV1) or spec.digest != _spec_digest(
+            spec.dataset_id, spec.revision_id, spec.fields, spec.schema_digest)
+            or (spec.dataset_id, spec.revision_id) != expected):
+        raise RowIdentityValidationError("row identity evidence is invalid")
 
 
 def validate_row_identity_coverage(

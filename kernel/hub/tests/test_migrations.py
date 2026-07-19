@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0028_sparse_output_admission", "0027_distribution_reports"),
         ("0027_distribution_reports", "0026_dataset_views"),
         ("0026_dataset_views", "0025_transform_library_keys"),
         ("0025_transform_library_keys", "0024_promoted_transforms"),
@@ -82,8 +83,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0027_distribution_reports"]
-    assert metadb.expected_schema_head() == "0027_distribution_reports"
+    assert scripts.get_heads() == ["0028_sparse_output_admission"]
+    assert metadb.expected_schema_head() == "0028_sparse_output_admission"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -176,6 +177,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0027_distribution_reports.py": (
             "1cb20334daf75c5d010dd296f996ff97daef86baab917f5c7c430855d1a82974"
+        ),
+        "0028_sparse_output_admission.py": (
+            "1c467a37a61799d282705d0c0ad2a547d3f63212841a49a9883e4e1ae32c4f86"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
