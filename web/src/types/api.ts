@@ -189,6 +189,122 @@ export interface DatasetViewPreview {
   sampleProvenance?: SampleProvenance | null
 }
 
+// Bounded, exact compound-inspection API. These DTOs intentionally contain only
+// opaque revision/asset identifiers; the browser never learns a manifest or locator.
+export interface CompoundFixtureAsset {
+  id: string
+  mediaType: string
+  byteLength: number
+  sha256: string
+  status: 'available' | 'unavailable'
+}
+
+export interface CompoundFixtureStream {
+  id: string
+  kind: string
+  clockId: string
+  state: 'present' | 'absent'
+  assetIds: string[]
+}
+
+export interface CompoundFixtureEpisode {
+  id: string
+  referenceClockId: string
+  startTick: string
+  endTick: string
+  streams: CompoundFixtureStream[]
+}
+
+export interface CompoundFixtureDetail {
+  datasetId: string
+  revisionId: string
+  episodes: CompoundFixtureEpisode[]
+  assets: CompoundFixtureAsset[]
+}
+
+export interface TemporalEvidenceGap {
+  afterObservationId: string
+  beforeObservationId: string
+  durationTicks: number
+  thresholdTicks: number
+}
+
+export interface InspectionEvidenceStream {
+  streamId: string
+  state: 'available' | 'absent' | 'unavailable' | 'permission' | 'corrupt' | 'truncated' | 'unknown'
+  coverageIntervals: Array<[number, number]>
+  gaps: TemporalEvidenceGap[]
+  clockMapping: {
+    sourceClockId: string
+    targetClockId: string
+    scaleNumerator: number
+    scaleDenominator: number
+    offsetTick: number
+  } | null
+  complete: boolean
+  reason?: string | null
+}
+
+export interface InspectionWindowObservation {
+  observationId: string
+  kind: 'point' | 'interval'
+  startTick: number
+  endTick?: number | null
+  values: Record<string, string | number | boolean | null>
+  assets: CompoundFixtureAsset[]
+}
+
+export interface InspectionWindowStream {
+  streamId: string
+  state: 'present' | 'absent' | 'partial' | 'truncated' | 'unavailable' | 'permission' | 'corrupt' | 'unknown'
+  complete: boolean
+  reason?: string | null
+  corruptCount: number
+  columns: ColumnSchema[]
+  observations: InspectionWindowObservation[]
+}
+
+export interface InspectionWindowResponse {
+  schemaVersion: 1
+  identity: {
+    compoundDatasetId: string
+    compoundRevision: string
+    episodeId: string
+    referenceClockId: string
+    startTick: number
+    endTick: number
+    streamIds: string[]
+  }
+  complete: boolean
+  limits: { maxRowsPerStream: number; maxRawBytesPerStream: number }
+  evidence: {
+    complete: boolean
+    approximation: { pointCoverage: string; pairwise: string }
+    streams: InspectionEvidenceStream[]
+    pair: {
+      state: 'available' | 'truncated' | 'unknown'
+      complete: boolean
+      reason?: string | null
+      leftStreamId?: string | null
+      rightStreamId?: string | null
+      toleranceTicks?: number | null
+      matchedCount?: number | null
+      nearestDelta?: { minimum?: number | null; maximum?: number | null; tieBreak: string } | null
+    } | null
+  }
+  observations: InspectionWindowStream[]
+}
+
+export interface InspectionWindowRequest {
+  episodeId: string
+  startTick: string
+  endTick: string
+  streamIds: string[]
+  pair?: { leftStreamId: string; rightStreamId: string } | null
+  gapThresholdTicks: string
+  toleranceTicks: string
+}
+
 export interface DistributionReportEstimate {
   schemaVersion: 1
   datasetViewId: string

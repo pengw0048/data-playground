@@ -6,6 +6,7 @@ import type {
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
+  CompoundFixtureDetail, InspectionWindowRequest, InspectionWindowResponse,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -202,6 +203,17 @@ export const api = {
   // upload a dataset file's bytes (raw body; name in a header) → lands in shared storage + registers
   uploadFile: (file: File) =>
     req<CatalogTable>('/catalog/upload', { method: 'POST', body: file, headers: { 'X-Upload-Filename': encodeURIComponent(file.name) } }),
+
+  compoundReference: () => req<CompoundFixtureDetail>('/compound-datasets/reference'),
+  compoundInspectionWindow: (datasetId: string, revisionId: string, body: InspectionWindowRequest,
+    options?: { signal?: AbortSignal }) =>
+    req<InspectionWindowResponse>(
+      `/compound-datasets/${encodeURIComponent(datasetId)}/revisions/${encodeURIComponent(revisionId)}/inspection-window`,
+      { method: 'POST', body: JSON.stringify(body), signal: options?.signal },
+    ),
+  compoundAssetUrl: (datasetId: string, revisionId: string, episodeId: string, streamId: string, assetId: string) =>
+    `${BASE}/compound-datasets/${encodeURIComponent(datasetId)}/revisions/${encodeURIComponent(revisionId)}`
+      + `/episodes/${encodeURIComponent(episodeId)}/streams/${encodeURIComponent(streamId)}/assets/${encodeURIComponent(assetId)}`,
 
   // One filtered/sorted page with its bounded window and total in the response body.
   tablesPage: (params: CatalogQueryParams = {}) =>
