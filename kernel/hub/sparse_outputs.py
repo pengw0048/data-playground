@@ -8,12 +8,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import uuid
+import contextlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from hub import db, metadb
 from hub.models import ExactDatasetRef, LineagePublication
@@ -21,10 +25,11 @@ from hub.plugins.adapters import DuckDBAdapter
 from hub.row_identity import (
     RowIdentityError,
     certify_row_identity_coverage,
+    decode_row_identity_coverage,
     freeze_row_identity_spec,
     serialize_row_identity_coverage,
 )
-from hub.sqlpolicy import FragmentKind, SQLPolicyError, identifier_key, validate_fragment
+from hub.sqlpolicy import FragmentKind, SQLPolicyError, identifier_key, quote_identifier, validate_fragment
 from hub.storage import ManagedSourceUnavailable, source_read_scope
 
 
@@ -42,6 +47,10 @@ class SparseOutputUnavailable(SparseOutputError):
 
 class SparseOutputSubmissionConflict(SparseOutputError):
     """One owner/canvas/submission identity has different immutable semantics."""
+
+
+class SparseOutputMaterializationConflict(SparseOutputError):
+    """The one internal sidecar owner is stale or disagrees with immutable admission facts."""
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,13 @@ class SparseOutputAdmission:
     id: str
     created: bool
     document: dict
+
+
+@dataclass(frozen=True)
+class SparseOutputMaterialization:
+    id: str
+    committed: bool
+    evidence: dict | None
 
 
 def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> SparseOutputAdmission:
@@ -121,6 +137,208 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
     except OSError as exc:
         raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable") from exc
     return SparseOutputAdmission(id=document["id"], created=created, document=document)
+
+
+def materialize_sparse_output(
+        storage, sparse_id: str, owner_token: str, *, lease_seconds: int = 300,
+) -> SparseOutputMaterialization:
+    """Materialize/replay one frozen Source -> Select sidecar under one DB-time fenced owner."""
+    token = _token(owner_token)
+    if not getattr(storage, "lock_supported", False):
+        raise SparseOutputMaterializationConflict("SparseOutput materialization requires OS locks")
+    lock_token = uuid.uuid4().hex
+    try:
+        candidate = metadb.reserve_sparse_output_materialization(
+            sparse_id=str(sparse_id), owner_token=token, lease_seconds=lease_seconds,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=lock_token)
+        if candidate.get("phase") == "committed":
+            return _revalidated_materialization_result(storage, str(sparse_id), candidate)
+        admission = metadb.sparse_output_materialization_input(str(sparse_id))
+        frozen = decode_row_identity_coverage(
+            admission["documents"]["evidence"],
+            ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
+                            revision_id=admission["inputRevisionId"]),
+            admission["rowIdentitySpecSha256"],
+        ).spec
+        writer = None
+        proof = None
+        reattached_lock = None
+        try:
+            if candidate["dev"] is None:
+                writer = storage.materialize_checkpoint(candidate)
+                metadb.bind_sparse_output_materialization(
+                    sparse_id=str(sparse_id), owner_token=token, uri=writer.uri,
+                    dev=writer.identity()[0], ino=writer.identity()[1])
+                with os.fdopen(os.dup(writer.fileno()), "wb") as output:
+                    _write_frozen_select(storage, admission, output)
+                writer.seal()
+                proof = storage.prove_checkpoint(writer)
+            else:
+                reattached_lock, proof = storage.reattach_checkpoint(candidate)
+            _validate_held_schema(proof.artifact_fileno(), admission)
+            exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
+                                    revision_id=admission["inputRevisionId"])
+            with _held_parquet_relation(proof.artifact_fileno()) as candidate_relation:
+                coverage = certify_row_identity_coverage(
+                    storage, exact, [field.name for field in frozen.fields], candidate_relation,
+                    owner=f"sparse-output-materialization:{sparse_id}", frozen_spec=frozen)
+            coverage_doc = _canonical_json(serialize_row_identity_coverage(
+                coverage, exact, frozen.digest))
+            proof.recheck()
+            committed = metadb.commit_sparse_output_materialization(
+                sparse_id=str(sparse_id), owner_token=token,
+                namespace_id=candidate["namespace_id"], storage_root=candidate["storage_root"],
+                lock_name=candidate["lock_name"], lock_token=candidate["lock_token"],
+                lock_protected=candidate["lock_protected"],
+                generation=candidate["generation"],
+                rows=proof.evidence["rows"], size_bytes=proof.evidence["bytes"],
+                content_sha256=proof.evidence["content_sha256"],
+                schema_sha256=proof.evidence["schema_sha256"], dev=proof.evidence["dev"],
+                ino=proof.evidence["ino"], coverage_doc=coverage_doc)
+            return _materialization_result(str(sparse_id), committed)
+        except Exception:
+            reconciled = metadb.reconcile_sparse_output_materialization(str(sparse_id))
+            if reconciled and reconciled.get("phase") == "committed":
+                if proof is not None:
+                    _revalidate_held_proof(storage, str(sparse_id), admission, proof, reconciled)
+                    return _materialization_result(str(sparse_id), reconciled)
+                return _revalidated_materialization_result(storage, str(sparse_id), reconciled)
+            raise
+        finally:
+            if proof is not None:
+                proof.close()
+            if writer is not None:
+                writer.release()
+            if reattached_lock is not None:
+                os.close(reattached_lock)
+    except SparseOutputError:
+        raise
+    except (ManagedSourceUnavailable, RowIdentityError, ValueError, OSError, duckdb.Error) as exc:
+        raise SparseOutputMaterializationConflict("SparseOutput materialization is invalid") from exc
+    except RuntimeError as exc:
+        raise SparseOutputMaterializationConflict("SparseOutput materialization is unavailable") from exc
+
+
+def reopen_sparse_output(storage, sparse_id: str):
+    """Return a held, fully revalidated read guard for committed sidecar truth only."""
+    committed = metadb.reconcile_sparse_output_materialization(str(sparse_id))
+    if not committed or committed.get("phase") != "committed":
+        raise SparseOutputUnavailable("SparseOutput materialization is unavailable")
+    guard = storage.reopen_checkpoint(committed)
+    try:
+        admission = metadb.sparse_output_materialization_input(str(sparse_id))
+        _validate_held_schema(guard.artifact_fileno(), admission)
+        exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
+                                revision_id=admission["inputRevisionId"])
+        frozen = decode_row_identity_coverage(
+            admission["documents"]["evidence"], exact,
+            admission["rowIdentitySpecSha256"]).spec
+        with _held_parquet_relation(guard.artifact_fileno()) as candidate_relation:
+            coverage = certify_row_identity_coverage(
+                storage, exact, [field.name for field in frozen.fields], candidate_relation,
+                owner=f"sparse-output-reopen:{sparse_id}", frozen_spec=frozen)
+        if serialize_row_identity_coverage(coverage, exact, frozen.digest) != committed["coverage"]:
+            raise SparseOutputUnavailable("SparseOutput materialization is unavailable")
+        guard.check()
+        return guard
+    except Exception:
+        guard.close()
+        raise
+
+
+def _write_frozen_select(storage, admission: dict, output) -> None:
+    exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
+                            revision_id=admission["inputRevisionId"])
+    uri = metadb.managed_local_file_revision_artifact(exact.dataset_id, exact.revision_id)
+    if uri is None:
+        raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable")
+    expression = admission["documents"]["config"]["expr"]
+    with db.base_guard(), source_read_scope(storage, [uri], owner="sparse-output-materialize"):
+        validated = validate_fragment(FragmentKind.PROJECTION, expression, con=db.conn())
+        reader = DuckDBAdapter().scan(uri).project(validated.sql).to_arrow_reader(65_536)
+        identity, payload = _output_schema(reader.schema, tuple(
+            field["name"] for field in admission["documents"]["schema"]["identity"]))
+        if {"version": 1, "identity": identity, "payload": payload} != admission["documents"]["schema"]:
+            raise SparseOutputMaterializationConflict("SparseOutput frozen schema is invalid")
+        with pq.ParquetWriter(output, reader.schema) as parquet:
+            for batch in reader:
+                parquet.write_batch(batch)
+
+
+def _validate_held_schema(artifact_fd: int, admission: dict) -> None:
+    """Bind every frozen identity and payload field to the same held Parquet descriptor."""
+    with os.fdopen(os.dup(artifact_fd), "rb") as source:
+        schema = pq.ParquetFile(source).schema_arrow
+    identity, payload = _output_schema(schema, tuple(
+        field["name"] for field in admission["documents"]["schema"]["identity"]))
+    if {"version": 1, "identity": identity, "payload": payload} != admission["documents"]["schema"]:
+        raise SparseOutputMaterializationConflict("SparseOutput frozen schema is invalid")
+
+
+def _revalidate_held_proof(storage, sparse_id: str, admission: dict, proof, committed: dict) -> None:
+    """Reject a post-commit response loss if the still-held descriptor no longer proves DB truth."""
+    _validate_held_schema(proof.artifact_fileno(), admission)
+    evidence = proof.storage._result_artifact_evidence(proof.uri, proof.artifact_fileno())
+    if (evidence["dev"], evidence["ino"], evidence["rows"], evidence["bytes"],
+            evidence["content_sha256"], evidence["schema_sha256"]) != (
+                committed["dev"], committed["ino"], committed["rows"], committed["bytes"],
+                committed["content_sha256"], committed["schema_sha256"]):
+        raise SparseOutputMaterializationConflict("SparseOutput materialization is unavailable")
+    exact = ExactDatasetRef(kind="exact", dataset_id=admission["inputDatasetId"],
+                            revision_id=admission["inputRevisionId"])
+    frozen = decode_row_identity_coverage(
+        admission["documents"]["evidence"], exact, admission["rowIdentitySpecSha256"]).spec
+    with _held_parquet_relation(proof.artifact_fileno()) as candidate_relation:
+        coverage = certify_row_identity_coverage(
+            storage, exact, [field.name for field in frozen.fields], candidate_relation,
+            owner=f"sparse-output-response-loss:{sparse_id}", frozen_spec=frozen)
+    if serialize_row_identity_coverage(coverage, exact, frozen.digest) != committed["coverage"]:
+        raise SparseOutputMaterializationConflict("SparseOutput materialization is unavailable")
+
+
+def _revalidated_materialization_result(storage, sparse_id: str, authority: dict) -> SparseOutputMaterialization:
+    with reopen_sparse_output(storage, sparse_id):
+        pass
+    return _materialization_result(sparse_id, authority)
+
+
+@contextlib.contextmanager
+def _held_parquet_relation(artifact_fd: int):
+    """Read a candidate only through the caller-held descriptor, never its pathname."""
+    source = os.fdopen(os.dup(artifact_fd), "rb")
+    table_name = f"__sparse_candidate_{uuid.uuid4().hex}"
+    view_name = f"{table_name}_source"
+    try:
+        parquet = pq.ParquetFile(source)
+        reader = pa.RecordBatchReader.from_batches(
+            parquet.schema_arrow, parquet.iter_batches(batch_size=65_536))
+        connection = db.conn()
+        relation = connection.from_arrow(reader)
+        relation.create_view(view_name, replace=True)
+        connection.execute(
+            f"CREATE TEMP TABLE {quote_identifier(table_name)} AS SELECT * FROM {quote_identifier(view_name)}")
+        yield connection.table(table_name)
+    finally:
+        with contextlib.suppress(Exception):
+            db.conn().execute(f"DROP TABLE IF EXISTS {quote_identifier(table_name)}")
+        with contextlib.suppress(Exception):
+            db.conn().execute(f"DROP VIEW IF EXISTS {quote_identifier(view_name)}")
+        source.close()
+
+
+def _materialization_result(sparse_id: str, authority: dict) -> SparseOutputMaterialization:
+    # Deliberately exclude all storage, lock, descriptor, inode, token, and lease authority.
+    return SparseOutputMaterialization(
+        id=sparse_id, committed=True,
+        evidence={key: authority[key] for key in (
+            "rows", "bytes", "contentSha256", "schemaSha256", "coverage")})
+
+
+def _token(value: object) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+        raise SparseOutputMaterializationConflict("SparseOutput materialization owner is invalid")
+    return value
 
 
 def _exact_ref(value: object) -> ExactDatasetRef:

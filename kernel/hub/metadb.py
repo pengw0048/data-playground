@@ -223,6 +223,51 @@ class SparseOutput(Base):
     )
 
 
+class SparseOutputMaterialization(Base):
+    """The one fenced, managed-local sidecar lifecycle for an admitted SparseOutput."""
+
+    __tablename__ = "sparse_output_materializations"
+    sparse_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("sparse_outputs.id"), primary_key=True)
+    phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_token: Mapped[str] = mapped_column(String(32), nullable=False)
+    lease_until: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    candidate_uri: Mapped[str] = mapped_column(
+        Text, ForeignKey("local_result_artifacts.uri"), nullable=False, unique=True)
+    generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_dev: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    candidate_ino: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    committed_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    committed_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    schema_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    coverage_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    coverage_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    __table_args__ = (
+        CheckConstraint("phase IN ('reserved', 'committed')", name="ck_sparse_mat_phase"),
+        CheckConstraint("length(owner_token) = 32", name="ck_sparse_mat_owner_token"),
+        CheckConstraint("length(generation) = 64", name="ck_sparse_mat_generation"),
+        CheckConstraint("candidate_dev IS NULL OR candidate_dev >= 0", name="ck_sparse_mat_dev"),
+        CheckConstraint("candidate_ino IS NULL OR candidate_ino >= 0", name="ck_sparse_mat_ino"),
+        CheckConstraint("committed_rows IS NULL OR committed_rows >= 0", name="ck_sparse_mat_rows"),
+        CheckConstraint("committed_bytes IS NULL OR committed_bytes > 0", name="ck_sparse_mat_bytes"),
+        CheckConstraint("content_sha256 IS NULL OR length(content_sha256) = 64", name="ck_sparse_mat_content"),
+        CheckConstraint("schema_sha256 IS NULL OR length(schema_sha256) = 64", name="ck_sparse_mat_schema"),
+        CheckConstraint("coverage_sha256 IS NULL OR length(coverage_sha256) = 64", name="ck_sparse_mat_coverage"),
+        CheckConstraint("(candidate_dev IS NULL AND candidate_ino IS NULL) OR "
+                        "(candidate_dev IS NOT NULL AND candidate_ino IS NOT NULL)",
+                        name="ck_sparse_mat_inode_pair"),
+        CheckConstraint("(phase = 'reserved' AND committed_rows IS NULL AND committed_bytes IS NULL "
+                        "AND content_sha256 IS NULL AND schema_sha256 IS NULL AND coverage_doc IS NULL "
+                        "AND coverage_sha256 IS NULL) OR "
+                        "(phase = 'committed' AND candidate_dev IS NOT NULL "
+                        "AND candidate_ino IS NOT NULL AND committed_rows IS NOT NULL AND committed_bytes IS NOT NULL "
+                        "AND content_sha256 IS NOT NULL AND schema_sha256 IS NOT NULL AND coverage_doc IS NOT NULL "
+                        "AND coverage_sha256 IS NOT NULL)",
+                        name="ck_sparse_mat_evidence"),
+    )
+
+
 class WorkspaceProviderBinding(Base):
     """Durable, non-sensitive display snapshot for one explicit external resource binding.
 
@@ -4058,18 +4103,317 @@ def _validate_sparse_output_documents(row: SparseOutput) -> None:
 
 
 def _validate_sparse_output_reference(s, row: SparseOutput) -> None:
-    """Fail closed on a retained admission whose one immutable base hold is missing or wrong."""
+    """Fail closed unless the retained base and any committed sidecar agree exactly."""
     revision = s.get(ManagedLocalFileRevision, row.input_revision_id, with_for_update=True)
     refs = list(s.scalars(select(LocalResultReference).where(
         LocalResultReference.owner_kind == "sparse_output",
         LocalResultReference.owner_key == row.id,
     ).order_by(LocalResultReference.uri).with_for_update()))
-    if revision is None or revision.logical_id != row.input_dataset_id or len(refs) != 1:
+    materialization = s.get(SparseOutputMaterialization, row.id, with_for_update=True)
+    expected = {revision.artifact_uri} if revision is not None else set()
+    if materialization is not None and materialization.phase == "committed":
+        expected.add(materialization.candidate_uri)
+    if (revision is None or revision.logical_id != row.input_dataset_id
+            or {ref.uri for ref in refs} != expected):
         raise RuntimeError("SparseOutput exact base retention is incomplete")
-    artifact = s.get(LocalResultArtifact, refs[0].uri, with_for_update=True)
-    if (artifact is None or artifact.state != "ready" or refs[0].uri != revision.artifact_uri
+    artifact = s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
+    if (artifact is None or artifact.state != "ready"
             or artifact.writer_run_id is not None or artifact.writer_token is not None):
         raise RuntimeError("SparseOutput exact base retention is incomplete")
+
+
+def _sparse_materialization_db_now(s) -> datetime.datetime:
+    # PostgreSQL ``now()`` is fixed at transaction start.  A row lock may wait past a lease
+    # boundary, so this leaf deliberately samples the server's statement wall clock instead.
+    value = (s.scalar(select(func.clock_timestamp()))
+             if s.get_bind().dialect.name == "postgresql" else _db_now(s))
+    return (value.replace(tzinfo=datetime.timezone.utc)
+            if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+
+
+def _sparse_materialization_lease_current(row: SparseOutputMaterialization, now) -> bool:
+    lease = row.lease_until
+    if lease.tzinfo is None:
+        lease = lease.replace(tzinfo=datetime.timezone.utc)
+    return lease > now
+
+
+def _sparse_materialization_doc(s, row: SparseOutputMaterialization) -> dict:
+    output = s.get(SparseOutput, row.sparse_id, with_for_update=True)
+    if output is not None:
+        _validate_sparse_output_documents(output)
+    artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+    refs = list(s.scalars(select(LocalResultReference).where(
+        LocalResultReference.uri == row.candidate_uri,
+    ).order_by(LocalResultReference.owner_kind, LocalResultReference.owner_key).with_for_update()))
+    generation = row.generation
+    basename = f"{_LOCAL_RESULT_PREFIX}sparse_{generation}.parquet"
+    expected_uri = os.path.join(artifact.storage_root, basename) if artifact else None
+    expected_lock = f"{basename[:-8]}.lock"
+    owners = [ref for ref in refs if ref.owner_kind != _LOCAL_RESULT_EPHEMERAL_OWNER_KIND]
+    if (output is None or artifact is None or artifact.namespace_id is None or artifact.state != "ready"
+            or artifact.committed_at is None or artifact.delete_token is not None
+            or artifact.delete_attempted_at is not None
+            or artifact.writer_run_id is not None or artifact.writer_token is not None
+            or artifact.uri != expected_uri or artifact.lock_name != expected_lock
+            or bool(artifact.lock_protected) != bool(artifact.lock_token)
+            or re.fullmatch(r"[0-9a-f]{32}", artifact.namespace_id) is None
+            or not os.path.isabs(artifact.storage_root)
+            or os.path.basename(artifact.storage_root) != _LOCAL_RESULT_DIR
+            or _local_result_candidate(artifact.uri) != artifact.uri
+            or (artifact.lock_token is not None
+                and re.fullmatch(r"[0-9a-f]{32}", artifact.lock_token) is None)
+            or re.fullmatch(r"[0-9a-f]{32}", row.owner_token) is None
+            or re.fullmatch(r"[0-9a-f]{64}", row.generation) is None
+            or row.generation != generation or row.phase != "committed" or len(owners) != 1
+            or owners[0].owner_kind != "sparse_output" or owners[0].owner_key != row.sparse_id
+            or row.candidate_dev is None or row.candidate_ino is None
+            or row.committed_rows is None or row.committed_bytes is None
+            or row.content_sha256 is None or row.schema_sha256 is None or row.coverage_doc is None
+            or not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                       for value in (row.candidate_dev, row.candidate_ino, row.committed_rows))
+            or not isinstance(row.committed_bytes, int) or isinstance(row.committed_bytes, bool)
+            or row.committed_bytes <= 0
+            or any(re.fullmatch(r"[0-9a-f]{64}", value) is None
+                   for value in (row.content_sha256, row.schema_sha256, row.coverage_sha256 or ""))
+            or row.coverage_sha256 != hashlib.sha256(row.coverage_doc.encode()).hexdigest()):
+        raise RuntimeError("SparseOutput materialization is inconsistent")
+    coverage = _validate_sparse_materialization_coverage(output, row.coverage_doc)
+    return {"phase": "committed", "generation": row.generation,
+            "rows": row.committed_rows, "bytes": row.committed_bytes,
+            "contentSha256": row.content_sha256, "schemaSha256": row.schema_sha256,
+            "content_sha256": row.content_sha256, "schema_sha256": row.schema_sha256,
+            "dev": row.candidate_dev, "ino": row.candidate_ino,
+            "coverage": coverage,
+            "namespace_id": artifact.namespace_id, "storage_root": artifact.storage_root,
+            "lock_name": artifact.lock_name, "lock_token": artifact.lock_token,
+            "lock_protected": bool(artifact.lock_protected),
+            "uri": artifact.uri}
+
+
+def _validate_sparse_materialization_coverage(output: SparseOutput, document: str) -> dict:
+    try:
+        coverage = json.loads(document)
+        if json.dumps(coverage, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != document:
+            raise ValueError
+        from hub.models import ExactDatasetRef
+        from hub.row_identity import decode_row_identity_coverage
+        exact = ExactDatasetRef(
+            kind="exact", dataset_id=output.input_dataset_id, revision_id=output.input_revision_id)
+        decode_row_identity_coverage(coverage, exact, output.row_identity_spec_sha256)
+        return coverage
+    except Exception as exc:
+        raise RuntimeError("SparseOutput materialization is inconsistent") from exc
+
+
+def reserve_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, lease_seconds: int, namespace_id: str,
+        storage_root: str, lock_token: str | None) -> dict:
+    """Create or replay the one current fenced sidecar candidate for an admitted SparseOutput."""
+    sparse_id, owner_token, namespace_id = map(str, (sparse_id, owner_token, namespace_id))
+    lock_token = str(lock_token) if lock_token is not None else None
+    if (re.fullmatch(r"[0-9a-f]{32}", owner_token) is None
+            or re.fullmatch(r"[0-9a-f]{32}", namespace_id) is None
+            or (lock_token is not None and re.fullmatch(r"[0-9a-f]{32}", lock_token) is None)
+            or not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool)
+            or not 1 <= lease_seconds <= 3600 or not os.path.isabs(storage_root)
+            or os.path.basename(storage_root) != _LOCAL_RESULT_DIR):
+        raise ValueError("SparseOutput materialization authority is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, sparse_id, with_for_update=True)
+        if output is None:
+            raise RuntimeError("SparseOutput admission is unavailable")
+        _validate_sparse_output_documents(output)
+        _lock_local_result_registry(s)
+        _validate_sparse_output_reference(s, output)
+        now = _sparse_materialization_db_now(s)
+        row = s.get(SparseOutputMaterialization, sparse_id, with_for_update=True)
+        if row is not None:
+            if row.phase == "committed":
+                artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+                if (row.owner_token != owner_token or artifact is None
+                        or artifact.namespace_id != namespace_id or artifact.storage_root != storage_root):
+                    raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+                return _sparse_materialization_doc(s, row)
+            if row.owner_token != owner_token or not _sparse_materialization_lease_current(row, now):
+                raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+            artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+            if (artifact is None or artifact.state != "writing" or artifact.writer_run_id != sparse_id
+                    or artifact.writer_token != owner_token
+                    or artifact.namespace_id != namespace_id or artifact.storage_root != storage_root):
+                raise RuntimeError("SparseOutput reservation replay changed exact authority")
+            return _sparse_candidate_doc(row, artifact)
+        generation = secrets.token_hex(32)
+        basename = f"{_LOCAL_RESULT_PREFIX}sparse_{generation}.parquet"
+        uri, lock_name = os.path.join(storage_root, basename), f"{basename[:-8]}.lock"
+        if _local_result_candidate(uri) != uri:
+            raise ValueError("SparseOutput candidate is outside the managed namespace")
+        artifact = LocalResultArtifact(
+            uri=uri, namespace_id=namespace_id, storage_root=storage_root, lock_name=lock_name,
+            lock_token=lock_token, lock_protected=lock_token is not None, state="writing",
+            writer_run_id=sparse_id, writer_token=owner_token, created_at=now)
+        s.add(artifact)
+        s.flush()
+        row = SparseOutputMaterialization(
+            sparse_id=sparse_id, phase="reserved", owner_token=owner_token,
+            lease_until=now + datetime.timedelta(seconds=lease_seconds), candidate_uri=uri,
+            generation=generation)
+        s.add(row)
+        s.flush()
+        return _sparse_candidate_doc(row, artifact)
+
+
+def _sparse_candidate_doc(row: SparseOutputMaterialization, artifact: LocalResultArtifact) -> dict:
+    generation = row.generation
+    basename = f"{_LOCAL_RESULT_PREFIX}sparse_{generation}.parquet"
+    expected_uri = os.path.join(artifact.storage_root, basename)
+    expected_lock = f"{basename[:-8]}.lock"
+    if (row.phase != "reserved" or artifact.state != "writing" or artifact.committed_at is not None
+            or artifact.writer_run_id != row.sparse_id or artifact.writer_token != row.owner_token
+            or row.candidate_uri != artifact.uri or artifact.uri != expected_uri
+            or artifact.lock_name != expected_lock or artifact.delete_token is not None
+            or bool(artifact.lock_protected) != bool(artifact.lock_token)
+            or re.fullmatch(r"[0-9a-f]{32}", row.owner_token) is None
+            or re.fullmatch(r"[0-9a-f]{32}", artifact.namespace_id) is None
+            or re.fullmatch(r"[0-9a-f]{64}", row.generation) is None
+            or row.generation != generation or not os.path.isabs(artifact.storage_root)
+            or os.path.basename(artifact.storage_root) != _LOCAL_RESULT_DIR
+            or _local_result_candidate(artifact.uri) != artifact.uri
+            or (artifact.lock_token is not None
+                and re.fullmatch(r"[0-9a-f]{32}", artifact.lock_token) is None)):
+        raise RuntimeError("SparseOutput candidate binding is incomplete")
+    return {"sparse_id": row.sparse_id, "uri": artifact.uri, "generation": row.generation,
+            "namespace_id": artifact.namespace_id, "storage_root": artifact.storage_root,
+            "lock_name": artifact.lock_name, "lock_token": artifact.lock_token,
+            "lock_protected": bool(artifact.lock_protected), "writer_token": artifact.writer_token,
+            "dev": row.candidate_dev, "ino": row.candidate_ino}
+
+
+def bind_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, uri: str, dev: int, ino: int) -> dict:
+    """Record the held candidate inode before evidence collection can be committed."""
+    if (not isinstance(dev, int) or isinstance(dev, bool) or dev < 0
+            or not isinstance(ino, int) or isinstance(ino, bool) or ino < 0):
+        raise ValueError("SparseOutput materialization identity is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        row = s.get(SparseOutputMaterialization, str(sparse_id), with_for_update=True)
+        if output is None or row is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _lock_local_result_registry(s)
+        if row.phase == "committed":
+            if row.owner_token != str(owner_token):
+                raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+            return _sparse_materialization_doc(s, row)
+        now = _sparse_materialization_db_now(s)
+        if row.owner_token != str(owner_token) or not _sparse_materialization_lease_current(row, now):
+            raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        candidate = _sparse_candidate_doc(row, artifact) if artifact else None
+        if candidate is None or candidate["uri"] != str(uri):
+            raise RuntimeError("SparseOutput materialization does not match candidate")
+        if row.candidate_dev is not None and (row.candidate_dev, row.candidate_ino) != (dev, ino):
+            raise RuntimeError("SparseOutput materialization identity changed")
+        row.candidate_dev, row.candidate_ino = dev, ino
+        s.flush()
+        return _sparse_candidate_doc(row, artifact)
+
+
+def commit_sparse_output_materialization(
+        *, sparse_id: str, owner_token: str, namespace_id: str, storage_root: str,
+        lock_name: str, lock_token: str | None, lock_protected: bool, generation: str,
+        rows: int, size_bytes: int, content_sha256: str, schema_sha256: str,
+        dev: int, ino: int, coverage_doc: str) -> dict:
+    """Fence an exact sidecar commit and atomically install its sole additional durable owner."""
+    namespace_id, storage_root, lock_name = str(namespace_id), str(storage_root), str(lock_name)
+    lock_token = str(lock_token) if lock_token is not None else None
+    if (re.fullmatch(r"[0-9a-f]{32}", namespace_id) is None
+            or not os.path.isabs(storage_root) or os.path.basename(storage_root) != _LOCAL_RESULT_DIR
+            or not lock_name or type(lock_protected) is not bool
+            or (lock_token is not None and re.fullmatch(r"[0-9a-f]{32}", lock_token) is None)
+            or bool(lock_token) != lock_protected
+            or not isinstance(rows, int) or isinstance(rows, bool) or rows < 0
+            or not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0
+            or not isinstance(dev, int) or isinstance(dev, bool) or dev < 0
+            or not isinstance(ino, int) or isinstance(ino, bool) or ino < 0
+            or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None
+                   for value in (generation, content_sha256, schema_sha256))
+            or not isinstance(coverage_doc, str) or len(coverage_doc.encode()) > 65_536):
+        raise ValueError("SparseOutput commit evidence is invalid")
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        row = s.get(SparseOutputMaterialization, str(sparse_id), with_for_update=True)
+        if output is None or row is None:
+            raise RuntimeError("SparseOutput materialization is unavailable")
+        _validate_sparse_output_documents(output)
+        _validate_sparse_materialization_coverage(output, coverage_doc)
+        _lock_local_result_registry(s)
+        if row.phase == "committed":
+            if row.owner_token != str(owner_token):
+                raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+            committed = _sparse_materialization_doc(s, row)
+            replay_evidence = (rows, size_bytes, content_sha256, schema_sha256,
+                               dev, ino, json.loads(coverage_doc))
+            committed_evidence = (committed["rows"], committed["bytes"], committed["contentSha256"],
+                                  committed["schemaSha256"], committed["dev"], committed["ino"],
+                                  committed["coverage"])
+            committed_authority = (committed["namespace_id"], committed["storage_root"],
+                                   committed["lock_name"], committed["lock_token"],
+                                   committed["lock_protected"])
+            if (committed["generation"] != str(generation)
+                    or committed_evidence != replay_evidence
+                    or committed_authority != (namespace_id, storage_root, lock_name,
+                                               lock_token, lock_protected)):
+                raise RuntimeError("SparseOutput commit replay changed evidence")
+            return committed
+        now = _sparse_materialization_db_now(s)
+        if row.owner_token != str(owner_token) or not _sparse_materialization_lease_current(row, now):
+            raise RuntimeError("SparseOutput materialization owner is stale or fenced")
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        candidate = _sparse_candidate_doc(row, artifact) if artifact else None
+        if (candidate is None or candidate["generation"] != str(generation)
+                or candidate["writer_token"] != str(owner_token)
+                or (candidate["namespace_id"], candidate["storage_root"], candidate["lock_name"],
+                    candidate["lock_token"], candidate["lock_protected"])
+                != (namespace_id, storage_root, lock_name, lock_token, lock_protected)
+                or (row.candidate_dev, row.candidate_ino) != (dev, ino)):
+            raise RuntimeError("SparseOutput commit does not match candidate")
+        s.add(LocalResultReference(uri=artifact.uri, owner_kind="sparse_output", owner_key=output.id))
+        artifact.state, artifact.committed_at = "ready", now
+        artifact.writer_run_id = artifact.writer_token = None
+        row.phase, row.committed_rows, row.committed_bytes = "committed", rows, size_bytes
+        row.content_sha256, row.schema_sha256 = str(content_sha256), str(schema_sha256)
+        row.coverage_doc, row.coverage_sha256 = coverage_doc, hashlib.sha256(coverage_doc.encode()).hexdigest()
+        s.flush()
+        _validate_sparse_output_reference(s, output)
+        return _sparse_materialization_doc(s, row)
+
+
+def reconcile_sparse_output_materialization(sparse_id: str) -> dict | None:
+    """Read exact committed truth after a response loss; never infer a success from a filename."""
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        if output is None:
+            return None
+        _lock_local_result_registry(s)
+        row = s.get(SparseOutputMaterialization, str(sparse_id), with_for_update=True)
+        if row is None:
+            return None
+        if row.phase == "committed":
+            return _sparse_materialization_doc(s, row)
+        artifact = s.get(LocalResultArtifact, row.candidate_uri, with_for_update=True)
+        return {"phase": "reserved", "candidate": _sparse_candidate_doc(row, artifact)}
+
+
+def sparse_output_materialization_input(sparse_id: str) -> dict:
+    """Private immutable admission facts for the internal materializer, never a consumer view."""
+    with session() as s:
+        row = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        if row is None:
+            raise RuntimeError("SparseOutput admission is unavailable")
+        _validate_sparse_output_documents(row)
+        _validate_sparse_output_reference(s, row)
+        return _sparse_output_doc(row)
 
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
@@ -11733,10 +12077,23 @@ def _uri_bound_as_checkpoint_candidate(s, uri: str) -> bool:
         DurableCheckpoint.candidate_uri == uri).limit(1)) is not None
 
 
+def _uri_bound_as_sparse_output_candidate(s, uri: str) -> bool:
+    """A current SparseOutput reservation remains live until #567 explicitly retires it."""
+    return s.scalar(select(SparseOutputMaterialization.sparse_id).where(
+        SparseOutputMaterialization.candidate_uri == uri,
+        SparseOutputMaterialization.phase == "reserved").limit(1)) is not None
+
+
 def _checkpoint_candidate_uri_exists():
     """SQL EXISTS correlating a local-result URI to a live checkpoint candidate binding."""
     return select(DurableCheckpoint.candidate_uri).where(
         DurableCheckpoint.candidate_uri == LocalResultArtifact.uri).exists()
+
+
+def _sparse_output_candidate_uri_exists():
+    return select(SparseOutputMaterialization.candidate_uri).where(
+        SparseOutputMaterialization.candidate_uri == LocalResultArtifact.uri,
+        SparseOutputMaterialization.phase == "reserved").exists()
 
 
 def local_result_lock_candidates(
@@ -11757,7 +12114,7 @@ def local_result_lock_candidates(
             LocalResultArtifact.lock_protected.is_(True),
             LocalResultArtifact.state.in_(("writing", "ready")),
             or_(LocalResultArtifact.writer_run_id.is_not(None), lease_exists),
-            ~_checkpoint_candidate_uri_exists(),
+            ~_checkpoint_candidate_uri_exists(), ~_sparse_output_candidate_uri_exists(),
         )
         cursor = registry.lock_cursor_uri
         rows = list(s.scalars(select(LocalResultArtifact).where(
@@ -11781,7 +12138,7 @@ def reconcile_dead_local_result(uri: str, namespace_id: str, lock_name: str) -> 
                 or row.lock_name != lock_name or row.state == "deleting"):
             return
         # Defense in depth for #449: a candidate binding is not proof the writer died.
-        if _uri_bound_as_checkpoint_candidate(s, uri):
+        if _uri_bound_as_checkpoint_candidate(s, uri) or _uri_bound_as_sparse_output_candidate(s, uri):
             return
         row.writer_run_id = row.writer_token = None
         for ref in s.scalars(select(LocalResultReference).where(
@@ -11841,18 +12198,20 @@ def claim_local_result_reclaims(
         # A durable_checkpoints.candidate_uri binding is a reclaim reference even with no
         # LocalResultReference row yet (uncommitted reserved candidates, #449).
         no_checkpoint = ~_checkpoint_candidate_uri_exists()
+        no_sparse_output = ~_sparse_output_candidate_uri_exists()
         rows = list(s.scalars(select(LocalResultArtifact).where(
             LocalResultArtifact.namespace_id == namespace_id,
             LocalResultArtifact.lock_protected.is_(True),
             LocalResultArtifact.state.in_(("writing", "ready")),
-            LocalResultArtifact.writer_run_id.is_(None), no_reference, no_checkpoint,
+            LocalResultArtifact.writer_run_id.is_(None), no_reference, no_checkpoint, no_sparse_output,
         ).order_by(LocalResultArtifact.created_at, LocalResultArtifact.uri)
           .limit(remaining).with_for_update()))
         for row in rows:
             if s.scalar(select(LocalResultReference.uri).where(
                     LocalResultReference.uri == row.uri).limit(1)) is not None:
                 continue
-            if _uri_bound_as_checkpoint_candidate(s, row.uri):
+            if (_uri_bound_as_checkpoint_candidate(s, row.uri)
+                    or _uri_bound_as_sparse_output_candidate(s, row.uri)):
                 continue
             row.state = "deleting"
             row.writer_run_id = row.writer_token = None
@@ -11936,7 +12295,7 @@ def delete_local_result(uri: str, namespace_id: str, delete_token: str, delete_f
         if s.scalar(select(LocalResultReference.uri).where(
                 LocalResultReference.uri == uri).limit(1)) is not None:
             raise RuntimeError("cannot delete a referenced local result")
-        if _uri_bound_as_checkpoint_candidate(s, uri):
+        if _uri_bound_as_checkpoint_candidate(s, uri) or _uri_bound_as_sparse_output_candidate(s, uri):
             raise RuntimeError("cannot delete a checkpoint-bound local result")
         delete_file()
         for binding in s.scalars(select(LocalFileInputRevision).where(

@@ -8,6 +8,7 @@ import hashlib
 import os
 import subprocess
 import sys
+import time
 import uuid
 
 import pytest
@@ -24,8 +25,11 @@ from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.sparse_outputs import (
     SparseOutputAdmissionRequest,
+    SparseOutputMaterializationConflict,
     SparseOutputSubmissionConflict,
     admit_sparse_output,
+    materialize_sparse_output,
+    reopen_sparse_output,
 )
 from hub.storage import LocalStorage
 from hub.tests.task_manifest_helpers import with_task_manifest
@@ -188,6 +192,70 @@ def test_postgres_sparse_output_admission_replays_one_exact_base_reference(tmp_p
         assert len(refs) == 1 and refs[0].uri == artifact
         assert len(conflict_refs) == 1 and conflict_refs[0].uri == artifact
         assert len(artifacts) == 1
+
+        token = uuid.uuid4().hex
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(materialize_sparse_output, storage, first.id, token)
+                       for _ in range(2)]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except SparseOutputMaterializationConflict:
+                pass
+        assert any(result.committed for result in outcomes)
+        assert materialize_sparse_output(storage, first.id, token).committed is True
+        with reopen_sparse_output(storage, first.id) as guard:
+            assert DuckDBAdapter().scan(guard.uri).count("*").fetchone()[0] == 2
+        with metadb.session() as session:
+            row = session.get(metadb.SparseOutputMaterialization, first.id)
+            refs = list(session.scalars(select(metadb.LocalResultReference).where(
+                metadb.LocalResultReference.owner_kind == "sparse_output",
+                metadb.LocalResultReference.owner_key == first.id,
+            )))
+        assert row is not None and row.phase == "committed" and len(refs) == 2
+
+        protected = admit_sparse_output(storage, SparseOutputAdmissionRequest(
+            **{**request.__dict__, "submission_id": "Postgres-Protected"}))
+        candidate = metadb.reserve_sparse_output_materialization(
+            sparse_id=protected.id, owner_token=uuid.uuid4().hex, lease_seconds=1,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=uuid.uuid4().hex)
+        with metadb.session() as session:
+            session.get(metadb.SparseOutputMaterialization, protected.id).lease_until = (
+                datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
+        assert metadb.local_result_lock_candidates(storage.namespace_id) == []
+        metadb.reconcile_dead_local_result(
+            candidate["uri"], storage.namespace_id, candidate["lock_name"])
+        assert metadb.claim_local_result_reclaims(storage.namespace_id) == []
+
+        locked = admit_sparse_output(storage, SparseOutputAdmissionRequest(
+            **{**request.__dict__, "submission_id": "Postgres-Locked-Expiry"}))
+        locked_token = uuid.uuid4().hex
+        locked_candidate = metadb.reserve_sparse_output_materialization(
+            sparse_id=locked.id, owner_token=locked_token, lease_seconds=1,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=uuid.uuid4().hex)
+        blocker = create_engine(os.environ["DP_TEST_DATABASE_URL"])
+        connection = blocker.connect()
+        transaction = connection.begin()
+        try:
+            connection.execute(text(
+                "SELECT sparse_id FROM sparse_output_materializations "
+                "WHERE sparse_id = :sparse_id FOR UPDATE"), {"sparse_id": locked.id})
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(metadb.bind_sparse_output_materialization,
+                                     sparse_id=locked.id, owner_token=locked_token,
+                                     uri=locked_candidate["uri"], dev=1, ino=1)
+                time.sleep(1.2)
+                transaction.commit()
+                with pytest.raises(RuntimeError, match="stale or fenced"):
+                    future.result(timeout=10)
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
+            connection.close()
+            blocker.dispose()
     finally:
         storage.close()
 
