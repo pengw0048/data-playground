@@ -20,7 +20,7 @@ jobs:
   kernel-tests:
     name: kernel (pytest — engine, plugins, agent)
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # cap billed minutes — kill a hung run instead of letting it burn to the 6h default
+    timeout-minutes: 15  # #574: 9:12–9:37 measured suite duration; preserves cleanup and runner-variance headroom
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
