@@ -23,6 +23,7 @@ import { KernelBadge } from './KernelBadge'
 import { CanvasDraftMenu } from './LocalDrafts'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
+import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -44,6 +45,7 @@ export function TopBar() {
   const [shareOpen, setShareOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
+  const [copyOpen, setCopyOpen] = useState(false)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
@@ -79,7 +81,7 @@ export function TopBar() {
   return (
     <>
       <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} />
+        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && saved && !currentDraftId} />
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined)} className={cn('ml-0.5 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
@@ -109,6 +111,7 @@ export function TopBar() {
       {shareOpen && <ShareModal onClose={() => setShareOpen(false)} />}
       {importOpen && <ImportPipelineModal onClose={() => setImportOpen(false)} />}
       {nativeImportOpen && <NativeCanvasImportModal onClose={() => setNativeImportOpen(false)} />}
+      {copyOpen && <CanvasCopyModal source={{ canvasId: useStore.getState().doc.id, version: useStore.getState().doc.version, name: useStore.getState().doc.name ?? 'Untitled canvas' }} onClose={() => setCopyOpen(false)} />}
     </>
   )
 }
@@ -134,7 +137,7 @@ function PeerAvatars() {
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
-function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void }) {
+function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
   const setView = useStore((s) => s.setView)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
@@ -150,6 +153,7 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativ
       <DropdownMenuContent align="start" className="w-[210px]">
         <DropdownMenuItem onSelect={() => setView('workspace')}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
+        <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
         <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>
         <DropdownMenuItem data-testid="import-native-canvas" onSelect={() => setTimeout(onNativeImport)}><Icon name="import" size={14} /> Import native Canvas…</DropdownMenuItem>
         {/* defer modal opens to the next tick — otherwise the menu-item pointerup that's still

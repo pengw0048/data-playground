@@ -2766,6 +2766,10 @@ class NativeCanvasImportConflict(RuntimeError):
     """One owner/import UUID is already bound to different normalized import intent."""
 
 
+class CanvasCopyConflict(RuntimeError):
+    """One owner/copy UUID is already bound to different copy intent."""
+
+
 class WorkspaceNameConflict(ValueError):
     """A sibling container already owns the requested display name."""
 
@@ -3127,6 +3131,100 @@ def import_native_canvas(
         _replace_promoted_transform_refs(s, "canvas", str(canvas_id), stored_doc)
         _workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=str(canvas_id), name=values["name"])
+        return True
+
+
+def create_canvas_copy(
+        *, uid: str, canvas_id: str, doc: dict, intent_digest: str, request_digest: str,
+        container_id: str, expected_container_version: int,
+        source_canvas_id: str, source_canvas_version: int | None = None,
+        source_subject_id: str | None = None,
+        source_manifest_sha256: str | None = None) -> bool:
+    """Atomically create one private owner Canvas and exact Workspace placement."""
+    stored_doc = {**doc, "_copyIntent": {
+        "digest": str(intent_digest), "requestDigest": str(request_digest),
+    }}
+    canonical_doc = json.dumps(
+        stored_doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    def replay(row: Canvas) -> bool:
+        try:
+            existing = json.loads(row.doc)
+        except (TypeError, ValueError) as exc:
+            raise CanvasCopyConflict("copyId is already bound to invalid content") from exc
+        if (row.owner_id != str(uid)
+                or existing.get("_copyIntent", {}).get("digest") != str(intent_digest)
+                or existing.get("_copyIntent", {}).get("requestDigest") != str(request_digest)):
+            raise CanvasCopyConflict("copyId is already bound to different copy intent")
+        return False
+
+    with session() as s:
+        existing = s.get(Canvas, str(canvas_id), with_for_update=True)
+        if existing is not None:
+            return replay(existing)
+        _workspace_container_at_version(s, container_id, expected_container_version)
+        source = s.get(Canvas, str(source_canvas_id), with_for_update=True)
+        if source is None or _workspace_canvas_role_in_session(s, source, str(uid)) is None:
+            raise KeyError(f"canvas '{source_canvas_id}' not found")
+        if source_subject_id is None:
+            if source_canvas_version is None or source.version != source_canvas_version:
+                raise WorkspaceVersionConflict(
+                    f"canvas '{source_canvas_id}' changed from expected version {source_canvas_version}")
+            retained_owner_kind, retained_owner_key = "canvas", str(source_canvas_id)
+        else:
+            found, identity = _execution_manifest_identity_for_subject_in_session(
+                s, str(source_canvas_id), str(source_subject_id))
+            if (not found or identity != source_manifest_sha256
+                    or s.get(ExecutionManifest, identity) is None):
+                raise WorkspaceVersionConflict(
+                    "retained execution manifest changed or became unavailable")
+            retained_owner_kind, retained_owner_key = "execution_manifest", str(identity)
+        _require_promoted_transform_use_in_session(
+            s, uid, stored_doc,
+            retained_owner_kind=retained_owner_kind,
+            retained_owner_key=retained_owner_key)
+        values = {
+            "id": str(canvas_id), "owner_id": str(uid),
+            "name": str(doc.get("name") or "untitled"), "version": 1,
+            "doc": canonical_doc,
+        }
+        dialect = s.get_bind().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+        else:  # pragma: no cover
+            raise RuntimeError(f"unsupported metadata database dialect: {dialect}")
+        inserted = s.scalar(dialect_insert(Canvas).values(**values).on_conflict_do_nothing(
+            index_elements=[Canvas.id]).returning(Canvas.id))
+        if inserted is None:
+            winner = s.get(Canvas, str(canvas_id), with_for_update=True)
+            if winner is None:  # pragma: no cover
+                raise RuntimeError("Canvas copy conflict winner is unavailable")
+            return replay(winner)
+        sync_local_result_owner(s, "canvas", str(canvas_id), stored_doc)
+        _replace_promoted_transform_refs(s, "canvas", str(canvas_id), stored_doc)
+        s.add(WorkspacePlacement(
+            container_id=container_id, target_kind="canvas", target_id=str(canvas_id),
+            name=values["name"], ordinal=0, version=1))
+        return True
+
+
+def canvas_copy_replay(
+        uid: str, canvas_id: str, intent_digest: str, request_digest: str) -> bool | None:
+    """Return replay state before touching a source that may have since been deleted."""
+    with session() as s:
+        row = s.get(Canvas, str(canvas_id))
+        if row is None:
+            return None
+        try:
+            document = json.loads(row.doc)
+        except (TypeError, ValueError) as exc:
+            raise CanvasCopyConflict("copyId is already bound to invalid content") from exc
+        if (row.owner_id != str(uid)
+                or document.get("_copyIntent", {}).get("digest") != str(intent_digest)
+                or document.get("_copyIntent", {}).get("requestDigest") != str(request_digest)):
+            raise CanvasCopyConflict("copyId is already bound to different copy intent")
         return True
 
 
@@ -6465,51 +6563,83 @@ def _drop_promoted_transform_refs(s, owner_kind: str, owner_key: str) -> None:
     ))
 
 
-def require_promoted_transform_use(
-        uid: str, graph_doc, *, canvas_id: str | None = None) -> None:
-    """Authorize promoted exact refs by ownership or an already-retained visible Canvas ref.
-
-    A missing/deleted exact ref is allowed through so validation/execution can report its truthful
-    unavailable state. Existing definitions cannot be imported into an unrelated user's Canvas merely
-    by guessing their opaque ID.
-    """
+def _require_promoted_transform_use_in_session(
+        s, uid: str, graph_doc, *,
+        retained_owner_kind: str | None = None,
+        retained_owner_key: str | None = None) -> None:
+    """Authorize exact refs by ownership or one already-authorized durable owner."""
     requested = _promoted_transform_refs(graph_doc)
     if not requested:
         return
+    if (retained_owner_kind is None) != (retained_owner_key is None):
+        raise ValueError("retained promoted Transform owner is incomplete")
+    retained: set[tuple[str, int]] = set()
+    if retained_owner_kind is not None:
+        if retained_owner_kind not in {"canvas", "execution_manifest"}:
+            raise ValueError("invalid promoted Transform authorization owner")
+        # Authorization comes only from a hold established while the exact version existed. A raw
+        # missing-version ref in a document is never a future capability after an owner publishes it.
+        retained = {(str(transform_id), int(version))
+                    for transform_id, version in s.execute(select(
+                        PromotedTransformVersionRef.transform_id,
+                        PromotedTransformVersionRef.version,
+                    ).join(PromotedTransformVersion, and_(
+                        PromotedTransformVersion.transform_id
+                        == PromotedTransformVersionRef.transform_id,
+                        PromotedTransformVersion.version
+                        == PromotedTransformVersionRef.version,
+                    )).where(
+                        PromotedTransformVersionRef.owner_kind == retained_owner_kind,
+                        PromotedTransformVersionRef.owner_key == str(retained_owner_key),
+                        PromotedTransformVersion.deleted_at.is_(None),
+                    ))}
+    for transform_id, version in sorted(requested):
+        row = s.get(PromotedTransformVersion, (transform_id, version))
+        if row is None or row.deleted_at is not None:
+            continue
+        identity = s.get(PromotedTransform, transform_id)
+        if identity is None:
+            raise RuntimeError("promoted Transform version has no logical identity")
+        if identity.owner_id != str(uid) and (transform_id, version) not in retained:
+            raise PermissionError(
+                f"promoted Transform {transform_id}@v{version} is not available to this user")
+
+
+def require_promoted_transform_use(
+        uid: str, graph_doc, *, canvas_id: str | None = None) -> None:
+    """Authorize promoted exact refs by ownership or an already-visible retained Canvas ref."""
     with session() as s:
-        retained: set[tuple[str, int]] = set()
+        retained_canvas_id: str | None = None
         if canvas_id:
             canvas = s.get(Canvas, str(canvas_id))
             if (canvas is not None
                     and _workspace_canvas_role_in_session(s, canvas, str(uid)) is not None):
-                # Authorization comes only from a hold that was durably established while the exact
-                # version existed and the Canvas writer was authorized. A raw missing-version ref in
-                # ``canvas.doc`` is intentionally not retained; otherwise a future owner promotion
-                # would silently turn that old document into a new cross-user capability.
-                retained = {(str(transform_id), int(version))
-                            for transform_id, version in s.execute(select(
-                                PromotedTransformVersionRef.transform_id,
-                                PromotedTransformVersionRef.version,
-                            ).join(PromotedTransformVersion, and_(
-                                PromotedTransformVersion.transform_id
-                                == PromotedTransformVersionRef.transform_id,
-                                PromotedTransformVersion.version
-                                == PromotedTransformVersionRef.version,
-                            )).where(
-                                PromotedTransformVersionRef.owner_kind == "canvas",
-                                PromotedTransformVersionRef.owner_key == str(canvas_id),
-                                PromotedTransformVersion.deleted_at.is_(None),
-                            ))}
-        for transform_id, version in sorted(requested):
-            row = s.get(PromotedTransformVersion, (transform_id, version))
-            if row is None or row.deleted_at is not None:
-                continue
-            identity = s.get(PromotedTransform, transform_id)
-            if identity is None:
-                raise RuntimeError("promoted Transform version has no logical identity")
-            if identity.owner_id != str(uid) and (transform_id, version) not in retained:
-                raise PermissionError(
-                    f"promoted Transform {transform_id}@v{version} is not available to this user")
+                retained_canvas_id = str(canvas_id)
+        _require_promoted_transform_use_in_session(
+            s, uid, graph_doc,
+            retained_owner_kind="canvas" if retained_canvas_id is not None else None,
+            retained_owner_key=retained_canvas_id)
+
+
+def require_retained_execution_manifest_transform_use(
+        uid: str, canvas_id: str, subject_id: str,
+        manifest_sha256: str, graph_doc) -> None:
+    """Authorize only the exact retained manifest resolved through one visible run subject."""
+    with session() as s:
+        canvas = s.get(Canvas, str(canvas_id))
+        if (canvas is None
+                or _workspace_canvas_role_in_session(s, canvas, str(uid)) is None):
+            raise KeyError(f"canvas '{canvas_id}' not found")
+        found, identity = _execution_manifest_identity_for_subject_in_session(
+            s, str(canvas_id), str(subject_id))
+        if (not found or identity != str(manifest_sha256)
+                or s.get(ExecutionManifest, str(manifest_sha256)) is None):
+            raise WorkspaceVersionConflict(
+                "retained execution manifest changed or became unavailable")
+        _require_promoted_transform_use_in_session(
+            s, uid, graph_doc,
+            retained_owner_kind="execution_manifest",
+            retained_owner_key=str(manifest_sha256))
 
 
 def delete_promoted_transform_version(
@@ -6637,6 +6767,21 @@ def _execution_manifest_summaries(identities: set[str | None]) -> dict[str | Non
     }
 
 
+def _execution_manifest_identity_for_subject_in_session(
+        s, canvas_id: str, subject_id: str) -> tuple[bool, str | None]:
+    if subject_id.startswith("t:"):
+        task = s.get(DurableTask, subject_id.removeprefix("t:"))
+        return (task is not None and task.canvas_id == canvas_id,
+                task.execution_manifest_sha256 if task is not None and task.canvas_id == canvas_id else None)
+    if subject_id.startswith("s:"):
+        state = s.get(RunState, subject_id.removeprefix("s:"))
+        return (state is not None and state.canvas_id == canvas_id,
+                state.execution_manifest_sha256 if state is not None and state.canvas_id == canvas_id else None)
+    history = s.get(RunRecord, subject_id)
+    return (history is not None and history.canvas_id == canvas_id,
+            history.execution_manifest_sha256 if history is not None and history.canvas_id == canvas_id else None)
+
+
 def execution_manifest_detail_for_subject(
         uid: str, canvas_id: str, subject_id: str) -> dict | None:
     """Resolve one History/Jobs subject under its current Canvas visibility.
@@ -6657,22 +6802,8 @@ def execution_manifest_detail_for_subject(
         if canvas is None or _workspace_canvas_role_in_session(s, canvas, str(uid)) is None:
             return None
 
-        identity: str | None
-        if subject_id.startswith("t:"):
-            task = s.get(DurableTask, subject_id.removeprefix("t:"))
-            identity = task.execution_manifest_sha256 if (
-                task is not None and task.canvas_id == canvas_id) else None
-            found = task is not None and task.canvas_id == canvas_id
-        elif subject_id.startswith("s:"):
-            state = s.get(RunState, subject_id.removeprefix("s:"))
-            identity = state.execution_manifest_sha256 if (
-                state is not None and state.canvas_id == canvas_id) else None
-            found = state is not None and state.canvas_id == canvas_id
-        else:
-            history = s.get(RunRecord, subject_id)
-            identity = history.execution_manifest_sha256 if (
-                history is not None and history.canvas_id == canvas_id) else None
-            found = history is not None and history.canvas_id == canvas_id
+        found, identity = _execution_manifest_identity_for_subject_in_session(
+            s, str(canvas_id), str(subject_id))
 
         if not found:
             return {

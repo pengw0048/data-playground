@@ -231,6 +231,7 @@ describe('execution manifest inspection', () => {
     expect(screen.getByText('Runtime descriptor snapshot')).toBeVisible()
     expect(screen.getByText('No declared parameter bindings were recorded.')).toBeVisible()
     expect(screen.getByText(/dataset-1@revision-1/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
     expect(apiMock.executionManifest).toHaveBeenCalledWith('history-canvas', 'manifest-history')
   })
 })
