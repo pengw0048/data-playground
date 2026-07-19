@@ -148,7 +148,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     // Reopen exactly the immutable base and final results; these assertions intentionally use the
     // ordinary revision APIs, not an in-process storage path or a moving catalog head.
     const jobs = await json<{ items: Array<{ outputReceipt?: WriteReceipt | null }> }>(
-      await page.request.get(`/api/jobs?runId=${encodeURIComponent(task.taskId)}&limit=1`),
+      await page.request.get(`/api/jobs?run_id=${encodeURIComponent(task.taskId)}&limit=1`),
       'reopen browser merge in Jobs API',
     )
     const final = jobs.items[0]?.outputReceipt
