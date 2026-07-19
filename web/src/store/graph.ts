@@ -104,6 +104,20 @@ export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
   return walk(id)
 }
 
+/**
+ * Column merges have a separate certified admission protocol.  Keeping this predicate next to
+ * the generic run entry points prevents alternate UI affordances (node play, inspector play, or
+ * rerun-all) from accidentally sending that configuration through the ordinary Write runner.
+ */
+export function hasConfiguredMergeColumnsWrite(doc: CanvasDoc, id: string): boolean {
+  const node = doc.nodes.find((item) => item.id === id)
+  if (node?.type !== 'write') return false
+  const value = node.data.config.mergeColumns
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const rules = (value as { rules?: unknown }).rules
+  return Array.isArray(rules) && rules.length > 0
+}
+
 /** A node is disabled if it, or ANY of its upstream ancestors, is flagged disabled — disabling a
  * node turns off everything downstream of it (the whole branch stops), mirroring ComfyUI. */
 export function isDisabled(doc: CanvasDoc, id: string): boolean {
@@ -1919,6 +1933,11 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Column merge uses its certified admission flow.', 'info')
+      return
+    }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) {
       get().pushToast('Fix invalid node parameters before running.', 'error')
       return
@@ -2120,6 +2139,11 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Column merge uses its certified admission flow.', 'info')
+      return
+    }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
     const doc = get().doc
     const binding = currentPreviewBinding(get(), id)

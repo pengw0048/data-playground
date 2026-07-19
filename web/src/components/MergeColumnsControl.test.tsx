@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   state: {} as any,
   preflight: vi.fn(), submit: vi.fn(), task: vi.fn(), jobs: vi.fn(), revision: vi.fn(),
-  tableByRegistration: vi.fn(), resolveDatasetRevision: vi.fn(),
+  tableByRegistration: vi.fn(), resolveDatasetRevision: vi.fn(), cancel: vi.fn(), retry: vi.fn(),
 }))
 
 vi.mock('../store/graph', () => ({
@@ -16,7 +16,7 @@ vi.mock('../api/client', () => ({
     mergeColumnsPreflight: mocks.preflight, submitMergeColumns: mocks.submit,
     mergeColumnsTask: mocks.task, workspaceJobs: mocks.jobs, datasetRevision: mocks.revision,
     tableByRegistration: mocks.tableByRegistration, resolveDatasetRevision: mocks.resolveDatasetRevision,
-    cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(),
+    cancelMergeColumnsTask: mocks.cancel, retryMergeColumnsTask: mocks.retry,
   },
   toMergeColumnsGraph: (doc: any, writeId: string) => ({ id: doc.id, version: doc.version, requirements: [], parameters: [], nodes: doc.nodes.filter((node: any) => ['source', 'select', writeId].includes(node.id)), edges: doc.edges }),
   KernelError: class KernelError extends Error {},
@@ -142,5 +142,57 @@ describe('MergeColumnsControl', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
     await screen.findByText('done')
     expect(screen.queryByText('Submitting…')).not.toBeInTheDocument()
+  })
+
+  it('persists an ambiguous submission before POST and recovers the same id after reopening', async () => {
+    const view = render(<MergeColumnsControl nodeId="write" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Check eligibility' }))
+    await screen.findByText('Eligible exact merge')
+    mocks.submit.mockRejectedValueOnce(new Error('response lost'))
+    fireEvent.click(screen.getByRole('button', { name: 'Run column merge' }))
+    await screen.findByRole('alert')
+    const beforeClose = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns
+    expect(beforeClose.submissionState).toBe('response_unknown')
+    expect(beforeClose.submissionId).toBeTruthy()
+    view.unmount()
+
+    mocks.submit.mockResolvedValueOnce({ taskId: 'recovered-task', status: 'queued', canRetry: false, canCancel: true,
+      mergeColumns: { phase: 'validating', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: true, canRetry: false, canCancel: true } })
+    render(<MergeColumnsControl nodeId="write" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Recover previous submission' }))
+    await waitFor(() => expect(mocks.submit).toHaveBeenCalledTimes(2))
+    expect(mocks.submit.mock.calls[1][0].submissionId).toBe(beforeClose.submissionId)
+    expect(mocks.preflight).toHaveBeenCalledTimes(1)
+    expect(mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns).toEqual(expect.objectContaining({
+      taskId: 'recovered-task', submissionState: undefined,
+    }))
+  })
+
+  it('treats a terminal stale task as a deliberate new admission, never an auto-rebase', async () => {
+    const merge = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns
+    merge.taskId = 'stale-task'
+    mocks.task.mockResolvedValueOnce({ taskId: 'stale-task', status: 'failed', canRetry: false, canCancel: false,
+      mergeColumns: { phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'rejected', reused: false,
+        diagnosticCode: 'stale_expected_head', canRetry: false, canCancel: false } })
+    render(<MergeColumnsControl nodeId="write" />)
+    await screen.findByText(/The destination moved/)
+    fireEvent.click(screen.getByRole('button', { name: 'Start new admission' }))
+    expect(mocks.state.updateConfig).toHaveBeenLastCalledWith('write', expect.objectContaining({ mergeColumns: expect.objectContaining({
+      taskId: undefined, submissionState: undefined,
+    }) }))
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
+  })
+
+  it('clears a failed cancel action rather than leaving task controls fenced', async () => {
+    const merge = mocks.state.doc.nodes.find((node: any) => node.id === 'write').data.config.mergeColumns
+    merge.taskId = 'active-task'
+    mocks.task.mockResolvedValueOnce({ taskId: 'active-task', status: 'running', canRetry: false, canCancel: true,
+      mergeColumns: { phase: 'writing', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'candidate', reused: false, canRetry: false, canCancel: true } })
+    mocks.cancel.mockRejectedValueOnce(new Error('cancel transport failed'))
+    render(<MergeColumnsControl nodeId="write" />)
+    const cancel = await screen.findByRole('button', { name: 'Cancel' })
+    fireEvent.click(cancel)
+    await screen.findByText('cancel transport failed')
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
   })
 })
