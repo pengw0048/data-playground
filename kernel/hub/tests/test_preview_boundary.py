@@ -263,6 +263,40 @@ def test_adapter_without_explicit_preview_capability_fails_closed() -> None:
         _engine(graph, FullOnlyAdapter()).relation("source")
 
 
+def test_exact_source_without_revision_preview_capability_fails_before_full_open(monkeypatch) -> None:
+    import hub.executors.engine as engine_mod
+
+    opened: list[str] = []
+
+    class ExactFullOnlyAdapter:
+        name = "exact-full-only"
+
+        def open_revision(self, _uri, revision_id):
+            opened.append(revision_id)
+            raise AssertionError("exact preview must not open the unbounded full-run relation")
+
+    graph = Graph(
+        id="exact-full-only-preview", version=1,
+        nodes=[_node("source", "source", {
+            "uri": "exact-full-only://dataset",
+            "datasetRef": {"kind": "exact", "datasetId": "dataset", "revisionId": "v1"},
+        })],
+        edges=[],
+    )
+    monkeypatch.setattr(
+        "hub.metadb.catalog_revision_binding_for_uri", lambda _uri: {"dataset_id": "dataset"})
+    monkeypatch.setattr(
+        "hub.workspace_providers.provider_dataset_identity", lambda _uri: None)
+    monkeypatch.setattr(engine_mod, "revision_adapter_for_uri", lambda *_args: ExactFullOnlyAdapter())
+
+    with db.run_scope(), pytest.raises(
+            NotPreviewable, match="does not guarantee a bounded exact-revision preview"):
+        BuildEngine(graph, lambda _uri: ExactFullOnlyAdapter(), object(), sample_k=7, full=False).relation(
+            "source")
+
+    assert opened == []
+
+
 @pytest.mark.parametrize(
     ("plugin", "adapter_name", "loader_name", "uri"),
     [

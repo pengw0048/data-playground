@@ -879,6 +879,16 @@ class ManagedLocalFileRevisionAdapter:
         except (KeyError, OSError, duckdb.Error) as exc:
             _raise_revision_access_error(exc)
 
+    def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
+        """Open one ledger-bound artifact through DuckDB's source-bounded preview path."""
+        from hub import metadb
+
+        try:
+            artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
+            return DuckDBAdapter().preview_scan(artifact_uri, limit=int(limit))
+        except (KeyError, OSError, duckdb.Error) as exc:
+            _raise_revision_access_error(exc)
+
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded facts and preview from one exact immutable local Parquet artifact."""
         from hub import metadb
@@ -954,6 +964,13 @@ class LocalFileInputRevisionAdapter:
         binding = self._binding(uri, revision_id)
         try:
             return DuckDBAdapter().scan(binding["artifact_uri"])
+        except (OSError, duckdb.Error) as exc:
+            _raise_revision_access_error(exc)
+
+    def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
+        binding = self._binding(uri, revision_id)
+        try:
+            return DuckDBAdapter().preview_scan(binding["artifact_uri"], limit=int(limit))
         except (OSError, duckdb.Error) as exc:
             _raise_revision_access_error(exc)
 
@@ -1138,6 +1155,17 @@ class LanceAdapter:
         except Exception as exc:
             _raise_revision_access_error(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
+
+    def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
+        """Open one retained Lance version with its scanner cap before yielding a relation."""
+        try:
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
+            dataset.schema  # force a missing-version failure before creating the scanner
+            return db.conn().from_arrow(dataset.scanner(limit=int(limit)).to_reader())
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            _raise_revision_access_error(exc)
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded, exact-version facts without consulting the mutable current head."""

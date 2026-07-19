@@ -12,6 +12,7 @@ import pytest
 from hub import db, metadb
 from hub.executors import engine as engine_mod
 from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.executors.preview import PREVIEW_SCAN
 from hub.kernel import RunBody, _admitted_kernel_graph
 from hub.kernel_backend import KernelBackend
 from hub.local_run_inputs import LocalRunInputError, bind_manifest, validate_manifest
@@ -104,6 +105,54 @@ def test_kernel_transport_reopens_the_admitted_lance_revision_after_head_move_an
     with pytest.raises(LocalRunInputError, match="revision is unavailable"):
         _admitted_kernel_graph(
             body, kernel_canvas=graph.id, deps=deps, metadata=metadb)
+
+
+def test_manifest_binding_replaces_untrusted_preview_limit_and_keeps_full_run_exact(tmp_path):
+    lance = pytest.importorskip("lance")
+    uri = str(tmp_path / "input.lance")
+    lance.write_dataset(pa.table({"value": [1, 2, 3]}), uri)
+
+    class SpyLanceAdapter(LanceAdapter):
+        def __init__(self):
+            self.open_calls: list[str] = []
+            self.preview_calls: list[tuple[str, int]] = []
+
+        def open_revision(self, uri: str, revision_id: str):
+            self.open_calls.append(revision_id)
+            return super().open_revision(uri, revision_id)
+
+        def preview_revision(self, uri: str, revision_id: str, *, limit: int):
+            self.preview_calls.append((revision_id, limit))
+            return super().preview_revision(uri, revision_id, limit=limit)
+
+    adapter = SpyLanceAdapter()
+    InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)._add(
+        name="input", uri=uri, strict_probe=True)
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: adapter)
+    graph = _source_graph(uri)
+    graph.nodes[0].data["config"]["_input_preview_limit"] = 1
+    manifest = runs._resolve_local_run_manifest(graph, "source", deps)
+
+    full_graph = bind_manifest(graph, "source", manifest, deps.resolve_adapter)
+    assert "_input_preview_limit" not in full_graph.nodes[0].data["config"]
+    with db.run_scope():
+        assert BuildEngine(
+            full_graph, deps.resolve_adapter, {}, full=True,
+        ).relation("source").fetchall() == [(1,), (2,), (3,)]
+    assert adapter.open_calls == [manifest[0]["revision_id"]] * 2
+    assert adapter.preview_calls == []
+
+    preview_graph = bind_manifest(
+        graph, "source", manifest, deps.resolve_adapter, preview_limit=PREVIEW_SCAN)
+    assert preview_graph.nodes[0].data["config"]["_input_preview_limit"] == PREVIEW_SCAN
+    with db.run_scope():
+        assert BuildEngine(
+            preview_graph, deps.resolve_adapter, {}, sample_k=PREVIEW_SCAN, full=False,
+        ).relation("source").fetchall() == [(1,), (2,), (3,)]
+    assert adapter.preview_calls == [
+        (manifest[0]["revision_id"], PREVIEW_SCAN),
+        (manifest[0]["revision_id"], PREVIEW_SCAN),
+    ]
 
 
 def test_kernel_transport_rejects_stale_and_secret_bearing_manifests():

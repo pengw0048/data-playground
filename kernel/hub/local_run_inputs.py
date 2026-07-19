@@ -283,7 +283,7 @@ def validate_manifest_graph(graph, target_node_id: str | None, manifest: object,
 
 def bind_manifest(
     graph, target_node_id: str | None, manifest: object, resolve_adapter, *,
-    allow_prebound_provider: bool = False,
+    allow_prebound_provider: bool = False, preview_limit: int | None = None,
 ):
     """Reopen admitted provider revisions and bind them only to a private dispatch graph."""
     admitted = validate_manifest_graph(
@@ -292,6 +292,10 @@ def bind_manifest(
     sources = source_nodes(bound, target_node_id)
     for node, item in zip(sources, admitted, strict=True):
         config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+        if isinstance(config, dict):
+            # Preview limits are server-owned dispatch state. Never preserve a client/import value:
+            # a full run must not be diverted into the bounded preview path and silently truncated.
+            config.pop("_input_preview_limit", None)
         source_uri = str(config.get("uri") or "") if isinstance(config, dict) else ""
         from hub import workspace_providers
         prebound_provider_uri = (
@@ -371,7 +375,14 @@ def bind_manifest(
             raise LocalRunInputError("local run input revision is unavailable")
         try:
             with db.base_guard():
-                adapter.open_revision(revision_uri, item["revision_id"])
+                if preview_limit is None:
+                    adapter.open_revision(revision_uri, item["revision_id"])
+                else:
+                    preview_revision = getattr(adapter, "preview_revision", None)
+                    if not callable(preview_revision):
+                        raise LocalRunInputError(
+                            "exact input revision has no bounded preview capability")
+                    preview_revision(revision_uri, item["revision_id"], limit=preview_limit)
         except (PermissionError, RevisionPermissionLost, RevisionProviderOffline,
                 ConnectionError, TimeoutError, OSError,
                 workspace_providers.ProviderDatasetUnavailable):
@@ -406,6 +417,8 @@ def bind_manifest(
         config["_input_dataset_id"] = item["dataset_id"]
         config["_input_provider"] = item["provider"]
         config["_input_revision_id"] = item["revision_id"]
+        if preview_limit is not None:
+            config["_input_preview_limit"] = preview_limit
         artifact_uri = (metadb.local_file_input_revision_artifact(
             item["dataset_id"], item["revision_id"])
             if item["provider"] == LOCAL_FILE_INPUT_PROVIDER

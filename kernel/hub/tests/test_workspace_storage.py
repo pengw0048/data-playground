@@ -447,6 +447,9 @@ class _ExactFixtureAdapter:
     def __init__(self, path: str):
         self.path = path
         self.failure: str | None = None
+        self.head = "fixture-revision-1"
+        self.open_calls: list[str] = []
+        self.preview_calls: list[tuple[str, int]] = []
 
     def matches(self, _uri):
         return True
@@ -483,11 +486,12 @@ class _ExactFixtureAdapter:
         if self.failure == "offline":
             raise RevisionProviderOffline("secret provider detail")
         return {
-            "revision_id": "fixture-revision-1",
+            "revision_id": self.head,
             "committed_at": datetime.datetime(2026, 7, 18, tzinfo=datetime.timezone.utc),
         }
 
     def open_revision(self, _uri, revision_id):
+        self.open_calls.append(revision_id)
         if self.failure == "permission":
             raise PermissionError("secret provider detail")
         if self.failure == "offline":
@@ -495,6 +499,16 @@ class _ExactFixtureAdapter:
         if revision_id != "fixture-revision-1":
             raise RevisionUnavailable("revision_unavailable")
         return self.scan(_uri)
+
+    def preview_revision(self, _uri, revision_id, *, limit):
+        self.preview_calls.append((revision_id, limit))
+        if self.failure == "permission":
+            raise PermissionError("secret provider detail")
+        if self.failure == "offline":
+            raise RevisionProviderOffline("secret provider detail")
+        if revision_id != "fixture-revision-1":
+            raise RevisionUnavailable("revision_unavailable")
+        return self.preview_scan(_uri, limit=limit)
 
     def revision_detail(self, _uri, revision_id, *, preview_limit):
         del preview_limit
@@ -554,12 +568,19 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert str(path) not in json.dumps(graph)
         assert config["providerReadMode"] == "exact"
         assert config["datasetRef"]["revisionId"] == "fixture-revision-1"
+        exact_adapter.head = "fixture-revision-2"
 
         preview = client.post("/api/run/preview", json={
             "graph": graph, "nodeId": source["id"], "k": 10,
         })
         assert preview.status_code == 200, preview.text
         assert [row["value"] for row in preview.json()["rows"]] == [1, 2]
+        assert exact_adapter.preview_calls == [
+            ("fixture-revision-1", 2000),
+            ("fixture-revision-1", 2000),
+            ("fixture-revision-1", 2000),
+        ]
+        assert exact_adapter.open_calls == []
         assert preview.json()["inputManifest"][0] == {
             "node_id": source["id"],
             "dataset_id": config["datasetRef"]["datasetId"],

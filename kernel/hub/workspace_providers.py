@@ -202,7 +202,7 @@ class _BoundProviderDatasetAdapter:
 
     _URI_METHODS = {
         "scan", "preview_scan", "schema", "count", "metadata_count", "fingerprint",
-        "resolve_revision", "open_revision",
+        "resolve_revision", "open_revision", "preview_revision",
     }
 
     def __init__(self, source_uri: str, physical_uri: str, adapter: object):
