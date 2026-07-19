@@ -143,6 +143,7 @@ def test_postgres_sparse_output_admission_replays_one_exact_base_reference(tmp_p
         assert storage.release_result(artifact, run_id) is True
         with metadb.session() as session:
             session.add(metadb.User(id=owner, name="Sparse PostgreSQL owner"))
+            session.flush()
             session.add(metadb.Canvas(id=canvas, owner_id=owner, name="Sparse", doc="{}"))
         request = SparseOutputAdmissionRequest(
             owner_id=owner, canvas_id=canvas, submission_id="Postgres-Submission",
