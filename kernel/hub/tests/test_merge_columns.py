@@ -4,21 +4,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import func, select
 
-from hub import db, merge_columns as merge_columns_module, metadb
+from hub import db, linear_checkpoint as lc, merge_columns as merge_columns_module, metadb
+from hub import merge_columns_tasks
 from hub.local_writes import write_managed_local_file
 from hub.merge_columns import (
     MergeColumnRuleV1,
     MergeColumnsError,
     MergeColumnsIntentV1,
+    merge_sparse_output_candidate,
     merge_sparse_output_columns,
     sparse_output_merge_evidence,
 )
@@ -108,6 +113,9 @@ def _case(local_catalog, tmp_path, table: pa.Table, *, projection: str,
     owner, canvas = f"u-{uuid.uuid4().hex}", f"c-{uuid.uuid4().hex}"
     with metadb.session() as s:
         s.add(metadb.User(id=owner, name=owner))
+        # The models intentionally have no ORM relationship. Flush the FK parent explicitly so the
+        # PostgreSQL acceptance path cannot depend on SQLAlchemy's order for unrelated pending mappers.
+        s.flush()
         s.add(metadb.Canvas(id=canvas, owner_id=owner, name=canvas, doc="{}"))
     exact = ExactDatasetRef(
         kind="exact", dataset_id=published["dataset_id"], revision_id=published["revision_id"])
@@ -489,3 +497,418 @@ def test_private_merge_row_contains_no_receipt_or_uri_authority(local_catalog, t
 
     forbidden = ("uri", "artifact", "lock", "descriptor", "inode", "device", "token", "lease")
     assert not any(term in key for key in keys(document) for term in forbidden)
+
+
+def _wait_task(task_id: str) -> dict:
+    import time
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        task = metadb.durable_task(task_id, include_admission=False)
+        assert task is not None
+        if task["status"] in ("done", "failed", "cancelled"):
+            return task
+        time.sleep(0.02)
+    raise AssertionError("durable merge task did not reach a terminal state")
+
+
+def _admit_durable_merge(case: MergeCase, intent: MergeColumnsIntentV1, submission: str) -> dict:
+    task, created = metadb.submit_merge_columns_task(
+        uid=case.admission["ownerId"], canvas_id=case.admission["canvasId"],
+        submission_id=submission, intent=intent)
+    assert created
+    return task
+
+
+def _commit_durable_merge_candidate(task: dict, case: MergeCase, intent: MergeColumnsIntentV1):
+    task_id = task["id"]
+    owner = "candidate-owner"
+    claimed = metadb.claim_merge_columns_task(task_id, owner)
+    assert claimed is not None
+    attempt_id = claimed["attempts"][-1]["id"]
+    table = merge_sparse_output_candidate(storage=case.storage, intent=intent)
+    candidate = metadb.reserve_linear_checkpoint_candidate(
+        task_id=task_id, attempt_id=attempt_id, owner_token=owner,
+        namespace_id=case.storage.namespace_id, storage_root=case.storage.result_root,
+        writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    lc.materialize_and_commit_checkpoint(
+        case.storage, task_id=task_id, attempt_id=attempt_id, owner_token=owner,
+        candidate=candidate, content=sink.getvalue().to_pybytes())
+    return attempt_id, owner
+
+
+def _expire_attempt(attempt_id: str) -> None:
+    with metadb.session() as s:
+        attempt = s.get(metadb.DurableTaskAttempt, attempt_id, with_for_update=True)
+        assert attempt is not None
+        attempt.lease_until = metadb._durable_task_db_now(s) - timedelta(seconds=1)
+
+
+def _publish_checkpoint_as_owner(
+        case: MergeCase, intent: MergeColumnsIntentV1, task_id: str,
+        attempt_id: str, owner_token: str, artifact_uris: dict[str, str] | None = None):
+    committed = metadb.linear_checkpoint_committed(task_id)
+    assert committed is not None
+
+    def copy_candidate(uri: str) -> None:
+        if artifact_uris is not None:
+            artifact_uris[owner_token] = uri
+        with open(committed["uri"], "rb") as source, open(uri, "wb") as target:
+            while chunk := source.read(1024 * 1024):
+                target.write(chunk)
+
+    return write_managed_local_file(
+        storage=case.storage, catalog=case.catalog, intent=intent.write_intent,
+        write_artifact=copy_candidate,
+        merge_publication=merge_columns_module.merge_columns_publication_context(
+            intent, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token))
+
+
+def test_durable_merge_reuses_only_committed_candidate_and_redacts_jobs(local_catalog, tmp_path,
+                                                                         monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")])
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    attempt_id, owner = _commit_durable_merge_candidate(task, case, intent)
+    with metadb.session() as s:
+        envelope = s.get(metadb.MergeColumnsTaskEnvelope, task["id"])
+        checkpoint = s.get(metadb.DurableCheckpoint, task["id"])
+        assert envelope is not None and envelope.phase == "candidate_committed"
+        assert checkpoint is not None and checkpoint.phase == "committed"
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt_id, owner,
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+    retried = metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    assert retried["status"] == "queued"
+
+    def no_second_merge(*_args, **_kwargs):
+        raise AssertionError("candidate-committed retry reopened SparseOutput")
+
+    monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate", no_second_merge)
+    original_publish = case.catalog.publish_managed_local_write
+
+    def lose_publication_response(*args, **kwargs):
+        original_publish(*args, **kwargs)
+        raise RuntimeError("publication response lost")
+
+    monkeypatch.setattr(case.catalog, "publish_managed_local_write", lose_publication_response)
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    done = _wait_task(task["id"])
+    assert done["status"] == "done"
+    assert done["output_receipt"] is not None
+    assert _revision_count(case.exact.dataset_id) == 2
+    inbox = metadb.list_durable_task_inbox_items(case.admission["ownerId"])
+    outcomes = [item["outcome"] for item in inbox["items"] if item["task_id"] == task["id"]]
+    assert sorted(outcomes) == ["cancelled", "completed"]
+    jobs = metadb.list_workspace_runs(case.admission["ownerId"])
+    job = next(item for item in jobs["items"] if item["taskId"] == task["id"])
+    assert job["mergeColumns"]["phase"] == "done"
+    assert job["mergeColumns"]["candidate"] == "committed"
+    assert job["writeIntent"] is None and job["inputManifest"] == []
+    assert case.logical_uri not in json.dumps(job["mergeColumns"])
+
+
+def test_durable_merge_corrupt_committed_candidate_fails_closed(local_catalog, tmp_path, monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="corrupt-candidate")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    attempt_id, owner = _commit_durable_merge_candidate(task, case, intent)
+    checkpoint = metadb.linear_checkpoint_committed(task["id"])
+    assert checkpoint is not None
+    with open(checkpoint["uri"], "wb") as corrupted:
+        corrupted.write(b"not a parquet candidate")
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt_id, owner,
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+    metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate",
+                        lambda *_args, **_kwargs: pytest.fail("corrupt candidate recomputed merge"))
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    failed = _wait_task(task["id"])
+    assert failed["status"] == "failed"
+    assert _revision_count(case.exact.dataset_id) == 1
+
+
+def test_durable_merge_stale_publication_owner_cannot_cross_replacement_claim(
+        local_catalog, tmp_path):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="publication-fence")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    stale_attempt, stale_owner = _commit_durable_merge_candidate(task, case, intent)
+    assert metadb.update_merge_columns_task_phase(
+        task["id"], stale_attempt, stale_owner, phase="publishing",
+        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+    _expire_attempt(stale_attempt)
+    replacement_owner = "replacement-publication-owner"
+    replacement = metadb.claim_merge_columns_task(task["id"], replacement_owner)
+    assert replacement is not None
+    replacement_attempt = replacement["attempts"][-1]["id"]
+
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="owner is stale or fenced"):
+        _publish_checkpoint_as_owner(
+            case, intent, task["id"], stale_attempt, stale_owner)
+    assert _revision_count(case.exact.dataset_id) == 1
+    assert metadb.update_merge_columns_task_phase(
+        task["id"], replacement_attempt, replacement_owner, phase="publishing",
+        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+    receipt = _publish_checkpoint_as_owner(
+        case, intent, task["id"], replacement_attempt, replacement_owner)
+    assert metadb.finish_durable_task_attempt(
+        task["id"], replacement_attempt, replacement_owner,
+        merge_columns_tasks._done(task["id"], intent.write_intent, receipt).model_dump())
+    assert _revision_count(case.exact.dataset_id) == 2
+    assert _merge_publication_count() == 1
+
+
+def test_durable_merge_cancel_after_reservation_retires_exact_authority(
+        local_catalog, tmp_path, monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="cancel-reserved")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    reserved: dict = {}
+
+    def cancel_reserved(_storage, *, candidate, **_kwargs):
+        reserved.update(candidate)
+        metadb.request_durable_task_cancel(task["id"])
+        raise RuntimeError("cancel after reservation")
+
+    monkeypatch.setattr(
+        merge_columns_tasks.lc, "materialize_and_commit_checkpoint", cancel_reserved)
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    assert _wait_task(task["id"])["status"] == "cancelled"
+    assert reserved["uri"]
+    assert metadb.linear_checkpoint_candidate(task["id"]) is None
+    with metadb.session() as s:
+        checkpoint = s.get(metadb.DurableCheckpoint, task["id"])
+        artifact = s.get(metadb.LocalResultArtifact, reserved["uri"])
+        assert checkpoint is not None and checkpoint.phase == "pending"
+        assert (checkpoint.candidate_uri, checkpoint.candidate_generation,
+                checkpoint.candidate_attempt_id, checkpoint.candidate_dev,
+                checkpoint.candidate_ino) == (None, None, None, None, None)
+        assert artifact is None or (
+            artifact.state == "deleting" and artifact.writer_run_id is None
+            and artifact.writer_token is None)
+
+
+def test_durable_merge_reconciles_candidate_commit_response_loss(
+        local_catalog, tmp_path, monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="commit-response-loss")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    original = metadb.commit_linear_checkpoint
+    calls = 0
+
+    def lose_commit_response(**kwargs):
+        nonlocal calls
+        calls += 1
+        original(**kwargs)
+        raise RuntimeError("candidate commit response lost")
+
+    monkeypatch.setattr(metadb, "commit_linear_checkpoint", lose_commit_response)
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    assert _wait_task(task["id"])["status"] == "done"
+    assert calls == 1
+    assert metadb.linear_checkpoint_committed(task["id"]) is not None
+    assert _revision_count(case.exact.dataset_id) == 2
+    assert _merge_publication_count() == 1
+
+
+@pytest.mark.parametrize(
+    "restart_phase,expected_merges",
+    [("validating", 1), ("merging", 1), ("reserved", 1),
+     ("candidate_committed", 0), ("publishing", 0)],
+)
+def test_durable_merge_restart_from_each_authoritative_phase(
+        local_catalog, tmp_path, monkeypatch, restart_phase, expected_merges):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")],
+        key=f"restart-{restart_phase}")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    owner = f"expired-{restart_phase}"
+    claimed = metadb.claim_merge_columns_task(task["id"], owner)
+    assert claimed is not None
+    attempt_id = claimed["attempts"][-1]["id"]
+    if restart_phase in ("validating", "merging", "reserved"):
+        visible_phase = "merging" if restart_phase == "reserved" else restart_phase
+        assert metadb.update_merge_columns_task_phase(
+            task["id"], attempt_id, owner, phase=visible_phase,
+            status_doc=merge_columns_tasks._status(
+                task["id"], phase=visible_phase, progress=0.2))
+        if restart_phase == "reserved":
+            metadb.reserve_linear_checkpoint_candidate(
+                task_id=task["id"], attempt_id=attempt_id, owner_token=owner,
+                namespace_id=case.storage.namespace_id,
+                storage_root=case.storage.result_root,
+                writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+    else:
+        table = merge_sparse_output_candidate(storage=case.storage, intent=intent)
+        candidate = metadb.reserve_linear_checkpoint_candidate(
+            task_id=task["id"], attempt_id=attempt_id, owner_token=owner,
+            namespace_id=case.storage.namespace_id,
+            storage_root=case.storage.result_root,
+            writer_token=uuid.uuid4().hex, lock_token=uuid.uuid4().hex)
+        sink = pa.BufferOutputStream()
+        pq.write_table(table, sink)
+        lc.materialize_and_commit_checkpoint(
+            case.storage, task_id=task["id"], attempt_id=attempt_id,
+            owner_token=owner, candidate=candidate, content=sink.getvalue().to_pybytes())
+        if restart_phase == "publishing":
+            assert metadb.update_merge_columns_task_phase(
+                task["id"], attempt_id, owner, phase="publishing",
+                status_doc=merge_columns_tasks._status(
+                    task["id"], phase="publishing", progress=0.8))
+    _expire_attempt(attempt_id)
+    original_merge = merge_columns_tasks.merge_sparse_output_candidate
+    merge_calls = 0
+
+    def count_merge(*args, **kwargs):
+        nonlocal merge_calls
+        merge_calls += 1
+        return original_merge(*args, **kwargs)
+
+    monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate", count_merge)
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    assert _wait_task(task["id"])["status"] == "done"
+    assert merge_calls == expected_merges
+    assert metadb.linear_checkpoint_committed(task["id"]) is not None
+    assert _revision_count(case.exact.dataset_id) == 2
+
+
+def test_durable_merge_cancel_and_stale_head_are_deterministic(local_catalog, tmp_path, monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="stale-durable")
+    cancelled = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    metadb.request_durable_task_cancel(cancelled["id"])
+    merge_columns_tasks.dispatch(cancelled["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    assert _wait_task(cancelled["id"])["status"] == "cancelled"
+    assert metadb.linear_checkpoint_candidate(cancelled["id"]) is None
+    assert _revision_count(case.exact.dataset_id) == 1
+
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    attempt_id, owner = _commit_durable_merge_candidate(task, case, intent)
+    _ordinary_replace(case, _retarget_write(intent.write_intent, key="advance-durable",
+                                             head=case.exact), base)
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt_id, owner,
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+    metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate",
+                        lambda *_args, **_kwargs: pytest.fail("stale head recomputed merge"))
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    failed = _wait_task(task["id"])
+    assert failed["status"] == "failed" and failed["error"] == "stale_expected_head"
+    assert _revision_count(case.exact.dataset_id) == 2
+    jobs = metadb.list_workspace_runs(case.admission["ownerId"])
+    job = next(item for item in jobs["items"] if item["taskId"] == task["id"])
+    assert job["error"] == "stale_expected_head"
+    assert job["canRetry"] is False
+    assert job["mergeColumns"]["canRetry"] is False
+    assert job["mergeColumns"]["diagnosticCode"] == "stale_expected_head"
+    assert "replace expected head is stale" not in json.dumps(job)
+    with pytest.raises(ValueError, match="requires a new submission"):
+        metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
+    inbox = metadb.list_durable_task_inbox_items(case.admission["ownerId"])
+    terminal = next(item for item in inbox["items"]
+                    if item["task_id"] == task["id"] and item["outcome"] == "failed")
+    assert terminal["diagnostic_code"] == "stale_expected_head"
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"),
+                    reason="requires dedicated PostgreSQL")
+def test_postgres_two_owners_have_one_durable_merge_candidate_and_publication(
+        local_catalog, tmp_path, monkeypatch):
+    base = pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": ["a", "b"]})
+    case = _case(local_catalog, tmp_path, base, projection="id, value AS replacement",
+                 identity_columns=["id"])
+    intent = _intent(case, [MergeColumnRuleV1(
+        source="replacement", target="value", mode="replace")], key="postgres-owners")
+    task = _admit_durable_merge(case, intent, str(uuid.uuid4()))
+    stale_attempt, stale_owner = _commit_durable_merge_candidate(task, case, intent)
+    assert metadb.update_merge_columns_task_phase(
+        task["id"], stale_attempt, stale_owner, phase="publishing",
+        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+    _expire_attempt(stale_attempt)
+    replacement_owner = "postgres-replacement-owner"
+    replacement = metadb.claim_merge_columns_task(task["id"], replacement_owner)
+    assert replacement is not None
+    replacement_attempt = replacement["attempts"][-1]["id"]
+    assert replacement_attempt != stale_attempt
+    assert metadb.update_merge_columns_task_phase(
+        task["id"], replacement_attempt, replacement_owner, phase="publishing",
+        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+
+    # Both owners enter the real catalog publication transaction from independent sessions. Hold the
+    # replacement's Task lock until the stale transaction is trying to acquire that same row: the old
+    # owner must block through the new commit and can then only recover the new owner's receipt.
+    replacement_locked = threading.Event()
+    stale_waiting = threading.Event()
+    original_fence = metadb._lock_merge_columns_publication_fence
+
+    def race_fence(s, context):
+        if context.owner_token == replacement_owner:
+            original_fence(s, context)
+            replacement_locked.set()
+            assert stale_waiting.wait(timeout=10)
+            return
+        assert context.owner_token == stale_owner
+        assert replacement_locked.wait(timeout=10)
+        stale_waiting.set()
+        original_fence(s, context)
+
+    monkeypatch.setattr(metadb, "_lock_merge_columns_publication_fence", race_fence)
+    artifact_uris: dict[str, str] = {}
+
+    def publish(owner_attempt):
+        owner, attempt_id = owner_attempt
+        return _publish_checkpoint_as_owner(
+            case, intent, task["id"], attempt_id, owner, artifact_uris)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(publish, (
+            (stale_owner, stale_attempt),
+            (replacement_owner, replacement_attempt),
+        )))
+    assert len({outcome.revision_id for outcome in outcomes}) == 1
+    receipt = outcomes[0]
+    assert receipt.publication.artifact_uri == artifact_uris[replacement_owner]
+    assert receipt.publication.artifact_uri != artifact_uris[stale_owner]
+    assert metadb.finish_durable_task_attempt(
+        task["id"], replacement_attempt, replacement_owner,
+        merge_columns_tasks._done(task["id"], intent.write_intent, receipt).model_dump())
+    with metadb.session() as s:
+        attempts = list(s.scalars(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == task["id"]).order_by(
+                metadb.DurableTaskAttempt.attempt_number)))
+        assert [attempt.status for attempt in attempts] == ["fenced", "done"]
+    assert _revision_count(case.exact.dataset_id) == 2
+    assert _merge_publication_count() == 1

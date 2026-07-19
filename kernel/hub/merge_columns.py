@@ -212,7 +212,7 @@ def sparse_output_merge_evidence(admission: dict, committed: dict) -> SparseOutp
         raise MergeColumnsError("merge SparseOutput evidence is invalid") from exc
 
 
-def _merge_document(intent: MergeColumnsIntentV1) -> str:
+def merge_columns_document(intent: MergeColumnsIntentV1) -> str:
     # The frozen intent contains only semantic evidence; no URI, lock, descriptor, inode, token, or
     # lease can enter this document.  Its own digest is validated by the model above.
     payload = _merge_semantic_payload(intent)
@@ -220,20 +220,26 @@ def _merge_document(intent: MergeColumnsIntentV1) -> str:
     return _canonical({"version": 1, "intent": payload})
 
 
-def merge_sparse_output_columns(*, storage, catalog, intent: MergeColumnsIntentV1) -> WriteReceipt:
-    """Merge one certified sidecar with full identity coverage and publish one typed replacement."""
+def merge_columns_publication_context(
+        intent: MergeColumnsIntentV1, *, task_id: str | None = None,
+        attempt_id: str | None = None,
+        owner_token: str | None = None) -> metadb.MergeColumnsPublicationContext:
+    """Return the private semantic companion required by the ordinary typed write."""
     frozen = MergeColumnsIntentV1.model_validate(intent)
-    write = WriteIntent.model_validate(frozen.write_intent)
-    document = _merge_document(frozen)
-    publication = metadb.MergeColumnsPublicationContext(
-        merge_doc=document, merge_sha256=hashlib.sha256(document.encode()).hexdigest())
-    # This check must precede every sidecar open, so an explicitly released SparseOutput still has
-    # semantic replay.  It compares every caller-controlled frozen field, not merely the key.
-    prior = metadb.catalog_managed_local_write_receipt(
-        write.model_dump(by_alias=True, mode="json"),
-        merge_publication=publication)
-    if prior is not None:
-        return WriteReceipt.model_validate(prior)
+    document = merge_columns_document(frozen)
+    return metadb.MergeColumnsPublicationContext(
+        merge_doc=document, merge_sha256=hashlib.sha256(document.encode()).hexdigest(),
+        task_id=task_id, attempt_id=attempt_id, owner_token=owner_token)
+
+
+def merge_sparse_output_candidate(*, storage, intent: MergeColumnsIntentV1) -> pa.Table:
+    """Build one complete Parquet candidate without publication.
+
+    The durable merge Task uses this only before its candidate checkpoint commits.  Keeping this
+    sidecar/base reopening and identity proof separate from publication makes the post-commit restart
+    boundary explicit: publication consumes checkpoint bytes and cannot re-run this function.
+    """
+    frozen = MergeColumnsIntentV1.model_validate(intent)
     # SparseOutput reopen performs a bounded DuckDB coverage scan before returning the held guard.
     # Serialize that scan on the process-local connection just like the base and merge scans below.
     with db.base_guard():
@@ -250,11 +256,6 @@ def merge_sparse_output_columns(*, storage, catalog, intent: MergeColumnsIntentV
             with db.base_guard(), source_read_scope(storage, [base_uri], owner="merge-columns"):
                 base = DuckDBAdapter().scan(base_uri).to_arrow_table()
             exact, identities = _validate_intent(frozen, admission, base.schema, sidecar.schema)
-            prior = metadb.catalog_managed_local_write_receipt(
-                write.model_dump(by_alias=True, mode="json"),
-                merge_publication=publication)
-            if prior is not None:
-                return WriteReceipt.model_validate(prior)
             with db.base_guard():
                 side_relation = db.conn().from_arrow(sidecar)
                 coverage = certify_row_identity_coverage(
@@ -285,6 +286,20 @@ def merge_sparse_output_columns(*, storage, catalog, intent: MergeColumnsIntentV
                                             for row in range(base.num_rows)], type=source.type))
             output = pa.Table.from_arrays(arrays, names=[field.name for field in base.schema] + [
                 rule.target for rule in frozen.rules if rule.mode == "add"])
+    return output
+
+
+def merge_sparse_output_columns(*, storage, catalog, intent: MergeColumnsIntentV1) -> WriteReceipt:
+    """Merge one certified sidecar with full identity coverage and publish one typed replacement."""
+    frozen = MergeColumnsIntentV1.model_validate(intent)
+    write = WriteIntent.model_validate(frozen.write_intent)
+    publication = merge_columns_publication_context(frozen)
+    prior = metadb.catalog_managed_local_write_receipt(
+        write.model_dump(by_alias=True, mode="json"),
+        merge_publication=publication)
+    if prior is not None:
+        return WriteReceipt.model_validate(prior)
+    output = merge_sparse_output_candidate(storage=storage, intent=frozen)
 
     def writer(uri: str) -> None:
         pq.write_table(output, uri)

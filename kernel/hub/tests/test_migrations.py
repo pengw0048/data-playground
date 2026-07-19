@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0031_durable_merge", "0030_merge_columns_pub"),
         ("0030_merge_columns_pub", "0029_sparse_output_mat"),
         ("0029_sparse_output_mat", "0028_sparse_output_admission"),
         ("0028_sparse_output_admission", "0027_distribution_reports"),
@@ -85,8 +86,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0030_merge_columns_pub"]
-    assert metadb.expected_schema_head() == "0030_merge_columns_pub"
+    assert scripts.get_heads() == ["0031_durable_merge"]
+    assert metadb.expected_schema_head() == "0031_durable_merge"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -188,6 +189,9 @@ def test_committed_migration_revisions_are_immutable():
         ),
         "0030_merge_columns_publication.py": (
             "b8f927ee183719645c0daf07bd8ef34b3abdaf99fc019219ede20f7e41dac3f9"
+        ),
+        "0031_durable_merge_columns.py": (
+            "3262058f6dd3b5091c91d2ad241c9051fb1e7dc9afb9ac35118aaa8577eb2f37"
         ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
