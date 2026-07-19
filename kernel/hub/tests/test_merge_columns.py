@@ -9,6 +9,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -208,6 +209,120 @@ def _read_revision(ref: ExactDatasetRef | DatasetRevision) -> pa.Table:
     uri = metadb.managed_local_file_revision_artifact(ref.dataset_id, ref.revision_id)
     assert uri is not None
     return pq.read_table(uri)
+
+
+def _fixture_checksum(table: pa.Table) -> str:
+    """Stable, value-only fixture fingerprint; never includes an artifact location."""
+    document = json.dumps(table.to_pydict(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(document.encode()).hexdigest()
+
+
+def _full_width_golden() -> tuple[pa.Table, pa.Table, pa.Table]:
+    """The named #585 fixture: logical key plus two untouched and two changed payload columns."""
+    base = pa.table({
+        "id": pa.array([101, 102, 103], type=pa.int64()),
+        "untouched_text": ["north", "south", "west"],
+        "untouched_numeric": pa.array([10, 20, 30], type=pa.int64()),
+        "replace_me": ["old-n", "old-s", "old-w"],
+    })
+    # Deliberately reordered: merge correctness is keyed by logical identity, not sidecar position.
+    sidecar = pa.table({
+        "id": pa.array([103, 101, 102], type=pa.int64()),
+        "replacement": ["new-w", "new-n", "new-s"],
+        "addition": pa.array([300, 100, 200], type=pa.int64()),
+    })
+    final = pa.table({
+        "id": pa.array([101, 102, 103], type=pa.int64()),
+        "untouched_text": ["north", "south", "west"],
+        "untouched_numeric": pa.array([10, 20, 30], type=pa.int64()),
+        "replace_me": ["new-n", "new-s", "new-w"],
+        "added_numeric": pa.array([100, 200, 300], type=pa.int64()),
+    })
+    return base, sidecar, final
+
+
+def test_full_width_golden_add_replace_history_and_durable_replay(local_catalog, tmp_path):
+    base, sidecar, expected = _full_width_golden()
+    manifest = json.loads((Path(__file__).parents[3] / "docs" / "acceptance" / "issue-585"
+                           / "fixture-manifest.json").read_text())
+    fixture = manifest["fixtures"]["full_width_add_replace"]
+    assert fixture["base"] == {"rows": base.num_rows, "columns": base.schema.names,
+                               "sha256": _fixture_checksum(base)}
+    assert fixture["sidecar"] == {"rows": sidecar.num_rows, "columns": sidecar.schema.names,
+                                  "sha256": _fixture_checksum(sidecar)}
+    assert fixture["final"] == {"rows": expected.num_rows, "columns": expected.schema.names,
+                                "sha256": _fixture_checksum(expected)}
+
+    case = _case(local_catalog, tmp_path, base,
+                 projection="id, replace_me AS replacement, untouched_numeric * 10 AS addition",
+                 identity_columns=["id"], name="issue-585-full-width")
+    # This is the actual frozen Source -> Select materialization, before the deliberately
+    # reordered hand-written candidate below. It proves the transform worker emits only the
+    # selected logical key and payload, with its projected values and no base/physical columns.
+    committed = metadb.reconcile_sparse_output_materialization(case.sparse_id)
+    assert committed is not None
+    transform_sidecar = pq.read_table(committed["uri"])
+    assert transform_sidecar.equals(pa.table({
+        "id": pa.array([101, 102, 103], type=pa.int64()),
+        "replacement": ["old-n", "old-s", "old-w"],
+        "addition": pa.array([100, 200, 300], type=pa.int64()),
+    }))
+    assert transform_sidecar.schema.names == ["id", "replacement", "addition"]
+    assert not {"untouched_text", "untouched_numeric", "replace_me"} & set(
+        transform_sidecar.schema.names)
+    assert not {"rowid", "row_number", "row_group", "row_offset", "fragment", "offset"} & set(
+        transform_sidecar.schema.names)
+
+    # Reorder only after the worker output has been checked so the next assertions specifically
+    # exercise keyed merge behavior rather than conflating it with projection materialization.
+    _rewrite_sidecar(case, sidecar)
+    committed = metadb.reconcile_sparse_output_materialization(case.sparse_id)
+    assert committed is not None
+    assert pq.read_table(committed["uri"]).schema.names == ["id", "replacement", "addition"]
+    intent = _intent(case, [
+        MergeColumnRuleV1(source="replacement", target="replace_me", mode="replace"),
+        MergeColumnRuleV1(source="addition", target="added_numeric", mode="add"),
+    ], key="issue-585-full-width")
+
+    task, created = metadb.submit_merge_columns_task(
+        uid=case.admission["ownerId"], canvas_id=case.admission["canvasId"],
+        submission_id="issue-585-full-width-submission", target_node_id="write", intent=intent)
+    replay, replay_created = metadb.submit_merge_columns_task(
+        uid=case.admission["ownerId"], canvas_id=case.admission["canvasId"],
+        submission_id="issue-585-full-width-submission", target_node_id="write", intent=intent)
+    assert created is True and replay_created is False and replay["id"] == task["id"]
+    merge_columns_tasks.dispatch(task["id"], SimpleNamespace(
+        storage=case.storage, catalog=case.catalog))
+    done = _wait_task(task["id"])
+    assert done["status"] == "done" and done["output_receipt"] is not None
+    receipt = done["output_receipt"]
+    final_ref = ExactDatasetRef(kind="exact", dataset_id=receipt["datasetId"],
+                                revision_id=receipt["revisionId"])
+
+    # Both exact revisions remain independently reopenable; the base is immutable and the result
+    # retains base schema order before the explicitly added column.
+    assert _read_revision(case.exact).equals(base)
+    assert _read_revision(final_ref).equals(expected)
+    assert _read_revision(final_ref).schema.names == expected.schema.names
+    assert _read_revision(final_ref).column("untouched_text").equals(base.column("untouched_text"))
+    assert _read_revision(final_ref).column("untouched_numeric").equals(base.column("untouched_numeric"))
+    assert _revision_count(case.exact.dataset_id) == 2 and _merge_publication_count() == 1
+    assert metadb.durable_task(task["id"], include_admission=False)["output_receipt"] == receipt
+
+
+def test_full_width_golden_invalid_sidecar_publishes_nothing(local_catalog, tmp_path):
+    base, sidecar, _expected = _full_width_golden()
+    case = _case(local_catalog, tmp_path, base,
+                 projection="id, replace_me AS replacement, untouched_numeric * 10 AS addition",
+                 identity_columns=["id"], name="issue-585-invalid-sidecar")
+    _rewrite_sidecar(case, sidecar.slice(0, 2))
+    intent = _intent(case, [
+        MergeColumnRuleV1(source="replacement", target="replace_me", mode="replace"),
+        MergeColumnRuleV1(source="addition", target="added_numeric", mode="add"),
+    ], key="issue-585-invalid-sidecar")
+    with pytest.raises(MergeColumnsError, match="complete logical identity"):
+        merge_sparse_output_columns(storage=case.storage, catalog=case.catalog, intent=intent)
+    assert _revision_count(case.exact.dataset_id) == 1 and _merge_publication_count() == 0
 
 
 def _ordinary_replace(case: MergeCase, intent: WriteIntent, table: pa.Table):

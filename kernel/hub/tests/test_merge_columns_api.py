@@ -16,7 +16,7 @@ from hub import metadb
 from hub.api_errors import APIError
 from hub.deps import Deps
 from hub.models import Graph
-from hub.routers import merge_columns as api
+from hub.routers import catalog as catalog_api, merge_columns as api
 
 
 @pytest.fixture(autouse=True)
@@ -164,6 +164,7 @@ def test_editor_preflights_without_side_effect_then_submits_and_replays(tmp_path
 
 def test_add_mapping_preflights_and_publishes_full_schema(tmp_path, monkeypatch):
     request = _request(tmp_path, monkeypatch)
+    base_revision_id = request.graph.nodes[0].data["config"]["datasetRef"]["revisionId"]
     request.graph.nodes[1].data["config"]["select"] = "id, value AS added"
     request.rules[0].source = "added"
     request.rules[0].target = "derived"
@@ -191,6 +192,16 @@ def test_add_mapping_preflights_and_publishes_full_schema(tmp_path, monkeypatch)
     table = pq.read_table(artifact)
     assert table.schema.names == ["id", "value", "untouched", "derived"]
     assert table.column("derived").to_pylist() == ["a", "b"]
+
+    # Reopen both immutable revisions through the ordinary catalog API handler.  This is a
+    # release-level aggregation over the existing retry/restart/cancel/concurrency coverage,
+    # not another merge execution matrix.
+    monkeypatch.setattr(catalog_api, "get_deps", api.get_deps)
+    base = catalog_api.open_dataset_revision(dataset_id, base_revision_id)
+    final = catalog_api.open_dataset_revision(dataset_id, head["revision_id"])
+    assert base.revision_id == base_revision_id and base.preview.rows[0]["value"] == "a"
+    assert final.parent_revision_id == base_revision_id
+    assert [field.name for field in final.preview.columns] == ["id", "value", "untouched", "derived"]
 
 
 def test_partial_or_invalid_admission_never_creates_merge_side_effects(tmp_path, monkeypatch):
