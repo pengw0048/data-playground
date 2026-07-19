@@ -270,7 +270,7 @@ export const api = {
     if (params?.limit) search.set('limit', String(params.limit))
     return req<WorkspaceSearchPage>(`/workspace/search?${search}`)
   },
-  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; datasetIds?: string[]; providerDatasetRefs?: string[]; transformId?: string; transformVersion?: string }) =>
+  workspaceCreateCanvas: (body: { containerId: string; expectedContainerVersion: number; name: string; requestId?: string; datasetIds?: string[]; providerDatasetRefs?: string[]; transformId?: string; transformVersion?: string }) =>
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),
     }),

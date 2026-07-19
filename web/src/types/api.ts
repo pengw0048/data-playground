@@ -450,6 +450,14 @@ export interface FolderNode { name: string; path: string; tableCount: number }
 export interface CatalogFolder { path: string }
 export interface CatalogBrowse { prefix: string; folders: FolderNode[]; tables: CatalogTable[] }
 export type WorkspaceResourceKind = 'container' | 'canvas' | 'dataset' | 'dataset_view'
+export interface WorkspaceLocalPlacementCapability {
+  writable: boolean
+  canCreateCanvas: boolean
+  canMoveCanvas: boolean
+  containerId?: string | null
+  containerVersion?: number | null
+  recoveryState: 'ready' | 'unavailable'
+}
 export interface WorkspaceResource {
   id: string
   kind: WorkspaceResourceKind
@@ -470,6 +478,10 @@ export interface WorkspaceResource {
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error'
   lastKnown?: boolean
   lastResolvedAt?: string | null
+  /** A local Canvas destination paired with this source-only provider resource. */
+  localPlacement?: WorkspaceLocalPlacementCapability | null
+  /** Provider resources are never mutated by Workspace Canvas actions. */
+  providerMutation?: boolean
 }
 export interface WorkspaceSourceStatus {
   id: string

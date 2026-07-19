@@ -56,7 +56,8 @@ const VIEW_DEFINITION: DatasetViewDefinition = {
   selectedColumns: ['frame_id'], predicate: null, sampling: { kind: 'all' }, sampleProvenance: null,
   retentionOwner: 'provider', createdAt: '2026-07-18T12:00:00Z', semanticSha256: 'a'.repeat(64), definitionSha256: 'b'.repeat(64),
 }
-const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder' }
+const EXTERNAL_LOCAL_PLACEMENT = { writable: true, canCreateCanvas: true, canMoveCanvas: true, containerId: 'local-overlay-anchor', containerVersion: 7, recoveryState: 'ready' as const }
+const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder', localPlacement: EXTERNAL_LOCAL_PLACEMENT, providerMutation: false }
 const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset' }
 const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mountId: 'warehouse', provider: 'fixture', completeness: 'complete' as const, error: null }
 
@@ -197,6 +198,67 @@ describe('WorkspaceExplorer', () => {
     expect(store.openFile).toHaveBeenCalledWith('created-1')
   })
 
+  it('creates a locally owned Canvas in a source-only provider folder and reuses its request id on retry', async () => {
+    store.workspaceResourceId = EXTERNAL_FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_FOLDER, ancestors: [ROOT], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    mocks.workspaceCreateCanvas
+      .mockRejectedValueOnce(new Error('connection interrupted after submission'))
+      .mockResolvedValueOnce({ ok: true, id: 'external-created', created: true, resource: CANVAS })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New canvas here' }))
+    const dialog = screen.getByRole('dialog', { name: 'New canvas here' })
+    expect(dialog).toHaveTextContent('locally owned Canvas overlay')
+    expect(dialog).toHaveTextContent('never changes the provider')
+    fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'Hand tracking review' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create canvas' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('connection interrupted')
+    fireEvent.click(screen.getByRole('button', { name: 'Create canvas' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledTimes(2))
+    const [first, second] = mocks.workspaceCreateCanvas.mock.calls.map(([body]) => body)
+    expect(first).toMatchObject({
+      containerId: 'local-overlay-anchor', expectedContainerVersion: 7,
+      name: 'Hand tracking review', requestId: expect.any(String),
+    })
+    expect(second).toEqual(first)
+    expect(store.openFile).toHaveBeenCalledWith('external-created')
+  })
+
+  it('resets the external create replay identity when the Canvas intent changes', async () => {
+    store.workspaceResourceId = EXTERNAL_FOLDER.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_FOLDER, ancestors: [ROOT], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    mocks.workspaceCreateCanvas.mockRejectedValue(new Error('retry later'))
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'New canvas here' }))
+    fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'first intent' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create canvas' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('retry later')
+    fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'second intent' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create canvas' }))
+
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledTimes(2))
+    expect(mocks.workspaceCreateCanvas.mock.calls[1][0]).toMatchObject({ name: 'second intent' })
+    expect(mocks.workspaceCreateCanvas.mock.calls[1][0].requestId)
+      .not.toBe(mocks.workspaceCreateCanvas.mock.calls[0][0].requestId)
+  })
+
+  it('keeps the create action unavailable when an external local overlay cannot be recovered', async () => {
+    const unavailable = { ...EXTERNAL_FOLDER, localPlacement: { ...EXTERNAL_LOCAL_PLACEMENT, recoveryState: 'unavailable' as const } }
+    store.workspaceResourceId = unavailable.id
+    mocks.workspaceResource.mockResolvedValue({ resource: unavailable, ancestors: [ROOT], source: { ...PROVIDER_COMPLETE, completeness: 'partial', error: 'provider offline' } })
+    mocks.workspaceBrowse.mockResolvedValue({ container: unavailable, items: [], nextCursor: null, hasMore: false, completeness: 'partial', sources: [{ ...PROVIDER_COMPLETE, completeness: 'unavailable', error: 'provider offline' }] })
+    render(<WorkspaceExplorer />)
+
+    const button = await screen.findByRole('button', { name: 'New canvas here' })
+    expect(button).toBeDisabled()
+    expect(button).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
+    expect(screen.getByText('This source-only provider location is empty.')).toBeVisible()
+  })
+
   it('explores a stable dataset in a new canvas at its visible container', async () => {
     store.workspaceResourceId = DATASET.id
     mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
@@ -288,6 +350,29 @@ describe('WorkspaceExplorer', () => {
     }))
   })
 
+  it('moves a Canvas into an external local overlay and uses its local destination again for undo', async () => {
+    mocks.workspaceBrowse.mockImplementation((containerId: string) => Promise.resolve(containerId === 'external.mount-folder'
+      ? { container: EXTERNAL_FOLDER, items: [], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }
+      : { container: ROOT, items: [EXTERNAL_FOLDER, CANVAS], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] }))
+    mocks.workspaceMoveCanvas
+      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, parentId: EXTERNAL_FOLDER.id, version: 4 }, previousContainer: ROOT, container: EXTERNAL_FOLDER })
+      .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, version: 5 }, previousContainer: EXTERNAL_FOLDER, container: ROOT })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Move canvas Analysis' }))
+    fireEvent.click(await screen.findByRole('button', { name: /Remote.*local overlay/ }))
+    const move = await screen.findByRole('button', { name: 'Move to Remote' })
+    expect(screen.getByText(/Destination:/)).toHaveTextContent('locally owned Canvas overlay')
+    fireEvent.click(move)
+    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
+      containerId: 'local-overlay-anchor', expectedContainerVersion: 7, expectedVersion: 3,
+    }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Undo move' }))
+    await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(2, 'canvas-placement', {
+      containerId: 'workspace-local-root', expectedContainerVersion: 1, expectedVersion: 4,
+    }))
+  })
+
   it('keeps an honest error and offers an explicit retry', async () => {
     mocks.workspaceBrowse.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce({ container: ROOT, items: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     render(<WorkspaceExplorer />)
@@ -344,8 +429,8 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    const archive = await screen.findByRole('button', { name: 'Open dataset observations from Mount archive · fixture' })
-    expect(screen.getByRole('button', { name: 'Open dataset observations from Mount warehouse · fixture' })).toBeVisible()
+    const archive = await screen.findByRole('button', { name: 'Open dataset observations from Source-only mount archive · fixture' })
+    expect(screen.getByRole('button', { name: 'Open dataset observations from Source-only mount warehouse · fixture' })).toBeVisible()
     fireEvent.click(archive)
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(duplicate.id)
   })
@@ -374,10 +459,9 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
-    expect(detail).toHaveTextContent('Read-only mount warehouse · fixture')
+    expect(detail).toHaveTextContent('Source-only mount warehouse · fixture')
     expect(detail).toHaveTextContent('Using the dataset creates only a local Source; it never writes to the provider')
-    expect(screen.getByRole('button', { name: 'New canvas here' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'New canvas here' })).toHaveAttribute('title', 'Read-only external mounts do not support creating canvases')
+    expect(screen.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Use in canvas' }))
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
@@ -391,6 +475,24 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('explores a provider dataset in the surrounding external local overlay without mutating the provider', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'provider-explore', created: true, resource: CANVAS })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
+    await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith(expect.objectContaining({
+      containerId: 'local-overlay-anchor', expectedContainerVersion: 7,
+      name: 'observations exploration', providerDatasetRefs: [EXTERNAL_DATASET.id], requestId: expect.any(String),
+    })))
+    expect(store.openFile).toHaveBeenCalledWith('provider-explore')
+    expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
   })
 
   it('preserves an external selection and ancestors when its refresh becomes unavailable', async () => {

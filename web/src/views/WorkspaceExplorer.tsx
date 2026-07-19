@@ -20,6 +20,41 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
 const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
+type CanvasDestination = { containerId: string; expectedContainerVersion: number; externalOverlay: boolean }
+
+// Provider containers expose a localPlacement capability rather than mutation authority.  This
+// converts it to the exact opaque local destination required by the mutation API; public provider
+// ids are deliberately never used for a Canvas create or move.
+function canvasDestination(resource: WorkspaceResource | null, action: 'create' | 'move'): CanvasDestination | null {
+  if (!resource || resource.detached) return null
+  if (!isExternal(resource)) {
+    return resource.version == null ? null : {
+      containerId: identity(resource), expectedContainerVersion: resource.version, externalOverlay: false,
+    }
+  }
+  const placement = resource.localPlacement
+  const allowed = action === 'create' ? placement?.canCreateCanvas : placement?.canMoveCanvas
+  if (!placement?.writable || !allowed || placement.recoveryState !== 'ready'
+      || !placement.containerId || placement.containerVersion == null) return null
+  return {
+    containerId: placement.containerId,
+    expectedContainerVersion: placement.containerVersion,
+    externalOverlay: true,
+  }
+}
+
+function canvasDestinationTitle(resource: WorkspaceResource | null, action: 'create' | 'move'): string {
+  if (!resource) return 'Load a Workspace destination first'
+  if (resource.detached) return 'Deleted Catalog folder tombstones do not accept new canvases'
+  if (!isExternal(resource)) return resource.version == null ? 'Load an exact Workspace destination first' : `Create in ${resource.name}`
+  if (canvasDestination(resource, action)) return `Create a locally owned Canvas beside ${resource.name}`
+  if (resource.localPlacement?.recoveryState === 'unavailable') return 'The local Canvas overlay is unavailable; retry after this source recovers'
+  return 'This source-only provider location has no writable local Canvas overlay'
+}
+
+function newRequestId(): string {
+  return globalThis.crypto.randomUUID()
+}
 const statusMessage = (status: WorkspaceSourceStatus) => status.error
   ?? (status.completeness === 'unavailable' ? 'source is offline'
     : status.completeness === 'unsupported' ? 'browse is not supported'
@@ -269,12 +304,13 @@ function WorkspaceMixedExplorer() {
   // retries the same deep link rather than silently falling back to a different container.
   const reload = () => setRevision((current) => current + 1)
   const undoLastMove = async () => {
-    if (!undoMove?.resource.placementId || undoMove.resource.version == null || undoMove.previousContainer.version == null) return
+    const destination = canvasDestination(undoMove?.previousContainer ?? null, 'move')
+    if (!undoMove?.resource.placementId || undoMove.resource.version == null || !destination) return
     setUndoBusy(true)
     try {
       await api.workspaceMoveCanvas(undoMove.resource.placementId, {
-        containerId: identity(undoMove.previousContainer),
-        expectedContainerVersion: undoMove.previousContainer.version,
+        containerId: destination.containerId,
+        expectedContainerVersion: destination.expectedContainerVersion,
         expectedVersion: undoMove.resource.version,
       })
       setUndoMove(null)
@@ -310,10 +346,8 @@ function WorkspaceMixedExplorer() {
           }}><Icon name="close" size={12} /></button>}
         </form>
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
-          <button onClick={() => setCreateOpen(true)} disabled={!container || container.version == null || loading || isExternal(container) || container.detached}
-            title={isExternal(container) ? 'Read-only external mounts do not support creating canvases'
-              : container?.detached ? 'Deleted Catalog folder tombstones do not accept new canvases'
-              : container ? `Create in ${container.name}` : 'Load a Workspace destination first'}
+          <button onClick={() => setCreateOpen(true)} disabled={!canvasDestination(container, 'create') || loading}
+            title={canvasDestinationTitle(container, 'create')}
             className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New canvas here</button>
         </div>
         <button onClick={reload} disabled={loading || loadingMore} data-testid="workspace-reload" className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
@@ -348,7 +382,9 @@ function WorkspaceMixedExplorer() {
           </button>}
         </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
           ? 'This Workspace location is unavailable.'
-          : isExternal(container) ? 'This read-only external location is empty.'
+          : isExternal(container) ? canvasDestination(container, 'create')
+            ? 'This source-only provider location is empty. Create a locally owned Canvas here to get started.'
+            : 'This source-only provider location is empty.'
             : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
       </div>
 
@@ -363,7 +399,7 @@ function WorkspaceMixedExplorer() {
       }} />}
       {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} onUse={() => setProviderDatasetAction(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
-      {createOpen && container?.version != null && <NewCanvasDialog container={container} onClose={() => setCreateOpen(false)}
+      {createOpen && canvasDestination(container, 'create') && <NewCanvasDialog container={container!} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
         files={files} onClose={() => setDatasetAction(null)}
@@ -609,19 +645,28 @@ function NewCanvasDialog({ container, onClose, onCreated }: {
   const [name, setName] = useState('untitled')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const replay = useRef<{ intent: string; requestId: string } | null>(null)
   const submit = async () => {
-    if (!name.trim() || container.version == null || busy) return
+    const destination = canvasDestination(container, 'create')
+    if (!name.trim() || !destination || busy) return
     setBusy(true); setError(null)
     try {
+      const intent = JSON.stringify({ containerId: destination.containerId,
+        expectedContainerVersion: destination.expectedContainerVersion, name: name.trim() })
+      if (destination.externalOverlay && replay.current?.intent !== intent) {
+        replay.current = { intent, requestId: newRequestId() }
+      }
       const created = await api.workspaceCreateCanvas({
-        containerId: identity(container), expectedContainerVersion: container.version, name: name.trim(),
+        containerId: destination.containerId, expectedContainerVersion: destination.expectedContainerVersion,
+        name: name.trim(), ...(destination.externalOverlay ? { requestId: replay.current!.requestId } : {}),
       })
       onCreated(created.id)
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
   return <Modal label="New canvas here" onClose={onClose}>
-    <p className="text-[12px] text-muted-foreground">Destination: <strong className="text-foreground">{container.name}</strong></p>
+    <p className="text-[12px] text-muted-foreground">Destination: <strong className="text-foreground">{container.name}</strong>{isExternal(container) && <span> · locally owned Canvas overlay</span>}</p>
+    {isExternal(container) && <p className="text-[11px] leading-5 text-muted-foreground">This creates a local Canvas beside a source-only provider resource. It never changes the provider.</p>}
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
       <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
@@ -719,8 +764,8 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
       const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
       if (!page.container) throw new Error(page.sources.map(statusMessage).find(Boolean) ?? 'Workspace destination is unavailable')
       setContainer(page.container)
-      const localContainers = page.items.filter((item) => item.kind === 'container' && !isExternal(item) && !item.detached)
-      setChildren((current) => nextCursor ? [...current, ...localContainers] : localContainers)
+      const destinations = page.items.filter((item) => item.kind === 'container' && !!canvasDestination(item, 'move'))
+      setChildren((current) => nextCursor ? [...current, ...destinations] : destinations)
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
       if (!nextCursor) setPath(nextPath ?? [page.container])
     } catch (caught) { setError(errorMessage(caught)) }
@@ -728,11 +773,12 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
   }, [])
   useEffect(() => { void load(LOCAL_ROOT_ID) }, [load])
   const move = async () => {
-    if (!resource.placementId || resource.version == null || !container || container.version == null || busy) return
+    const destination = canvasDestination(container, 'move')
+    if (!resource.placementId || resource.version == null || !destination || busy) return
     setBusy(true); setError(null)
     try {
       onMoved(await api.workspaceMoveCanvas(resource.placementId, {
-        containerId: identity(container), expectedContainerVersion: container.version,
+        containerId: destination.containerId, expectedContainerVersion: destination.expectedContainerVersion,
         expectedVersion: resource.version,
       }))
     } catch (caught) { setError(errorMessage(caught)) }
@@ -745,14 +791,14 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
     </nav>
     <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border p-1">
       {loading && !children.length ? <div className="p-3 text-[11px] text-muted-foreground">Loading containers…</div> : children.map((child) => <button key={child.id} onClick={() => void load(identity(child), null, [...path, child])}
-        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent"><Icon name="chevronRight" size={12} /> {child.name}</button>)}
+        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent"><Icon name="chevronRight" size={12} /> <span className="min-w-0 flex-1 truncate">{child.name}</span>{isExternal(child) && <span className="text-[10px] text-muted-foreground">local overlay</span>}</button>)}
       {!loading && !children.length && <div className="p-3 text-[11px] text-muted-foreground">No child containers.</div>}
       {hasMore && <button onClick={() => void load(identity(container!), cursor)} disabled={loading} className="p-2 text-[11px] font-semibold text-primary">Load more containers</button>}
     </div>
-    {container && <p className="text-[12px]">Destination: <strong>{container.name}</strong></p>}
+    {container && <p className="text-[12px]">Destination: <strong>{container.name}</strong>{isExternal(container) && ' · locally owned Canvas overlay'}</p>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
-      <button onClick={() => void move()} disabled={busy || !container || container.detached || container.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
+      <button onClick={() => void move()} disabled={busy || !canvasDestination(container, 'move') || container?.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
   </Modal>
 }
 
@@ -768,7 +814,7 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
 function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? (isCatalogFolder(resource) ? 'Catalog folder' : 'Container') : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
-  const source = isExternal(resource) ? `Mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
+  const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
     : isCatalogFolder(resource) ? 'Local Catalog projection'
       : resource.kind === 'dataset' ? 'Local Catalog'
         : resource.kind === 'dataset_view' ? 'Local exact view'
@@ -795,7 +841,7 @@ function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink, o
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
       <div className="mt-5 grid gap-3 text-[12px]">
-        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Read-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
+        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Stable identity</div><div className="break-all font-mono text-[11px]">{resource.id}</div></div>
         {resource.resourceId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Provider resource</div><div className="break-all font-mono text-[11px]">{resource.resourceId}</div></div>}
         {(resource.lastKnown || resource.referenceState && resource.referenceState !== 'current') && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
@@ -805,7 +851,7 @@ function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink, o
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
       </div>
       <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
-        This mount is read-only. Using the dataset creates only a local Source; it never writes to the provider.
+        This provider resource is source-only. Using the dataset creates only a local Source; it never writes to the provider.
         <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown}
           className="mt-3 block w-full rounded-md bg-foreground px-3 py-2 font-semibold text-background disabled:opacity-50">Use in canvas</button>
       </div>
@@ -823,16 +869,24 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const replay = useRef<{ intent: string; requestId: string } | null>(null)
   const submit = async () => {
     if (busy) return
     setBusy(true); setError(null)
     try {
       if (mode === 'explore') {
-        if (!container || container.version == null) throw new Error('Load an exact local Workspace destination first')
+        const destination = canvasDestination(container, 'create')
+        if (!destination) throw new Error('Load an exact writable local Canvas destination first')
         if (!name.trim()) return
+        const intent = JSON.stringify({ containerId: destination.containerId,
+          expectedContainerVersion: destination.expectedContainerVersion, name: name.trim(), providerDatasetRefs: [resource.id] })
+        if (destination.externalOverlay && replay.current?.intent !== intent) {
+          replay.current = { intent, requestId: newRequestId() }
+        }
         const created = await api.workspaceCreateCanvas({
-          containerId: identity(container), expectedContainerVersion: container.version,
+          containerId: destination.containerId, expectedContainerVersion: destination.expectedContainerVersion,
           name: name.trim(), providerDatasetRefs: [resource.id],
+          ...(destination.externalOverlay ? { requestId: replay.current!.requestId } : {}),
         })
         onOpened(created.id)
       } else {
@@ -847,7 +901,7 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
     finally { setBusy(false) }
   }
   return <Modal label={`Use ${resource.name}`} onClose={onClose}>
-    <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated.</p>
+    <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated. {isExternal(container) && canvasDestination(container, 'create') && 'The new Canvas is a locally owned overlay beside this source-only provider resource.'}</p>
     <div className="grid grid-cols-2 gap-2">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in new canvas</span></button>
       <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to canvas</span></button>

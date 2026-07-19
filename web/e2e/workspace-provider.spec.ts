@@ -20,21 +20,30 @@ test.describe('provider Workspace Source acceptance', () => {
     }] }))
   })
 
-  test('uses, previews, runs, and inspects an exact provider Source in Chromium', async ({ page }) => {
+  test('creates a local Canvas overlay, then uses, previews, runs, and inspects an exact provider Source in Chromium', async ({ page }) => {
     test.setTimeout(60_000)
     await page.goto('/#/workspace')
     const resource = page.getByRole('button', {
-      name: new RegExp(`Open dataset ${datasetName} from Mount browser-provider`),
+      name: new RegExp(`Open dataset ${datasetName} from Source-only mount browser-provider`),
     })
     await expect(resource).toBeVisible({ timeout: 20_000 })
     await resource.click()
     const detail = page.getByRole('dialog', { name: datasetName })
-    await expect(detail).toContainText('Read-only mount browser-provider · dp-file-catalog')
+    await expect(detail).toContainText('Source-only mount browser-provider · dp-file-catalog')
     await detail.getByRole('button', { name: 'Use in canvas' }).click()
 
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetName}` })
     await expect(useDialog).toContainText('data and credentials are not copied')
+    await expect(useDialog).toContainText('locally owned overlay')
+    const createRequest = page.waitForRequest((request) =>
+      request.url().endsWith('/api/workspace/canvases') && request.method() === 'POST')
     await useDialog.getByRole('button', { name: 'Create and open' }).click()
+    const createBody = JSON.parse((await createRequest).postData() ?? '{}') as {
+      containerId?: string; requestId?: string; providerDatasetRefs?: string[]
+    }
+    expect(createBody.requestId).toEqual(expect.any(String))
+    expect(createBody.containerId).not.toBe('browser-observations')
+    expect(createBody.providerDatasetRefs).toHaveLength(1)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     const source = page.locator('.react-flow__node').filter({ hasText: datasetName })
     await expect(source).toHaveCount(1)
