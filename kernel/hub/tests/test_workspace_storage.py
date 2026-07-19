@@ -1036,7 +1036,12 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
     root = metadb.local_workspace_root()
     provider = _WorkspaceFixtureProvider()
     mount_id = f"overlay-{uuid.uuid4().hex}"
-    resources = [CatalogResource(id="container-a", kind="container", name="Provider folder")]
+    resources = [
+        CatalogResource(id="container-a", kind="container", name="Provider folder"),
+        CatalogResource(
+            id="provider-child", kind="dataset", name="Provider child", parent_id="container-a",
+            uri="file:///provider-child.parquet"),
+    ]
     monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
@@ -1149,7 +1154,76 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert hidden_search.status_code == 200, hidden_search.text
             assert all(item["id"] != f"canvas:{created_doc['id']}"
                        for group in hidden_search.json()["groups"] for item in group["items"])
-            assert client.get(f"/api/workspace/resources/canvas:{created_doc['id']}").status_code == 404
+            deep_link = client.get(f"/api/workspace/resources/canvas:{created_doc['id']}")
+            assert deep_link.status_code == 200, deep_link.text
+            assert deep_link.json()["resource"]["parentId"] == remote["id"]
+            assert deep_link.json()["ancestors"][-1]["id"] == remote["id"]
+
+            second = client.post("/api/workspace/canvases", json={
+                **create_body, "requestId": str(uuid.uuid4()), "name": "Second local overlay canvas",
+            })
+            assert second.status_code == 200, second.text
+            created_ids.append(second.json()["id"])
+
+            # The public external container owns a bounded, source-aware local-overlay-first page.
+            # Local Canvas placements and provider children are neither duplicated nor omitted.
+            composed_ids: list[str] = []
+            remote_container_id = remote["id"].removeprefix("container:")
+            composed = client.get(f"/api/workspace/containers/{remote_container_id}", params={"limit": 1})
+            assert composed.status_code == 200, composed.text
+            first_composed = composed.json()
+            assert first_composed["sources"][0]["id"] == "local"
+            assert first_composed["sources"][0]["completeness"] == "page"
+            assert first_composed["items"][0]["id"] == f"canvas:{created_doc['id']}"
+            cursor = first_composed["nextCursor"]
+            while cursor:
+                composed_ids.extend(item["id"] for item in composed.json()["items"])
+                composed = client.get(f"/api/workspace/containers/{remote_container_id}", params={
+                    "limit": 1, "cursor": cursor,
+                })
+                assert composed.status_code == 200, composed.text
+                cursor = composed.json()["nextCursor"]
+            composed_ids.extend(item["id"] for item in composed.json()["items"])
+            assert composed_ids == [
+                f"canvas:{created_doc['id']}", f"canvas:{second.json()['id']}",
+                f"canvas:{workspace_scope['canvas_id']}",
+                next(item["id"] for item in composed.json()["items"] if item["resourceId"] == "provider-child"),
+            ]
+            mismatched_cursor = client.get(f"/api/workspace/containers/{root['id']}", params={
+                "limit": 1, "cursor": first_composed["nextCursor"],
+            })
+            assert mismatched_cursor.status_code == 422
+
+            # A provider failure or a removed mount never hides the locally owned overlay page or
+            # Canvas deep link.  The provider source remains explicitly partial/unavailable.
+            normal_resolve = provider.resolve
+            monkeypatch.setattr(provider, "resolve", lambda _mount, _resource_id: ProviderResourceResult(
+                state="unavailable", reason="access revoked", failure="permission_lost"))
+            unavailable_page = client.get(
+                f"/api/workspace/containers/{remote_container_id}", params={"limit": 10})
+            assert unavailable_page.status_code == 200, unavailable_page.text
+            assert {item["id"] for item in unavailable_page.json()["items"]} == {
+                f"canvas:{created_doc['id']}", f"canvas:{second.json()['id']}",
+                f"canvas:{workspace_scope['canvas_id']}",
+            }
+            assert unavailable_page.json()["completeness"] == "partial"
+            assert unavailable_page.json()["sources"][1]["referenceState"] == "permission_lost"
+            assert client.get(f"/api/workspace/resources/canvas:{created_doc['id']}").status_code == 200
+            monkeypatch.setattr(provider, "resolve", normal_resolve)
+            assert client.get(f"/api/workspace/containers/{remote_container_id}").status_code == 200
+
+            monkeypatch.delenv("DP_CATALOG_MOUNTS")
+            removed_mount = client.get(f"/api/workspace/containers/{remote_container_id}")
+            assert removed_mount.status_code == 200, removed_mount.text
+            assert {item["id"] for item in removed_mount.json()["items"]} == {
+                f"canvas:{created_doc['id']}", f"canvas:{second.json()['id']}",
+                f"canvas:{workspace_scope['canvas_id']}",
+            }
+            assert removed_mount.json()["sources"][1]["kind"] == "configuration"
+            assert client.get(f"/api/workspace/resources/canvas:{created_doc['id']}").status_code == 200
+            monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+                "id": mount_id, "provider": "fixture", "containerId": root["id"],
+            }]))
             replay = client.post("/api/workspace/canvases", json=create_body)
             assert replay.status_code == 200, replay.text
             assert replay.json() == created_doc
@@ -1260,12 +1334,19 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             metadb.engine().dispose()
             assert metadb.workspace_provider_overlay_anchor(remote["bindingId"])["containerId"] == anchor_id
             assert client.get(f"/api/canvas/{created_doc['id']}").status_code == 200
+            renamed_deep_link = client.get(f"/api/workspace/resources/canvas:{created_doc['id']}")
+            assert renamed_deep_link.status_code == 200, renamed_deep_link.text
+            assert renamed_deep_link.json()["ancestors"][-1]["name"] == "Renamed folder"
 
             # A delete/recreate with the same provider ID is terminally detached until explicit relink.
             resources[:] = []
             detached = client.get(f"/api/workspace/resources/{remote['id']}")
             assert detached.status_code == 200, detached.text
             assert detached.json()["resource"]["referenceState"] == "detached"
+            detached_deep_link = client.get(f"/api/workspace/resources/canvas:{created_doc['id']}")
+            assert detached_deep_link.status_code == 200, detached_deep_link.text
+            assert detached_deep_link.json()["resource"]["parentId"] == remote["id"]
+            assert detached_deep_link.json()["source"]["referenceState"] == "detached"
             resources[:] = [CatalogResource(id="container-a", kind="container", name="Recreated folder")]
             still_detached = client.get(f"/api/workspace/resources/{remote['id']}")
             assert still_detached.json()["resource"]["referenceState"] == "detached"

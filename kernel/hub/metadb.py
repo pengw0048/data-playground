@@ -5398,6 +5398,88 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         }
 
 
+def workspace_provider_overlay_browse(
+        binding_id: str, *, uid: str, limit: int = 50, cursor: str | None = None,
+) -> dict:
+    """Page Canvas placements at one external binding's hidden local overlay.
+
+    This is deliberately separate from :func:`workspace_browse`: ordinary local navigation and
+    search must not discover anchors or the Canvases placed there.  The returned placement parent
+    is nevertheless the public external container, never the hidden local anchor ID.
+    """
+    limit = max(1, min(int(limit), _WORKSPACE_BROWSE_MAX_LIMIT))
+    decoded = _workspace_cursor_decode(cursor)
+    with session() as s:
+        anchor = s.get(WorkspaceExternalOverlayAnchor, binding_id)
+        if anchor is None:
+            raise KeyError("Workspace provider overlay anchor not found")
+        container = s.get(WorkspaceContainer, anchor.container_id)
+        if container is None or s.get(WorkspaceProviderBinding, binding_id) is None:  # pragma: no cover - FK-protected invariant
+            raise RuntimeError("Workspace provider overlay binding is incomplete")
+        visible_or_missing_canvas = or_(
+            ~_workspace_canvas_exists_clause(), _workspace_canvas_visible_clause(uid))
+        after = _workspace_after(
+            WorkspacePlacement.ordinal, WorkspacePlacement.name, WorkspacePlacement.id, 1, decoded)
+        placements = list(s.scalars(select(WorkspacePlacement).where(
+            WorkspacePlacement.container_id == container.id,
+            WorkspacePlacement.target_kind == "canvas", visible_or_missing_canvas,
+            *([after] if after is not None else []),
+        ).order_by(
+            WorkspacePlacement.ordinal,
+            _workspace_name_order(WorkspacePlacement.name),
+            WorkspacePlacement.id,
+        ).limit(limit + 1)))
+        page = placements[:limit]
+        has_more = len(placements) > limit
+        next_cursor = (
+            _workspace_cursor_encode(page[-1].ordinal, 1, page[-1].name, page[-1].id)
+            if has_more and page else None
+        )
+        return {
+            "items": [
+                _workspace_public_placement_resource(
+                    s, row, detached=s.get(Canvas, row.target_id) is None)
+                for row in page
+            ],
+            "nextCursor": next_cursor,
+            "hasMore": has_more,
+        }
+
+
+def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
+    """Resolve a Canvas hidden from local navigation through its external overlay binding."""
+    try:
+        kind, identity = resource_id.split(":", 1)
+    except ValueError as exc:
+        raise KeyError("invalid Workspace resource reference") from exc
+    if kind != "canvas" or not identity:
+        raise KeyError(f"Workspace resource '{resource_id}' not found")
+    with session() as s:
+        placement = s.scalar(select(WorkspacePlacement).join(
+            WorkspaceExternalOverlayAnchor,
+            WorkspaceExternalOverlayAnchor.container_id == WorkspacePlacement.container_id,
+        ).where(
+            WorkspacePlacement.target_kind == "canvas",
+            WorkspacePlacement.target_id == identity,
+        ))
+        if placement is None:
+            raise KeyError(f"Workspace resource '{resource_id}' not found")
+        if s.get(Canvas, identity) is not None and canvas_role(identity, uid) is None:
+            raise KeyError(f"Workspace resource '{resource_id}' not found")
+        anchor = s.scalar(select(WorkspaceExternalOverlayAnchor).where(
+            WorkspaceExternalOverlayAnchor.container_id == placement.container_id))
+        if anchor is None:  # pragma: no cover - join above guarantees it
+            raise RuntimeError("Workspace provider overlay anchor is missing")
+        binding = s.get(WorkspaceProviderBinding, anchor.binding_id)
+        if binding is None:  # pragma: no cover - FK-protected invariant
+            raise RuntimeError("Workspace provider overlay binding is missing")
+        return {
+            "resource": _workspace_public_placement_resource(
+                s, placement, detached=s.get(Canvas, identity) is None),
+            "binding": _workspace_provider_binding_doc(binding),
+        }
+
+
 def workspace_search(query: str, *, uid: str, limit: int = 25,
                      cursor: str | None = None) -> dict:
     """Search current local Workspace metadata without materializing the complete catalog."""
