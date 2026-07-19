@@ -345,6 +345,18 @@ class DatasetRevisionAdapter(Protocol):
 
 
 @runtime_checkable
+class DatasetRevisionPreviewAdapter(Protocol):
+    """Optional source-bounded preview read for one immutable adapter revision.
+
+    ``open_revision`` is intentionally not a preview fallback: it may construct an unbounded provider
+    read before a relation-level ``LIMIT`` is applied. An adapter that cannot enforce this limit before
+    provider work begins omits this capability, and exact Source preview fails closed.
+    """
+
+    def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation: ...
+
+
+@runtime_checkable
 class CatalogProvider(Protocol):
     """The dataset catalog — browse/search/resolve/lineage + write-back, built to scale to thousands of
     tables. Swap the WHOLE provider via `reg.set_catalog(obj)` to back it with an external metadata

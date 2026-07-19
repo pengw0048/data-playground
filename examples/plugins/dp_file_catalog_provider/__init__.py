@@ -136,6 +136,13 @@ class FileCatalogDatasetAdapter(_FileCatalogReadAdapter):
             raise RevisionUnavailable("revision_unavailable")
         return self.scan(uri)
 
+    def preview_revision(self, uri: str, revision_id: str, *, limit: int):
+        """Enforce the preview cap before opening this provider-owned immutable binding."""
+        path, bound_revision = _dataset_binding(uri)
+        if bound_revision != revision_id or not path.is_file():
+            raise RevisionUnavailable("revision_unavailable")
+        return self.preview_scan(uri, limit=int(limit))
+
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         relation = self.open_revision(uri, revision_id)
         bounded = max(1, min(int(preview_limit), 100))

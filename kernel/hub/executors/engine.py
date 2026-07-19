@@ -620,20 +620,29 @@ class BuildEngine:
                 except ValueError as exc:
                     raise NotPreviewable(node, "selected revision reference is invalid") from exc
                 open_revision = getattr(revision_adapter, "open_revision", None)
+                preview_revision = getattr(revision_adapter, "preview_revision", None)
                 if ((provider_dataset_id is None and binding is None)
                         or (provider_dataset_id if provider_dataset_id is not None
                             else str(binding.get("dataset_id") or "")) != dataset_id
                         or not callable(open_revision)):
                     raise NotPreviewable(node, "selected revision is unavailable; choose another revision or follow latest")
                 try:
-                    exact = open_revision(uri, revision_id)
                     if self.schema_only:
-                        return exact.limit(0)
-                    # Keep the existing interactive preview work bound. Exact open fixes identity; it
-                    # must not accidentally turn a downstream preview into an unbounded source scan.
+                        return open_revision(uri, revision_id).limit(0)
+                    # An exact revision identity is not by itself a bounded preview claim. The adapter
+                    # must receive the hard source cap before it opens/scans the provider revision.
                     if self.sample_k is not None and not self.full and not self.reservoir_preview:
-                        return exact.limit(self.sample_k)
-                    return exact
+                        if not callable(preview_revision):
+                            raise NotPreviewable(
+                                node, f"source adapter '{getattr(revision_adapter, 'name', type(revision_adapter).__name__)}' "
+                                "does not guarantee a bounded exact-revision preview — needs a full pass",
+                            )
+                        # The adapter-side bound is the contract. Keep this outer cap as defense in
+                        # depth for a malformed adapter response, never as evidence of bounded work.
+                        return preview_revision(uri, revision_id, limit=self.sample_k).limit(self.sample_k)
+                    return open_revision(uri, revision_id)
+                except NotPreviewable:
+                    raise
                 except Exception as exc:
                     raise NotPreviewable(
                         node, "selected revision is unavailable; choose another revision or follow latest") from exc
@@ -674,6 +683,14 @@ class BuildEngine:
                 if not callable(open_revision):
                     raise NotPreviewable(node, "persisted input revision is unavailable")
                 try:
+                    preview_limit = cfg.get("_input_preview_limit")
+                    if preview_limit is not None:
+                        preview_revision = getattr(revision_adapter, "preview_revision", None)
+                        if not callable(preview_revision):
+                            raise NotPreviewable(
+                                node, "persisted input revision has no bounded preview capability")
+                        return preview_revision(uri, str(revision_id), limit=int(preview_limit)).limit(
+                            int(preview_limit))
                     return open_revision(uri, str(revision_id))
                 except Exception as exc:  # provider retention/removal must never fall back to head
                     raise NotPreviewable(node, "persisted input revision is unavailable") from exc

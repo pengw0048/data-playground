@@ -32,7 +32,7 @@ from hub.backends import (
 )
 from hub.deps import get_deps
 from hub.executors.engine import declared_schema
-from hub.executors.preview import preview_node
+from hub.executors.preview import PREVIEW_SCAN, preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
 from hub.execution_manifest import (
@@ -410,6 +410,7 @@ def _source_supports_automatic_local_admission(node, deps) -> bool:
 def _resolve_local_run_manifest(
         graph, target_node_id: str | None, deps, *, materialize_local_files: bool = False,
         local_file_candidates: list[dict[str, str]] | None = None,
+        preview_limit: int | None = None,
         ) -> list[dict[str, str]]:
     """Resolve every local-run Source once through its registered exact-revision provider."""
     resolved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -484,7 +485,14 @@ def _resolve_local_run_manifest(
                 if current_dataset_id != dataset_id:
                     raise ValueError("selected dataset identity does not match the current registration")
                 with db.base_guard():
-                    adapter.open_revision(uri, revision_id)
+                    if preview_limit is None:
+                        adapter.open_revision(uri, revision_id)
+                    else:
+                        preview_revision = getattr(adapter, "preview_revision", None)
+                        if not callable(preview_revision):
+                            raise LocalRunInputError(
+                                "exact input revision has no bounded preview capability")
+                        preview_revision(uri, revision_id, limit=preview_limit)
                 provider = str(getattr(adapter, "name", "") or "")
             else:
                 resolved = adapter.resolve_revision(uri)
@@ -521,12 +529,14 @@ def _resolve_local_run_manifest(
 
 
 def _bind_local_run_manifest(
-        graph, manifest: list[dict[str, str]], deps, target_node_id: str | None = None):
+        graph, manifest: list[dict[str, str]], deps, target_node_id: str | None = None,
+        *, preview_limit: int | None = None):
     """Reopen persisted exact bindings and attach them only to the dispatch copy of a graph."""
     from hub.local_run_inputs import LocalRunInputError, bind_manifest
 
     try:
-        return bind_manifest(graph, target_node_id, manifest, deps.resolve_adapter)
+        return bind_manifest(
+            graph, target_node_id, manifest, deps.resolve_adapter, preview_limit=preview_limit)
     except (PermissionError, RevisionPermissionLost) as exc:
         raise APIError(
             403, "permission to read an exact input revision was lost",
@@ -1280,8 +1290,10 @@ def run_preview(req: PreviewRequest, uid: str = Depends(current_user)) -> Sample
         if req.input_manifest is not None:
             manifest = req.input_manifest
         else:
-            manifest = _resolve_local_run_manifest(req.graph, req.node_id, deps)
-        preview_graph = _bind_local_run_manifest(req.graph, manifest, deps, req.node_id)
+            manifest = _resolve_local_run_manifest(
+                req.graph, req.node_id, deps, preview_limit=PREVIEW_SCAN)
+        preview_graph = _bind_local_run_manifest(
+            req.graph, manifest, deps, req.node_id, preview_limit=PREVIEW_SCAN)
     except APIError:
         if req.input_manifest is not None or pinned:
             return SampleResult(

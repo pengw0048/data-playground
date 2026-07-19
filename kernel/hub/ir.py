@@ -181,6 +181,8 @@ def resolve_config(node: GraphNode) -> dict:
         # without exposing a client-side Source configuration surface.
         if isinstance(cfg.get("_input_revision_id"), str) and cfg["_input_revision_id"]:
             c["_input_revision_id"] = cfg["_input_revision_id"]
+        if isinstance(cfg.get("_input_preview_limit"), int) and cfg["_input_preview_limit"] > 0:
+            c["_input_preview_limit"] = cfg["_input_preview_limit"]
         if isinstance(cfg.get("_input_artifact_uri"), str) and cfg["_input_artifact_uri"]:
             c["_input_artifact_uri"] = cfg["_input_artifact_uri"]
         if isinstance(cfg.get("_input_provider_uri"), str) and cfg["_input_provider_uri"]:

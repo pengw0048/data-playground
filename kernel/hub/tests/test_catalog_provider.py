@@ -286,12 +286,35 @@ with TestClient(app) as client:
     assert os.environ["DP_CATALOG_MOUNTS"] not in json.dumps(graph)
     assert str(Path(os.environ["DP_WORKSPACE"]).parent / "catalog") not in json.dumps(graph)
 
+    from hub.deps import get_deps
+    physical = get_deps().resolve_adapter(config["uri"])
+    exact_adapter = physical.adapter
+    preview_calls = []
+    original_preview = exact_adapter.preview_revision
+    original_open = exact_adapter.open_revision
+
+    def record_preview(uri, revision_id, *, limit):
+        preview_calls.append((uri, revision_id, limit))
+        return original_preview(uri, revision_id, limit=limit)
+
+    def full_open_is_a_bug(*_args, **_kwargs):
+        raise AssertionError("exact preview called the full-run revision path")
+
+    exact_adapter.preview_revision = record_preview
+    exact_adapter.open_revision = full_open_is_a_bug
+
     preview = client.post("/api/run/preview", json={
         "graph": graph, "nodeId": source["id"], "k": 10,
     })
+    exact_adapter.open_revision = original_open
     assert preview.status_code == 200, preview.text
     preview_body = preview.json()
     assert preview_body["rows"] == [{"id": 1}, {"id": 2}]
+    assert preview_calls == [
+        (physical.physical_uri, "provider-dataset-a-v1", 2000),
+        (physical.physical_uri, "provider-dataset-a-v1", 2000),
+        (physical.physical_uri, "provider-dataset-a-v1", 2000),
+    ]
     inputs = preview_body["inputManifest"]
     assert len(inputs) == 1
     assert inputs[0]["revision_id"] == "provider-dataset-a-v1"
