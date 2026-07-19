@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import sys
 import threading
@@ -147,6 +148,8 @@ def core_view_factory(tmp_path):
         )
         assert created is True
         create.storage = storage
+        create.catalog = catalog
+        create.logical_uri = logical_uri
         return stored
 
     yield create
@@ -778,24 +781,6 @@ def test_ephemeral_compare_never_invents_incompatible_deltas(core_view_factory):
     assert categories["b"]["countDelta"] is None
     assert categories["b"]["reason"] == "outside_right_top_k"
 
-    attempt = claim["task"]["attempts"][-1]
-    completed = distribution_reports.complete_distribution_report(
-        task_id=claim["task"]["id"], attempt_id=attempt["id"],
-        owner_token="compare-owner", report=base.model_dump(by_alias=True, mode="json"))
-    assert completed is not None
-    other = f"compare-other-{uuid.uuid4().hex}"
-    with metadb.session() as session:
-        session.add(metadb.User(id=other, name="Other"))
-    request = {"leftReportId": base.report_id, "rightReportId": base.report_id}
-    with TestClient(app) as client:
-        compared = client.post("/api/distribution-reports/compare", json=request)
-        assert compared.status_code == 200, compared.text
-        assert compared.json()["coverage"]["reason"] == "compatible_full_coverage"
-        assert client.post(
-            "/api/distribution-reports/compare", json=request,
-            headers={"X-DP-User": other},
-        ).status_code == 404
-
 
 def test_retained_revision_field_identity_matches_a_real_cross_revision_rename(
     tmp_path, monkeypatch,
@@ -869,6 +854,395 @@ def test_retained_revision_field_identity_matches_a_real_cross_revision_rename(
             by_alias=True)["meanDelta"] == 0
     finally:
         storage.close()
+
+
+def test_bucket_drill_down_replays_exact_reservoir_and_is_owner_bounded(
+    core_view_factory, monkeypatch,
+):
+    values = list(range(200))
+    view = core_view_factory(
+        {
+            "value": values,
+            "constant": [1] * len(values),
+            "nested": [[b"\x00", b"\xff"] for _value in values],
+            "category": ["'; DROP VIEW distribution_report_bucket; --" if index % 2 else "safe"
+                         for index in values],
+            "observed_at": [datetime.datetime(2025, 1, 1) + datetime.timedelta(days=index)
+                            for index in values],
+        },
+        sampling={"kind": "reservoir", "size": 125, "seed": 42},
+    )
+    other = f"drill-other-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=other, name="Other"))
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    completed = _complete_computed_report(view)
+    report_id = completed["report_id"]
+    document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+        json.dumps(completed["report"]))
+    numeric = next(
+        section for section in document.sections
+        if section.kind == "numeric" and section.column_name == "constant")
+    bucket = next(item for item in numeric.histogram if item.count > 0)
+    categorical = next(
+        section for section in document.sections
+        if section.kind == "categorical" and section.column_name == "category")
+    injected_category = next(item for item in categorical.top if item.label != "safe")
+    temporal = next(section for section in document.sections if section.kind == "temporal")
+    temporal_bucket = next(item for item in temporal.buckets if item.count > 0)
+
+    storage = getattr(core_view_factory, "storage")
+    moved_run = uuid.uuid4().hex
+    moved_artifact = storage.begin_result(
+        f"managed-file:{getattr(core_view_factory, 'logical_uri')}", moved_run)
+    pq.write_table(pa.table({
+        "value": list(range(1_000, 1_200)),
+        "constant": [9] * 200,
+        "nested": [[b"new-head"]] * 200,
+        "category": ["new-head"] * 200,
+        "observed_at": [datetime.datetime(2030, 1, 1)] * 200,
+    }), moved_artifact)
+    storage.commit_result(moved_artifact, moved_run)
+    moved = getattr(core_view_factory, "catalog").publish_managed_local_file_output(
+        name="moved-report-head",
+        logical_uri=getattr(core_view_factory, "logical_uri"),
+        artifact_uri=moved_artifact,
+    )
+    assert moved["revision_id"] != document.revision_id
+    assert storage.release_result(moved_artifact, moved_run) is True
+
+    definition = DatasetViewDefinitionV1.model_validate(view)
+    with dataset_view_routes._open_exact(
+        definition.dataset_ref, operation="test-drill-membership",
+    ) as source:
+        sampled = dataset_view_routes._defined_relation(source, definition)
+        sample_values = set(sampled.project('"value"').to_arrow_table()["value"].to_pylist())
+
+    with TestClient(app) as client:
+        drilled = client.get(
+            f"/api/distribution-reports/{report_id}/sections/"
+            f"{numeric.section_id}/buckets/{bucket.bucket_id}/examples")
+        assert drilled.status_code == 200, drilled.text
+        payload = drilled.json()
+        assert payload["exampleSemantics"] == "bounded_examples_from_measured_bucket"
+        assert payload["rowLimit"] == 100
+        assert payload["samplingIdentity"] == view["sampleProvenance"]["identity"]
+        assert payload["revisionId"] == view["datasetRef"]["revisionId"]
+        assert bucket.count == 125
+        assert payload["returnedRows"] == 100
+        assert payload["truncated"] is True
+        assert {row["value"] for row in payload["rows"]} <= sample_values
+        assert all(row["nested"] == ["<1 bytes>", "<1 bytes>"] for row in payload["rows"])
+        for row in payload["rows"]:
+            assert row["constant"] >= bucket.lower
+            assert (row["constant"] <= bucket.upper
+                    if bucket.upper_inclusive else row["constant"] < bucket.upper)
+
+        category_drill = client.get(
+            f"/api/distribution-reports/{report_id}/sections/"
+            f"{categorical.section_id}/buckets/{injected_category.bucket_id}/examples")
+        assert category_drill.status_code == 200, category_drill.text
+        assert all(row["category"] == injected_category.label
+                   for row in category_drill.json()["rows"])
+        temporal_drill = client.get(
+            f"/api/distribution-reports/{report_id}/sections/"
+            f"{temporal.section_id}/buckets/{temporal_bucket.bucket_id}/examples")
+        assert temporal_drill.status_code == 200, temporal_drill.text
+        for row in temporal_drill.json()["rows"]:
+            value = datetime.datetime.fromisoformat(row["observed_at"])
+            assert value >= temporal_bucket.start.replace(tzinfo=None)
+            assert (value <= temporal_bucket.end.replace(tzinfo=None)
+                    if temporal_bucket.end_inclusive
+                    else value < temporal_bucket.end.replace(tzinfo=None))
+
+        compared = client.post("/api/distribution-reports/compare", json={
+            "leftReportId": report_id, "rightReportId": report_id,
+        })
+        assert compared.status_code == 200, compared.text
+        assert compared.json()["coverage"]["reason"] == "same_deterministic_sample"
+        assert all(column["matchReason"] == "name_and_logical_type"
+                   for column in compared.json()["columns"])
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                distribution_report_insights, "_open_exact",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("invalid bucket opened source data")),
+            )
+            invalid = client.get(
+                f"/api/distribution-reports/{report_id}/sections/"
+                f"{numeric.section_id}/buckets/not-issued/examples")
+            assert invalid.status_code == 422
+        headers = {"X-DP-User": other}
+        assert client.get(
+            f"/api/distribution-reports/{report_id}/sections/"
+            f"{numeric.section_id}/buckets/{bucket.bucket_id}/examples",
+            headers=headers,
+        ).status_code == 404
+        assert client.post("/api/distribution-reports/compare", headers=headers, json={
+            "leftReportId": report_id, "rightReportId": report_id,
+        }).status_code == 404
+
+        artifact = metadb.managed_local_file_revision_artifact(
+            document.dataset_id, document.revision_id)
+        assert artifact is not None
+        os.remove(artifact)
+        assert client.get(f"/api/distribution-reports/{report_id}").status_code == 200
+        assert client.post("/api/distribution-reports/compare", json={
+            "leftReportId": report_id, "rightReportId": report_id,
+        }).status_code == 200
+        gone = client.get(
+            f"/api/distribution-reports/{report_id}/sections/"
+            f"{numeric.section_id}/buckets/{bucket.bucket_id}/examples")
+        assert gone.status_code == 410
+
+
+def test_numeric_and_large_temporal_drill_down_reuse_report_bucket_membership(
+    core_view_factory, monkeypatch,
+):
+    numbers = [0.0, 0.6749999999999999, 0.9]
+    moments = [
+        datetime.datetime(1, 1, 1),
+        datetime.datetime(4000, 6, 15, 12, 34, 56, 789012),
+        datetime.datetime(9999, 12, 31, 23, 59, 59, 999999),
+    ]
+    view = core_view_factory({"number": numbers, "observed_at": moments})
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    completed = _complete_computed_report(view)
+    document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+        json.dumps(completed["report"]))
+    numeric = next(section for section in document.sections if section.kind == "numeric")
+    temporal = next(section for section in document.sections if section.kind == "temporal")
+
+    numeric_rows = []
+    temporal_rows = []
+    with TestClient(app) as client:
+        for section, buckets, output in (
+            (numeric, numeric.histogram, numeric_rows),
+            (temporal, temporal.buckets, temporal_rows),
+        ):
+            for bucket in buckets:
+                response = client.get(
+                    f"/api/distribution-reports/{completed['report_id']}/sections/"
+                    f"{section.section_id}/buckets/{bucket.bucket_id}/examples")
+                assert response.status_code == 200, response.text
+                payload = response.json()
+                assert payload["bucketCount"] == bucket.count
+                assert payload["returnedRows"] == bucket.count
+                output.extend(payload["rows"])
+    assert sorted(row["number"] for row in numeric_rows) == numbers
+    assert sorted(row["observed_at"] for row in temporal_rows) == sorted(
+        value.isoformat() for value in moments)
+
+
+def test_numeric_report_and_drill_membership_matches_every_public_bucket_edge(
+    core_view_factory, monkeypatch,
+):
+    cases = {
+        "fractional": (0.0, 0.9, 0.6749999999999999),
+        "negative": (-1.0, 1.0, -0.9),
+        "large_magnitude": (-1e150, 1e150, -7e149),
+    }
+    expected = {}
+    data = {}
+    for column, (minimum, maximum, edge) in cases.items():
+        finite = [
+            minimum,
+            math.nextafter(edge, -math.inf),
+            edge,
+            math.nextafter(edge, math.inf),
+            (minimum + maximum) / 2,
+            maximum,
+        ]
+        expected[column] = finite
+        data[column] = [*finite, None, float("nan"), float("inf"), float("-inf")]
+    constant = [-7.25] * 6
+    expected["constant"] = constant
+    data["constant"] = [*constant, None, float("nan"), float("inf"), float("-inf")]
+
+    view = core_view_factory(data)
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    completed = _complete_computed_report(view)
+    document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+        json.dumps(completed["report"]))
+    sections = {
+        section.column_name: section
+        for section in document.sections if section.kind == "numeric"
+    }
+    assert set(sections) == set(expected)
+
+    drilled: dict[str, list[float]] = {column: [] for column in sections}
+    with TestClient(app) as client:
+        for column, section in sections.items():
+            for bucket in section.histogram:
+                expected_bucket = [
+                    value for value in expected[column]
+                    if bucket.lower <= value and (
+                        value <= bucket.upper
+                        if bucket.upper_inclusive
+                        else value < bucket.upper
+                    )
+                ]
+                assert bucket.count == len(expected_bucket)
+                response = client.get(
+                    f"/api/distribution-reports/{completed['report_id']}/sections/"
+                    f"{section.section_id}/buckets/{bucket.bucket_id}/examples")
+                assert response.status_code == 200, response.text
+                payload = response.json()
+                assert payload["bucketCount"] == bucket.count
+                assert payload["returnedRows"] == bucket.count
+                assert payload["truncated"] is False
+                values = [row[column] for row in payload["rows"]]
+                drilled[column].extend(values)
+                assert sorted(values) == sorted(expected_bucket)
+                for value in values:
+                    assert math.isfinite(value)
+                    assert bucket.lower <= value
+                    assert (
+                        value <= bucket.upper
+                        if bucket.upper_inclusive
+                        else value < bucket.upper
+                    )
+
+    for column, values in expected.items():
+        assert sorted(drilled[column]) == sorted(values)
+    constant_section = sections["constant"]
+    assert len(constant_section.histogram) == 1
+    assert constant_section.histogram[0].lower == constant_section.histogram[0].upper == -7.25
+    assert constant_section.histogram[0].upper_inclusive is True
+    for column, (minimum, maximum, edge) in cases.items():
+        section = sections[column]
+        edge_index = next(
+            index for index, bucket in enumerate(section.histogram)
+            if bucket.lower == edge)
+        assert edge_index > 0
+        assert section.histogram[edge_index - 1].upper == edge
+        assert section.histogram[edge_index - 1].upper_inclusive is False
+        assert section.histogram[0].lower == minimum
+        assert section.histogram[-1].upper == maximum
+        assert section.histogram[-1].upper_inclusive is True
+
+
+def test_bucket_drill_down_bounds_arrow_cells_before_python_materialization(
+    core_view_factory, monkeypatch,
+):
+    huge_items = 2_000_000
+    list_values = pa.array(range(huge_items + 6), type=pa.int64())
+    nested_lists = pa.ListArray.from_arrays(
+        pa.array([
+            0,
+            huge_items,
+            huge_items + 2,
+            huge_items + 4,
+            huge_items + 6,
+        ], type=pa.int32()),
+        list_values,
+    )
+    huge_text = "x" * 2_000_000
+    huge_binary = b"x" * 2_000_000
+    nested_binary = pa.array([
+        [b"a"],
+        [b"b"],
+        [huge_binary],
+        [b"\x00", b"\xff"],
+    ], type=pa.list_(pa.binary()))
+    view = core_view_factory({
+        "value": pa.array([1, 1, 1, 1]),
+        "nested_list": nested_lists,
+        "text": pa.array(["ok", huge_text, "ok", "ok"]),
+        "nested_binary": nested_binary,
+    })
+    from hub.deps import get_deps
+    deps = get_deps()
+    monkeypatch.setattr(dataset_view_routes, "get_deps", lambda: SimpleNamespace(
+        storage=getattr(core_view_factory, "storage"), resolve_adapter=deps.resolve_adapter))
+    admitted, _created = distribution_reports.admit_distribution_report(
+        owner_id=metadb.DEFAULT_USER_ID, intent=_intent(view))
+    claim = distribution_reports.claim_distribution_report(
+        admitted["task"]["id"], "arrow-bound-owner")
+    assert claim is not None
+    report = _report(claim, rowCount=4)
+    numeric_report = report["sections"][2]
+    numeric_report.update({
+        "min": 1.0,
+        "max": 1.0,
+        "mean": 1.0,
+        "quantiles": [
+            {"probability": probability, "value": 1.0}
+            for probability in (0.0, 0.25, 0.5, 0.75, 1.0)
+        ],
+        "histogram": [{
+            "bucketId": "column-000-numeric-000",
+            "lower": 1.0,
+            "upper": 1.0,
+            "count": 4,
+            "upperInclusive": True,
+        }],
+    })
+    attempt = claim["task"]["attempts"][-1]
+    completed = distribution_reports.complete_distribution_report(
+        task_id=claim["task"]["id"],
+        attempt_id=attempt["id"],
+        owner_token="arrow-bound-owner",
+        report=report,
+    )
+    assert completed is not None and completed["report"] is not None
+    document = distribution_reports.DistributionReportDocumentV1.model_validate_json(
+        json.dumps(completed["report"]))
+    numeric = next(section for section in document.sections if section.kind == "numeric")
+    bucket = next(item for item in numeric.histogram if item.count > 0)
+
+    materialized_types = []
+    original_as_py = distribution_report_insights._arrow_scalar_as_py
+
+    def guarded_as_py(array, index):
+        materialized_types.append(array.type)
+        return original_as_py(array, index)
+
+    monkeypatch.setattr(
+        distribution_report_insights, "_arrow_scalar_as_py", guarded_as_py)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/distribution-reports/{completed['report_id']}/sections/"
+            f"{numeric.section_id}/buckets/{bucket.bucket_id}/examples")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["bucketCount"] == 4
+    assert payload["returnedRows"] == 1
+    assert payload["truncated"] is True
+    assert payload["rows"] == [{
+        "value": 1,
+        "nested_list": [huge_items + 4, huge_items + 5],
+        "text": "ok",
+        "nested_binary": ["<1 bytes>", "<1 bytes>"],
+    }]
+    assert len(materialized_types) == 4
+
+
+def test_example_normalization_is_recursive_json_safe_and_bounded():
+    cyclic = []
+    cyclic.append(cyclic)
+    too_large = list(range(distribution_report_insights._EXAMPLE_MAX_CONTAINER_ITEMS + 1))
+    rows = distribution_report_insights._bounded_rows([
+        {"cycle": cyclic},
+        {"tooLarge": too_large},
+        {"nested": [b"\x00", {"payload": bytearray(b"abc")}],
+         "nan": float("nan"), "positiveInfinity": float("inf")},
+    ])
+    assert rows == [{
+        "nested": ["<1 bytes>", {"payload": "<3 bytes>"}],
+        "nan": "NaN", "positiveInfinity": "Infinity",
+    }]
+    json.dumps(rows, allow_nan=False)
 
 
 def test_numeric_float_wire_boundaries_fail_closed_and_reconcile(core_view_factory, monkeypatch):

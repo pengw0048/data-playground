@@ -112,6 +112,48 @@ def _section_id(index: int, kind: str) -> str:
     return f"column-{index:03d}-{kind}"
 
 
+def _bucket_index_expression(value: str) -> str:
+    """The integer temporal membership function shared by report counts and drill-down."""
+    quotient = f"(({value} - ?) // ?)"
+    return f"least(CAST({quotient} AS INTEGER), ?)"
+
+
+def _numeric_bucket_edges(minimum: float, maximum: float) -> list[float]:
+    width = (maximum - minimum) / MAX_BUCKETS
+    return [minimum + width * bucket for bucket in range(MAX_BUCKETS)] + [maximum]
+
+
+def _numeric_bucket_predicate(
+    value: str,
+    lower: float,
+    upper: float,
+    *,
+    upper_inclusive: bool,
+) -> tuple[str, list[float]]:
+    upper_operator = "<=" if upper_inclusive else "<"
+    return f"({value} >= ? AND {value} {upper_operator} ?)", [lower, upper]
+
+
+def _numeric_bucket_case(value: str, edges: list[float]) -> tuple[str, list[float]]:
+    if len(edges) != MAX_BUCKETS + 1:
+        raise ValueError("numeric histogram requires the fixed bounded edges")
+    clauses = []
+    parameters = []
+    for bucket, (lower, upper) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+        predicate, bounds = _numeric_bucket_predicate(
+            value, lower, upper, upper_inclusive=bucket == MAX_BUCKETS - 1)
+        clauses.append(f"WHEN {predicate} THEN {bucket}")
+        parameters.extend(bounds)
+    return f"CASE {' '.join(clauses)} END", parameters
+
+
+def _temporal_bucket_layout(minimum: int, maximum: int) -> tuple[int, int]:
+    population_span = maximum - minimum + 1
+    width = max(1, (population_span + MAX_BUCKETS - 1) // MAX_BUCKETS)
+    bucket_count = min(MAX_BUCKETS, max(1, (population_span + width - 1) // width))
+    return width, bucket_count
+
+
 def _finite_float(value) -> float | None:
     if value is None:
         return None
@@ -120,8 +162,9 @@ def _finite_float(value) -> float | None:
 
 
 def _utc(micros: int) -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(
-        int(micros) / 1_000_000, tz=datetime.timezone.utc)
+    return (
+        datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+        + datetime.timedelta(microseconds=int(micros)))
 
 
 def _unsupported(
@@ -171,15 +214,13 @@ def _numeric_section(
         return [_unsupported(
             section_id, "empty_finite_population", column=column)]
     minimum, maximum = float(row[2]), float(row[3])
-    width = None
+    edges = None
     if minimum != maximum:
         span = maximum - minimum
-        width = span / MAX_BUCKETS
-        if (not math.isfinite(span) or span > _MAX_SAFE_STDDEV_SPAN
-                or not math.isfinite(width) or width == 0):
+        if not math.isfinite(span) or span > _MAX_SAFE_STDDEV_SPAN:
             return [_unsupported(
                 section_id, "numeric_range_unsupported", column=column)]
-        edges = [minimum + width * bucket for bucket in range(MAX_BUCKETS)] + [maximum]
+        edges = _numeric_bucket_edges(minimum, maximum)
         if any(upper <= lower for lower, upper in zip(edges, edges[1:])):
             return [_unsupported(
                 section_id, "numeric_range_unsupported", column=column)]
@@ -205,18 +246,17 @@ def _numeric_section(
             "lower": minimum, "upper": maximum, "count": count, "upperInclusive": True,
         })
     else:
-        assert width is not None
+        assert edges is not None
+        bucket_case, parameters = _numeric_bucket_case(value, edges)
         buckets = con.execute(
-            f"SELECT least(CAST(floor(({value} - ?) / ?) AS INTEGER), ?) AS bucket, "
+            f"SELECT {bucket_case} AS bucket, "
             f"count(*) FROM {quote_identifier(table)} "
             f"WHERE {quoted} IS NOT NULL AND isfinite({value}) "
             "GROUP BY bucket ORDER BY bucket",
-            [minimum, width, MAX_BUCKETS - 1],
+            parameters,
         ).fetchall()
         counts = {int(bucket): int(bucket_count) for bucket, bucket_count in buckets}
-        for bucket in range(MAX_BUCKETS):
-            lower = minimum + width * bucket
-            upper = maximum if bucket == MAX_BUCKETS - 1 else minimum + width * (bucket + 1)
+        for bucket, (lower, upper) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
             histogram.append({
                 "bucketId": f"column-{index:03d}-numeric-{bucket:03d}",
                 "lower": lower, "upper": upper, "count": counts.get(bucket, 0),
@@ -283,10 +323,9 @@ def _temporal_section(
         return [_unsupported(
             _section_id(index, "temporal"), "empty_finite_population", column=column)]
     minimum, maximum = int(row[2]), int(row[3])
-    width = max(1, math.ceil((maximum - minimum + 1) / MAX_BUCKETS))
-    bucket_count = min(MAX_BUCKETS, max(1, math.ceil((maximum - minimum + 1) / width)))
+    width, bucket_count = _temporal_bucket_layout(minimum, maximum)
     grouped = con.execute(
-        f"SELECT least(CAST(floor((epoch_us({quoted}) - ?) / ?) AS INTEGER), ?) bucket, "
+        f"SELECT {_bucket_index_expression(f'epoch_us({quoted})')} bucket, "
         f"count(*) FROM {quote_identifier(table)} WHERE {quoted} IS NOT NULL "
         "GROUP BY bucket ORDER BY bucket",
         [minimum, width, bucket_count - 1],
