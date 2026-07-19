@@ -897,6 +897,196 @@ class TemporalWindowV1(Wire):
         return self
 
 
+class TemporalEvidencePairV1(Wire):
+    """The only pairwise comparison allowed in one bounded evidence request."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    left_stream_id: str = Field(min_length=1, max_length=128)
+    right_stream_id: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def distinct_streams(self) -> "TemporalEvidencePairV1":
+        if self.left_stream_id == self.right_stream_id:
+            raise ValueError("temporal evidence pair streams must differ")
+        return self
+
+
+class TemporalEvidenceStreamViewBindingV1(Wire):
+    """One server-owned bounded DatasetView bound to one requested stream."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    stream_id: str = Field(min_length=1, max_length=128)
+    dataset_view_id: str = Field(min_length=1, max_length=32)
+
+
+class TemporalEvidenceRequestV1(Wire):
+    """One exact compound calculation over stored, bounded DatasetViews only."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    manifest_json: str = Field(min_length=2, max_length=131_072)
+    episode_id: str = Field(min_length=1, max_length=128)
+    stream_ids: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(
+        min_length=1, max_length=8)
+    stream_views: list[TemporalEvidenceStreamViewBindingV1] = Field(default_factory=list, max_length=8)
+    reference_view_id: str = Field(min_length=1, max_length=32)
+    pair: TemporalEvidencePairV1 | None = None
+    gap_threshold_ticks: str = Field(
+        min_length=1, max_length=20, pattern=r"^(?:[1-9][0-9]*)$",
+        description="Canonical positive signed-int64 decimal string.",
+    )
+    tolerance_ticks: str = Field(
+        default="0", min_length=1, max_length=20,
+        pattern=r"^(?:0|[1-9][0-9]*)$",
+        description="Canonical nonnegative signed-int64 decimal string.",
+    )
+
+    @model_validator(mode="after")
+    def bounded_stream_set(self) -> "TemporalEvidenceRequestV1":
+        if len(set(self.stream_ids)) != len(self.stream_ids):
+            raise ValueError("temporal evidence stream ids must be unique")
+        stream_ids = [item.stream_id for item in self.stream_views]
+        if len(set(stream_ids)) != len(stream_ids) or set(stream_ids) - set(self.stream_ids):
+            raise ValueError("temporal evidence stream views must uniquely bind selected streams")
+        view_ids = {item.dataset_view_id for item in self.stream_views}
+        if self.reference_view_id not in view_ids:
+            raise ValueError("temporal evidence reference view must bind one selected stream")
+        if self.pair is not None and ({self.pair.left_stream_id, self.pair.right_stream_id}
+                                      - set(self.stream_ids)):
+            raise ValueError("temporal evidence pair must be selected from stream ids")
+        if not (0 < int(self.gap_threshold_ticks) <= (1 << 63) - 1):
+            raise ValueError("temporal evidence gap threshold must be positive signed 64-bit")
+        if not (0 <= int(self.tolerance_ticks) <= (1 << 63) - 1):
+            raise ValueError("temporal evidence tolerance must be nonnegative signed 64-bit")
+        return self
+
+
+class TemporalEvidenceRateV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    numerator: int
+    denominator: int
+    physical_unit: str | None = None
+    unit: str | None = None
+
+
+class TemporalEvidenceMappingV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    source_clock_id: str
+    target_clock_id: str
+    scale_numerator: int
+    scale_denominator: int
+    offset_tick: int
+
+
+class TemporalEvidenceGapV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    after_observation_id: str
+    before_observation_id: str
+    duration_ticks: int
+    threshold_ticks: int
+
+
+class TemporalEvidenceDeltaV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    count: int
+    minimum: int | None
+    maximum: int | None
+    tie_break: str
+    right_reuse: bool
+
+
+class TemporalEvidenceWindowEvidenceV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    time_domain: str
+    start_tick: int
+    end_tick: int
+
+
+class TemporalEvidenceMemberIdentityV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    stream_id: str
+    dataset_id: str
+    revision_id: str
+
+
+class TemporalEvidenceViewIdentityV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    stream_id: str
+    view_id: str
+    definition_sha256: str
+    semantic_sha256: str
+
+
+class TemporalEvidenceIdentityV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    computation_version: str
+    compound_dataset_id: str
+    compound_revision: str
+    episode_id: str
+    streams: list[str]
+    window: TemporalEvidenceWindowEvidenceV1
+    pair: tuple[str, str] | None
+    tolerance_ticks: int
+    gap_threshold_ticks: int
+    members: list[TemporalEvidenceMemberIdentityV1]
+    dataset_views: list[TemporalEvidenceViewIdentityV1]
+    evidence_id: str
+
+
+class TemporalEvidenceStreamV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    stream_id: str
+    state: Literal["available", "absent", "unavailable", "permission", "corrupt", "truncated", "unknown"]
+    provider_coverage: str | None
+    nominal_rate: TemporalEvidenceRateV1 | None
+    measured_rate: TemporalEvidenceRateV1 | None
+    corrupt_count: int
+    observed_count: int
+    bounded_read_count: int
+    coverage_intervals: list[tuple[int, int]]
+    gaps: list[TemporalEvidenceGapV1]
+    first_tick: int | None
+    last_tick: int | None
+    clock_mapping: TemporalEvidenceMappingV1 | None
+    gap_threshold_ticks: int
+    complete: bool
+    reason: str | None = None
+
+
+class TemporalEvidencePairEvidenceV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    state: Literal["available", "truncated", "unknown"]
+    complete: bool
+    reason: str | None = None
+    left_stream_id: str | None = None
+    right_stream_id: str | None = None
+    overlap_ticks: int | None = None
+    overlap_approximation: str | None = None
+    tolerance_ticks: int | None = None
+    matched_count: int | None = None
+    unmatched_left_count: int | None = None
+    unmatched_right_count: int | None = None
+    unknown_count: int | None = None
+    nearest_delta: TemporalEvidenceDeltaV1 | None = None
+
+
+class TemporalEvidenceApproximationV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    point_coverage: str
+    pairwise: str
+
+
+class TemporalEvidenceResponseV1(Wire):
+    """Versioned redacted evidence record; it never exposes raw observations or locators."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    schema_version: Literal[1] = 1
+    identity: TemporalEvidenceIdentityV1
+    complete: bool
+    approximation: TemporalEvidenceApproximationV1
+    streams: list[TemporalEvidenceStreamV1]
+    pair: TemporalEvidencePairEvidenceV1 | None
+
+
 class DatasetViewCreateRequest(Wire):
     """Immutable DatasetView intent. Workspace placement is derived by the server."""
 
