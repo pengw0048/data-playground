@@ -1,0 +1,4 @@
+observation_id,episode_id,start_tick,end_tick,fixture_phase
+episode-1-annotation-001,episode-1,1000,2500,protocol-a
+episode-1-annotation-002,episode-1,6000,8000,protocol-b
+episode-2-annotation-001,episode-2,21000,24000,protocol-c

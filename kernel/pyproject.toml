@@ -82,6 +82,7 @@ path = "hatch_build.py"
 
 [tool.hatch.build.targets.wheel.force-include]
 "../web/dist" = "hub/_web"
+"../fixtures/compound" = "hub/_fixtures/compound"
 
 [tool.pytest.ini_options]
 testpaths = ["hub/tests"]
