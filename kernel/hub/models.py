@@ -2150,7 +2150,6 @@ class DurableMergeColumnsView(Wire):
     ]
     base_dataset_id: str = Field(min_length=1, max_length=128)
     base_revision_id: str = Field(min_length=1, max_length=128)
-    sparse_output_id: str = Field(min_length=1, max_length=128)
     candidate: Literal["pending", "committed"]
     reused: bool
     candidate_rows: int | None = Field(default=None, ge=0)

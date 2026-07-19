@@ -4341,19 +4341,12 @@
           "reused": {
             "title": "Reused",
             "type": "boolean"
-          },
-          "sparseOutputId": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Sparseoutputid",
-            "type": "string"
           }
         },
         "required": [
           "phase",
           "baseDatasetId",
           "baseRevisionId",
-          "sparseOutputId",
           "candidate",
           "reused",
           "canRetry",
@@ -6286,6 +6279,281 @@
           "password"
         ],
         "title": "LoginBody",
+        "type": "object"
+      },
+      "MergeColumnRuleV1": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "add",
+              "replace"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "mode"
+        ],
+        "title": "MergeColumnRuleV1",
+        "type": "object"
+      },
+      "MergeColumnsCoverageCountsV1": {
+        "properties": {
+          "duplicateGroups": {
+            "minimum": 0.0,
+            "title": "Duplicategroups",
+            "type": "integer"
+          },
+          "duplicateRows": {
+            "minimum": 0.0,
+            "title": "Duplicaterows",
+            "type": "integer"
+          },
+          "nullRows": {
+            "minimum": 0.0,
+            "title": "Nullrows",
+            "type": "integer"
+          },
+          "rows": {
+            "minimum": 0.0,
+            "title": "Rows",
+            "type": "integer"
+          },
+          "uniqueIdentities": {
+            "minimum": 0.0,
+            "title": "Uniqueidentities",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "uniqueIdentities",
+          "nullRows",
+          "duplicateGroups",
+          "duplicateRows"
+        ],
+        "title": "MergeColumnsCoverageCountsV1",
+        "type": "object"
+      },
+      "MergeColumnsCoverageV1": {
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/MergeColumnsCoverageCountsV1"
+          },
+          "candidate": {
+            "$ref": "#/components/schemas/MergeColumnsCoverageCountsV1"
+          },
+          "extraIdentities": {
+            "minimum": 0.0,
+            "title": "Extraidentities",
+            "type": "integer"
+          },
+          "matchedIdentities": {
+            "minimum": 0.0,
+            "title": "Matchedidentities",
+            "type": "integer"
+          },
+          "missingIdentities": {
+            "minimum": 0.0,
+            "title": "Missingidentities",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "base",
+          "candidate",
+          "matchedIdentities",
+          "missingIdentities",
+          "extraIdentities",
+          "status"
+        ],
+        "title": "MergeColumnsCoverageV1",
+        "type": "object"
+      },
+      "MergeColumnsPreflightProvenanceV1": {
+        "properties": {
+          "producer": {
+            "default": "source_to_select",
+            "title": "Producer",
+            "type": "string"
+          },
+          "selectKind": {
+            "default": "builtin",
+            "title": "Selectkind",
+            "type": "string"
+          },
+          "selectVersion": {
+            "default": 1,
+            "title": "Selectversion",
+            "type": "integer"
+          },
+          "source": {
+            "default": "exact",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "title": "MergeColumnsPreflightProvenanceV1",
+        "type": "object"
+      },
+      "MergeColumnsPreflightV1": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/MergeColumnsCoverageV1"
+          },
+          "declaredKey": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Declaredkey",
+            "type": "array"
+          },
+          "eligible": {
+            "default": true,
+            "title": "Eligible",
+            "type": "boolean"
+          },
+          "expectedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "identityColumns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Identitycolumns",
+            "type": "array"
+          },
+          "outputSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Outputschema",
+            "type": "array"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/MergeColumnsPreflightProvenanceV1"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MergeColumnRuleV1"
+            },
+            "title": "Rules",
+            "type": "array"
+          }
+        },
+        "required": [
+          "base",
+          "identityColumns",
+          "coverage",
+          "rules",
+          "expectedHead",
+          "outputSchema",
+          "provenance"
+        ],
+        "title": "MergeColumnsPreflightV1",
+        "type": "object"
+      },
+      "MergeColumnsRequestV1": {
+        "additionalProperties": false,
+        "description": "One graph-shaped request; no storage or SparseOutput authority crosses this boundary.",
+        "properties": {
+          "graph": {
+            "$ref": "#/components/schemas/Graph"
+          },
+          "identityColumns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Identitycolumns",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MergeColumnRuleV1"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "title": "Rules",
+            "type": "array"
+          },
+          "submissionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "graph",
+          "submissionId",
+          "identityColumns",
+          "rules"
+        ],
+        "title": "MergeColumnsRequestV1",
+        "type": "object"
+      },
+      "MergeColumnsTaskV1": {
+        "additionalProperties": false,
+        "properties": {
+          "canCancel": {
+            "title": "Cancancel",
+            "type": "boolean"
+          },
+          "canRetry": {
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "mergeColumns": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableMergeColumnsView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "taskId": {
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "status",
+          "canRetry",
+          "canCancel"
+        ],
+        "title": "MergeColumnsTaskV1",
         "type": "object"
       },
       "MkdirRequest": {
@@ -12950,6 +13218,22 @@
           "provenance"
         ],
         "title": "WriteReceipt",
+        "type": "object"
+      },
+      "_RetryRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "retryRequestId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Retryrequestid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "retryRequestId"
+        ],
+        "title": "_RetryRequest",
         "type": "object"
       }
     }
@@ -21456,6 +21740,423 @@
           }
         },
         "summary": "Whoami"
+      }
+    },
+    "/api/merge-columns": {
+      "post": {
+        "operationId": "submit_api_merge_columns_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeColumnsRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeColumnsTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Submit"
+      }
+    },
+    "/api/merge-columns/preflight": {
+      "post": {
+        "operationId": "preflight_api_merge_columns_preflight_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeColumnsRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeColumnsPreflightV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preflight"
+      }
+    },
+    "/api/merge-columns/{task_id}": {
+      "get": {
+        "operationId": "status_api_merge_columns__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeColumnsTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Status"
+      }
+    },
+    "/api/merge-columns/{task_id}/cancel": {
+      "post": {
+        "operationId": "cancel_api_merge_columns__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeColumnsTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Cancel"
+      }
+    },
+    "/api/merge-columns/{task_id}/retry": {
+      "post": {
+        "operationId": "retry_api_merge_columns__task_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_RetryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MergeColumnsTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Retry"
       }
     },
     "/api/nodes": {

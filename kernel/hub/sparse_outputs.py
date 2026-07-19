@@ -74,6 +74,27 @@ class SparseOutputAdmission:
 
 
 @dataclass(frozen=True)
+class SparseOutputPreparation:
+    """Read-only normalized evidence for one prospective SparseOutput admission.
+
+    This deliberately owns no database row, retention reference, candidate, or lock.  Product
+    admission can therefore show the same exact coverage truth before it chooses to submit the
+    sidecar-producing saga.
+    """
+
+    owner_id: str
+    canvas_id: str
+    submission_id: str
+    dataset_ref: ExactDatasetRef
+    documents: dict[str, str]
+    digests: dict[str, str]
+    row_identity_spec_sha256: str
+    base_schema: pa.Schema
+    sidecar_schema: pa.Schema
+    identity_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SparseOutputMaterialization:
     id: str
     committed: bool
@@ -101,6 +122,25 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
     The outer guard intentionally spans projection binding, coverage, and metadata commit.  A base
     revision therefore cannot be released between evidence collection and its durable retention ref.
     """
+    prepared = prepare_sparse_output_admission(storage, request)
+    sparse_id = _sparse_id(prepared.owner_id, prepared.canvas_id, prepared.submission_id)
+    try:
+        document, created = metadb.sparse_output_admit(
+            owner_id=prepared.owner_id, canvas_id=prepared.canvas_id,
+            submission_id=prepared.submission_id, sparse_id=sparse_id,
+            input_dataset_id=prepared.dataset_ref.dataset_id,
+            input_revision_id=prepared.dataset_ref.revision_id,
+            documents=prepared.documents, digests=prepared.digests,
+            row_identity_spec_sha256=prepared.row_identity_spec_sha256)
+    except metadb.SparseOutputSubmissionConflict as exc:
+        raise SparseOutputSubmissionConflict(
+            "SparseOutput submission belongs to a different immutable admission") from exc
+    return SparseOutputAdmission(id=document["id"], created=created, document=document)
+
+
+def prepare_sparse_output_admission(
+        storage, request: SparseOutputAdmissionRequest) -> SparseOutputPreparation:
+    """Compute prospective exact sidecar evidence without retaining or allocating anything."""
     owner_id = _identity_text(request.owner_id, "owner", 512)
     canvas_id = _identity_text(request.canvas_id, "canvas", 512)
     submission_id = _submission_id(request.submission_id)
@@ -112,17 +152,15 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
         dataset_ref.dataset_id, dataset_ref.revision_id)
     if artifact_uri is None:
         raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable")
-
     try:
         with db.base_guard(), source_read_scope(
-                storage, [artifact_uri], owner=f"sparse-output-admission:{uuid.uuid4().hex}"):
+                storage, [artifact_uri], owner=f"sparse-output-preflight:{uuid.uuid4().hex}"):
             base = DuckDBAdapter().scan(artifact_uri)
             validated = validate_fragment(FragmentKind.PROJECTION, expression, con=db.conn())
             if any(function.name.lower() == "row_number" for function in validated.functions):
                 raise SparseOutputValidationError("SparseOutput Select config is invalid")
             candidate = base.project(validated.sql)
-            # Projection is lazy. Bind its schema while this exact read guard is definitely live; do
-            # not inspect the relation again after coverage closes its nested guard.
+            base_schema = base.limit(0).to_arrow_table().schema
             output_schema = candidate.limit(0).to_arrow_table().schema
             identity_schema, payload_schema = _output_schema(output_schema, identity_columns)
             frozen_spec = freeze_row_identity_spec(dataset_ref, identity_columns, base)
@@ -134,24 +172,17 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
             documents, digests = _immutable_documents(
                 owner_id, canvas_id, submission_id, dataset_ref, validated.sql,
                 identity_schema, payload_schema, provenance, evidence, frozen_spec.digest)
-            sparse_id = _sparse_id(owner_id, canvas_id, submission_id)
-            try:
-                document, created = metadb.sparse_output_admit(
-                    owner_id=owner_id, canvas_id=canvas_id, submission_id=submission_id,
-                    sparse_id=sparse_id, input_dataset_id=dataset_ref.dataset_id,
-                    input_revision_id=dataset_ref.revision_id,
-                    documents=documents, digests=digests,
-                    row_identity_spec_sha256=frozen_spec.digest)
-            except metadb.SparseOutputSubmissionConflict as exc:
-                raise SparseOutputSubmissionConflict(
-                    "SparseOutput submission belongs to a different immutable admission") from exc
     except SparseOutputError:
         raise
     except (ManagedSourceUnavailable, RowIdentityError, SQLPolicyError, ValueError, duckdb.Error) as exc:
         raise SparseOutputValidationError("SparseOutput admission is invalid") from exc
     except OSError as exc:
         raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable") from exc
-    return SparseOutputAdmission(id=document["id"], created=created, document=document)
+    return SparseOutputPreparation(
+        owner_id=owner_id, canvas_id=canvas_id, submission_id=submission_id,
+        dataset_ref=dataset_ref, documents=documents, digests=digests,
+        row_identity_spec_sha256=frozen_spec.digest, base_schema=base_schema,
+        sidecar_schema=output_schema, identity_columns=identity_columns)
 
 
 def materialize_sparse_output(

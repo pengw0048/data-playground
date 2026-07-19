@@ -135,6 +135,45 @@ def side_fields_name(schema: pa.Schema, requested: str) -> str:
     return matches[0]
 
 
+def merge_output_schema(
+        base_schema: pa.Schema, sidecar_schema: pa.Schema, identity_columns: list[str],
+        rules: list[MergeColumnRuleV1]) -> list[ColumnSchema]:
+    """Validate V1 mapping shape and return the one full-width output schema.
+
+    Both read-only preflight and the final merge revalidation use this exact helper.  The latter
+    additionally proves frozen sidecar/base evidence; this function deliberately has no I/O or
+    publication authority.
+    """
+    identity_keys = {identifier_key(name) for name in identity_columns}
+    base_fields = {identifier_key(field.name): field for field in base_schema}
+    side_fields = {identifier_key(field.name): field for field in sidecar_schema}
+    if (len(base_fields) != len(base_schema) or len(side_fields) != len(sidecar_schema)
+            or len(identity_keys) != len(identity_columns)):
+        raise MergeColumnsError("merge schema is ambiguous")
+    if (not rules or len(rules) != len({identifier_key(rule.target) for rule in rules})
+            or len(rules) != len({identifier_key(rule.source) for rule in rules})):
+        raise MergeColumnsError("merge rules are invalid")
+    for rule in rules:
+        source_key, target_key = identifier_key(rule.source), identifier_key(rule.target)
+        if (source_key not in side_fields or target_key in identity_keys
+                or source_key in identity_keys or not rule.source or not rule.target):
+            raise MergeColumnsError("merge rules are invalid")
+        target = base_fields.get(target_key)
+        if rule.mode == "add":
+            if target is not None:
+                raise MergeColumnsError("merge add target already exists")
+        elif target is None or target.type != side_fields[source_key].type:
+            raise MergeColumnsError("merge replace type is invalid")
+    payload = [field.name for field in sidecar_schema if identifier_key(field.name) not in identity_keys]
+    if {identifier_key(rule.source) for rule in rules} != {identifier_key(name) for name in payload}:
+        raise MergeColumnsError("merge rules do not consume the certified sidecar payload")
+    return _schema_columns(base_schema) + [
+        ColumnSchema(name=rule.target, type=_schema_columns(
+            pa.schema([side_fields[identifier_key(rule.source)]]))[0].type)
+        for rule in rules if rule.mode == "add"
+    ]
+
+
 def _validate_intent(intent: MergeColumnsIntentV1, admission: dict, base_schema: pa.Schema,
                      sidecar_schema: pa.Schema) -> tuple[ExactDatasetRef, list[str]]:
     exact = _as_exact(intent.base)
@@ -149,37 +188,7 @@ def _validate_intent(intent: MergeColumnsIntentV1, admission: dict, base_schema:
     frozen = decode_row_identity_coverage(
         evidence, exact, admission["rowIdentitySpecSha256"]).spec
     identities = [field.name for field in frozen.fields]
-    base_fields = {identifier_key(field.name): field for field in base_schema}
-    side_fields = {identifier_key(field.name): field for field in sidecar_schema}
-    if len(base_fields) != len(base_schema) or len(side_fields) != len(sidecar_schema):
-        raise MergeColumnsError("merge schema is ambiguous")
-    if (not intent.rules
-            or len(intent.rules) != len({identifier_key(rule.target) for rule in intent.rules})):
-        raise MergeColumnsError("merge rules are invalid")
-    if len(intent.rules) != len({identifier_key(rule.source) for rule in intent.rules}):
-        raise MergeColumnsError("merge rules are invalid")
-    for rule in intent.rules:
-        source_key, target_key = identifier_key(rule.source), identifier_key(rule.target)
-        if (source_key not in side_fields or target_key in {identifier_key(name) for name in identities}
-                or source_key in {identifier_key(name) for name in identities}
-                or not rule.source or not rule.target):
-            raise MergeColumnsError("merge rules are invalid")
-        target = base_fields.get(target_key)
-        if rule.mode == "add":
-            if target is not None:
-                raise MergeColumnsError("merge add target already exists")
-        elif target is None or target.type != side_fields[source_key].type:
-            raise MergeColumnsError("merge replace type is invalid")
-    payload = [field.name for field in sidecar_schema if identifier_key(field.name) not in {
-        identifier_key(name) for name in identities}]
-    if {identifier_key(rule.source) for rule in intent.rules} != {
-            identifier_key(name) for name in payload}:
-        raise MergeColumnsError("merge rules do not consume the certified sidecar payload")
-    expected = _schema_columns(base_schema) + [
-        ColumnSchema(name=rule.target, type=_schema_columns(
-            pa.schema([side_fields[identifier_key(rule.source)]]))[0].type)
-        for rule in intent.rules if rule.mode == "add"
-    ]
+    expected = merge_output_schema(base_schema, sidecar_schema, identities, intent.rules)
     if intent.output_schema != expected or write.expected_schema != expected:
         raise MergeColumnsError("merge output schema is invalid")
     return exact, identities

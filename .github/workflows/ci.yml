@@ -203,10 +203,12 @@ jobs:
           hub/tests/test_linear_checkpoint_commit.py
           hub/tests/test_linear_checkpoint_lifecycle.py
       - name: Verify durable SparseOutput merge ownership on PostgreSQL
-        # This named race is PostgreSQL-gated and must not disappear behind the SQLite skip.
+        # These named races are PostgreSQL-gated and must not disappear behind the SQLite skip.
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_merge_columns.py -k postgres
+          && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_merge_columns_api.py -k postgres
       - name: Verify temporal publication atomicity on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
