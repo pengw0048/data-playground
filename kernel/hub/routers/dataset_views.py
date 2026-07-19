@@ -340,15 +340,18 @@ def create_dataset_view(
                 "sampleProvenance": (
                     provenance.model_dump(by_alias=True, mode="json") if provenance else None),
                 "retentionOwner": source.retention_owner,
-                "createdAt": created_at.isoformat(),
+                "createdAt": created_at,
                 "semanticSha256": semantic_sha256,
             }
             if request.temporal_window is not None:
                 base["temporalWindow"] = request.temporal_window.model_dump(
                     by_alias=True, mode="json")
-            definition_sha256 = _canonical_sha256(base)
-            definition = DatasetViewDefinitionV1.model_validate({
-                **base, "definitionSha256": definition_sha256,
+            draft = DatasetViewDefinitionV1.model_validate({
+                **base, "definitionSha256": "0" * 64,
+            })
+            definition_sha256 = _canonical_sha256(draft.definition_digest_payload())
+            definition = draft.model_copy(update={
+                "definition_sha256": definition_sha256,
             })
             document = json.dumps(
                 definition.model_dump(by_alias=True, mode="json"),

@@ -363,12 +363,9 @@ def _sha256(payload: str) -> str:
 
 
 def _view_definition_digest(view: DatasetViewDefinitionV1) -> str:
-    payload = view.model_dump(by_alias=True, mode="json")
-    payload.pop("definitionSha256")
-    if payload.get("temporalWindow") is None:
-        payload.pop("temporalWindow", None)
     return _sha256(json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        view.definition_digest_payload(),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
 
 def _task_id(owner_id: str, submission_id: str) -> str:

@@ -21,6 +21,7 @@ from hub.models import DatasetViewDefinitionV1
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import dataset_views as dataset_view_routes
+from hub.routers import distribution_reports as distribution_report_routes
 from hub.storage import LocalStorage
 
 
@@ -469,6 +470,7 @@ def test_core_revision_hold_is_installed_and_released_with_view(
             storage=storage,
             resolve_adapter=lambda _uri: DuckDBAdapter(),
         ))
+        monkeypatch.setattr(distribution_report_routes, "dispatch", lambda _task_id: None)
 
         with TestClient(app) as client:
             request = _request({
@@ -479,12 +481,37 @@ def test_core_revision_hold_is_installed_and_released_with_view(
             assert created.status_code == 201, created.text
             definition = created.json()
             assert definition["retentionOwner"] == "core"
+            parsed = DatasetViewDefinitionV1.model_validate(definition)
+            assert dataset_view_routes._canonical_sha256(
+                parsed.definition_digest_payload()) == definition["definitionSha256"]
+            report_submission = str(uuid.uuid4())
+            admitted = client.post(
+                f"/api/dataset-views/{definition['id']}/distribution-reports",
+                json={"submissionId": report_submission, "confirmed": True},
+            )
+            assert admitted.status_code == 201, admitted.text
+            report_id = admitted.json()["reportId"]
             with metadb.session() as session:
                 refs = list(session.scalars(select(metadb.LocalResultReference).where(
                     metadb.LocalResultReference.owner_kind == "dataset_view",
                     metadb.LocalResultReference.owner_key == definition["id"],
                 )))
                 assert [ref.uri for ref in refs] == [artifact]
+
+            assert metadb._engine is not None
+            metadb._engine.dispose()
+            metadb._engine = metadb._Session = None
+            metadb.init_db()
+            reloaded = client.get(f"/api/dataset-views/{definition['id']}")
+            assert reloaded.status_code == 200
+            assert reloaded.json() == definition
+            replay = client.post(
+                f"/api/dataset-views/{definition['id']}/distribution-reports",
+                json={"submissionId": report_submission, "confirmed": True},
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["reportId"] == report_id
+
             assert client.delete(f"/api/dataset-views/{definition['id']}").status_code == 200
             with metadb.session() as session:
                 assert session.scalar(select(metadb.LocalResultReference.uri).where(
