@@ -1092,9 +1092,12 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
                 session.add_all([
                     metadb.User(id=editor_id, name="Overlay editor"),
                     metadb.User(id=viewer_id, name="Overlay viewer"),
-                    metadb.CanvasShare(
-                        canvas_id=workspace_scope["canvas_id"], user_id=editor_id, role="editor"),
                 ])
+                # Flush the principals before the ID-only share row. SQLite does not enforce this
+                # foreign-key ordering by default, while PostgreSQL correctly rejects the reverse.
+                session.flush()
+                session.add(metadb.CanvasShare(
+                    canvas_id=workspace_scope["canvas_id"], user_id=editor_id, role="editor"))
             editor_move = client.put(
                 f"/api/workspace/placements/{source_placement['id']}/canvas",
                 headers={"X-DP-User": editor_id}, json={
