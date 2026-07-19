@@ -110,7 +110,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('button', { name: 'Open datasetview robot interactions' }).parentElement)
       .toHaveTextContent('DatasetView · Local exact view')
     expect(mocks.datasetView).toHaveBeenCalledWith('view-1')
-    expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1')
+    await waitFor(() => expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1'))
   })
 
   it('continues a bounded page only when the user requests more', async () => {
