@@ -3,6 +3,7 @@ import { roleCanEdit, targetParameterDeclarations, useStore } from '../store/gra
 import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
+import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
@@ -16,15 +17,21 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
+  const target = doc.nodes.find((node) => node.id === nodeId)
+  const isWrite = target?.type === 'write'
+  const mergeRules = target?.data.config.mergeColumns
+  const isConfiguredMerge = !!mergeRules && typeof mergeRules === 'object' && !Array.isArray(mergeRules)
+    && Array.isArray((mergeRules as { rules?: unknown }).rules)
+    && (mergeRules as { rules: unknown[] }).rules.length > 0
   const setParameterBinding = useStore((s) => s.setRunParameterBinding)
   const clearParameterBinding = useStore((s) => s.clearRunParameterBinding)
   const editParameters = useStore((s) => s.editRunParameters)
   const submitParameters = useStore((s) => s.submitRunParameters)
 
   useEffect(() => {
-    if (!run || run.phase === 'idle') estimate(nodeId)
+    if (!isConfiguredMerge && (!run || run.phase === 'idle')) estimate(nodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId])
+  }, [isConfiguredMerge, nodeId])
 
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
@@ -38,6 +45,14 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const parameterBindings = new Map((run?.parameterBindings ?? []).map((item) => [item.name, item.value]))
   const parameterErrors = parameterDeclarations.map((item) => parameterValueError(
     item, parameterBindings.has(item.name), parameterBindings.get(item.name)))
+
+  if (isConfiguredMerge) return (
+    <div className="p-3.5">
+      <Label>CERTIFIED COLUMN MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware column merge rather than an ordinary overwrite run.</div>
+      <MergeColumnsControl nodeId={nodeId} />
+    </div>
+  )
 
   return (
     <div className="p-3.5">
@@ -140,6 +155,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </Button>
         </>
       )}
+
+      {isWrite && <MergeColumnsControl nodeId={nodeId} compact />}
 
       {phase === 'done' && st && (
         <>

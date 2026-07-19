@@ -976,6 +976,26 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.some((toast) => toast.msg === message && toast.kind === 'error')).toBe(true)
   })
 
+  it('routes configured column-merge Writes to their certified panel instead of the ordinary runner', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/source.parquet' }
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', mergeColumns: {
+      identityColumns: ['id'], rules: [{ source: 'score', target: 'score', mode: 'add' }],
+    } }
+    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }] } })
+
+    await useStore.getState().requestRun('write')
+    await useStore.getState().run('write')
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
+    expect(useStore.getState().openPanels).toEqual({ write: 'run' })
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Column merge uses its certified admission flow.')).toBe(true)
+  })
+
   it('runs the exact managed-local intent shown by write admission', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/source.parquet' }

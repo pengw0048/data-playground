@@ -14,6 +14,7 @@ function Write({ id, data }: NodeComponentProps) {
   const runPhase = useStore((s) => s.runs[id]?.phase)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
+  const merge = data.config.mergeColumns as { taskId?: string; rules?: unknown[] } | undefined
   useEffect(() => {
     if (runPhase === 'estimating' || runPhase === 'confirm'
         || runPhase === 'drift' || runPhase === 'running') return
@@ -28,8 +29,9 @@ function Write({ id, data }: NodeComponentProps) {
     : admission?.managed
       ? admission.blocker ? `blocked · ${admission.blocker}` : `${admission.mode} · ${admission.expectedSchema.length} cols`
       : admission ? `${admission.mode} · ${admission.provider}` : 'checking destination…'
+  const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   return (
-    <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${semantics}` : 'name an output → (destination in the panel)'}>
+    <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${mergeSemantics ?? semantics}` : 'name an output → (destination in the panel)'}>
       <div className="flex gap-2">
         <Field label="file name" style={{ flex: 1.6 }}>
           <MiniInput value={name} placeholder="output.parquet" onChange={(v) => updateConfig(id, { filename: v })} />

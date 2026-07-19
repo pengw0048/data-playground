@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -169,5 +169,33 @@ describe('RunPanel typed parameter gate', () => {
     render(<RunPanel nodeId="target" />)
     fireEvent.click(screen.getByRole('button', { name: 'Edit parameters' }))
     expect(mocks.edit).toHaveBeenCalledWith('target')
+  })
+
+  it('shows configured column merges only through their certified admission control', async () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { mergeColumns: {
+        identityColumns: ['id'], rules: [{ source: 'score', target: 'score', mode: 'add' }],
+      } } },
+    }]
+    mocks.state.doc.parameters = []
+    mocks.state.runs = { target: { phase: 'idle' } }
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByText('CERTIFIED COLUMN MERGE')).toBeVisible()
+    expect(screen.getByLabelText('Certified column merge')).toBeVisible()
+    await waitFor(() => expect(mocks.state.estimate).not.toHaveBeenCalled())
+    expect(screen.queryByRole('button', { name: 'Run' })).not.toBeInTheDocument()
+  })
+
+  it('continues to estimate an ordinary Write with no merge rules', async () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: {} },
+    }]
+    mocks.state.doc.parameters = []
+    mocks.state.runs = { target: { phase: 'idle' } }
+    render(<RunPanel nodeId="target" />)
+    await waitFor(() => expect(mocks.state.estimate).toHaveBeenCalledWith('target'))
   })
 })

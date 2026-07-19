@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type CanvasFile, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
+import type { DatasetRevisionDetail, WriteReceipt } from '../types/api'
 import { routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { status as statusTok } from '../theme/tokens'
@@ -49,6 +50,7 @@ const updateLabel = (updatedAt: string | null | undefined) => (
 const refreshLabel = (refreshedAt: number) => new Date(refreshedAt).toLocaleTimeString()
 
 function jobPhase(item: WorkspaceJobDto): string | null {
+  if (item.mergeColumns) return `Column merge · ${readable(item.mergeColumns.phase)}`
   if (item.externalWait) return `External wait · ${readable(item.externalWait.phase)}`
   if (item.checkpoint) return `Checkpoint · ${readable(item.checkpoint.phase)}`
   if (item.boundedFanout) return `Fan-out · ${readable(item.boundedFanout.stage)}`
@@ -175,7 +177,15 @@ export function JobsView() {
     const runId = item.runId ?? item.id
     setActing(`${runId}:${action}`); setActionError('')
     try {
-      if (action === 'cancel') await api.cancelRun(runId)
+      if (item.mergeColumns && item.taskId) {
+        if (action === 'cancel') await api.cancelMergeColumnsTask(item.taskId)
+        else {
+          const actionId = retryActions.current.get(runId) ?? globalThis.crypto.randomUUID()
+          retryActions.current.set(runId, actionId)
+          await api.retryMergeColumnsTask(item.taskId, actionId)
+          retryActions.current.delete(runId)
+        }
+      } else if (action === 'cancel') await api.cancelRun(runId)
       else {
         const actionId = retryActions.current.get(runId) ?? globalThis.crypto.randomUUID()
         retryActions.current.set(runId, actionId)
@@ -356,6 +366,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const rows = item.rows ?? item.profile?.rowCount ?? null
   const phase = jobPhase(item)
   const report = item.distributionReport
+  const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}` : item.canvasName || 'Unavailable canvas'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
@@ -372,7 +383,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
       <div className="grid gap-1"><div><strong>{item.taskId ? 'Task' : 'Run'}:</strong> <span className="font-mono">{item.runId ?? item.id}</span></div><div><strong>State:</strong> <span className="capitalize">{item.status}</span></div>{phase && <div><strong>Phase:</strong> {phase}</div>}<div><strong>Current attempt:</strong> <span className="font-mono">{item.attempt}</span></div><div><strong>Progress:</strong> {progressLabel(item.progress)}</div><div><strong>Last durable update:</strong> {updateLabel(item.updatedAt)}</div>{item.cancelRequested && <div className="text-amber-700">Cancellation requested; waiting for the owned work to stop or be fenced.</div>}{item.error && <div role="alert" className="whitespace-pre-wrap rounded border border-destructive/25 bg-destructive/10 p-2 text-destructive">{item.error}</div>}</div>
       <div className="flex flex-wrap content-start gap-2">
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
-        {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>Open node</a>}
+        {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
@@ -386,11 +397,29 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.externalWait && <div><strong>External provider:</strong> {item.externalWait.providerKind} · provider attempt #{item.externalWait.attemptNumber}</div>}
         {item.checkpoint && <div><strong>Checkpoint:</strong> {item.checkpoint.checkpointNodeId}:{item.checkpoint.outputPortId}{item.checkpoint.resumeEligible ? ' · resume eligible' : ''}{item.checkpoint.contentDigest ? ` · ${item.checkpoint.contentDigest}` : ''}{item.checkpoint.rows != null ? ` · ${item.checkpoint.rows.toLocaleString()} rows` : ''}{item.checkpoint.diagnosticCode ? ` · ${item.checkpoint.diagnosticCode}` : ''}</div>}
         {item.boundedFanout && <div><strong>Fan-out:</strong> {item.boundedFanout.completedPartitions}/{item.boundedFanout.partitionCount ?? '—'} partitions{item.boundedFanout.failedPartitions ? ` · ${item.boundedFanout.failedPartitions} failed` : ''} · checkpoint {item.boundedFanout.checkpoint} · gather {item.boundedFanout.gather}{item.boundedFanout.diagnosticCode ? ` · ${item.boundedFanout.diagnosticCode}` : ''}</div>}
+        {item.mergeColumns && <div><strong>Column merge:</strong> {readable(item.mergeColumns.phase)} · candidate {item.mergeColumns.candidate}{item.mergeColumns.reused ? ' (reused)' : ''}{item.mergeColumns.candidateRows != null ? ` · ${item.mergeColumns.candidateRows.toLocaleString()} rows` : ''}{item.mergeColumns.diagnosticCode ? ` · ${item.mergeColumns.diagnosticCode}` : ''}</div>}
         <div><strong>Exact inputs:</strong> {item.inputManifest?.length ? item.inputManifest.map((input) => `${input.dataset_id}@${input.revision_id}`).join(', ') : 'No versioned sources'}</div>
         {item.writeIntent && <div><strong>Write:</strong> {item.writeIntent.mode} · {item.writeIntent.destination.name} · expected head {item.writeIntent.expectedHead?.revisionId ?? 'none'}</div>}
-        {item.outputReceipt && <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{item.outputReceipt.datasetId}</span> · revision <span className="font-mono">{item.outputReceipt.revisionId}</span> · {item.outputReceipt.rows.toLocaleString()} rows · {item.outputReceipt.bytes.toLocaleString()} bytes</div>}
+        {item.outputReceipt && <ExactRevisionReceipt receipt={item.outputReceipt} />}
         {item.checkpoint?.resumeEligible && item.checkpoint.clientKey && <button type="button" className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent w-fit" onClick={() => onOutput(outputKey(item.checkpoint!.clientKey, item.checkpoint!.outputPortId))}>Open checkpoint</button>}
       </div>}
     </div>}
   </article>
+}
+
+function ExactRevisionReceipt({ receipt }: { receipt: WriteReceipt }) {
+  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const open = async () => {
+    setLoading(true); setError('')
+    try { setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId)) }
+    catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setLoading(false) }
+  }
+  return <div className="rounded border border-border bg-background p-2"><strong>Receipt:</strong> dataset <span className="font-mono">{receipt.datasetId}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes
+    <Button size="sm" variant="outline" className="ml-2 h-6 px-2 text-[10px]" onClick={() => void open()} disabled={loading}>{loading ? 'Opening…' : 'Open exact revision'}</Button>
+    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}</div>}
+    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-muted/30 p-2 text-[10.5px]"><div>Committed {detail.committedAt ? new Date(detail.committedAt).toLocaleString() : 'at an unknown time'} · {detail.summary.rowCount == null ? 'row count unavailable' : `${detail.summary.rowCount.toLocaleString()} rows`}</div><div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'} · {detail.preview.columns.length} fields</div><div className="mt-1 overflow-auto"><table className="w-full text-left"><thead><tr>{detail.preview.columns.map((column) => <th key={column.name} className="pr-2 font-medium">{column.name}</th>)}</tr></thead><tbody>{detail.preview.rows.slice(0, 5).map((row, index) => <tr key={index}>{detail.preview.columns.map((column) => <td key={column.name} className="max-w-24 truncate pr-2 font-mono">{String(row[column.name] ?? '')}</td>)}</tr>)}</tbody></table></div>{detail.preview.hasMore && <div className="mt-1 text-muted-foreground">Preview is bounded; this remains the exact published revision.</div>}</div>}
+  </div>
 }

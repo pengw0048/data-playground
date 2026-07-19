@@ -1,5 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { api, KernelError, setApiUser, toGraph } from './client'
+import { api, KernelError, setApiUser, toGraph, toMergeColumnsGraph } from './client'
 import type { CanvasDoc } from '../types/graph'
 import type { WriteIntent } from '../types/api'
 
@@ -45,6 +45,29 @@ describe('toGraph wire serialization', () => {
 
   it('drops note/code annotation nodes (no build step)', () => {
     expect(toGraph(doc).nodes.map((n) => n.id)).toEqual(['a', 'j'])
+  })
+
+  it('sends only the direct Source → Select → Write chain to certified merge admission', () => {
+    const mergeDoc: CanvasDoc = {
+      ...doc,
+      nodes: [
+        { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'source', status: 'latest', config: { uri: 'exact.parquet', datasetRef: { kind: 'exact', datasetId: 'd', revisionId: 'r' } } } },
+        { id: 'select', type: 'select', position: { x: 1, y: 0 }, data: { title: 'select', status: 'draft', config: { select: 'id, score' } } },
+        { id: 'write', type: 'write', position: { x: 2, y: 0 }, data: { title: 'write', status: 'draft', config: { filename: 'exact.parquet' } } },
+        { id: 'unrelated', type: 'filter', position: { x: 9, y: 9 }, data: { title: 'unrelated', status: 'draft', config: { predicate: 'x > 0' } } },
+      ],
+      edges: [
+        { id: 'source-select', source: 'source', target: 'select', data: { wire: 'dataset' } },
+        { id: 'select-write', source: 'select', target: 'write', data: { wire: 'dataset' } },
+        { id: 'unrelated-write', source: 'unrelated', target: 'write', data: { wire: 'dataset' } },
+      ],
+    }
+    const graph = toMergeColumnsGraph(mergeDoc, 'write')
+    // The extra direct input is retained as evidence for authoritative shape rejection; unrelated
+    // parts of the canvas remain absent and can never join this certified request.
+    expect(graph.nodes.map((node: any) => node.id).sort()).toEqual(['select', 'source', 'unrelated', 'write'])
+    expect(graph.edges.map((edge: any) => edge.id).sort()).toEqual(['select-write', 'source-select', 'unrelated-write'])
+    expect(graph.nodes.some((node: any) => node.id === 'a')).toBe(false)
   })
 
   it('sends an Agent request with only the current prompt and current graph payload', async () => {
