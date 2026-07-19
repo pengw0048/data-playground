@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import datetime
 import uuid
 import hashlib
 import json
@@ -29,9 +30,12 @@ from hub.row_identity import (
 )
 from hub.sparse_outputs import (
     SparseOutputAdmissionRequest,
+    SparseOutputMaterializationConflict,
     SparseOutputSubmissionConflict,
     SparseOutputValidationError,
     admit_sparse_output,
+    materialize_sparse_output,
+    reopen_sparse_output,
 )
 from hub.storage import LocalStorage
 
@@ -149,6 +153,351 @@ def test_admission_retains_only_existing_exact_base_and_replays_atomically(local
     assert len(_sparse_refs(first.id)) == 1
 
 
+def test_materialization_writes_one_sidecar_and_reopens_exact_evidence(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "materialize.parquet"), pa.table({
+        "id": pa.array([1, 2], type=pa.int32()), "payload": pa.array(["a", "b"]),
+        "untouched": pa.array([4, 5], type=pa.int32()),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="materialize"))
+    result = materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    assert result.committed is True
+    assert result.evidence["coverage"]["status"] == "complete"
+    assert result.evidence["rows"] == 2
+    assert len(_sparse_refs(admitted.id)) == 2
+    with metadb.session() as session:
+        materialization = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        assert materialization is not None and materialization.phase == "committed"
+        artifact = session.get(metadb.LocalResultArtifact, materialization.candidate_uri)
+        assert artifact is not None and artifact.committed_at is not None
+        assert artifact.writer_run_id is artifact.writer_token is None
+    with reopen_sparse_output(storage, admitted.id) as guard:
+        table = DuckDBAdapter().scan(guard.uri).to_arrow_table()
+    assert table.column_names == ["id", "score"]
+
+
+def test_reserved_candidate_stays_protected_after_expiry(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "protected.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="protected"))
+    token = uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=token, lease_seconds=1,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root, lock_token=uuid.uuid4().hex)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        row.lease_until = metadb._db_now(session) - datetime.timedelta(seconds=1)
+    assert metadb.local_result_lock_candidates(storage.namespace_id) == []
+    metadb.reconcile_dead_local_result(candidate["uri"], storage.namespace_id, candidate["lock_name"])
+    with metadb.session() as session:
+        artifact = session.get(metadb.LocalResultArtifact, candidate["uri"])
+        assert artifact.writer_run_id == admitted.id and artifact.writer_token == token
+    assert metadb.claim_local_result_reclaims(storage.namespace_id) == []
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, token)
+
+
+def test_future_owner_claim_keeps_the_reserved_generation_and_candidate(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "rotated-owner.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="rotated-owner"))
+    first_token, next_token = uuid.uuid4().hex, uuid.uuid4().hex
+    first = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=first_token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        artifact = session.get(metadb.LocalResultArtifact, row.candidate_uri)
+        row.owner_token = next_token
+        row.lease_until = metadb._db_now(session) + datetime.timedelta(seconds=30)
+        artifact.writer_token = next_token
+    with pytest.raises(RuntimeError, match="stale or fenced"):
+        metadb.reserve_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=first_token, lease_seconds=30,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=uuid.uuid4().hex)
+    replay = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=next_token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    assert replay["generation"] == first["generation"]
+    assert replay["uri"] == first["uri"] and replay["lock_name"] == first["lock_name"]
+
+
+def test_commit_response_loss_reconciles_the_one_committed_sidecar(local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "response-loss.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="response-loss"))
+    original = metadb.commit_sparse_output_materialization
+
+    def committed_then_lost(**kwargs):
+        original(**kwargs)
+        raise ConnectionError("response lost")
+
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", committed_then_lost)
+    result = materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    assert result.committed is True and result.evidence["coverage"]["status"] == "complete"
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.SparseOutputMaterialization)) == 1
+        assert session.scalar(select(func.count()).select_from(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "sparse_output",
+            metadb.LocalResultReference.owner_key == admitted.id)) == 2
+
+
+def test_committed_commit_replay_rejects_a_different_generation(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "generation-replay.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="generation-replay"))
+    token = uuid.uuid4().hex
+    materialize_sparse_output(storage, admitted.id, token)
+    committed = metadb.reconcile_sparse_output_materialization(admitted.id)
+    wrong_generation = "f" * 64 if committed["generation"] != "f" * 64 else "e" * 64
+    with pytest.raises(RuntimeError, match="changed evidence"):
+        metadb.commit_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=token,
+            namespace_id=committed["namespace_id"], storage_root=committed["storage_root"],
+            lock_name=committed["lock_name"], lock_token=committed["lock_token"],
+            lock_protected=committed["lock_protected"], generation=wrong_generation,
+            rows=committed["rows"], size_bytes=committed["bytes"],
+            content_sha256=committed["content_sha256"],
+            schema_sha256=committed["schema_sha256"], dev=committed["dev"], ino=committed["ino"],
+            coverage_doc=json.dumps(
+                committed["coverage"], sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def test_response_loss_never_accepts_a_corrupted_committed_descriptor(local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "response-corrupt.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="response-corrupt"))
+    original = metadb.commit_sparse_output_materialization
+
+    def committed_corrupt_then_lost(**kwargs):
+        original(**kwargs)
+        with metadb.session() as session:
+            uri = session.get(metadb.SparseOutputMaterialization, admitted.id).candidate_uri
+        pq.write_table(pa.table({"id": pa.array([1], type=pa.int32()),
+                                 "score": pa.array(["changed"])}), uri)
+        raise ConnectionError("response lost")
+
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", committed_corrupt_then_lost)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+
+
+def test_reservation_requires_the_exact_base_hold_before_any_side_effect(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "missing-base.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="missing-base"))
+    with metadb.session() as session:
+        session.delete(session.scalar(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "sparse_output",
+            metadb.LocalResultReference.owner_key == admitted.id)))
+        before = session.scalar(select(func.count()).select_from(metadb.LocalResultArtifact))
+    with pytest.raises(RuntimeError, match="base retention"):
+        metadb.reserve_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=uuid.uuid4().hex, lease_seconds=30,
+            namespace_id=storage.namespace_id, storage_root=storage.result_root,
+            lock_token=uuid.uuid4().hex)
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id) is None
+        assert session.scalar(select(func.count()).select_from(metadb.LocalResultArtifact)) == before
+
+
+def test_materialization_without_os_locks_has_no_reservation_side_effect(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "no-lock.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="no-lock"))
+    storage.lock_supported = False
+    with pytest.raises(SparseOutputMaterializationConflict, match="requires OS locks"):
+        materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id) is None
+
+
+def test_committed_replay_and_reopen_fail_closed_on_held_payload_schema_drift(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "schema-drift.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="schema-drift"))
+    token = uuid.uuid4().hex
+    materialize_sparse_output(storage, admitted.id, token)
+    with metadb.session() as session:
+        uri = session.get(metadb.SparseOutputMaterialization, admitted.id).candidate_uri
+    pq.write_table(pa.table({"id": pa.array([1], type=pa.int32()),
+                             "wrong_score": pa.array(["a"])}), uri)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, token)
+    with pytest.raises(Exception):
+        reopen_sparse_output(storage, admitted.id)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("storage_root", "/tmp/.dp-results"),
+    ("lock_name", "wrong.lock"),
+    ("writer", None),
+    ("candidate_ino", 0),
+    ("coverage_sha256", "0" * 64),
+])
+def test_committed_authority_or_evidence_tampering_fails_closed(
+        local_catalog, tmp_path, field, value):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / f"tamper-{field}.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission=f"tamper-{field}"))
+    token = uuid.uuid4().hex
+    materialize_sparse_output(storage, admitted.id, token)
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        artifact = session.get(metadb.LocalResultArtifact, row.candidate_uri)
+        if field in {"storage_root", "lock_name"}:
+            setattr(artifact, field, value)
+        elif field == "writer":
+            artifact.writer_run_id, artifact.writer_token = admitted.id, uuid.uuid4().hex
+        else:
+            setattr(row, field, value)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, token)
+
+
+def test_committed_sidecar_survives_storage_reconstruction(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "reconstruct.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="reconstruct"))
+    materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    rebuilt = LocalStorage(storage.root)
+    try:
+        with reopen_sparse_output(rebuilt, admitted.id) as guard:
+            assert DuckDBAdapter().scan(guard.uri).count("*").fetchone()[0] == 1
+    finally:
+        rebuilt.close()
+
+
+def test_bound_wrong_payload_schema_is_not_reattached_or_committed(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "reattach-schema.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="reattach-schema"))
+    token = uuid.uuid4().hex
+    candidate = metadb.reserve_sparse_output_materialization(
+        sparse_id=admitted.id, owner_token=token, lease_seconds=30,
+        namespace_id=storage.namespace_id, storage_root=storage.result_root,
+        lock_token=uuid.uuid4().hex)
+    writer = storage.materialize_checkpoint(candidate)
+    try:
+        metadb.bind_sparse_output_materialization(
+            sparse_id=admitted.id, owner_token=token, uri=writer.uri,
+            dev=writer.identity()[0], ino=writer.identity()[1])
+        with os.fdopen(os.dup(writer.fileno()), "wb") as output:
+            pq.write_table(pa.table({"id": pa.array([1], type=pa.int32()),
+                                     "wrong_score": pa.array(["a"])}), output)
+        writer.seal()
+    finally:
+        writer.release()
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, token)
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id).phase == "reserved"
+        assert len(_sparse_refs(admitted.id)) == 1
+
+
+@pytest.mark.parametrize("field, value", [("storage_root", "/tmp/.dp-results"), ("lock_name", "bad.lock")])
+def test_commit_refuses_authority_tampering_after_proof(local_catalog, tmp_path, monkeypatch, field, value):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / f"before-commit-{field}.parquet"), pa.table({
+        "id": pa.array([1], type=pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission=f"before-commit-{field}"))
+    original = metadb.commit_sparse_output_materialization
+
+    def tampered_commit(**kwargs):
+        with metadb.session() as session:
+            row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+            setattr(session.get(metadb.LocalResultArtifact, row.candidate_uri), field, value)
+        return original(**kwargs)
+
+    monkeypatch.setattr(metadb, "commit_sparse_output_materialization", tampered_commit)
+    with pytest.raises(SparseOutputMaterializationConflict):
+        materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    with metadb.session() as session:
+        assert session.get(metadb.SparseOutputMaterialization, admitted.id).phase == "reserved"
+        assert len(_sparse_refs(admitted.id)) == 1
+
+
+def test_concurrent_materialization_has_one_current_owner_and_exact_sidecar(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "concurrent-materialize.parquet"), pa.table({
+        "id": pa.array([1, 2], type=pa.int32()), "payload": pa.array(["a", "b"]),
+    }))
+    owner, canvas = _owner_canvas()
+    admitted = admit_sparse_output(storage, _request(
+        published, owner=owner, canvas=canvas, submission="concurrent-materialize"))
+    token = uuid.uuid4().hex
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(materialize_sparse_output, storage, admitted.id, token) for _ in range(2)]
+        results = []
+        for future in futures:
+            try:
+                results.append(future.result())
+            except SparseOutputMaterializationConflict:
+                pass
+    assert any(result.committed for result in results)
+    assert materialize_sparse_output(storage, admitted.id, token).committed is True
+    with metadb.session() as session:
+        row = session.get(metadb.SparseOutputMaterialization, admitted.id)
+        assert row is not None and row.phase == "committed" and row.owner_token == token
+        refs = list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "sparse_output",
+            metadb.LocalResultReference.owner_key == admitted.id)))
+        assert len(refs) == 2 and row.candidate_uri in {ref.uri for ref in refs}
+
+
 @pytest.mark.parametrize(("projection", "status"), [
     ("id + 10 AS id, payload AS score", "partial"),
     ("1 AS id, payload AS score", "invalid"),
@@ -163,6 +512,10 @@ def test_partial_and_invalid_coverage_are_retained_as_truth(local_catalog, tmp_p
         published, owner=owner, canvas=canvas, submission=f"submission-{status}", projection=projection))
     assert admitted.document["documents"]["evidence"]["status"] == status
     assert len(_sparse_refs(admitted.id)) == 1
+    materialized = materialize_sparse_output(storage, admitted.id, uuid.uuid4().hex)
+    assert materialized.evidence["coverage"]["status"] == status
+    with reopen_sparse_output(storage, admitted.id) as guard:
+        assert DuckDBAdapter().scan(guard.uri).count("*").fetchone()[0] == 2
 
 
 def test_concurrent_same_submission_converges_on_one_row_and_one_reference(local_catalog, tmp_path):
