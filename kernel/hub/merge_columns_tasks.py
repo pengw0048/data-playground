@@ -23,14 +23,14 @@ _active_lock = threading.Lock()
 _active: dict[str, threading.Thread] = {}
 
 
-def _status(task_id: str, *, phase: str, progress: float) -> dict:
-    doc = RunStatus(run_id=task_id, status="running", target_node_id="merge-columns",
+def _status(task_id: str, target_node_id: str, *, phase: str, progress: float) -> dict:
+    doc = RunStatus(run_id=task_id, status="running", target_node_id=target_node_id,
                     progress=progress).model_dump()
     doc["merge_phase"] = phase
     return doc
 
 
-def _failed(task_id: str, exc: BaseException) -> dict:
+def _failed(task_id: str, target_node_id: str, exc: BaseException) -> dict:
     if (isinstance(exc, metadb.ManagedLocalWriteConflict)
             and str(exc) == "replace expected head is stale"):
         code = "stale_expected_head"
@@ -38,19 +38,21 @@ def _failed(task_id: str, exc: BaseException) -> dict:
         code = "checkpoint_invalid"
     else:
         code = "merge_columns_write_failed"
-    return RunStatus(run_id=task_id, status="failed", target_node_id="merge-columns",
+    return RunStatus(run_id=task_id, status="failed", target_node_id=target_node_id,
                      error=code).model_dump()
 
 
-def _cancelled(task_id: str) -> dict:
-    return RunStatus(run_id=task_id, status="cancelled", target_node_id="merge-columns").model_dump()
+def _cancelled(task_id: str, target_node_id: str) -> dict:
+    return RunStatus(run_id=task_id, status="cancelled", target_node_id=target_node_id).model_dump()
 
 
-def _done(task_id: str, intent: WriteIntent, receipt: WriteReceipt) -> RunStatus:
+def _done(
+        task_id: str, target_node_id: str, intent: WriteIntent,
+        receipt: WriteReceipt) -> RunStatus:
     return RunStatus(
-        run_id=task_id, status="done", target_node_id="merge-columns", progress=1.0,
+        run_id=task_id, status="done", target_node_id=target_node_id, progress=1.0,
         total_rows=receipt.rows, outputs=[RunOutput(
-            node_id="merge-columns", port_id="out", wire="dataset",
+            node_id=target_node_id, port_id="out", wire="dataset",
             publication_kind="catalog", outcome="committed",
             uri=receipt.publication.artifact_uri, table=intent.destination.name,
             version=receipt.publication.catalog_version, rows=receipt.rows,
@@ -80,13 +82,15 @@ def _candidate_bytes(table: pa.Table) -> bytes:
 
 def _publish_candidate(
         deps, *, task_id: str, attempt_id: str, owner_token: str,
-        frozen: MergeColumnsIntentV1, intent: WriteIntent) -> RunStatus:
+        target_node_id: str, frozen: MergeColumnsIntentV1,
+        intent: WriteIntent) -> RunStatus:
     prior = _receipt(intent, frozen)
     if prior is not None:
-        return _done(task_id, intent, prior)
+        return _done(task_id, target_node_id, intent, prior)
     if not metadb.update_merge_columns_task_phase(
             task_id, attempt_id, owner_token, phase="publishing",
-            status_doc=_status(task_id, phase="publishing", progress=0.8)):
+            status_doc=_status(
+                task_id, target_node_id, phase="publishing", progress=0.8)):
         raise RuntimeError("merge columns publication owner is stale or fenced")
     try:
         guard, _evidence = lc.reopen_checkpoint(deps.storage, task_id)
@@ -117,11 +121,11 @@ def _publish_candidate(
             merge_publication=merge_columns_publication_context(
                 frozen, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token))
         guard.check()
-        return _done(task_id, intent, receipt)
+        return _done(task_id, target_node_id, intent, receipt)
     except Exception:
         prior = _receipt(intent, frozen)
         if prior is not None:
-            return _done(task_id, intent, prior)
+            return _done(task_id, target_node_id, intent, prior)
         raise
     finally:
         with contextlib.suppress(Exception):
@@ -135,6 +139,7 @@ def _worker(task_id: str, deps) -> None:
         if claimed is None:
             return
         attempt_id = str(claimed["attempts"][-1]["id"])
+        target_node_id = str(claimed["target_node_id"])
         frozen = MergeColumnsIntentV1.model_validate(claimed["merge_columns_intent"])
         intent = WriteIntent.model_validate(claimed["write_intent"])
         try:
@@ -142,14 +147,15 @@ def _worker(task_id: str, deps) -> None:
             prior = _receipt(intent, frozen)
             if prior is not None:
                 metadb.finish_durable_task_attempt(
-                    task_id, attempt_id, owner_token, _done(task_id, intent, prior).model_dump())
+                    task_id, attempt_id, owner_token,
+                    _done(task_id, target_node_id, intent, prior).model_dump())
                 return
             recovery = lc.recover_checkpoint(
                 deps.storage, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token)
             if recovery["action"] == "committed":
                 status = _publish_candidate(
                     deps, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,
-                    frozen=frozen, intent=intent)
+                    target_node_id=target_node_id, frozen=frozen, intent=intent)
             else:
                 if recovery["action"] == "reattach":
                     lc.commit_reattached_checkpoint(
@@ -158,12 +164,14 @@ def _worker(task_id: str, deps) -> None:
                 else:
                     if not metadb.update_merge_columns_task_phase(
                             task_id, attempt_id, owner_token, phase="validating",
-                            status_doc=_status(task_id, phase="validating", progress=0.1)):
+                            status_doc=_status(
+                                task_id, target_node_id, phase="validating", progress=0.1)):
                         return
                     _heartbeat(task_id, attempt_id, owner_token)
                     if not metadb.update_merge_columns_task_phase(
                             task_id, attempt_id, owner_token, phase="merging",
-                            status_doc=_status(task_id, phase="merging", progress=0.35)):
+                            status_doc=_status(
+                                task_id, target_node_id, phase="merging", progress=0.35)):
                         return
                     table = merge_sparse_output_candidate(storage=deps.storage, intent=frozen)
                     _heartbeat(task_id, attempt_id, owner_token)
@@ -187,27 +195,29 @@ def _worker(task_id: str, deps) -> None:
                             raise
                 if metadb.durable_task_attempt_should_stop(task_id, attempt_id, owner_token):
                     metadb.finish_durable_task_attempt(
-                        task_id, attempt_id, owner_token, _cancelled(task_id))
+                        task_id, attempt_id, owner_token,
+                        _cancelled(task_id, target_node_id))
                     return
                 status = _publish_candidate(
                     deps, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,
-                    frozen=frozen, intent=intent)
+                    target_node_id=target_node_id, frozen=frozen, intent=intent)
             if (status.status == "cancelled"
                     or metadb.durable_task_attempt_should_stop(task_id, attempt_id, owner_token)):
                 prior = _receipt(intent, frozen)
-                status = _done(task_id, intent, prior) if prior is not None else RunStatus.model_validate(
-                    _cancelled(task_id))
+                status = (_done(task_id, target_node_id, intent, prior)
+                          if prior is not None else RunStatus.model_validate(
+                              _cancelled(task_id, target_node_id)))
             metadb.finish_durable_task_attempt(task_id, attempt_id, owner_token, status.model_dump())
         except BaseException as exc:
             prior = None
             with contextlib.suppress(Exception):
                 prior = _receipt(intent, frozen)
             if prior is not None:
-                status = _done(task_id, intent, prior).model_dump()
+                status = _done(task_id, target_node_id, intent, prior).model_dump()
             elif metadb.durable_task_attempt_should_stop(task_id, attempt_id, owner_token):
-                status = _cancelled(task_id)
+                status = _cancelled(task_id, target_node_id)
             else:
-                status = _failed(task_id, exc)
+                status = _failed(task_id, target_node_id, exc)
             metadb.finish_durable_task_attempt(task_id, attempt_id, owner_token, status)
     finally:
         with _active_lock:

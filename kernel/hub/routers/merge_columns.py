@@ -127,6 +127,7 @@ def _request_sha256(request: MergeColumnsRequestV1) -> str:
                    "datasetRef": base.model_dump(by_alias=True, mode="json")},
         "select": _node_config(select)["select"],
         "sink": {
+            "targetNodeId": write.id,
             "name": spec.name, "filename": spec.filename, "extension": spec.extension,
             "mode": spec.mode, "destinationId": spec.destination_id,
             "destinationPath": spec.destination_path, "partitionBy": spec.partition_by,
@@ -329,7 +330,8 @@ def submit(request: MergeColumnsRequestV1, uid: str = Depends(current_user)) -> 
         )
         task, _created = metadb.submit_merge_columns_task(
             uid=uid, canvas_id=str(request.graph.id), submission_id=request.submission_id,
-            intent=intent, sparse_owner_id=canvas_owner, request_sha256=_request_sha256(request))
+            target_node_id=_shape(request)[2].id, intent=intent,
+            sparse_owner_id=canvas_owner, request_sha256=_request_sha256(request))
     except metadb.DurableTaskSubmissionConflict as exc:
         # A post-commit response loss may leave the deterministic Task durable.  Reconcile it before
         # surfacing a failure; never tear down a retained sidecar in an unconditional finally block.

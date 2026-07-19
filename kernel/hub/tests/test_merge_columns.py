@@ -515,7 +515,7 @@ def _wait_task(task_id: str) -> dict:
 def _admit_durable_merge(case: MergeCase, intent: MergeColumnsIntentV1, submission: str) -> dict:
     task, created = metadb.submit_merge_columns_task(
         uid=case.admission["ownerId"], canvas_id=case.admission["canvasId"],
-        submission_id=submission, intent=intent)
+        submission_id=submission, target_node_id="write", intent=intent)
     assert created
     return task
 
@@ -582,7 +582,7 @@ def test_durable_merge_reuses_only_committed_candidate_and_redacts_jobs(local_ca
         assert checkpoint is not None and checkpoint.phase == "committed"
     assert metadb.finish_durable_task_attempt(
         task["id"], attempt_id, owner,
-        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "write"})
     retried = metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
     assert retried["status"] == "queued"
 
@@ -628,7 +628,7 @@ def test_durable_merge_corrupt_committed_candidate_fails_closed(local_catalog, t
         corrupted.write(b"not a parquet candidate")
     assert metadb.finish_durable_task_attempt(
         task["id"], attempt_id, owner,
-        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "write"})
     metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
     monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate",
                         lambda *_args, **_kwargs: pytest.fail("corrupt candidate recomputed merge"))
@@ -650,7 +650,8 @@ def test_durable_merge_stale_publication_owner_cannot_cross_replacement_claim(
     stale_attempt, stale_owner = _commit_durable_merge_candidate(task, case, intent)
     assert metadb.update_merge_columns_task_phase(
         task["id"], stale_attempt, stale_owner, phase="publishing",
-        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+        status_doc=merge_columns_tasks._status(
+            task["id"], "write", phase="publishing", progress=0.8))
     _expire_attempt(stale_attempt)
     replacement_owner = "replacement-publication-owner"
     replacement = metadb.claim_merge_columns_task(task["id"], replacement_owner)
@@ -663,12 +664,14 @@ def test_durable_merge_stale_publication_owner_cannot_cross_replacement_claim(
     assert _revision_count(case.exact.dataset_id) == 1
     assert metadb.update_merge_columns_task_phase(
         task["id"], replacement_attempt, replacement_owner, phase="publishing",
-        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+        status_doc=merge_columns_tasks._status(
+            task["id"], "write", phase="publishing", progress=0.8))
     receipt = _publish_checkpoint_as_owner(
         case, intent, task["id"], replacement_attempt, replacement_owner)
     assert metadb.finish_durable_task_attempt(
         task["id"], replacement_attempt, replacement_owner,
-        merge_columns_tasks._done(task["id"], intent.write_intent, receipt).model_dump())
+        merge_columns_tasks._done(
+            task["id"], "write", intent.write_intent, receipt).model_dump())
     assert _revision_count(case.exact.dataset_id) == 2
     assert _merge_publication_count() == 1
 
@@ -757,7 +760,7 @@ def test_durable_merge_restart_from_each_authoritative_phase(
         assert metadb.update_merge_columns_task_phase(
             task["id"], attempt_id, owner, phase=visible_phase,
             status_doc=merge_columns_tasks._status(
-                task["id"], phase=visible_phase, progress=0.2))
+                task["id"], "write", phase=visible_phase, progress=0.2))
         if restart_phase == "reserved":
             metadb.reserve_linear_checkpoint_candidate(
                 task_id=task["id"], attempt_id=attempt_id, owner_token=owner,
@@ -780,7 +783,7 @@ def test_durable_merge_restart_from_each_authoritative_phase(
             assert metadb.update_merge_columns_task_phase(
                 task["id"], attempt_id, owner, phase="publishing",
                 status_doc=merge_columns_tasks._status(
-                    task["id"], phase="publishing", progress=0.8))
+                    task["id"], "write", phase="publishing", progress=0.8))
     _expire_attempt(attempt_id)
     original_merge = merge_columns_tasks.merge_sparse_output_candidate
     merge_calls = 0
@@ -819,7 +822,7 @@ def test_durable_merge_cancel_and_stale_head_are_deterministic(local_catalog, tm
                                              head=case.exact), base)
     assert metadb.finish_durable_task_attempt(
         task["id"], attempt_id, owner,
-        {"run_id": task["id"], "status": "cancelled", "target_node_id": "merge-columns"})
+        {"run_id": task["id"], "status": "cancelled", "target_node_id": "write"})
     metadb.retry_durable_task(task["id"], str(uuid.uuid4()))
     monkeypatch.setattr(merge_columns_tasks, "merge_sparse_output_candidate",
                         lambda *_args, **_kwargs: pytest.fail("stale head recomputed merge"))
@@ -856,7 +859,8 @@ def test_postgres_two_owners_have_one_durable_merge_candidate_and_publication(
     stale_attempt, stale_owner = _commit_durable_merge_candidate(task, case, intent)
     assert metadb.update_merge_columns_task_phase(
         task["id"], stale_attempt, stale_owner, phase="publishing",
-        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+        status_doc=merge_columns_tasks._status(
+            task["id"], "write", phase="publishing", progress=0.8))
     _expire_attempt(stale_attempt)
     replacement_owner = "postgres-replacement-owner"
     replacement = metadb.claim_merge_columns_task(task["id"], replacement_owner)
@@ -865,7 +869,8 @@ def test_postgres_two_owners_have_one_durable_merge_candidate_and_publication(
     assert replacement_attempt != stale_attempt
     assert metadb.update_merge_columns_task_phase(
         task["id"], replacement_attempt, replacement_owner, phase="publishing",
-        status_doc=merge_columns_tasks._status(task["id"], phase="publishing", progress=0.8))
+        status_doc=merge_columns_tasks._status(
+            task["id"], "write", phase="publishing", progress=0.8))
 
     # Both owners enter the real catalog publication transaction from independent sessions. Hold the
     # replacement's Task lock until the stale transaction is trying to acquire that same row: the old
@@ -904,7 +909,8 @@ def test_postgres_two_owners_have_one_durable_merge_candidate_and_publication(
     assert receipt.publication.artifact_uri != artifact_uris[stale_owner]
     assert metadb.finish_durable_task_attempt(
         task["id"], replacement_attempt, replacement_owner,
-        merge_columns_tasks._done(task["id"], intent.write_intent, receipt).model_dump())
+        merge_columns_tasks._done(
+            task["id"], "write", intent.write_intent, receipt).model_dump())
     with metadb.session() as s:
         attempts = list(s.scalars(select(metadb.DurableTaskAttempt).where(
             metadb.DurableTaskAttempt.task_id == task["id"]).order_by(
