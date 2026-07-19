@@ -2,8 +2,8 @@
 
 ## Scope and identity
 
-- Underlying product head audited: `00e9ff8c15d8940882f42d51343fc29c61091356` (`fix: fence fallback merge destination titles`), the reviewed #607 + #584 stacked head available to this acceptance worktree. It is not represented as a released `main` commit.
-- Acceptance evidence commit: recorded after the focused commands run, using the two-step metadata convention below. The executable test/fixture tree is committed first; a final documentation-only amend then records that immutable evidence-tree commit without making a self-referential SHA claim.
+- Underlying product commit audited: `b48be6f28fb14a505ffae79b7a3155516d0b7c5b` (`feat: run certified column merges from Write inspector (#612)`), the released #583/#607/#584 product path on `main`.
+- Acceptance evidence commit: `ffb9ab43c6a0460a6dcf00a1682747f515a008f8`. This immutable parent contains the exact executable tests, fixture contract, and audit content exercised by the focused commands. The enclosing child changes only this identity metadata, so the reference is stable and non-self-referential.
 - Fixture profile: `sqlite-local-managed`; the static sanitized contract is [fixture-manifest.json](fixture-manifest.json).
 - The fixture is a three-row, full-width managed-local base with logical identity `id`, two untouched columns, a replacement payload, and an added payload. Checksums cover logical rows and columns only.
 
