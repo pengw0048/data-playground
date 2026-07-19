@@ -120,5 +120,17 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
     await history.getByRole('button', { name: /Execution manifest/ }).click()
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
+
+    const deepLink = await page.request.get(`/api/workspace/resources/canvas:${canvasId}`)
+    expect(deepLink.ok()).toBeTruthy()
+    const deepLinkBody = await deepLink.json() as {
+      resource: { parentId?: string }; ancestors: Array<{ id?: string }>
+    }
+    expect(deepLinkBody.resource.parentId).toBe(externalPage.container.id)
+    expect(deepLinkBody.ancestors.at(-1)?.id).toBe(externalPage.container.id)
+
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(page.locator('.react-flow__node').filter({ hasText: datasetName })).toHaveCount(1)
   })
 })

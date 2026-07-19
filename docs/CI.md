@@ -37,6 +37,49 @@ the required core CI remains the stable merge gate when a Ray workflow is legiti
 CodeQL and Gitleaks also run on the integrated `main` tree. Superseded PR heads use
 `cancel-in-progress` so only the current revision consumes runners.
 
+## Writable local-overlay release evidence
+
+The source-only provider certification remains a focused test and fixture journey; it does not add a
+workflow or widen the public provider-conformance runtime. From a prepared checkout, run the installed
+wheel journey with:
+
+```bash
+cd kernel
+uv run pytest -q -s \
+  hub/tests/test_catalog_provider.py::test_file_provider_wheel_passes_public_conformance
+```
+
+For the shipped browser path, point the fixture mount and its provider root at the same disposable
+directory, then run the focused Playwright spec after building the SPA:
+
+```bash
+cd web
+npm run build
+DP_E2E_PROVIDER_ACCEPTANCE=1 \
+DP_E2E_PROVIDER_ROOT=/tmp/dp-provider-fixture \
+DP_CATALOG_MOUNTS='[{"id":"browser-provider","provider":"dp-file-catalog","config":{"root":"/tmp/dp-provider-fixture"}}]' \
+npm run e2e -- --no-deps --project=chromium e2e/workspace-provider.spec.ts
+```
+
+The journey records sanitized evidence only: local Canvas/placement and provider-binding/anchor identity
+survive restart and restore; an explicit same-ID relink gets a new binding. The fixture checks that the
+provider root did not change during Data Playground actions. It does not claim provider write-back,
+provider configuration or bytes in backups, background synchronization, a failure/relink Playwright
+matrix, public conformance expansion, Ray coverage, or organization-specific integration.
+
+The existing restore gates supply the storage profiles rather than a new CI matrix:
+
+```bash
+cd kernel
+uv run pytest -q -s hub/tests/test_backup_restore_drill.py -k sqlite
+DP_TEST_DATABASE_URL=postgresql+psycopg://... \
+  uv run pytest -q -s hub/tests/test_backup_restore_drill.py -k postgres
+```
+
+Their `BACKUP_RESTORE_OVERLAY_EVIDENCE` reports only preserved binding, anchor, placement, Canvas,
+replay, and state facts. Provider paths, configuration, credentials, and provider-owned bytes are outside
+the backup set and outside that evidence.
+
 ## Heavy acceptance
 
 The following workflows retain independent `workflow_dispatch` entry points. Runtime-backed suites also
