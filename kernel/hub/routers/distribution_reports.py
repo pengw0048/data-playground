@@ -12,8 +12,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from hub import distribution_reports
 from hub.api_errors import APIError, APIErrorCode
 from hub.distribution_report_insights import (
+    DistributionReportBucketExamplesV1,
     DistributionReportCompareRequestV1,
     DistributionReportComparisonV1,
+    InvalidReportBucket,
+    bucket_examples,
     compare_reports,
 )
 from hub.distribution_report_tasks import (
@@ -22,8 +25,14 @@ from hub.distribution_report_tasks import (
     estimate_distribution_report,
 )
 from hub.models import DatasetViewDefinitionV1, to_camel
+from hub.plugins.adapters import (
+    RevisionPermissionLost,
+    RevisionProviderOffline,
+    RevisionUnavailable,
+)
 from hub.routers.dataset_views import _stored_definition
 from hub.security import current_user
+from hub.storage import ManagedSourceReadError
 
 
 router = APIRouter()
@@ -187,6 +196,41 @@ def compare_distribution_reports(
     left, _left_view = _completed_document(uid, request.left_report_id)
     right, _right_view = _completed_document(uid, request.right_report_id)
     return compare_reports(left, right)
+
+
+@router.get(
+    "/distribution-reports/{report_id}/sections/{section_id}/buckets/{bucket_id}/examples",
+    response_model=DistributionReportBucketExamplesV1,
+)
+def get_distribution_report_bucket_examples(
+    report_id: str,
+    section_id: str,
+    bucket_id: str,
+    uid: str = Depends(current_user),
+) -> DistributionReportBucketExamplesV1:
+    """Replay one frozen view and filter by one server-issued retained bucket."""
+    if any(not value or len(value) > 64 for value in (section_id, bucket_id)):
+        raise APIError(
+            422, "Unsupported distribution report bucket id",
+            code=APIErrorCode.VALIDATION_ERROR, retryable=False)
+    document, view = _completed_document(uid, report_id)
+    try:
+        return bucket_examples(document, view, section_id, bucket_id)
+    except InvalidReportBucket as exc:
+        raise APIError(
+            422, str(exc), code=APIErrorCode.VALIDATION_ERROR, retryable=False) from exc
+    except (RevisionUnavailable, ManagedSourceReadError, KeyError) as exc:
+        raise APIError(
+            410, "Distribution report source revision is unavailable",
+            code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    except RevisionPermissionLost as exc:
+        raise APIError(
+            403, "Distribution report source permission was lost",
+            code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
+    except (RevisionProviderOffline, ConnectionError, TimeoutError) as exc:
+        raise APIError(
+            503, "Distribution report source provider is offline",
+            code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
 
 
 @router.get(
