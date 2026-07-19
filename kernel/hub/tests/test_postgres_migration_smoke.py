@@ -11,12 +11,23 @@ import sys
 import uuid
 
 import pytest
+import pyarrow as pa
+import pyarrow.parquet as pq
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 
 from hub import metadb
+from hub.models import ExactDatasetRef
+from hub.plugins.adapters import DuckDBAdapter
+from hub.plugins.catalog import InMemoryCatalog
+from hub.sparse_outputs import (
+    SparseOutputAdmissionRequest,
+    SparseOutputSubmissionConflict,
+    admit_sparse_output,
+)
+from hub.storage import LocalStorage
 from hub.tests.task_manifest_helpers import with_task_manifest
 
 
@@ -110,6 +121,75 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
         assert connection.execute(text("""
             SELECT id FROM workspace_containers WHERE id = 'workspace-local-root'
         """)).scalar_one() == "workspace-local-root"
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
+def test_postgres_sparse_output_admission_replays_one_exact_base_reference(tmp_path):
+    """Exercise the shared DB transaction boundary without allocating a sparse sidecar artifact."""
+    suffix = uuid.uuid4().hex
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    catalog = InMemoryCatalog(str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    owner, canvas = f"sparse-owner-{suffix}", f"sparse-canvas-{suffix}"
+    logical_uri = str(tmp_path / "base.parquet")
+    run_id = f"sparse-base-{suffix}"
+    artifact = storage.begin_result(f"managed-file:{logical_uri}", run_id)
+    try:
+        pq.write_table(pa.table({
+            "id": pa.array([1, 2], type=pa.int32()), "payload": pa.array(["a", "b"]),
+        }), artifact)
+        storage.commit_result(artifact, run_id)
+        published = catalog.publish_managed_local_file_output(
+            name="sparse-base", logical_uri=logical_uri, artifact_uri=artifact)
+        assert storage.release_result(artifact, run_id) is True
+        with metadb.session() as session:
+            session.add(metadb.User(id=owner, name="Sparse PostgreSQL owner"))
+            session.flush()
+            session.add(metadb.Canvas(id=canvas, owner_id=owner, name="Sparse", doc="{}"))
+        request = SparseOutputAdmissionRequest(
+            owner_id=owner, canvas_id=canvas, submission_id="Postgres-Submission",
+            dataset_ref=ExactDatasetRef(
+                kind="exact", dataset_id=published["dataset_id"],
+                revision_id=published["revision_id"]),
+            select_config={"expr": "id, payload AS score"}, identity_columns=["id"],
+            provenance={"idempotencyKey": f"sparse-{suffix}", "provenance": "manual"},
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            replays = list(pool.map(lambda _ignored: admit_sparse_output(storage, request), range(4)))
+        first = replays[0]
+        assert {result.id for result in replays} == {first.id}
+        assert sum(result.created for result in replays) == 1
+        conflicting = SparseOutputAdmissionRequest(
+            **{**request.__dict__, "submission_id": "Postgres-Conflict",
+               "select_config": {"expr": "id, payload AS other_score"}})
+        winning = SparseOutputAdmissionRequest(
+            **{**request.__dict__, "submission_id": "Postgres-Conflict"})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(admit_sparse_output, storage, value) for value in (winning, conflicting)]
+        outcomes = [future.exception() or future.result() for future in futures]
+        assert sum(isinstance(result, SparseOutputSubmissionConflict) for result in outcomes) == 1
+        assert sum(not isinstance(result, Exception) for result in outcomes) == 1
+        with metadb.session() as session:
+            refs = list(session.scalars(select(metadb.LocalResultReference).where(
+                metadb.LocalResultReference.owner_kind == "sparse_output",
+                metadb.LocalResultReference.owner_key == first.id,
+            )))
+            conflict_row = session.scalar(select(metadb.SparseOutput).where(
+                metadb.SparseOutput.owner_id == owner,
+                metadb.SparseOutput.canvas_id == canvas,
+                metadb.SparseOutput.submission_id == "postgres-conflict",
+            ))
+            assert conflict_row is not None
+            conflict_refs = list(session.scalars(select(metadb.LocalResultReference).where(
+                metadb.LocalResultReference.owner_kind == "sparse_output",
+                metadb.LocalResultReference.owner_key == conflict_row.id,
+            )))
+            artifacts = list(session.scalars(select(metadb.LocalResultArtifact).where(
+                metadb.LocalResultArtifact.uri == artifact)))
+        assert len(refs) == 1 and refs[0].uri == artifact
+        assert len(conflict_refs) == 1 and conflict_refs[0].uri == artifact
+        assert len(artifacts) == 1
+    finally:
+        storage.close()
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
