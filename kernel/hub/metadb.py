@@ -4711,6 +4711,9 @@ def _release_sparse_output_in_session(s, output: SparseOutput) -> dict:
         s.delete(ref)
     if row is not None:
         s.delete(row)
+    # These tables intentionally have no ORM relationships.  Flush the children before the parent
+    # so PostgreSQL's immediate foreign-key checks observe the same atomic release as SQLite.
+    s.flush()
     s.delete(output)
     return {"released": True, "uris": uris}
 
@@ -4722,6 +4725,20 @@ def release_sparse_output(sparse_id: str) -> dict | None:
         if output is None:
             return None
         return _release_sparse_output_in_session(s, output)
+
+
+def release_unclaimed_merge_sparse_output(sparse_id: str) -> bool:
+    """Retire one terminal merge sidecar only when no Task envelope claimed it."""
+    with session() as s:
+        output = s.get(SparseOutput, str(sparse_id), with_for_update=True)
+        if output is None:
+            return False
+        claimed = s.scalar(select(MergeColumnsTaskEnvelope).where(
+            MergeColumnsTaskEnvelope.sparse_output_id == output.id).with_for_update())
+        if claimed is not None:
+            return False
+        _release_sparse_output_in_session(s, output)
+        return True
 
 
 _WORKSPACE_BROWSE_MAX_LIMIT = 100
@@ -5919,6 +5936,7 @@ def _linear_checkpoint_admission_doc(
 
 def submit_merge_columns_task(
         *, uid: str, canvas_id: str, submission_id: str, intent: object,
+        sparse_owner_id: str | None = None, request_sha256: str | None = None,
         max_attempts: int = 3) -> tuple[dict, bool]:
     """Atomically admit one frozen certified SparseOutput merge and its checkpoint owner."""
     from hub.merge_columns import (
@@ -5941,6 +5959,8 @@ def submit_merge_columns_task(
         "sparseEvidence": frozen.sparse_evidence.model_dump(by_alias=True, mode="json"),
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
     uid, canvas_id = str(uid), str(canvas_id)
+    if request_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", request_sha256):
+        raise ValueError("merge columns request identity is invalid")
     task_id = durable_task_submission_id(uid, canvas_id, normalized_submission)
     checkpoint_id = "mcp:" + hashlib.sha256(
         f"merge-columns-checkpoint-v1\0{task_id}\0{intent_sha}".encode()).hexdigest()
@@ -5949,8 +5969,20 @@ def submit_merge_columns_task(
         if canvas is None:
             raise RuntimeError("merge columns task canvas does not exist")
         if s.get_bind().dialect.name == "sqlite":
+            # SQLite ignores SELECT ... FOR UPDATE.  Fence Canvas before reading a
+            # collaborator row so a concurrent revocation cannot interleave here.
             s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
                 updated_at=Canvas.updated_at))
+        sparse_owner_id = str(sparse_owner_id or uid)
+        if canvas.owner_id != sparse_owner_id:
+            raise DurableTaskSubmissionConflict("merge columns canvas ownership changed")
+        share_role = None
+        if canvas.owner_id != uid:
+            share_role = s.scalar(select(CanvasShare.role).where(
+                CanvasShare.canvas_id == canvas_id, CanvasShare.user_id == uid,
+            ).with_for_update())
+        if _effective_canvas_role(canvas, uid, share_role) not in ("owner", "editor"):
+            raise DurableTaskSubmissionConflict("merge columns actor no longer has editor access")
         task = s.get(DurableTask, task_id, with_for_update=True)
         checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
         envelope = s.get(MergeColumnsTaskEnvelope, task_id, with_for_update=True)
@@ -5968,13 +6000,15 @@ def submit_merge_columns_task(
                     or envelope.merge_doc != merge_doc or envelope.merge_sha256 != merge_sha):
                 raise DurableTaskSubmissionConflict(
                     "merge columns submission does not match its frozen admission")
+            if request_sha256 is not None and task.input_manifest != json.dumps({"requestSha256": request_sha256}):
+                raise DurableTaskSubmissionConflict("merge columns submission request changed")
             _lock_local_result_registry(s)
             return _durable_task_doc(s, task), False
 
         sparse = s.get(SparseOutput, frozen.sparse_output_id, with_for_update=True)
         materialization = s.get(
             SparseOutputMaterialization, frozen.sparse_output_id, with_for_update=True)
-        if (sparse is None or sparse.owner_id != uid or sparse.canvas_id != canvas_id
+        if (sparse is None or sparse.owner_id != sparse_owner_id or sparse.canvas_id != canvas_id
                 or sparse.input_dataset_id != frozen.base.dataset_id
                 or sparse.input_revision_id != frozen.base.revision_id
                 or materialization is None or materialization.phase != "committed"):
@@ -5984,13 +6018,19 @@ def submit_merge_columns_task(
         committed = _sparse_materialization_doc(s, materialization)
         if sparse_output_merge_evidence(_sparse_output_doc(sparse), committed) != frozen.sparse_evidence:
             raise DurableTaskSubmissionConflict("merge columns SparseOutput evidence changed")
+        try:
+            _validate_managed_local_write_precondition(s, frozen.write_intent, lock=True)
+        except ManagedLocalWriteConflict as exc:
+            raise DurableTaskSubmissionConflict(str(exc)) from exc
         write = frozen.write_intent.model_dump(by_alias=True, mode="json")
         now = _durable_task_db_now(s)
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=canvas_id, submission_id=normalized_submission,
             intent_sha256=intent_sha, target_node_id="merge-columns",
             task_kind="merge_columns_write", backend_kind="local", graph_doc=None,
-            input_manifest=None, write_intent=json.dumps(write, sort_keys=True, separators=(",", ":")),
+            input_manifest=(json.dumps({"requestSha256": request_sha256})
+                            if request_sha256 is not None else None),
+            write_intent=json.dumps(write, sort_keys=True, separators=(",", ":")),
             status="queued", status_doc=json.dumps(_task_status_doc(task_id, "merge-columns")),
             max_attempts=max_attempts, created_at=now, updated_at=now)
         attempt = DurableTaskAttempt(
@@ -6803,21 +6843,24 @@ def finish_durable_task_attempt(
         return True
 
 
+def _request_durable_task_cancel_in_session(s, task: DurableTask) -> dict:
+    """Apply the generic cancellation state transition to an already-authorized Task."""
+    if task.status not in _TERMINAL_RUN:
+        now = _durable_task_db_now(s)
+        task.cancel_requested = True
+        task.updated_at = now
+        attempt = s.scalar(select(DurableTaskAttempt).where(
+            DurableTaskAttempt.task_id == task.id,
+        ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+        if attempt is not None and attempt.cancel_requested_at is None:
+            attempt.cancel_requested_at = now
+    return _durable_task_doc(s, task)
+
+
 def request_durable_task_cancel(task_id: str) -> dict | None:
     with session() as s:
         task = _lock_durable_task_for_write(s, str(task_id))
-        if task is None:
-            return None
-        if task.status not in _TERMINAL_RUN:
-            now = _durable_task_db_now(s)
-            task.cancel_requested = True
-            task.updated_at = now
-            attempt = s.scalar(select(DurableTaskAttempt).where(
-                DurableTaskAttempt.task_id == task.id,
-            ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
-            if attempt is not None and attempt.cancel_requested_at is None:
-                attempt.cancel_requested_at = now
-        return _durable_task_doc(s, task)
+        return _request_durable_task_cancel_in_session(s, task) if task is not None else None
 
 
 def _external_wait_terminal(
@@ -7261,90 +7304,96 @@ def fail_external_wait_finalization(
         return True
 
 
-def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
+def _retry_durable_task_in_session(
+        s, task: DurableTask, retry_request_id: str) -> dict:
+    """Apply the generic retry state transition to an already-authorized Task."""
     retry_request_id = str(retry_request_id).lower()
+    replay = s.scalar(select(DurableTaskAttempt).where(
+        DurableTaskAttempt.task_id == task.id,
+        DurableTaskAttempt.retry_request_id == retry_request_id,
+    ).limit(1))
+    if replay is not None:
+        return _durable_task_doc(s, task)
+    if task.status not in ("failed", "cancelled"):
+        raise ValueError("only a failed or cancelled durable task can be retried")
+    if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
+        raise ValueError("stale merge columns head requires a new submission")
+    if task.task_kind == "temporal_resample_write" and task.status == "failed":
+        from hub.temporal_resample_diagnostics import temporal_failure_retryable
+        if not temporal_failure_retryable(task.error):
+            raise ValueError("temporal resample failure requires a new submission")
+    last = s.scalar(select(DurableTaskAttempt).where(
+        DurableTaskAttempt.task_id == task.id,
+    ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
+    if last is None or last.attempt_number >= task.max_attempts:
+        raise ValueError("durable task retry limit is exhausted")
+    now = _durable_task_db_now(s)
+    number = last.attempt_number + 1
+    s.add(DurableTaskAttempt(
+        id=uuid.uuid4().hex, task_id=task.id, attempt_number=number,
+        execution_manifest_sha256=task.execution_manifest_sha256,
+        retry_request_id=retry_request_id, status="queued", created_at=now))
+    task.status = "queued"
+    task.cancel_requested = False
+    task.retry_count = number - 1
+    task.progress = None
+    task.error = None
+    task.output_receipt = None
+    task.completed_at = None
+    task.updated_at = now
+    task.status_doc = json.dumps(
+        _task_status_doc(task.id, task.target_node_id), default=str)
+    if task.task_kind == "external_wait":
+        from hub.external_wait import ExternalWaitSubmitRequest
+        wait = s.get(DurableExternalWait, task.id, with_for_update=True)
+        if wait is None:
+            raise RuntimeError("external-wait durable evidence is missing")
+        prior = ExternalWaitSubmitRequest.model_validate_json(wait.submit_request)
+        request = prior.model_copy(update={
+            "idempotency_key": _external_wait_key(task.id, number)})
+        wait.submit_request = request.model_dump_json()
+        wait.idempotency_key = request.idempotency_key
+        wait.handle_doc = wait.checkpoint_doc = None
+        wait.download_evidence = None
+        wait.stage_dev = wait.stage_ino = None
+        wait.phase = "unsubmitted"
+        wait.poll_count = 0
+        wait.next_poll_at = now
+        wait.deadline_at = now + datetime.timedelta(seconds=60)
+        wait.diagnostic_code = None
+        wait.owner_token = wait.lease_until = None
+        wait.updated_at = now
+    elif task.task_kind == "distribution_report":
+        report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
+        if report is None:
+            raise RuntimeError("distribution report envelope is unavailable")
+        report.report_doc = None
+        report.completed_at = None
+        report.updated_at = now
+    elif task.task_kind == "merge_columns_write":
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+        checkpoint = s.get(DurableCheckpoint, task.id, with_for_update=True)
+        if envelope is None or checkpoint is None:
+            raise RuntimeError("merge columns retry evidence is unavailable")
+        envelope.phase = (
+            "candidate_committed" if checkpoint.phase == "committed" else "validating")
+        envelope.updated_at = now
+    elif task.task_kind == "temporal_resample_write":
+        envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
+        if envelope is None:
+            raise RuntimeError("temporal resample retry evidence is unavailable")
+        envelope.phase = "admitted"
+        envelope.updated_at = now
+    s.flush()
+    return _durable_task_doc(s, task)
+
+
+def retry_durable_task(task_id: str, retry_request_id: str) -> dict:
     with session() as s:
         task = _lock_durable_task_for_write(s, task_id)
         if task is None:
             raise KeyError(task_id)
-        replay = s.scalar(select(DurableTaskAttempt).where(
-            DurableTaskAttempt.task_id == task.id,
-            DurableTaskAttempt.retry_request_id == retry_request_id,
-        ).limit(1))
-        if replay is not None:
-            return _durable_task_doc(s, task)
-        if task.status not in ("failed", "cancelled"):
-            raise ValueError("only a failed or cancelled durable task can be retried")
-        if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
-            raise ValueError("stale merge columns head requires a new submission")
-        if task.task_kind == "temporal_resample_write" and task.status == "failed":
-            from hub.temporal_resample_diagnostics import temporal_failure_retryable
-            if not temporal_failure_retryable(task.error):
-                raise ValueError("temporal resample failure requires a new submission")
-        last = s.scalar(select(DurableTaskAttempt).where(
-            DurableTaskAttempt.task_id == task.id,
-        ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
-        if last is None or last.attempt_number >= task.max_attempts:
-            raise ValueError("durable task retry limit is exhausted")
-        now = _durable_task_db_now(s)
-        number = last.attempt_number + 1
-        s.add(DurableTaskAttempt(
-            id=uuid.uuid4().hex, task_id=task.id, attempt_number=number,
-            execution_manifest_sha256=task.execution_manifest_sha256,
-            retry_request_id=retry_request_id, status="queued", created_at=now))
-        task.status = "queued"
-        task.cancel_requested = False
-        task.retry_count = number - 1
-        task.progress = None
-        task.error = None
-        task.output_receipt = None
-        task.completed_at = None
-        task.updated_at = now
-        task.status_doc = json.dumps(
-            _task_status_doc(task.id, task.target_node_id), default=str)
-        if task.task_kind == "external_wait":
-            from hub.external_wait import ExternalWaitSubmitRequest
-            wait = s.get(DurableExternalWait, task.id, with_for_update=True)
-            if wait is None:
-                raise RuntimeError("external-wait durable evidence is missing")
-            prior = ExternalWaitSubmitRequest.model_validate_json(wait.submit_request)
-            request = prior.model_copy(update={
-                "idempotency_key": _external_wait_key(task.id, number)})
-            wait.submit_request = request.model_dump_json()
-            wait.idempotency_key = request.idempotency_key
-            wait.handle_doc = wait.checkpoint_doc = None
-            wait.download_evidence = None
-            wait.stage_dev = wait.stage_ino = None
-            wait.phase = "unsubmitted"
-            wait.poll_count = 0
-            wait.next_poll_at = now
-            wait.deadline_at = now + datetime.timedelta(seconds=60)
-            wait.diagnostic_code = None
-            wait.owner_token = wait.lease_until = None
-            wait.updated_at = now
-        elif task.task_kind == "distribution_report":
-            report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
-            if report is None:
-                raise RuntimeError("distribution report envelope is unavailable")
-            report.report_doc = None
-            report.completed_at = None
-            report.updated_at = now
-        elif task.task_kind == "merge_columns_write":
-            envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
-            checkpoint = s.get(DurableCheckpoint, task.id, with_for_update=True)
-            if envelope is None or checkpoint is None:
-                raise RuntimeError("merge columns retry evidence is unavailable")
-            envelope.phase = (
-                "candidate_committed" if checkpoint.phase == "committed" else "validating")
-            envelope.updated_at = now
-        elif task.task_kind == "temporal_resample_write":
-            envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
-            if envelope is None:
-                raise RuntimeError("temporal resample retry evidence is unavailable")
-            envelope.phase = "admitted"
-            envelope.updated_at = now
-        s.flush()
-        return _durable_task_doc(s, task)
+        return _retry_durable_task_in_session(s, task, retry_request_id)
 
 
 def recoverable_durable_task_ids(limit: int = 100) -> list[str]:
@@ -9048,7 +9097,6 @@ def _sanitized_merge_columns_jobs_view(
         "phase": envelope.phase,
         "baseDatasetId": envelope.base_dataset_id,
         "baseRevisionId": envelope.base_revision_id,
-        "sparseOutputId": envelope.sparse_output_id,
         "candidate": "committed" if committed else "pending",
         "reused": bool(committed and checkpoint.candidate_attempt_id != current_attempt_id),
         "candidateRows": checkpoint.committed_rows if committed else None,
@@ -9058,6 +9106,105 @@ def _sanitized_merge_columns_jobs_view(
         "canCancel": can_cancel,
         "diagnosticCode": diagnostic,
     }
+
+
+def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
+    """Return one owner-scoped sanitized merge Task view without paging through Jobs."""
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        if task is None or task.task_kind != "merge_columns_write" or task.owner_id != str(uid):
+            return None
+        role = canvas_role(task.canvas_id, str(uid))
+        if role is None:
+            return None
+        task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
+        attempts = task_doc["attempts"]
+        latest = attempts[-1] if attempts else {
+            "id": "missing", "attempt_number": task.retry_count + 1,
+        }
+        can_mutate = role in ("owner", "editor")
+        can_retry = (can_mutate and task.status in ("failed", "cancelled")
+                     and latest["attempt_number"] < task.max_attempts
+                     and task.error != "stale_expected_head")
+        can_cancel = can_mutate and task.status in ("queued", "running")
+        checkpoint = s.get(DurableCheckpoint, task.id)
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id)
+        if envelope is None:
+            raise RuntimeError("merge columns task envelope is unavailable")
+        return {
+            "taskId": task.id,
+            "status": task.status,
+            "canRetry": can_retry,
+            "canCancel": can_cancel,
+            "mergeColumns": _sanitized_merge_columns_jobs_view(
+                task, checkpoint, envelope, current_attempt_id=latest["id"],
+                can_retry=can_retry, can_cancel=can_cancel),
+        }
+
+
+def merge_columns_task_request_sha256(task_id: str) -> str | None:
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        if task is None or task.task_kind != "merge_columns_write" or task.input_manifest is None:
+            return None
+        try:
+            value = json.loads(task.input_manifest).get("requestSha256")
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def _lock_merge_columns_task_action(
+        s, task_id: str, uid: str) -> DurableTask | None:
+    """Lock a merge Task only after its current Canvas role is made authoritative.
+
+    The first Task read supplies an immutable subject for the Canvas/CanvasShare lock
+    order.  Re-reading the Task under its row lock then prevents a stale subject or
+    a revoked collaborator from changing the task state.
+    """
+    subject = s.execute(select(DurableTask.canvas_id).where(
+        DurableTask.id == str(task_id),
+    )).scalar_one_or_none()
+    if subject is None:
+        return None
+    canvas_id = str(subject)
+    canvas = s.get(Canvas, canvas_id, with_for_update=True)
+    if canvas is None:
+        return None
+    if s.get_bind().dialect.name == "sqlite":
+        # SQLite ignores FOR UPDATE; fence Canvas before reading CanvasShare so
+        # revocation and action admission serialize on the same subject.
+        s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
+            updated_at=Canvas.updated_at))
+    share_role = None
+    if canvas.owner_id != str(uid):
+        share_role = s.scalar(select(CanvasShare.role).where(
+            CanvasShare.canvas_id == canvas_id,
+            CanvasShare.user_id == str(uid),
+        ).with_for_update())
+    if _effective_canvas_role(canvas, str(uid), share_role) not in ("owner", "editor"):
+        return None
+    task = s.get(DurableTask, str(task_id), with_for_update=True, populate_existing=True)
+    if (task is None or task.task_kind != "merge_columns_write"
+            or task.owner_id != str(uid) or task.canvas_id != canvas_id):
+        return None
+    return task
+
+
+def cancel_merge_columns_task(task_id: str, uid: str) -> dict | None:
+    """Cancel one merge Task after atomically confirming its current editor role."""
+    with session() as s:
+        task = _lock_merge_columns_task_action(s, task_id, uid)
+        return _request_durable_task_cancel_in_session(s, task) if task is not None else None
+
+
+def retry_merge_columns_task(
+        task_id: str, uid: str, retry_request_id: str) -> dict | None:
+    """Retry one merge Task after atomically confirming its current editor role."""
+    with session() as s:
+        task = _lock_merge_columns_task_action(s, task_id, uid)
+        return (_retry_durable_task_in_session(s, task, retry_request_id)
+                if task is not None else None)
 
 
 def _sanitized_bounded_fanout_jobs_view(
