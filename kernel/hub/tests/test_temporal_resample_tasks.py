@@ -317,6 +317,33 @@ def test_openapi_exposes_the_finite_temporal_diagnostic_contract():
     }
 
 
+def test_openapi_enforces_exactly_one_temporal_target_mode():
+    from jsonschema import Draft202012Validator
+
+    contract = json.loads(render_openapi())
+    schemas = contract["components"]["schemas"]
+    bundle = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schemas,
+        "$ref": "#/$defs/TemporalResampleWriteRequestV1",
+    }
+    bundle = json.loads(json.dumps(bundle).replace("#/components/schemas/", "#/$defs/"))
+    validator = Draft202012Validator(bundle)
+    stream = _request().model_dump(by_alias=True, mode="json")
+    fixed = {**stream, "window": None, "targetViewId": None, "fixedGrid": {
+        "targetClockId": "reference-ms", "timeDomain": "reference",
+        "startTick": "0", "endTick": "10", "rateNumerator": "1000",
+        "rateDenominator": "1", "phaseTick": "0",
+    }}
+    all_missing = {**stream, "window": None, "targetViewId": None, "fixedGrid": None}
+    both_modes = {**stream, "fixedGrid": fixed["fixedGrid"]}
+
+    assert list(validator.iter_errors(stream)) == []
+    assert list(validator.iter_errors(fixed)) == []
+    assert list(validator.iter_errors(all_missing))
+    assert list(validator.iter_errors(both_modes))
+
+
 def test_public_fixture_submit_publishes_exact_sanitized_result_and_replays(real_case, monkeypatch):
     from hub import temporal_resample_tasks as tasks
     from hub.compound_datasets import open_compound_manifest
@@ -428,6 +455,65 @@ def test_bad_expected_schema_fails_public_preflight_without_task_or_output(real_
         assert int(session.scalar(select(func.count()).select_from(metadb.DurableTask).where(
             metadb.DurableTask.owner_id == real_case.owner)) or 0) == 0
     assert _temporal_counts(real_case.owner) == (0, 0, 0, 0)
+
+
+def test_fixed_grid_preflights_before_scanning_target_and_uses_existing_task_path(real_case, monkeypatch):
+    from hub import temporal_resample_tasks as tasks
+
+    clock = next(item for item in real_case.authority.manifest.streams
+                 if item.id == "target-observations").clock
+    request_doc = real_case.request.model_dump(by_alias=True, mode="json")
+    request_doc.pop("targetViewId")
+    request_doc.pop("window")
+    request_doc["fixedGrid"] = {
+        "targetClockId": clock.id, "timeDomain": "reference", "startTick": "0", "endTick": "10000",
+        "rateNumerator": "1000", "rateDenominator": "1", "phaseTick": "0",
+    }
+    request = TemporalResampleWriteRequestV1.model_validate(request_doc)
+    read_tick_fields: list[str] = []
+    original = tasks._points
+
+    def tracked_points(**kwargs):
+        read_tick_fields.append(kwargs["index"].tick_field)
+        return original(**kwargs)
+
+    monkeypatch.setattr(tasks, "_points", tracked_points)
+    manifest, candidate = tasks.candidate_for_request(real_case.owner, request)
+    assert manifest == real_case.authority.manifest
+    assert read_tick_fields == ["device_tick"]
+    assert candidate.spec.fixed_grid is not None
+    assert candidate.spec.target_view is None
+    assert candidate.evidence["targetPointCount"] == 10_000
+    assert candidate.rows[-1].target_observation_id == f"fixed-grid:{clock.id}:9999"
+    assert candidate.rows[-1].source_observation_id is None
+
+    task, created = metadb.submit_temporal_resample_task(
+        uid=real_case.owner, request=request, candidate_sha256=candidate.digest)
+    assert created is True
+    tasks._worker(task["id"], real_case.deps)
+    completed = metadb.durable_task(task["id"])
+    assert completed is not None and completed["status"] == "done"
+    result = metadb.temporal_resample_task_result(task["id"])
+    assert result is not None
+    assert result["receipt"]["rows"] == 10_000
+    assert result["evidence"]["spec"]["fixedGrid"] == {
+        "targetClockId": clock.id, "rateNumerator": 1000,
+        "rateDenominator": 1, "phaseTick": 0,
+    }
+
+    forbidden = real_case.request.model_dump(by_alias=True, mode="json")
+    forbidden["fixedGrid"] = request_doc["fixedGrid"]
+    with pytest.raises(ValueError, match="unused target DatasetView or stream window"):
+        TemporalResampleWriteRequestV1.model_validate(forbidden)
+
+    bad_doc = dict(request_doc)
+    bad_doc["candidateCap"] = bad_doc["outputCap"] = 1
+    bad_request = TemporalResampleWriteRequestV1.model_validate(bad_doc)
+    read_tick_fields.clear()
+    with pytest.raises(TemporalResampleAdmissionError) as error:
+        tasks.candidate_for_request(real_case.owner, bad_request)
+    assert error.value.code is TemporalResampleDiagnosticCode.SPEC_INVALID
+    assert read_tick_fields == []
 
 
 def test_existing_output_member_fails_public_preflight_without_task_or_output(real_case):

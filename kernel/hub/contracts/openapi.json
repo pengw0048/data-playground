@@ -10198,6 +10198,75 @@
         "title": "TemporalEvidenceWindowEvidenceV1",
         "type": "object"
       },
+      "TemporalFixedGridTargetV1": {
+        "additionalProperties": false,
+        "description": "One exact rational target grid in the target clock's physical time unit.",
+        "properties": {
+          "endTick": {
+            "description": "Canonical signed-int64 exclusive target-clock end tick.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+            "title": "Endtick",
+            "type": "string"
+          },
+          "phaseTick": {
+            "description": "Canonical signed-int64 target-clock phase/origin tick.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+            "title": "Phasetick",
+            "type": "string"
+          },
+          "rateDenominator": {
+            "description": "Positive rational observations-per-second denominator.",
+            "maxLength": 19,
+            "minLength": 1,
+            "pattern": "^[1-9][0-9]*$",
+            "title": "Ratedenominator",
+            "type": "string"
+          },
+          "rateNumerator": {
+            "description": "Positive rational observations-per-second numerator.",
+            "maxLength": 19,
+            "minLength": 1,
+            "pattern": "^[1-9][0-9]*$",
+            "title": "Ratenumerator",
+            "type": "string"
+          },
+          "startTick": {
+            "description": "Canonical signed-int64 inclusive target-clock start tick.",
+            "maxLength": 20,
+            "minLength": 1,
+            "pattern": "^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$",
+            "title": "Starttick",
+            "type": "string"
+          },
+          "targetClockId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Targetclockid",
+            "type": "string"
+          },
+          "timeDomain": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Timedomain",
+            "type": "string"
+          }
+        },
+        "required": [
+          "targetClockId",
+          "timeDomain",
+          "startTick",
+          "endTick",
+          "rateNumerator",
+          "rateDenominator",
+          "phaseTick"
+        ],
+        "title": "TemporalFixedGridTargetV1",
+        "type": "object"
+      },
       "TemporalResampleDiagnosticCode": {
         "description": "Finite public diagnostics for temporal-resample admission and execution.",
         "enum": [
@@ -10538,7 +10607,50 @@
       },
       "TemporalResampleWriteRequestV1": {
         "additionalProperties": false,
-        "description": "One bounded, exact temporal-resample submission.\n\nThe compound identity and DatasetViews name immutable identities only.  The server\nreopens both views during admission and again under the durable lease; raw\nobservations, provider URIs, and credentials never enter this envelope.",
+        "description": "One bounded, exact temporal-resample submission.\n\nThe source DatasetView is always reopened during admission and under the durable\nlease.  Stream-timestamp targets also reopen their exact target DatasetView; a\nfixed-grid target instead binds the exact target stream, clock, and mapping\nauthority and scans no target view.  Raw observations, provider URIs, and\ncredentials never enter this envelope.",
+        "oneOf": [
+          {
+            "properties": {
+              "fixedGrid": {
+                "type": "null"
+              },
+              "targetViewId": {
+                "not": {
+                  "type": "null"
+                }
+              },
+              "window": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "window",
+              "targetViewId"
+            ],
+            "title": "Stream timestamp target"
+          },
+          {
+            "properties": {
+              "fixedGrid": {
+                "not": {
+                  "type": "null"
+                }
+              },
+              "targetViewId": {
+                "type": "null"
+              },
+              "window": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "fixedGrid"
+            ],
+            "title": "Fixed rational-grid target"
+          }
+        ],
         "properties": {
           "candidateCap": {
             "default": 10000,
@@ -10564,6 +10676,16 @@
             "minLength": 1,
             "title": "Episodeid",
             "type": "string"
+          },
+          "fixedGrid": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalFixedGridTargetV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "outputCap": {
             "default": 10000,
@@ -10620,10 +10742,17 @@
             "type": "string"
           },
           "targetViewId": {
-            "maxLength": 32,
-            "minLength": 1,
-            "title": "Targetviewid",
-            "type": "string"
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetviewid"
           },
           "toleranceTicks": {
             "default": "0",
@@ -10634,7 +10763,14 @@
             "type": "string"
           },
           "window": {
-            "$ref": "#/components/schemas/TemporalWindowV1"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TemporalWindowV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "writeIntent": {
             "$ref": "#/components/schemas/WriteIntent"
@@ -10650,8 +10786,6 @@
           "outputStreamId",
           "outputMemberId",
           "sourceViewId",
-          "targetViewId",
-          "window",
           "selectedFields",
           "writeIntent"
         ],

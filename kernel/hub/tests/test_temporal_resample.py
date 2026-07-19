@@ -16,6 +16,7 @@ from hub.temporal_resample import (
     INT64_MIN,
     DatasetViewIdentity,
     FieldSelection,
+    FixedGridTarget,
     ManagedOutputRevision,
     PointObservation,
     ResampleWindow,
@@ -23,6 +24,7 @@ from hub.temporal_resample import (
     TemporalResampleSpecV1,
     build_resample_candidate,
     compose_child_manifest,
+    preflight_fixed_grid,
 )
 
 
@@ -127,6 +129,76 @@ def test_fixture_source_facts_produce_sorted_nearest_rows_and_null_gap(tmp_path)
     assert first.evidence["gapTargetObservationIds"] == ["episode-1-target-007"]
     assert first.evidence["signedDeltaTicks"] == {"count": 6, "minimum": 0, "maximum": 0}
     assert first.evidence["complete"] is True
+
+
+def test_fixed_rational_grid_is_canonical_half_open_and_preserves_known_gap(tmp_path):
+    manifest = _fixture_manifest(tmp_path)
+    source, _target = _fixture_episode_points(tmp_path)
+    clock = next(item for item in manifest.streams if item.id == "target-observations").clock
+    base = replace(_spec(manifest, tolerance=1, candidate_cap=10_000, output_cap=10_000),
+                   window=ResampleWindow("reference", 8_000, 10_000))
+    first = build_resample_candidate(
+        manifest, replace(base, target_view=None, fixed_grid=FixedGridTarget(clock.id, 1_000, 1, 0)), source, [])
+    equivalent = build_resample_candidate(
+        manifest, replace(base, target_view=None, fixed_grid=FixedGridTarget(clock.id, 2_000, 2, 1)), source, [])
+    changed = build_resample_candidate(
+        manifest, replace(base, target_view=None, fixed_grid=FixedGridTarget(clock.id, 500, 1, 0)), source, [])
+
+    assert first.spec == equivalent.spec
+    assert first.spec.identity_document() == equivalent.spec.identity_document()
+    assert first.spec.idempotency_digest == equivalent.spec.idempotency_digest
+    assert first.spec.idempotency_digest != changed.spec.idempotency_digest
+    assert [item.tick for item in first.target_points[:3]] == [8_000, 8_001, 8_002]
+    assert first.target_points[-1].tick == 9_999
+    assert all(item.tick < 10_000 for item in first.target_points)
+    assert first.rows[-1].target_observation_id == f"fixed-grid:{clock.id}:9999"
+    assert first.evidence["targetPointCount"] == 2_000
+    assert any(item.target_tick == 9_999 and item.source_observation_id is None for item in first.rows)
+    child = compose_child_manifest(
+        manifest, first, ManagedOutputRevision("fixed-output", "managed.fixed", "fixed-r1"))
+    stream = next(item for item in child["streams"] if item["id"] == "derived-resample")
+    assert stream["timing"] == "regular"
+    assert stream["nominalRate"] == {"numerator": 1000, "denominator": 1, "physicalUnit": "second"}
+
+
+def test_fixed_grid_rejects_nonintegral_overflow_and_cap_before_point_reads(tmp_path):
+    manifest = _fixture_manifest(tmp_path)
+    clock = next(item for item in manifest.streams if item.id == "target-observations").clock
+    base = _spec(manifest, candidate_cap=10, output_cap=10)
+    cases = [
+        (FixedGridTarget(clock.id, 3, 1, 0), "integral"),
+        (FixedGridTarget(clock.id, 1, (1 << 63) - 1, 0), "overflows"),
+        (FixedGridTarget(clock.id, 1_000, 1, 0), "cap"),
+    ]
+    for grid, message in cases:
+        with pytest.raises(TemporalResampleError, match=message):
+            preflight_fixed_grid(manifest, replace(base, target_view=None, fixed_grid=grid))
+    with pytest.raises(TemporalResampleError, match="positive"):
+        preflight_fixed_grid(manifest, replace(
+            base, target_view=None, fixed_grid=FixedGridTarget(clock.id, 0, 1, 0)))
+    with pytest.raises(TemporalResampleError, match="target clock"):
+        preflight_fixed_grid(manifest, replace(
+            base, target_view=None, fixed_grid=FixedGridTarget("wrong-clock", 500, 1, 0)))
+
+
+def test_fixed_grid_phase_alignment_and_randomized_bounds_are_exact(tmp_path):
+    manifest = _fixture_manifest(tmp_path)
+    clock = next(item for item in manifest.streams if item.id == "target-observations").clock
+    rng = random.Random(582)
+    for _ in range(100):
+        start = rng.randrange(-100, 100)
+        end = start + rng.randrange(1, 30)
+        phase = rng.randrange(-20, 21)
+        # 500 Hz is exactly two reference-ms ticks in the public fixture.
+        spec = replace(_spec(manifest, candidate_cap=100, output_cap=100), target_view=None,
+                       window=ResampleWindow("reference", start, end),
+                       fixed_grid=FixedGridTarget(clock.id, 500, 1, phase))
+        candidate = build_resample_candidate(manifest, spec, [], [])
+        ticks = [item.tick for item in candidate.target_points]
+        assert ticks == sorted(ticks)
+        assert all(start <= tick < end and (tick - phase) % 2 == 0 for tick in ticks)
+        expected = [tick for tick in range(start, end) if (tick - phase) % 2 == 0]
+        assert ticks == expected
 
 
 def test_invalid_contract_fails_before_any_candidate_and_caps_are_strict(tmp_path):
