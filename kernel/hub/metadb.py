@@ -4711,6 +4711,9 @@ def _release_sparse_output_in_session(s, output: SparseOutput) -> dict:
         s.delete(ref)
     if row is not None:
         s.delete(row)
+    # These tables intentionally have no ORM relationships.  Flush the children before the parent
+    # so PostgreSQL's immediate foreign-key checks observe the same atomic release as SQLite.
+    s.flush()
     s.delete(output)
     return {"released": True, "uris": uris}
 
