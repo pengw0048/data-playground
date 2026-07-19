@@ -1641,8 +1641,29 @@ def test_external_overlay_browse_rejects_legacy_and_cross_layout_cursors(
         "id": mount_id, "provider": "fixture", "containerId": root["id"],
     }]))
     with TestClient(app) as client:
-        root_page = client.get(f"/api/workspace/containers/{root['id']}").json()
-        remote = next(item for item in root_page["items"] if item.get("resourceId") == "container-a")
+        response = client.get(
+            f"/api/workspace/containers/{root['id']}", params={"limit": 50})
+        assert response.status_code == 200, response.text
+        root_page = response.json()
+        remote = next(
+            (item for item in root_page["items"] if item.get("resourceId") == "container-a"),
+            None,
+        )
+        cursor = root_page["nextCursor"]
+        while remote is None and cursor is not None:
+            response = client.get(
+                f"/api/workspace/containers/{root['id']}",
+                params={"limit": 50, "cursor": cursor},
+            )
+            assert response.status_code == 200, response.text
+            root_page = response.json()
+            remote = next(
+                (item for item in root_page["items"]
+                 if item.get("resourceId") == "container-a"),
+                None,
+            )
+            cursor = root_page["nextCursor"]
+        assert remote is not None
         identity = remote["id"].removeprefix("container:")
         current = client.get(f"/api/workspace/containers/{identity}", params={"limit": 1})
         assert current.status_code == 200, current.text
@@ -1699,8 +1720,29 @@ def test_external_overlay_canvas_deep_link_refreshes_live_container_and_falls_ba
     monkeypatch.setattr(provider, "resolve", resolve)
     monkeypatch.setattr(provider, "ancestors", ancestors)
     with TestClient(app) as client:
-        root_page = client.get(f"/api/workspace/containers/{root['id']}").json()
-        remote = next(item for item in root_page["items"] if item.get("resourceId") == "container-a")
+        response = client.get(
+            f"/api/workspace/containers/{root['id']}", params={"limit": 50})
+        assert response.status_code == 200, response.text
+        root_page = response.json()
+        remote = next(
+            (item for item in root_page["items"] if item.get("resourceId") == "container-a"),
+            None,
+        )
+        cursor = root_page["nextCursor"]
+        while remote is None and cursor is not None:
+            response = client.get(
+                f"/api/workspace/containers/{root['id']}",
+                params={"limit": 50, "cursor": cursor},
+            )
+            assert response.status_code == 200, response.text
+            root_page = response.json()
+            remote = next(
+                (item for item in root_page["items"]
+                 if item.get("resourceId") == "container-a"),
+                None,
+            )
+            cursor = root_page["nextCursor"]
+        assert remote is not None
         created = client.post("/api/workspace/canvases", json={
             "requestId": str(uuid.uuid4()),
             "containerId": remote["localPlacement"]["containerId"],
