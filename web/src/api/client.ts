@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
-  CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
 } from '../types/api'
@@ -25,6 +25,16 @@ export class KernelError extends Error {
     this.code = code
     this.retryable = retryable
   }
+}
+
+export interface CanvasCopyRequest {
+  copyId: string
+  sourceCanvasId: string
+  sourceCanvasVersion?: number
+  sourceSubjectId?: string
+  containerId: string
+  expectedContainerVersion: number
+  name: string
 }
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -351,6 +361,14 @@ export const api = {
     req<NativeCanvasValidation>('/canvas/native-import/validate', { method: 'POST', body: JSON.stringify(body), signal: options?.signal }),
   importNativeCanvas: (body: { filename: string; importId: string; envelope: Record<string, unknown>; validationDigest: string; confirmWarnings: boolean }, options?: { signal?: AbortSignal }) =>
     req<{ ok: boolean; id: string; created: boolean; replayed: boolean }>('/canvas/native-import', { method: 'POST', body: JSON.stringify(body), signal: options?.signal }),
+  validateCanvasCopy: (body: CanvasCopyRequest) =>
+    req<CanvasCopyValidation>('/canvas/copy/validate', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  createCanvasCopy: (body: CanvasCopyRequest & { copyIntentDigest: string; validationDigest: string; confirmWarnings: boolean }) =>
+    req<{ ok: boolean; id: string; created: boolean; replayed: boolean }>('/canvas/copy', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
 
   compile: (doc: CanvasDoc, targetNodeId?: string, parameterBindings?: CanvasParameterBinding[]) =>
     req<CompilePlan>('/graph/compile', { method: 'POST', body: JSON.stringify({ graph: toGraph(doc), targetNodeId, parameterBindings }) }),

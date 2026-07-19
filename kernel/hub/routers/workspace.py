@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from pydantic.alias_generators import to_camel
 from sqlalchemy import select as _sa_select
 
-from hub import auth, auth_admission, metadb, native_canvas, workspace_providers
+from hub import auth, auth_admission, canvas_copy, metadb, native_canvas, workspace_providers
 from hub.api_errors import APIError, APIErrorCode, APIErrorResponse
 from hub.deps import get_deps
 from hub.models import (
@@ -514,6 +514,37 @@ class NativeCanvasImportResponse(_StrictAuthBody):
     replayed: bool
 
 
+class CanvasCopyValidateBody(_StrictAuthBody):
+    copy_id: UUID = Field(alias="copyId", strict=False)
+    source_canvas_id: str = Field(alias="sourceCanvasId", min_length=1, max_length=512)
+    source_canvas_version: int | None = Field(
+        default=None, alias="sourceCanvasVersion", ge=1)
+    source_subject_id: str | None = Field(
+        default=None, alias="sourceSubjectId", min_length=1, max_length=1024)
+    container_id: str = Field(alias="containerId", min_length=1, max_length=512)
+    expected_container_version: int = Field(alias="expectedContainerVersion", ge=1)
+    name: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _one_copy_source(self) -> "CanvasCopyValidateBody":
+        if (self.source_canvas_version is None) == (self.source_subject_id is None):
+            raise ValueError("provide exactly one source Canvas version or retained manifest subject")
+        return self
+
+
+class CanvasCopyCreateBody(CanvasCopyValidateBody):
+    copy_intent_digest: str = Field(
+        alias="copyIntentDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    validation_digest: str = Field(
+        alias="validationDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirm_warnings: bool = Field(alias="confirmWarnings")
+
+
+class CanvasCopyValidationResponse(NativeCanvasValidationResponse):
+    copy_intent_digest: str = Field(
+        alias="copyIntentDigest", min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
 def _native_request_openapi(model: type[BaseModel]) -> dict[str, Any]:
     return {
         "requestBody": {
@@ -565,6 +596,63 @@ def _workspace_action_error(exc: Exception) -> None:
     if isinstance(exc, ValueError):
         raise HTTPException(422, str(exc)) from exc
     raise exc
+
+
+def _prepare_canvas_copy(body: CanvasCopyValidateBody, uid: str) -> tuple[
+        dict, list[native_canvas.Diagnostic], str, str | None]:
+    name = metadb._workspace_name(body.name)
+    with metadb.session() as s:
+        metadb._workspace_container_at_version(
+            s, body.container_id, body.expected_container_version)
+        source = s.get(metadb.Canvas, body.source_canvas_id)
+        if source is None or metadb._workspace_canvas_role_in_session(s, source, uid) is None:
+            raise KeyError(f"canvas '{body.source_canvas_id}' not found")
+        if body.source_canvas_version is not None:
+            if source.version != body.source_canvas_version:
+                raise metadb.WorkspaceVersionConflict(
+                    f"canvas '{body.source_canvas_id}' changed from expected version {body.source_canvas_version}")
+            document = json.loads(source.doc)
+            canvas, stripped = canvas_copy.prepare_current(document, name)
+            lineage = {
+                "kind": "canvas", "canvasId": source.id, "canvasVersion": source.version,
+            }
+            descriptors, manifest_sha256 = None, None
+            retained_parameters = False
+        else:
+            detail = metadb.execution_manifest_detail_for_subject(
+                uid, body.source_canvas_id, str(body.source_subject_id))
+            if detail is None or detail["availability"] != "available" or detail["document"] is None:
+                raise metadb.WorkspaceVersionConflict(
+                    "retained execution manifest is unavailable; live Canvas state was not substituted")
+            canvas, stripped = canvas_copy.prepare_manifest(detail["document"], name)
+            manifest_sha256 = str(detail["sha256"])
+            lineage = {
+                "kind": "executionManifest", "canvasId": source.id,
+                "subjectId": body.source_subject_id, "sha256": manifest_sha256,
+            }
+            descriptors = detail["document"].get("descriptors")
+            retained_parameters = bool(detail["document"].get("parameters"))
+    canvas["_copiedFrom"] = lineage
+    if manifest_sha256 is None:
+        metadb.require_promoted_transform_use(
+            uid, canvas, canvas_id=body.source_canvas_id)
+    else:
+        metadb.require_retained_execution_manifest_transform_use(
+            uid, body.source_canvas_id, str(body.source_subject_id), manifest_sha256, canvas)
+    items = canvas_copy.diagnostics(
+        canvas, get_deps(), uid, descriptors=descriptors,
+        stripped_credentials=stripped, retained_parameters=retained_parameters)
+    source_intent = {
+        "canvasId": body.source_canvas_id,
+        "canvasVersion": body.source_canvas_version,
+        "subjectId": body.source_subject_id,
+        "manifestSha256": manifest_sha256,
+    }
+    destination = {
+        "containerId": body.container_id,
+        "containerVersion": body.expected_container_version,
+    }
+    return canvas, items, canvas_copy.intent_digest(source_intent, destination, canvas), manifest_sha256
 
 
 def _provider_dataset_sources(refs: list[str], uid: str) -> list[dict]:
@@ -885,6 +973,65 @@ async def import_native_canvas(request: Request, uid: str = Depends(current_user
     except metadb.NativeCanvasImportConflict as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
     return {"ok": True, "id": canvas_id, "created": created, "replayed": not created}
+
+
+@router.post("/canvas/copy/validate", response_model=CanvasCopyValidationResponse)
+def validate_canvas_copy(body: CanvasCopyValidateBody,
+                         uid: str = Depends(current_user)) -> dict:
+    """Validate one exact source snapshot and Workspace destination without creating it."""
+    try:
+        canvas, items, intent, _manifest = _prepare_canvas_copy(body, uid)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+    summary = native_canvas.summary({
+        "canvas": canvas, "descriptors": {}, "dataReferences": [], "libraryProcessors": [],
+    }, items)
+    summary["validationDigest"] = canvas_copy.validation_digest(intent, items)
+    summary["copyIntentDigest"] = intent
+    return summary
+
+
+@router.post("/canvas/copy", response_model=NativeCanvasImportResponse)
+def create_canvas_copy(body: CanvasCopyCreateBody,
+                       uid: str = Depends(current_user)) -> dict:
+    """Create or replay one owned, detached Canvas copy."""
+    created_id = canvas_copy.canvas_id(uid, str(body.copy_id))
+    request_digest = canvas_copy.request_digest(
+        source_canvas_id=body.source_canvas_id,
+        source_canvas_version=body.source_canvas_version,
+        source_subject_id=body.source_subject_id,
+        container_id=body.container_id,
+        container_version=body.expected_container_version,
+        name=body.name)
+    try:
+        if metadb.canvas_copy_replay(
+                uid, created_id, body.copy_intent_digest, request_digest):
+            return {"ok": True, "id": created_id, "created": False, "replayed": True}
+        canvas, items, intent, manifest_sha256 = _prepare_canvas_copy(body, uid)
+        if intent != body.copy_intent_digest or not canvas_copy.validation_matches(
+                body.validation_digest, intent, items):
+            raise metadb.WorkspaceVersionConflict(
+                "Canvas copy validation changed; validate this exact source and destination again")
+        if any(item.severity == "error" for item in items):
+            raise ValueError("Canvas copy has blocking validation errors")
+        if any(item.severity == "warning" for item in items) and not body.confirm_warnings:
+            raise metadb.WorkspaceVersionConflict(
+                "Canvas copy has warnings; confirm them before creating it")
+        doc = {**canvas, "id": created_id, "version": 1}
+        created = metadb.create_canvas_copy(
+            uid=uid, canvas_id=created_id, doc=doc, intent_digest=intent,
+            request_digest=request_digest,
+            container_id=body.container_id,
+            expected_container_version=body.expected_container_version,
+            source_canvas_id=body.source_canvas_id,
+            source_canvas_version=body.source_canvas_version,
+            source_subject_id=body.source_subject_id,
+            source_manifest_sha256=manifest_sha256)
+    except metadb.CanvasCopyConflict as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+    return {"ok": True, "id": created_id, "created": created, "replayed": not created}
 
 
 def _validate_canvas_execution_contract(doc: dict) -> None:

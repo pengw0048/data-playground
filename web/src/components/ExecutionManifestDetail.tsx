@@ -31,10 +31,12 @@ export function ExecutionManifestDetail({
   canvasId,
   subjectId,
   summary,
+  onClone,
 }: {
   canvasId: string
   subjectId: string
   summary: ManifestSummary
+  onClone?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [detail, setDetail] = useState<ExecutionManifestDetailDto | null>(null)
@@ -88,17 +90,18 @@ export function ExecutionManifestDetail({
           {availabilityMessage[detail.availability]}
         </div>
       )}
-      {detail?.availability === 'available' && detail.document && <ManifestDocument detail={detail} />}
+      {detail?.availability === 'available' && detail.document && <ManifestDocument detail={detail} onClone={onClone} />}
     </div>}
   </section>
 }
 
-function ManifestDocument({ detail }: { detail: ExecutionManifestDetailDto }) {
+function ManifestDocument({ detail, onClone }: { detail: ExecutionManifestDetailDto; onClone?: () => void }) {
   const document = detail.document!
   const target = document.target.nodeId
     ? `${document.target.nodeId}${document.target.portId ? `:${document.target.portId}` : ''}`
     : 'Whole graph'
   return <>
+    {onClone && <button type="button" className="w-fit rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" onClick={onClone}>Clone as new Canvas…</button>}
     <div className="grid gap-1">
       <div><strong>Digest:</strong> <span className="dp-mono break-all">{detail.sha256}</span></div>
       <div><strong>Schema:</strong> version {detail.schemaVersion}</div>

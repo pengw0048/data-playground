@@ -440,6 +440,24 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByRole('heading', { name: 'Import native Canvas' })).toBeHidden()
   })
 
+  test('saves the persisted Canvas as an independent owned copy', async ({ page }) => {
+    await fresh(page)
+    const original = await page.evaluate(() => location.hash)
+    const sourceId = decodeURIComponent(original.split('/').pop()!)
+    await page.getByTestId('app-menu').click()
+    await page.getByTestId('copy-canvas').click()
+    await page.getByLabel('New Canvas name').fill('E2E independent copy')
+    await page.getByRole('button', { name: 'Review copy' }).click()
+    await expect(page.getByText('0 nodes · 0 connections · 0 requirements')).toBeVisible()
+    await page.getByRole('button', { name: 'Create and open' }).click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(original)
+    const copyId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const copied = await (await page.request.get(`/api/canvas/${copyId}`)).json()
+    expect(copied.name).toBe('E2E independent copy')
+    expect(copied._copiedFrom).toMatchObject({ kind: 'canvas', canvasId: sourceId })
+    expect(copied._copiedFrom.canvasVersion).toBeGreaterThanOrEqual(1)
+  })
+
   test('pipeline import lands a returned graph on its newly created canvas', async ({ page }) => {
     await enablePipelineImporter(page)
     await fresh(page)
@@ -1178,6 +1196,15 @@ test.describe('Data Playground canvas', () => {
         },
       } })
     })
+    let cloneRequest: Record<string, unknown> | null = null
+    await page.route('**/api/canvas/copy/validate', async (route) => {
+      cloneRequest = route.request().postDataJSON()
+      await route.fulfill({ json: {
+        name: 'Historical copy', nodeCount: 1, edgeCount: 0, requirements: [], parameters: [],
+        diagnostics: [], canImport: true, requiresConfirmation: false,
+        validationDigest: 'd'.repeat(64), copyIntentDigest: 'e'.repeat(64),
+      } })
+    })
 
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
@@ -1186,6 +1213,12 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('Submitted graph')).toBeVisible()
     await expect(page.getByText(/events@revision-1/)).toBeVisible()
     await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
+    await page.getByRole('button', { name: 'Clone as new Canvas…' }).click()
+    await page.getByRole('button', { name: 'Review copy' }).click()
+    await expect(page.getByText('1 nodes · 0 connections · 0 requirements')).toBeVisible()
+    expect(cloneRequest).toMatchObject({
+      sourceCanvasId: canvasId, sourceSubjectId: 'history-manifest',
+    })
   })
 
   test('identity lives on the Workspace shell, not the canvas chrome — and no user switching', async ({ page }) => {

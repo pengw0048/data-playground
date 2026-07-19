@@ -47,6 +47,10 @@ export interface NativeCanvasValidation {
   validationDigest: string
 }
 
+export interface CanvasCopyValidation extends NativeCanvasValidation {
+  copyIntentDigest: string
+}
+
 export interface RelationCacheStats {
   entries: number
   bytes: number

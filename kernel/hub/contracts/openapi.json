@@ -114,6 +114,238 @@
         "title": "BrowseRequest",
         "type": "object"
       },
+      "CanvasCopyCreateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "confirmWarnings": {
+            "title": "Confirmwarnings",
+            "type": "boolean"
+          },
+          "containerId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Containerid",
+            "type": "string"
+          },
+          "copyId": {
+            "format": "uuid",
+            "title": "Copyid",
+            "type": "string"
+          },
+          "copyIntentDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Copyintentdigest",
+            "type": "string"
+          },
+          "expectedContainerVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcontainerversion",
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "sourceCanvasId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourcecanvasid",
+            "type": "string"
+          },
+          "sourceCanvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcecanvasversion"
+          },
+          "sourceSubjectId": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcesubjectid"
+          },
+          "validationDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Validationdigest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "copyId",
+          "sourceCanvasId",
+          "containerId",
+          "expectedContainerVersion",
+          "name",
+          "copyIntentDigest",
+          "validationDigest",
+          "confirmWarnings"
+        ],
+        "title": "CanvasCopyCreateBody",
+        "type": "object"
+      },
+      "CanvasCopyValidateBody": {
+        "additionalProperties": false,
+        "properties": {
+          "containerId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Containerid",
+            "type": "string"
+          },
+          "copyId": {
+            "format": "uuid",
+            "title": "Copyid",
+            "type": "string"
+          },
+          "expectedContainerVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcontainerversion",
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "sourceCanvasId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Sourcecanvasid",
+            "type": "string"
+          },
+          "sourceCanvasVersion": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcecanvasversion"
+          },
+          "sourceSubjectId": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcesubjectid"
+          }
+        },
+        "required": [
+          "copyId",
+          "sourceCanvasId",
+          "containerId",
+          "expectedContainerVersion",
+          "name"
+        ],
+        "title": "CanvasCopyValidateBody",
+        "type": "object"
+      },
+      "CanvasCopyValidationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "canImport": {
+            "title": "Canimport",
+            "type": "boolean"
+          },
+          "copyIntentDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Copyintentdigest",
+            "type": "string"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/NativeCanvasDiagnosticResponse"
+            },
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "edgeCount": {
+            "minimum": 0.0,
+            "title": "Edgecount",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "nodeCount": {
+            "minimum": 0.0,
+            "title": "Nodecount",
+            "type": "integer"
+          },
+          "parameters": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Parameters",
+            "type": "array"
+          },
+          "requirements": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Requirements",
+            "type": "array"
+          },
+          "requiresConfirmation": {
+            "title": "Requiresconfirmation",
+            "type": "boolean"
+          },
+          "validationDigest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Validationdigest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "nodeCount",
+          "edgeCount",
+          "requirements",
+          "parameters",
+          "diagnostics",
+          "canImport",
+          "requiresConfirmation",
+          "validationDigest",
+          "copyIntentDigest"
+        ],
+        "title": "CanvasCopyValidationResponse",
+        "type": "object"
+      },
       "CanvasTransformReference": {
         "properties": {
           "availability": {
@@ -10377,6 +10609,172 @@
           }
         },
         "summary": "Create Canvas"
+      }
+    },
+    "/api/canvas/copy": {
+      "post": {
+        "description": "Create or replay one owned, detached Canvas copy.",
+        "operationId": "create_canvas_copy_api_canvas_copy_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CanvasCopyCreateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NativeCanvasImportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Create Canvas Copy"
+      }
+    },
+    "/api/canvas/copy/validate": {
+      "post": {
+        "description": "Validate one exact source snapshot and Workspace destination without creating it.",
+        "operationId": "validate_canvas_copy_api_canvas_copy_validate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CanvasCopyValidateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CanvasCopyValidationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Validate Canvas Copy"
       }
     },
     "/api/canvas/native-import": {

@@ -300,6 +300,7 @@ describe('JobsView', () => {
 
     expect(await screen.findByText('Submitted graph')).toBeVisible()
     expect(screen.getByText(/"threshold"/)).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Clone as new Canvas…' })).toBeVisible()
     expect(mocks.executionManifest).toHaveBeenCalledWith('canvas-1', 't:task-manifest')
   })
 

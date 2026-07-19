@@ -10,6 +10,7 @@ import { ExecutionManifestDetail } from '../components/ExecutionManifestDetail'
 import { FullResult } from './DataPanel'
 import { SampleProvenanceSummary } from './DataPanel'
 import type { CatalogTable, DatasetRevisionDetail, RunInputManifestItem, RunOutput } from '../types/api'
+import { CanvasCopyModal, type CanvasCopySource } from './CanvasCopyModal'
 
 // Persisted run history + telemetry for the current canvas (survives restarts) — /canvas/{id}/runs.
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
@@ -19,11 +20,12 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   const [err, setErr] = useState('')
   const [open, setOpen] = useState<string | null>(null)  // expanded run id → per-node breakdown
   const [resultOpen, setResultOpen] = useState<string | null>(null)
+  const [copySource, setCopySource] = useState<CanvasCopySource | null>(null)
   useEffect(() => {
     api.listRuns(canvasId).then(setRuns).catch((e) => setErr((e as Error).message))
   }, [canvasId])
 
-  return (
+  return <>
     <Dialog open onOpenChange={(o) => { if (!o) onClose() }}>
       <DialogContent className="dp-modal-overlay flex max-h-[80vh] w-[620px] max-w-[calc(100vw-2rem)] flex-col gap-0 overflow-hidden p-0 [&>button]:hidden">
         <div className="flex items-center gap-2 border-b border-border px-4 py-3">
@@ -65,7 +67,8 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
-                  <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r} />
+                  <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r}
+                    onClone={() => setCopySource({ canvasId, subjectId: r.id, name: useStore.getState().doc.name ?? 'Untitled canvas' })} />
                   {r.jobType === 'run' && <RunInputManifest historyId={r.id} manifest={r.inputManifest} />}
                   {r.outputs.length > 0 && (
                     <HistoryOutputs historyId={r.id} runId={r.runId ?? undefined}
@@ -84,7 +87,8 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
         </div>
       </DialogContent>
     </Dialog>
-  )
+    {copySource && <CanvasCopyModal source={copySource} onClose={() => setCopySource(null)} onCreated={onClose} />}
+  </>
 }
 
 type ManifestAvailability = 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
