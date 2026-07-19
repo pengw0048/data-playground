@@ -184,6 +184,7 @@ jobs:
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_managed_local_file_revisions.py -k typed_local
+          && uv run pytest -q -o faulthandler_timeout=60 hub/tests/test_row_identity.py
       - name: Verify exact ordinary local input admission on PostgreSQL
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
