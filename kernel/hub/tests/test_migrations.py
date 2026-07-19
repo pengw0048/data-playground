@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0033_temporal_task", "0032_temporal_pub"),
         ("0032_temporal_pub", "0031_durable_merge"),
         ("0031_durable_merge", "0030_merge_columns_pub"),
         ("0030_merge_columns_pub", "0029_sparse_output_mat"),
@@ -87,8 +88,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0032_temporal_pub"]
-    assert metadb.expected_schema_head() == "0032_temporal_pub"
+    assert scripts.get_heads() == ["0033_temporal_task"]
+    assert metadb.expected_schema_head() == "0033_temporal_task"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -226,6 +227,9 @@ def test_committed_migration_revisions_are_immutable():
         "0032_temporal_publication.py": (
             "be5f868b1ab1936a21773771c18d312cbf2e2f13bc5d94450664dff2f551cbeb"
         ),
+            "0033_temporal_resample_task.py": (
+                "0d47e6da5b505575950b01bb20f1fe340c91a744ee451f15c135727fddc7306c"
+            ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
 

@@ -211,6 +211,7 @@ jobs:
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_temporal_publication.py
+          hub/tests/test_temporal_resample_tasks.py
       - name: Verify bounded fan-out plan and runtime contracts on PostgreSQL
         # #415 close bar's "combined proof on PG" — the fan-out slot pool / fencing / GC only exercise
         # real duplicate-owner + varchar(32) semantics on PostgreSQL, not SQLite.
