@@ -1,0 +1,10 @@
+{
+  "assetFile": "flower.webm",
+  "byteLength": 554058,
+  "license": "CC0-1.0",
+  "mediaType": "video/webm",
+  "modifications": "Unmodified upstream bytes; no transcoding or extraction. The video observation declares only source timeline [0, 2000) ms.",
+  "repositorySizeBudgetBytes": 614400,
+  "sha256": "c6f8a348953395598a9a73b9bab1676436410797bce9f398f4be1531d6e76dda",
+  "sourceUrl": "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm"
+}
