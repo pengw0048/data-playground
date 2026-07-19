@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from hub import db, distribution_reports, metadb
-from hub.models import DatasetViewDefinitionV1
+from hub.models import ColumnSchema, DatasetViewDefinitionV1
 from hub.plugins.adapters import (
     RevisionPermissionLost,
     RevisionProviderOffline,
@@ -310,11 +310,43 @@ def _temporal_section(
     }]
 
 
+def _report_columns(source, relation) -> list[ColumnSchema]:
+    """Carry only unambiguous provider/declared field identities from exact revision evidence."""
+    inferred = relation_columns(relation)
+    try:
+        evidence = [ColumnSchema.model_validate(item) for item in source.detail.get("columns", [])]
+    except (TypeError, ValueError):
+        return inferred
+    field_id_counts: dict[str, int] = {}
+    for column in evidence:
+        if column.field_id is not None:
+            field_id_counts[column.field_id] = field_id_counts.get(column.field_id, 0) + 1
+    by_name: dict[str, list[ColumnSchema]] = {}
+    for column in evidence:
+        by_name.setdefault(column.name, []).append(column)
+    result = []
+    for column in inferred:
+        candidates = [item for item in by_name.get(column.name, []) if (
+            item.type == column.type
+            and item.field_id is not None
+            and item.provenance in ("declared", "provider")
+            and field_id_counts.get(item.field_id) == 1
+        )]
+        if len(candidates) == 1:
+            result.append(column.model_copy(update={
+                "field_id": candidates[0].field_id,
+                "provenance": candidates[0].provenance,
+            }))
+        else:
+            result.append(column)
+    return result
+
+
 def compute_distribution_report(claim: dict, lease: _LeaseState) -> dict:
     view = DatasetViewDefinitionV1.model_validate(claim["view_snapshot"])
     with _open_exact(view.dataset_ref, operation="distribution-report") as source:
         relation = _defined_relation(source, view)
-        columns = relation_columns(relation)
+        columns = _report_columns(source, relation)
         safe_columns = [column for column in columns
                         if len(column.name.encode("utf-8", errors="strict")) <= 512]
         eligible = safe_columns[:MAX_COLUMNS]

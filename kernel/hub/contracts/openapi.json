@@ -1829,6 +1829,70 @@
         "title": "DeclareKeyRequest",
         "type": "object"
       },
+      "DistributionCategoricalDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "categories": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionCategoryDeltaV1"
+            },
+            "maxItems": 40,
+            "title": "Categories",
+            "type": "array"
+          },
+          "distinctCountDelta": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Distinctcountdelta"
+          },
+          "distinctCountReason": {
+            "enum": [
+              "exact",
+              "approximate"
+            ],
+            "title": "Distinctcountreason",
+            "type": "string"
+          },
+          "kind": {
+            "const": "categorical",
+            "default": "categorical",
+            "title": "Kind",
+            "type": "string"
+          },
+          "otherCountDelta": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Othercountdelta"
+          },
+          "otherCountReason": {
+            "enum": [
+              "same_top_k",
+              "different_top_k"
+            ],
+            "title": "Othercountreason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "categories",
+          "otherCountReason",
+          "distinctCountReason"
+        ],
+        "title": "DistributionCategoricalDeltaV1",
+        "type": "object"
+      },
       "DistributionCategoricalSectionV1": {
         "additionalProperties": false,
         "properties": {
@@ -1884,6 +1948,72 @@
         "title": "DistributionCategoricalSectionV1",
         "type": "object"
       },
+      "DistributionCategoryDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "countDelta": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Countdelta"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Label"
+          },
+          "leftCount": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Leftcount"
+          },
+          "reason": {
+            "enum": [
+              "present_in_both_top_k",
+              "outside_left_top_k",
+              "outside_right_top_k"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "rightCount": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rightcount"
+          }
+        },
+        "required": [
+          "label",
+          "reason"
+        ],
+        "title": "DistributionCategoryDeltaV1",
+        "type": "object"
+      },
       "DistributionCategoryV1": {
         "additionalProperties": false,
         "properties": {
@@ -1916,6 +2046,212 @@
           "count"
         ],
         "title": "DistributionCategoryV1",
+        "type": "object"
+      },
+      "DistributionColumnComparisonV1": {
+        "additionalProperties": false,
+        "properties": {
+          "comparable": {
+            "title": "Comparable",
+            "type": "boolean"
+          },
+          "fieldId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fieldid"
+          },
+          "leftColumn": {
+            "$ref": "#/components/schemas/ColumnSchema"
+          },
+          "leftSections": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "categorical": "#/components/schemas/DistributionCategoricalSectionV1",
+                  "coverage_schema": "#/components/schemas/DistributionCoverageSchemaSectionV1",
+                  "missingness": "#/components/schemas/DistributionMissingnessSectionV1",
+                  "numeric": "#/components/schemas/DistributionNumericSectionV1",
+                  "temporal": "#/components/schemas/DistributionTemporalSectionV1",
+                  "unsupported": "#/components/schemas/DistributionUnsupportedSectionV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/DistributionCoverageSchemaSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionMissingnessSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionNumericSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionCategoricalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionTemporalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionUnsupportedSectionV1"
+                }
+              ]
+            },
+            "maxItems": 2,
+            "title": "Leftsections",
+            "type": "array"
+          },
+          "matchReason": {
+            "enum": [
+              "stable_field_identity",
+              "name_and_logical_type"
+            ],
+            "title": "Matchreason",
+            "type": "string"
+          },
+          "metricDelta": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "categorical": "#/components/schemas/DistributionCategoricalDeltaV1",
+                    "numeric": "#/components/schemas/DistributionNumericDeltaV1",
+                    "temporal": "#/components/schemas/DistributionTemporalDeltaV1"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/DistributionNumericDeltaV1"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DistributionCategoricalDeltaV1"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DistributionTemporalDeltaV1"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metricdelta"
+          },
+          "missingCountDelta": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missingcountdelta"
+          },
+          "reason": {
+            "enum": [
+              "compatible",
+              "coverage_mismatch",
+              "computation_version_mismatch",
+              "logical_type_mismatch",
+              "section_kind_mismatch",
+              "unsupported_section"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "rightColumn": {
+            "$ref": "#/components/schemas/ColumnSchema"
+          },
+          "rightSections": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "categorical": "#/components/schemas/DistributionCategoricalSectionV1",
+                  "coverage_schema": "#/components/schemas/DistributionCoverageSchemaSectionV1",
+                  "missingness": "#/components/schemas/DistributionMissingnessSectionV1",
+                  "numeric": "#/components/schemas/DistributionNumericSectionV1",
+                  "temporal": "#/components/schemas/DistributionTemporalSectionV1",
+                  "unsupported": "#/components/schemas/DistributionUnsupportedSectionV1"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/DistributionCoverageSchemaSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionMissingnessSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionNumericSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionCategoricalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionTemporalSectionV1"
+                },
+                {
+                  "$ref": "#/components/schemas/DistributionUnsupportedSectionV1"
+                }
+              ]
+            },
+            "maxItems": 2,
+            "title": "Rightsections",
+            "type": "array"
+          }
+        },
+        "required": [
+          "matchReason",
+          "leftColumn",
+          "rightColumn",
+          "leftSections",
+          "rightSections",
+          "comparable",
+          "reason"
+        ],
+        "title": "DistributionColumnComparisonV1",
+        "type": "object"
+      },
+      "DistributionCoverageComparisonV1": {
+        "additionalProperties": false,
+        "properties": {
+          "comparable": {
+            "title": "Comparable",
+            "type": "boolean"
+          },
+          "left": {
+            "$ref": "#/components/schemas/DistributionReportIdentityV1"
+          },
+          "reason": {
+            "enum": [
+              "compatible_full_coverage",
+              "same_deterministic_sample",
+              "full_sample_coverage_mismatch",
+              "different_deterministic_samples"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "right": {
+            "$ref": "#/components/schemas/DistributionReportIdentityV1"
+          }
+        },
+        "required": [
+          "left",
+          "right",
+          "comparable",
+          "reason"
+        ],
+        "title": "DistributionCoverageComparisonV1",
         "type": "object"
       },
       "DistributionCoverageSchemaSectionV1": {
@@ -2000,6 +2336,45 @@
         "title": "DistributionHistogramBucketV1",
         "type": "object"
       },
+      "DistributionHistogramDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "countDelta": {
+            "title": "Countdelta",
+            "type": "integer"
+          },
+          "leftBucketId": {
+            "title": "Leftbucketid",
+            "type": "string"
+          },
+          "lower": {
+            "title": "Lower",
+            "type": "number"
+          },
+          "rightBucketId": {
+            "title": "Rightbucketid",
+            "type": "string"
+          },
+          "upper": {
+            "title": "Upper",
+            "type": "number"
+          },
+          "upperInclusive": {
+            "title": "Upperinclusive",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "leftBucketId",
+          "rightBucketId",
+          "lower",
+          "upper",
+          "upperInclusive",
+          "countDelta"
+        ],
+        "title": "DistributionHistogramDeltaV1",
+        "type": "object"
+      },
       "DistributionMissingnessSectionV1": {
         "additionalProperties": false,
         "properties": {
@@ -2033,6 +2408,108 @@
           "missingCount"
         ],
         "title": "DistributionMissingnessSectionV1",
+        "type": "object"
+      },
+      "DistributionNumericDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "countDelta": {
+            "title": "Countdelta",
+            "type": "integer"
+          },
+          "histogram": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DistributionHistogramDeltaV1"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Histogram"
+          },
+          "histogramReason": {
+            "enum": [
+              "equal_edges",
+              "unequal_edges"
+            ],
+            "title": "Histogramreason",
+            "type": "string"
+          },
+          "kind": {
+            "const": "numeric",
+            "default": "numeric",
+            "title": "Kind",
+            "type": "string"
+          },
+          "maxDelta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maxdelta"
+          },
+          "meanDelta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Meandelta"
+          },
+          "minDelta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mindelta"
+          },
+          "nonFiniteCountDelta": {
+            "title": "Nonfinitecountdelta",
+            "type": "integer"
+          },
+          "quantiles": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionQuantileDeltaV1"
+            },
+            "maxItems": 5,
+            "title": "Quantiles",
+            "type": "array"
+          },
+          "stddevDelta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stddevdelta"
+          }
+        },
+        "required": [
+          "countDelta",
+          "nonFiniteCountDelta",
+          "quantiles",
+          "histogramReason"
+        ],
+        "title": "DistributionNumericDeltaV1",
         "type": "object"
       },
       "DistributionNumericSectionV1": {
@@ -2138,6 +2615,31 @@
         "title": "DistributionNumericSectionV1",
         "type": "object"
       },
+      "DistributionQuantileDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "probability": {
+            "title": "Probability",
+            "type": "number"
+          },
+          "valueDelta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Valuedelta"
+          }
+        },
+        "required": [
+          "probability"
+        ],
+        "title": "DistributionQuantileDeltaV1",
+        "type": "object"
+      },
       "DistributionQuantileV1": {
         "additionalProperties": false,
         "properties": {
@@ -2240,6 +2742,83 @@
           "status"
         ],
         "title": "DistributionReportAttemptViewV1",
+        "type": "object"
+      },
+      "DistributionReportCompareRequestV1": {
+        "additionalProperties": false,
+        "properties": {
+          "leftReportId": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Leftreportid",
+            "type": "string"
+          },
+          "rightReportId": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Rightreportid",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "leftReportId",
+          "rightReportId"
+        ],
+        "title": "DistributionReportCompareRequestV1",
+        "type": "object"
+      },
+      "DistributionReportComparisonV1": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "items": {
+              "$ref": "#/components/schemas/DistributionColumnComparisonV1"
+            },
+            "maxItems": 64,
+            "title": "Columns",
+            "type": "array"
+          },
+          "coverage": {
+            "$ref": "#/components/schemas/DistributionCoverageComparisonV1"
+          },
+          "schemaVersion": {
+            "const": 1,
+            "default": 1,
+            "title": "Schemaversion",
+            "type": "integer"
+          },
+          "unmatchedLeftColumns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 64,
+            "title": "Unmatchedleftcolumns",
+            "type": "array"
+          },
+          "unmatchedRightColumns": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "maxItems": 64,
+            "title": "Unmatchedrightcolumns",
+            "type": "array"
+          }
+        },
+        "required": [
+          "coverage",
+          "columns",
+          "unmatchedLeftColumns",
+          "unmatchedRightColumns"
+        ],
+        "title": "DistributionReportComparisonV1",
         "type": "object"
       },
       "DistributionReportDocumentV1": {
@@ -2538,6 +3117,71 @@
         "title": "DistributionReportEstimateV1",
         "type": "object"
       },
+      "DistributionReportIdentityV1": {
+        "additionalProperties": false,
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "computationVersion": {
+            "title": "Computationversion",
+            "type": "string"
+          },
+          "datasetId": {
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "datasetViewId": {
+            "title": "Datasetviewid",
+            "type": "string"
+          },
+          "measuredRows": {
+            "minimum": 0.0,
+            "title": "Measuredrows",
+            "type": "integer"
+          },
+          "reportId": {
+            "title": "Reportid",
+            "type": "string"
+          },
+          "revisionId": {
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "sampleProvenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SampleProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "samplingIdentity": {
+            "title": "Samplingidentity",
+            "type": "string"
+          },
+          "viewDefinitionSha256": {
+            "title": "Viewdefinitionsha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reportId",
+          "datasetViewId",
+          "datasetId",
+          "revisionId",
+          "viewDefinitionSha256",
+          "computationVersion",
+          "measuredRows",
+          "complete",
+          "samplingIdentity"
+        ],
+        "title": "DistributionReportIdentityV1",
+        "type": "object"
+      },
       "DistributionReportIntentV1": {
         "additionalProperties": false,
         "description": "One strict owner-scoped request against an exact immutable DatasetView snapshot.",
@@ -2683,6 +3327,47 @@
         "title": "DistributionReportTaskViewV1",
         "type": "object"
       },
+      "DistributionTemporalBucketDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "countDelta": {
+            "title": "Countdelta",
+            "type": "integer"
+          },
+          "end": {
+            "format": "date-time",
+            "title": "End",
+            "type": "string"
+          },
+          "endInclusive": {
+            "title": "Endinclusive",
+            "type": "boolean"
+          },
+          "leftBucketId": {
+            "title": "Leftbucketid",
+            "type": "string"
+          },
+          "rightBucketId": {
+            "title": "Rightbucketid",
+            "type": "string"
+          },
+          "start": {
+            "format": "date-time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "leftBucketId",
+          "rightBucketId",
+          "start",
+          "end",
+          "endInclusive",
+          "countDelta"
+        ],
+        "title": "DistributionTemporalBucketDeltaV1",
+        "type": "object"
+      },
       "DistributionTemporalBucketV1": {
         "additionalProperties": false,
         "properties": {
@@ -2720,6 +3405,45 @@
           "endInclusive"
         ],
         "title": "DistributionTemporalBucketV1",
+        "type": "object"
+      },
+      "DistributionTemporalDeltaV1": {
+        "additionalProperties": false,
+        "properties": {
+          "bucketReason": {
+            "enum": [
+              "equal_edges",
+              "unequal_edges"
+            ],
+            "title": "Bucketreason",
+            "type": "string"
+          },
+          "buckets": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DistributionTemporalBucketDeltaV1"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Buckets"
+          },
+          "kind": {
+            "const": "temporal",
+            "default": "temporal",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucketReason"
+        ],
+        "title": "DistributionTemporalDeltaV1",
         "type": "object"
       },
       "DistributionTemporalSectionV1": {
@@ -16552,6 +17276,89 @@
           }
         },
         "summary": "Mkdir Destination"
+      }
+    },
+    "/api/distribution-reports/compare": {
+      "post": {
+        "description": "Compare two retained documents without rescanning either measured population.",
+        "operationId": "compare_distribution_reports_api_distribution_reports_compare_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DistributionReportCompareRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DistributionReportComparisonV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Compare Distribution Reports"
       }
     },
     "/api/distribution-reports/{report_id}": {
