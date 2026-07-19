@@ -50,7 +50,7 @@ from hub.api_errors import (
 )
 from hub.routers import (
     catalog, compound_datasets, dataset_views, distribution_reports, inspection_windows, runs,
-    temporal_evidence, workspace,
+    temporal_evidence, temporal_resample_tasks, workspace,
 )
 from hub.routers.runs import _status_or_lost
 from hub.security import current_user
@@ -414,6 +414,8 @@ app.include_router(
     compound_datasets.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 app.include_router(
     temporal_evidence.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
+app.include_router(
+    temporal_resample_tasks.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 app.include_router(
     inspection_windows.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 app.include_router(

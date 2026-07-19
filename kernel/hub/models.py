@@ -11,10 +11,12 @@ import math
 from typing import Annotated, Any, Literal
 
 from pydantic import (
-    UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter,
+    UUID4, AfterValidator, BaseModel, ConfigDict, Field, JsonValue, PrivateAttr, TypeAdapter,
     field_validator, model_serializer, model_validator,
 )
 from pydantic.alias_generators import to_camel
+
+from hub.temporal_resample_diagnostics import TemporalResampleDiagnosticCode
 
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
 # (a metric or a node value driving another node's param). All must be representable on an edge.
@@ -1085,6 +1087,132 @@ class TemporalEvidenceResponseV1(Wire):
     approximation: TemporalEvidenceApproximationV1
     streams: list[TemporalEvidenceStreamV1]
     pair: TemporalEvidencePairEvidenceV1 | None
+
+
+class TemporalResampleFieldV1(Wire):
+    """One selected scalar source field and its declared unit."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    field: str = Field(min_length=1, max_length=512)
+    unit: str = Field(min_length=1, max_length=256)
+
+
+class TemporalResampleWriteRequestV1(Wire):
+    """One bounded, exact temporal-resample submission.
+
+    The compound identity and DatasetViews name immutable identities only.  The server
+    reopens both views during admission and again under the durable lease; raw
+    observations, provider URIs, and credentials never enter this envelope.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    submission_id: str = Field(min_length=1, max_length=256)
+    compound_dataset_id: str = Field(min_length=1, max_length=128)
+    compound_revision_id: str = Field(min_length=1, max_length=128)
+    episode_id: str = Field(min_length=1, max_length=128)
+    source_stream_id: str = Field(min_length=1, max_length=128)
+    target_stream_id: str = Field(min_length=1, max_length=128)
+    output_stream_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    output_member_id: str = Field(
+        min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    source_view_id: str = Field(min_length=1, max_length=32)
+    target_view_id: str = Field(min_length=1, max_length=32)
+    window: TemporalWindowV1
+    tolerance_ticks: str = Field(
+        default="0", min_length=1, max_length=20, pattern=r"^(?:0|[1-9][0-9]*)$")
+    selected_fields: list[TemporalResampleFieldV1] = Field(min_length=1, max_length=32)
+    candidate_cap: int = Field(default=10_000, ge=1, le=10_000)
+    output_cap: int = Field(default=10_000, ge=1, le=10_000)
+    write_intent: WriteIntent
+
+    @field_validator("submission_id")
+    @classmethod
+    def canonical_submission_id(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("temporal resample submission id must be trimmed and NUL-free")
+        return value
+
+    @model_validator(mode="after")
+    def _exact_bounded_shape(self) -> "TemporalResampleWriteRequestV1":
+        if self.source_stream_id == self.target_stream_id:
+            raise ValueError("source and target streams must differ")
+        if len({item.field for item in self.selected_fields}) != len(self.selected_fields):
+            raise ValueError("selected fields must be unique")
+        if not (0 <= int(self.tolerance_ticks) <= (1 << 63) - 1):
+            raise ValueError("tolerance ticks must be a nonnegative signed 64-bit integer")
+        if self.write_intent.mode not in ("create", "replace"):
+            raise ValueError("temporal resample write must create or replace")
+        if self.write_intent.destination.provider != "managed-local-file" or self.write_intent.partitions:
+            raise ValueError("temporal resample requires an unpartitioned managed-local destination")
+        # The temporal publisher derives lineage from the admitted exact compound
+        # revision and DatasetViews.  Callers must not smuggle arbitrary parents
+        # into that server-authored record.
+        if self.write_intent.provenance.parents:
+            raise ValueError("temporal resample derives provenance parents on the server")
+        return self
+
+
+class TemporalResampleRetryRequestV1(Wire):
+    """Idempotent retry request for one retained temporal task."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    retry_request_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("retry_request_id")
+    @classmethod
+    def canonical_retry_request_id(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("retry request id must be trimmed and NUL-free")
+        return value
+
+
+class TemporalResampleOutputReceiptV1(Wire):
+    """Public durable output identity without a physical locator or write credentials."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str = Field(min_length=1, max_length=256)
+    parent_head: ExactDatasetRef | None = None
+    head: DatasetRevision
+    rows: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    bytes: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    schema_facts: list[ColumnSchema] = Field(default_factory=list, max_length=1024, alias="schema")
+    durable: Literal[True] = True
+
+
+class TemporalResampleEvidenceV1(Wire):
+    """Canonical redacted evidence for a completed temporal publication."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    schema_version: Literal[1]
+    computation_version: Literal["temporal-resample-v1"]
+    spec: dict[str, JsonValue]
+    source_points_sha256: PlanDigest
+    target_points_sha256: PlanDigest
+    source_point_count: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    target_point_count: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    matched_count: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    unmatched_target_count: int = Field(ge=0, le=MAX_SAFE_INTEGER)
+    gap_target_observation_ids: list[str] = Field(default_factory=list, max_length=10_000)
+    signed_delta_ticks: dict[str, int | None]
+    absolute_delta_ticks: dict[str, int | None]
+    complete: Literal[True]
+
+
+class TemporalResampleTaskResponseV1(Wire):
+    """Sanitized durable status for the temporal-resample leaf."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid", strict=True)
+    task_id: str
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    can_retry: bool
+    cancel_requested: bool
+    diagnostic_code: TemporalResampleDiagnosticCode | None = None
+    receipt: TemporalResampleOutputReceiptV1 | None = None
+    evidence: TemporalResampleEvidenceV1 | None = None
+    child_dataset_id: str | None = Field(default=None, max_length=128)
+    child_revision_id: str | None = Field(default=None, max_length=128)
 
 
 class InspectionWindowRequestV1(Wire):
