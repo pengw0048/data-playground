@@ -29,7 +29,7 @@ from hub.catalog_provider import (
 
 _EXTERNAL_PREFIX = "external."
 _PROVIDER_DATASET_URI_PREFIX = "workspace-provider://"
-_CURSOR_VERSION = 1
+_CURSOR_VERSION = 2
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
 _MAX_CONFIG_BYTES = 1024 * 1024
@@ -484,16 +484,16 @@ def _source_status(
     }
 
 
-def _cursor_encode(container_id: str, fingerprint: str, source_index: int,
+def _cursor_encode(layout: str, container_id: str, fingerprint: str, source_index: int,
                    source_cursor: str | None, history: list[tuple[str, str | None]]) -> str:
     raw = json.dumps(
-        [_CURSOR_VERSION, container_id, fingerprint, source_index, source_cursor, history],
+        [_CURSOR_VERSION, layout, container_id, fingerprint, source_index, source_cursor, history],
         separators=(",", ":"),
     ).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def _cursor_decode(cursor: str | None, *, container_id: str, fingerprint: str,
+def _cursor_decode(cursor: str | None, *, layout: str, container_id: str, fingerprint: str,
                    source_count: int) -> tuple[int, str | None, list[tuple[str, str | None]]]:
     if cursor is None:
         return 0, None, []
@@ -501,7 +501,7 @@ def _cursor_decode(cursor: str | None, *, container_id: str, fingerprint: str,
         raise ValueError("invalid Workspace cursor")
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        version, bound_container, bound_fingerprint, source_index, source_cursor, history = json.loads(raw)
+        version, bound_layout, bound_container, bound_fingerprint, source_index, source_cursor, history = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace cursor") from exc
     valid_history = (
@@ -511,7 +511,7 @@ def _cursor_decode(cursor: str | None, *, container_id: str, fingerprint: str,
                 and (item[1] is None or isinstance(item[1], str) and len(item[1]) <= 512)
                 for item in history)
     )
-    if (version != _CURSOR_VERSION or bound_container != container_id
+    if (version != _CURSOR_VERSION or bound_layout != layout or bound_container != container_id
             or bound_fingerprint != fingerprint
             or isinstance(source_index, bool) or not isinstance(source_index, int)
             or source_index < 0 or source_index >= source_count
@@ -571,7 +571,8 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
         sources.append(_Source("configuration"))
     fingerprint = _mount_fingerprint(local_mounts, invalid)
     source_index, source_cursor, history = _cursor_decode(
-        cursor, container_id=container_id, fingerprint=fingerprint, source_count=len(sources))
+        cursor, layout="local-mounted", container_id=container_id, fingerprint=fingerprint,
+        source_count=len(sources))
     statuses = [
         _source_status(source, *(history[index] if index < len(history) else ("pending", None)))
         for index, source in enumerate(sources)
@@ -639,7 +640,7 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
             break
 
     next_cursor = (
-        _cursor_encode(container_id, fingerprint, *next_state)
+        _cursor_encode("local-mounted", container_id, fingerprint, *next_state)
         if next_state is not None else None
     )
     partial = any(status["completeness"] in _ERROR_STATES for status in statuses)
@@ -653,93 +654,159 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
     }
 
 
-def _remote_page(identity: str, *, limit: int, cursor: str | None,
+def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                  mounts: list[_MountedProvider], invalid: bool) -> dict:
     mount_id, resource_id, binding_id = _decode_external_identity(identity)
     cached = metadb.workspace_provider_binding(
         binding_id, mount_id=mount_id, resource_id=resource_id)
     if cached is None:
         raise KeyError("Workspace provider binding not found")
+    # A pre-0034 cached container has no anchor until it is first exposed.  Direct external
+    # browsing must take the same one-time recovery path as root browse; subsequent reads stay
+    # metadata-only and never acquire the Workspace write lock.
+    if metadb.workspace_provider_overlay_anchor(binding_id) is None:
+        metadb.workspace_provider_ensure_overlay_anchor(binding_id)
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
-    if mounted is None:
-        cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error", error="catalog mount is not configured")
-        cached_mount = _MountedProvider(
-            CatalogMount(id=mount_id, provider=cached["provider"], config={}),
-            cached["containerId"],
-        )
-        source = _Source("configuration")
-        return {
-            "container": _binding_resource(cached, cached_mount), "items": [],
-            "nextCursor": None, "hasMore": False,
-            "completeness": "partial",
-            "sources": [_source_status(
-                source, "unavailable", "catalog mount is not configured", "provider_error")],
-        }
-    if cached["provider"] != mounted.mount.provider:
-        cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error", error="catalog mount provider changed")
-        status = _source_status(
-            _Source("provider", mounted), "unavailable",
-            "catalog mount provider changed", "provider_error")
-        return {"container": _binding_resource(cached, mounted), "items": [],
-                "nextCursor": None, "hasMore": False, "completeness": "partial",
-                "sources": [status]}
-    source = _Source("provider", mounted)
-    fingerprint = _mount_fingerprint([mounted], invalid)
+    cached_mount = _MountedProvider(
+        CatalogMount(id=mount_id, provider=cached["provider"], config={}), cached["containerId"])
+    provider_source = _Source("provider", mounted) if mounted is not None else _Source("configuration")
+    sources = [_Source("local"), provider_source]
+    fingerprint = _mount_fingerprint([mounted], invalid) if mounted is not None else _mount_fingerprint([], invalid)
     source_index, source_cursor, history = _cursor_decode(
-        cursor, container_id=identity, fingerprint=fingerprint, source_count=1)
-    assert source_index == 0 and not history
-    if cached["referenceState"] == "detached":
-        status = _source_status(
-            source, "unavailable", cached.get("lastError") or "resource is detached",
-            "detached",
-        )
-        return {"container": _binding_resource(cached, mounted), "items": [],
-                "nextCursor": None, "hasMore": False, "completeness": "partial",
-                "sources": [status]}
-    try:
-        provider = _load_provider(mounted.mount.provider)
-    except Exception:  # noqa: BLE001 -- activation failure is an honest source result
-        cached = metadb.workspace_provider_mark_binding(
-            binding_id, state="offline", error=_activation_error())
-        status = _source_status(source, "unavailable", _activation_error(), "offline")
-        return {"container": _binding_resource(cached, mounted), "items": [], "nextCursor": None, "hasMore": False,
-                "completeness": "partial", "sources": [status]}
-    resolved = bounded_resolve(provider, mounted.mount, resource_id)
-    if resolved.state != "ready" or resolved.item is None:
-        state = _reference_state(resolved.failure, resolved.state)
-        cached = metadb.workspace_provider_mark_binding(
-            binding_id, state=state, error=resolved.reason)
-        status = _source_status(source, resolved.state, resolved.reason, state)
-        return {"container": _binding_resource(cached, mounted), "items": [], "nextCursor": None, "hasMore": False,
-                "completeness": "partial", "sources": [status]}
-    if resolved.item.id != resource_id or resolved.item.kind != "container":
-        raise KeyError(f"Workspace resource 'container:{identity}' is not a container")
-    container = _workspace_resource(resolved.item, mounted)
-    page = bounded_list_children(
-        provider, mounted.mount, resource_id, limit=limit, cursor=source_cursor)
-    items = [
-        _workspace_resource(item, mounted, parent_binding_id=container["bindingId"])
-        for item in page.items
+        cursor, layout="external-overlay", container_id=identity, fingerprint=fingerprint,
+        source_count=len(sources))
+    statuses = [
+        _source_status(source, *(history[index] if index < len(history) else ("pending", None)))
+        for index, source in enumerate(sources)
     ]
-    next_cursor = None
-    if page.state == "ready" and page.next_cursor is not None:
-        if not page.items:
-            status = _source_status(
-                source, "unavailable", "catalog provider returned a non-advancing page")
+    items: list[dict] = []
+    public_container = _binding_resource(cached, cached_mount)
+    next_state: tuple[int, str | None, list[tuple[str, str | None]]] | None = None
+    current = source_index
+
+    while current < len(sources) and len(items) < limit:
+        source = sources[current]
+        remaining = limit - len(items)
+        if source.kind == "local":
+            overlay = metadb.workspace_provider_overlay_browse(
+                binding_id, uid=uid, limit=remaining, cursor=source_cursor)
+            items.extend(overlay["items"])
+            if overlay["nextCursor"] is not None:
+                statuses[current] = _source_status(source, "page")
+                next_state = (current, overlay["nextCursor"], history)
+                break
+            statuses[current] = _source_status(source, "complete")
+        elif mounted is None:
+            cached = metadb.workspace_provider_mark_binding(
+                binding_id, state="provider_error", error="catalog mount is not configured")
+            public_container = _binding_resource(cached, cached_mount)
+            statuses[current] = _source_status(
+                source, "unavailable", "catalog mount is not configured", "provider_error")
+        elif cached["provider"] != mounted.mount.provider:
+            cached = metadb.workspace_provider_mark_binding(
+                binding_id, state="provider_error", error="catalog mount provider changed")
+            public_container = _binding_resource(cached, mounted)
+            statuses[current] = _source_status(
+                source, "unavailable", "catalog mount provider changed", "provider_error")
+        elif cached["referenceState"] == "detached":
+            statuses[current] = _source_status(
+                source, "unavailable", cached.get("lastError") or "resource is detached", "detached")
         else:
-            status = _source_status(source, "page")
-            next_cursor = _cursor_encode(identity, fingerprint, 0, page.next_cursor, [])
-    else:
-        completeness = "complete" if page.state == "ready" else page.state
-        status = _source_status(source, completeness, page.reason)
-    partial = status["completeness"] in _ERROR_STATES
+            try:
+                provider = _load_provider(mounted.mount.provider)
+            except Exception:  # noqa: BLE001 -- activation failure is an honest source result
+                cached = metadb.workspace_provider_mark_binding(
+                    binding_id, state="offline", error=_activation_error())
+                public_container = _binding_resource(cached, mounted)
+                statuses[current] = _source_status(source, "unavailable", _activation_error(), "offline")
+            else:
+                resolved = bounded_resolve(provider, mounted.mount, resource_id)
+                if resolved.state != "ready" or resolved.item is None:
+                    state = _reference_state(resolved.failure, resolved.state)
+                    cached = metadb.workspace_provider_mark_binding(
+                        binding_id, state=state, error=resolved.reason)
+                    public_container = _binding_resource(cached, mounted)
+                    statuses[current] = _source_status(source, resolved.state, resolved.reason, state)
+                elif resolved.item.id != resource_id or resolved.item.kind != "container":
+                    raise KeyError(f"Workspace resource 'container:{identity}' is not a container")
+                else:
+                    ancestry = bounded_ancestors(provider, mounted.mount, resource_id)
+                    provider_ancestors = [item for item in ancestry.items if item.kind == "container"]
+                    dropped = len(provider_ancestors) != len(ancestry.items)
+                    parent_binding_id: str | None = None
+                    ancestry_completeness = "complete"
+                    ancestry_error: str | None = None
+                    if ancestry.state == "ready" and not dropped:
+                        for ancestor in provider_ancestors:
+                            parent = _workspace_resource(
+                                ancestor, mounted, parent_binding_id=parent_binding_id)
+                            parent_binding_id = parent["bindingId"]
+                        container = _workspace_resource(
+                            resolved.item, mounted, parent_binding_id=parent_binding_id)
+                    else:
+                        # A bounded ancestor failure must not rewrite a last-known parent to root.
+                        # Refresh the target display facts only and preserve its cached ancestry.
+                        binding = metadb.workspace_provider_cache_resource(
+                            mount_id=mounted.mount.id, provider=mounted.mount.provider,
+                            container_id=mounted.container_id, resource_id=resolved.item.id,
+                            kind=resolved.item.kind, name=resolved.item.name,
+                            parent_is_known=False)
+                        container = _binding_resource(binding, mounted)
+                        ancestry_completeness = (
+                            "partial" if ancestry.state == "ready" else ancestry.state)
+                        ancestry_error = (
+                            "catalog provider returned a non-container ancestor"
+                            if dropped else ancestry.reason)
+                        container = {**container, "lastKnown": True}
+                    public_container = container
+                    page = bounded_list_children(
+                        provider, mounted.mount, resource_id, limit=remaining, cursor=source_cursor)
+                    if len(page.items) > remaining:
+                        statuses[current] = _source_status(
+                            source, "unavailable", "catalog provider exceeded the requested browse limit")
+                    else:
+                        items.extend(
+                            _workspace_resource(item, mounted, parent_binding_id=container["bindingId"])
+                            for item in page.items)
+                        if page.state == "ready" and page.next_cursor is not None:
+                            if not page.items:
+                                statuses[current] = _source_status(
+                                    source, "unavailable", "catalog provider returned a non-advancing page")
+                            else:
+                                statuses[current] = _source_status(
+                                    source,
+                                    "page" if ancestry_completeness == "complete"
+                                    else ancestry_completeness,
+                                    ancestry_error,
+                                )
+                                next_state = (current, page.next_cursor, history)
+                                break
+                        else:
+                            completeness = "complete" if page.state == "ready" else page.state
+                            statuses[current] = _source_status(
+                                source,
+                                ancestry_completeness if completeness == "complete"
+                                else completeness,
+                                ancestry_error if completeness == "complete" else page.reason,
+                            )
+
+        current += 1
+        source_cursor = None
+        history = [(status["completeness"], status.get("error")) for status in statuses[:current]]
+        if len(items) >= limit and current < len(sources):
+            next_state = (current, None, history)
+            break
+
+    next_cursor = (
+        _cursor_encode("external-overlay", identity, fingerprint, *next_state)
+        if next_state is not None else None
+    )
+    partial = any(status["completeness"] in _ERROR_STATES for status in statuses)
     return {
-        "container": container, "items": items, "nextCursor": next_cursor,
-        "hasMore": next_cursor is not None,
+        "container": public_container, "items": items,
+        "nextCursor": next_cursor, "hasMore": next_cursor is not None,
         "completeness": "partial" if partial else "page" if next_cursor else "complete",
-        "sources": [status],
+        "sources": statuses,
     }
 
 
@@ -749,7 +816,7 @@ def browse(container_id: str, *, uid: str, limit: int = 50,
     limit = max(1, min(int(limit), metadb._WORKSPACE_BROWSE_MAX_LIMIT))
     mounts, invalid = _configured_mounts()
     if container_id.startswith(_EXTERNAL_PREFIX):
-        return _remote_page(container_id, limit=limit, cursor=cursor,
+        return _remote_page(container_id, uid=uid, limit=limit, cursor=cursor,
                             mounts=mounts, invalid=invalid)
     return _mixed_page(container_id, uid=uid, limit=limit, cursor=cursor,
                        mounts=mounts, invalid=invalid)
@@ -794,6 +861,29 @@ def _cached_resolution(
     }
 
 
+def _overlay_cached_resolution(
+    resource: dict, binding: dict, mounted: _MountedProvider, source: _Source, *, uid: str,
+    completeness: str, error: str | None,
+) -> dict:
+    """Resolve a local Canvas through cached external ancestry without reading its provider."""
+    try:
+        local_parent = metadb.workspace_resolve(
+            f"container:{binding['containerId']}", uid=uid)
+        local_ancestors = [*local_parent["ancestors"], local_parent["resource"]]
+    except KeyError:
+        local_ancestors = []
+    cached_ancestors = [
+        _binding_resource(item, mounted)
+        for item in metadb.workspace_provider_binding_ancestors(binding["bindingId"])
+    ]
+    return {
+        "resource": resource,
+        "ancestors": [*local_ancestors, *cached_ancestors, _binding_resource(binding, mounted)],
+        "source": _source_status(
+            source, completeness, error, binding["referenceState"]),
+    }
+
+
 def resolve(resource_ref: str, *, uid: str) -> dict:
     """Resolve local or provider identity and bounded ancestors without catalog materialization."""
     try:
@@ -801,7 +891,48 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     except ValueError as exc:
         raise KeyError("invalid Workspace resource reference") from exc
     if kind not in {"container", "dataset"} or not identity.startswith(_EXTERNAL_PREFIX):
-        return metadb.workspace_resolve(resource_ref, uid=uid)
+        try:
+            return metadb.workspace_resolve(resource_ref, uid=uid)
+        except KeyError:
+            overlay = metadb.workspace_provider_overlay_resolve(resource_ref, uid=uid)
+            binding = overlay["binding"]
+            mounts, _invalid = _configured_mounts()
+            mounted = next((item for item in mounts if item.mount.id == binding["mountId"]), None)
+            if mounted is None:
+                binding = metadb.workspace_provider_mark_binding(
+                    binding["bindingId"], state="provider_error",
+                    error="catalog mount is not configured")
+                cached_mount = _MountedProvider(
+                    CatalogMount(id=binding["mountId"], provider=binding["provider"], config={}),
+                    binding["containerId"],
+                )
+                return _overlay_cached_resolution(
+                    overlay["resource"], binding, cached_mount, _Source("configuration"), uid=uid,
+                    completeness="unavailable", error="catalog mount is not configured")
+            source = _Source("provider", mounted)
+            if binding["provider"] != mounted.mount.provider:
+                binding = metadb.workspace_provider_mark_binding(
+                    binding["bindingId"], state="provider_error", error="catalog mount provider changed")
+                return _overlay_cached_resolution(
+                    overlay["resource"], binding, mounted, source, uid=uid,
+                    completeness="unavailable", error="catalog mount provider changed")
+            # Reuse the external-container resolver rather than parallel its provider/cache state
+            # machine.  The parent is external, so this recursive call takes the branch below.
+            parent = resolve(overlay["resource"]["parentId"], uid=uid)
+            if parent["resource"] is not None:
+                return {
+                    "resource": overlay["resource"],
+                    "ancestors": [*parent["ancestors"], parent["resource"]],
+                    "source": parent["source"],
+                }
+            latest = metadb.workspace_provider_binding(binding["bindingId"])
+            if latest is None:  # pragma: no cover - FK-protected anchor binding
+                raise RuntimeError("Workspace provider overlay binding is missing")
+            return _overlay_cached_resolution(
+                overlay["resource"], latest, mounted, source, uid=uid,
+                completeness=parent["source"]["completeness"],
+                error=parent["source"].get("error"),
+            )
 
     mount_id, resource_id, binding_id = _decode_external_identity(identity)
     cached = metadb.workspace_provider_binding(
@@ -893,7 +1024,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     return {
         "resource": current,
         "ancestors": combined,
-        "source": _source_status(source, completeness, error),
+        "source": _source_status(source, completeness, error, current["referenceState"]),
     }
 
 
