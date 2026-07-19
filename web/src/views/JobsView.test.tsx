@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   workspaceJobs: vi.fn(), executionManifest: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
+  cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(), datasetRevision: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
@@ -25,6 +26,9 @@ describe('JobsView', () => {
     mocks.executionManifest.mockResolvedValue({ availability: 'not_recorded', document: null })
     mocks.cancelRun.mockResolvedValue(undefined)
     mocks.retryRun.mockResolvedValue(undefined)
+    mocks.cancelMergeColumnsTask.mockResolvedValue(undefined)
+    mocks.retryMergeColumnsTask.mockResolvedValue(undefined)
+    mocks.datasetRevision.mockResolvedValue({})
     mocks.listCanvases.mockResolvedValue([])
     useStore.setState({ view: 'jobs', jobsQuery: '', files: [], toasts: [] } as never)
   })
@@ -271,6 +275,33 @@ describe('JobsView', () => {
     expect(screen.getByText(/replace · durable · expected head head-6/)).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelRun).toHaveBeenCalledWith('task-1'))
+  })
+
+  it('uses only the dedicated merge task actions and never falls back from an exact receipt', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'merge-1', taskId: 'merge-1', status: 'running', error: null, canCancel: true,
+      mergeColumns: { phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
+    expect(screen.getByText('Column merge:', { exact: true })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
+    await waitFor(() => expect(mocks.cancelMergeColumnsTask).toHaveBeenCalledWith('merge-1'))
+    expect(mocks.cancelRun).not.toHaveBeenCalledWith('merge-1')
+  })
+
+  it('keeps a compacted exact merge receipt unavailable instead of opening latest', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'merge-done', taskId: 'merge-done', status: 'done', error: null,
+      outputReceipt: { datasetId: 'dataset-1', revisionId: 'rev-gone', rows: 2, bytes: 12, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-gone', retentionOwner: 'core' }, schema: [], partitions: [], publication: { provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'redacted', publishSequence: 1, idempotencyKey: 'merge-done' } },
+    })], hasMore: false, nextCursor: null })
+    mocks.datasetRevision.mockRejectedValueOnce(new Error('gone'))
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
+    expect(await screen.findByText(/Exact revision unavailable: gone/)).toBeVisible()
+    expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-1', 'rev-gone')
+    expect(mocks.workspaceJobs).toHaveBeenCalledTimes(1)
   })
 
   it('loads the selected durable task manifest through its current Canvas subject', async () => {

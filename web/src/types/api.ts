@@ -806,6 +806,49 @@ export interface WriteAdmission {
   blocker?: string | null
 }
 
+// Certified local add/replace-column work.  The browser deliberately carries only the small,
+// three-node graph and lets the API remain the authority for eligibility, coverage, schema, and
+// moving-head admission.
+export interface MergeColumnRule { source: string; target: string; mode: 'add' | 'replace' }
+export interface MergeColumnsRequest {
+  graph: { id: string; version: number; requirements: string[]; parameters: unknown[]; nodes: unknown[]; edges: unknown[] }
+  submissionId: string
+  identityColumns: string[]
+  rules: MergeColumnRule[]
+}
+export interface MergeColumnsCoverageCounts { rows: number; uniqueIdentities: number; nullRows: number; duplicateGroups: number; duplicateRows: number }
+export interface MergeColumnsPreflight {
+  base: { kind: 'exact'; datasetId: string; revisionId: string }
+  declaredKey: string[]
+  identityColumns: string[]
+  coverage: { base: MergeColumnsCoverageCounts; candidate: MergeColumnsCoverageCounts; matchedIdentities: number; missingIdentities: number; extraIdentities: number; status: string }
+  rules: MergeColumnRule[]
+  expectedHead: { kind: 'exact'; datasetId: string; revisionId: string }
+  outputSchema: ColumnSchema[]
+  provenance: { producer: string; source: string; selectKind: string; selectVersion: number }
+  eligible: boolean
+}
+export interface MergeColumnsTaskProjection {
+  phase: 'validating' | 'merging' | 'candidate_committed' | 'publishing' | 'done' | 'failed' | 'cancelled'
+  baseDatasetId: string
+  baseRevisionId: string
+  candidate: 'pending' | 'committed'
+  reused: boolean
+  candidateRows?: number | null
+  candidateBytes?: number | null
+  candidateDigest?: string | null
+  canRetry: boolean
+  canCancel: boolean
+  diagnosticCode?: string | null
+}
+export interface MergeColumnsTask {
+  taskId: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  canRetry: boolean
+  canCancel: boolean
+  mergeColumns?: MergeColumnsTaskProjection | null
+}
+
 export interface RunInputManifestItem {
   // Run history persists this deliberately minimal dict verbatim, so its inner keys remain snake_case.
   node_id: string

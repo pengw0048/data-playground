@@ -3,6 +3,7 @@ import { roleCanEdit, targetParameterDeclarations, useStore } from '../store/gra
 import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
+import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
@@ -16,6 +17,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const hasRetainedPreviewBinding = useStore((s) => !!s.previewBindings[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
+  const isWrite = doc.nodes.find((node) => node.id === nodeId)?.type === 'write'
   const setParameterBinding = useStore((s) => s.setRunParameterBinding)
   const clearParameterBinding = useStore((s) => s.clearRunParameterBinding)
   const editParameters = useStore((s) => s.editRunParameters)
@@ -140,6 +142,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </Button>
         </>
       )}
+
+      {isWrite && <MergeColumnsControl nodeId={nodeId} compact />}
 
       {phase === 'done' && st && (
         <>

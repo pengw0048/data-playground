@@ -7,6 +7,7 @@ import type {
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   CompoundFixtureDetail, InspectionWindowRequest, InspectionWindowResponse,
+  MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -108,6 +109,32 @@ function toGraph(doc: CanvasDoc) {
       targetHandle: e.targetHandle,
       data: e.data ?? { wire: 'dataset' },
     })),
+  }
+}
+
+// This endpoint intentionally does not receive the whole canvas.  Keep the payload bounded to
+// the direct upstream chain so unrelated cards, graph presentation, and future node kinds cannot
+// accidentally become part of certified merge admission.
+export function toMergeColumnsGraph(doc: CanvasDoc, writeNodeId: string): MergeColumnsRequest['graph'] {
+  const write = doc.nodes.find((node) => node.id === writeNodeId)
+  const directToWrite = doc.edges.filter((edge) => edge.target === writeNodeId)
+  const selectIds = new Set(directToWrite.map((edge) => edge.source))
+  const directToSelect = doc.edges.filter((edge) => selectIds.has(edge.target))
+  const ids = new Set([writeNodeId, ...selectIds, ...directToSelect.map((edge) => edge.source)])
+  const nodes = doc.nodes.filter((node) => ids.has(node.id) && node.type !== 'note' && node.type !== 'code')
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  return {
+    id: doc.id,
+    version: doc.version,
+    requirements: [],
+    parameters: [],
+    nodes: nodes.map((node) => ({
+      id: node.id, type: node.type, position: node.position, parentId: node.parentId ?? null,
+      data: { title: node.data.title, config: node.data.config, bypassed: node.data.bypassed, disabled: node.data.disabled },
+    })),
+    edges: [...directToSelect, ...directToWrite]
+      .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+      .map((edge) => ({ id: edge.id, source: edge.source, target: edge.target, sourceHandle: edge.sourceHandle, targetHandle: edge.targetHandle, data: edge.data ?? { wire: 'dataset' } })),
   }
 }
 
@@ -456,6 +483,16 @@ export const api = {
       }),
     }),
 
+  mergeColumnsPreflight: (body: MergeColumnsRequest) =>
+    req<MergeColumnsPreflight>('/merge-columns/preflight', { method: 'POST', body: JSON.stringify(body) }),
+  submitMergeColumns: (body: MergeColumnsRequest) =>
+    req<MergeColumnsTask>('/merge-columns', { method: 'POST', body: JSON.stringify(body) }),
+  mergeColumnsTask: (taskId: string) => req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}`),
+  cancelMergeColumnsTask: (taskId: string) =>
+    req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
+  retryMergeColumnsTask: (taskId: string, retryRequestId: string) =>
+    req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}/retry`, { method: 'POST', body: JSON.stringify({ retryRequestId }) }),
+
   inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[],
     parameterBindings?: CanvasParameterBinding[]) =>
     req<InputDrift>('/run/input-drift', {
@@ -659,8 +696,9 @@ export interface BoundedFanoutJobDto {
   gather: 'pending' | 'running' | 'committed'
   diagnosticCode?: string | null
 }
+export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
-export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; distributionReport?: DistributionReportJobDto | null }
+export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {

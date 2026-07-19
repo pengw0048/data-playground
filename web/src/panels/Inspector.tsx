@@ -11,6 +11,7 @@ import { Icon, type IconName } from '../ui/Icon'
 import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
 import { api } from '../api/client'
+import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
 import type { ColumnSchema } from '../types/graph'
 import { Button } from '@/components/ui/button'
@@ -398,6 +399,7 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
           {receipt.publication?.backendVersion && <div className="mt-0.5">backend {receipt.publication.backendVersion}</div>}
         </div>
       )}
+      <MergeColumnsControl nodeId={nodeId} />
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />

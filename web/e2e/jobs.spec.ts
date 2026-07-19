@@ -80,3 +80,31 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.getByRole('button', { name: 'Retry load more' }).click()
   await expect(page.getByText('run-older')).toBeVisible()
 })
+
+test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
+  const mergeJob = {
+    id: 'merge-task-1', runId: 'merge-task-1', taskId: 'merge-task-1', jobType: 'run', status: 'done',
+    canvasId: 'canvas-merge', canvasName: 'Column enrichment', targetNodeId: 'merge-columns',
+    nodeLabel: 'Write enrichment', backend: 'local', placement: 'local', attempt: 'merge-task-1',
+    rows: null, ms: 20, outputs: [], taskAttempts: [], canRetry: false, canCancel: false,
+    mergeColumns: { phase: 'done', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-base', candidate: 'committed', reused: false, candidateRows: 2, candidateBytes: 120, canRetry: false, canCancel: false },
+    outputReceipt: { datasetId: 'dataset-1', revisionId: 'rev-published', rows: 2, bytes: 120, durable: true, head: { datasetId: 'dataset-1', revisionId: 'rev-published', retentionOwner: 'core' }, schema: [], partitions: [], publication: { provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'redacted', publishSequence: 1, idempotencyKey: 'merge-task-1' } },
+    createdAt: '2026-07-19T12:00:00Z', updatedAt: '2026-07-19T12:01:00Z',
+  }
+  await page.route('**/api/canvas', async (route) => route.fulfill({ json: [{ id: 'canvas-merge', name: 'Column enrichment', version: 1, role: 'editor' }] }))
+  await page.route('**/api/jobs?*', async (route) => route.fulfill({ json: { items: [mergeJob], nextCursor: null, hasMore: false } }))
+  await page.route('**/api/canvas/canvas-merge/runs/merge-task-1/manifest', async (route) => route.fulfill({ json: { availability: 'not_recorded' } }))
+  await page.route('**/api/catalog/revisions/dataset-1/rev-published', async (route) => route.fulfill({ json: {
+    datasetId: 'dataset-1', revisionId: 'rev-published', committedAt: '2026-07-19T12:01:00Z', retentionOwner: 'core', parentRevisionId: 'rev-base', producerOperation: 'merge-columns',
+    summary: { rowCount: 2, dataFileCount: 1, totalBytes: 120, fragmentCount: 1 }, preview: { columns: [{ name: 'id', type: 'BIGINT' }, { name: 'score', type: 'DOUBLE' }], rows: [{ id: 1, score: 0.8 }], hasMore: true, rowLimit: 100 },
+  } }))
+
+  await page.goto('/#/jobs')
+  await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
+  await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
+  await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
+  await expect(page.getByText('rev-published')).toBeVisible()
+  await page.getByRole('button', { name: 'Open exact revision' }).click()
+  await expect(page.getByLabel('Exact revision detail')).toContainText('Parent rev-base')
+  await expect(page.getByText('Preview is bounded; this remains the exact published revision.')).toBeVisible()
+})
