@@ -227,9 +227,9 @@ export function JobsView() {
           : `Snapshot; no active Jobs. Last successful refresh: ${refreshLabel(lastSuccessfulRefresh)}`
 
   const reportId = params.get('report')
-  if (reportId) return <DistributionReportPage reportId={reportId} onClose={() => {
+  if (reportId) return <DistributionReportPage reportId={reportId} compareReportId={params.get('compare') || undefined} onClose={() => {
     const next = new URLSearchParams(params)
-    next.delete('report')
+    next.delete('report'); next.delete('compare')
     setJobsQuery(next.toString())
   }} />
 

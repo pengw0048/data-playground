@@ -54,6 +54,12 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: `report=${reportId}` })
   })
 
+  it('preserves a comparison identity on retained-report deep links', () => {
+    const report = 'a'.repeat(32), compare = 'b'.repeat(32)
+    window.location.hash = `#/distribution-reports/${report}?compare=${compare}`
+    expect(parseHash()).toEqual({ view: 'jobs', jobsQuery: `report=${report}&compare=${compare}` })
+  })
+
   it('round-trips Inbox filter query', () => {
     const query = new URLSearchParams({ filter: 'unread' }).toString()
     window.location.hash = routeHash('inbox', undefined, undefined, undefined, undefined, undefined, query)

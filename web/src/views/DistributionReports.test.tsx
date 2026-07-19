@@ -1,8 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DatasetViewDefinition, DistributionReportEnvelope } from '../types/api'
+import type { DatasetViewDefinition, DistributionReportComparison, DistributionReportEnvelope } from '../types/api'
 
-const mocks = vi.hoisted(() => ({ distributionReport: vi.fn(), distributionReports: vi.fn(), estimateDistributionReport: vi.fn(), submitDistributionReport: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn() }))
+const mocks = vi.hoisted(() => ({ distributionReport: vi.fn(), distributionReports: vi.fn(), compareDistributionReports: vi.fn(), distributionReportBucketExamples: vi.fn(), estimateDistributionReport: vi.fn(), submitDistributionReport: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn() }))
 vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
@@ -42,8 +42,14 @@ const envelope = (reportId = 'a'.repeat(32)): DistributionReportEnvelope => ({
   ] },
 })
 
+const comparison = (rightId = 'b'.repeat(32), comparable = true, revisionId = 'revision-2'): DistributionReportComparison => {
+  const report = envelope().report!
+  const identity = (id: string, revisionId: string) => ({ reportId: id, datasetViewId: view.id, datasetId: 'dataset-1', revisionId, viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', measuredRows: 10, complete: false, samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance })
+  return { schemaVersion: 1, coverage: { left: identity(report.reportId, 'revision-1'), right: identity(rightId, revisionId), comparable, reason: comparable ? 'same_deterministic_sample' : 'different_deterministic_samples' }, columns: [{ matchReason: 'name_and_logical_type', fieldId: null, leftColumn: { name: 'category', type: 'string', nullable: true }, rightColumn: { name: 'category', type: 'string', nullable: true }, leftSections: report.sections.filter((section) => section.kind === 'categorical'), rightSections: report.sections.filter((section) => section.kind === 'categorical'), comparable, reason: comparable ? 'compatible' : 'coverage_mismatch', missingCountDelta: comparable ? 1 : null, metricDelta: comparable ? { kind: 'categorical', categories: [{ label: 'Other', leftCount: 7, rightCount: null, countDelta: null, reason: 'outside_right_top_k' }], otherCountDelta: null, otherCountReason: 'different_top_k', distinctCountDelta: null, distinctCountReason: 'approximate' } : null }], unmatchedLeftColumns: [], unmatchedRightColumns: [] }
+}
+
 describe('DistributionReportPage', () => {
-  beforeEach(() => { vi.clearAllMocks(); mocks.distributionReport.mockResolvedValue(envelope()) })
+  beforeEach(() => { vi.clearAllMocks(); mocks.distributionReport.mockResolvedValue(envelope()); mocks.distributionReports.mockResolvedValue([]) })
 
   it('puts exact coverage and sample evidence before bounded renderers', async () => {
     const { container } = render(<DistributionReportPage reportId={'a'.repeat(32)} />)
@@ -222,6 +228,104 @@ describe('DistributionReportPage', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'The exact retained revision became unavailable before this report finished.',
     )
+  })
+
+  it('renders only server-authorized comparison deltas and keeps the primary report on comparison failure', async () => {
+    const source = envelope().report!
+    const comparison: DistributionReportComparison = { schemaVersion: 1, coverage: { left: { reportId: source.reportId, datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: source.revisionId, viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, right: { reportId: 'b'.repeat(32), datasetViewId: source.datasetViewId, datasetId: source.datasetId, revisionId: 'revision-2', viewDefinitionSha256: source.viewDefinitionSha256, computationVersion: source.computationVersion, measuredRows: source.measuredRows, complete: source.complete, samplingIdentity: 'sample-7' }, comparable: true, reason: 'same_deterministic_sample' }, columns: [], unmatchedLeftColumns: [], unmatchedRightColumns: [] }
+    mocks.compareDistributionReports.mockResolvedValue(comparison)
+    const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
+    expect(await screen.findByText('Coverage and identity before comparison')).toBeVisible()
+    mocks.compareDistributionReports.mockRejectedValue(new KernelError(503, 'sanitized', 'service_unavailable', true))
+    page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Comparison is temporarily unavailable')
+    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+  })
+
+  it('uses the exact bucket endpoint and explains revision-gone examples without hiding the report', async () => {
+    mocks.distributionReportBucketExamples.mockRejectedValue(new KernelError(410, 'sanitized', 'resource_gone', false))
+    render(<DistributionReportPage reportId={'a'.repeat(32)} />)
+    fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
+    expect(await screen.findByRole('dialog', { name: 'Bucket examples' })).toHaveTextContent('exact revision is no longer available')
+    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+  })
+
+  it.each([
+    { status: 403, code: 'permission_denied' },
+    { status: 404, code: 'not_found' },
+  ])('does not expose retained comparison metadata for a $status response', async ({ status, code }) => {
+    const sensitive = 'sensitive-dataset@secret-revision'
+    mocks.compareDistributionReports.mockRejectedValue(new KernelError(status, sensitive, code, false))
+    render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('The selected comparison is unavailable or not authorized.')
+    expect(screen.queryByText(sensitive)).not.toBeInTheDocument()
+    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+  })
+
+  it.each([
+    { status: 403, code: 'permission_denied' },
+    { status: 404, code: 'not_found' },
+  ])('does not expose retained example metadata for a $status response', async ({ status, code }) => {
+    const sensitive = 'sensitive-dataset@secret-revision'
+    mocks.distributionReportBucketExamples.mockRejectedValue(new KernelError(status, sensitive, code, false))
+    render(<DistributionReportPage reportId={'a'.repeat(32)} />)
+    fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
+    expect(await screen.findByRole('alert')).toHaveTextContent('Examples are unavailable for this bucket.')
+    expect(screen.queryByText(sensitive)).not.toBeInTheDocument()
+    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+  })
+
+  it('keeps the primary document visible while a comparison is pending and exposes a linked cross-view id without metadata', async () => {
+    let resolve!: (value: DistributionReportComparison) => void
+    mocks.compareDistributionReports.mockReturnValue(new Promise((done) => { resolve = done }))
+    render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'c'.repeat(32)} />)
+    expect(await screen.findByText('Loading comparison…')).toBeVisible()
+    expect(screen.getByText('Coverage before distributions')).toBeVisible()
+    expect(screen.getByRole('option', { name: `Linked report · ${'c'.repeat(32)}` })).toBeVisible()
+    await act(async () => { resolve(comparison('c'.repeat(32))) })
+    expect(await screen.findByText('Coverage and identity before comparison')).toBeVisible()
+  })
+
+  it('does not render deltas for incompatible coverage and preserves unknown top-K values as unknown', async () => {
+    mocks.compareDistributionReports.mockResolvedValue(comparison('b'.repeat(32), false))
+    const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'b'.repeat(32)} />)
+    expect(await screen.findByText(/Coverage is not comparable/)).toBeVisible()
+    expect(screen.queryByText(/Server-authorized deltas/)).not.toBeInTheDocument()
+    mocks.compareDistributionReports.mockResolvedValue(comparison())
+    page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId={'d'.repeat(32)} />)
+    expect(await screen.findByText(/outside comparison top-K/)).toBeVisible()
+    expect(screen.getByText(/Other: different top k/)).toBeVisible()
+  })
+
+  it('drops stale comparison and examples responses, and distinguishes empty, invalid, and gone examples', async () => {
+    let oldCompare!: (value: DistributionReportComparison) => void
+    let newCompare!: (value: DistributionReportComparison) => void
+    mocks.compareDistributionReports.mockImplementation((_left: string, right: string) => new Promise((done) => { if (right === 'old') oldCompare = done; else newCompare = done }))
+    const page = render(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId="old" />)
+    await waitFor(() => expect(mocks.compareDistributionReports).toHaveBeenCalledWith('a'.repeat(32), 'old'))
+    page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} compareReportId="new" />)
+    await waitFor(() => expect(mocks.compareDistributionReports).toHaveBeenCalledWith('a'.repeat(32), 'new'))
+    await act(async () => { newCompare(comparison('new', true, 'new-revision')) })
+    await act(async () => { oldCompare(comparison('old', true, 'old-revision')); await Promise.resolve() })
+    expect(await screen.findByText((_, node) => node?.textContent === 'dataset-1@new-revision')).toBeVisible()
+    expect(screen.queryByText((_, node) => node?.textContent === 'dataset-1@old-revision')).not.toBeInTheDocument()
+    page.rerender(<DistributionReportPage reportId={'a'.repeat(32)} />)
+    let oldExample!: (value: any) => void, newExample!: (value: any) => void
+    mocks.distributionReportBucketExamples.mockImplementation((_report: string, _section: string, bucket: string) => new Promise((done) => { if (bucket === 'bucket') oldExample = done; else newExample = done }))
+    const exampleButtons = await screen.findAllByRole('button', { name: 'View examples' })
+    fireEvent.click(exampleButtons[0]); fireEvent.click(exampleButtons[1])
+    await act(async () => { newExample({ schemaVersion: 1, reportId: 'a'.repeat(32), datasetViewId: view.id, datasetId: 'dataset-1', revisionId: 'revision-1', viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance, sectionId: 'category', bucketId: 'top', bucketKind: 'categorical', columnName: 'category', bucketCount: 7, exampleSemantics: 'bounded_examples_from_measured_bucket', rowLimit: 100, returnedRows: 1, truncated: false, rows: [{ evidence: 'new bucket' }] }) })
+    await act(async () => { oldExample({ schemaVersion: 1, reportId: 'a'.repeat(32), datasetViewId: view.id, datasetId: 'dataset-1', revisionId: 'revision-1', viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance, sectionId: 'numeric', bucketId: 'bucket', bucketKind: 'numeric', columnName: 'number', bucketCount: 8, exampleSemantics: 'bounded_examples_from_measured_bucket', rowLimit: 100, returnedRows: 1, truncated: false, rows: [{ evidence: 'old bucket' }] }); await Promise.resolve() })
+    expect(await screen.findByText(/new bucket/)).toBeVisible()
+    expect(screen.queryByText(/old bucket/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    mocks.distributionReportBucketExamples.mockResolvedValue({ schemaVersion: 1, reportId: 'a'.repeat(32), datasetViewId: view.id, datasetId: 'dataset-1', revisionId: 'revision-1', viewDefinitionSha256: view.definitionSha256, computationVersion: 'distribution-v1', samplingIdentity: 'sample-7', sampleProvenance: view.sampleProvenance, sectionId: 'numeric', bucketId: 'bucket', bucketKind: 'numeric', columnName: 'number', bucketCount: 0, exampleSemantics: 'bounded_examples_from_measured_bucket', rowLimit: 100, returnedRows: 0, truncated: false, rows: [] })
+    fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
+    expect(await screen.findByText('This measured bucket has no available example rows.')).toBeVisible()
+    mocks.distributionReportBucketExamples.mockRejectedValue(new KernelError(422, 'sanitized', 'validation_error', false))
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    fireEvent.click((await screen.findAllByRole('button', { name: 'View examples' }))[0])
+    expect(await screen.findByRole('alert')).toHaveTextContent('unsupported or no longer valid')
   })
 })
 

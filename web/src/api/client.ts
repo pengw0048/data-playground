@@ -2,7 +2,7 @@
 import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
-  InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport,
+  InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
@@ -300,6 +300,8 @@ export const api = {
     req<DistributionReportEnvelope[]>(`/dataset-views/${encodeURIComponent(viewId)}/distribution-reports`),
   distributionReport: (reportId: string) =>
     req<DistributionReportEnvelope>(`/distribution-reports/${encodeURIComponent(reportId)}`),
+  compareDistributionReports: (leftReportId: string, rightReportId: string) => req<DistributionReportComparison>('/distribution-reports/compare', { method: 'POST', body: JSON.stringify({ schemaVersion: 1, leftReportId, rightReportId }) }),
+  distributionReportBucketExamples: (reportId: string, sectionId: string, bucketId: string) => req<DistributionReportBucketExamples>(`/distribution-reports/${encodeURIComponent(reportId)}/sections/${encodeURIComponent(sectionId)}/buckets/${encodeURIComponent(bucketId)}/examples`),
   setTableMetadata: (id: string, meta: CatalogMetadata) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}/metadata`, { method: 'PUT', body: JSON.stringify(meta) }),
   saveTableEdit: (id: string, edit: CatalogEdit) =>
