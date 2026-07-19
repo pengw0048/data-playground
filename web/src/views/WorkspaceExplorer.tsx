@@ -45,7 +45,9 @@ function canvasDestination(resource: WorkspaceResource | null, action: 'create' 
 
 function canvasDestinationTitle(resource: WorkspaceResource | null, action: 'create' | 'move'): string {
   if (!resource) return 'Load a Workspace destination first'
-  if (resource.detached) return 'Deleted Catalog folder tombstones do not accept new canvases'
+  if (resource.detached) return isExternal(resource)
+    ? 'This source-only provider location is detached; relink or recover it before using its local Canvas overlay'
+    : 'Deleted Catalog folder tombstones do not accept new canvases'
   if (!isExternal(resource)) return resource.version == null ? 'Load an exact Workspace destination first' : `Create in ${resource.name}`
   if (canvasDestination(resource, action)) return `Create a locally owned Canvas beside ${resource.name}`
   if (resource.localPlacement?.recoveryState === 'unavailable') return 'The local Canvas overlay is unavailable; retry after this source recovers'
@@ -320,6 +322,7 @@ function WorkspaceMixedExplorer() {
       pushToast(`Could not undo move: ${errorMessage(caught)}`, 'error')
     } finally { setUndoBusy(false) }
   }
+  const undoDestination = undoMove ? canvasDestination(undoMove.previousContainer, 'move') : null
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -356,8 +359,10 @@ function WorkspaceMixedExplorer() {
       </header>
 
       {undoMove && <div role="status" className="flex items-center gap-2 border-b border-border bg-primary/5 px-7 py-2 text-[12px] text-foreground">
-        <span className="flex-1">Moved “{undoMove.resource.name}” to {undoMove.destination.name}.</span>
-        <button onClick={() => void undoLastMove()} disabled={undoBusy} className="font-semibold text-primary underline disabled:opacity-50">{undoBusy ? 'Undoing…' : 'Undo move'}</button>
+        <span className="flex-1">Moved “{undoMove.resource.name}” to {undoMove.destination.name}.{!undoDestination && ' Its previous source-only location is unavailable; recover or relink it before undoing.'}</span>
+        <button onClick={() => void undoLastMove()} disabled={undoBusy || !undoDestination}
+          title={!undoDestination ? canvasDestinationTitle(undoMove.previousContainer, 'move') : undefined}
+          className="font-semibold text-primary underline disabled:opacity-50">{undoBusy ? 'Undoing…' : undoDestination ? 'Undo move' : 'Undo unavailable'}</button>
         <button onClick={() => setUndoMove(null)} aria-label="Dismiss move confirmation"><Icon name="close" size={13} /></button>
       </div>}
 
@@ -870,12 +875,12 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
+  const destination = canvasDestination(container, 'create')
   const submit = async () => {
     if (busy) return
     setBusy(true); setError(null)
     try {
       if (mode === 'explore') {
-        const destination = canvasDestination(container, 'create')
         if (!destination) throw new Error('Load an exact writable local Canvas destination first')
         if (!name.trim()) return
         const intent = JSON.stringify({ containerId: destination.containerId,
@@ -901,7 +906,7 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
     finally { setBusy(false) }
   }
   return <Modal label={`Use ${resource.name}`} onClose={onClose}>
-    <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated. {isExternal(container) && canvasDestination(container, 'create') && 'The new Canvas is a locally owned overlay beside this source-only provider resource.'}</p>
+    <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated. {isExternal(container) && destination && 'The new Canvas is a locally owned overlay beside this source-only provider resource.'}</p>
     <div className="grid grid-cols-2 gap-2">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in new canvas</span></button>
       <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to canvas</span></button>
@@ -909,8 +914,11 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
       : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Target canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
         : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available.</div>}
+    {mode === 'explore' && !destination && <div role="status" className="text-[12px] text-muted-foreground">{canvasDestinationTitle(container, 'create')}</div>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
-    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !destination : !canvasId)}
+      title={mode === 'explore' && !destination ? canvasDestinationTitle(container, 'create') : undefined}
+      className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
   </Modal>
 }
 

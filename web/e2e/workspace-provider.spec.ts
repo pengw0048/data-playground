@@ -4,6 +4,7 @@ import { expect, test } from '@playwright/test'
 
 const enabled = process.env.DP_E2E_PROVIDER_ACCEPTANCE === '1'
 const providerRoot = process.env.DP_E2E_PROVIDER_ROOT
+const containerName = 'Browser provider collection'
 const datasetName = 'Browser provider observations'
 
 test.describe('provider Workspace Source acceptance', () => {
@@ -13,16 +14,35 @@ test.describe('provider Workspace Source acceptance', () => {
     const root = resolve(providerRoot!)
     mkdirSync(root, { recursive: true })
     writeFileSync(resolve(root, 'observations.csv'), 'id,value\n1,alpha\n2,beta\n')
-    writeFileSync(resolve(root, 'catalog.json'), JSON.stringify({ resources: [{
-      id: 'browser-observations', kind: 'dataset', name: datasetName,
-      uri: 'observations.csv', revisionId: 'browser-provider-revision-v1',
-      columns: [{ name: 'id', type: 'int64' }, { name: 'value', type: 'string' }],
-    }] }))
+    writeFileSync(resolve(root, 'catalog.json'), JSON.stringify({ resources: [
+      { id: 'browser-collection', kind: 'container', name: containerName },
+      {
+        id: 'browser-observations', kind: 'dataset', name: datasetName,
+        parentId: 'browser-collection', uri: 'observations.csv',
+        revisionId: 'browser-provider-revision-v1',
+        columns: [{ name: 'id', type: 'int64' }, { name: 'value', type: 'string' }],
+      },
+    ] }))
   })
 
   test('creates a local Canvas overlay, then uses, previews, runs, and inspects an exact provider Source in Chromium', async ({ page }) => {
     test.setTimeout(60_000)
     await page.goto('/#/workspace')
+    const container = page.getByRole('button', {
+      name: new RegExp(`Open container ${containerName} from Source-only mount browser-provider`),
+    })
+    await expect(container).toBeVisible({ timeout: 20_000 })
+    const externalBrowse = page.waitForResponse((response) =>
+      response.url().includes('/api/workspace/containers/')
+      && response.request().method() === 'GET')
+    await container.click()
+    const externalPage = await (await externalBrowse).json() as {
+      container: { id: string; resourceId?: string; providerMutation?: boolean; localPlacement?: { containerId: string; containerVersion: number } }
+    }
+    expect(externalPage.container.resourceId).toBe('browser-collection')
+    expect(externalPage.container.providerMutation).toBe(false)
+    const localPlacement = externalPage.container.localPlacement
+    expect(localPlacement).toBeTruthy()
     const resource = page.getByRole('button', {
       name: new RegExp(`Open dataset ${datasetName} from Source-only mount browser-provider`),
     })
@@ -35,15 +55,27 @@ test.describe('provider Workspace Source acceptance', () => {
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetName}` })
     await expect(useDialog).toContainText('data and credentials are not copied')
     await expect(useDialog).toContainText('locally owned overlay')
+    const writes: string[] = []
+    page.on('request', (request) => {
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method()) && request.url().includes('/api/')) {
+        writes.push(new URL(request.url()).pathname)
+      }
+    })
     const createRequest = page.waitForRequest((request) =>
       request.url().endsWith('/api/workspace/canvases') && request.method() === 'POST')
     await useDialog.getByRole('button', { name: 'Create and open' }).click()
     const createBody = JSON.parse((await createRequest).postData() ?? '{}') as {
-      containerId?: string; requestId?: string; providerDatasetRefs?: string[]
+      containerId?: string; expectedContainerVersion?: number; requestId?: string; providerDatasetRefs?: string[]
     }
-    expect(createBody.requestId).toEqual(expect.any(String))
-    expect(createBody.containerId).not.toBe('browser-observations')
+    expect(createBody).toEqual(expect.objectContaining({
+      containerId: localPlacement!.containerId,
+      expectedContainerVersion: localPlacement!.containerVersion,
+      requestId: expect.any(String), providerDatasetRefs: expect.any(Array),
+    }))
+    expect(createBody.containerId).not.toBe(externalPage.container.id)
+    expect(createBody.containerId).not.toBe('browser-collection')
     expect(createBody.providerDatasetRefs).toHaveLength(1)
+    expect(writes).toEqual(['/api/workspace/canvases'])
     await expect(page.getByTestId('toolbar')).toBeVisible()
     const source = page.locator('.react-flow__node').filter({ hasText: datasetName })
     await expect(source).toHaveCount(1)
