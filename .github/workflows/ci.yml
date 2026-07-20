@@ -30,13 +30,11 @@ jobs:
       fail-fast: false  # one failing shard must not hide failures in the others
       matrix:
         shard: [kernel, lifecycle, remainder-0, remainder-1]
-    env:
-      # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path is
-      # missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
-      DP_DATA_DIR: ${{ runner.temp }}/dp-test-data-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path
+      # is missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
       - name: Placeholder web build (kernel doesn't serve the SPA in tests)
         run: mkdir -p web/dist
       - name: Install kernel (dev extra)
@@ -52,6 +50,7 @@ jobs:
         run: |
           set -uo pipefail
           cd kernel
+          export DP_DATA_DIR="$RUNNER_TEMP/dp-test-data-${{ matrix.shard }}"
           case "${{ matrix.shard }}" in
             kernel)
               files="hub/tests/test_kernel.py" ;;
