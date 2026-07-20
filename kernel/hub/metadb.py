@@ -16127,7 +16127,8 @@ def _managed_local_write_receipt_in_session(
     if revision is None:
         return None
     if revision.write_intent_doc != intent_doc:
-        raise RuntimeError(f"managed local write idempotency key collision: {idempotency_key}")
+        raise ManagedLocalWriteConflict(
+            f"managed local write idempotency key collision: {idempotency_key}")
     try:
         from hub.models import WriteReceipt
 
@@ -16188,7 +16189,8 @@ def _managed_local_lance_write_receipt_in_session(
     if row is None:
         return None
     if row.write_intent_doc != intent_doc:
-        raise RuntimeError(f"managed local write idempotency key collision: {idempotency_key}")
+        raise ManagedLocalWriteConflict(
+            f"managed local write idempotency key collision: {idempotency_key}")
     try:
         from hub.models import WriteReceipt
 

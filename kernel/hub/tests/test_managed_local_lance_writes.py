@@ -172,6 +172,22 @@ def test_lance_append_rejects_invalid_destinations_and_schema_before_fragment_al
     assert allocations == 0
 
 
+def test_lance_readmission_after_head_advance_is_a_typed_conflict_not_a_500(lance_destination):
+    """Re-admitting a completed append's key with the advanced head is a typed 409, never a raw 500."""
+    _lance, _catalog, table, binding = lance_destination
+    committed = write_managed_local_lance_append(
+        intent=_intent(table, binding, "readmit-key"), data=pa.table({"value": [2]}))
+    advanced = LanceAdapter().resolve_revision(table.uri)["revision_id"]
+    assert advanced != committed.parent_head.revision_id
+
+    # Same lineage key, but the recomputed intent now names the advanced head — a false-positive
+    # "collision" that used to raise a bare RuntimeError (HTTP 500) from admission.
+    readmit = _intent(table, binding, "readmit-key", revision_id=advanced)
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="idempotency key collision"):
+        metadb.catalog_admit_managed_local_lance_write(
+            readmit.model_dump(by_alias=True, mode="json"))
+
+
 def test_two_lance_appends_admitted_from_one_head_have_one_cas_winner(lance_destination):
     _lance, _catalog, table, binding = lance_destination
     head = LanceAdapter().resolve_revision(table.uri)["revision_id"]
