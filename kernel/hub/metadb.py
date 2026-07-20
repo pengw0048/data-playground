@@ -577,7 +577,7 @@ class DurableTask(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'restore_revision_write','distribution_report')",
+            "'restore_revision_write','keyed_upsert_write','distribution_report')",
             name="ck_durable_task_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
@@ -586,7 +586,9 @@ class DurableTask(Base):
             "AND input_manifest IS NULL AND write_intent IS NULL) OR "
             "(task_kind = 'restore_revision_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'restore-revision') OR "
-            "(task_kind <> 'distribution_report' AND task_kind <> 'restore_revision_write' "
+            "(task_kind = 'keyed_upsert_write' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NULL AND target_node_id = 'keyed-upsert') OR "
+            "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NOT NULL AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
         UniqueConstraint(
@@ -774,6 +776,30 @@ class RestoreRevisionTaskEnvelope(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
         UniqueConstraint("write_idempotency_key", name="uq_restore_revision_write_key"),
+    )
+
+
+class KeyedUpsertTaskEnvelope(Base):
+    """Dataset-scoped resume point for one certified keyed-upsert Task.
+
+    Holds the frozen UpsertIntentV1 so a claim can re-run the deterministic service, plus the exact
+    projected evidence so an owner reopens identical matched/inserted/unchanged/rejected/duplicate/
+    conflict counts through the task view.
+    """
+    __tablename__ = "keyed_upsert_task_envelopes"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    base_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    base_revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    payload_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    upsert_intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    write_idempotency_key: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("write_idempotency_key", name="uq_keyed_upsert_write_key"),
     )
 
 
@@ -5897,6 +5923,12 @@ def restore_revision_submission_id(uid: str, submission_id: str) -> str:
         f"restore-revision-write-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
 
 
+def keyed_upsert_submission_id(uid: str, submission_id: str) -> str:
+    """Deterministic owner+submission identity for one canvas-less keyed-upsert Task."""
+    return "kus_" + hashlib.sha256(
+        f"keyed-upsert-write-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
+
+
 def _task_status_doc(task_id: str, target_node_id: str | None, status: str = "queued") -> dict:
     from hub.models import RunStatus
     return RunStatus(
@@ -5937,6 +5969,27 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
                 "dataset_id": envelope.source_dataset_id,
                 "revision_id": envelope.source_revision_id,
             },
+        }
+    if task.task_kind == "keyed_upsert_write":
+        from hub.models import WriteIntent
+
+        envelope = s.get(KeyedUpsertTaskEnvelope, task.id)
+        if envelope is None or task.write_intent is None:
+            raise RuntimeError("keyed upsert durable admission is incomplete")
+        try:
+            write = WriteIntent.model_validate_json(task.write_intent)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("keyed upsert durable admission is invalid") from exc
+        if (write.mode != "replace" or write.destination.provider != "managed-local-file"
+                or write.idempotency_key != envelope.write_idempotency_key
+                or write.provenance.parents):
+            raise RuntimeError("keyed upsert durable admission is invalid")
+        return {
+            "graph_doc": None, "input_manifest": [],
+            "write_intent": write.model_dump(by_alias=True, mode="json"),
+            "target_node_id": task.target_node_id, "target_port_id": None,
+            "upsert_intent": json.loads(envelope.upsert_intent_doc),
+            "upsert_evidence": json.loads(envelope.evidence_doc),
         }
     if task.task_kind == "merge_columns_write":
         envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
@@ -6399,6 +6452,88 @@ def submit_restore_revision_task(
             s.flush()
         except IntegrityError as exc:
             raise DurableTaskSubmissionConflict("restore revision submission conflicts") from exc
+        return _durable_task_doc(s, task), True
+
+
+def submit_keyed_upsert_task(
+        *, uid: str, submission_id: str, intent: object, evidence: object,
+        max_attempts: int = 3) -> tuple[dict, bool]:
+    """Atomically admit one dataset-scoped keyed upsert. Canvas-less and view-less: keyed by owner +
+    submission id, serializing on the owner row. Publication idempotency stays with the frozen write."""
+    from hub.models import WriteIntent
+
+    doc = intent if isinstance(intent, dict) else dict(intent)
+    write = WriteIntent.model_validate(doc["writeIntent"])
+    base, head = doc["base"], doc["head"]
+    if (write.mode != "replace" or write.destination.provider != "managed-local-file"
+            or write.provenance.parents or write.destination.dataset_id != base["datasetId"]):
+        raise ValueError("keyed upsert requires a self-scoped managed-local replace intent")
+    submission = str(submission_id).lower()
+    if (not submission or len(submission) > 128 or submission != submission.strip()
+            or "\x00" in submission):
+        raise ValueError("keyed upsert submission id is invalid")
+    if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+            or not 1 <= max_attempts <= 3):
+        raise ValueError("keyed upsert task max attempts is invalid")
+    uid = str(uid)
+    intent_doc = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    evidence_doc = json.dumps(
+        evidence if isinstance(evidence, dict) else dict(evidence),
+        sort_keys=True, separators=(",", ":"))
+    write_doc = json.dumps(
+        write.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":"))
+    request_sha = hashlib.sha256(json.dumps({
+        "baseDatasetId": str(base["datasetId"]), "baseRevisionId": str(base["revisionId"]),
+        "payloadDatasetId": str(head["datasetId"]), "payloadRevisionId": str(head["revisionId"]),
+        "datasetId": write.destination.dataset_id,
+        "expectedHead": write.expected_head.model_dump(by_alias=True, mode="json"),
+        "idempotencyKey": write.idempotency_key,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    task_id = keyed_upsert_submission_id(uid, submission)
+    status_doc = json.dumps(_task_status_doc(task_id, "keyed-upsert"), default=str)
+    with session() as s:
+        user = s.get(User, uid, with_for_update=True)
+        if user is None:
+            raise RuntimeError("keyed upsert task owner does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(User).where(User.id == uid).values(created_at=User.created_at))
+        now = _durable_task_db_now(s)
+        existing = s.get(DurableTask, task_id, with_for_update=True)
+        if existing is not None:
+            if (existing.owner_id != uid or existing.task_kind != "keyed_upsert_write"
+                    or existing.submission_id != submission
+                    or existing.intent_sha256 != request_sha):
+                raise DurableTaskSubmissionConflict(
+                    "keyed upsert submission does not match its frozen admission")
+            return _durable_task_doc(s, existing), False
+        conflict = s.scalar(select(KeyedUpsertTaskEnvelope.task_id).where(
+            KeyedUpsertTaskEnvelope.write_idempotency_key == write.idempotency_key).limit(1))
+        if conflict is not None and str(conflict) != task_id:
+            raise DurableTaskSubmissionConflict(
+                "keyed upsert write key is already owned by another task")
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
+            submission_id=submission, intent_sha256=request_sha,
+            target_node_id="keyed-upsert", task_kind="keyed_upsert_write",
+            execution_manifest_sha256=None, backend_kind="local", graph_doc=None,
+            input_manifest=None, write_intent=write_doc, status="queued",
+            status_doc=status_doc, max_attempts=max_attempts, created_at=now, updated_at=now,
+        )
+        s.add(task)
+        s.add(DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            status="queued", created_at=now))
+        s.add(KeyedUpsertTaskEnvelope(
+            task_id=task_id, base_dataset_id=str(base["datasetId"]),
+            base_revision_id=str(base["revisionId"]),
+            payload_dataset_id=str(head["datasetId"]),
+            payload_revision_id=str(head["revisionId"]),
+            upsert_intent_doc=intent_doc, evidence_doc=evidence_doc,
+            write_idempotency_key=write.idempotency_key, created_at=now, updated_at=now))
+        try:
+            s.flush()
+        except IntegrityError as exc:
+            raise DurableTaskSubmissionConflict("keyed upsert submission conflicts") from exc
         return _durable_task_doc(s, task), True
 
 
@@ -6898,6 +7033,11 @@ def claim_merge_columns_task(task_id: str, owner_token: str) -> dict | None:
 def claim_restore_revision_task(task_id: str, owner_token: str) -> dict | None:
     """Claim one restore-revision Task under its dedicated recovery/worker path."""
     return _claim_durable_task_kind(task_id, owner_token, "restore_revision_write")
+
+
+def claim_keyed_upsert_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim one keyed-upsert Task under its dedicated recovery/worker path."""
+    return _claim_durable_task_kind(task_id, owner_token, "keyed_upsert_write")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -7535,8 +7675,9 @@ def _retry_durable_task_in_session(
         return _durable_task_doc(s, task)
     if task.status not in ("failed", "cancelled"):
         raise ValueError("only a failed or cancelled durable task can be retried")
-    if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
-        raise ValueError("stale merge columns head requires a new submission")
+    if (task.task_kind in ("merge_columns_write", "keyed_upsert_write")
+            and task.error == "stale_expected_head"):
+        raise ValueError("stale expected head requires a new submission")
     last = s.scalar(select(DurableTaskAttempt).where(
         DurableTaskAttempt.task_id == task.id,
     ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
@@ -7712,6 +7853,29 @@ def recoverable_restore_revision_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "restore_revision_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_keyed_upsert_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired running keyed-upsert tasks for the dedicated worker."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "keyed_upsert_write",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -9344,6 +9508,59 @@ def restore_revision_task_view(task_id: str, uid: str) -> dict | None:
             "diagnosticCode": task.error,
             "receipt": receipt,
         }
+
+
+_KEYED_UPSERT_TERMINAL = frozenset({"done", "failed", "cancelled"})
+
+
+def keyed_upsert_task_view(task_id: str, uid: str) -> dict | None:
+    """Return one owner-scoped keyed-upsert Task view; peers and cross-owner ids are unavailable."""
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        if (task is None or task.task_kind != "keyed_upsert_write"
+                or task.owner_id != str(uid)):
+            return None
+        envelope = s.get(KeyedUpsertTaskEnvelope, task.id)
+        if envelope is None:
+            raise RuntimeError("keyed upsert task envelope is unavailable")
+        receipt = json.loads(task.output_receipt) if task.output_receipt else None
+        return {
+            "taskId": task.id,
+            "status": task.status,
+            "datasetId": envelope.base_dataset_id,
+            "expectedHeadRevisionId": envelope.base_revision_id,
+            "payloadDatasetId": envelope.payload_dataset_id,
+            "payloadRevisionId": envelope.payload_revision_id,
+            "childRevisionId": receipt["revisionId"] if receipt else None,
+            "diagnosticCode": task.error,
+            "canCancel": task.status not in _KEYED_UPSERT_TERMINAL,
+            "canRetry": (task.status in ("failed", "cancelled")
+                         and task.error != "stale_expected_head"),
+            "receipt": receipt,
+            "evidence": json.loads(envelope.evidence_doc),
+        }
+
+
+def _authorize_keyed_upsert_owner(s, task_id: str, uid: str) -> DurableTask | None:
+    task = _lock_durable_task_for_write(s, str(task_id))
+    if (task is None or task.task_kind != "keyed_upsert_write" or task.owner_id != str(uid)):
+        return None
+    return task
+
+
+def cancel_keyed_upsert_task(task_id: str, uid: str) -> dict | None:
+    """Cancel one keyed-upsert Task after confirming its owner under a fenced row lock."""
+    with session() as s:
+        task = _authorize_keyed_upsert_owner(s, task_id, uid)
+        return _request_durable_task_cancel_in_session(s, task) if task is not None else None
+
+
+def retry_keyed_upsert_task(task_id: str, uid: str, retry_request_id: str) -> dict | None:
+    """Retry one failed or cancelled keyed-upsert Task after confirming its owner."""
+    with session() as s:
+        task = _authorize_keyed_upsert_owner(s, task_id, uid)
+        return (_retry_durable_task_in_session(s, task, retry_request_id)
+                if task is not None else None)
 
 
 def merge_columns_task_view(task_id: str, uid: str) -> dict | None:

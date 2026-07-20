@@ -9643,6 +9643,274 @@
         "title": "UnregisterTarget",
         "type": "object"
       },
+      "UpsertEvidenceV1": {
+        "additionalProperties": false,
+        "description": "Exact per-outcome counts for one keyed upsert. On a published upsert the last three are 0;\na non-zero rejected/duplicate/conflict is a fail-closed preflight error, never a publication.",
+        "properties": {
+          "conflict": {
+            "title": "Conflict",
+            "type": "integer"
+          },
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "integer"
+          },
+          "inserted": {
+            "title": "Inserted",
+            "type": "integer"
+          },
+          "matched": {
+            "title": "Matched",
+            "type": "integer"
+          },
+          "rejected": {
+            "title": "Rejected",
+            "type": "integer"
+          },
+          "unchanged": {
+            "title": "Unchanged",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "matched",
+          "inserted",
+          "unchanged",
+          "rejected",
+          "duplicate",
+          "conflict"
+        ],
+        "title": "UpsertEvidenceV1",
+        "type": "object"
+      },
+      "UpsertPreflightV1": {
+        "additionalProperties": false,
+        "description": "Side-effect-free projection of one prospective upsert.",
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "eligible": {
+            "default": true,
+            "title": "Eligible",
+            "type": "boolean"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/UpsertEvidenceV1"
+          },
+          "expectedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "head": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Keys",
+            "type": "array"
+          },
+          "outputSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Outputschema",
+            "type": "array"
+          }
+        },
+        "required": [
+          "base",
+          "head",
+          "expectedHead",
+          "keys",
+          "outputSchema",
+          "evidence"
+        ],
+        "title": "UpsertPreflightV1",
+        "type": "object"
+      },
+      "UpsertRequestV1": {
+        "additionalProperties": false,
+        "description": "One intent to upsert a payload revision into a managed-local dataset's current head.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "expectedHeadRevisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedheadrevisionid",
+            "type": "string"
+          },
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Keys",
+            "type": "array"
+          },
+          "payloadDatasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Payloaddatasetid",
+            "type": "string"
+          },
+          "payloadRevisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Payloadrevisionid",
+            "type": "string"
+          },
+          "submissionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "submissionId",
+          "datasetId",
+          "expectedHeadRevisionId",
+          "payloadDatasetId",
+          "payloadRevisionId",
+          "keys"
+        ],
+        "title": "UpsertRequestV1",
+        "type": "object"
+      },
+      "UpsertRetryRequestV1": {
+        "additionalProperties": false,
+        "properties": {
+          "retryRequestId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Retryrequestid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "retryRequestId"
+        ],
+        "title": "UpsertRetryRequestV1",
+        "type": "object"
+      },
+      "UpsertTaskV1": {
+        "additionalProperties": false,
+        "description": "Owner-scoped status of one durable keyed-upsert Task.",
+        "properties": {
+          "canCancel": {
+            "default": false,
+            "title": "Cancancel",
+            "type": "boolean"
+          },
+          "canRetry": {
+            "default": false,
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "childRevisionId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Childrevisionid"
+          },
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpsertEvidenceV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expectedHeadRevisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedheadrevisionid",
+            "type": "string"
+          },
+          "payloadDatasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Payloaddatasetid",
+            "type": "string"
+          },
+          "payloadRevisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Payloadrevisionid",
+            "type": "string"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "taskId": {
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "status",
+          "datasetId",
+          "expectedHeadRevisionId",
+          "payloadDatasetId",
+          "payloadRevisionId"
+        ],
+        "title": "UpsertTaskV1",
+        "type": "object"
+      },
       "UserBody": {
         "additionalProperties": false,
         "properties": {
@@ -16834,6 +17102,170 @@
         "summary": "Catalog Upload"
       }
     },
+    "/api/catalog/upsert": {
+      "post": {
+        "operationId": "submit_api_catalog_upsert_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Submit"
+      }
+    },
+    "/api/catalog/upsert/preflight": {
+      "post": {
+        "operationId": "preflight_api_catalog_upsert_preflight_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertPreflightV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Preflight"
+      }
+    },
     "/api/creds": {
       "get": {
         "operationId": "list_creds_api_creds_get",
@@ -19372,6 +19804,259 @@
           }
         },
         "summary": "Kernel Info"
+      }
+    },
+    "/api/keyed-upsert/{task_id}": {
+      "get": {
+        "operationId": "status_api_keyed_upsert__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Status"
+      }
+    },
+    "/api/keyed-upsert/{task_id}/cancel": {
+      "post": {
+        "operationId": "cancel_api_keyed_upsert__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Cancel"
+      }
+    },
+    "/api/keyed-upsert/{task_id}/retry": {
+      "post": {
+        "operationId": "retry_api_keyed_upsert__task_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRetryRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpsertTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Retry"
       }
     },
     "/api/livez": {

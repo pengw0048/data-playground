@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from typing import Literal
 
 import pyarrow as pa
@@ -201,17 +202,24 @@ def _build_result(base: pa.Table, head: pa.Table, keys: list[str]) -> pa.Table:
     return pa.concat_tables([head, base.filter(keep)])
 
 
+def _name_types(columns) -> list[tuple[str, str]]:
+    return [(column.name, column.type) for column in columns]
+
+
 def _validate_write_binds_base(intent: UpsertIntentV1, base_columns: list[ColumnSchema]) -> None:
     write = intent.write_intent
     if (write.mode != "replace" or write.destination.provider != "managed-local-file"
             or write.destination.dataset_id != intent.base.dataset_id
             or write.expected_head != intent.base):
         raise KeyedUpsertError("upsert write intent is invalid")
-    if intent.output_schema != base_columns or list(write.expected_schema) != base_columns:
+    expected = _name_types(base_columns)
+    if _name_types(intent.output_schema) != expected or _name_types(write.expected_schema) != expected:
         raise KeyedUpsertError("upsert output schema is invalid")
 
 
-def _preflight_and_build(storage, intent: UpsertIntentV1) -> tuple[pa.Table, UpsertEvidenceV1]:
+def _preflight(storage, intent: UpsertIntentV1) -> tuple[pa.Table, pa.Table, UpsertEvidenceV1]:
+    """Validate and project one upsert without any side effect. Fails closed on a stale head, an
+    incompatible payload schema, an invalid write binding, or null/duplicate/ambiguous keys."""
     head_now = metadb.catalog_managed_local_head_for_dataset(intent.base.dataset_id)
     if head_now is None or head_now.get("revision_id") != intent.base.revision_id:
         raise KeyedUpsertError("upsert expected head is stale")
@@ -231,10 +239,19 @@ def _preflight_and_build(storage, intent: UpsertIntentV1) -> tuple[pa.Table, Ups
             "upsert rejected null or duplicate keys "
             f"(rejected={evidence.rejected}, duplicate={evidence.duplicate}, "
             f"conflict={evidence.conflict})")
-    return _build_result(base_table, head_table, intent.keys), evidence
+    return base_table, head_table, evidence
 
 
-def upsert_managed_local_file(*, storage, catalog, intent: UpsertIntentV1) -> UpsertOutcomeV1:
+def preflight_upsert(*, storage, intent: UpsertIntentV1) -> UpsertEvidenceV1:
+    """Side-effect-free projection of one upsert: exact matched/inserted/unchanged counts, or a
+    fail-closed error for every documented blocker."""
+    _base, _head, evidence = _preflight(storage, UpsertIntentV1.model_validate(intent))
+    return evidence
+
+
+def upsert_managed_local_file(
+        *, storage, catalog, intent: UpsertIntentV1,
+        before_publish: Callable[[], object] | None = None) -> UpsertOutcomeV1:
     """Upsert one payload revision into a base revision and publish one exact replacement."""
     frozen = UpsertIntentV1.model_validate(intent)
     write = WriteIntent.model_validate(frozen.write_intent)
@@ -249,14 +266,16 @@ def upsert_managed_local_file(*, storage, catalog, intent: UpsertIntentV1) -> Up
             receipt=WriteReceipt.model_validate(prior),
             evidence=_evidence(_coverage(storage, frozen, head_table)))
 
-    result, evidence = _preflight_and_build(storage, frozen)
+    base_table, head_table, evidence = _preflight(storage, frozen)
+    result = _build_result(base_table, head_table, frozen.keys)
 
     def writer(uri: str) -> None:
         pq.write_table(result, uri)
 
     try:
         receipt = write_managed_local_file(
-            storage=storage, catalog=catalog, intent=write, write_artifact=writer)
+            storage=storage, catalog=catalog, intent=write, write_artifact=writer,
+            before_publish=before_publish)
     except Exception:
         prior = metadb.catalog_managed_local_write_receipt(write_doc)
         if prior is not None:
