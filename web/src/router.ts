@@ -64,7 +64,6 @@ export function parseHash(): Route {
     }
   }
   if (seg === 'relationships') return { view: seg }
-  if (seg === 'compound-inspector') return { view: seg }
   // bare "/" opens the editor on the last/newest canvas (bootstrap picks the id).
   return { view: 'canvas' }
 }

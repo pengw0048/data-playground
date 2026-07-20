@@ -10,7 +10,6 @@ import { WorkspaceExplorer } from './WorkspaceExplorer'
 import { JobsView } from './JobsView'
 import { InboxView } from './InboxView'
 import { TransformsLibrary } from './TransformsLibrary'
-import { CompoundInspector } from './CompoundInspector'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
@@ -47,7 +46,6 @@ export function Shell() {
         {view === 'jobs' && <JobsView />}
         {view === 'inbox' && <InboxView onUnreadChange={refreshUnread} />}
         {view === 'transforms' && <TransformsLibrary />}
-        {view === 'compound-inspector' && <CompoundInspector />}
         {view === 'relationships' && <div style={{ height: '100%' }}><ERDiagram /></div>}
       </main>
       {settingsOpen && <SettingsModal onClose={closeSettings} />}
@@ -109,7 +107,6 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         {item('jobs', 'clock', 'Jobs')}
         {item('inbox', 'note', 'Inbox', unreadCount)}
         {item('transforms', 'fx', 'Transforms')}
-        {item('compound-inspector', 'search', 'Inspect episode')}
         {/* Relationships is reached from a dataset detail drawer (Workspace → open a dataset → View relationships),
             not a top-level destination — it is always a graph focused on some table. */}
         <Button variant="ghost" onClick={(event) => onSettings(event.currentTarget)} data-testid="rail-settings"
