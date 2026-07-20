@@ -1,0 +1,120 @@
+{
+  "all_ok": true,
+  "datasets": {
+    "orders_large": {
+      "columns": [
+        "id",
+        "gkey",
+        "category",
+        "amount"
+      ],
+      "content_xxhash": "15f2f5e691b113b18ec16fe2d03590d5",
+      "file_bytes": 86667763,
+      "format": "parquet",
+      "rows": 6000000
+    },
+    "orders_small": {
+      "columns": [
+        "id",
+        "gkey",
+        "category",
+        "amount"
+      ],
+      "content_xxhash": "646feaab4189bf09d2d94a2558bd3b3e",
+      "file_bytes": 12978729,
+      "format": "csv",
+      "rows": 200000
+    }
+  },
+  "generated_utc": "2026-07-20T19:12:04Z",
+  "issue": 640,
+  "machine": {
+    "cpu_count": 16,
+    "duckdb": "1.5.4",
+    "git_sha": "3b5fc99229ac144762f1feccfff7149cfc9b49a8",
+    "machine": "arm64",
+    "platform": "darwin",
+    "processor": "arm",
+    "python": "3.12.13",
+    "total_ram_bytes": 68719476736
+  },
+  "schema_version": 1,
+  "workflows": [
+    {
+      "committed_outputs": 1,
+      "dataset": "orders_small",
+      "description": "CSV source \u2192 rollup \u2192 managed-local write, well under the memory budget.",
+      "kind": "write",
+      "memory_limit": "2GB",
+      "ok": true,
+      "output_verified": true,
+      "peak_rss_bytes": 237207552,
+      "peak_spill_bytes": 0,
+      "run_error": null,
+      "spill_cap": null,
+      "status": "done",
+      "threads": 16,
+      "total_rows": 200000,
+      "wall_seconds": 0.163,
+      "workflow": "under_budget_write"
+    },
+    {
+      "committed_outputs": 1,
+      "dataset": "orders_large",
+      "description": "Same shape at a size exceeding the budget; DuckDB spills to disk and the run still completes correctly.",
+      "kind": "write",
+      "memory_limit": "256MB",
+      "ok": true,
+      "output_verified": true,
+      "peak_rss_bytes": 473677824,
+      "peak_spill_bytes": 386596864,
+      "run_error": null,
+      "spill_cap": null,
+      "status": "done",
+      "threads": 2,
+      "total_rows": 3000000,
+      "wall_seconds": 0.641,
+      "workflow": "over_budget_spill"
+    },
+    {
+      "columns_profiled": 4,
+      "dataset": "orders_large",
+      "description": "One full profile pass over every row of the larger dataset.",
+      "kind": "profile",
+      "memory_limit": "256MB",
+      "ok": true,
+      "peak_rss_bytes": 201654272,
+      "peak_spill_bytes": 0,
+      "rows_scanned": 6000000,
+      "sampled": false,
+      "spill_cap": null,
+      "status": "done",
+      "threads": 2,
+      "wall_seconds": 0.153,
+      "workflow": "profile_over_budget"
+    },
+    {
+      "committed_outputs": 0,
+      "dataset": "orders_large",
+      "description": "Oversized rollup with the spill volume also bounded: the run fails with a truthful error and commits nothing.",
+      "kind": "oom",
+      "memory_limit": "256MB",
+      "ok": true,
+      "oom_root_cause": {
+        "exception": "OutOfMemoryException",
+        "is_out_of_memory": true,
+        "message": "Out of Memory Error: failed to offload data block of size 256.0 KiB (30.4 MiB/30.5 MiB used).",
+        "rows_returned": 0
+      },
+      "peak_rss_bytes": 536985600,
+      "peak_spill_bytes": 19365888,
+      "run_error": "at 'envelope_out': TransactionException: TransactionContext Error: Current transaction is aborted (please ROLLBACK)",
+      "spill_cap": "32MB",
+      "status": "failed",
+      "threads": 2,
+      "total_rows": null,
+      "wall_seconds": 0.239,
+      "workflow": "oom_boundary"
+    }
+  ]
+}

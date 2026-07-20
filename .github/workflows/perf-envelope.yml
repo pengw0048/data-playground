@@ -1,0 +1,42 @@
+name: Performance envelope
+
+# Intentionally separate from the required PR checks: it runs a small seeded set of local
+# workflows on a schedule, on demand, and as a release prerequisite, recording wall time, peak RSS,
+# spill behavior, and the honest out-of-memory outcome. The committed reference lives in
+# docs/acceptance/issue-640/envelope.json; this job regenerates one on Linux and uploads it.
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-envelope-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  envelope:
+    name: measured local performance and memory envelope
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      # The kernel wheel force-includes ../web/dist; an empty dir satisfies the install hook.
+      - name: Placeholder web build
+        run: mkdir -p web/dist
+      - name: Install kernel (dev extra)
+        run: cd kernel && uv sync --extra dev
+      - name: Run the performance envelope
+        run: cd kernel && uv run python ../scripts/perf_envelope.py --output "$RUNNER_TEMP/perf-envelope.json"
+      - name: Upload envelope
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: perf-envelope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/perf-envelope.json
+          if-no-files-found: warn
+          retention-days: 14
