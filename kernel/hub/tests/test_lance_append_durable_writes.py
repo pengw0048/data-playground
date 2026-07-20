@@ -139,6 +139,15 @@ def test_managed_lance_append_publishes_exactly_one_version_and_receipt(
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert jobs["items"][0]["outputReceipt"]["revisionId"] == "2"
 
+    # The receipt is also visible in the per-canvas Run history, exactly as an in-process managed
+    # write's is — and Jobs still lists the owning task once, not a history twin as well.
+    history = metadb.list_runs(str(graph.id))
+    receipts = [output["write_receipt"] for record in history for output in record["outputs"]
+                if output.get("write_receipt")]
+    assert [receipt["revision_id"] for receipt in receipts] == ["2"]
+    assert receipts[0]["parent_head"]["revision_id"] == "1"
+    assert len([item for item in jobs["items"] if item["runId"] == task["id"]]) == 1
+
     metadb.delete_canvas_cascade(str(graph.id))
     deps.storage.close()
 
@@ -196,6 +205,10 @@ def test_managed_lance_append_restart_after_commit_reconciles_one_version(
     assert observed["output_receipt"]["revisionId"] == receipt.revision_id
     assert _lance_version_count(dest_uri) == 2  # no duplicate append
     assert lance.dataset(dest_uri).to_table()["value"].to_pylist() == [1, 7, 8]
+    # Reconciled-on-recovery completion still records the canvas Run history receipt.
+    history = metadb.list_runs(str(graph.id))
+    assert [output["write_receipt"]["revision_id"] for record in history
+            for output in record["outputs"] if output.get("write_receipt")] == [receipt.revision_id]
 
     metadb.delete_canvas_cascade(str(graph.id))
     deps.storage.close()
