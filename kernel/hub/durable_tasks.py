@@ -157,6 +157,8 @@ def recover(deps) -> None:
     recover_merge_columns(deps)
     from hub.restore_revision_tasks import recover as recover_restore_revision
     recover_restore_revision(deps)
+    from hub.keyed_upsert_tasks import recover as recover_keyed_upsert
+    recover_keyed_upsert(deps)
     from hub.bounded_fanout_tasks import recover as recover_bounded_fanout
     recover_bounded_fanout(deps)
     from hub.distribution_report_tasks import recover as recover_distribution_reports

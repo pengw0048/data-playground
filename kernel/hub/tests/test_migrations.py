@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0037_keyed_upsert", "0036_restore_revision"),
         ("0036_restore_revision", "0035_remove_temporal"),
         ("0035_remove_temporal", "0034_external_overlay"),
         ("0034_external_overlay", "0033_temporal_task"),
@@ -91,8 +92,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0036_restore_revision"]
-    assert metadb.expected_schema_head() == "0036_restore_revision"
+    assert scripts.get_heads() == ["0037_keyed_upsert"]
+    assert metadb.expected_schema_head() == "0037_keyed_upsert"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -217,6 +218,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0037_keyed_upsert_task.py": (
+            "fc07c4f24ac0b44724dcede66e1e79c4a073ba460601d4081b1f5c614f295e39"
+        ),
         "0036_restore_revision_task.py": (
             "e63f603fc1daeed7cfbfd32d8e7367e98e1be507d21a546611d3c0df0ac8ffa9"
         ),
