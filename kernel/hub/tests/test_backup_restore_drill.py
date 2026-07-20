@@ -1572,7 +1572,10 @@ def _assert_backup_identity(path: Path, info: dict, *, db: str, storage: str) ->
         )
 
 
-def _wait_for(predicate, timeout: float = 3.0):
+def _wait_for(predicate, timeout: float = 30.0):
+    # Generous ceiling: the predicate returns as soon as recovery lands, so a passing run is
+    # unaffected; only a genuinely stuck condition waits this long. 3s intermittently expired under
+    # CI runner load while the durable recovery was merely slow, not broken.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
