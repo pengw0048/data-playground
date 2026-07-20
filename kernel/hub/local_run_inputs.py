@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import stat
 import uuid
@@ -25,6 +26,7 @@ _LOCAL_FILE_INPUT_EXTENSIONS = (
     ".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson",
     ".arrow", ".feather", ".ipc",
 )
+_EXACT_ADMISSION_ATTEMPTS = 2
 
 
 class LocalRunInputError(RuntimeError):
@@ -155,42 +157,51 @@ def snapshot_local_file_input(
     if not callable(begin) or not callable(commit) or not callable(abort):
         raise LocalRunInputError(
             "ordinary local input exact admission requires managed local-result ownership")
-    artifact_uri = begin(f"local-input:{dataset_id}", writer_id)
-    try:
-        with _stable_local_file_copy(
-                storage, uri, artifact_uri) as (snapshot_path, content_sha256):
-            semantic = json.dumps({
-                # Identity describes the user's stable bytes plus the declared interpretation.
-                # Canonical Parquet is the retained transport, not the identity: retries/upgrades
-                # must keep reopening the first admitted rows instead of silently re-parsing them.
-                "contract": "local-file-input-v1",
-                "content_sha256": content_sha256,
-                "format": format_name,
-                "options": options,
-            }, sort_keys=True, separators=(",", ":"))
-            revision_id = hashlib.sha256(semantic.encode()).hexdigest()
-            if metadb.local_file_input_revision_artifact(dataset_id, revision_id) is not None:
-                abort(artifact_uri, writer_id)
-                return revision_id, None
-            with db.base_guard():
-                relation = adapter.scan_local_snapshot(snapshot_path, uri, options=options)
-                adapter.write(artifact_uri, relation, mode="overwrite")
-            commit(artifact_uri, writer_id)
-    except LocalRunInputError:
-        abort(artifact_uri, writer_id)
-        raise
-    except Exception as exc:
-        abort(artifact_uri, writer_id)
-        raise LocalRunInputError(
-            "ordinary local input could not be parsed into an immutable exact binding") from exc
-    except BaseException:
-        abort(artifact_uri, writer_id)
-        raise
-    return revision_id, {
-        "dataset_id": dataset_id,
-        "revision_id": revision_id,
-        "artifact_uri": artifact_uri,
-    }
+    # A failed attempt aborts its candidate artifact and the binding is content-addressed, so a
+    # transient engine/IO error under concurrent admission is safe to retry from a clean candidate.
+    for attempt in range(_EXACT_ADMISSION_ATTEMPTS):
+        artifact_uri = begin(f"local-input:{dataset_id}", writer_id)
+        try:
+            with _stable_local_file_copy(
+                    storage, uri, artifact_uri) as (snapshot_path, content_sha256):
+                semantic = json.dumps({
+                    # Identity describes the user's stable bytes plus the declared interpretation.
+                    # Canonical Parquet is the retained transport, not the identity: retries/upgrades
+                    # must keep reopening the first admitted rows instead of silently re-parsing them.
+                    "contract": "local-file-input-v1",
+                    "content_sha256": content_sha256,
+                    "format": format_name,
+                    "options": options,
+                }, sort_keys=True, separators=(",", ":"))
+                revision_id = hashlib.sha256(semantic.encode()).hexdigest()
+                if metadb.local_file_input_revision_artifact(dataset_id, revision_id) is not None:
+                    abort(artifact_uri, writer_id)
+                    return revision_id, None
+                with db.base_guard():
+                    relation = adapter.scan_local_snapshot(snapshot_path, uri, options=options)
+                    adapter.write(artifact_uri, relation, mode="overwrite")
+                commit(artifact_uri, writer_id)
+        except LocalRunInputError:
+            abort(artifact_uri, writer_id)
+            raise
+        except Exception as exc:
+            abort(artifact_uri, writer_id)
+            logging.getLogger("hub").warning(
+                "ordinary local exact admission attempt failed (retrying=%s)",
+                attempt + 1 < _EXACT_ADMISSION_ATTEMPTS, exc_info=True)
+            if attempt + 1 < _EXACT_ADMISSION_ATTEMPTS:
+                continue
+            raise LocalRunInputError(
+                "ordinary local input could not be parsed into an immutable exact binding") from exc
+        except BaseException:
+            abort(artifact_uri, writer_id)
+            raise
+        return revision_id, {
+            "dataset_id": dataset_id,
+            "revision_id": revision_id,
+            "artifact_uri": artifact_uri,
+        }
+    raise AssertionError("exact admission loop must exit via return or raise")
 
 
 def _finalize_local_file_candidates(
