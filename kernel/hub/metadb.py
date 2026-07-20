@@ -16251,6 +16251,24 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
         return _managed_local_write_head_in_session(s, normalized)
 
 
+def catalog_managed_local_write_unmanaged_conflict(logical_uri: str, name: str) -> bool:
+    """Whether an unmanaged catalog entry already occupies this managed create/replace namespace.
+
+    Mirrors the publication-time guard so admission can reject the collision with actionable guidance
+    instead of failing the run with a raw namespace error.
+    """
+    normalized = str(logical_uri).rstrip("/")
+    if not normalized:
+        raise ValueError("managed local write requires a logical destination URI")
+    logical_id, catalog_key = _catalog_managed_namespace_identity(normalized, f"tbl_{name}")
+    tokens = sorted({normalized, logical_id, catalog_key})
+    with session() as s:
+        conflict = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.uri.in_(tokens), CatalogEntry.logical_id.is_(None),
+        ).limit(1)).first()
+        return conflict is not None
+
+
 def catalog_admit_managed_local_write(
         value: object, *,
         merge_publication: MergeColumnsPublicationContext | None = None) -> dict | None:

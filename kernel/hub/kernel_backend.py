@@ -136,6 +136,13 @@ class KernelBackend:
         return True  # the persisted admission is matched before the kernel is ensured or dispatched
 
     @staticmethod
+    def supports_managed_local_write_intents() -> bool:
+        # Admitting the kernel default routes managed-local create/replace through the certified
+        # durable-Task owner (the same lifecycle the in-process local writer uses) instead of an
+        # unmanaged write. Publication authority and restart recovery stay with that durable owner.
+        return True
+
+    @staticmethod
     def supports_named_multi_output_runs() -> bool:
         return True  # both the warm runner and default isolated runner preserve the complete output set
 
