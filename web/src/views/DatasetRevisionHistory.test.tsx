@@ -4,7 +4,7 @@ import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from 
 
 const mocks = vi.hoisted(() => ({
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
-  createDatasetView: vi.fn(),
+  createDatasetView: vi.fn(), restoreRevision: vi.fn(), restoreRevisionTask: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
@@ -236,6 +236,67 @@ describe('DatasetRevisionHistory', () => {
     expect(parseHash()).toEqual({ view: 'workspace', workspaceResourceId: 'dataset_view:view-1' })
     expect(window.location.hash).not.toContain('scope=datasets')
     expect(store.pushToast).toHaveBeenCalledWith('Saved “orders view” beside its source in Workspace', 'success')
+  })
+
+  const coreDetail = (revisionId: string) => detail(revisionId, { retentionOwner: 'core' })
+  const openForRestore = async (opened: string) => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-head'), revision('rev-old')], nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockImplementation((_dataset: string, revisionId: string) =>
+      Promise.resolve(coreDetail(revisionId)))
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: `Open revision ${opened}` }))
+    await screen.findByText(`Exact revision ${opened}`)
+  }
+
+  it('publishes an old core revision as a new head and reopens the exact result', async () => {
+    await openForRestore('rev-old')
+    mocks.restoreRevision.mockResolvedValue({
+      taskId: 'task-1', status: 'done', sourceDatasetId: 'dataset-stable', sourceRevisionId: 'rev-old',
+      expectedHeadRevisionId: 'rev-head', childRevisionId: 'rev-new', receipt: null,
+    })
+    fireEvent.click(screen.getByTestId('restore-revision'))
+    const dialog = await screen.findByRole('dialog', { name: 'Restore revision as new head' })
+    fireEvent.click(within(dialog).getByTestId('restore-revision-confirm'))
+
+    await waitFor(() => expect(mocks.restoreRevision).toHaveBeenCalledTimes(1))
+    const [datasetId, revisionId, body] = mocks.restoreRevision.mock.calls[0]
+    expect([datasetId, revisionId]).toEqual(['dataset-stable', 'rev-old'])
+    expect(body.expectedHeadRevisionId).toBe('rev-head')
+    expect(typeof body.submissionId).toBe('string')
+    await waitFor(() => expect(store.pushToast).toHaveBeenCalledWith(
+      'Published revision rev-new from the restored source', 'success'))
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-stable', 'rev-new'))
+  })
+
+  it('surfaces a moving-head conflict without reporting success', async () => {
+    await openForRestore('rev-old')
+    mocks.restoreRevision.mockResolvedValue({
+      taskId: 'task-1', status: 'failed', sourceDatasetId: 'dataset-stable', sourceRevisionId: 'rev-old',
+      expectedHeadRevisionId: 'rev-head', childRevisionId: null, diagnosticCode: 'stale_expected_head',
+    })
+    fireEvent.click(screen.getByTestId('restore-revision'))
+    const dialog = await screen.findByRole('dialog', { name: 'Restore revision as new head' })
+    fireEvent.click(within(dialog).getByTestId('restore-revision-confirm'))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(/current head changed/i)
+    expect(store.pushToast).not.toHaveBeenCalled()
+  })
+
+  it('offers restore only for retained core revisions that are not the current head', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-head'), revision('rev-old')], nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockImplementation((_dataset: string, revisionId: string) => Promise.resolve(
+      revisionId === 'rev-head' ? coreDetail('rev-head')
+        : detail('rev-old', { retentionOwner: 'provider' })))
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-head' }))
+    await screen.findByText('Exact revision rev-head')
+    expect(screen.queryByTestId('restore-revision')).toBeNull()  // the current head has nothing to restore
+    fireEvent.click(screen.getByRole('button', { name: 'Open revision rev-old' }))
+    await screen.findByText('Exact revision rev-old')
+    expect(screen.queryByTestId('restore-revision')).toBeNull()  // provider-owned history is not core-restorable
   })
 
   it('rejects a reservoir seed above the DuckDB signed 32-bit contract', async () => {

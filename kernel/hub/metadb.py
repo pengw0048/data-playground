@@ -577,15 +577,17 @@ class DurableTask(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'distribution_report')",
+            "'restore_revision_write','distribution_report')",
             name="ck_durable_task_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
             "AND target_node_id IS NULL AND dataset_view_id IS NOT NULL "
             "AND execution_manifest_sha256 IS NULL AND graph_doc IS NULL "
             "AND input_manifest IS NULL AND write_intent IS NULL) OR "
-            "(task_kind <> 'distribution_report' AND canvas_id IS NOT NULL "
-            "AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
+            "(task_kind = 'restore_revision_write' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NULL AND target_node_id = 'restore-revision') OR "
+            "(task_kind <> 'distribution_report' AND task_kind <> 'restore_revision_write' "
+            "AND canvas_id IS NOT NULL AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
         UniqueConstraint(
             "owner_id", "dataset_view_id", "submission_id",
@@ -757,6 +759,21 @@ class MergeColumnsTaskEnvelope(Base):
         CheckConstraint(
             "phase IN ('validating','merging','candidate_committed','publishing',"
             "'done','failed','cancelled')", name="ck_merge_task_phase"),
+    )
+
+
+class RestoreRevisionTaskEnvelope(Base):
+    """Dataset-scoped resume point for one restore-old-revision-as-new-head Task."""
+    __tablename__ = "restore_revision_task_envelopes"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    source_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    write_idempotency_key: Mapped[str] = mapped_column(String(2048), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("write_idempotency_key", name="uq_restore_revision_write_key"),
     )
 
 
@@ -5874,6 +5891,12 @@ def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> 
     return local_run_submission_id(uid, canvas_id, submission_id)
 
 
+def restore_revision_submission_id(uid: str, submission_id: str) -> str:
+    """Deterministic owner+submission identity for one canvas-less restore-revision Task."""
+    return "rrs_" + hashlib.sha256(
+        f"restore-revision-write-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
+
+
 def _task_status_doc(task_id: str, target_node_id: str | None, status: str = "queued") -> dict:
     from hub.models import RunStatus
     return RunStatus(
@@ -5892,6 +5915,29 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
     """Load one Task's immutable definition from its canonical manifest or legacy frozen columns."""
     if task.task_kind == "distribution_report":
         return {}
+    if task.task_kind == "restore_revision_write":
+        from hub.models import WriteIntent
+
+        envelope = s.get(RestoreRevisionTaskEnvelope, task.id)
+        if envelope is None or task.write_intent is None:
+            raise RuntimeError("restore revision durable admission is incomplete")
+        try:
+            write = WriteIntent.model_validate_json(task.write_intent)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("restore revision durable admission is invalid") from exc
+        if (write.mode != "replace" or write.destination.provider != "managed-local-file"
+                or write.idempotency_key != envelope.write_idempotency_key
+                or write.provenance.parents):
+            raise RuntimeError("restore revision durable admission is invalid")
+        return {
+            "graph_doc": None, "input_manifest": [],
+            "write_intent": write.model_dump(by_alias=True, mode="json"),
+            "target_node_id": task.target_node_id, "target_port_id": None,
+            "restore_source": {
+                "dataset_id": envelope.source_dataset_id,
+                "revision_id": envelope.source_revision_id,
+            },
+        }
     if task.task_kind == "merge_columns_write":
         envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
         if envelope is None or task.write_intent is None:
@@ -6280,6 +6326,82 @@ def submit_merge_columns_task(
         return _durable_task_doc(s, task), True
 
 
+def submit_restore_revision_task(
+        *, uid: str, submission_id: str, source_dataset_id: str, source_revision_id: str,
+        intent: object, max_attempts: int = 3) -> tuple[dict, bool]:
+    """Atomically admit one dataset-scoped restore of a retained revision as a new head.
+
+    The task has no canvas or dataset view: it is keyed by its owner and submission id and
+    serializes on the owner row. Publication idempotency stays with the frozen typed write.
+    """
+    from hub.models import WriteIntent
+
+    frozen = WriteIntent.model_validate(intent)
+    if (frozen.mode != "replace" or frozen.destination.provider != "managed-local-file"
+            or frozen.provenance.parents):
+        raise ValueError("restore revision requires a self-scoped managed-local replace intent")
+    submission = str(submission_id).lower()
+    if (not submission or len(submission) > 128 or submission != submission.strip()
+            or "\x00" in submission):
+        raise ValueError("restore revision submission id is invalid")
+    if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+            or not 1 <= max_attempts <= 3):
+        raise ValueError("restore revision task max attempts is invalid")
+    uid = str(uid)
+    write_doc = json.dumps(
+        frozen.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":"))
+    request_sha = hashlib.sha256(json.dumps({
+        "sourceDatasetId": str(source_dataset_id),
+        "sourceRevisionId": str(source_revision_id),
+        "datasetId": frozen.destination.dataset_id,
+        "expectedHead": frozen.expected_head.model_dump(by_alias=True, mode="json"),
+        "idempotencyKey": frozen.idempotency_key,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    task_id = restore_revision_submission_id(uid, submission)
+    status_doc = json.dumps(_task_status_doc(task_id, "restore-revision"), default=str)
+    with session() as s:
+        user = s.get(User, uid, with_for_update=True)
+        if user is None:
+            raise RuntimeError("restore revision task owner does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(User).where(User.id == uid).values(created_at=User.created_at))
+        now = _durable_task_db_now(s)
+        existing = s.get(DurableTask, task_id, with_for_update=True)
+        if existing is not None:
+            if (existing.owner_id != uid or existing.task_kind != "restore_revision_write"
+                    or existing.submission_id != submission
+                    or existing.intent_sha256 != request_sha):
+                raise DurableTaskSubmissionConflict(
+                    "restore revision submission does not match its frozen admission")
+            return _durable_task_doc(s, existing), False
+        conflict = s.scalar(select(RestoreRevisionTaskEnvelope.task_id).where(
+            RestoreRevisionTaskEnvelope.write_idempotency_key == frozen.idempotency_key).limit(1))
+        if conflict is not None and str(conflict) != task_id:
+            raise DurableTaskSubmissionConflict(
+                "restore revision write key is already owned by another task")
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
+            submission_id=submission, intent_sha256=request_sha,
+            target_node_id="restore-revision", task_kind="restore_revision_write",
+            execution_manifest_sha256=None, backend_kind="local", graph_doc=None,
+            input_manifest=None, write_intent=write_doc, status="queued",
+            status_doc=status_doc, max_attempts=max_attempts, created_at=now, updated_at=now,
+        )
+        s.add(task)
+        s.add(DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            status="queued", created_at=now))
+        s.add(RestoreRevisionTaskEnvelope(
+            task_id=task_id, source_dataset_id=str(source_dataset_id),
+            source_revision_id=str(source_revision_id),
+            write_idempotency_key=frozen.idempotency_key, created_at=now, updated_at=now))
+        try:
+            s.flush()
+        except IntegrityError as exc:
+            raise DurableTaskSubmissionConflict("restore revision submission conflicts") from exc
+        return _durable_task_doc(s, task), True
+
+
 def submit_linear_checkpoint_task(
         *, uid: str, canvas_id: str, submission_id: str,
         final_target_node_id: str, checkpoint_id: str, checkpoint_node_id: str,
@@ -6572,11 +6694,11 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
         # SQLite ignores SELECT ... FOR UPDATE. Acquire its stable explicit subject row before
         # reading Task/action replay state; distribution reports never fabricate a Canvas subject.
         subject = s.execute(select(
-            DurableTask.canvas_id, DurableTask.dataset_view_id,
+            DurableTask.canvas_id, DurableTask.dataset_view_id, DurableTask.owner_id,
         ).where(DurableTask.id == task_id)).one_or_none()
         if subject is None:
             return None
-        canvas_id, dataset_view_id = subject
+        canvas_id, dataset_view_id, owner_id = subject
         if canvas_id is not None:
             locked = s.execute(update(Canvas).where(Canvas.id == canvas_id).values(
                 updated_at=Canvas.updated_at))
@@ -6584,7 +6706,9 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
             locked = s.execute(update(DatasetView).where(
                 DatasetView.id == dataset_view_id).values(created_at=DatasetView.created_at))
         else:
-            return None
+            # Canvas-less, view-less kinds (restore-revision) serialize on their owner row.
+            locked = s.execute(update(User).where(User.id == owner_id).values(
+                created_at=User.created_at))
         if locked.rowcount != 1:
             return None
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
@@ -6769,6 +6893,11 @@ def claim_bounded_fanout_write_task(task_id: str, owner_token: str) -> dict | No
 def claim_merge_columns_task(task_id: str, owner_token: str) -> dict | None:
     """Claim the one exact durable SparseOutput merge Task."""
     return _claim_durable_task_kind(task_id, owner_token, "merge_columns_write")
+
+
+def claim_restore_revision_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim one restore-revision Task under its dedicated recovery/worker path."""
+    return _claim_durable_task_kind(task_id, owner_token, "restore_revision_write")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -7560,6 +7689,29 @@ def recoverable_merge_columns_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "merge_columns_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_restore_revision_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired running restore-revision tasks for the dedicated worker."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "restore_revision_write",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -9165,6 +9317,33 @@ def _sanitized_merge_columns_jobs_view(
         "canCancel": can_cancel,
         "diagnosticCode": diagnostic,
     }
+
+
+def restore_revision_task_view(task_id: str, uid: str) -> dict | None:
+    """Return one owner-scoped restore Task view; peers and cross-owner ids are unavailable."""
+    from hub.models import WriteIntent
+
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        if (task is None or task.task_kind != "restore_revision_write"
+                or task.owner_id != str(uid)):
+            return None
+        envelope = s.get(RestoreRevisionTaskEnvelope, task.id)
+        if envelope is None or task.write_intent is None:
+            raise RuntimeError("restore revision task envelope is unavailable")
+        write = WriteIntent.model_validate_json(task.write_intent)
+        expected_head = write.expected_head.revision_id if write.expected_head else ""
+        receipt = json.loads(task.output_receipt) if task.output_receipt else None
+        return {
+            "taskId": task.id,
+            "status": task.status,
+            "sourceDatasetId": envelope.source_dataset_id,
+            "sourceRevisionId": envelope.source_revision_id,
+            "expectedHeadRevisionId": expected_head,
+            "childRevisionId": receipt["revisionId"] if receipt else None,
+            "diagnosticCode": task.error,
+            "receipt": receipt,
+        }
 
 
 def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
@@ -16289,6 +16468,15 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
         raise ValueError("managed local write requires a logical destination URI")
     with session() as s:
         return _managed_local_write_head_in_session(s, normalized)
+
+
+def catalog_managed_local_head_for_dataset(dataset_id: str) -> dict | None:
+    """Resolve one core managed-local dataset id to its current head for restore admission."""
+    with session() as s:
+        logical = s.get(CatalogLogicalDataset, str(dataset_id))
+        if logical is None:
+            return None
+        return _managed_local_write_head_in_session(s, logical.logical_uri)
 
 
 def catalog_managed_local_write_unmanaged_conflict(logical_uri: str, name: str) -> bool:
