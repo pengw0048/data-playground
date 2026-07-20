@@ -42,12 +42,6 @@ describe('Workspace routes', () => {
     expect(parseHash()).toEqual({ view: 'workspace' })
   })
 
-  it('keeps the exact compound inspector as a first-class, reopenable route', () => {
-    window.location.hash = '#/compound-inspector'
-    expect(parseHash()).toEqual({ view: 'compound-inspector' })
-    expect(routeHash('compound-inspector')).toBe('#/compound-inspector')
-  })
-
   it('round-trips Jobs filters and run/artifact deep-link identity', () => {
     const query = new URLSearchParams({ status: 'failed', canvas: 'canvas-1', run: 'run-1', output: 'write:out' }).toString()
     window.location.hash = routeHash('jobs', undefined, undefined, undefined, query)
