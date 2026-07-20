@@ -4,6 +4,7 @@ import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
+import { UpsertControl } from '../components/UpsertControl'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
@@ -23,15 +24,19 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const isConfiguredMerge = !!mergeRules && typeof mergeRules === 'object' && !Array.isArray(mergeRules)
     && Array.isArray((mergeRules as { rules?: unknown }).rules)
     && (mergeRules as { rules: unknown[] }).rules.length > 0
+  const upsertKeys = target?.data.config.keyedUpsert
+  const isConfiguredUpsert = !!upsertKeys && typeof upsertKeys === 'object' && !Array.isArray(upsertKeys)
+    && Array.isArray((upsertKeys as { keys?: unknown }).keys)
+    && (upsertKeys as { keys: unknown[] }).keys.length > 0
   const setParameterBinding = useStore((s) => s.setRunParameterBinding)
   const clearParameterBinding = useStore((s) => s.clearRunParameterBinding)
   const editParameters = useStore((s) => s.editRunParameters)
   const submitParameters = useStore((s) => s.submitRunParameters)
 
   useEffect(() => {
-    if (!isConfiguredMerge && (!run || run.phase === 'idle')) estimate(nodeId)
+    if (!isConfiguredMerge && !isConfiguredUpsert && (!run || run.phase === 'idle')) estimate(nodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConfiguredMerge, nodeId])
+  }, [isConfiguredMerge, isConfiguredUpsert, nodeId])
 
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
@@ -51,6 +56,14 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       <Label>CERTIFIED COLUMN MERGE</Label>
       <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware column merge rather than an ordinary overwrite run.</div>
       <MergeColumnsControl nodeId={nodeId} />
+    </div>
+  )
+
+  if (isConfiguredUpsert) return (
+    <div className="p-3.5">
+      <Label>CERTIFIED KEYED UPSERT</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write is admitted as an exact, version-aware keyed upsert rather than an ordinary overwrite run.</div>
+      <UpsertControl nodeId={nodeId} />
     </div>
   )
 

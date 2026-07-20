@@ -7,7 +7,7 @@ import type {
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
-  RestoreRevisionTask,
+  RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -487,6 +487,16 @@ export const api = {
     req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
   retryMergeColumnsTask: (taskId: string, retryRequestId: string) =>
     req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}/retry`, { method: 'POST', body: JSON.stringify({ retryRequestId }) }),
+
+  upsertPreflight: (body: UpsertRequest) =>
+    req<UpsertPreflight>('/catalog/upsert/preflight', { method: 'POST', body: JSON.stringify(body) }),
+  submitUpsert: (body: UpsertRequest) =>
+    req<UpsertTask>('/catalog/upsert', { method: 'POST', body: JSON.stringify(body) }),
+  upsertTask: (taskId: string) => req<UpsertTask>(`/keyed-upsert/${encodeURIComponent(taskId)}`),
+  cancelUpsertTask: (taskId: string) =>
+    req<UpsertTask>(`/keyed-upsert/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
+  retryUpsertTask: (taskId: string, retryRequestId: string) =>
+    req<UpsertTask>(`/keyed-upsert/${encodeURIComponent(taskId)}/retry`, { method: 'POST', body: JSON.stringify({ retryRequestId }) }),
 
   inputDrift: (doc: CanvasDoc, targetNodeId: string, inputManifest: RunInputManifestItem[],
     parameterBindings?: CanvasParameterBinding[]) =>
