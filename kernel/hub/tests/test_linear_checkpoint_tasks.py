@@ -38,6 +38,22 @@ def _metadata_schema(tmp_path_factory):
         metadb._engine, metadb._Session = original_engine, original_session
 
 
+@pytest.fixture(autouse=True)
+def _join_checkpoint_workers():
+    """Drain any worker daemon this test dispatched before the next one shares the module DB, so a
+    straggler can't re-dispatch a stale task under another test's recovery scan."""
+    yield
+    with lct._active_lock:
+        threads = [state[1] for state in lct._active.values() if state[1].is_alive()]
+    deadline = time.time() + 60
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.time()))
+    with lct._active_lock:
+        remaining = {task_id: state[1].name for task_id, state in lct._active.items()
+                     if state[1].is_alive()}
+    assert remaining == {}, f"checkpoint workers outlived their test: {remaining}"
+
+
 def _canvas_graph(tmp_path, canvas_id: str, deps):
     lance = pytest.importorskip("lance")
     source = tmp_path / "source.lance"
@@ -126,13 +142,7 @@ def test_happy_path_materialize_publish_and_jobs(tmp_path):
     assert status.status in ("queued", "running")
     task_id = status.run_id
 
-    deadline = time.time() + 30
-    observed = None
-    while time.time() < deadline:
-        observed = metadb.durable_task(task_id)
-        if observed and observed["status"] in ("done", "failed", "cancelled"):
-            break
-        time.sleep(0.1)
+    observed = _await_status(task_id)
     assert observed is not None and observed["status"] == "done", observed
     assert observed["output_receipt"] is not None
     assert observed["output_receipt"]["rows"] == 3
@@ -171,6 +181,7 @@ def test_same_semantic_replay_returns_one_task(tmp_path):
     second, _ = start_run(deps, graph.model_copy(deep=True), "write", uid,
                           confirmed=True, submission_id=submission)
     assert first.run_id == second.run_id
+    assert _await_status(first.run_id)["status"] == "done"
     deps.storage.close()
 
 
@@ -185,18 +196,24 @@ def test_changed_semantics_conflict(tmp_path):
         session.add(metadb.Canvas(id=canvas_id, owner_id=uid, name="Conflict"))
     deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
     graph = _canvas_graph(tmp_path, canvas_id, deps)
-    start_run(deps, graph.model_copy(deep=True), "write", uid,
-              confirmed=True, submission_id=submission)
+    status, _ = start_run(deps, graph.model_copy(deep=True), "write", uid,
+                          confirmed=True, submission_id=submission)
     changed = graph.model_copy(deep=True)
     select = next(node for node in changed.nodes if node.id == "select")
     select.data["config"]["select"] = "value"
     with pytest.raises(HTTPException) as exc:
         start_run(deps, changed, "write", uid, confirmed=True, submission_id=submission)
     assert exc.value.status_code == 409
+    assert _await_status(status.run_id)["status"] == "done"
     deps.storage.close()
 
 
 def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
+    # Keep the production lease lengths and execution path, but own time and worker coordination so
+    # CI scheduling cannot expire the lease mid-materialize or inject an unrelated recovery attempt.
+    controlled_now = metadb._now()
+    monkeypatch.setattr(metadb, "_durable_task_db_now", lambda _session: controlled_now)
+    monkeypatch.setattr(lct, "dispatch", lambda task_id, deps: lct._worker(task_id, deps))
     uid, canvas_id = f"once-user-{uuid.uuid4().hex}", f"once-canvas-{uuid.uuid4().hex}"
     submission = str(uuid.uuid4())
     with metadb.session() as session:
@@ -215,16 +232,10 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(lct, "_materialize_prefix", counted)
     status, _ = start_run(deps, graph, "write", uid, confirmed=True, submission_id=submission)
     task_id = status.run_id
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        observed = metadb.durable_task(task_id)
-        if observed and observed["status"] == "done":
-            break
-        time.sleep(0.1)
-    assert metadb.durable_task(task_id)["status"] == "done"
+    assert _await_status(task_id)["status"] == "done"
     assert counts["prefix"] == 1
 
-    # Force a failed terminal then retry: Phase 2 only.
+    # Force a failed terminal then retry: Phase 2 reuses the committed checkpoint, never Phase 1.
     with metadb.session() as session:
         task = session.get(metadb.DurableTask, task_id)
         task.status = "failed"
@@ -238,14 +249,11 @@ def test_prefix_execute_once_across_post_commit_retry(tmp_path, monkeypatch):
         attempt.completed_at = metadb._now()
     from hub.durable_tasks import retry
     retry(task_id, str(uuid.uuid4()), deps)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        observed = metadb.durable_task(task_id)
-        if observed and observed["status"] == "done" and len(observed["attempts"]) >= 2:
-            break
-        time.sleep(0.1)
+    observed = metadb.durable_task(task_id)
+    assert observed is not None
+    assert [attempt["status"] for attempt in observed["attempts"]] == ["failed", "done"]
     assert counts["prefix"] == 1
-    assert metadb.durable_task(task_id)["status"] == "done"
+    assert observed["status"] == "done"
     deps.storage.close()
 
 
@@ -268,12 +276,17 @@ def test_checkpoint_invalid_error_surfaces_as_jobs_diagnostic():
     assert other["diagnosticCode"] is None
 
 
-def _await_status(task_id, statuses=("done", "failed", "cancelled"), timeout=30):
+def _await_status(task_id, statuses=("done", "failed", "cancelled"), timeout=60):
     deadline = time.time() + timeout
     observed = None
     while time.time() < deadline:
         observed = metadb.durable_task(task_id)
         if observed and observed["status"] in statuses:
+            with lct._active_lock:
+                active = lct._active.get(str(task_id))
+            if active is not None:
+                active[1].join(timeout=max(0.0, deadline - time.time()))
+                assert not active[1].is_alive(), f"checkpoint worker did not exit: {task_id}"
             return observed
         time.sleep(0.05)
     return observed
@@ -309,7 +322,10 @@ def _run_then_orphan_after_publish(tmp_path, deps):
     return task_id, intent_doc, head
 
 
-def test_cancel_after_landed_publish_reconciles_done(tmp_path):
+def test_cancel_after_landed_publish_reconciles_done(tmp_path, monkeypatch):
+    controlled_now = metadb._now()
+    monkeypatch.setattr(metadb, "_durable_task_db_now", lambda _session: controlled_now)
+    monkeypatch.setattr(lct, "dispatch", lambda task_id, deps: lct._worker(task_id, deps))
     deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
     task_id, intent_doc, head = _run_then_orphan_after_publish(tmp_path, deps)
     metadb.request_durable_task_cancel(task_id)
@@ -321,7 +337,10 @@ def test_cancel_after_landed_publish_reconciles_done(tmp_path):
     deps.storage.close()
 
 
-def test_exhausted_recovery_after_landed_publish_reconciles_done(tmp_path):
+def test_exhausted_recovery_after_landed_publish_reconciles_done(tmp_path, monkeypatch):
+    controlled_now = metadb._now()
+    monkeypatch.setattr(metadb, "_durable_task_db_now", lambda _session: controlled_now)
+    monkeypatch.setattr(lct, "dispatch", lambda task_id, deps: lct._worker(task_id, deps))
     deps = Deps(str(tmp_path), str(tmp_path / "data"), maintain_storage=False)
     task_id, intent_doc, _ = _run_then_orphan_after_publish(tmp_path, deps)
     with metadb.session() as s:
