@@ -167,10 +167,12 @@ test.describe('accessibility gate @ux-smoke', () => {
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     await fresh(page)
     const canvasName = `a11y-space-${Date.now()}`
-    await page.getByTestId('file-menu').click()
-    const nameInput = page.getByPlaceholder('untitled')
-    await expect(nameInput).toBeVisible()
-    await nameInput.fill(canvasName)
+    // A just-created canvas can re-render and dismiss the file menu right after it opens, so retry
+    // the open-and-fill until the rename sticks rather than racing a single open.
+    await expect(async () => {
+      await page.getByTestId('file-menu').click()
+      await page.getByPlaceholder('untitled').fill(canvasName)
+    }).toPass({ timeout: 15_000 })
     await page.keyboard.press('Escape')
     await expect(page.getByTestId('file-menu')).toContainText(canvasName)
     await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
