@@ -17,7 +17,9 @@ from hub import db, metadb
 from hub.api_errors import APIError, APIErrorCode
 from hub.executors.engine import BuildEngine
 from hub.models import Graph, ParameterBinding, ParameterDeclaration, RunEstimate, RunStatus
-from hub.local_run_inputs import finalize_local_file_candidates
+from hub.local_run_inputs import (
+    LocalRunInputError, finalize_local_file_candidates, snapshot_local_file_input,
+)
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.routers import runs
@@ -93,6 +95,46 @@ def _admit_ordinary_source(*, source, canvas_id: str, storage, adapter, intent: 
         manifest[0]["dataset_id"], manifest[0]["revision_id"])
     assert artifact is not None
     return graph, deps, manifest, run_id, artifact
+
+
+def test_exact_admission_retries_a_transient_engine_error(tmp_path):
+    """A transient scan/write failure under concurrent admission recovers on retry (the #523 area)."""
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    source = tmp_path / "ordinary.parquet"
+    _write_ordinary_source(source, [1, 2, 3])
+
+    real_scan = adapter.scan_local_snapshot
+    calls = {"n": 0}
+
+    def flaky_scan(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient engine collision")
+        return real_scan(*args, **kwargs)
+
+    adapter.scan_local_snapshot = flaky_scan  # type: ignore[method-assign]
+    revision_id, candidate = snapshot_local_file_input(
+        uri=str(source), config={"uri": str(source)},
+        dataset_id="ds-flaky", adapter=adapter, storage=storage)
+    assert calls["n"] == 2 and candidate is not None and revision_id
+
+
+def test_exact_admission_surfaces_a_persistent_engine_error_as_a_typed_contract_failure(tmp_path):
+    """A persistent engine failure exhausts the retry and still fails typed, never a raw 500."""
+    adapter = DuckDBAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    source = tmp_path / "ordinary.parquet"
+    _write_ordinary_source(source, [1, 2, 3])
+
+    def always_fail(*args, **kwargs):
+        raise RuntimeError("persistent engine failure")
+
+    adapter.scan_local_snapshot = always_fail  # type: ignore[method-assign]
+    with pytest.raises(LocalRunInputError, match="could not be parsed into an immutable exact binding"):
+        snapshot_local_file_input(
+            uri=str(source), config={"uri": str(source)},
+            dataset_id="ds-persist", adapter=adapter, storage=storage)
 
 
 def test_ordinary_local_formats_keep_exact_rows_across_rename_restart_retry_and_cleanup(tmp_path):
