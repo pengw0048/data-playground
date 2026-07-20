@@ -35,8 +35,16 @@ MANIFEST = {
             "scenarios": ["slow", "unavailable", "permission_denied", "stale_reference", "partial_failure", "recovery"],
             "purpose": "Deterministic route/browser injection; never requires a private service or credential.",
         },
+        "lance_append_target": {
+            "datasets": ["lance-append-target"],
+            "purpose": "A pre-existing registerable Lance dataset in the outputs destination so the "
+                       "default-journey acceptance can certify a managed-local Lance append and its idempotent retry.",
+        },
     },
 }
+
+
+LANCE_APPEND_TARGET = "lance-append-target"
 
 
 def _write_csv(path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:
@@ -62,6 +70,24 @@ def _seed_starter_data(output: Path) -> None:
     events_parquet = output / "events.parquet"
     lance.write_dataset(pq.read_table(events_parquet), str(output / "events.lance"))
     events_parquet.unlink()
+
+
+def _build_lance_append_target(workspace: Path) -> None:
+    """Seed a registerable Lance dataset in the workspace outputs destination.
+
+    The default Write node writes into the ``outputs`` destination root, so the acceptance journey can
+    append to this dataset and prove the managed-local Lance append + idempotent retry from #633. Its
+    schema matches a ``select id, event AS label`` projection over the starter ``events`` dataset.
+    """
+    import lance  # noqa: PLC0415 - available through the kernel runtime used by this script
+    import pyarrow as pa  # noqa: PLC0415 - available through the kernel runtime
+
+    outputs = workspace / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    lance.write_dataset(
+        pa.table({"id": pa.array([1, 2], pa.int64()), "label": ["seed-a", "seed-b"]}),
+        str(outputs / f"{LANCE_APPEND_TARGET}.lance"),
+    )
 
 
 def _build_full_catalog(output: Path) -> None:
@@ -90,6 +116,7 @@ def build(output: Path, profile: str) -> Path:
     _seed_starter_data(output)
     if profile == "full":
         _build_full_catalog(output)
+        _build_lance_append_target(output.parent)
     manifest_dir = output / "ux-fixtures"
     manifest_dir.mkdir(exist_ok=True)
     (manifest_dir / "manifest.json").write_text(

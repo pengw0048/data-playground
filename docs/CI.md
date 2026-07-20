@@ -90,6 +90,12 @@ have scheduled health runs because external services and base images can drift:
 - [`ray-validation.yml`](../.github/workflows/ray-validation.yml)
 - [`ray-jobs-acceptance.yml`](../.github/workflows/ray-jobs-acceptance.yml)
 
+`ux-acceptance.yml` runs the browser suite at the `full` fixture profile. That profile gates the
+default fresh-workspace write-journey certification (`web/e2e/default-write-journey.spec.ts`,
+issue #635) so it never runs per-PR: it certifies, on the unmodified default kernel backend, the
+Workspace → Source → transform → Write → managed revision + receipt → Jobs/Inbox → exact-revision
+reopen → hub-restart-recovery path, and writes reviewable evidence to `docs/acceptance/issue-635`.
+
 Run one manually from the Actions page or with, for example:
 
 ```bash
