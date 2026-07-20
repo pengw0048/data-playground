@@ -112,6 +112,16 @@ def test_preflight_projects_without_side_effect_then_submit_and_replay(tmp_path,
     assert _revisions(deps, base["dataset_id"]) == 2  # head moved exactly once
 
 
+def test_reused_submission_id_with_a_different_intent_conflicts(tmp_path, monkeypatch):
+    deps, base = _dataset(tmp_path, monkeypatch)
+    payload = _payload(deps, _table([2, 3], ["B", "C"]))
+    first = api.submit(_request(base, payload, keys=("id",)), "owner")
+    with pytest.raises(APIError) as caught:  # same id, same operands, different key set
+        api.submit(_request(base, payload, keys=("value",)), "owner")
+    assert caught.value.status_code == 409
+    assert api.submit(_request(base, payload, keys=("id",)), "owner").task_id == first.task_id
+
+
 def test_all_insert_and_all_update_projections(tmp_path, monkeypatch):
     deps, base = _dataset(tmp_path, monkeypatch)
     inserts = api.preflight(_request(base, _payload(deps, _table([7, 8], ["g", "h"]))), "owner")

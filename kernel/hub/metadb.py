@@ -9541,6 +9541,17 @@ def keyed_upsert_task_view(task_id: str, uid: str) -> dict | None:
         }
 
 
+def keyed_upsert_task_admission_keys(task_id: str) -> list[str] | None:
+    """The frozen upsert key list, for a submit replay's identity check. Server-side only — never
+    returned to a client, which keeps the sanitized task view free of raw keys."""
+    with session() as s:
+        envelope = s.get(KeyedUpsertTaskEnvelope, str(task_id))
+        if envelope is None:
+            return None
+        keys = json.loads(envelope.upsert_intent_doc).get("keys")
+        return [str(key) for key in keys] if isinstance(keys, list) else None
+
+
 def _authorize_keyed_upsert_owner(s, task_id: str, uid: str) -> DurableTask | None:
     task = _lock_durable_task_for_write(s, str(task_id))
     if (task is None or task.task_kind != "keyed_upsert_write" or task.owner_id != str(uid)):

@@ -163,8 +163,10 @@ def submit(request: UpsertRequestV1, uid: str = Depends(current_user)) -> Upsert
     if existing is not None:
         view = _task_view(task_id, uid)
         if (view.dataset_id != request.dataset_id
+                or view.expected_head_revision_id != request.expected_head_revision_id
                 or view.payload_dataset_id != request.payload_dataset_id
-                or view.payload_revision_id != request.payload_revision_id):
+                or view.payload_revision_id != request.payload_revision_id
+                or metadb.keyed_upsert_task_admission_keys(task_id) != list(request.keys)):
             raise APIError(409, "upsert submission id is already used for another intent",
                            code=APIErrorCode.CONFLICT, retryable=False)
         dispatch(task_id, get_deps())
