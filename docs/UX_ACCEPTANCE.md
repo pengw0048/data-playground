@@ -33,8 +33,8 @@ uv run python ../scripts/build_ux_fixtures.py --profile smoke --output /tmp/dp-u
 uv run python ../scripts/build_ux_fixtures.py --profile full --output /tmp/dp-ux-full/data
 ```
 
-`smoke` contains the standard starter data plus temporal and multimodal streams. `full` additionally
-contains a 120-dataset catalog and 24 relationship-dense datasets. The generated
+`smoke` contains the standard starter data. `full` additionally contains a 120-dataset catalog and 24
+relationship-dense datasets. The generated
 `ux-fixtures/manifest.json` records the fixture matrix, including route/browser-injected slow,
 unavailable, permission-denied, stale-reference, partial-failure, and recovery scenarios. These fixtures
 need neither external credentials nor a private service.
@@ -81,7 +81,7 @@ toast, chart, profile cell, or disabled paging control makes a smaller scope loo
 | Tier | When | Required evidence |
 | --- | --- | --- |
 | PR smoke | Normal CI | `@ux-smoke` Playwright tests cover explicit canvas targeting, preview invalidation, sample/export scope, destructive disclosure, keyboard navigation, and serious/critical axe findings. |
-| Full matrix | Daily schedule, manual dispatch, and release candidate | Full Playwright suite on the full fixture profile, including the documented minimum viewport. The full-only browser specs search the 120-entry catalog, render declared relationship-dense data, open synchronized temporal/multimodal streams, and inject slow, unavailable, permission-denied, stale-reference, partial-failure, and recovery states. Report, traces, test results, fixture manifest, workspace, and test DB are retained as an artifact. |
+| Full matrix | Daily schedule, manual dispatch, and release candidate | Full Playwright suite on the full fixture profile, including the documented minimum viewport. The full-only browser specs search the 120-entry catalog, render declared relationship-dense data, and inject slow, unavailable, permission-denied, stale-reference, partial-failure, and recovery states. Report, traces, test results, fixture manifest, workspace, and test DB are retained as an artifact. |
 | Release candidate | Tag-triggered release workflow | The full matrix plus the P0/P1 golden-workflow issue gate must pass before publishing release assets. |
 
 The full matrix does not run on pull requests or after merging to `main`; the tagged smoke in required
