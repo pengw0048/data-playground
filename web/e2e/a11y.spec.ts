@@ -1,6 +1,6 @@
 import { test, expect, type Page, type Locator } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
-import { backToWorkspace, workspaceResource } from './support/workspace'
+import { backToWorkspace, goToWorkspace, workspaceResource } from './support/workspace'
 
 // Accessibility gate for issue #118: keyboard contract on Workspace/Canvas + one axe smoke suite that
 // fails the build on serious/critical violations across the primary surfaces.
@@ -165,18 +165,15 @@ test.describe('accessibility gate @ux-smoke', () => {
   })
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
-    await fresh(page)
+    // Build the target canvas via the API so the keyboard assertion doesn't ride the fragile
+    // file-menu rename, which flakes when a just-created canvas re-renders the menu away.
+    await page.goto('/')
+    await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
     const canvasName = `a11y-space-${Date.now()}`
-    // A just-created canvas can re-render and dismiss the file menu right after it opens, so retry
-    // the open-and-fill until the rename sticks rather than racing a single open.
-    await expect(async () => {
-      await page.getByTestId('file-menu').click()
-      await page.getByPlaceholder('untitled').fill(canvasName)
-    }).toPass({ timeout: 15_000 })
-    await page.keyboard.press('Escape')
-    await expect(page.getByTestId('file-menu')).toContainText(canvasName)
-    await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
-    await backToWorkspace(page)
+    expect((await page.request.post('/api/canvas', { data: {
+      id: canvasName, name: canvasName, version: 1, requirements: [], nodes: [], edges: [],
+    } })).ok()).toBeTruthy()
+    await goToWorkspace(page)
     await page.getByRole('heading', { name: 'Workspace' }).click()
     const openCard = await workspaceResource(page, 'canvas', canvasName)
     expect(await tabUntil(page, openCard)).toBe(true)
