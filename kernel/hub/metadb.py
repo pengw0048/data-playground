@@ -6013,8 +6013,11 @@ def submit_durable_local_write_task(
         raise ValueError("durable task semantic identity must be its execution manifest")
     graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
     intent = WriteIntent.model_validate(write_intent)
-    if intent.mode not in ("create", "replace"):
-        raise ValueError("durable local tasks support only create or replace writes")
+    if intent.mode not in ("create", "replace") and not (
+            intent.mode == "append"
+            and intent.destination.provider == "managed-local-lance"):
+        raise ValueError(
+            "durable local tasks support only create, replace, or managed-local Lance append writes")
     input_manifest = validate_manifest(input_manifest)
     graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
     manifest_payload = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))

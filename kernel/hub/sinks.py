@@ -113,7 +113,10 @@ def preflight_sink(spec: SinkSpec, workspace: str, storage, resolve_adapter,
 def expected_sink_uri(spec: SinkSpec, target_uri: str, adapter) -> str:
     """Published URI implied by the built-in file adapter's shared sink semantics."""
     core_file_adapter = adapter is None or adapter.__class__.__module__ == "hub.plugins.adapters"
-    if core_file_adapter and (spec.mode == "append" or spec.partition_by):
+    # Only the parquet/csv/json directory-append and Hive partitioning fold into an extension-stripped
+    # directory; a Lance append commits in place and keeps its `.lance` URI.
+    directory_rewriting = spec.extension.lower() != ".lance"
+    if core_file_adapter and directory_rewriting and (spec.mode == "append" or spec.partition_by):
         return os.path.splitext(target_uri)[0]
     return target_uri
 
