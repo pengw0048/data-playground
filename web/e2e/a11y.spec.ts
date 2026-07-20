@@ -166,9 +166,17 @@ test.describe('accessibility gate @ux-smoke', () => {
 
   test('keyboard: Space opens a canvas from Workspace', async ({ page }) => {
     await fresh(page)
+    const canvasName = `a11y-space-${Date.now()}`
+    await page.getByTestId('file-menu').click()
+    const nameInput = page.getByPlaceholder('untitled')
+    await expect(nameInput).toBeVisible()
+    await nameInput.fill(canvasName)
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('file-menu')).toContainText(canvasName)
+    await expect(page.getByTestId('autosave')).toContainText(/saved/i, { timeout: 8_000 })
     await backToWorkspace(page)
     await page.getByRole('heading', { name: 'Workspace' }).click()
-    const openCard = page.getByRole('button', { name: /^Open canvas / }).first()
+    const openCard = await workspaceResource(page, 'canvas', canvasName)
     expect(await tabUntil(page, openCard)).toBe(true)
     await page.keyboard.press('Space')
     await expect(page.getByTestId('toolbar')).toBeVisible({ timeout: 10_000 })

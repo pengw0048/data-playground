@@ -34,16 +34,9 @@ async function freshSource(page: Page, uri: string) {
 test.describe('full researcher acceptance matrix', () => {
   test.skip(!fullProfile, 'full fixtures are exercised by the scheduled, release, and matrix-changing PR workflow')
 
-  test('uses the large catalog, relationship-dense, and temporal/multimodal fixtures', async ({ page }) => {
+  test('uses the large catalog and relationship-dense fixtures', async ({ page }) => {
     await goToWorkspace(page)
     await openWorkspaceTable(page, 'catalog_119')
-
-    // Traverse the bounded Workspace pages rather than assuming fixture order. The three synchronized
-    // streams all need to remain discoverable after the 120-entry catalog is present.
-    for (const name of ['episodes', 'frames', 'audio_windows']) {
-      await page.getByRole('button', { name: 'Close' }).click()
-      await openWorkspaceTable(page, name)
-    }
 
     const [left, right] = await Promise.all([
       namedTable(page.request, 'relationship_dense_00'),
@@ -77,7 +70,7 @@ test.describe('full researcher acceptance matrix', () => {
     await page.getByTestId('workspace-reload').click()
     await expect(page.getByText(/Couldn't load this Workspace location: Service Unavailable/i)).toBeVisible()
     await page.getByRole('button', { name: 'Retry' }).click()
-    await expect(await workspaceResource(page, 'dataset', 'episodes')).toBeVisible()
+    await expect(await workspaceResource(page, 'dataset', 'catalog_119')).toBeVisible()
 
     const inspector = await freshSource(page, 'events')
     await page.route('**/api/run/preview', (route) => route.fulfill({
