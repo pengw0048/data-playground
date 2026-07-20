@@ -272,15 +272,23 @@ jobs:
       # built before `uv sync` or hatchling errors ("Forced include not found").
       - name: Install web deps
         run: cd web && npm install
-      - name: Unit tests (vitest — store + components)
-        run: cd web && npm test
       - name: Build SPA
         run: cd web && npm run build
       # kernel: the Playwright webServer boots `dataplay` (needs uv + deps incl. anthropic via dev)
       - name: Install kernel
         run: cd kernel && uv sync --extra dev
+      # Cache the browser binary and skip --with-deps: the ubuntu-latest image already ships
+      # Chromium's shared libraries, so only the ~120MB download is worth avoiding on a cache hit.
+      - name: Resolve Playwright version
+        id: playwright
+        run: echo "version=$(node -p "require('./web/node_modules/@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browser
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
       - name: Install Playwright browser
-        run: cd web && npx playwright install --with-deps chromium
+        run: cd web && npx playwright install chromium
       # The Playwright project DAG runs the tagged researcher smoke first, the remaining Chromium
       # suite second, and the minimum-viewport project last, without executing smoke fixtures twice.
       - name: Run E2E (UX smoke first)
@@ -292,3 +300,17 @@ jobs:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 7
+
+  web-unit:
+    name: web unit (vitest — store + components)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install web deps
+        run: cd web && npm install
+      - name: Unit tests (vitest — store + components)
+        run: cd web && npm test
