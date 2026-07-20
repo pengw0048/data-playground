@@ -6013,8 +6013,11 @@ def submit_durable_local_write_task(
         raise ValueError("durable task semantic identity must be its execution manifest")
     graph = Graph.model_validate(graph_doc).model_dump(by_alias=True, mode="json")
     intent = WriteIntent.model_validate(write_intent)
-    if intent.mode not in ("create", "replace"):
-        raise ValueError("durable local tasks support only create or replace writes")
+    if intent.mode not in ("create", "replace") and not (
+            intent.mode == "append"
+            and intent.destination.provider == "managed-local-lance"):
+        raise ValueError(
+            "durable local tasks support only create, replace, or managed-local Lance append writes")
     input_manifest = validate_manifest(input_manifest)
     graph_payload = json.dumps(graph, sort_keys=True, separators=(",", ":"))
     manifest_payload = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
@@ -6598,6 +6601,25 @@ def _durable_task_write_receipt(task: DurableTask, receipt):
     return receipt
 
 
+def _mirror_durable_managed_write_history(
+        s, task, *, outputs, rows, ms=None, per_node=None, profile=None,
+        target_node_id=None, target_port_id=None, job_type="run") -> None:
+    """Record a completed managed-local durable write into the canvas Run history so its Write
+    receipt shows there just as an in-process managed write's does. Jobs de-dupes the owning task
+    against this history row (list_workspace_runs), so it stays a single Jobs entry."""
+    if task.task_kind != "managed_local_write":
+        return
+    _upsert_run_record(
+        s, canvas_id=task.canvas_id, target_node_id=target_node_id or task.target_node_id,
+        target_port_id=target_port_id, job_type=job_type or "run", status="done",
+        rows=rows, ms=ms, error=None,
+        outputs=[output.model_dump() for output in outputs],
+        per_node=per_node, profile=profile,
+        run_id=task.id, request_id=None,
+        execution_manifest_sha256=task.execution_manifest_sha256, execution_manifest_doc=None,
+    )
+
+
 def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     """Reconcile a write-bearing task to done when its receipt already landed, so dead-owner
     recovery, cancel, or attempt exhaustion never misreports a committed write as failed/cancelled."""
@@ -6638,6 +6660,7 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     task.status_doc = json.dumps(status, default=str)
     task.output_receipt = attempt.output_receipt = receipt_json
     task.completed_at = attempt.completed_at = task.updated_at = now
+    _mirror_durable_managed_write_history(s, task, outputs=[output], rows=receipt.rows)
     _terminalize_hidden_task_envelope(s, task, now)
     _emit_durable_task_inbox_item(s, task=task, attempt=attempt, task_status="done", now=now)
     return True
@@ -6895,6 +6918,13 @@ def finish_durable_task_attempt(
         task.output_receipt = receipt_payload
         task.completed_at = now
         task.updated_at = now
+        if status.status == "done" and receipt is not None:
+            _mirror_durable_managed_write_history(
+                s, task, outputs=status.outputs, rows=status.total_rows, ms=status.ms,
+                per_node=[item.model_dump() for item in (status.per_node or [])] or None,
+                profile=status.profile.model_dump() if status.profile else None,
+                target_node_id=status.target_node_id, target_port_id=status.target_port_id,
+                job_type=status.job_type)
         _terminalize_hidden_task_envelope(s, task, now)
         _emit_durable_task_inbox_item(
             s, task=task, attempt=attempt, task_status=status.status,
@@ -9384,7 +9414,15 @@ def list_workspace_runs(
         effective_backend = func.coalesce(
             RunBackendJob.backend, state_backend_ref, state_placement, literal("unknown"))
         history_identity = literal("h:") + RunRecord.id
-        history_predicates = [visible_canvas]
+        history_predicates = [
+            visible_canvas,
+            # A managed-local durable write mirrors its receipt into Run history, but Jobs already
+            # lists the owning task ("t:"); exclude the history twin so it stays one Jobs entry.
+            ~exists().where(and_(
+                DurableTask.id == RunRecord.run_id,
+                DurableTask.canvas_id == RunRecord.canvas_id,
+            )),
+        ]
         if canvas_id:
             history_predicates.append(RunRecord.canvas_id == canvas_id)
         if run_id:

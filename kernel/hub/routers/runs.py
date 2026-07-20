@@ -2597,13 +2597,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     est = runner.estimate(plan, rows, byts)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
-    if (managed_write and effective_write_intent is not None
-            and effective_write_intent.mode in ("create", "replace")):
+    durable_managed_write = effective_write_intent is not None and (
+        effective_write_intent.mode in ("create", "replace")
+        or (effective_write_intent.mode == "append"
+            and effective_write_intent.destination.provider == "managed-local-lance"))
+    if managed_write and durable_managed_write:
         # This one consumer transfers ownership to a durable Task before any worker dispatch —
-        # including the default per-canvas kernel, whose managed-local create/replace is now admitted
-        # and published by this same durable owner. Append, provider-neutral, placed, subprocess, and
-        # Ray paths retain their current lifecycle. The stable local submission id also remains the
-        # Write provenance identity.
+        # including the default per-canvas kernel, whose managed-local create/replace and Lance append
+        # are published by this same durable owner (CAS + receipt reconciliation). Provider-neutral,
+        # placed, subprocess, and Ray paths retain their current lifecycle. The stable local submission
+        # id also remains the Write provenance identity.
         operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
         if operational_canvas is None or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "durable managed-local writes require a saved canvas")
