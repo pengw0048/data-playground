@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false  # one failing shard must not hide failures in the others
       matrix:
-        shard: [kernel, lifecycle, remainder-0, remainder-1]
+        shard: [kernel, lifecycle, remainder-0, remainder-1, remainder-2]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -43,27 +43,47 @@ jobs:
         run: cd kernel && uv run python -m hub.contracts.openapi --check
       - name: Run shard ${{ matrix.shard }}
         # test_kernel.py is its own shard (a monolith can't be split further); ray_jobs +
-        # object_lifecycle share the lifecycle shard. The rest is split into two balanced halves by a
-        # stable round-robin over the sorted test files, matching pytest's `testpaths` collection so
-        # new files are auto-assigned and none are dropped.
+        # object_lifecycle share the lifecycle shard. The rest is split into three time-balanced
+        # groups from measured per-file durations (one heavy CPU-bound file dominates, so a naive
+        # by-name split leaves a straggler). remainder-0/-1 are explicit; remainder-2 is the
+        # complement, so any newly added test file lands there and is never silently dropped.
         shell: bash
         run: |
           set -uo pipefail
           cd kernel
           export DP_DATA_DIR="$RUNNER_TEMP/dp-test-data-${{ matrix.shard }}"
+          dedicated="test_kernel.py test_ray_jobs.py test_object_lifecycle.py"
+          group_0="test_api_contract.py test_backend_source_pins.py test_backup_restore_drill.py
+            test_body_limit.py test_bounded_fanout_plan.py test_bounded_fanout_write_tasks.py
+            test_catalog_folders.py test_ci_workflow_policy.py test_dataset_revisions.py
+            test_durable_external_wait_tasks.py test_durable_local_write_tasks.py
+            test_execution_manifests.py test_external_wait.py test_kernel_status.py
+            test_local_named_outputs.py test_local_run_input_admission.py test_merge_columns.py
+            test_migrations.py test_native_canvas.py test_observability_contracts.py
+            test_plugin_status.py test_plugin_wheel_conformance.py test_promoted_transform_versions.py
+            test_run_authz.py test_subprocess_process_groups.py test_task_inbox.py
+            test_task_inbox_api.py test_workload_env.py test_write_admission.py"
+          group_1="test_agent_data_policy.py test_backend_recovery_fences.py test_canvas_copy.py
+            test_canvas_roles.py test_checkpoint_conformance.py test_creds.py test_dataset_views.py
+            test_graph_validation.py test_http_filesystem_policy.py test_lance_append_durable_writes.py
+            test_lineage_execution.py test_linear_checkpoint_admission.py test_linear_checkpoint_tasks.py
+            test_local_result_lifecycle.py test_managed_local_file_revisions.py test_managed_source_e2e.py
+            test_managed_source_lifecycle.py test_mcp_http.py test_named_output_process_runners.py
+            test_preview_boundary.py test_profile_process_runner.py test_region_object_lifecycle.py
+            test_run_identity.py test_secret_refs.py test_sparse_outputs.py test_sqlpolicy.py
+            test_transform_library_ux.py test_ux_release_gate.py"
           case "${{ matrix.shard }}" in
-            kernel)
-              files="hub/tests/test_kernel.py" ;;
-            lifecycle)
-              files="hub/tests/test_ray_jobs.py hub/tests/test_object_lifecycle.py" ;;
-            remainder-*)
-              k="${{ matrix.shard }}"; k="${k##remainder-}"
-              files=$(find hub/tests -name 'test_*.py' \
-                        ! -name test_kernel.py ! -name test_ray_jobs.py ! -name test_object_lifecycle.py \
-                        | sort | awk -v k="$k" 'NR % 2 == (k + 0)') ;;
+            kernel)      names="test_kernel.py" ;;
+            lifecycle)   names="test_ray_jobs.py test_object_lifecycle.py" ;;
+            remainder-0) names="$group_0" ;;
+            remainder-1) names="$group_1" ;;
+            remainder-2) names=$(comm -23 \
+                          <(find hub/tests -name 'test_*.py' -exec basename {} \; | sort) \
+                          <(printf '%s\n' $dedicated $group_0 $group_1 | sort)) ;;
           esac
-          test -n "$files"  # a shard that selected nothing is a bug, not an empty pass
-          uv run pytest -q -o faulthandler_timeout=60 --durations=0 --durations-min=0.01 $files
+          files=$(printf 'hub/tests/%s ' $names)
+          test -n "$names"  # a shard that selected nothing is a bug, not an empty pass
+          uv run pytest -q -o faulthandler_timeout=60 --durations=25 $files
 
   kernel-tests:
     # Aggregates the sharded pytest matrix into the one required status check named in branch
