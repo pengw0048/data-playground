@@ -1057,6 +1057,67 @@ def test_kernel_default_occupied_unmanaged_name_returns_typed_error(tmp_path, mo
     deps.storage.close()
 
 
+def test_direct_api_unknown_destination_fails_fast_without_a_claim(tmp_path, monkeypatch):
+    from hub.api_errors import APIError, APIErrorCode
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    next(n for n in graph.nodes if n.id == "write").data["config"]["destId"] = "ghost-destination"
+
+    with metadb.session() as session:
+        before = session.scalar(select(func.count()).select_from(metadb.RunState))
+
+    # Direct API / MCP callers supply no submissionId; the unknown destination must fail pre-claim.
+    with pytest.raises(APIError) as excinfo:
+        runs.start_run(deps, graph, "write", uid, confirmed=True)
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.code == APIErrorCode.INVALID_REQUEST
+    assert "unknown destination" in str(excinfo.value.detail)
+
+    with metadb.session() as session:
+        after = session.scalar(select(func.count()).select_from(metadb.RunState))
+    assert after == before
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_injected_pre_dispatch_failure_terminalizes_the_kernel_claim(tmp_path, monkeypatch):
+    from hub.kernel_backend import KernelBackend
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+
+    monkeypatch.setattr(
+        KernelBackend, "_ensure_kernel", lambda self, canvas_id: ("127.0.0.1:1", "token"))
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("injected pre-dispatch failure")
+
+    monkeypatch.setattr(KernelBackend, "run", boom)
+
+    with pytest.raises(RuntimeError, match="injected pre-dispatch failure"):
+        runs.start_run(deps, graph, "write", uid, confirmed=True)
+
+    with metadb.session() as session:
+        rows = session.scalars(select(metadb.RunState)).all()
+    assert len(rows) == 1
+    run_id, status, kernel_id = rows[0].run_id, rows[0].status, rows[0].kernel_id
+    assert status == "failed" and kernel_id is None
+    persisted = metadb.get_run_state(run_id)
+    assert "injected pre-dispatch failure" in persisted["error"]
+
+    # the run is terminal, so the reconciler never misreports the healthy kernel as gone
+    assert metadb.reap_orphaned_runs() == 0
+    assert "kernel is gone" not in (metadb.get_run_state(run_id)["error"] or "")
+
+    # cancel finds no live execution owner and the run is already terminal
+    assert run_id not in deps.run_index
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
 def test_kernel_default_replayed_submission_adopts_one_task_and_revision(tmp_path, monkeypatch):
     _use_kernel_backend(monkeypatch)
     deps, graph, _source, uid = _ordinary_task_context(tmp_path)

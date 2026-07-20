@@ -591,6 +591,39 @@ def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
         return False
 
 
+def _resolve_write_sink_or_typed_error(spec, deps) -> str:
+    """Resolve a Write sink URI, mapping an unknown/unresolvable destination to a typed 4xx so no run
+    claim is ever created for a destination that cannot exist."""
+    from hub.sinks import preflight_sink
+    try:
+        return preflight_sink(spec, deps.workspace, deps.storage, deps.resolve_adapter)
+    except ValueError as exc:
+        raise APIError(
+            400, str(exc), code=APIErrorCode.INVALID_REQUEST, retryable=False) from exc
+
+
+def _preflight_write_target_destination(deps, graph, node_id: str) -> None:
+    """Reject an unknown Write destination with a typed 4xx before a run claim exists, on paths that
+    skip write admission (direct API / MCP callers supply no submissionId)."""
+    from hub.sinks import SinkSpec
+    node = next((candidate for candidate in graph.nodes if candidate.id == node_id), None)
+    if node is None or node.type != "write":
+        return
+    cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    spec = SinkSpec.from_config(
+        cfg, node.data.get("title") if isinstance(node.data, dict) else None)
+    _resolve_write_sink_or_typed_error(spec, deps)
+
+
+def _kernel_run_provably_undispatched(runner, run_id: str, status) -> bool:
+    """True when a raised local dispatch left the kernel claim behind with no execution owner, so it
+    must be terminalized rather than adopted as an ambiguous response loss."""
+    from hub.kernel_backend import KernelBackend
+    return (isinstance(runner, KernelBackend) and status.status == "queued"
+            and metadb.run_kernel_id(run_id) is None
+            and metadb.backend_job(run_id) is None)
+
+
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
         supplied: WriteIntent | None = None, *, direct_local: bool = False) -> WriteAdmission:
@@ -598,7 +631,7 @@ def _write_admission_for_graph(
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
         SinkSpec, is_core_managed_local_file_sink,
-        is_core_managed_local_lance_append_sink, preflight_sink,
+        is_core_managed_local_lance_append_sink,
     )
 
     node = next((candidate for candidate in graph.nodes if candidate.id == node_id), None)
@@ -607,8 +640,7 @@ def _write_admission_for_graph(
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     spec = SinkSpec.from_config(
         cfg, node.data.get("title") if isinstance(node.data, dict) else None)
-    logical_uri = preflight_sink(
-        spec, deps.workspace, deps.storage, deps.resolve_adapter)
+    logical_uri = _resolve_write_sink_or_typed_error(spec, deps)
     adapter = deps.resolve_adapter(logical_uri)
     managed_file = (
         is_core_managed_local_file_sink(spec, logical_uri, adapter, deps.storage)
@@ -2529,6 +2561,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             effective_write_intent = write_admission.intent
             _inject_write_intent(graph, target_node_id, write_admission.intent)
             _inject_write_intent(durable_graph, target_node_id, write_admission.intent)
+    elif target is not None and target.type == "write":
+        # No submissionId (direct API / MCP), so the admission gate above was skipped; still reject an
+        # unknown destination with a typed 4xx before the dispatch claim exists.
+        _preflight_write_target_destination(deps, graph, str(target_node_id))
     intent_sha256 = _local_run_intent_sha256(
         intent_graph, target_node_id, input_manifest, effective_write_intent)
     plan = compiler.compile_plan(graph, target_node_id, deps.registry, deps.node_specs, deps.node_ir)
@@ -2847,12 +2883,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             except Exception as exc:
                 if prebound_local_run_id is None:
                     raise
+                # A missing in-process receipt proves no worker ran; the DB-backed kernel instead
+                # returns the queued claim, so an unclaimed kernel run is also treated as pre-dispatch.
+                status = None
                 try:
-                    # LocalRunner records this receipt before it starts the worker. A missing receipt
-                    # therefore proves this invocation did not create a worker; an existing receipt is
-                    # an ambiguous response-loss outcome and must be adopted without another dispatch.
                     status = runner.status(prebound_local_run_id)
                 except KeyError:
+                    pass
+                if status is None or _kernel_run_provably_undispatched(
+                        runner, prebound_local_run_id, status):
                     metadb.fail_claimed_local_run_dispatch(
                         prebound_local_run_id, f"{type(exc).__name__}: {exc}")
                     if deps.run_index.get(prebound_local_run_id) is runner:
