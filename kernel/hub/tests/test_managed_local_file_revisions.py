@@ -314,7 +314,8 @@ def test_typed_local_write_preconditions_fail_before_artifact_allocation(
             _write_intent(logical_uri, "stale-replace", head=old_head),
             3,
         )
-    with pytest.raises(RuntimeError, match="idempotency key collision"):
+    # A reused idempotency key bound to a different intent is a typed conflict (409), never a raw 500.
+    with pytest.raises(metadb.ManagedLocalWriteConflict, match="idempotency key collision"):
         _typed_write(
             storage, catalog,
             _write_intent(logical_uri, "precondition-create", head=old_head),
