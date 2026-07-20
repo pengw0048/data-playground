@@ -159,8 +159,6 @@ def recover(deps) -> None:
     recover_bounded_fanout(deps)
     from hub.distribution_report_tasks import recover as recover_distribution_reports
     recover_distribution_reports()
-    from hub.temporal_resample_tasks import recover as recover_temporal_resample
-    recover_temporal_resample(deps)
 
 
 def recovery_loop(deps, stop: threading.Event) -> None:
@@ -217,7 +215,4 @@ def retry(task_id: str, retry_request_id: str, deps) -> dict:
     elif task["task_kind"] == "distribution_report":
         from hub.distribution_report_tasks import dispatch as dispatch_report
         dispatch_report(task_id)
-    elif task["task_kind"] == "temporal_resample_write":
-        from hub.temporal_resample_tasks import dispatch as dispatch_temporal
-        dispatch_temporal(task_id, deps)
     return task

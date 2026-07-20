@@ -15,9 +15,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from hub.temporal_resample_diagnostics import TemporalResampleDiagnosticCode
-
-
 class APIErrorCode(StrEnum):
     """Codes emitted by the core API.
 
@@ -49,14 +46,11 @@ class APIErrorCode(StrEnum):
     UPSTREAM_TIMEOUT = "upstream_timeout"
 
 
-MachineErrorCode = APIErrorCode | TemporalResampleDiagnosticCode
-
-
 class APIErrorResponse(BaseModel):
     """Additive error response shared by all ``/api`` routes."""
 
     detail: Any = Field(description="Human-readable detail; clients must not parse this value.")
-    code: MachineErrorCode = Field(description="Stable machine-readable error code.")
+    code: APIErrorCode = Field(description="Stable machine-readable error code.")
     retryable: bool = Field(
         description=(
             "Whether the server knows that retrying the same request is safe under this operation's "
@@ -110,7 +104,7 @@ class APIError(HTTPException):
         status_code: int,
         detail: Any,
         *,
-        code: MachineErrorCode,
+        code: APIErrorCode,
         retryable: bool,
         headers: dict[str, str] | None = None,
     ) -> None:
@@ -119,7 +113,7 @@ class APIError(HTTPException):
         self.retryable = retryable
 
 
-def classify_http_error(exc: HTTPException) -> tuple[MachineErrorCode, bool]:
+def classify_http_error(exc: HTTPException) -> tuple[APIErrorCode, bool]:
     """Return the explicit classification or the stable status-level fallback."""
 
     if isinstance(exc, APIError):
@@ -136,7 +130,7 @@ def api_error_response(
     *,
     status_code: int,
     detail: Any,
-    code: MachineErrorCode,
+    code: APIErrorCode,
     retryable: bool,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:

@@ -576,7 +576,7 @@ class DurableTask(Base):
         UniqueConstraint("owner_id", "canvas_id", "submission_id", name="uq_durable_task_submission"),
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
-            "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write','temporal_resample_write',"
+            "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
             "'distribution_report')",
             name="ck_durable_task_kind"),
         CheckConstraint(
@@ -584,9 +584,7 @@ class DurableTask(Base):
             "AND target_node_id IS NULL AND dataset_view_id IS NOT NULL "
             "AND execution_manifest_sha256 IS NULL AND graph_doc IS NULL "
             "AND input_manifest IS NULL AND write_intent IS NULL) OR "
-            "(task_kind = 'temporal_resample_write' AND canvas_id IS NULL AND dataset_view_id IS NULL "
-            "AND target_node_id = 'temporal-resample') OR "
-            "(task_kind <> 'distribution_report' AND task_kind <> 'temporal_resample_write' AND canvas_id IS NOT NULL "
+            "(task_kind <> 'distribution_report' AND canvas_id IS NOT NULL "
             "AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
         UniqueConstraint(
@@ -759,29 +757,6 @@ class MergeColumnsTaskEnvelope(Base):
         CheckConstraint(
             "phase IN ('validating','merging','candidate_committed','publishing',"
             "'done','failed','cancelled')", name="ck_merge_task_phase"),
-    )
-
-
-class TemporalResampleTaskEnvelope(Base):
-    __tablename__ = "temporal_resample_task_envelopes"
-    task_id: Mapped[str] = mapped_column(String, ForeignKey("durable_tasks.id"), primary_key=True)
-    request_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    candidate_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    # This task is the sole durable owner of its managed-write replay key.  It
-    # prevents a second submission from observing another task's receipt while
-    # its own attempt remains running.
-    write_idempotency_key: Mapped[str] = mapped_column(String(2048), nullable=False)
-    phase: Mapped[str] = mapped_column(String(32), nullable=False, server_default="admitted")
-    result_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    __table_args__ = (
-        CheckConstraint("length(request_sha256) = 64", name="ck_temporal_task_request_sha"),
-        CheckConstraint("length(candidate_sha256) = 64", name="ck_temporal_task_candidate_sha"),
-        UniqueConstraint("write_idempotency_key", name="uq_temporal_task_write_key"),
-        CheckConstraint("phase IN ('admitted','recomputing','publishing','done','failed','cancelled')",
-                        name="ck_temporal_task_phase"),
     )
 
 
@@ -1446,54 +1421,6 @@ class MergeColumnsPublication(Base):
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
         CheckConstraint("length(merge_sha256) = 64", name="ck_merge_columns_publication_sha"),
-    )
-
-
-class CompoundDatasetRevision(Base):
-    """One owner-scoped immutable compound manifest retained for temporal derivations."""
-    __tablename__ = "compound_dataset_revisions"
-    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    revision_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    manifest_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    parent_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now)
-
-
-class CompoundDatasetHead(Base):
-    """The one current child allowed to advance an owner-scoped compound dataset."""
-    __tablename__ = "compound_dataset_heads"
-    owner_id: Mapped[str] = mapped_column(String, primary_key=True)
-    dataset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    revision_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
-
-
-class TemporalResamplePublication(Base):
-    """Private semantic ledger paired atomically with one managed-local output receipt."""
-    __tablename__ = "temporal_resample_publications"
-    idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
-    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), nullable=False)
-    write_intent_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    parent_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    parent_revision_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    child_revision_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    spec_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence_doc: Mapped[str] = mapped_column(Text, nullable=False)
-    candidate_digest: Mapped[str] = mapped_column(String(64), nullable=False)
-    output_member_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    output_revision_id: Mapped[str] = mapped_column(
-        String(32), ForeignKey("managed_local_file_revisions.revision_id"), nullable=False,
-        unique=True)
-    created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now)
-    __table_args__ = (
-        CheckConstraint("length(candidate_digest) = 64", name="ck_temporal_resample_candidate_sha"),
-        UniqueConstraint(
-            "owner_id", "parent_dataset_id", "child_revision_id",
-            name="uq_temporal_resample_owner_child"),
     )
 
 
@@ -5636,7 +5563,7 @@ _CHECKPOINT_PARENT_KINDS = frozenset({
 })
 # #423: bounded_fanout_write is Jobs-visible via sanitized parent-only projection. The hidden
 # distribution-report lifecycle has no Jobs projection until its own product surface exists.
-_JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report", "temporal_resample_write"})
+_JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write", "distribution_report",
@@ -5965,33 +5892,6 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
     """Load one Task's immutable definition from its canonical manifest or legacy frozen columns."""
     if task.task_kind == "distribution_report":
         return {}
-    if task.task_kind == "temporal_resample_write":
-        envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
-        if envelope is None or task.write_intent is None:
-            raise RuntimeError("temporal resample durable admission is incomplete")
-        try:
-            from hub.models import TemporalResampleWriteRequestV1, WriteIntent
-            request = TemporalResampleWriteRequestV1.model_validate_json(envelope.request_doc)
-            request_doc = json.dumps(request.model_dump(by_alias=True, mode="json"), sort_keys=True,
-                                     separators=(",", ":"))
-            write = WriteIntent.model_validate_json(task.write_intent)
-            if (hashlib.sha256(request_doc.encode()).hexdigest() != envelope.request_sha256
-                    or envelope.request_sha256 != task.intent_sha256
-                    or write != request.write_intent
-                    or envelope.write_idempotency_key != write.idempotency_key
-                    or write.provenance.parents
-                    or write.provenance.publication.producer != "temporal-resample"
-                    or write.provenance.publication.producer_version != 1
-                    or write.provenance.publication.step_id != task.id
-                    or write.provenance.publication.provenance != "manual"):
-                raise ValueError
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("temporal resample durable admission is invalid") from exc
-        return {"temporal_resample_request": request.model_dump(by_alias=True, mode="json"),
-                "temporal_resample_candidate_sha256": envelope.candidate_sha256,
-                "temporal_resample_phase": envelope.phase, "graph_doc": None,
-                "input_manifest": [], "write_intent": write.model_dump(by_alias=True, mode="json"),
-                "target_node_id": task.target_node_id, "target_port_id": None}
     if task.task_kind == "merge_columns_write":
         envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
         if envelope is None or task.write_intent is None:
@@ -6377,98 +6277,6 @@ def submit_merge_columns_task(
         return _durable_task_doc(s, task), True
 
 
-def submit_temporal_resample_task(
-        *, uid: str, request: object, candidate_sha256: str, max_attempts: int = 3) -> tuple[dict, bool]:
-    from hub.models import LineagePublication, TemporalResampleWriteRequestV1, WriteProvenance
-
-    frozen = TemporalResampleWriteRequestV1.model_validate(request)
-    if not re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256)):
-        raise ValueError("temporal candidate identity is invalid")
-    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 3:
-        raise ValueError("temporal resample task max attempts is invalid")
-    uid, submission = str(uid), str(frozen.submission_id).lower()
-    # submissionId is an owner-scoped endpoint key.  Reusing it for a different
-    # compound admission must conflict instead of silently creating another
-    # task, even though SQLite UNIQUE constraints treat NULL canvas ids loosely.
-    task_id = "trs_" + hashlib.sha256(
-        f"temporal-resample-write-v1\0{uid}\0{submission}".encode()).hexdigest()[:48]
-    server_provenance = WriteProvenance(
-        publication=LineagePublication(
-            idempotency_key=frozen.write_intent.idempotency_key, provenance="manual",
-            producer="temporal-resample", producer_version=1, step_id=task_id),
-        parents=[],
-    )
-    frozen = frozen.model_copy(update={
-        "write_intent": frozen.write_intent.model_copy(update={"provenance": server_provenance}),
-    })
-    request_doc = json.dumps(frozen.model_dump(by_alias=True, mode="json"), sort_keys=True,
-                             separators=(",", ":"))
-    request_sha = hashlib.sha256(request_doc.encode()).hexdigest()
-    write_doc = json.dumps(frozen.write_intent.model_dump(by_alias=True, mode="json"), sort_keys=True,
-                           separators=(",", ":"))
-    try:
-        with session() as s:
-            owner = s.get(User, uid, with_for_update=True)
-            if owner is None:
-                raise ValueError("temporal resample task owner is unavailable")
-            if s.get_bind().dialect.name == "sqlite":
-                # SQLite ignores FOR UPDATE.  A no-op write to the existing owner row
-                # serializes the two owner-scoped uniqueness checks below.
-                s.execute(update(User).where(User.id == uid).values(name=User.name))
-            now = _durable_task_db_now(s)
-            task = s.get(DurableTask, task_id, with_for_update=True)
-            envelope = s.get(TemporalResampleTaskEnvelope, task_id, with_for_update=True)
-            if task is not None or envelope is not None:
-                if (task is None or envelope is None or task.task_kind != "temporal_resample_write"
-                        or task.owner_id != uid or task.canvas_id is not None
-                        or task.submission_id != submission or task.intent_sha256 != request_sha
-                        or task.write_intent != write_doc or envelope.request_doc != request_doc
-                        or envelope.request_sha256 != request_sha
-                        or envelope.candidate_sha256 != candidate_sha256):
-                    raise DurableTaskSubmissionConflict(
-                        "temporal resample submission does not match its frozen admission")
-                return _durable_task_doc(s, task), False
-            key_owner = s.scalar(select(TemporalResampleTaskEnvelope).where(
-                TemporalResampleTaskEnvelope.write_idempotency_key
-                == frozen.write_intent.idempotency_key
-            ).with_for_update())
-            if key_owner is not None:
-                raise DurableTaskSubmissionConflict(
-                    "temporal resample write key is bound to another task")
-            task = DurableTask(
-                id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
-                submission_id=submission, intent_sha256=request_sha,
-                target_node_id="temporal-resample", task_kind="temporal_resample_write",
-                backend_kind="local", graph_doc=None, input_manifest=None, write_intent=write_doc,
-                status="queued", status_doc=json.dumps(_task_status_doc(task_id, "temporal-resample")),
-                max_attempts=max_attempts, created_at=now, updated_at=now)
-            s.add(task)
-            s.flush()
-            s.add_all((
-                DurableTaskAttempt(id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
-                                   execution_manifest_sha256=None, status="queued", created_at=now),
-                TemporalResampleTaskEnvelope(
-                    task_id=task_id, request_doc=request_doc, request_sha256=request_sha,
-                    candidate_sha256=candidate_sha256,
-                    write_idempotency_key=frozen.write_intent.idempotency_key,
-                    phase="admitted", created_at=now, updated_at=now),
-            ))
-            s.flush()
-            return _durable_task_doc(s, task), True
-    except IntegrityError:
-        # Different owners do not share an owner-row lock, while the managed write
-        # key is intentionally global.  Convert that exact winning-key race after
-        # rollback; unrelated integrity failures remain visible as implementation bugs.
-        with session() as s:
-            key_owner = s.scalar(select(TemporalResampleTaskEnvelope).where(
-                TemporalResampleTaskEnvelope.write_idempotency_key
-                == frozen.write_intent.idempotency_key))
-        if key_owner is not None:
-            raise DurableTaskSubmissionConflict(
-                "temporal resample write key is bound to another task") from None
-        raise
-
-
 def submit_linear_checkpoint_task(
         *, uid: str, canvas_id: str, submission_id: str,
         final_target_node_id: str, checkpoint_id: str, checkpoint_node_id: str,
@@ -6737,13 +6545,6 @@ def _durable_task_doc(
             "poll_count": wait.poll_count,
             "diagnostic_code": wait.diagnostic_code,
         }
-    temporal = s.get(TemporalResampleTaskEnvelope, task.id)
-    if temporal is not None:
-        try:
-            doc["temporal_resample_result"] = (
-                json.loads(temporal.result_doc) if temporal.result_doc is not None else None)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("temporal resample result is corrupt") from exc
     return doc
 
 
@@ -6780,12 +6581,7 @@ def _lock_durable_task_for_write(s, task_id: str) -> DurableTask | None:
             locked = s.execute(update(DatasetView).where(
                 DatasetView.id == dataset_view_id).values(created_at=DatasetView.created_at))
         else:
-            # A non-Canvas durable leaf still needs one SQLite writer fence.  The immutable owner
-            # row is its stable subject; PostgreSQL takes the Task row lock below.
-            owner_id = s.scalar(select(DurableTask.owner_id).where(DurableTask.id == task_id))
-            if owner_id is None:
-                return None
-            locked = s.execute(update(User).where(User.id == owner_id).values(name=User.name))
+            return None
         if locked.rowcount != 1:
             return None
     return s.get(DurableTask, task_id, with_for_update=True, populate_existing=True)
@@ -6818,14 +6614,9 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
                 s, intent.idempotency_key, canonical,
                 MergeColumnsPublicationContext(
                     merge_doc=envelope.merge_doc, merge_sha256=envelope.merge_sha256), lock=True)
-        elif task.task_kind == "temporal_resample_write":
-            envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
-            if envelope is None or envelope.result_doc is None:
-                return False
-            prior = json.loads(envelope.result_doc).get("receipt")
         else:
             prior = _managed_local_write_receipt_in_session(s, intent.idempotency_key, canonical)
-        if prior is None and task.task_kind not in {"merge_columns_write", "temporal_resample_write"}:
+        if prior is None and task.task_kind != "merge_columns_write":
             prior = _managed_local_lance_write_receipt_in_session(
                 s, intent.idempotency_key, canonical)
     except Exception:
@@ -6866,12 +6657,6 @@ def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.dateti
             raise RuntimeError("merge columns envelope has no terminal task state")
         envelope.phase = task.status
         envelope.updated_at = now
-    elif task.task_kind == "temporal_resample_write":
-        envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
-        if envelope is None:
-            raise RuntimeError("temporal resample task envelope is unavailable")
-        envelope.phase = task.status
-        envelope.updated_at = now
 
 
 def _claim_durable_task_kind(
@@ -6901,10 +6686,7 @@ def _claim_durable_task_kind(
                 if _finish_task_with_landed_write_receipt(s, task, attempt, now):
                     return None
                 task.status = "failed"
-                task.error = (
-                    "temporal_attempts_exhausted"
-                    if task.task_kind == "temporal_resample_write"
-                    else "durable task exhausted recovery attempts")
+                task.error = "durable task exhausted recovery attempts"
                 task.completed_at = now
                 failed = _task_status_doc(task.id, task.target_node_id, "failed")
                 failed["error"] = task.error
@@ -6964,10 +6746,6 @@ def claim_bounded_fanout_write_task(task_id: str, owner_token: str) -> dict | No
 def claim_merge_columns_task(task_id: str, owner_token: str) -> dict | None:
     """Claim the one exact durable SparseOutput merge Task."""
     return _claim_durable_task_kind(task_id, owner_token, "merge_columns_write")
-
-
-def claim_temporal_resample_task(task_id: str, owner_token: str) -> dict | None:
-    return _claim_durable_task_kind(task_id, owner_token, "temporal_resample_write")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -7061,47 +6839,6 @@ def update_merge_columns_task_phase(
         task.updated_at = envelope.updated_at = now
         envelope.phase = phase
         return True
-
-
-def update_temporal_resample_task_phase(
-        task_id: str, attempt_id: str, owner_token: str, *, phase: str, status_doc: dict) -> bool:
-    from hub.models import RunStatus
-    if phase not in {"recomputing", "publishing"}:
-        raise ValueError("temporal resample task phase is invalid")
-    status = RunStatus.model_validate(status_doc)
-    if status.status != "running" or status.run_id != str(task_id):
-        raise ValueError("temporal resample task phase requires a running status")
-    with session() as s:
-        task = _lock_durable_task_for_write(s, str(task_id))
-        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
-        envelope = s.get(TemporalResampleTaskEnvelope, str(task_id), with_for_update=True)
-        now = _durable_task_db_now(s)
-        lease = attempt.lease_until if attempt is not None else None
-        if lease is not None and lease.tzinfo is None:
-            lease = lease.replace(tzinfo=datetime.timezone.utc)
-        if (task is None or attempt is None or envelope is None or task.status in _TERMINAL_RUN
-                or task.task_kind != "temporal_resample_write" or attempt.status != "running"
-                or attempt.owner_token != str(owner_token) or lease is None or lease <= now):
-            return False
-        task.status_doc = json.dumps(status.model_dump(), default=str)
-        task.progress = attempt.progress = status.progress
-        task.updated_at = envelope.updated_at = now
-        envelope.phase = phase
-        return True
-
-
-def temporal_resample_task_result(task_id: str) -> dict | None:
-    with session() as s:
-        envelope = s.get(TemporalResampleTaskEnvelope, str(task_id))
-        if envelope is None or envelope.result_doc is None:
-            return None
-        try:
-            result = json.loads(envelope.result_doc)
-            if set(result) != {"receipt", "evidence", "child"}:
-                raise ValueError
-            return result
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("temporal resample result is corrupt") from exc
 
 
 def finish_durable_task_attempt(
@@ -7641,10 +7378,6 @@ def _retry_durable_task_in_session(
         raise ValueError("only a failed or cancelled durable task can be retried")
     if task.task_kind == "merge_columns_write" and task.error == "stale_expected_head":
         raise ValueError("stale merge columns head requires a new submission")
-    if task.task_kind == "temporal_resample_write" and task.status == "failed":
-        from hub.temporal_resample_diagnostics import temporal_failure_retryable
-        if not temporal_failure_retryable(task.error):
-            raise ValueError("temporal resample failure requires a new submission")
     last = s.scalar(select(DurableTaskAttempt).where(
         DurableTaskAttempt.task_id == task.id,
     ).order_by(DurableTaskAttempt.attempt_number.desc()).limit(1).with_for_update())
@@ -7700,12 +7433,6 @@ def _retry_durable_task_in_session(
             raise RuntimeError("merge columns retry evidence is unavailable")
         envelope.phase = (
             "candidate_committed" if checkpoint.phase == "committed" else "validating")
-        envelope.updated_at = now
-    elif task.task_kind == "temporal_resample_write":
-        envelope = s.get(TemporalResampleTaskEnvelope, task.id, with_for_update=True)
-        if envelope is None:
-            raise RuntimeError("temporal resample retry evidence is unavailable")
-        envelope.phase = "admitted"
         envelope.updated_at = now
     s.flush()
     return _durable_task_doc(s, task)
@@ -7806,27 +7533,6 @@ def recoverable_merge_columns_task_ids(limit: int = 100) -> list[str]:
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
-                DurableTaskAttempt.lease_until <= now),
-        ).order_by(DurableTask.created_at).limit(limit)).all()
-        return [str(row) for row in rows]
-
-
-def recoverable_temporal_resample_task_ids(limit: int = 100) -> list[str]:
-    with session() as s:
-        now = _durable_task_db_now(s)
-        latest_attempt = select(
-            DurableTaskAttempt.task_id,
-            func.max(DurableTaskAttempt.attempt_number).label("number"),
-        ).group_by(DurableTaskAttempt.task_id).subquery()
-        rows = s.scalars(select(DurableTask.id).join(
-            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
-        ).join(DurableTaskAttempt, and_(
-            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
-            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
-        )).where(
-            DurableTask.task_kind == "temporal_resample_write",
-            DurableTask.status.in_(("queued", "running")),
-            or_(DurableTaskAttempt.status == "queued", DurableTaskAttempt.lease_until.is_(None),
                 DurableTaskAttempt.lease_until <= now),
         ).order_by(DurableTask.created_at).limit(limit)).all()
         return [str(row) for row in rows]
@@ -16315,433 +16021,6 @@ class MergeColumnsPublicationContext:
     owner_token: str | None = None
 
 
-@dataclass(frozen=True)
-class TemporalResamplePublicationContext:
-    """Private companion carrying the already-frozen temporal candidate into publication."""
-
-    owner_id: str
-    parent_manifest: object
-    candidate: object
-    output_member_id: str
-    output_revision_id: str
-    task_id: str | None = None
-    attempt_id: str | None = None
-    owner_token: str | None = None
-
-
-def _canonical_temporal_publication_context(
-        value: TemporalResamplePublicationContext | None) -> TemporalResamplePublicationContext | None:
-    if value is None:
-        return None
-    if not isinstance(value, TemporalResamplePublicationContext):
-        raise ValueError("temporal publication context is invalid")
-    if (not isinstance(value.owner_id, str) or not value.owner_id
-            or not isinstance(value.output_member_id, str) or not value.output_member_id
-            or not isinstance(value.output_revision_id, str)
-            or len(value.output_revision_id) != 32):
-        raise ValueError("temporal publication context is invalid")
-    try:
-        int(value.output_revision_id, 16)
-        from hub.temporal_resample import build_resample_candidate
-        rebuilt = build_resample_candidate(
-            value.parent_manifest, value.candidate.spec,
-            value.candidate.source_points, value.candidate.target_points)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("temporal publication context is invalid") from exc
-    if rebuilt != value.candidate:
-        raise ValueError("temporal publication candidate is not canonical")
-    authority = (value.task_id, value.attempt_id, value.owner_token)
-    if any(item is not None for item in authority) and not all(
-            isinstance(item, str) and item for item in authority):
-        raise ValueError("temporal publication task authority is invalid")
-    return value
-
-
-def _temporal_expected_output_schema_for(parent_manifest: object, spec: object) -> list[tuple[str, str]]:
-    """Canonicalize the pure temporal schema through the managed-write type vocabulary."""
-    import pyarrow as pa
-
-    from hub import db
-    from hub.plugins.adapters import relation_columns
-    from hub.temporal_resample import _output_schema
-
-    fields = _output_schema(parent_manifest, spec)
-    schema = pa.schema([
-        pa.field(str(field["name"]), pa.type_for_alias(str(field["type"])),
-                 nullable=bool(field["nullable"]))
-        for field in fields
-    ])
-    with db.base_guard():
-        columns = relation_columns(db.conn().from_arrow(pa.Table.from_batches([], schema=schema)))
-    return [(column.name, column.type) for column in columns]
-
-
-def _temporal_expected_output_schema(context: TemporalResamplePublicationContext) -> list[tuple[str, str]]:
-    return _temporal_expected_output_schema_for(context.parent_manifest, context.candidate.spec)
-
-
-def _validate_temporal_candidate_output(
-        context: TemporalResamplePublicationContext, intent: object, payload: dict) -> None:
-    expected = _temporal_expected_output_schema(context)
-    declared = [(column.name, column.type) for column in intent.expected_schema]
-    rows = payload.get("rowCount")
-    if declared != expected:
-        raise ValueError("temporal output schema does not match its frozen candidate")
-    if isinstance(rows, bool) or not isinstance(rows, int) or rows != len(context.candidate.rows):
-        raise ValueError("temporal output row count does not match its frozen candidate")
-
-
-def _temporal_publication_documents(context: TemporalResamplePublicationContext) -> tuple[str, str, str]:
-    """Return canonical persisted meaning; output UUID is deliberately excluded."""
-    spec_doc = json.dumps(context.candidate.spec.identity_document(), sort_keys=True,
-                          separators=(",", ":"))
-    evidence_doc = json.dumps(context.candidate.evidence, sort_keys=True,
-                              separators=(",", ":"))
-    parent_doc = json.dumps(_temporal_manifest_document(context.parent_manifest), sort_keys=True,
-                            separators=(",", ":"))
-    return spec_doc, evidence_doc, parent_doc
-
-
-def _temporal_manifest_document(manifest: object) -> dict:
-    """Use the pure contract's canonical projection without making it a public persistence API."""
-    from hub.temporal_resample import _manifest_document
-    return _manifest_document(manifest)
-
-
-def _temporal_resample_replay_in_session(
-        s, idempotency_key: str, intent_doc: str,
-        context: TemporalResamplePublicationContext, *, lock: bool = False) -> dict | None:
-    if context.task_id is not None:
-        envelope = s.get(TemporalResampleTaskEnvelope, context.task_id, with_for_update=lock)
-        if envelope is None or envelope.write_idempotency_key != idempotency_key:
-            raise ManagedLocalWriteConflict("temporal publication key is not owned by this task")
-    receipt = _managed_local_write_receipt_in_session(s, idempotency_key, intent_doc, lock=lock)
-    query = select(TemporalResamplePublication).where(
-        TemporalResamplePublication.idempotency_key == idempotency_key).limit(1)
-    if lock:
-        query = query.with_for_update()
-    row = s.scalars(query).first()
-    if receipt is None:
-        if row is not None:
-            raise RuntimeError("temporal publication lost its exact write receipt")
-        return None
-    if row is None:
-        raise ManagedLocalWriteConflict(
-            "managed local write key is already owned by a non-temporal publication")
-    spec_doc, evidence_doc, parent_doc = _temporal_publication_documents(context)
-    parent = context.parent_manifest.ref
-    if (row.owner_id != context.owner_id or row.write_intent_doc != intent_doc
-            or row.parent_dataset_id != parent.dataset_id
-            or row.parent_revision_id != parent.revision_id
-            or row.spec_doc != spec_doc or row.evidence_doc != evidence_doc
-            or row.candidate_digest != context.candidate.digest
-            or row.output_member_id != context.output_member_id
-            or row.output_revision_id != receipt["revisionId"]):
-        raise ManagedLocalWriteConflict("temporal idempotency key changed its immutable meaning")
-    child = s.get(CompoundDatasetRevision, {
-        "owner_id": row.owner_id, "dataset_id": row.parent_dataset_id,
-        "revision_id": row.child_revision_id}, with_for_update=lock)
-    parent_row = s.get(CompoundDatasetRevision, {
-        "owner_id": row.owner_id, "dataset_id": row.parent_dataset_id,
-        "revision_id": row.parent_revision_id}, with_for_update=lock)
-    head = s.get(CompoundDatasetHead, {
-        "owner_id": row.owner_id, "dataset_id": row.parent_dataset_id}, with_for_update=lock)
-    if (child is None or parent_row is None or parent_row.manifest_doc != parent_doc
-            or head is None or not _compound_head_descends_from(
-                s, row.owner_id, row.parent_dataset_id, head.revision_id,
-                child.revision_id, lock=lock)):
-        raise RuntimeError("temporal publication lost its child revision or head")
-    child_doc = _validate_temporal_child_replay(s, row, child, receipt, context=context)
-    return {"receipt": receipt, "evidence": json.loads(row.evidence_doc), "child": {
-        "datasetId": child.dataset_id, "revisionId": child.revision_id,
-        "manifest": child_doc}}
-
-
-def _open_stored_compound_revision(row: CompoundDatasetRevision):
-    from hub.compound_datasets import open_compound_manifest
-
-    try:
-        manifest = open_compound_manifest(row.manifest_doc.encode("utf-8"))
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise RuntimeError("stored compound revision is invalid") from exc
-    canonical = json.dumps(_temporal_manifest_document(manifest), sort_keys=True,
-                           separators=(",", ":"))
-    if (canonical != row.manifest_doc or manifest.ref.dataset_id != row.dataset_id
-            or manifest.ref.revision_id != row.revision_id):
-        raise RuntimeError("stored compound revision identity is invalid")
-    return manifest
-
-
-def _compound_head_descends_from(
-        s, owner_id: str, dataset_id: str, head_revision_id: str,
-        ancestor_revision_id: str, *, lock: bool) -> bool:
-    current, seen = head_revision_id, set()
-    for _depth in range(128):
-        if current == ancestor_revision_id:
-            return True
-        if current in seen:
-            return False
-        seen.add(current)
-        row = s.get(CompoundDatasetRevision, {
-            "owner_id": owner_id, "dataset_id": dataset_id,
-            "revision_id": current}, with_for_update=lock)
-        if row is None:
-            return False
-        _open_stored_compound_revision(row)
-        publication_query = select(TemporalResamplePublication).where(
-            TemporalResamplePublication.owner_id == owner_id,
-            TemporalResamplePublication.parent_dataset_id == dataset_id,
-            TemporalResamplePublication.child_revision_id == current,
-        ).limit(2)
-        if lock:
-            publication_query = publication_query.with_for_update()
-        publications = list(s.scalars(publication_query))
-        if len(publications) != 1:
-            return False
-        publication = publications[0]
-        receipt = _managed_local_write_receipt_in_session(
-            s, publication.idempotency_key, publication.write_intent_doc, lock=lock)
-        if receipt is None or publication.parent_revision_id != row.parent_revision_id:
-            return False
-        _validate_temporal_child_replay(s, publication, row, receipt)
-        if row.parent_revision_id is None:
-            return False
-        current = row.parent_revision_id
-    return False
-
-
-def _validate_temporal_child_replay(
-        s, row: TemporalResamplePublication, child: CompoundDatasetRevision,
-        receipt: dict, *, context: TemporalResamplePublicationContext | None = None) -> dict:
-    from hub.temporal_resample import (
-        ManagedOutputRevision, _digest, compose_child_manifest,
-    )
-
-    manifest = _open_stored_compound_revision(child)
-    if context is not None:
-        expected = compose_child_manifest(context.parent_manifest, context.candidate,
-            ManagedOutputRevision(member_id=row.output_member_id,
-                                  dataset_id=receipt["datasetId"],
-                                  revision_id=receipt["revisionId"]))
-        expected_doc = json.dumps(expected, sort_keys=True, separators=(",", ":"))
-        if (child.parent_revision_id != context.parent_manifest.ref.revision_id
-                or child.revision_id != expected["revisionId"]
-                or child.manifest_doc != expected_doc):
-            raise RuntimeError("temporal child revision changed its canonical parent or output")
-        return expected
-    try:
-        spec = json.loads(row.spec_doc)
-        evidence = json.loads(row.evidence_doc)
-        output_stream_id = spec["outputStreamId"]
-        episode_id = spec["episodeId"]
-        computation = spec["computationVersion"]
-        member = next(item for item in manifest.members if item.id == row.output_member_id)
-        stream = next(item for item in manifest.streams if item.id == output_stream_id)
-        binding = next(item for item in manifest.bindings
-                       if item.episode_id == episode_id and item.stream_id == output_stream_id)
-    except (KeyError, StopIteration, TypeError, ValueError) as exc:
-        raise RuntimeError("temporal child revision lost its declared output") from exc
-    if (json.dumps(spec, sort_keys=True, separators=(",", ":")) != row.spec_doc
-            or json.dumps(evidence, sort_keys=True, separators=(",", ":")) != row.evidence_doc
-            or evidence.get("spec") != spec
-            or spec.get("compoundDatasetId") != row.parent_dataset_id
-            or spec.get("compoundRevisionId") != row.parent_revision_id
-            or row.output_revision_id != receipt["revisionId"]):
-        raise RuntimeError("temporal descendant spec, evidence, and receipt disagree")
-    parent_row = s.get(CompoundDatasetRevision, {
-        "owner_id": row.owner_id, "dataset_id": row.parent_dataset_id,
-        "revision_id": row.parent_revision_id})
-    if parent_row is None:
-        raise RuntimeError("temporal descendant lost its exact parent")
-    parent = _open_stored_compound_revision(parent_row)
-    inherited = _temporal_manifest_document(manifest)
-    inherited_members = [item for item in inherited["members"]
-                         if item["id"] != row.output_member_id]
-    inherited_streams = [item for item in inherited["streams"]
-                         if item["id"] != output_stream_id]
-    inherited_bindings = [item for item in inherited["bindings"]
-                          if item["streamId"] != output_stream_id]
-    if (len(inherited["members"]) - len(inherited_members) != 1
-            or len(inherited["streams"]) - len(inherited_streams) != 1
-            or len(inherited["bindings"]) - len(inherited_bindings) != len(parent.episodes)):
-        raise RuntimeError("temporal descendant output shape is inconsistent")
-    inherited.update(
-        revisionId=parent.ref.revision_id, members=inherited_members,
-        streams=inherited_streams, bindings=inherited_bindings)
-    if inherited != json.loads(parent_row.manifest_doc):
-        raise RuntimeError("temporal descendant changed inherited parent facts")
-    evidence_sha = _digest(evidence)
-    if (child.parent_revision_id != row.parent_revision_id
-            or member.dataset_id != receipt["datasetId"]
-            or member.revision_id != receipt["revisionId"]
-            or binding.state != "present" or binding.member_id != row.output_member_id
-            or stream.transform_chain != (
-                computation, f"evidence-sha256:{evidence_sha}",
-                f"candidate-sha256:{row.candidate_digest}")):
-        raise RuntimeError("temporal child revision disagrees with its publication evidence")
-    return json.loads(child.manifest_doc)
-
-
-def _temporal_write_replay_in_session(
-        s, idempotency_key: str, intent_doc: str,
-        context: TemporalResamplePublicationContext, *, lock: bool = False) -> dict | None:
-    replay = _temporal_resample_replay_in_session(
-        s, idempotency_key, intent_doc, context, lock=lock)
-    return None if replay is None else replay["receipt"]
-
-
-def _lock_temporal_parent_in_session(
-        s, context: TemporalResamplePublicationContext) -> None:
-    """Lock and validate expected parent before catalog or output mutation begins."""
-    if context.task_id is not None:
-        task = _lock_durable_task_for_write(s, context.task_id)
-        attempt = s.get(DurableTaskAttempt, context.attempt_id, with_for_update=True)
-        envelope = s.get(TemporalResampleTaskEnvelope, context.task_id, with_for_update=True)
-        now = _durable_task_db_now(s)
-        lease = attempt.lease_until if attempt is not None else None
-        if lease is not None and lease.tzinfo is None:
-            lease = lease.replace(tzinfo=datetime.timezone.utc)
-        if (task is None or attempt is None or envelope is None or task.owner_id != context.owner_id
-                or task.task_kind != "temporal_resample_write" or task.status != "running"
-                or task.cancel_requested or attempt.status != "running"
-                or attempt.owner_token != context.owner_token or lease is None or lease <= now
-                or envelope.phase != "publishing"):
-            raise ManagedLocalWriteConflict("temporal task publication lease is stale or cancelled")
-    parent = context.parent_manifest.ref
-    row = s.get(CompoundDatasetRevision, {
-        "owner_id": context.owner_id, "dataset_id": parent.dataset_id,
-        "revision_id": parent.revision_id}, with_for_update=True)
-    head = s.get(CompoundDatasetHead, {
-        "owner_id": context.owner_id, "dataset_id": parent.dataset_id}, with_for_update=True)
-    _spec_doc, _evidence_doc, parent_doc = _temporal_publication_documents(context)
-    if (row is None or head is None or head.revision_id != parent.revision_id
-            or row.manifest_doc != parent_doc):
-        raise ManagedLocalWriteConflict("temporal expected compound parent is stale or unavailable")
-
-
-def _commit_temporal_publication_in_session(
-        s, *, context: TemporalResamplePublicationContext, intent_doc: str,
-        receipt: dict, revision: ManagedLocalFileRevision) -> None:
-    """Persist child semantic truth while the managed-local catalog transaction is still open."""
-    from hub.temporal_resample import ManagedOutputRevision, compose_child_manifest
-
-    receipt_schema = [(column.get("name"), column.get("type"))
-                      for column in receipt.get("schema") or []]
-    if (receipt_schema != _temporal_expected_output_schema(context)
-            or receipt.get("rows") != len(context.candidate.rows)):
-        raise RuntimeError("temporal write receipt does not match its frozen candidate")
-    parent = context.parent_manifest.ref
-    output = ManagedOutputRevision(
-        member_id=context.output_member_id, dataset_id=receipt["datasetId"],
-        revision_id=revision.revision_id)
-    child_doc = compose_child_manifest(context.parent_manifest, context.candidate, output)
-    if revision.revision_id != context.output_revision_id:
-        raise RuntimeError("temporal output revision did not honor its reserved identity")
-    if child_doc.get("revisionId") is None:
-        raise RuntimeError("temporal child manifest is invalid")
-    spec_doc, evidence_doc, _parent_doc = _temporal_publication_documents(context)
-    s.add(CompoundDatasetRevision(
-        owner_id=context.owner_id, dataset_id=parent.dataset_id,
-        revision_id=str(child_doc["revisionId"]),
-        manifest_doc=json.dumps(child_doc, sort_keys=True, separators=(",", ":")),
-        parent_revision_id=parent.revision_id,
-    ))
-    head = s.get(CompoundDatasetHead, {
-        "owner_id": context.owner_id, "dataset_id": parent.dataset_id}, with_for_update=True)
-    if head is None or head.revision_id != parent.revision_id:
-        raise ManagedLocalWriteConflict("temporal expected compound parent became stale")
-    head.revision_id = str(child_doc["revisionId"])
-    s.add(TemporalResamplePublication(
-        idempotency_key=receipt["publication"]["idempotencyKey"], owner_id=context.owner_id,
-        write_intent_doc=intent_doc, parent_dataset_id=parent.dataset_id,
-        parent_revision_id=parent.revision_id, child_revision_id=str(child_doc["revisionId"]),
-        spec_doc=spec_doc, evidence_doc=evidence_doc,
-        candidate_digest=context.candidate.digest, output_member_id=context.output_member_id,
-        output_revision_id=revision.revision_id,
-    ))
-    if context.task_id is not None:
-        task = s.get(DurableTask, context.task_id, with_for_update=True)
-        attempt = s.get(DurableTaskAttempt, context.attempt_id, with_for_update=True)
-        envelope = s.get(TemporalResampleTaskEnvelope, context.task_id, with_for_update=True)
-        if task is None or attempt is None or envelope is None:
-            raise RuntimeError("temporal task publication authority disappeared")
-        result = {"receipt": receipt, "evidence": context.candidate.evidence,
-                  "child": {"datasetId": parent.dataset_id, "revisionId": child_doc["revisionId"]}}
-        envelope.result_doc = json.dumps(result, sort_keys=True, separators=(",", ":"))
-        envelope.phase = "done"
-        now = _durable_task_db_now(s)
-        from hub.models import RunOutput, RunStatus, WriteReceipt
-        typed = WriteReceipt.model_validate(receipt)
-        status = RunStatus(run_id=task.id, status="done", target_node_id="temporal-resample",
-                           progress=1.0, total_rows=typed.rows, outputs=[RunOutput(
-                               node_id="temporal-resample", port_id="out", wire="dataset",
-                               publication_kind="catalog", outcome="committed",
-                               uri=typed.publication.artifact_uri,
-                               table=typed.publication.logical_uri,
-                               version=typed.publication.catalog_version, rows=typed.rows,
-                               write_receipt=typed)]).model_dump()
-        receipt_doc = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
-        task.status = attempt.status = "done"
-        task.progress = attempt.progress = 1.0
-        task.error = attempt.error = None
-        task.status_doc = json.dumps(status, default=str)
-        task.output_receipt = attempt.output_receipt = receipt_doc
-        task.completed_at = attempt.completed_at = task.updated_at = envelope.updated_at = now
-
-
-def catalog_register_temporal_compound_parent(owner_id: str, manifest: object) -> None:
-    """Seed an exact existing compound revision for the private temporal publisher.
-
-    This is intentionally not a general compound-authoring surface: callers may register only the
-    immutable manifest that they already obtained from their read authority, and it may not replace
-    an existing revision or move a nonempty head.
-    """
-    if not isinstance(owner_id, str) or not owner_id:
-        raise ValueError("temporal compound owner is invalid")
-    try:
-        from hub.compound_datasets import open_compound_manifest
-        doc = json.dumps(_temporal_manifest_document(manifest), sort_keys=True,
-                         separators=(",", ":"))
-        validated = open_compound_manifest(doc.encode("utf-8"))
-        if validated != manifest:
-            raise ValueError("temporal compound parent is not canonical")
-        ref = validated.ref
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("temporal compound parent is invalid") from exc
-    with session() as s:
-        if s.get(User, owner_id) is None:
-            raise ValueError("temporal compound owner does not exist")
-        current = s.get(CompoundDatasetRevision, {
-            "owner_id": owner_id, "dataset_id": ref.dataset_id,
-            "revision_id": ref.revision_id}, with_for_update=True)
-        head = s.get(CompoundDatasetHead, {
-            "owner_id": owner_id, "dataset_id": ref.dataset_id}, with_for_update=True)
-        if current is not None:
-            if current.manifest_doc != doc:
-                raise RuntimeError("temporal compound revision identity collision")
-            if head is None or head.revision_id != ref.revision_id:
-                raise ManagedLocalWriteConflict("temporal compound parent is not current")
-            return
-        if head is not None:
-            raise ManagedLocalWriteConflict("temporal compound dataset already has a head")
-        s.add(CompoundDatasetRevision(
-            owner_id=owner_id, dataset_id=ref.dataset_id, revision_id=ref.revision_id,
-            manifest_doc=doc))
-        s.add(CompoundDatasetHead(
-            owner_id=owner_id, dataset_id=ref.dataset_id, revision_id=ref.revision_id))
-
-
-def catalog_temporal_resample_publication_receipt(
-        value: object, *, temporal_publication: TemporalResamplePublicationContext) -> dict | None:
-    """Recover the complete temporal tuple after a lost publication response."""
-    _intent, _payload, intent_doc = _canonical_managed_local_write_intent(value)
-    context = _canonical_temporal_publication_context(temporal_publication)
-    assert context is not None
-    with session() as s:
-        return _temporal_resample_replay_in_session(
-            s, _intent.idempotency_key, intent_doc, context)
-
-
 def _canonical_managed_local_write_intent(value: object) -> tuple[object, dict, str]:
     from hub.models import WriteIntent
 
@@ -16974,14 +16253,10 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
 
 def catalog_admit_managed_local_write(
         value: object, *,
-        merge_publication: MergeColumnsPublicationContext | None = None,
-        temporal_publication: TemporalResamplePublicationContext | None = None) -> dict | None:
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict | None:
     """Validate a frozen intent before artifact allocation, returning a prior durable receipt."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
     merge_context = _canonical_merge_publication_context(merge_publication)
-    temporal_context = _canonical_temporal_publication_context(temporal_publication)
-    if merge_context is not None and temporal_context is not None:
-        raise ValueError("managed local publication companions are mutually exclusive")
     if intent.mode not in ("create", "replace"):
         raise ValueError("managed local-file writes support create/replace only")
     if intent.partitions:
@@ -16989,9 +16264,7 @@ def catalog_admit_managed_local_write(
     with session() as s:
         prior = (_managed_local_merge_replay_in_session(
             s, intent.idempotency_key, canonical, merge_context)
-            if merge_context is not None else _temporal_write_replay_in_session(
-                s, intent.idempotency_key, canonical, temporal_context)
-            if temporal_context is not None else _managed_local_write_receipt_in_session(
+            if merge_context is not None else _managed_local_write_receipt_in_session(
                 s, intent.idempotency_key, canonical))
         if prior is not None:
             return prior
@@ -17008,20 +16281,14 @@ def catalog_admit_managed_local_write(
 
 def catalog_managed_local_write_receipt(
         value: object, *,
-        merge_publication: MergeColumnsPublicationContext | None = None,
-        temporal_publication: TemporalResamplePublicationContext | None = None) -> dict | None:
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict | None:
     """Recover an exact typed write receipt by idempotency key after response loss."""
     intent, _payload, canonical = _canonical_managed_local_write_intent(value)
     merge_context = _canonical_merge_publication_context(merge_publication)
-    temporal_context = _canonical_temporal_publication_context(temporal_publication)
-    if merge_context is not None and temporal_context is not None:
-        raise ValueError("managed local publication companions are mutually exclusive")
     with session() as s:
         prior = (_managed_local_merge_replay_in_session(
             s, intent.idempotency_key, canonical, merge_context)
-            if merge_context is not None else _temporal_write_replay_in_session(
-                s, intent.idempotency_key, canonical, temporal_context)
-            if temporal_context is not None else _managed_local_write_receipt_in_session(
+            if merge_context is not None else _managed_local_write_receipt_in_session(
                 s, intent.idempotency_key, canonical))
         if prior is not None:
             return prior
@@ -17129,8 +16396,7 @@ def catalog_publish_managed_local_file(
         logical_uri: str, artifact_uri: str, name: str, doc: dict, *,
         parents: list[str] | None = None, lineage: dict | None = None,
         write_intent: object | None = None, total_bytes: int | None = None,
-        merge_publication: MergeColumnsPublicationContext | None = None,
-        temporal_publication: TemporalResamplePublicationContext | None = None) -> dict:
+        merge_publication: MergeColumnsPublicationContext | None = None) -> dict:
     """Atomically publish one already-validated local artifact as a new immutable revision.
 
     The catalog retains only the current physical projection; the revision ledger owns every physical
@@ -17149,13 +16415,8 @@ def catalog_publish_managed_local_file(
     canonical_lineage = _catalog_lineage_canonical(lineage, len(parent_tokens))
     typed_intent = intent_payload = intent_doc = None
     merge_context = _canonical_merge_publication_context(merge_publication)
-    temporal_context = _canonical_temporal_publication_context(temporal_publication)
-    if merge_context is not None and temporal_context is not None:
-        raise ValueError("managed local publication companions are mutually exclusive")
     if merge_context is not None and write_intent is None:
         raise ValueError("merge publication context requires a typed local write")
-    if temporal_context is not None and write_intent is None:
-        raise ValueError("temporal publication context requires a typed local write")
     if write_intent is not None:
         typed_intent, intent_payload, intent_doc = _canonical_managed_local_write_intent(write_intent)
         if typed_intent.mode not in ("create", "replace"):
@@ -17174,8 +16435,6 @@ def catalog_publish_managed_local_file(
         ]
         if expected_schema != actual_schema:
             raise ValueError("managed local write output schema does not match its intent")
-        if temporal_context is not None:
-            _validate_temporal_candidate_output(temporal_context, typed_intent, payload)
         if (canonical_lineage is None
                 or canonical_lineage["idempotency_key"] != typed_intent.idempotency_key
                 or parent_tokens != typed_intent.provenance.parents):
@@ -17191,16 +16450,6 @@ def catalog_publish_managed_local_file(
             raise ValueError("managed local write requires bounded non-negative bytes")
     execution_manifest_candidates: set[str | None] = set()
     with session() as s:
-        if temporal_context is not None:
-            # SQLite must become the writer before any replay/head reads. PostgreSQL keeps its
-            # row-level lock order because this helper is a no-op there.
-            _catalog_sqlite_write_fence(s)
-            # Replay precedes the expected-parent fence: a successful first attempt has advanced the
-            # head, so treating that advancement as a stale retry would destroy response-loss recovery.
-            prior_temporal = _temporal_write_replay_in_session(
-                s, typed_intent.idempotency_key, intent_doc, temporal_context)
-            if prior_temporal is not None:
-                return prior_temporal
         if merge_context is not None:
             # The durable owner lock comes before every catalog/lineage lock and remains held until
             # this transaction commits. A replacement claim therefore linearizes either wholly
@@ -17209,11 +16458,7 @@ def catalog_publish_managed_local_file(
         # Take the lineage reservation before the managed output projection. This matches the
         # composite-publication ordering used by the other catalog writers and keeps both effects
         # in this transaction: a lineage failure must roll back the new head and revision receipt.
-        if temporal_context is None:
-            _catalog_sqlite_write_fence(s)
-        if temporal_context is not None:
-            # Validate the expected parent only after replay and the SQLite writer fence.
-            _lock_temporal_parent_in_session(s, temporal_context)
+        _catalog_sqlite_write_fence(s)
         lineage_publication_key = None
         lineage_applied = False
         parent_snapshots: list[_CatalogLineageParentSnapshot] = []
@@ -17233,9 +16478,7 @@ def catalog_publish_managed_local_file(
             if typed_intent is not None:
                 typed_replay = (_managed_local_merge_replay_in_session(
                     s, typed_intent.idempotency_key, intent_doc, merge_context)
-                    if merge_context is not None else _temporal_write_replay_in_session(
-                        s, typed_intent.idempotency_key, intent_doc, temporal_context)
-                    if temporal_context is not None else _managed_local_write_receipt_in_session(
+                    if merge_context is not None else _managed_local_write_receipt_in_session(
                         s, typed_intent.idempotency_key, intent_doc))
                 if typed_replay is None or typed_replay["revisionId"] != receipt["revision_id"]:
                     raise RuntimeError("managed local publication has no exact typed receipt")
@@ -17262,9 +16505,7 @@ def catalog_publish_managed_local_file(
         if typed_intent is not None:
             prior_write = (_managed_local_merge_replay_in_session(
                 s, typed_intent.idempotency_key, intent_doc, merge_context, lock=True)
-                if merge_context is not None else _temporal_write_replay_in_session(
-                    s, typed_intent.idempotency_key, intent_doc, temporal_context, lock=True)
-                if temporal_context is not None else _managed_local_write_receipt_in_session(
+                if merge_context is not None else _managed_local_write_receipt_in_session(
                     s, typed_intent.idempotency_key, intent_doc, lock=True))
             if prior_write is not None:
                 _catalog_require_lineage_publication(
@@ -17301,9 +16542,7 @@ def catalog_publish_managed_local_file(
             if typed_intent is not None:
                 typed_replay = (_managed_local_merge_replay_in_session(
                     s, typed_intent.idempotency_key, intent_doc, merge_context, lock=True)
-                    if merge_context is not None else _temporal_write_replay_in_session(
-                        s, typed_intent.idempotency_key, intent_doc, temporal_context, lock=True)
-                    if temporal_context is not None else _managed_local_write_receipt_in_session(
+                    if merge_context is not None else _managed_local_write_receipt_in_session(
                         s, typed_intent.idempotency_key, intent_doc, lock=True))
                 if typed_replay is None or typed_replay["revisionId"] != receipt["revision_id"]:
                     raise RuntimeError("managed local publication has no exact typed receipt")
@@ -17349,8 +16588,7 @@ def catalog_publish_managed_local_file(
         )
         s.add(entry)
         _sync_children(s, artifact_uri, tags, cols)
-        revision_id = (temporal_context.output_revision_id
-                       if temporal_context is not None else uuid.uuid4().hex)
+        revision_id = uuid.uuid4().hex
         committed_at = _db_now(s)
         revision = ManagedLocalFileRevision(
             revision_id=revision_id, logical_id=logical.logical_id,
@@ -17425,12 +16663,6 @@ def catalog_publish_managed_local_file(
                 merge_sha256=merge_context.merge_sha256,
                 revision_id=revision.revision_id,
             ))
-        if temporal_context is not None:
-            if typed_intent is None or revision.write_receipt_doc is None:
-                raise RuntimeError("temporal publication has no exact typed receipt")
-            _commit_temporal_publication_in_session(
-                s, context=temporal_context, intent_doc=intent_doc,
-                receipt=receipt.model_dump(by_alias=True, mode="json"), revision=revision)
         if canonical_lineage is not None:
             destination_snapshot = _catalog_lineage_parent_snapshot(s, artifact_uri)
             target_snapshots = [destination_snapshot, *parent_snapshots]
@@ -18722,9 +17954,6 @@ def managed_local_file_revision_gc_batch(
         merge_reference = select(MergeColumnsPublication.revision_id).where(
             MergeColumnsPublication.revision_id == ManagedLocalFileRevision.revision_id,
         ).exists()
-        temporal_reference = select(TemporalResamplePublication.output_revision_id).where(
-            TemporalResamplePublication.output_revision_id == ManagedLocalFileRevision.revision_id,
-        ).exists()
         statement = (select(ManagedLocalFileRevision)
             .join(CatalogLogicalDataset,
                   CatalogLogicalDataset.logical_id == ManagedLocalFileRevision.logical_id)
@@ -18736,7 +17965,6 @@ def managed_local_file_revision_gc_batch(
                 ),
                 ~external_reference,
                 ~merge_reference,
-                ~temporal_reference,
             )
             .order_by(
                 ManagedLocalFileRevision.committed_at,
@@ -18754,11 +17982,6 @@ def managed_local_file_revision_gc_batch(
                 MergeColumnsPublication.revision_id == revision.revision_id,
             ).limit(1).with_for_update())
             if merge_ref is not None:
-                continue
-            temporal_ref = s.scalar(select(TemporalResamplePublication.output_revision_id).where(
-                TemporalResamplePublication.output_revision_id == revision.revision_id,
-            ).limit(1).with_for_update())
-            if temporal_ref is not None:
                 continue
             artifact = s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
             retention_ref = s.get(LocalResultReference, {
