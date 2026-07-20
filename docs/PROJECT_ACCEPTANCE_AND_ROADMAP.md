@@ -11,8 +11,8 @@ subsystems live in [Catalog](CATALOG.md), [Plugins](PLUGINS.md), [Ray](RAY.md), 
 [Supported deployments and trust model](SUPPORT.md).
 
 The delivered foundation and remaining product/architecture roadmap for exact dataset revisions,
-transactional writes, sparse enrichment, durable background work, a unified workspace, and
-heterogeneous temporal data is [Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
+transactional writes, sparse enrichment, durable background work, and a unified workspace is
+[Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
 
 ## Product scope
 
