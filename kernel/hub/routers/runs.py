@@ -576,9 +576,14 @@ def _bind_local_run_manifest(
 
 
 def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
-    """Whether this exact runner owns the issue-399 typed local publication contract."""
+    """Whether a managed-local create/replace admitted for this routed runner can be published.
+
+    Managed-local create/replace is owned by the certified durable-Task lifecycle regardless of the
+    selected execution backend, so this is a pure capability check: the default per-canvas kernel and
+    the in-process local writer both route publication through that one durable owner.
+    """
     supports = getattr(runner, "supports_managed_local_write_intents", None)
-    if runner is not deps.runner or not callable(supports):
+    if not callable(supports):
         return False
     try:
         return bool(supports())
@@ -800,6 +805,12 @@ def _write_admission_for_graph(
     head = metadb.catalog_managed_local_write_head(logical_uri)
     replacing = bool(
         head is not None and head.get("state") == "active" and head.get("revision_id"))
+    if not replacing and metadb.catalog_managed_local_write_unmanaged_conflict(
+            logical_uri, spec.name):
+        raise HTTPException(
+            409,
+            f"the destination name '{spec.name}' is already registered as an unmanaged output; "
+            "rename this Write or unregister the existing catalog entry, then retry")
     expected_head = (ExactDatasetRef(
         kind="exact",
         dataset_id=str(head["dataset_id"]),
@@ -2552,9 +2563,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise RunNeedsConfirm(est)
     if (managed_write and effective_write_intent is not None
             and effective_write_intent.mode in ("create", "replace")):
-        # This one consumer transfers ownership to a durable Task before any worker dispatch. Append,
-        # provider-neutral, placed, kernel, subprocess, and Ray paths deliberately retain their current
-        # lifecycle. The stable local submission id also remains the Write provenance identity.
+        # This one consumer transfers ownership to a durable Task before any worker dispatch —
+        # including the default per-canvas kernel, whose managed-local create/replace is now admitted
+        # and published by this same durable owner. Append, provider-neutral, placed, subprocess, and
+        # Ray paths retain their current lifecycle. The stable local submission id also remains the
+        # Write provenance identity.
         operational_canvas = auth_canvas or (str(getattr(graph, "id", "") or "") or None)
         if operational_canvas is None or not metadb.canvas_exists(operational_canvas):
             raise HTTPException(409, "durable managed-local writes require a saved canvas")

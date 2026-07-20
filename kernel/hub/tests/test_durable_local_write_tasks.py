@@ -940,3 +940,189 @@ deps.storage.close()
             server.kill()
             server.wait(timeout=5)
         server_log.close()
+
+
+# -- default per-canvas kernel backend (issue #632) ------------------------------------ #
+# The shipped default backend is the per-canvas kernel; the conftest pins DP_EXECUTION to
+# local-out-of-core, so these select the kernel explicitly to certify that managed-local
+# create/replace is admitted and published through the same certified durable-Task owner.
+
+
+def _use_kernel_backend(monkeypatch) -> None:
+    from hub.settings import settings
+    monkeypatch.setattr(settings, "execution", "kernel")
+
+
+def _await_durable_task(task_id: str, timeout: float = 20.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        observed = metadb.durable_task(task_id)
+        if observed is not None and observed["status"] in ("done", "failed", "cancelled"):
+            return observed
+        time.sleep(0.05)
+    raise AssertionError(f"durable task {task_id} did not finish")
+
+
+def _managed_revision_count(logical_uri: str) -> int:
+    logical_id = metadb._catalog_logical_id(str(logical_uri).rstrip("/"))
+    with metadb.session() as session:
+        return int(session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalFileRevision).where(
+            metadb.ManagedLocalFileRevision.logical_id == logical_id)) or 0)
+
+
+def test_kernel_default_admits_and_publishes_managed_create(tmp_path, monkeypatch):
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    submission = str(uuid.uuid4())
+
+    admission = _write_admission_for_graph(deps, graph, "write", uid, submission)
+    assert admission.managed is True and admission.intent is not None
+    assert admission.intent.mode == "create"
+
+    status, owner = runs.start_run(
+        deps, graph, "write", uid, confirmed=True, submission_id=submission)
+    assert owner is None
+    task = metadb.durable_task(status.run_id)
+    assert task is not None and task["task_kind"] == "managed_local_write"
+
+    observed = _await_durable_task(task["id"])
+    assert observed["status"] == "done", observed
+    receipt = observed["output_receipt"]
+    assert receipt["revisionId"] and receipt["parentHead"] is None
+    logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == receipt["revisionId"]
+    assert _managed_revision_count(logical_uri) == 1
+    jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
+    assert jobs["items"][0]["outputReceipt"]["revisionId"] == receipt["revisionId"]
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_kernel_default_managed_replace_chains_to_prior_head(tmp_path, monkeypatch):
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+
+    first, _ = runs.start_run(
+        deps, graph, "write", uid, confirmed=True, submission_id=str(uuid.uuid4()))
+    created = _await_durable_task(metadb.durable_task(first.run_id)["id"])
+    assert created["status"] == "done", created
+    logical_uri = metadb.durable_task(
+        first.run_id)["write_intent"]["destination"]["logicalUri"]
+    first_revision = created["output_receipt"]["revisionId"]
+
+    replace_admission = _write_admission_for_graph(
+        deps, graph, "write", uid, str(uuid.uuid4()))
+    assert replace_admission.intent is not None
+    assert replace_admission.intent.mode == "replace"
+
+    second, _ = runs.start_run(
+        deps, graph, "write", uid, confirmed=True, submission_id=str(uuid.uuid4()))
+    replaced = _await_durable_task(metadb.durable_task(second.run_id)["id"])
+    assert replaced["status"] == "done", replaced
+    assert replaced["output_receipt"]["parentHead"]["revisionId"] == first_revision
+    assert replaced["output_receipt"]["revisionId"] != first_revision
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == replaced["output_receipt"]["revisionId"]
+    assert _managed_revision_count(logical_uri) == 2
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+
+
+def test_kernel_default_occupied_unmanaged_name_returns_typed_error(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    node = next(n for n in graph.nodes if n.id == "write")
+    filename = node.data["config"]["filename"]
+    occupied_uri = deps.storage.output_uri(filename[: -len(".parquet")], ".parquet")
+    pq.write_table(pa.table({"value": [9]}), occupied_uri)
+    deps.catalog._add(
+        name=node.data["config"].get("name") or node.data["title"],
+        uri=occupied_uri, strict_probe=True)
+
+    with pytest.raises(HTTPException) as excinfo:
+        _write_admission_for_graph(deps, graph, "write", uid, str(uuid.uuid4()))
+    assert excinfo.value.status_code == 409
+    assert "unmanaged" in str(excinfo.value.detail)
+    assert "rename" in str(excinfo.value.detail)
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_kernel_default_replayed_submission_adopts_one_task_and_revision(tmp_path, monkeypatch):
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    submission = str(uuid.uuid4())
+    real_dispatch = durable_tasks.dispatch
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        durable_tasks, "dispatch", lambda task_id, _deps: dispatched.append(str(task_id)))
+
+    # A real client re-POSTs the same submission with a fresh graph payload after a lost response.
+    first, _ = runs.start_run(
+        deps, graph.model_copy(deep=True), "write", uid, confirmed=True,
+        submission_id=submission)
+    replay, _ = runs.start_run(
+        deps, graph.model_copy(deep=True), "write", uid, confirmed=True,
+        submission_id=submission)
+    assert replay.run_id == first.run_id
+    task = metadb.durable_task(first.run_id)
+    assert task is not None and len(task["attempts"]) == 1
+    assert dispatched == [first.run_id, first.run_id]
+
+    # Executing the adopted task exactly once yields a single revision + receipt.
+    real_dispatch(task["id"], deps)
+    observed = _await_durable_task(task["id"])
+    assert observed["status"] == "done", observed
+    logical_uri = task["write_intent"]["destination"]["logicalUri"]
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == observed["output_receipt"]["revisionId"]
+    assert _managed_revision_count(logical_uri) == 1
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
+
+
+def test_kernel_default_restart_after_commit_reconciles_one_revision(tmp_path, monkeypatch):
+    from hub.models import WriteIntent
+
+    _use_kernel_backend(monkeypatch)
+    deps, graph, _source, uid = _ordinary_task_context(tmp_path)
+    submission = str(uuid.uuid4())
+    real_dispatch = durable_tasks.dispatch
+    monkeypatch.setattr(durable_tasks, "dispatch", lambda task_id, _deps: None)
+
+    # The kernel default admits and creates a recoverable durable task before the crash.
+    status, _ = runs.start_run(
+        deps, graph.model_copy(deep=True), "write", uid, confirmed=True,
+        submission_id=submission)
+    task = metadb.durable_task(status.run_id)
+    assert task is not None and task["task_kind"] == "managed_local_write"
+    intent = WriteIntent.model_validate(task["write_intent"])
+    logical_uri = intent.destination.logical_uri
+
+    # A crashed attempt committed the revision from the task's frozen intent; response was lost.
+    receipt = write_managed_local_file(
+        storage=deps.storage, catalog=deps.catalog, intent=intent,
+        write_artifact=lambda uri: pq.write_table(pa.table({"value": [1, 2]}), uri))
+    assert _managed_revision_count(logical_uri) == 1
+
+    # Restart recovery re-dispatches the same task; it reconciles onto the committed revision.
+    real_dispatch(task["id"], deps)
+    observed = _await_durable_task(task["id"])
+    assert observed["status"] == "done", observed
+    assert observed["output_receipt"]["revisionId"] == receipt.revision_id
+    assert metadb.catalog_managed_local_write_head(
+        logical_uri)["revision_id"] == receipt.revision_id
+    assert _managed_revision_count(logical_uri) == 1
+
+    metadb.delete_canvas_cascade(str(graph.id))
+    deps.storage.close()
