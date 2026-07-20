@@ -17,54 +17,70 @@ permissions:
   contents: read
 
 jobs:
-  kernel-tests:
-    name: kernel (pytest — engine, plugins, agent)
+  kernel-shards:
+    # One isolated pytest process per shard, each on its own runner instead of three processes
+    # oversubscribing a single two-core runner (which both starved worker threads and left the
+    # remainder shard's ~11min single-process straggler bounding the whole check). Every shard keeps
+    # its own SQLite DB (conftest) and seeded-data dir. `kernel-tests` below aggregates them into the
+    # single required status check.
+    name: kernel pytest shard (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # #574: 9:12–9:37 measured suite duration; preserves cleanup and runner-variance headroom
+    timeout-minutes: 12  # each shard is a fraction of the suite; headroom over the ~6min long pole
+    strategy:
+      fail-fast: false  # one failing shard must not hide failures in the others
+      matrix:
+        shard: [kernel, lifecycle, remainder-0, remainder-1]
+    env:
+      # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path is
+      # missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
+      DP_DATA_DIR: ${{ runner.temp }}/dp-test-data-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path
-      # is missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
       - name: Placeholder web build (kernel doesn't serve the SPA in tests)
         run: mkdir -p web/dist
       - name: Install kernel (dev extra)
         run: cd kernel && uv sync --extra dev
       - name: Check committed OpenAPI contract
         run: cd kernel && uv run python -m hub.contracts.openapi --check
-      - name: Run tests (three isolated shards)
-        # The suite has no cross-file state contract. Separate pytest processes get independent SQLite
-        # databases from conftest.py; give each an independent seeded-data directory too. This avoids
-        # the serial suite's late-run SQLite/data-dir contention while retaining every test in this
-        # required check. Do not use pytest-xdist here: its file scheduling leaves the large kernel
-        # test module as a straggler.
+      - name: Run shard ${{ matrix.shard }}
+        # test_kernel.py is its own shard (a monolith can't be split further); ray_jobs +
+        # object_lifecycle share the lifecycle shard. The rest is split into two balanced halves by a
+        # stable round-robin over the sorted test files, matching pytest's `testpaths` collection so
+        # new files are auto-assigned and none are dropped.
         shell: bash
         run: |
           set -uo pipefail
           cd kernel
+          case "${{ matrix.shard }}" in
+            kernel)
+              files="hub/tests/test_kernel.py" ;;
+            lifecycle)
+              files="hub/tests/test_ray_jobs.py hub/tests/test_object_lifecycle.py" ;;
+            remainder-*)
+              k="${{ matrix.shard }}"; k="${k##remainder-}"
+              files=$(find hub/tests -name 'test_*.py' \
+                        ! -name test_kernel.py ! -name test_ray_jobs.py ! -name test_object_lifecycle.py \
+                        | sort | awk -v k="$k" 'NR % 2 == (k + 0)') ;;
+          esac
+          test -n "$files"  # a shard that selected nothing is a bug, not an empty pass
+          uv run pytest -q -o faulthandler_timeout=60 $files
 
-          run_shard() {
-            local name="$1"
-            shift
-            DP_DATA_DIR="$RUNNER_TEMP/dp-test-data-$name" \
-              uv run pytest -q -o faulthandler_timeout=60 "$@"
-          }
-
-          run_shard kernel hub/tests/test_kernel.py &
-          kernel_pid=$!
-          run_shard lifecycle hub/tests/test_ray_jobs.py hub/tests/test_object_lifecycle.py &
-          lifecycle_pid=$!
-          run_shard remainder \
-            --ignore=hub/tests/test_kernel.py \
-            --ignore=hub/tests/test_ray_jobs.py \
-            --ignore=hub/tests/test_object_lifecycle.py &
-          remainder_pid=$!
-
-          result=0
-          wait "$kernel_pid" || result=1
-          wait "$lifecycle_pid" || result=1
-          wait "$remainder_pid" || result=1
-          exit "$result"
+  kernel-tests:
+    # Aggregates the sharded pytest matrix into the one required status check named in branch
+    # protection, so splitting the suite across runners doesn't change the required check.
+    name: kernel (pytest — engine, plugins, agent)
+    runs-on: ubuntu-latest
+    needs: kernel-shards
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require every pytest shard to pass
+        run: |
+          if [ "${{ needs.kernel-shards.result }}" != "success" ]; then
+            echo "kernel pytest shards did not all pass: ${{ needs.kernel-shards.result }}"
+            exit 1
+          fi
 
   python-quality:
     # QA-01 / issue #111 — Ruff + basedpyright. No Ray, no browsers; a few minutes on ubuntu-latest.
@@ -87,7 +103,7 @@ jobs:
   # QA-01 / #112: declared Python support is 3.11–3.13 via requires-python + classifiers, but
   # kernel/.python-version pins 3.12. This cheap matrix proves each declared version can install
   # from the lockfile, import the package / CLI entry point, and pass the core-contract subset.
-  # The full suite stays on the pinned primary version in kernel-tests above — not in this matrix.
+  # The full suite stays on the pinned primary version in the kernel pytest shards above — not here.
   # Local: cd kernel && uv run pytest -q hub/tests/test_graph_validation.py hub/tests/test_sqlpolicy.py hub/tests/test_migrations.py
   kernel-python-matrix:
     name: kernel (Python ${{ matrix.python }} — install/import/core-contract)
@@ -217,7 +233,7 @@ jobs:
           hub/tests/test_bounded_fanout_plan.py
           hub/tests/test_bounded_fanout_write_tasks.py
       - name: Verify durable Ray Jobs lifecycle on PostgreSQL
-        # The PostgreSQL-gated Ray Jobs races skip on SQLite, so kernel-tests never runs them; select
+        # The PostgreSQL-gated Ray Jobs races skip on SQLite, so the kernel pytest shards never run them; select
         # them here by name so a regression cannot pass CI while every check stays green.
         run: >-
           cd kernel && uv run pytest -q -o faulthandler_timeout=60
