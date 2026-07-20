@@ -63,7 +63,7 @@ jobs:
                         | sort | awk -v k="$k" 'NR % 2 == (k + 0)') ;;
           esac
           test -n "$files"  # a shard that selected nothing is a bug, not an empty pass
-          uv run pytest -q -o faulthandler_timeout=60 $files
+          uv run pytest -q -o faulthandler_timeout=60 --durations=0 --durations-min=0.01 $files
 
   kernel-tests:
     # Aggregates the sharded pytest matrix into the one required status check named in branch
