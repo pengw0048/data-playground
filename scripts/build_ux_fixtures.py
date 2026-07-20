@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -84,9 +85,11 @@ def _build_lance_append_target(workspace: Path) -> None:
 
     outputs = workspace / "outputs"
     outputs.mkdir(parents=True, exist_ok=True)
+    target = outputs / f"{LANCE_APPEND_TARGET}.lance"
+    shutil.rmtree(target, ignore_errors=True)  # idempotent: a rebuild always seeds a fresh dataset
     lance.write_dataset(
         pa.table({"id": pa.array([1, 2], pa.int64()), "label": ["seed-a", "seed-b"]}),
-        str(outputs / f"{LANCE_APPEND_TARGET}.lance"),
+        str(target),
     )
 
 
