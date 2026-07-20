@@ -745,6 +745,19 @@ export interface MergeColumnsTask {
   mergeColumns?: MergeColumnsTaskProjection | null
 }
 
+// One durable restore of a retained revision as a new head. The API owns moving-head admission;
+// the browser previews the source and current head, then submits and polls this owner-scoped task.
+export interface RestoreRevisionTask {
+  taskId: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  sourceDatasetId: string
+  sourceRevisionId: string
+  expectedHeadRevisionId: string
+  childRevisionId?: string | null
+  diagnosticCode?: string | null
+  receipt?: WriteReceipt | null
+}
+
 export interface RunInputManifestItem {
   // Run history persists this deliberately minimal dict verbatim, so its inner keys remain snake_case.
   node_id: string

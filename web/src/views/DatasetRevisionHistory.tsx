@@ -4,7 +4,7 @@ import { compareSchemas } from '../lib/schemaCompatibility'
 import { useStore } from '../store/graph'
 import type {
   CatalogTable, DatasetRevision, DatasetRevisionDetail, DatasetRevisionSummary, DatasetViewDefinition,
-  SchemaCompatibilityStatus,
+  RestoreRevisionTask, SchemaCompatibilityStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 
@@ -52,6 +52,7 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
   const [detailError, setDetailError] = useState<string | null>(null)
   const [parentError, setParentError] = useState<string | null>(null)
   const [saveDetail, setSaveDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [restoreDetail, setRestoreDetail] = useState<DatasetRevisionDetail | null>(null)
   const [canSaveView, setCanSaveView] = useState(false)
   const historyRequest = useRef(0)
   const capabilityRequest = useRef(0)
@@ -165,9 +166,18 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
       {loadMoreError && <div role="alert" className="text-[10.5px] text-destructive">Couldn't load more history: {loadMoreError}</div>}
       {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
-        canSave={canSaveView} onSave={setSaveDetail} />}
+        canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
+        onRestore={setRestoreDetail} />}
     </>}
     {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
+    {restoreDetail && <RestoreRevisionDialog detail={restoreDetail} headRevisionId={items[0]?.revisionId ?? ''}
+      onClose={() => setRestoreDetail(null)}
+      onRestored={(child) => {
+        setRestoreDetail(null)
+        void loadFirst()
+        void openRevision({ datasetId: child.sourceDatasetId, revisionId: child.childRevisionId!,
+          committedAt: null, retentionOwner: 'core' })
+      }} />}
   </section>
 }
 
@@ -177,11 +187,14 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
   </div>
 }
 
-function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave }: {
+function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave,
+  headRevisionId, onRestore }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
+  headRevisionId: string | null
+  onRestore: (detail: DatasetRevisionDetail) => void
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
@@ -195,10 +208,17 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
       <div className="text-[9.5px] text-muted-foreground">Dataset {detail.datasetId} · {timestamp(detail.committedAt)} · retained by {detail.retentionOwner}</div>
       <div className="text-[9.5px] text-muted-foreground">Parent {detail.parentRevisionId ?? 'not evidenced'} · producer {detail.producerOperation ?? 'not provided'}</div>
       </div>
-      {canSave && <button type="button" onClick={() => onSave(detail)}
-        className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
-        Save view
-      </button>}
+      <div className="flex shrink-0 flex-col gap-1">
+        {canSave && <button type="button" onClick={() => onSave(detail)}
+          className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
+          Save view
+        </button>}
+        {detail.retentionOwner === 'core' && detail.revisionId !== headRevisionId
+          && <button type="button" data-testid="restore-revision" onClick={() => onRestore(detail)}
+            className="rounded-md border border-border bg-card px-2 py-1 text-[10.5px] font-semibold text-foreground hover:bg-accent">
+            Restore as new revision
+          </button>}
+      </div>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
@@ -384,6 +404,98 @@ function SaveDatasetViewDialog({ table, detail, onClose }: {
         <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
         <button onClick={() => void submit()} disabled={busy || !name.trim() || !selected.length}
           className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Saving exact view…' : 'Save view'}</button>
+      </div>
+    </div>
+  </div>
+}
+
+const restoreFailure = (task: RestoreRevisionTask) => task.diagnosticCode === 'stale_expected_head'
+  ? 'The current head changed before this restore published. Reload the history and try again.'
+  : task.diagnosticCode === 'revision_unavailable'
+    ? 'The source revision is no longer retained, so it cannot be restored.'
+    : 'The restore did not publish. Reload the history and try again.'
+
+function RestoreRevisionDialog({ detail, headRevisionId, onClose, onRestored }: {
+  detail: DatasetRevisionDetail; headRevisionId: string
+  onClose: () => void; onRestored: (task: RestoreRevisionTask) => void
+}) {
+  const pushToast = useStore((state) => state.pushToast)
+  const [head, setHead] = useState<DatasetRevisionDetail | null>(null)
+  const [headError, setHeadError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submission = useRef('')
+  const generation = useRef(0)
+
+  useEffect(() => {
+    const request = ++generation.current
+    api.datasetRevision(detail.datasetId, headRevisionId)
+      .then((next) => { if (request === generation.current) setHead(next) })
+      .catch((caught) => { if (request === generation.current) setHeadError(errorMessage(caught)) })
+    return () => { generation.current += 1 }
+  }, [detail.datasetId, headRevisionId])
+
+  const submit = async () => {
+    if (busy) return
+    if (!submission.current) submission.current = crypto.randomUUID()
+    const request = ++generation.current
+    setBusy(true); setError(null)
+    try {
+      let task = await api.restoreRevision(detail.datasetId, detail.revisionId,
+        { submissionId: submission.current, expectedHeadRevisionId: headRevisionId })
+      while (task.status !== 'done' && task.status !== 'failed' && task.status !== 'cancelled') {
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        if (request !== generation.current) return
+        task = await api.restoreRevisionTask(task.taskId)
+      }
+      if (request !== generation.current) return
+      if (task.status === 'done' && task.childRevisionId) {
+        submission.current = ''
+        pushToast(`Published revision ${task.childRevisionId} from the restored source`, 'success')
+        onRestored(task)
+        return
+      }
+      setError(task.status === 'failed' ? restoreFailure(task) : 'The restore was cancelled.')
+    } catch (caught) {
+      if (request !== generation.current) return
+      const status = statusOf(caught)
+      setError(status === 409
+        ? 'The current head changed. Reload the history and try again.'
+        : status === 410 ? 'The source revision is no longer retained, so it cannot be restored.'
+          : `Couldn't restore this revision: ${errorMessage(caught)}`)
+    } finally {
+      if (request === generation.current) setBusy(false)
+    }
+  }
+
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={() => { if (!busy) onClose() }}>
+    <div role="dialog" aria-modal="true" aria-label="Restore revision as new head" aria-busy={busy}
+      className="flex max-h-[90vh] w-[520px] max-w-full flex-col gap-3 overflow-hidden rounded-xl border border-border bg-card p-5 shadow-xl"
+      onClick={(event) => event.stopPropagation()}>
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1"><h2 className="text-[15px] font-bold">Restore revision as new head</h2>
+          <p className="text-[10.5px] text-muted-foreground">Publishes the contents of an old revision as a new current revision. History stays append-only.</p></div>
+        <button onClick={onClose} disabled={busy} aria-label="Close restore dialog" className="disabled:opacity-40"><Icon name="close" size={15} /></button>
+      </div>
+      <div className="grid gap-2">
+        <div className="rounded-md border border-border p-2">
+          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Restoring this source</div>
+          <div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">{detail.revisionId}</div>
+          <div className="text-[9.5px] text-muted-foreground">{number(detail.summary.rowCount)} rows · {bytes(detail.summary.totalBytes)} · {timestamp(detail.committedAt)}</div>
+        </div>
+        <div className="rounded-md border border-border p-2">
+          <div className="text-[9px] uppercase tracking-wide text-muted-foreground">Over the current head</div>
+          {headError ? <div role="alert" className="text-[10.5px] text-destructive">Couldn't load the current head: {headError}</div>
+            : !head ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading current head…</div>
+              : <><div className="dp-mono break-all text-[10.5px] font-semibold text-foreground">{head.revisionId}</div>
+                <div className="text-[9.5px] text-muted-foreground">{number(head.summary.rowCount)} rows · {bytes(head.summary.totalBytes)} · {timestamp(head.committedAt)}</div></>}
+        </div>
+      </div>
+      {error && <div role="alert" className="text-[11px] text-destructive">{error}</div>}
+      <div className="flex justify-end gap-2">
+        <button onClick={onClose} disabled={busy} className="rounded-md border border-border px-3 py-1.5 text-[12px] disabled:opacity-50">Cancel</button>
+        <button onClick={() => void submit()} disabled={busy || !!headError} data-testid="restore-revision-confirm"
+          className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Restoring…' : 'Restore as new head'}</button>
       </div>
     </div>
   </div>

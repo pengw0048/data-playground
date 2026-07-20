@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0036_restore_revision", "0035_remove_temporal"),
         ("0035_remove_temporal", "0034_external_overlay"),
         ("0034_external_overlay", "0033_temporal_task"),
         ("0033_temporal_task", "0032_temporal_pub"),
@@ -90,8 +91,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0035_remove_temporal"]
-    assert metadb.expected_schema_head() == "0035_remove_temporal"
+    assert scripts.get_heads() == ["0036_restore_revision"]
+    assert metadb.expected_schema_head() == "0036_restore_revision"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -216,6 +217,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0036_restore_revision_task.py": (
+            "e63f603fc1daeed7cfbfd32d8e7367e98e1be507d21a546611d3c0df0ac8ffa9"
+        ),
         "0035_remove_temporal_state.py": (
             "625bb60791f16073068e5ff46ee91af5f1ef8b983fb77cf4d01bebb124a5aced"
         ),

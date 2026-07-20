@@ -7,6 +7,7 @@ import type {
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
+  RestoreRevisionTask,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -303,6 +304,12 @@ export const api = {
   },
   datasetRevision: (datasetId: string, revisionId: string) =>
     req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
+  restoreRevision: (datasetId: string, revisionId: string, body: { submissionId: string; expectedHeadRevisionId: string }) =>
+    req<RestoreRevisionTask>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/restore`, {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  restoreRevisionTask: (taskId: string) =>
+    req<RestoreRevisionTask>(`/restore-revision/${encodeURIComponent(taskId)}`),
   createDatasetView: (body: DatasetViewCreateRequest) =>
     req<DatasetViewDefinition>('/dataset-views', {
       method: 'POST', body: JSON.stringify(body),

@@ -1643,6 +1643,37 @@ class DurableDistributionReportView(Wire):
     deep_link: str = Field(min_length=1, max_length=256)
 
 
+class RestoreRevisionRequestV1(Wire):
+    """One intent to publish a retained revision's contents as a new head."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    submission_id: str = Field(min_length=1, max_length=128)
+    expected_head_revision_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("submission_id")
+    @classmethod
+    def _submission_id(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("submissionId must be trimmed and NUL-free")
+        return value.lower()
+
+
+class RestoreRevisionTaskV1(Wire):
+    """Owner-scoped status of one durable restore-as-new-head Task."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    task_id: str
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    source_dataset_id: str = Field(min_length=1, max_length=128)
+    source_revision_id: str = Field(min_length=1, max_length=256)
+    expected_head_revision_id: str = Field(min_length=1, max_length=256)
+    child_revision_id: str | None = Field(default=None, min_length=1, max_length=256)
+    diagnostic_code: str | None = Field(default=None, max_length=64)
+    receipt: WriteReceipt | None = None
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
