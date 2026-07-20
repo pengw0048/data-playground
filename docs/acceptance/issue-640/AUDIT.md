@@ -39,7 +39,7 @@ Thread counts follow the product's existing rule (`_apply_session` lowers thread
 
 The envelope asserts the boundary from both sides:
 
-1. **Under the budget, over-sized working sets degrade gracefully.** `over_budget_spill` builds a rollup hash table far larger than the 256 MB budget; DuckDB spills ~357 MiB to `DP_SPILL_DIR` and the managed write still commits. `output_verified` re-reads the committed Parquet and confirms `sum(n)` equals the 6,000,000 input rows — a completed run is never a silent wrong result.
+1. **Under the budget, over-sized working sets degrade gracefully.** `over_budget_spill` builds a rollup hash table far larger than the 256 MB budget; DuckDB spills ~369 MiB to `DP_SPILL_DIR` and the managed write still commits. `output_verified` re-reads the committed Parquet and confirms `sum(n)` equals the 6,000,000 input rows — a completed run is never a silent wrong result.
 
 2. **Beyond the budget, with the spill volume also exhausted, the run fails truthfully and commits nothing.** `oom_boundary` bounds the spill volume at 32 MiB (`SET max_temp_directory_size`, simulating a full spill disk). The full run path ends `status = failed` with **zero** committed outputs — the runner discards every unpublished partial. The root cause captured on the product's own session config is a DuckDB `OutOfMemoryException` (`"failed to offload data block … 30.4 MiB/30.5 MiB used"`) returning zero rows, proving the failure is the memory boundary rather than an unrelated fault.
 
