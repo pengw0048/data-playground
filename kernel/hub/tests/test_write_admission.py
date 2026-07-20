@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from hub import metadb
+from hub.api_errors import APIErrorCode
 from hub.models import Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
@@ -241,6 +242,38 @@ def test_external_destination_keeps_provider_neutral_mode(contract):
     assert admission.managed is False
     assert admission.mode == "append"
     assert admission.intent is None
+
+
+def test_unknown_destination_is_rejected_before_admission(contract):
+    from hub.api_errors import APIError
+    deps, graph = contract
+    write = next(node for node in graph.nodes if node.id == "write")
+    write.data["config"]["destId"] = "ghost-destination"
+
+    with pytest.raises(APIError) as excinfo:
+        _write_admission_for_graph(
+            deps, graph, "write", "researcher", "71111111-1111-4111-8111-111111111111")
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.code == APIErrorCode.INVALID_REQUEST
+    assert "unknown destination" in str(excinfo.value.detail)
+
+
+def test_unknown_destination_admission_api_returns_the_typed_envelope(contract, monkeypatch):
+    deps, graph = contract
+    next(node for node in graph.nodes if node.id == "write").data["config"]["destId"] = "ghost"
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "nodeId": "write",
+        "submissionId": "72222222-2222-4222-8222-222222222222",
+    })
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["code"] == APIErrorCode.INVALID_REQUEST
+    assert body["retryable"] is False
+    assert "unknown destination" in body["detail"]
 
 
 def test_nonlocal_execution_transport_is_not_mislabeled_managed(contract):

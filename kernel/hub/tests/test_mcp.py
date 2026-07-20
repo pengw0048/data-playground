@@ -373,6 +373,16 @@ def test_run_canvas_executes_to_completion():
     assert out["status"] == "done" and out["error"] is None and out["targetNodeId"] == f
 
 
+def test_run_canvas_unknown_destination_is_a_tool_error():
+    cid = data("create_canvas", {})["canvasId"]
+    s = data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})["nodeId"]
+    w = data("add_node", {"canvasId": cid, "kind": "write", "config": {
+        "filename": "out.parquet", "writeMode": "overwrite", "destId": "ghost-destination"}})["nodeId"]
+    data("connect", {"canvasId": cid, "sourceId": s, "targetId": w})
+    res = call("run_canvas", {"canvasId": cid, "confirm": True})
+    assert res["isError"] is True and "unknown destination" in res["content"][0]["text"]
+
+
 def test_run_canvas_multiple_sinks_requires_node_id():
     cid = data("create_canvas", {})["canvasId"]
     data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
