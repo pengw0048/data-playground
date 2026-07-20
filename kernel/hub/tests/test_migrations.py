@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0035_remove_temporal", "0034_external_overlay"),
         ("0034_external_overlay", "0033_temporal_task"),
         ("0033_temporal_task", "0032_temporal_pub"),
         ("0032_temporal_pub", "0031_durable_merge"),
@@ -89,8 +90,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0034_external_overlay"]
-    assert metadb.expected_schema_head() == "0034_external_overlay"
+    assert scripts.get_heads() == ["0035_remove_temporal"]
+    assert metadb.expected_schema_head() == "0035_remove_temporal"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -104,7 +105,8 @@ def test_migration_revision_ids_fit_alembic_version_num():
 
 def test_temporal_parent_blocks_downgrade_without_partial_schema_loss(tmp_path):
     with _isolated_metadata(f"sqlite:///{tmp_path / 'temporal-downgrade.db'}"):
-        metadb.migrate_db()
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0032_temporal_pub")
         with metadb.engine().begin() as connection:
             connection.execute(sa.text(
                 "INSERT INTO compound_dataset_revisions "
@@ -131,9 +133,92 @@ def test_temporal_parent_blocks_downgrade_without_partial_schema_loss(tmp_path):
             command.upgrade(metadb._alembic_cfg(connection), "head")
 
 
+def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'remove-temporal-state.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0034_external_overlay")
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO users (id, name, is_admin, created_at) VALUES "
+                "('migration-owner', 'Migration owner', false, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO local_result_artifacts "
+                "(uri, namespace_id, storage_root, lock_name, lock_token, lock_protected, state, "
+                "created_at, committed_at) VALUES "
+                "('file:///ordinary.parquet', 'migration-namespace', '/tmp', 'ordinary.lock', "
+                "'ordinary-token', true, 'ready', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO catalog_logical_datasets "
+                "(logical_id, catalog_key, logical_uri, current_uri, updated_at) VALUES "
+                "('ordinary-logical', 'ordinary-key', 'dataset://ordinary', "
+                "'file:///ordinary.parquet', CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO managed_local_file_revisions "
+                "(revision_id, logical_id, artifact_uri, publish_seq, table_doc, committed_at) VALUES "
+                "('ordinary-revision', 'ordinary-logical', 'file:///ordinary.parquet', 1, '{}', "
+                "CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO temporal_resample_publications "
+                "(idempotency_key, owner_id, write_intent_doc, parent_dataset_id, "
+                "parent_revision_id, child_revision_id, spec_doc, evidence_doc, candidate_digest, "
+                "output_member_id, output_revision_id, created_at) VALUES "
+                "('temporal-write', 'migration-owner', '{}', 'compound', :parent, :child, '{}', '{}', "
+                ":candidate, 'output-member', 'ordinary-revision', CURRENT_TIMESTAMP)"), {
+                    "parent": "a" * 64, "child": "b" * 64, "candidate": "c" * 64,
+                })
+            connection.execute(sa.text(
+                "INSERT INTO durable_tasks "
+                "(id, owner_id, submission_id, intent_sha256, target_node_id, task_kind, "
+                "backend_kind, write_intent, status, status_doc, cancel_requested, retry_count, "
+                "max_attempts, created_at, updated_at) VALUES "
+                "('temporal-task', 'migration-owner', 'temporal-submission', :intent, 'temporal-resample', "
+                "'temporal_resample_write', 'local', '{}', 'running', '{}', false, 0, 3, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"), {"intent": "d" * 64})
+            connection.execute(sa.text(
+                "INSERT INTO temporal_resample_task_envelopes "
+                "(task_id, request_doc, request_sha256, candidate_sha256, write_idempotency_key, "
+                "phase, created_at, updated_at) VALUES "
+                "('temporal-task', '{}', :request, :candidate, 'temporal-write', 'recomputing', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"), {
+                    "request": "d" * 64, "candidate": "c" * 64,
+                })
+            connection.execute(sa.text(
+                "INSERT INTO durable_task_attempts "
+                "(id, task_id, attempt_number, status, created_at) VALUES "
+                "('temporal-attempt', 'temporal-task', 1, 'running', CURRENT_TIMESTAMP)"))
+
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            tables = set(inspect(connection).get_table_names())
+            assert {
+                "temporal_resample_task_envelopes", "temporal_resample_publications",
+                "compound_dataset_heads", "compound_dataset_revisions",
+            }.isdisjoint(tables)
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM durable_tasks WHERE id = 'temporal-task'"
+            )).scalar_one() == 0
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM durable_task_attempts WHERE id = 'temporal-attempt'"
+            )).scalar_one() == 0
+            assert connection.execute(sa.text(
+                "SELECT artifact_uri FROM managed_local_file_revisions "
+                "WHERE revision_id = 'ordinary-revision'"
+            )).scalar_one() == "file:///ordinary.parquet"
+
+            command.downgrade(metadb._alembic_cfg(connection), "0034_external_overlay")
+            assert {
+                "temporal_resample_task_envelopes", "temporal_resample_publications",
+                "compound_dataset_heads", "compound_dataset_revisions",
+            } <= set(inspect(connection).get_table_names())
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+
+
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0035_remove_temporal_state.py": (
+            "625bb60791f16073068e5ff46ee91af5f1ef8b983fb77cf4d01bebb124a5aced"
+        ),
         "0034_external_overlay_anchor.py": (
             "e9040678c38e06c4c60c623c621afd16664842bb30472ab0b49bbd8cb87ae960"
         ),
@@ -231,9 +316,9 @@ def test_committed_migration_revisions_are_immutable():
         "0032_temporal_publication.py": (
             "be5f868b1ab1936a21773771c18d312cbf2e2f13bc5d94450664dff2f551cbeb"
         ),
-            "0033_temporal_resample_task.py": (
-                "0d47e6da5b505575950b01bb20f1fe340c91a744ee451f15c135727fddc7306c"
-            ),
+        "0033_temporal_resample_task.py": (
+            "0d47e6da5b505575950b01bb20f1fe340c91a744ee451f15c135727fddc7306c"
+        ),
     }
     revision_paths = {path.name: path for path in versions_path.glob("*.py")}
 
