@@ -1,9 +1,9 @@
 # Versioned data and durable execution
 
 This document records both the delivered foundation and the remaining product and architecture roadmap
-for reproducible dataset work, column-oriented enrichment, long-running jobs, and heterogeneous
-research data. It is intentionally capability-led: the sections below distinguish behavior on `main`
-from the semantics that still need a numbered implementation issue.
+for reproducible dataset work, column-oriented enrichment, and long-running jobs. It is intentionally
+capability-led: the sections below distinguish behavior on `main` from the semantics that still need a
+numbered implementation issue.
 
 The goal is not a thin first release. Each delivery phase below is a complete, supportable product
 slice with an explicit exit gate. Later phases extend the same identities and state machines instead
@@ -11,7 +11,7 @@ of introducing parallel concepts for local, distributed, or provider-backed exec
 
 ## Product decisions
 
-The roadmap is built around six decisions.
+The roadmap is built around five decisions.
 
 1. A dataset is a stable logical identity with an ordered revision history. A physical URI is an
    implementation detail, not the dataset identity.
@@ -23,9 +23,6 @@ The roadmap is built around six decisions.
    copying every untouched column through every worker.
 5. The browser is an observer of durable work. Closing a tab, changing canvases, or reconnecting
    must not own the lifetime of a submitted run.
-6. Heterogeneous temporal data is a collection of related streams, spans, and assets. It should not
-   be forced into one giant table before it can be discovered, inspected, filtered, or analyzed.
-
 These decisions share one foundation: stable identities for resources, revisions, run manifests,
 tasks, attempts, checkpoints, and artifacts.
 
@@ -47,10 +44,6 @@ waits without occupying workers, collects and verifies results, and gathers them
 researcher closes the browser, watches progress later in Jobs, and receives a completion or
 attention item in Inbox.
 
-**Understand heterogeneous data before training.** A researcher filters episodes by interaction,
-motion, viewpoint, stream coverage, and quality; opens synchronized camera, depth, pose, action, and
-annotation streams; saves a reproducible subset; and compares distribution reports across revisions.
-
 ## Delivered foundation and remaining gaps
 
 Status verified against `main` on 2026-07-19. The public release tracker is
@@ -61,12 +54,12 @@ second issue tracker.
 | Area | Delivered on `main` | Remaining boundary |
 | --- | --- | --- |
 | Workspace | A local Workspace composes canvases, datasets, folders, local placement, browse, search, and read-only provider mounts. An installed provider dataset can become a local Canvas Source through a stable local binding without writing to the provider. The discovery-to-runnable-data track is complete. | A read-only mount remains a source: default managed-local publication does not write back to it. A full catalog replacement must explicitly own any provider-native write-back and curation behavior. |
-| Exact reads and views | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before supported local execution. Installed provider Sources with explicit immutable revision evidence can preview and enter an exact admitted local run. Researchers can save and reopen exact DatasetViews and reproducible bounded distribution reports. | Mutable-only provider Sources remain bounded-inspection only and cannot be made reproducible by UI wording. The delivered view/report foundation does not imply every provider can supply revision history or every future temporal report section. |
-| Managed writes | Typed managed-local create and replace writes freeze destination, expected head, schema, provenance, and idempotency; managed Lance append is separately admitted. Receipts reconcile publication evidence. Certified local row identity, immutable SparseOutput sidecars, and durable local merge publication are also complete in the backend. | The merge-columns product path remains [#437](https://github.com/pengw0048/data-playground/issues/437): [#583](https://github.com/pengw0048/data-playground/issues/583) admits/submits it, [#584](https://github.com/pengw0048/data-playground/issues/584) exposes it in Write and Jobs, and [#585](https://github.com/pengw0048/data-playground/issues/585) certifies release behavior. Key-based upsert remains separately gated in [#489](https://github.com/pengw0048/data-playground/issues/489). |
+| Exact reads and views | Native revision-capable adapters expose bounded revision history and exact reads; ordinary local file Sources are admitted as immutable managed snapshots before supported local execution. Installed provider Sources with explicit immutable revision evidence can preview and enter an exact admitted local run. Researchers can save and reopen exact DatasetViews and reproducible bounded distribution reports. | Mutable-only provider Sources remain bounded-inspection only and cannot be made reproducible by UI wording. The delivered view/report foundation does not imply every provider can supply revision history or every report dimension. |
+| Managed writes | Typed managed-local create and replace writes freeze destination, expected head, schema, provenance, and idempotency; managed Lance append is separately admitted. Receipts reconcile publication evidence. Certified local row identity, immutable SparseOutput sidecars, and durable local add-or-replace-column publication are complete. | The local add-or-replace-columns path is complete in [#437](https://github.com/pengw0048/data-playground/issues/437). Key-based upsert remains separately gated in [#489](https://github.com/pengw0048/data-playground/issues/489). |
 | Durable work | Task/Attempt state supports managed local writes, external waits, checkpoints, bounded fan-out, restart/retry/cancel recovery, Jobs, and Inbox. [#485](https://github.com/pengw0048/data-playground/issues/485) certifies the current durable consistency set through backup and restore. The browser observes rather than owns durable work. | This is not yet a general scheduler or arbitrary provider-job platform. |
 | Transform definitions | Promoted Transforms have owner-scoped durable identities and append-only immutable versions. Canvases and execution manifests retain exact `id + version` references and typed admitted run parameters. The researcher-facing library provides target-Canvas selection, version inspection, and an explicit upgrade workflow. | The supported workflow is complete; it is deliberately not a marketplace or package builder. |
 | Extension boundary | Installed-wheel plugin contracts and conformance cover catalog composition, read-only mounts, adapters, nodes, destinations, runners, capabilities, and telemetry. A read-only mount never mutates its external catalog; core-managed local outputs remain separate from provider-native write-back. | New SPIs need a real consumer and deterministic conformance. Provider-specific operational behavior, including write-back, remains outside core unless the replacing catalog or destination explicitly implements it. |
-| Research semantics | The catalog retains bounded lineage, schemas, previews, relationships, and native revision facts where an adapter supplies them. Exact DatasetViews and distribution reports are delivered. Compound temporal data now has exact identities, an offline checksum-bound fixture, measured coverage/alignment evidence, a synchronized inspector, and a durable API for nearest resampling onto an exact stream timestamp timeline. | [#312](https://github.com/pengw0048/data-playground/issues/312) remains open for the compound product: [#582](https://github.com/pengw0048/data-playground/issues/582) adds exact fixed-grid targets after the delivered stream-timestamp API; [#444](https://github.com/pengw0048/data-playground/issues/444) is demand-gated on a real installed provider; and [#445](https://github.com/pengw0048/data-playground/issues/445) adds temporal report sections and drill-down. [#443](https://github.com/pengw0048/data-playground/issues/443) tracks that resampling sequence. |
+| Research semantics | The catalog retains bounded lineage, schemas, previews, relationships, and native revision facts where an adapter supplies them. Exact DatasetViews and distribution reports are delivered. Timestamp columns remain ordinary table data and can participate in the same exact-read and view contracts. | Core does not promise a domain-specific episode, stream, clock, or viewer model. New report dimensions must arise from a supported generic dataset contract and a bounded, reproducible researcher workflow. |
 
 The rest of this document keeps the north-star semantics for the remaining work. It does not imply that
 every type, operation, or UX described below is available today.
@@ -475,112 +468,16 @@ researcher should never have to remember which canvas tab was open when a long j
 - Publish terminal state and artifact ownership exactly once, with receipt-based recovery.
 - Resume artifact downloads and verify checksums before publication.
 
-## Heterogeneous and robotics data
+## Dataset views, assets, and reports
 
-Robotics and embodied-data research adds multiple cameras, depth, poses, actions, state, calibration,
-annotations, and clocks. The product should model those relationships without embedding one
-organization's dataset schema in core.
+DatasetViews and distribution reports are ordinary, reproducible data-processing artifacts. A saved
+view retains its parent revision, predicate, sampling choices, and whether it is virtual or
+materialized. A report retains its exact view and computation inputs so that its scope is inspectable
+when it is reopened or compared.
 
-### Compound dataset
-
-A compound dataset revision contains:
-
-- episodes or sessions;
-- named temporal spans;
-- stream descriptors;
-- media and array assets;
-- relationships among episodes, streams, subjects, tasks, and environments; and
-- annotations, saved views, and reports that reference exact revision-scoped identities.
-
-A compound revision binds every member asset to an exact identity, provider revision where available,
-and checksum. A StreamDescriptor records modality, clock or time domain, timestamp unit and epoch,
-monotonicity and uncertainty, sampling rate, coverage intervals, encoding, shape, unit, coordinate
-frame, handedness, pose convention, calibration reference and validity interval, and asset mapping.
-The compound manifest contains a coordinate-frame graph rather than isolated frame-name strings.
-Action and state streams declare whether values are absolute, delta, velocity, or another control
-semantic, plus units and normalization. Streams may include multiple cameras, depth, audio, pose,
-state, action, force, annotation, or derived features.
-
-Large media stays in external assets with frame and range mappings. It is not copied into a metadata
-table merely to fit the catalog.
-
-### Time and alignment
-
-Raw timestamps and clock mappings are preserved. Alignment and resampling are explicit derived
-operations that record:
-
-- source and target time domains;
-- offset and drift model;
-- tolerance;
-- interpolation or nearest-sample policy;
-- gap behavior; and
-- the exact input revisions.
-
-Missing intervals remain visible. A derived aligned view never erases the raw timing evidence.
-
-### Quality, filtering, and discovery
-
-Quality assessment and filtering are separate:
-
-- quality signals are non-destructive annotations with producer and revision identity;
-- a DatasetView stores parent revision, predicate, sampling seed, strata, feature or embedding
-  revision, and whether it is virtual or materialized; and
-- filtering produces a reproducible view or new revision rather than deleting evidence silently.
-
-Discovery facets should include task, object interaction, motion, embodiment, viewpoint, modality
-coverage, quality, source, duration, and revision. Embedding and motion projections always display the
-model, parameters, input revision, approximation, and freshness. They support exploration; they are
-not presented as objective ground truth.
-
-### Distribution analysis as a product
-
-Researchers need to understand data before training. Distribution reports should cover:
-
-- stream coverage and missingness;
-- episode and span length;
-- sample rates and temporal gaps;
-- task, embodiment, environment, and viewpoint balance;
-- motion direction and magnitude;
-- object interactions;
-- duplicates and near-duplicates;
-- clusters, outliers, and bias slices; and
-- differences between dataset revisions or saved subsets.
-
-A report is a versioned artifact. It can be saved in the workspace, compared with another report,
-opened at the underlying samples, and referenced by a canvas. Every chart states its revision,
-sampling method, filters, approximation, and unknown-data handling.
-
-### Research UX
-
-The primary inspector for a compound dataset is a synchronized, multi-pane timeline:
-
-- linked camera and depth playback;
-- signal plots for action, state, pose, and derived features;
-- annotations and selected spans;
-- calibration and coordinate-frame context;
-- coverage and missing-data bands; and
-- direct navigation from a distribution slice to representative episodes.
-
-A table remains useful for episode metadata and summaries, but it is not the only representation.
-
-### Extension and conformance model
-
-Providers extend compound data through stream manifest readers, converters, modality viewers,
-feature extractors, quality assessors, distribution metrics, and search facets. Core owns stable
-descriptors, revision identity, the timeline contract, reports, and plugin composition.
-
-The public test kit includes a synthetic multi-stream fixture with:
-
-- multiple cameras and sample rates;
-- clock offset and drift;
-- gaps and a missing modality;
-- a corrupt frame;
-- calibration changes;
-- long and short episodes; and
-- deterministic motion, duplicate, and distribution ground truth.
-
-An integration is supported only after it passes this local fixture and its provider-specific live
-suite.
+Assets may remain external to a table when an adapter can identify them exactly. That does not imply a
+specialized media, episode, timeline, alignment, or clock experience in core. Timestamp columns remain
+ordinary schema fields; they can be filtered, profiled, and passed through a Canvas like other columns.
 
 ## Public plugin and integration strategy
 
@@ -591,7 +488,7 @@ cadence.
 The public repository should ship:
 
 - typed SPIs for resource mounts, revision reads, transactional writes, merge capabilities, task
-  providers, stream manifests, search facets, viewers, and metrics;
+  providers, declarative capability viewers, and metrics;
 - a conformance test kit with deterministic fakes;
 - capability negotiation and a compatibility manifest;
 - example plugins that use only public data and local services; and
@@ -750,30 +647,9 @@ Exit gate:
 - current-head conflicts never lose data; and
 - failure of one provider cannot corrupt another provider's revision or artifact ownership.
 
-### Phase 6 — Compound temporal data and distribution analysis
-
-Deliver:
-
-- compound dataset, episode, span, stream, asset, and clock descriptors;
-- explicit alignment, window, and resample operations;
-- synchronized multi-pane exploration;
-- reproducible DatasetView filtering and sampling;
-- versioned distribution and diversity reports;
-- search facets for interaction, motion, embodiment, coverage, and quality; and
-- plugin converters, viewers, feature extractors, and metrics.
-
-Exit gate:
-
-- the synthetic multi-stream fixture round-trips without losing timestamps, gaps, or calibration;
-- alignment drift and gap golden tests pass;
-- saved views and reports reproduce against the same revision;
-- reports retain reproducible slice and query provenance and open representative or matching samples;
-- long-episode and large-catalog performance budgets are met; and
-- approximate embeddings and sampling remain labeled with model, revision, parameters, and freshness.
-
 ### Cross-cutting production Definition of Done
 
-This is not a final hardening phase. Every Phase 1–6 exit gate includes the applicable migration,
+This is not a final hardening phase. Every delivery-phase exit gate includes the applicable migration,
 backup, observability, compatibility, and failure-recovery work below. The combined product is not
 declared mature until:
 
@@ -797,7 +673,6 @@ Phase exit gates use one shared adversarial matrix rather than separate happy-pa
 | Revisions | Concurrent append, replace, compaction, and catalog refresh; mutable-only sources; historical retention, tombstone, unregister, backup, restore, and GC. |
 | Writes and merge | Failure before and after artifact write, provider commit, response, catalog update, and current-pointer publication; duplicate requests and supervisors; schema, key, null, cardinality, checkpoint-intent, and column conflicts. |
 | Durable tasks | Late and duplicate poll or callback, callback authentication and event dedupe, provider outage, rate limit, missing credential, expired result, failed collection, database-time lease expiry, and cancel/complete races. |
-| Heterogeneous data | Multiple clocks, rates, cameras, drift, gaps, corrupt media, missing modalities, calibration changes, timeline seek accuracy, and deterministic distribution fixtures. |
 
 Across every row, partial artifacts remain owned and reclaimable, no terminal result depends on an
 in-memory owner or browser, and recovery distinguishes commit unknown from commit rejected using
@@ -813,7 +688,8 @@ durable receipts.
   part of the capability contract.
 - The durable task plane is not a general-purpose workflow service. It owns data-work intent,
   dependencies, external waits, artifacts, and user-facing recovery.
-- Large media remains referenced by assets; core does not require embedding it in relational cells.
+- Exact external assets remain references when an adapter supports them; core does not require embedding
+  them in relational cells.
 - The public core remains useful offline. Provider-specific packages cannot become mandatory
   dependencies.
 - The supported trust model remains local users and trusted collaborators. This roadmap does not add
@@ -832,7 +708,6 @@ turn each phase into a tracking issue only after the following contracts are rev
 - row-identity and deterministic bucket rules;
 - task phase, retry, cancellation, and receipt semantics;
 - workspace overlay ownership; and
-- compound stream and clock descriptors.
 
 Each implementation issue should name the invariant it establishes, its supported provider and
 deployment profile, failure injection, migration impact, UI outcome, and measurable release gate.
