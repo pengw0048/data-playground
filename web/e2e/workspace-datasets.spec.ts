@@ -11,6 +11,7 @@ type RegisteredDataset = {
 }
 
 test('discovers, previews, batch-uses, runs, and safely unregisters local datasets @ux-smoke', async ({ page }) => {
+  test.slow()  // registers + previews + runs two canvases + batch-unregisters; the full-profile catalog pushes it past the 30s default
   const suffix = Date.now()
   const registeredName = `issue497_registered_${suffix}`
   const registeredFolder = `research/issue-497-${suffix}`
