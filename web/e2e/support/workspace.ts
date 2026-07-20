@@ -21,6 +21,7 @@ export async function workspaceResource(
     const loadMore = page.getByTestId('workspace-load-more')
     await expect(resource.or(loadMore).first()).toBeVisible({ timeout: 15_000 })
     if (await resource.isVisible()) return resource
+    await expect(loadMore).toBeEnabled({ timeout: 15_000 })
     await Promise.all([
       page.waitForResponse((response) => response.url().includes('/api/workspace/containers/')),
       loadMore.click(),
