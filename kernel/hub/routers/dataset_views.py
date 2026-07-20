@@ -62,15 +62,12 @@ class _DatasetViewUnsupported(ValueError):
 
 def supports_dataset_view_source(uri: str, adapter: object) -> bool:
     """Return the exact server-owned capability advertised by the Catalog UI."""
-    from hub.compound_fixture import CompoundFixtureAdapter, FIXTURE_URI_PREFIX
-
     try:
         local = paths.local_path(uri)
     except ValueError:
         local = None
     return (
-        (local is not None or (uri.startswith(FIXTURE_URI_PREFIX)
-                               and isinstance(adapter, CompoundFixtureAdapter)))
+        local is not None
         and isinstance(adapter, DatasetRevisionAdapter)
         and "exact" in set(getattr(adapter, "revision_selectors", ()))
         and getattr(adapter, "retention_owner", "provider") in {"core", "provider"}

@@ -434,9 +434,6 @@ class Deps:
         self.workspace = workspace
         self.data_dir = data_dir
         self.adapters = default_adapters()
-        # One fixed trusted-local fixture authority; no generic fixture URI registry exists.
-        from hub.compound_fixture import CompoundFixtureAdapter
-        self.adapters.insert(0, CompoundFixtureAdapter())
         self.default_adapter = DuckDBAdapter()
         self.registry = ProcessorRegistry()
         from hub.plugins.importer import NullImporter
@@ -475,14 +472,6 @@ class Deps:
         self._load_bundled()
         if self.catalog is None:
             raise RuntimeError("bundled default-catalog plugin did not install a catalog")
-        # The fixed public reference fixture is core-owned even when an external provider replaces the
-        # selected product catalog below. Keep this private boundary local; ordinary catalog behavior
-        # continues to use ``self.catalog`` exclusively.
-        self._reference_catalog = self.catalog
-        # Materialize the fixed public fixture even after ordinary starter data already exists.
-        # Its server-owned authority registers exact members lazily when a consumer needs it.
-        from hub.compound_fixture import materialize_fixture
-        materialize_fixture(self.data_dir)
         # Catalog selection is a composition-time decision.  Do not construct a runner, profile
         # supervisor, or run controller until every plugin has had its one registration opportunity.
         self._load_plugins()

@@ -2,9 +2,9 @@
 """Build deterministic data fixtures for UX acceptance runs.
 
 The smoke profile keeps browser CI quick while retaining the product's starter datasets.
-The full profile adds large-catalog, relationship-dense, temporal, and multimodal data for
-scheduled and release-candidate acceptance runs. Failure scenarios are represented in the
-manifest because they are injected at the HTTP or browser boundary, not by real credentials.
+The full profile adds large-catalog and relationship-dense data for scheduled and
+release-candidate acceptance runs. Failure scenarios are represented in the manifest because they
+are injected at the HTTP or browser boundary, not by real credentials.
 """
 
 from __future__ import annotations
@@ -30,14 +30,6 @@ MANIFEST = {
         "relationship_dense": {
             "datasets": 24,
             "purpose": "Dense join and lineage rendering with bounded result disclosure.",
-        },
-        "temporal_multimodal": {
-            "datasets": ["episodes", "frames", "audio_windows"],
-            "purpose": "Independent CSV discovery rows; they do not assert synchronized playback.",
-        },
-        "compound_timeline": {
-            "files": ["compound/manifest.json", "compound/ground-truth.json"],
-            "purpose": "Offline exact compound evidence with declared clocks, gaps, and modality absence.",
         },
         "fault_injection": {
             "scenarios": ["slow", "unavailable", "permission_denied", "stale_reference", "partial_failure", "recovery"],
@@ -72,47 +64,6 @@ def _seed_starter_data(output: Path) -> None:
     events_parquet.unlink()
 
 
-def _build_temporal_multimodal(output: Path) -> None:
-    _write_csv(
-        output / "episodes.csv",
-        ["episode_id", "subject_id", "start_ms", "end_ms", "label"],
-        [
-            {"episode_id": index, "subject_id": index % 4, "start_ms": index * 1_000,
-             "end_ms": index * 1_000 + 900, "label": "walk" if index % 2 else "rest"}
-            for index in range(16)
-        ],
-    )
-    _write_csv(
-        output / "frames.csv",
-        ["episode_id", "frame_ms", "image_url", "camera"],
-        [
-            {"episode_id": episode, "frame_ms": episode * 1_000 + frame * 100,
-             "image_url": f"https://picsum.photos/seed/ux-{episode}-{frame}/320/240",
-             "camera": "front" if frame % 2 else "side"}
-            for episode in range(16) for frame in range(5)
-        ],
-    )
-    _write_csv(
-        output / "audio_windows.csv",
-        ["episode_id", "start_ms", "end_ms", "rms"],
-        [
-            {"episode_id": episode, "start_ms": episode * 1_000 + window * 100,
-             "end_ms": episode * 1_000 + (window + 1) * 100,
-             "rms": round((episode + window) / 100, 3)}
-            for episode in range(16) for window in range(9)
-        ],
-    )
-
-
-def _build_compound_timeline(output: Path) -> None:
-    """Delegate the canonical compound fixture to the kernel-owned pure builder."""
-    kernel = Path(__file__).resolve().parents[1] / "kernel"
-    if str(kernel) not in sys.path:
-        sys.path.insert(0, str(kernel))
-    from hub.compound_fixture_definition import build_compound_timeline
-
-    build_compound_timeline(output)
-
 def _build_full_catalog(output: Path) -> None:
     for index in range(120):
         _write_csv(
@@ -137,8 +88,6 @@ def build(output: Path, profile: str) -> Path:
         raise ValueError(f"unknown UX fixture profile: {profile}")
     output.mkdir(parents=True, exist_ok=True)
     _seed_starter_data(output)
-    _build_temporal_multimodal(output)
-    _build_compound_timeline(output)
     if profile == "full":
         _build_full_catalog(output)
     manifest_dir = output / "ux-fixtures"
