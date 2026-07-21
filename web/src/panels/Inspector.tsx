@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite,
+  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -12,6 +12,7 @@ import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
 import { api } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
+import { UpsertControl } from '../components/UpsertControl'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
 import type { ColumnSchema } from '../types/graph'
 import { Button } from '@/components/ui/button'
@@ -108,6 +109,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, nodeId))
+  const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, nodeId))
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
@@ -198,6 +200,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             its own edit/action guards; wrapping it in the destination fieldset would also disable
             the read-only Jobs and receipt links. */}
         <MergeColumnsControl nodeId={nodeId} />
+        <UpsertControl nodeId={nodeId} />
       </>}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
@@ -272,7 +275,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredMerge ? 'Review column merge' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
+            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />

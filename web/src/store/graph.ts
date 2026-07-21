@@ -118,6 +118,15 @@ export function hasConfiguredMergeColumnsWrite(doc: CanvasDoc, id: string): bool
   return Array.isArray(rules) && rules.length > 0
 }
 
+export function hasConfiguredUpsertWrite(doc: CanvasDoc, id: string): boolean {
+  const node = doc.nodes.find((item) => item.id === id)
+  if (node?.type !== 'write') return false
+  const value = node.data.config.keyedUpsert
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const keys = (value as { keys?: unknown }).keys
+  return Array.isArray(keys) && keys.length > 0
+}
+
 /** A node is disabled if it, or ANY of its upstream ancestors, is flagged disabled — disabling a
  * node turns off everything downstream of it (the whole branch stops), mirroring ComfyUI. */
 export function isDisabled(doc: CanvasDoc, id: string): boolean {
@@ -1938,6 +1947,11 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast('Column merge uses its certified admission flow.', 'info')
       return
     }
+    if (hasConfiguredUpsertWrite(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Keyed upsert uses its certified admission flow.', 'info')
+      return
+    }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) {
       get().pushToast('Fix invalid node parameters before running.', 'error')
       return
@@ -2142,6 +2156,11 @@ export const useStore = create<Store>((set, get) => ({
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Column merge uses its certified admission flow.', 'info')
+      return
+    }
+    if (hasConfiguredUpsertWrite(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Keyed upsert uses its certified admission flow.', 'info')
       return
     }
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return

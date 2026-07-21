@@ -758,6 +758,49 @@ export interface RestoreRevisionTask {
   receipt?: WriteReceipt | null
 }
 
+// One certified keyed upsert of a payload revision into a managed-local head. The API owns
+// eligibility, key validation, schema effects, and moving-head admission; the browser renders only
+// what preflight/task provide.
+export interface UpsertEvidence {
+  matched: number
+  inserted: number
+  unchanged: number
+  rejected: number
+  duplicate: number
+  conflict: number
+}
+export interface UpsertRequest {
+  submissionId: string
+  datasetId: string
+  expectedHeadRevisionId: string
+  payloadDatasetId: string
+  payloadRevisionId: string
+  keys: string[]
+}
+export interface UpsertPreflight {
+  base: { kind: 'exact'; datasetId: string; revisionId: string }
+  head: { kind: 'exact'; datasetId: string; revisionId: string }
+  expectedHead: { kind: 'exact'; datasetId: string; revisionId: string }
+  keys: string[]
+  outputSchema: ColumnSchema[]
+  evidence: UpsertEvidence
+  eligible: boolean
+}
+export interface UpsertTask {
+  taskId: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  datasetId: string
+  expectedHeadRevisionId: string
+  payloadDatasetId: string
+  payloadRevisionId: string
+  childRevisionId?: string | null
+  diagnosticCode?: string | null
+  canCancel: boolean
+  canRetry: boolean
+  receipt?: WriteReceipt | null
+  evidence?: UpsertEvidence | null
+}
+
 export interface RunInputManifestItem {
   // Run history persists this deliberately minimal dict verbatim, so its inner keys remain snake_case.
   node_id: string
