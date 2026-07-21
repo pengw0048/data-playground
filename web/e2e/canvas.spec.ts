@@ -142,7 +142,7 @@ test.describe('Data Playground canvas', () => {
       // The one-shot request is already consumed. A user zoom followed by an ordinary selection
       // rerender must not invoke fitView again or reset the chosen viewport.
       const viewport = page.locator('.react-flow__viewport')
-      await page.locator('.react-flow__controls-zoomin').click()
+      await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
       const manualViewport = await viewport.getAttribute('style')
       await nodes.first().click()
       await page.waitForTimeout(500)
@@ -168,7 +168,7 @@ test.describe('Data Playground canvas', () => {
     expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).toBe(pristineId)
     expect(await canvasesFor(page)).toHaveLength(1)
     const viewport = page.locator('.react-flow__viewport')
-    await page.locator('.react-flow__controls-zoomin').click()
+    await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
     const manual = await viewport.getAttribute('style')
     await page.waitForTimeout(500)
     expect(await viewport.getAttribute('style')).toBe(manual)
@@ -366,7 +366,7 @@ test.describe('Data Playground canvas', () => {
     // The route consumes its reveal once. A later user zoom remains in control rather than being
     // replaced by another route-driven center operation.
     const viewport = page.locator('.react-flow__viewport')
-    await page.locator('.react-flow__controls-zoomin').click()
+    await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
     const afterUserZoom = await viewport.getAttribute('style')
     await page.waitForTimeout(500)
     expect(await viewport.getAttribute('style')).toBe(afterUserZoom)
@@ -562,14 +562,41 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
   })
 
-  test('minimap and zoom controls are both present and do not overlap', async ({ page }) => {
+  test('minimap and labelled view controls are both present and do not overlap', async ({ page }) => {
     await fresh(page)
-    await addNode(page, 'Shape', 'filter') // minimap + zoom controls only mount once the canvas has a node to navigate
+    await addNode(page, 'Shape', 'filter') // minimap + viewport controls only mount once the canvas has a node to navigate
     const minimap = page.locator('.react-flow__minimap')
-    const controls = page.locator('.react-flow__controls')
+    const controls = page.getByTestId('toolbar-view-controls')
     await expect(minimap).toBeVisible()
     await expect(controls).toBeVisible()
+    await expect(controls.getByRole('button', { name: 'Fit view' })).toBeVisible()
+    await expect(controls.getByText('Fit view', { exact: true })).toBeVisible()
     expect(overlaps(await boxOf(minimap), await boxOf(controls)), 'minimap overlaps zoom controls').toBe(false)
+  })
+
+  test('toolbar groups view controls and exposes current toggle state', async ({ page }) => {
+    await fresh(page)
+    await addNode(page, 'Shape', 'filter')
+
+    const addControls = page.getByTestId('toolbar-add-controls')
+    const viewControls = page.getByTestId('toolbar-view-controls')
+    await expect(addControls).toHaveAttribute('role', 'group')
+    await expect(viewControls).toHaveAttribute('role', 'group')
+    await expect(addControls.getByText('Add', { exact: true })).toBeVisible()
+    await expect(viewControls.getByText('View', { exact: true })).toBeVisible()
+    await expect(viewControls.getByRole('button', { name: 'Fit view' })).toBeVisible()
+
+    const inspector = viewControls.getByRole('button', { name: 'Hide Inspector' })
+    await expect(inspector).toHaveAttribute('aria-pressed', 'true')
+    await inspector.hover()
+    await expect(page.getByRole('tooltip')).toHaveText('Inspector — shown')
+    await inspector.click()
+    await expect(viewControls.getByRole('button', { name: 'Show Inspector' })).toHaveAttribute('aria-pressed', 'false')
+
+    const shape = addControls.getByRole('button', { name: 'Shape', exact: true })
+    await shape.click()
+    await expect(shape).toHaveAttribute('aria-expanded', 'true')
+    await expect(shape).toHaveAttribute('aria-pressed', 'true')
   })
 
   test('agent is unavailable without a configured model (no rule-based stand-in)', async ({ page }) => {

@@ -28,6 +28,18 @@ async function expectFullyInViewport(page: Page, loc: Locator, label: string) {
   expect(box.y + box.height, `${label} clipped on the bottom`).toBeLessThanOrEqual(vp.height + 0.5)
 }
 
+async function expectToolbarGroupsDoNotOverlap(page: Page, label: string) {
+  const toolbar = page.getByTestId('toolbar')
+  const addControls = page.getByTestId('toolbar-add-controls')
+  const viewControls = page.getByTestId('toolbar-view-controls')
+  await expectFullyInViewport(page, toolbar, `${label} toolbar`)
+  await expectFullyInViewport(page, addControls, `${label} add controls`)
+  await expectFullyInViewport(page, viewControls, `${label} view controls`)
+  const addBox = await boxOf(addControls)
+  const viewBox = await boxOf(viewControls)
+  expect(addBox.x + addBox.width, `${label} add and view controls overlap`).toBeLessThanOrEqual(viewBox.x + 0.5)
+}
+
 async function goToWorkspaceShell(page: Page) {
   await page.goto('/')
   await expect(page.getByTestId('toolbar')).toBeVisible()
@@ -114,6 +126,15 @@ test.describe('minimum viewport support', () => {
     await openCanvasWithSource(page)
     const node = page.locator('.react-flow__node').first()
     await expectFullyInViewport(page, node, 'canvas node')
+    const addControls = page.getByTestId('toolbar-add-controls')
+    const viewControls = page.getByTestId('toolbar-view-controls')
+    await expectToolbarGroupsDoNotOverlap(page, 'Canvas')
+    await expect(viewControls.getByText('Fit view', { exact: true })).toBeVisible()
+    await expect(viewControls.getByRole('group', { name: 'Viewport controls' })).toBeVisible()
+    await expect(viewControls.getByRole('group', { name: 'Panel controls' })).toBeVisible()
+    for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Hide Inspector']) {
+      await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `Canvas ${name}`)
+    }
     await expectFullyInViewport(page, page.getByTestId('inspector'), 'inspector')
     // Inspector run control stays reachable at the minimum viewport (sources label it Count rows).
     await expectFullyInViewport(
@@ -185,7 +206,7 @@ test.describe('minimum viewport support', () => {
 
     // React Flow's Fit View control operates inside the flexed canvas, whose right edge is the
     // current Inspector edge. The fitted node must remain inside that real region.
-    await page.locator('.react-flow__controls-fitview').click()
+    await page.getByRole('button', { name: 'Fit view', exact: true }).click()
     const fittedFlow = await boxOf(page.locator('.react-flow'))
     const fittedNode = await boxOf(page.locator('.react-flow__node').first())
     expect(fittedNode.x).toBeGreaterThanOrEqual(fittedFlow.x)
@@ -231,5 +252,15 @@ test.describe('minimum viewport support', () => {
     await expect(page.getByRole('button', { name: 'Collapse navigation' })).toBeVisible()
     await page.getByTestId('rail-settings').click()
     await expectFullyInViewport(page, page.getByTestId('settings-modal'), '1024px settings')
+
+    await openCanvasWithSource(page)
+    const viewControls = page.getByTestId('toolbar-view-controls')
+    await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector collapsed)')
+    for (const name of ['Zoom in', 'Zoom out', 'Fit view', 'Show Inspector']) {
+      await expectFullyInViewport(page, viewControls.getByRole('button', { name }), `1024px Canvas ${name}`)
+    }
+    await page.getByRole('button', { name: 'Show Inspector', exact: true }).click()
+    await expect.poll(() => viewControls.getByText('Fit view', { exact: true }).count()).toBe(0)
+    await expectToolbarGroupsDoNotOverlap(page, '1024px Canvas (Inspector expanded)')
   })
 })
