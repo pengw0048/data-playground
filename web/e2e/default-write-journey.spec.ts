@@ -119,6 +119,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
 
     // 7. Exact-revision reopen from the published receipt.
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
+    await page.getByText('Technical evidence', { exact: true }).click()
     await page.getByRole('button', { name: 'Open exact revision' }).click()
     await expect(page.getByLabel('Exact revision detail')).toBeVisible()
     const detail = await ok<{ revisionId: string; preview: { columns: Array<{ name: string }> } }>(
@@ -138,6 +139,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await shoot(page, 'dark', 'canvas')
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+    await page.getByText('Technical evidence', { exact: true }).click()
     await page.getByRole('button', { name: 'Open exact revision' }).click()
     await expect(page.getByLabel('Exact revision detail')).toBeVisible()
     await shoot(page, 'dark', 'jobs')
