@@ -992,6 +992,9 @@ interface Store {
   currentDraftId: string | null
   localDrafts: LocalCanvasDraft[]
   draftStorageErrors: string[]
+  // Set only after bootstrap has authoritatively established that this principal has neither a
+  // remote Canvas nor a recoverable local draft.  The Workspace consumes it as the first-run choice.
+  firstRunChoice: boolean
   numericParamDrafts: Record<string, Record<string, string>>  // invalid/pending text; never persisted
 
   agentOpen: boolean
@@ -1479,6 +1482,7 @@ export const useStore = create<Store>((set, get) => ({
   currentDraftId: null,
   localDrafts: [],
   draftStorageErrors: [],
+  firstRunChoice: false,
   numericParamDrafts: {},
   agentOpen: false,
   agentLog: [],
@@ -2761,8 +2765,11 @@ export const useStore = create<Store>((set, get) => ({
       get().refreshLocalDrafts()
       const users = await api.users()
       set({ users })
-      await get().refreshFiles()
+      const filesRefreshed = await get().refreshFiles()
       const files = get().files
+      // Do not infer a fresh workspace from an empty stale list: only an authoritative list can
+      // establish that there is no existing Canvas. A local draft is user work too.
+      set({ firstRunChoice: filesRefreshed && files.length === 0 && get().localDrafts.length === 0 })
       // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
       // last-opened / newest / a fresh file. A #/workspace or #/transforms link still loads a
       // current canvas underneath, then switches to that shell view below.
@@ -2789,7 +2796,7 @@ export const useStore = create<Store>((set, get) => ({
         if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
         else if (fallback) await get().openFile(fallback)
         // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
-        else set({ view: 'files' })
+        else get().setView('workspace')
         // A Workspace dataset/container deep link carries more identity than the top-level view.
         // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
         // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
@@ -2991,7 +2998,7 @@ export const useStore = create<Store>((set, get) => ({
     }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
-    set({ view: 'canvas' })
+    set({ view: 'canvas', firstRunChoice: false })
     if (signal && persistence === 'remote') void get().refreshFiles()
     return { ok: true, canvasId: doc.id, persistence }
   },
@@ -3000,12 +3007,23 @@ export const useStore = create<Store>((set, get) => ({
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
     const current = get()
-    const replacePristine = current.canvasRole === 'owner'
+    let replacePristine = current.canvasRole === 'owner'
       && current.currentDraftId == null && current.serverVersion != null
       && current.doc.name === 'untitled' && current.doc.nodes.length === 0 && current.doc.edges.length === 0
+    // A blank graph is not necessarily pristine: a run is durable user work.  Fail closed when
+    // history cannot be read, so an offline/revoked tab creates a separate example instead.
+    if (replacePristine) {
+      try { replacePristine = (await api.listRuns(current.doc.id)).length === 0 }
+      catch { replacePristine = false }
+      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId
+          || get().doc.id !== current.doc.id) return { ok: false }
+    }
     const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
     if (!doc) return get().newFile()
+    // A response-lost in-place save must retain the known server base. Retrying it as a create could
+    // collide with the original Canvas and turn an uncertain update into a different document.
+    if (replacePristine) doc.version = current.serverVersion!
     let persistence: CanvasPersistence = 'remote'
     try {
       if (replacePristine) {
@@ -3043,12 +3061,15 @@ export const useStore = create<Store>((set, get) => ({
     if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
     if (persistence === 'local-draft' && userId) {
-      const draft = draftForDoc(userId, doc, null, undefined, doc)
+      const draft = draftForDoc(
+        userId, doc, replacePristine ? current.serverVersion : null, undefined,
+        replacePristine ? null : doc,
+      )
       const stored = writeCanvasDraft(draft)
       const visibleDraft = draftAfterStorageWrite(draft, stored)
       set((state) => ({
         currentDraftId: draft.draftId,
-        serverVersion: null,
+        serverVersion: replacePristine ? current.serverVersion : null,
         localDrafts: replaceDraft(state.localDrafts, visibleDraft),
         saved: stored.ok,
         draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
@@ -3057,7 +3078,7 @@ export const useStore = create<Store>((set, get) => ({
     }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
-    set({ view: 'canvas' })
+    set({ view: 'canvas', firstRunChoice: false })
     return { ok: true, canvasId: doc.id, persistence }
   },
 
@@ -3123,13 +3144,22 @@ export const useStore = create<Store>((set, get) => ({
     // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)
     const f = get().files.find((x) => x.id === id)
     if (typeof window !== 'undefined' && !window.confirm(`Delete "${f?.name || 'this canvas'}"? This can't be undone.`)) return
-    try { await api.deleteCanvas(id); await get().refreshFiles() } catch { /* offline */ }
+    let filesRefreshed = false
+    try {
+      await api.deleteCanvas(id)
+      filesRefreshed = await get().refreshFiles()
+    } catch { return } // do not navigate away from a Canvas whose deletion was not confirmed
     // only load a replacement (which navigates to the editor) if the deleted file was the one open
     // IN the editor; deleting from the Recents grid should just drop the card and stay in the shell.
     if (get().doc.id === id && get().view === 'canvas') {
       const next = get().files[0]?.id
       if (next) await get().openFile(next)
-      else await get().newFile()
+      // Deleting the final Canvas must not manufacture a replacement. Reuse the complete first-run
+      // choice only when the now-empty list and local-draft index were both read authoritatively.
+      else set({
+        view: 'workspace',
+        firstRunChoice: filesRefreshed && get().localDrafts.length === 0,
+      })
     }
   },
 

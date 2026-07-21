@@ -21,6 +21,7 @@ import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
 import { locateNode } from './locateNode'
+import { useExampleCreatesSeparate } from './useExampleCreatesSeparate'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -51,6 +52,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
   // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
   // straight to "Agent unavailable" (the default is no model).
   const [agentOk, setAgentOk] = useState(false)
+  const exampleCreatesSeparate = useExampleCreatesSeparate()
   useEffect(() => {
     if (!canEdit) return
     api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false))
@@ -68,7 +70,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
         </div>
         {canEdit && (
           <div className="mt-3.5 flex justify-center gap-2">
-            <Button onClick={add} className="rounded-lg bg-foreground text-[12.5px] text-background hover:bg-foreground/90">+ Add a source</Button>
+            <Button variant="outline" onClick={add} className="rounded-lg text-[12.5px] text-muted-foreground">+ Add a source</Button>
             {agentOk && <Button variant="outline" onClick={() => setAgentOpen(true)} className="rounded-lg text-[12.5px] text-muted-foreground">Ask the Agent</Button>}
           </div>
         )}
@@ -77,6 +79,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
           <div className="text-[10.5px] font-semibold uppercase tracking-[0.6px] text-muted-foreground/70">Start from an example</div>
           {examples.map((ex) => (
             <button key={ex.key} onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
+              aria-label={exampleCreatesSeparate ? `Create example Canvas: ${ex.name}` : `Use example in this Canvas: ${ex.name}`}
               className="rounded-lg border border-border bg-card px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent">
               <div className="text-[12px] font-semibold text-foreground">{ex.name}</div>
               <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-muted-foreground">{ex.blurb}</div>

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // the store module runs autosave side-effects at import; stub the network client so nothing escapes.
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
-  listCanvases: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   executionManifest: vi.fn(),
@@ -14,6 +14,8 @@ vi.mock('../api/client', () => ({
   api: new Proxy({}, {
     get: (_target, property) => property === 'listCanvases'
       ? apiMocks.listCanvases
+      : property === 'listRuns'
+        ? apiMocks.listRuns
       : property === 'getCanvas'
         ? apiMocks.getCanvas
         : property === 'createCanvas'
@@ -88,6 +90,7 @@ describe('graph store — core authority ops', () => {
     // start each test from a known empty doc
     localStorage.clear()
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
+    apiMocks.listRuns.mockReset().mockResolvedValue([])
     apiMocks.getCanvas.mockReset()
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
       { ok: true, id: doc.id, created: true }
@@ -2611,12 +2614,47 @@ describe('graph store — core authority ops', () => {
     blank.name = 'untitled'
     useStore.getState().loadDoc(blank, 'owner')
     useStore.setState({ serverVersion: 1, currentDraftId: null })
+    apiMocks.listRuns.mockResolvedValue([])
     apiMocks.saveCanvas.mockResolvedValue({ ok: true, id: 'pristine', version: 2 })
 
     expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true, canvasId: 'pristine' })
     expect(apiMocks.createCanvas).not.toHaveBeenCalled()
     expect(apiMocks.saveCanvas).toHaveBeenCalledWith(expect.objectContaining({ id: 'pristine' }), false, 1)
     expect(useStore.getState().doc.nodes.length).toBeGreaterThan(0)
+  })
+
+  it('creates a separate example when an otherwise blank Canvas has run history', async () => {
+    const blank = emptyTestDoc('ran-blank')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    apiMocks.listRuns.mockResolvedValue([{ runId: 'durable-user-work' }])
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true })
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+  })
+
+  it('keeps an in-place example replacement as a version-fenced draft when its save response is lost', async () => {
+    const blank = emptyTestDoc('response-loss-blank')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 7, currentDraftId: null })
+    apiMocks.listRuns.mockResolvedValue([])
+    apiMocks.saveCanvas.mockRejectedValueOnce(new TypeError('response lost'))
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({
+      ok: true, canvasId: blank.id, persistence: 'local-draft',
+    })
+    expect(useStore.getState().serverVersion).toBe(7)
+    expect(useStore.getState().localDrafts).toMatchObject([{
+      canvasId: blank.id,
+      baseCanvasId: blank.id,
+      baseVersion: 7,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+    }])
   })
 
   it('fails the current canvas closed when new-file creation returns 401', async () => {
