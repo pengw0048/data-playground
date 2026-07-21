@@ -122,10 +122,13 @@ def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
     commands = [step.get("run", "") for step in jobs["e2e"]["steps"]]
     assert commands.count("cd web && npm run e2e") == 1
     config = (_ROOT / "web" / "playwright.config.ts").read_text(encoding="utf-8")
+    assert "name: 'chromium-first-run'" in config
+    assert "grep: /@first-run/" in config
     assert "name: 'chromium-ux-smoke'" in config
+    assert "dependencies: ['chromium-first-run']" in config
     assert "grep: /@ux-smoke/" in config
     assert "dependencies: ['chromium-ux-smoke']" in config
-    assert "grepInvert: /@ux-smoke/" in config
+    assert "grepInvert: /@ux-smoke|@first-run/" in config
 
 
 def test_non_subsystem_heavy_acceptance_is_not_a_pull_request_gate() -> None:

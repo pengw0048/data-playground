@@ -22,6 +22,12 @@ import {
   canvasDocsEqual, canvasEditableContentEqual, deleteCanvasDraft, readCanvasDrafts, writeCanvasDraft,
   type LocalCanvasDraft,
 } from './canvasDrafts'
+import {
+  isPristineExampleReplacement,
+  isSameExampleReplacementSnapshot,
+  type ExampleCreationIntent,
+  type ExampleReplacementSnapshot,
+} from './exampleReplacement'
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
@@ -1139,7 +1145,7 @@ interface Store {
   refreshUsers: () => Promise<void>
   openFile: (id: string, options?: { serverCopy?: boolean }) => Promise<boolean>
   newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
-  newFromExample: (key: string) => Promise<CanvasCreationResult>
+  newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
@@ -3003,20 +3009,37 @@ export const useStore = create<Store>((set, get) => ({
     return { ok: true, canvasId: doc.id, persistence }
   },
 
-  newFromExample: async (key) => {
+  newFromExample: async (key, intent = 'create-separate') => {
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
     const current = get()
-    let replacePristine = current.canvasRole === 'owner'
-      && current.currentDraftId == null && current.serverVersion != null
-      && current.doc.name === 'untitled' && current.doc.nodes.length === 0 && current.doc.edges.length === 0
+    const candidate: ExampleReplacementSnapshot = {
+      doc: current.doc,
+      canvasRole: current.canvasRole,
+      currentDraftId: current.currentDraftId,
+      serverVersion: current.serverVersion,
+    }
+    // The mutation may downgrade a UI-confirmed replacement, but it must never upgrade an action
+    // that the UI described as creating a separate Canvas.
+    let replacePristine = intent === 'replace-pristine' && isPristineExampleReplacement(candidate)
     // A blank graph is not necessarily pristine: a run is durable user work.  Fail closed when
     // history cannot be read, so an offline/revoked tab creates a separate example instead.
     if (replacePristine) {
-      try { replacePristine = (await api.listRuns(current.doc.id)).length === 0 }
-      catch { replacePristine = false }
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId
-          || get().doc.id !== current.doc.id) return { ok: false }
+      let runsEmpty = false
+      try { runsEmpty = (await api.listRuns(current.doc.id)).length === 0 }
+      catch { /* fail closed below */ }
+      const latest = get()
+      if (generation !== _fileNavigationGeneration || (latest.currentUser?.id ?? null) !== userId
+          || latest.doc.id !== current.doc.id) return { ok: false }
+      const latestCandidate: ExampleReplacementSnapshot = {
+        doc: latest.doc,
+        canvasRole: latest.canvasRole,
+        currentDraftId: latest.currentDraftId,
+        serverVersion: latest.serverVersion,
+      }
+      replacePristine = runsEmpty
+        && isPristineExampleReplacement(latestCandidate)
+        && isSameExampleReplacementSnapshot(candidate, latestCandidate)
     }
     const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file

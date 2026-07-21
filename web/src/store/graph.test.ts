@@ -2617,7 +2617,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.listRuns.mockResolvedValue([])
     apiMocks.saveCanvas.mockResolvedValue({ ok: true, id: 'pristine', version: 2 })
 
-    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true, canvasId: 'pristine' })
+    expect(await useStore.getState().newFromExample('purchases', 'replace-pristine')).toMatchObject({ ok: true, canvasId: 'pristine' })
     expect(apiMocks.createCanvas).not.toHaveBeenCalled()
     expect(apiMocks.saveCanvas).toHaveBeenCalledWith(expect.objectContaining({ id: 'pristine' }), false, 1)
     expect(useStore.getState().doc.nodes.length).toBeGreaterThan(0)
@@ -2630,7 +2630,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ serverVersion: 1, currentDraftId: null })
     apiMocks.listRuns.mockResolvedValue([{ runId: 'durable-user-work' }])
 
-    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true })
+    expect(await useStore.getState().newFromExample('purchases', 'replace-pristine')).toMatchObject({ ok: true })
     expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
     expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
     expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
@@ -2644,7 +2644,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.listRuns.mockResolvedValue([])
     apiMocks.saveCanvas.mockRejectedValueOnce(new TypeError('response lost'))
 
-    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({
+    expect(await useStore.getState().newFromExample('purchases', 'replace-pristine')).toMatchObject({
       ok: true, canvasId: blank.id, persistence: 'local-draft',
     })
     expect(useStore.getState().serverVersion).toBe(7)
@@ -2655,6 +2655,90 @@ describe('graph store — core authority ops', () => {
       createAttemptDoc: null,
       syncState: 'dirty',
     }])
+  })
+
+  it('never upgrades a displayed separate-create action into an in-place replacement', async () => {
+    const blank = emptyTestDoc('displayed-separate')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+
+    const result = await useStore.getState().newFromExample('purchases', 'create-separate')
+
+    expect(result).toMatchObject({ ok: true })
+    expect(apiMocks.listRuns).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+  })
+
+  it('preserves requirements on an otherwise empty Canvas by creating the example separately', async () => {
+    const blank = { ...emptyTestDoc('configured-requirements'), name: 'untitled', requirements: ['polars>=1'] }
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+
+    const result = await useStore.getState().newFromExample('purchases', 'replace-pristine')
+
+    expect(result).toMatchObject({ ok: true })
+    expect(apiMocks.listRuns).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+    expect(blank.requirements).toEqual(['polars>=1'])
+  })
+
+  it('preserves parameters on an otherwise empty Canvas by creating the example separately', async () => {
+    const blank = {
+      ...emptyTestDoc('configured-parameters'),
+      name: 'untitled',
+      parameters: [{ name: 'threshold', type: 'float' as const, default: 0.5 }],
+    }
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+
+    const result = await useStore.getState().newFromExample('purchases', 'replace-pristine')
+
+    expect(result).toMatchObject({ ok: true })
+    expect(apiMocks.listRuns).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+    expect(blank.parameters).toEqual([{ name: 'threshold', type: 'float', default: 0.5 }])
+  })
+
+  it('downgrades an intended replacement when durable content changes while run history is loading', async () => {
+    const blank = emptyTestDoc('edited-during-history')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    let finishRuns!: (runs: unknown[]) => void
+    apiMocks.listRuns.mockReturnValue(new Promise((resolve) => { finishRuns = resolve }))
+
+    const creation = useStore.getState().newFromExample('purchases', 'replace-pristine')
+    useStore.getState().setRequirements(['duckdb>=1'])
+    expect(useStore.getState().setParameters([
+      { name: 'limit', type: 'integer', default: 100 },
+    ])).toBeNull()
+    const edited = useStore.getState().doc
+    finishRuns([])
+
+    expect(await creation).toMatchObject({ ok: true })
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+    expect(edited.requirements).toEqual(['duckdb>=1'])
+    expect(edited.parameters).toEqual([{ name: 'limit', type: 'integer', default: 100 }])
+  })
+
+  it('downgrades an intended replacement when run history cannot be confirmed', async () => {
+    const blank = emptyTestDoc('history-unavailable')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    apiMocks.listRuns.mockRejectedValue(new TypeError('offline'))
+
+    expect(await useStore.getState().newFromExample('purchases', 'replace-pristine')).toMatchObject({ ok: true })
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
+    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
   })
 
   it('fails the current canvas closed when new-file creation returns 401', async () => {

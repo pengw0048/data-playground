@@ -21,7 +21,7 @@ import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
 import { locateNode } from './locateNode'
-import { useExampleCreatesSeparate } from './useExampleCreatesSeparate'
+import { useExampleCreationIntent } from './useExampleCreationIntent'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -52,7 +52,8 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
   // gate the Agent CTA on a configured model — otherwise the most prominent first-run button leads
   // straight to "Agent unavailable" (the default is no model).
   const [agentOk, setAgentOk] = useState(false)
-  const exampleCreatesSeparate = useExampleCreatesSeparate()
+  const exampleIntent = useExampleCreationIntent(canEdit)
+  const exampleCreatesSeparate = exampleIntent === 'create-separate'
   useEffect(() => {
     if (!canEdit) return
     api.agentStatus().then((s) => setAgentOk(!!s.available)).catch(() => setAgentOk(false))
@@ -78,7 +79,7 @@ function EmptyState({ canEdit }: { canEdit: boolean }) {
         {canEdit && <div className="mx-auto mt-6 grid max-w-[460px] gap-2">
           <div className="text-[10.5px] font-semibold uppercase tracking-[0.6px] text-muted-foreground/70">Start from an example</div>
           {examples.map((ex) => (
-            <button key={ex.key} onClick={() => { void newFromExample(ex.key) }} title={ex.blurb}
+            <button key={ex.key} onClick={() => { void newFromExample(ex.key, exampleIntent) }} title={ex.blurb}
               aria-label={exampleCreatesSeparate ? `Create example Canvas: ${ex.name}` : `Use example in this Canvas: ${ex.name}`}
               className="rounded-lg border border-border bg-card px-3 py-2 text-left transition-colors hover:border-primary/50 hover:bg-accent">
               <div className="text-[12px] font-semibold text-foreground">{ex.name}</div>

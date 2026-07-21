@@ -25,7 +25,7 @@ import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { api } from '../api/client'
-import { useExampleCreatesSeparate } from './useExampleCreatesSeparate'
+import { useExampleCreationIntent } from './useExampleCreationIntent'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -214,7 +214,8 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const currentDraftId = useStore((s) => s.currentDraftId)
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
-  const exampleCreatesSeparate = useExampleCreatesSeparate()
+  const exampleIntent = useExampleCreationIntent(open && canEdit)
+  const exampleCreatesSeparate = exampleIntent === 'create-separate'
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
@@ -262,7 +263,7 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
           {exampleCreatesSeparate ? 'Create example Canvas' : 'New from example'}
         </div>
         {examples.map((ex) => (
-          <DropdownMenuItem key={ex.key} onSelect={() => { setOpen(false); void newFromExample(ex.key) }} title={ex.blurb}
+          <DropdownMenuItem key={ex.key} onSelect={() => { setOpen(false); void newFromExample(ex.key, exampleIntent) }} title={ex.blurb}
             aria-label={exampleCreatesSeparate ? `Create example Canvas: ${ex.name}` : ex.name}>
             <Icon name="grid" size={14} /> {ex.name}
           </DropdownMenuItem>
