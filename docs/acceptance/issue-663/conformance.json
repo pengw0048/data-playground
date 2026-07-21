@@ -1,0 +1,73 @@
+{
+  "issue": 663,
+  "title": "acceptance: certify release candidate v0.1.0",
+  "verdict": "fail",
+  "verdict_reason": "Researcher journeys and the installed wheel are green, but the tagged release cannot publish from the frozen commit: release-artifacts.yml wheel-smoke migration self-check fails (issue #670). Release must re-freeze after the fix.",
+  "identity": {
+    "frozen_commit": "5a2943691a9cab196efaf6f33b889f2108981c71",
+    "version": "0.1.0",
+    "re_freeze_record": "https://github.com/pengw0048/data-playground/issues/174#issuecomment-5029540360",
+    "executed_on": "2026-07-20",
+    "environment": {
+      "os": "macOS 26.5.2 (25F84)",
+      "node": "v26.5.0",
+      "uv": "0.10.10",
+      "python_host": "3.12.13",
+      "python_wheel_runtime": "3.13.12",
+      "playwright": "1.61.1",
+      "duckdb": "1.5.4",
+      "pyarrow": "25.0.0"
+    }
+  },
+  "artifacts": {
+    "wheel": {
+      "name": "data_playground-0.1.0-py3-none-any.whl",
+      "sha256": "03b784c5bd4a00f7fc684f0419fc8e73882484c35594276b718f122b2a68ec8a"
+    },
+    "image": {
+      "built": false,
+      "reason": "Docker is unavailable in this audit environment; image build + container smoke run only in release-artifacts.yml (CI). Not exercised locally."
+    }
+  },
+  "checks": [
+    {"id": "web-build", "command": "cd web && npm ci && npm run build", "result": "pass"},
+    {"id": "wheel-build", "command": "cd kernel && uv build --wheel --out-dir dist", "result": "pass"},
+    {"id": "wheel-has-spa", "command": "python3 scripts/check_wheel_has_spa.py kernel/dist/*.whl", "result": "pass", "detail": "ships a real SPA (1018 bytes hub/_web/index.html)"},
+    {"id": "wheel-fresh-install", "command": "uv venv <outside-checkout>; uv pip install <wheel>", "result": "pass", "detail": "importlib.metadata reports 0.1.0"},
+    {"id": "starter-canvas-smoke", "command": "python3 scripts/release_smoke.py --base-url http://127.0.0.1:8477 --expect-version 0.1.0", "result": "pass", "detail": "version 0.1.0, sha=frozen commit, aggregate committed 50 rows, one named output, sample columns {user_id,total,n}"},
+    {"id": "version-identity", "command": "python3 scripts/check_release_versions.py --pyproject --package-json --wheel --api-version-json --require pyproject,package_json,wheel,api", "result": "pass", "detail": "all sources report 0.1.0"},
+    {"id": "schema-head", "command": "packaged Alembic head vs metadb.expected_schema_head()", "result": "pass", "detail": "stored_head == expected_schema_head() == 0038_inbox_dataset_scoped"},
+    {"id": "release-artifacts-migration-selfcheck", "command": "verbatim release-artifacts.yml 'Verify the wheel-installed baseline migration' step", "result": "fail", "detail": "assert revisions == ['0001_schema_baseline.py'] fails: wheel ships 38 migration files (0001..0038). Filed as #670.", "finding": 670, "severity": "P1"},
+    {"id": "full-ux-matrix", "command": "cd web && CI=true DP_E2E_FIXTURE_PROFILE=full npm run e2e", "result": "pass", "detail": "116 passed in 3.1m; .last-run.json status=passed, failedTests=[]"},
+    {"id": "p0-p1-ux-gate", "command": "python3 scripts/ux_release_gate.py --repo pengw0048/data-playground", "result": "pass", "detail": "No open P0/P1 UX golden-workflow defects."},
+    {"id": "headless-run-parity", "command": "<wheel-venv>/bin/dataplay run \"Purchases per user\" --workspace <ws> --json", "result": "pass", "detail": "status=done, total_rows=50, placement=local, all 5 nodes done, output committed to top_users.parquet (table top_users, version v51c4ffa1ee)"}
+  ],
+  "golden_journeys": [
+    {"journey": "Workspace discovery", "covered_by": "workspace.spec.ts, workspace-datasets.spec.ts", "result": "pass"},
+    {"journey": "Catalog browse/search/paging/folders", "covered_by": "ux-full-matrix.spec.ts (120-dataset + relationship-dense)", "result": "pass"},
+    {"journey": "Canvas build + preview + invalidation", "covered_by": "ux-golden-workflows.spec.ts, canvas.spec.ts", "result": "pass"},
+    {"journey": "Write -> managed revision + receipt", "covered_by": "default-write-journey.spec.ts, canvas.spec.ts", "result": "pass"},
+    {"journey": "Jobs", "covered_by": "jobs.spec.ts", "result": "pass"},
+    {"journey": "Inbox", "covered_by": "inbox.spec.ts", "result": "pass"},
+    {"journey": "Revision history — exact reopen", "covered_by": "default-write-journey.spec.ts, workspace.spec.ts", "result": "pass"},
+    {"journey": "Revision history — restore-as-new-head (#307)", "covered_by": "restore-revision.spec.ts", "result": "pass"},
+    {"journey": "Revision history — keyed upsert (#489)", "covered_by": "keyed-upsert-journey.spec.ts, upsert.spec.ts, merge-columns.spec.ts", "result": "pass"},
+    {"journey": "Durable recovery (hub restart mid-run)", "covered_by": "default-write-journey.spec.ts test 4, keyed-upsert-journey.spec.ts test 3", "result": "pass"}
+  ],
+  "findings": [
+    {"ref": 670, "severity": "P1", "summary": "release-artifacts.yml migration self-check asserts a single squashed baseline; wheel ships 38 migrations, so tag v0.1.0 cannot publish.", "in_leaf": false},
+    {"ref": null, "severity": "P2", "summary": "CHANGELOG [Unreleased] states Alembic head 0012_linear_checkpoint_admission; actual head is 0038_inbox_dataset_scoped. Same root cause as #670; folded into #670.", "in_leaf": false},
+    {"ref": null, "severity": "P3", "summary": "GET /api/catalog/tables/<id>/revisions/capabilities returns 501 NOT_IMPLEMENTED for plain-file datasets (events.parquet), surfaced as a devtools-only console error on the catalog surface. Existing contract (no revision adapter -> 501); tolerated by the passing full matrix; no visible or functional impact. Captured in visual-review.json.", "in_leaf": false}
+  ],
+  "documented_p2_status": {
+    "note": "The re-freeze record (#174) declares the documented-P2 list empty; #665/#664/#666 landed the prior three P2s. None reproduced here.",
+    "P2-1_first_attempt_flakes": "absent",
+    "P2-2_canvas_less_task_projection": "absent",
+    "P2-3_postgres_keyed_upsert_journey": "absent (runs on the scheduled tier)"
+  },
+  "not_exercised_locally": [
+    "Docker image build + container smoke (no Docker; runs in release-artifacts.yml image-smoke).",
+    "Shared profile (Compose + Postgres) condensed journey and backup/restore drill (no Postgres/Compose locally; keyed-upsert-on-Postgres runs in the ux-acceptance.yml scheduled postgres-journey per #666/#669).",
+    "Maintainer human screenshot review (required before this leaf closes)."
+  ]
+}

@@ -1,0 +1,42 @@
+[
+  {
+    "viewport": "1440x900",
+    "theme": "light",
+    "consoleOrPageErrors": [
+      {
+        "kind": "console",
+        "text": "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
+      }
+    ]
+  },
+  {
+    "viewport": "1440x900",
+    "theme": "dark",
+    "consoleOrPageErrors": [
+      {
+        "kind": "console",
+        "text": "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
+      }
+    ]
+  },
+  {
+    "viewport": "1280x720",
+    "theme": "light",
+    "consoleOrPageErrors": [
+      {
+        "kind": "console",
+        "text": "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
+      }
+    ]
+  },
+  {
+    "viewport": "1280x720",
+    "theme": "dark",
+    "consoleOrPageErrors": [
+      {
+        "kind": "console",
+        "text": "Failed to load resource: the server responded with a status of 501 (Not Implemented)"
+      }
+    ]
+  }
+]
