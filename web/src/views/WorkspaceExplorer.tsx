@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
@@ -6,6 +6,7 @@ import type {
   WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu'
 import {
   CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
   type CatalogDiscoveryQueryState,
@@ -16,6 +17,19 @@ import { examples } from '../examples'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
+const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
+  id: `container:${LOCAL_ROOT_ID}`, kind: 'container', name: 'Workspace', detached: false, source: 'local',
+}
+const NON_EMPTY_LOCAL_FOLDER_REASON = "Move or remove this Folder's contents before deleting it."
+
+const WorkspaceOverflowMenuContext = createContext<{ openId: string | null; setOpenId: (id: string | null) => void }>({
+  openId: null, setOpenId: () => undefined,
+})
+
+function WorkspaceOverflowMenuProvider({ children }: { children: ReactNode }) {
+  const [openId, setOpenId] = useState<string | null>(null)
+  return <WorkspaceOverflowMenuContext.Provider value={{ openId, setOpenId }}>{children}</WorkspaceOverflowMenuContext.Provider>
+}
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
@@ -23,6 +37,10 @@ const isExternal = (resource: WorkspaceResource | null) => resource?.source === 
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
 const isCurrentCatalogLocation = (resource: WorkspaceResource | null) => !!resource && !resource.detached
   && (identity(resource) === LOCAL_ROOT_ID || resource.catalogFolderState === 'current')
+function folderDeleteMode(resource: WorkspaceResource): 'delete' | 'explain' | null {
+  if (resource.canDeleteFolder) return 'delete'
+  return resource.folderMutationUnavailableReason === NON_EMPTY_LOCAL_FOLDER_REASON ? 'explain' : null
+}
 type CanvasDestination = { containerId: string; expectedContainerVersion: number; externalOverlay: boolean }
 
 // Provider containers expose a localPlacement capability rather than mutation authority.  This
@@ -188,11 +206,11 @@ export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
   const firstRunChoice = useStore((state) => state.firstRunChoice)
-  return <div className="flex h-full min-h-0 flex-col">
+  return <WorkspaceOverflowMenuProvider><div className="flex h-full min-h-0 flex-col">
     {firstRunChoice && <FirstRunCanvasChoice />}
     <WorkspaceLocalDrafts />
     <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
-  </div>
+  </div></WorkspaceOverflowMenuProvider>
 }
 
 // A first-run choice belongs beside the Workspace, not in a separate tutorial surface: datasets
@@ -260,12 +278,18 @@ function WorkspaceMixedExplorer() {
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  const [folderCreateParent, setFolderCreateParent] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
+  const [folderRenameResource, setFolderRenameResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
+  const [folderDeleteResource, setFolderDeleteResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
+  const [canvasRenameResource, setCanvasRenameResource] = useState<WorkspaceResource | null>(null)
+  const [canvasDeleteResource, setCanvasDeleteResource] = useState<WorkspaceResource | null>(null)
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
   const [providerDatasetAction, setProviderDatasetAction] = useState<WorkspaceResource | null>(null)
   const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
   const [relinkResource, setRelinkResource] = useState<WorkspaceResource | null>(null)
   const [undoMove, setUndoMove] = useState<{
     resource: WorkspaceResource; previousContainer: WorkspaceResource; destination: WorkspaceResource
+    destinationPath: WorkspaceResource[]
   } | null>(null)
   const [undoBusy, setUndoBusy] = useState(false)
   const [revision, setRevision] = useState(0)
@@ -494,9 +518,11 @@ function WorkspaceMixedExplorer() {
           }}><Icon name="close" size={12} /></button>}
         </form>
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
+          {container?.canCreateFolder && <button onClick={() => setFolderCreateParent({ resource: container, path: crumbs })} disabled={loading}
+            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New folder</button>}
           <button onClick={() => setCreateOpen(true)} disabled={!canvasDestination(container, 'create') || loading}
             title={canvasDestinationTitle(container, 'create')}
-            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New canvas here</button>
+            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">{isExternal(container) ? 'Create a local Canvas here' : 'New canvas here'}</button>
         </div>
         <button onClick={reload} disabled={loading || loadingMore} data-testid="workspace-reload" className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
           <Icon name="refresh" size={13} /> Reload
@@ -504,7 +530,7 @@ function WorkspaceMixedExplorer() {
       </header>
 
       {undoMove && <div role="status" className="flex items-center gap-2 border-b border-border bg-primary/5 px-7 py-2 text-[12px] text-foreground">
-        <span className="flex-1">Moved “{undoMove.resource.name}” to {undoMove.destination.name}.{!undoDestination && ' Its previous source-only location is unavailable; recover or relink it before undoing.'}</span>
+        <span className="flex-1">Moved “{undoMove.resource.name}” to {breadcrumb(undoMove.destinationPath)}.{!undoDestination && ' Its previous source-only location is unavailable; recover or relink it before undoing.'}</span>
         <button onClick={() => void undoLastMove()} disabled={undoBusy || !undoDestination}
           title={!undoDestination ? canvasDestinationTitle(undoMove.previousContainer, 'move') : undefined}
           className="font-semibold text-primary underline disabled:opacity-50">{undoBusy ? 'Undoing…' : undoDestination ? 'Undo move' : 'Undo unavailable'}</button>
@@ -528,7 +554,18 @@ function WorkspaceMixedExplorer() {
           <button onClick={reload} className="font-semibold underline">Retry</button>
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : items.length ? <div className="mx-auto grid max-w-5xl gap-2">
           {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
-            onMove={resource.kind === 'canvas' && !resource.detached ? () => setMoveResource(resource) : undefined} />)}
+            onNewFolder={resource.kind === 'container' && resource.canCreateFolder
+              ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
+            onRenameFolder={resource.kind === 'container' && resource.canRenameFolder
+              ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
+            onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
+              ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
+            onMove={resource.kind === 'canvas' && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+              ? () => setMoveResource(resource) : undefined}
+            onRenameCanvas={resource.kind === 'canvas' && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+              ? () => setCanvasRenameResource(resource) : undefined}
+            onDeleteCanvas={resource.kind === 'canvas' && files.find((file) => file.id === identity(resource))?.role === 'owner'
+              ? () => setCanvasDeleteResource(resource) : undefined} />)}
           {loadMoreError && <div role="alert" className="mx-auto mt-2 text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
           {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
             {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more'}
@@ -563,6 +600,22 @@ function WorkspaceMixedExplorer() {
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && canvasDestination(container, 'create') && <NewCanvasDialog container={container!} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
+      {folderCreateParent && <FolderCreateDialog parent={folderCreateParent.resource} path={folderCreateParent.path}
+        onClose={() => setFolderCreateParent(null)} onCreated={(resource) => {
+          setFolderCreateParent(null); reload(); setWorkspaceResource(resource.id)
+        }} />}
+      {folderRenameResource && <FolderRenameDialog resource={folderRenameResource.resource} path={folderRenameResource.path}
+        onClose={() => setFolderRenameResource(null)} onRenamed={(resource) => {
+          setFolderRenameResource(null); reload(); setWorkspaceResource(resource.id)
+        }} />}
+      {folderDeleteResource && <FolderDeleteDialog resource={folderDeleteResource.resource} path={folderDeleteResource.path}
+        onClose={() => setFolderDeleteResource(null)} onDeleted={() => {
+          setFolderDeleteResource(null); reload()
+        }} onOpenFolder={() => { setFolderDeleteResource(null); setWorkspaceResource(folderDeleteResource.resource.id) }} />}
+      {canvasRenameResource && <CanvasRenameDialog resource={canvasRenameResource} onClose={() => setCanvasRenameResource(null)}
+        onRenamed={() => { setCanvasRenameResource(null); void refreshFiles(); reload() }} />}
+      {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
+        onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
         files={files} onClose={() => setDatasetAction(null)}
         onOpened={(canvasId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openFile(canvasId) }} />}
@@ -571,10 +624,11 @@ function WorkspaceMixedExplorer() {
         onOpened={(canvasId) => {
           setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
         }} />}
-      {moveResource && container && <MoveCanvasDialog resource={moveResource} sourceContainer={container} onClose={() => setMoveResource(null)}
-        onMoved={(result) => {
+      {moveResource && container && <MoveCanvasDialog resource={moveResource} sourceContainer={container} sourcePath={crumbs} onClose={() => setMoveResource(null)}
+        onMoved={(result, destinationPath) => {
           setMoveResource(null)
-          setUndoMove({ resource: result.resource, previousContainer: result.previousContainer, destination: result.container })
+          setUndoMove({ resource: result.resource, previousContainer: result.previousContainer, destination: result.container,
+            destinationPath })
           reload()
         }} />}
       {relinkResource && <RelinkResourceDialog resource={relinkResource} onClose={() => setRelinkResource(null)}
@@ -933,13 +987,145 @@ function NewCanvasDialog({ container, onClose, onCreated }: {
   }
   return <Modal label="New canvas here" onClose={onClose}>
     <p className="text-[12px] text-muted-foreground">Destination: <strong className="text-foreground">{container.name}</strong>{isExternal(container) && <span> · locally owned Canvas overlay</span>}</p>
-    {isExternal(container) && <p className="text-[11px] leading-5 text-muted-foreground">This creates a local Canvas beside a source-only provider resource. It never changes the provider.</p>}
+    {isExternal(container) && <p className="text-[11px] leading-5 text-muted-foreground">This does not change the connected catalog. The Canvas is local to Data Playground.</p>}
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
       <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={!name.trim() || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating…' : 'Create canvas'}</button></div>
+  </Modal>
+}
+
+function breadcrumb(path: WorkspaceResource[]): string {
+  const names = path.map((item) => item.name).filter(Boolean)
+  return names[0] === 'Workspace' ? names.join(' / ') : ['Workspace', ...names].join(' / ')
+}
+
+function FolderCreateDialog({ parent, path, onClose, onCreated }: {
+  parent: WorkspaceResource; path: WorkspaceResource[]; onClose: () => void
+  onCreated: (resource: WorkspaceResource) => void
+}) {
+  const [name, setName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const replay = useRef<{ intent: string; requestId: string } | null>(null)
+  const submit = async () => {
+    if (!name.trim() || parent.version == null || busy) return
+    setBusy(true); setError(null)
+    try {
+      const intent = JSON.stringify({ parentId: identity(parent), expectedParentVersion: parent.version, name: name.trim() })
+      if (replay.current?.intent !== intent) replay.current = { intent, requestId: newRequestId() }
+      const result = await api.workspaceCreateFolder({
+        parentId: identity(parent), expectedParentVersion: parent.version, name: name.trim(), requestId: replay.current.requestId,
+      })
+      onCreated(result.resource)
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label="New folder" onClose={onClose}>
+    <p className="text-[12px] text-muted-foreground">Parent: <strong className="text-foreground">{breadcrumb(path)}</strong></p>
+    <label className="grid gap-1 text-[11px] text-muted-foreground">Folder name
+      <input autoFocus aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+    </label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button onClick={() => void submit()} disabled={!name.trim() || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Creating…' : 'Create'}</button></div>
+  </Modal>
+}
+
+function FolderRenameDialog({ resource, path, onClose, onRenamed }: {
+  resource: WorkspaceResource; path: WorkspaceResource[]; onClose: () => void
+  onRenamed: (resource: WorkspaceResource) => void
+}) {
+  const [name, setName] = useState(resource.name)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (!name.trim() || resource.version == null || busy) return
+    setBusy(true); setError(null)
+    try { onRenamed((await api.workspaceRenameFolder(identity(resource), { expectedVersion: resource.version, name: name.trim() })).resource) }
+    catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Rename ${resource.name}`} onClose={onClose}>
+    <p className="text-[12px] text-muted-foreground">Location: <strong className="text-foreground">{breadcrumb(path.slice(0, -1))}</strong></p>
+    <label className="grid gap-1 text-[11px] text-muted-foreground">Folder name
+      <input autoFocus aria-label="Folder name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+    </label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button onClick={() => void submit()} disabled={!name.trim() || name.trim() === resource.name || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button></div>
+  </Modal>
+}
+
+function FolderDeleteDialog({ resource, path, onClose, onDeleted, onOpenFolder }: {
+  resource: WorkspaceResource; path: WorkspaceResource[]; onClose: () => void; onDeleted: () => void; onOpenFolder: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const empty = resource.canDeleteFolder
+  const submit = async () => {
+    if (!empty || resource.version == null || busy) return
+    setBusy(true); setError(null)
+    try { await api.workspaceDeleteFolder(identity(resource), { expectedVersion: resource.version }); onDeleted() }
+    catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Delete ${resource.name}`} onClose={onClose}>
+    <p className="text-[12px] text-muted-foreground">Location: <strong className="text-foreground">{breadcrumb(path.slice(0, -1))}</strong></p>
+    {!empty ? <p role="status" className="text-[12px] leading-5 text-muted-foreground">This folder must be empty before it can be deleted.</p>
+      : <p className="text-[12px] leading-5 text-muted-foreground">Delete this empty local Folder? This cannot be undone.</p>}
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      {!empty && <button onClick={onOpenFolder} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background">Open folder</button>}
+      {empty && <button onClick={() => void submit()} disabled={busy} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button>}</div>
+  </Modal>
+}
+
+function CanvasRenameDialog({ resource, onClose, onRenamed }: {
+  resource: WorkspaceResource; onClose: () => void; onRenamed: () => void
+}) {
+  const [name, setName] = useState(resource.name)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (!name.trim() || resource.version == null || busy) return
+    setBusy(true); setError(null)
+    try {
+      const doc = await api.getCanvas(identity(resource))
+      await api.saveCanvas({ ...doc, name: name.trim() }, false, resource.version)
+      onRenamed()
+    } catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Rename ${resource.name}`} onClose={onClose}>
+    <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
+      <input autoFocus aria-label="Canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
+    </label>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button onClick={() => void submit()} disabled={!name.trim() || name.trim() === resource.name || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button></div>
+  </Modal>
+}
+
+function CanvasDeleteDialog({ resource, onClose, onDeleted }: {
+  resource: WorkspaceResource; onClose: () => void; onDeleted: () => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async () => {
+    if (busy) return
+    setBusy(true); setError(null)
+    try { await api.deleteCanvas(identity(resource)); onDeleted() }
+    catch (caught) { setError(errorMessage(caught)) }
+    finally { setBusy(false) }
+  }
+  return <Modal label={`Delete ${resource.name}`} onClose={onClose}>
+    <p className="text-[12px] text-muted-foreground">Delete this local Canvas? This cannot be undone.</p>
+    {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+      <button onClick={() => void submit()} disabled={busy} className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button></div>
   </Modal>
 }
 
@@ -1013,9 +1199,9 @@ function DatasetActionDialog({ action, container, destinationError, files, onClo
   </Modal>
 }
 
-function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
-  resource: WorkspaceResource; sourceContainer: WorkspaceResource; onClose: () => void
-  onMoved: (result: WorkspaceMoveCanvasResult) => void
+function MoveCanvasDialog({ resource, sourceContainer, sourcePath, onClose, onMoved }: {
+  resource: WorkspaceResource; sourceContainer: WorkspaceResource; sourcePath: WorkspaceResource[]; onClose: () => void
+  onMoved: (result: WorkspaceMoveCanvasResult, destinationPath: WorkspaceResource[]) => void
 }) {
   const [path, setPath] = useState<WorkspaceResource[]>([])
   const [container, setContainer] = useState<WorkspaceResource | null>(null)
@@ -1025,18 +1211,31 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const loadRequest = useRef(0)
   const load = useCallback(async (targetId: string, nextCursor?: string | null, nextPath?: WorkspaceResource[]) => {
+    const request = ++loadRequest.current
     setLoading(true); setError(null)
     try {
       const page = await api.workspaceBrowse(targetId, { limit: PAGE_SIZE, cursor: nextCursor ?? undefined })
+      if (request !== loadRequest.current) return
       if (!page.container) throw new Error(page.sources.map(statusMessage).find(Boolean) ?? 'Workspace destination is unavailable')
       setContainer(page.container)
+      if (!nextCursor) {
+        const next = nextPath ?? [page.container]
+        // The first picker page can resolve before React commits its path state. Its children still
+        // carry the root parent identity, so restore that display-only ancestor rather than showing
+        // an ambiguous bare name in the move confirmation.
+        setPath(next.length === 1 && next[0].parentId === WORKSPACE_ROOT_BREADCRUMB.id
+          ? [WORKSPACE_ROOT_BREADCRUMB, ...next] : next)
+      }
       const destinations = page.items.filter((item) => item.kind === 'container' && !!canvasDestination(item, 'move'))
       setChildren((current) => nextCursor ? [...current, ...destinations] : destinations)
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
-      if (!nextCursor) setPath(nextPath ?? [page.container])
-    } catch (caught) { setError(errorMessage(caught)) }
-    finally { setLoading(false) }
+    } catch (caught) {
+      if (request === loadRequest.current) setError(errorMessage(caught))
+    } finally {
+      if (request === loadRequest.current) setLoading(false)
+    }
   }, [])
   useEffect(() => { void load(LOCAL_ROOT_ID) }, [load])
   const move = async () => {
@@ -1047,22 +1246,27 @@ function MoveCanvasDialog({ resource, sourceContainer, onClose, onMoved }: {
       onMoved(await api.workspaceMoveCanvas(resource.placementId, {
         containerId: destination.containerId, expectedContainerVersion: destination.expectedContainerVersion,
         expectedVersion: resource.version,
-      }))
+      }), path)
     } catch (caught) { setError(errorMessage(caught)) }
     finally { setBusy(false) }
   }
   return <Modal label={`Move ${resource.name}`} onClose={onClose}>
-    <p className="text-[11px] text-muted-foreground">Current location: <strong className="text-foreground">{sourceContainer.name}</strong></p>
+    <p className="text-[11px] text-muted-foreground">Current location: <strong className="text-foreground">{breadcrumb(sourcePath)}</strong></p>
     <nav aria-label="Choose destination path" className="flex flex-wrap gap-1 text-[11px]">
       {path.map((item, index) => <button key={item.id} onClick={() => void load(identity(item), null, path.slice(0, index + 1))} className="text-primary underline">{item.name}</button>)}
     </nav>
     <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border p-1">
-      {loading && !children.length ? <div className="p-3 text-[11px] text-muted-foreground">Loading containers…</div> : children.map((child) => <button key={child.id} onClick={() => void load(identity(child), null, [...path, child])}
+      {loading && !children.length ? <div className="p-3 text-[11px] text-muted-foreground">Loading containers…</div> : children.map((child) => <button key={child.id} onClick={() => {
+        // `children` can paint one render before React commits the paired path state. Prefer the
+        // current loaded container in that narrow window so destination identity never loses its root.
+        const prefix = path.length ? path : container ? [container] : []
+        void load(identity(child), null, [...prefix, child])
+      }}
         className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent"><Icon name="chevronRight" size={12} /> <span className="min-w-0 flex-1 truncate">{child.name}</span>{isExternal(child) && <span className="text-[10px] text-muted-foreground">local overlay</span>}</button>)}
       {!loading && !children.length && <div className="p-3 text-[11px] text-muted-foreground">No child containers.</div>}
       {hasMore && <button onClick={() => void load(identity(container!), cursor)} disabled={loading} className="p-2 text-[11px] font-semibold text-primary">Load more containers</button>}
     </div>
-    {container && <p className="text-[12px]">Destination: <strong>{container.name}</strong>{isExternal(container) && ' · locally owned Canvas overlay'}</p>}
+    {container && <p className="text-[12px]">Destination: <strong>{breadcrumb(path)}</strong>{isExternal(container) && ' · locally owned Canvas overlay'}</p>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void move()} disabled={busy || !canvasDestination(container, 'move') || container?.id === sourceContainer.id} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Moving…' : `Move to ${container?.name ?? 'destination'}`}</button></div>
@@ -1078,7 +1282,12 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
   </div>
 }
 
-function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
+function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDeleteCanvas }: {
+  resource: WorkspaceResource; onOpen: () => void; onNewFolder?: () => void; onRenameFolder?: () => void; onDeleteFolder?: () => void
+  onMove?: () => void; onRenameCanvas?: () => void; onDeleteCanvas?: () => void
+}) {
+  const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
+  const menuOpen = openId === resource.id
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
@@ -1095,8 +1304,24 @@ function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource
       <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span></span>
       {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
-    {onMove && <button type="button" onClick={onMove} aria-label={`Move canvas ${resource.name}`}
-      className="mr-2 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-semibold text-muted-foreground hover:text-foreground">Move</button>}
+    <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
+      <DropdownMenuTrigger asChild>
+        <button type="button" aria-label={`More actions for ${resource.name}`}
+          onPointerDown={(event) => {
+            if (!menuOpen && event.button === 0 && !event.ctrlKey) setOpenId(resource.id)
+          }}
+          className="mr-2 shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[13px] font-semibold text-muted-foreground hover:text-foreground">•••</button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" aria-label={`Actions for ${resource.name}`} className="min-w-40">
+        <DropdownMenuItem onSelect={onOpen}>{resource.kind === 'dataset' ? 'Open in Workspace' : 'Open'}</DropdownMenuItem>
+        {onNewFolder && <DropdownMenuItem onSelect={onNewFolder}>New folder</DropdownMenuItem>}
+        {onRenameFolder && <DropdownMenuItem onSelect={onRenameFolder}>Rename</DropdownMenuItem>}
+        {onDeleteFolder && <DropdownMenuItem onSelect={onDeleteFolder} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
+        {onRenameCanvas && <DropdownMenuItem onSelect={onRenameCanvas}>Rename</DropdownMenuItem>}
+        {onMove && <DropdownMenuItem onSelect={onMove}>Move</DropdownMenuItem>}
+        {onDeleteCanvas && <DropdownMenuItem onSelect={onDeleteCanvas} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
+      </DropdownMenuContent>
+    </DropdownMenu>
   </div>
 }
 

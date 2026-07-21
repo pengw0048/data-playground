@@ -1,10 +1,11 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetViewDefinition } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
-  workspaceCreateCanvas: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
+  workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
+  getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
@@ -78,12 +79,12 @@ const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mo
 
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     store.workspaceResourceId = null
     store.workspaceSearchQuery = ''
     store.workspaceScope = 'all'
     store.workspaceDatasetQuery = ''
-    store.files = []
+    store.files = [{ id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' }]
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
@@ -162,6 +163,109 @@ describe('WorkspaceExplorer', () => {
       .toHaveTextContent('Folder · Local')
   })
 
+  it('derives one Folder overflow menu from local capabilities and creates with the exact parent CAS token', async () => {
+    const localFolder = { ...FOLDER, canCreateFolder: true, canRenameFolder: true, canDeleteFolder: true }
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [localFolder], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.workspaceCreateFolder.mockResolvedValue({ ok: true, resource: { ...localFolder, id: 'container:child', name: 'Child' } })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Research' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Research' })).toHaveTextContent('OpenNew folderRenameDelete')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'New folder' }))
+    const dialog = screen.getByRole('dialog', { name: 'New folder' })
+    expect(dialog).toHaveTextContent('Parent: Workspace / Research')
+    fireEvent.change(screen.getByLabelText('Folder name'), { target: { value: 'Child' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await waitFor(() => expect(mocks.workspaceCreateFolder).toHaveBeenCalledWith(expect.objectContaining({
+      parentId: 'folder-1', expectedParentVersion: 1, name: 'Child', requestId: expect.any(String),
+    })))
+  })
+
+  it('keeps non-empty local Folder deletion non-destructive and offers opening the Folder instead', async () => {
+    const nonEmpty = { ...FOLDER, canCreateFolder: true, canRenameFolder: true, canDeleteFolder: false,
+      folderMutationUnavailableReason: "Move or remove this Folder's contents before deleting it." }
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [nonEmpty], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Research' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    const dialog = screen.getByRole('dialog', { name: 'Delete Research' })
+    expect(dialog).toHaveTextContent('This folder must be empty before it can be deleted.')
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder' }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(nonEmpty.id)
+    expect(mocks.workspaceDeleteFolder).not.toHaveBeenCalled()
+  })
+
+  it('does not advertise configured mount deletion, but keeps the explicit detached recovery cleanup action', async () => {
+    const mount = { ...FOLDER, id: 'container:mount-point', name: 'Mount point', canCreateFolder: true, canRenameFolder: true,
+      canDeleteFolder: false, folderMutationUnavailableReason: 'This Folder is configured as a provider mount point and cannot be deleted.' }
+    const cleanupFolder = { ...FOLDER, id: 'container:cleanup-folder', name: 'Recovered local Folder', detached: true,
+      canCreateFolder: false, canRenameFolder: false, canDeleteFolder: true,
+      folderMutationUnavailableReason: 'This Folder is below a detached Catalog folder; only empty local Folder recovery cleanup is available.' }
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [mount, cleanupFolder], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.workspaceDeleteFolder.mockResolvedValue({ ok: true })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Mount point' }), { button: 0, ctrlKey: false })
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Recovered local Folder' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+    await waitFor(() => expect(mocks.workspaceDeleteFolder).toHaveBeenCalledWith('cleanup-folder', { expectedVersion: 1 }))
+  })
+
+  it('renames and deletes only an owned local Canvas through confirmation dialogs with its exact version', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.getCanvas.mockResolvedValue({ id: 'canvas-1', name: 'Analysis', version: 3, nodes: [], edges: [] })
+    mocks.saveCanvas.mockResolvedValue({ ok: true, id: 'canvas-1', version: 4 })
+    mocks.deleteCanvas.mockResolvedValue({ ok: true })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
+    fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'Renamed Analysis' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
+    await waitFor(() => expect(mocks.saveCanvas).toHaveBeenCalledWith({
+      id: 'canvas-1', name: 'Renamed Analysis', version: 3, nodes: [], edges: [],
+    }, false, 3))
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(mocks.deleteCanvas).not.toHaveBeenCalled()
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Delete Analysis' })).getByRole('button', { name: 'Delete' }))
+    await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledWith('canvas-1'))
+  })
+
+  it('does not expose local Canvas mutations to a viewer', async () => {
+    store.files = [{ id: 'canvas-1', name: 'Analysis', version: 3, role: 'viewer' }]
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+  })
+
+  it('keeps a source-only provider Folder free of Folder writes while retaining local Canvas creation', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [EXTERNAL_FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Remote' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu')).toHaveTextContent('Open')
+    expect(screen.queryByRole('menuitem', { name: 'New folder' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(mocks.workspaceCreateFolder).not.toHaveBeenCalled()
+    expect(mocks.workspaceRenameFolder).not.toHaveBeenCalled()
+    expect(mocks.workspaceDeleteFolder).not.toHaveBeenCalled()
+  })
+
   it('shows source-grouped partial search results and opens stable identities', async () => {
     store.workspaceSearchQuery = 'observations'
     mocks.workspaceSearch.mockResolvedValue({
@@ -226,7 +330,7 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'New canvas here' }))
     const dialog = screen.getByRole('dialog', { name: 'New canvas here' })
     expect(dialog).toHaveTextContent('locally owned Canvas overlay')
-    expect(dialog).toHaveTextContent('never changes the provider')
+    expect(dialog).toHaveTextContent('does not change the connected catalog')
     fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'Hand tracking review' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create canvas' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('connection interrupted')
@@ -577,8 +681,11 @@ describe('WorkspaceExplorer', () => {
       .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, version: 5 }, previousContainer: FOLDER, container: ROOT })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Move canvas Analysis' }))
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
+    expect(await screen.findByRole('dialog', { name: 'Move Analysis' })).toHaveTextContent('Current location: Workspace')
     fireEvent.click(await screen.findByRole('button', { name: 'Research' }))
+    await waitFor(() => expect(screen.getByText(/Destination:/)).toHaveTextContent('Destination: Workspace / Research'))
     fireEvent.click(await screen.findByRole('button', { name: 'Move to Research' }))
     await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
       containerId: 'folder-1', expectedContainerVersion: 1, expectedVersion: 3,
@@ -598,7 +705,8 @@ describe('WorkspaceExplorer', () => {
       .mockResolvedValueOnce({ ok: true, resource: { ...CANVAS, version: 5 }, previousContainer: EXTERNAL_FOLDER, container: ROOT })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Move canvas Analysis' }))
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
     fireEvent.click(await screen.findByRole('button', { name: /Remote.*local overlay/ }))
     const move = await screen.findByRole('button', { name: 'Move to Remote' })
     expect(screen.getByText(/Destination:/)).toHaveTextContent('locally owned Canvas overlay')
@@ -624,11 +732,13 @@ describe('WorkspaceExplorer', () => {
       .mockResolvedValueOnce({ ok: true, resource: { ...overlayCanvas, parentId: EXTERNAL_FOLDER.id, version: 5 }, previousContainer: ROOT, container: EXTERNAL_FOLDER })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Move canvas Analysis' }))
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Move to Workspace' }))
     await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(1, 'canvas-placement', {
       containerId: 'workspace-local-root', expectedContainerVersion: 1, expectedVersion: 3,
     }))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Moved “Analysis”'))
     fireEvent.click(await screen.findByRole('button', { name: 'Undo move' }))
     await waitFor(() => expect(mocks.workspaceMoveCanvas).toHaveBeenNthCalledWith(2, 'canvas-placement', {
       containerId: 'local-overlay-anchor', expectedContainerVersion: 7, expectedVersion: 4,
@@ -648,8 +758,10 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Move canvas Analysis' }))
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Move' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Move to Workspace' }))
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Moved “Analysis”'))
     const undo = await screen.findByRole('button', { name: 'Undo unavailable' })
     expect(undo).toBeDisabled()
     expect(undo).toHaveAttribute('title', 'The local Canvas overlay is unavailable; retry after this source recovers')
@@ -745,7 +857,7 @@ describe('WorkspaceExplorer', () => {
     const detail = await screen.findByRole('dialog', { name: 'observations' })
     expect(detail).toHaveTextContent('Source-only mount warehouse · fixture')
     expect(detail).toHaveTextContent('Using the dataset creates only a local Source; it never writes to the provider')
-    expect(screen.getByRole('button', { name: 'New canvas here' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Create a local Canvas here' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Use in canvas' }))
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',

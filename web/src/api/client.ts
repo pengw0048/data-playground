@@ -5,7 +5,7 @@ import type {
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
-  WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceFolderActionResult, WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
 } from '../types/api'
@@ -275,6 +275,16 @@ export const api = {
   workspaceMoveCanvas: (placementId: string, body: { containerId: string; expectedContainerVersion: number; expectedVersion: number }) =>
     req<WorkspaceMoveCanvasResult>(`/workspace/placements/${encodeURIComponent(placementId)}/canvas`, {
       method: 'PUT', body: JSON.stringify(body),
+    }),
+  workspaceCreateFolder: (body: { parentId: string; expectedParentVersion: number; name: string; requestId: string }) =>
+    req<WorkspaceFolderActionResult>('/workspace/folders', { method: 'POST', body: JSON.stringify(body) }),
+  workspaceRenameFolder: (containerId: string, body: { expectedVersion: number; name: string }) =>
+    req<WorkspaceFolderActionResult>(`/workspace/folders/${encodeURIComponent(containerId)}`, {
+      method: 'PATCH', body: JSON.stringify(body),
+    }),
+  workspaceDeleteFolder: (containerId: string, body: { expectedVersion: number }) =>
+    req<{ ok: boolean }>(`/workspace/folders/${encodeURIComponent(containerId)}`, {
+      method: 'DELETE', body: JSON.stringify(body),
     }),
   // folder entities (incl. empty ones) — used for the folder-name autocomplete + tree editing
   catalogFolders: () => req<CatalogFolder[]>('/catalog/folders'),
