@@ -654,14 +654,6 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
         if next_state is not None else None
     )
     partial = any(status["completeness"] in _ERROR_STATES for status in statuses)
-    if local_mounts:
-        container = {
-            **container,
-            "canDeleteFolder": False,
-            "folderMutationUnavailableReason": (
-                "This Folder is configured as a provider mount point and cannot be deleted."
-            ),
-        }
     return {
         "container": container,
         "items": items,

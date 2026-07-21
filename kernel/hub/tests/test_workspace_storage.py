@@ -7,6 +7,7 @@ import base64
 import contextlib
 import datetime
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -1136,30 +1137,84 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
 
 
 def test_workspace_configured_mount_point_cannot_be_deleted(workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
-    folder = metadb.workspace_create_container(root["id"], "Configured provider mount")
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-configured-provider-mount")
     provider = _WorkspaceFixtureProvider()
+    provider_search_calls = 0
+    provider_search = provider.search
+
+    def counted_search(*args, **kwargs):
+        nonlocal provider_search_calls
+        provider_search_calls += 1
+        return provider_search(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "search", counted_search)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
-    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+    mount_config = json.dumps([{
         "id": "protected-folder", "provider": "fixture", "containerId": folder["id"],
-    }]))
+    }])
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", mount_config)
+
+    def assert_delete_fenced(resource):
+        assert resource["id"] == f"container:{folder['id']}"
+        assert resource["canCreateFolder"] is True
+        assert resource["canRenameFolder"] is True
+        assert resource["canDeleteFolder"] is False
+        assert resource["folderMutationUnavailableReason"] == (
+            "This Folder is configured as a provider mount point and cannot be deleted."
+        )
 
     with TestClient(app) as client:
+        parent = client.get(f"/api/workspace/containers/{root['id']}", params={"limit": 100})
+        assert parent.status_code == 200, parent.text
+        parent_row = next(
+            item for item in parent.json()["items"]
+            if item["id"] == f"container:{folder['id']}")
+        assert_delete_fenced(parent_row)
+
         browsed = client.get(f"/api/workspace/containers/{folder['id']}")
         assert browsed.status_code == 200, browsed.text
         assert any(item.get("resourceId") == "dataset-a" for item in browsed.json()["items"])
-        assert browsed.json()["container"]["canDeleteFolder"] is False
-        assert browsed.json()["container"]["folderMutationUnavailableReason"] == (
-            "This Folder is configured as a provider mount point and cannot be deleted."
-        )
-        reads_before_delete = provider.list_calls
-        deleted = client.request("DELETE", f"/api/workspace/folders/{folder['id']}", json={
-            "expectedVersion": folder["version"],
-        })
+        assert_delete_fenced(browsed.json()["container"])
+
+        resolved = client.get(f"/api/workspace/resources/container:{folder['id']}")
+        assert resolved.status_code == 200, resolved.text
+        assert_delete_fenced(resolved.json()["resource"])
+
+        searched = client.get("/api/workspace/search", params={"q": folder["name"]})
+        assert searched.status_code == 200, searched.text
+        local_group = next(
+            group for group in searched.json()["groups"] if group["source"]["id"] == "local")
+        search_row = next(
+            item for item in local_group["items"]
+            if item["id"] == f"container:{folder['id']}")
+        assert_delete_fenced(search_row)
+
+        provider_calls_before_delete = (provider.list_calls, provider_search_calls)
+        engine = metadb._engine
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement.lower())
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            deleted = client.request("DELETE", f"/api/workspace/folders/{folder['id']}", json={
+                "expectedVersion": folder["version"],
+            })
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
         assert deleted.status_code == 422
-        assert provider.list_calls == reads_before_delete
-    resolved = metadb.workspace_resolve(f"container:{folder['id']}", uid=metadb.DEFAULT_USER_ID)
-    assert resolved["resource"]["id"] == f"container:{folder['id']}"
+        assert (provider.list_calls, provider_search_calls) == provider_calls_before_delete
+        assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
+                       for statement in statements)
+        assert os.environ["DP_CATALOG_MOUNTS"] == mount_config
+
+        after = client.get(f"/api/workspace/resources/container:{folder['id']}")
+        assert after.status_code == 200, after.text
+        assert_delete_fenced(after.json()["resource"])
 
 
 def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(

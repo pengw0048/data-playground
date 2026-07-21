@@ -5034,46 +5034,63 @@ def _workspace_folder_capabilities(s, row: WorkspaceContainer) -> dict:
             "canCreateFolder": False, "canRenameFolder": False, "canDeleteFolder": False,
             "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
         }
+    # Import lazily because the provider composer depends on this metadata module. The composer is
+    # the single parser for operator-owned mount configuration; every local WorkspaceResource must
+    # nevertheless project that same delete fence, not only a composed browse response.
+    from hub import workspace_providers
     if row.catalog_folder_state == "detached":
-        return {
+        capabilities = {
             "canCreateFolder": False, "canRenameFolder": False, "canDeleteFolder": False,
             "folderMutationUnavailableReason": "This Folder is detached and read-only.",
         }
-    if row.is_root:
-        return {
+    elif row.is_root:
+        capabilities = {
             "canCreateFolder": True, "canRenameFolder": False, "canDeleteFolder": False,
             "folderMutationUnavailableReason": "The Workspace root cannot be renamed or deleted.",
         }
-    if row.catalog_folder_id is not None:
-        return {
+    elif row.catalog_folder_id is not None:
+        capabilities = {
             "canCreateFolder": True, "canRenameFolder": False, "canDeleteFolder": False,
             "folderMutationUnavailableReason": "This Folder is managed by the Catalog.",
         }
-    has_children = s.scalar(select(WorkspaceContainer.id).where(
-        WorkspaceContainer.parent_id == row.id).limit(1)) is not None
-    has_placements = s.scalar(select(WorkspacePlacement.id).where(
-        WorkspacePlacement.container_id == row.id).limit(1)) is not None
-    if _workspace_has_detached_catalog_ancestor(s, row):
-        can_delete = not has_children and not has_placements
+    else:
+        has_children = s.scalar(select(WorkspaceContainer.id).where(
+            WorkspaceContainer.parent_id == row.id).limit(1)) is not None
+        has_placements = s.scalar(select(WorkspacePlacement.id).where(
+            WorkspacePlacement.container_id == row.id).limit(1)) is not None
+        if _workspace_has_detached_catalog_ancestor(s, row):
+            can_delete = not has_children and not has_placements
+            capabilities = {
+                "canCreateFolder": False,
+                "canRenameFolder": False,
+                "canDeleteFolder": can_delete,
+                "folderMutationUnavailableReason": (
+                    "This Folder is below a detached Catalog folder; only empty local Folder "
+                    "recovery cleanup is available."
+                    if can_delete else
+                    "This Folder is below a detached Catalog folder and is not empty."
+                ),
+            }
+        else:
+            capabilities = {
+                "canCreateFolder": True,
+                "canRenameFolder": True,
+                "canDeleteFolder": not has_children and not has_placements,
+                **({} if not has_children and not has_placements else {
+                    "folderMutationUnavailableReason": (
+                        "Move or remove this Folder's contents before deleting it."
+                    ),
+                }),
+            }
+    if workspace_providers.is_configured_mount_container(row.id):
         return {
-            "canCreateFolder": False,
-            "canRenameFolder": False,
-            "canDeleteFolder": can_delete,
+            **capabilities,
+            "canDeleteFolder": False,
             "folderMutationUnavailableReason": (
-                "This Folder is below a detached Catalog folder; only empty local Folder "
-                "recovery cleanup is available."
-                if can_delete else
-                "This Folder is below a detached Catalog folder and is not empty."
+                "This Folder is configured as a provider mount point and cannot be deleted."
             ),
         }
-    return {
-        "canCreateFolder": True,
-        "canRenameFolder": True,
-        "canDeleteFolder": not has_children and not has_placements,
-        **({} if not has_children and not has_placements else {
-            "folderMutationUnavailableReason": "Move or remove this Folder's contents before deleting it.",
-        }),
-    }
+    return capabilities
 
 
 def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
