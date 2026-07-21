@@ -84,6 +84,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
+  await page.getByText('Advanced filters', { exact: true }).click()
   for (const width of [1024, 1280, 1440]) {
     await page.setViewportSize({ width, height: 720 })
     await expectJobsFiltersToFit(page)
@@ -105,6 +106,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByRole('link', { name: 'Open node' })).toHaveAttribute(
     'href', '#/canvas/canvas-jobs?node=publish')
   await expect(page).toHaveURL(/run=run-failed/)
+  await page.getByText('Technical evidence', { exact: true }).click()
   await page.getByRole('button', { name: /Execution manifest/ }).click()
   await expect(page.getByText('Submitted graph')).toBeVisible()
   await expect(page.getByText('No declared parameter bindings were recorded.')).toBeVisible()
@@ -118,7 +120,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await expect(page.getByText(/Couldn’t load more Jobs/)).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis' })).toBeVisible()
   await page.getByRole('button', { name: 'Retry load more' }).click()
-  await expect(page.getByText('run-older')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open run run-older in Climate analysis' })).toBeVisible()
 })
 
 test('reopens a certified column merge from Jobs and opens only its exact published revision @ux-smoke', async ({ page }) => {
@@ -142,6 +144,7 @@ test('reopens a certified column merge from Jobs and opens only its exact publis
   await page.goto('/#/jobs')
   await expect(page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' })).toBeVisible()
   await page.getByRole('button', { name: 'Open run merge-task-1 in Column enrichment' }).click()
+  await page.getByText('Technical evidence', { exact: true }).click()
   await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
   await expect(page.getByText('rev-published')).toBeVisible()
   await page.getByRole('button', { name: 'Open exact revision' }).click()

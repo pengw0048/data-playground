@@ -19,6 +19,9 @@ const job = (overrides = {}) => ({
   outputs: [], createdAt: '2026-07-16T12:00:00Z', ...overrides,
 })
 
+const openAdvancedFilters = () => fireEvent.click(screen.getByText('Advanced filters'))
+const openTechnicalEvidence = () => fireEvent.click(screen.getByText('Technical evidence'))
+
 describe('JobsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -36,10 +39,11 @@ describe('JobsView', () => {
   it('distinguishes loading from an empty filtered result', async () => {
     let finish: ((value: { items: never[]; hasMore: boolean; nextCursor: null }) => void) | undefined
     mocks.workspaceJobs.mockReturnValue(new Promise((resolve) => { finish = resolve }))
+    useStore.setState({ jobsQuery: 'status=failed' } as never)
     render(<JobsView />)
     expect(screen.getByText('Loading Jobs…')).toBeVisible()
-    finish?.({ items: [], hasMore: false, nextCursor: null })
-    expect(await screen.findByText('No runs match these filters.')).toBeVisible()
+    await act(async () => { finish?.({ items: [], hasMore: false, nextCursor: null }) })
+    expect(screen.getByText('No Jobs match these filters.')).toBeVisible()
   })
 
   it('shows normalized workspace history and stable canvas/node links', async () => {
@@ -47,7 +51,7 @@ describe('JobsView', () => {
 
     expect(await screen.findByText('Alpha research')).toBeVisible()
     expect(screen.getByText('Publish observations')).toBeVisible()
-    expect(screen.queryByText('destination unavailable')).not.toBeInTheDocument()
+    expect(screen.getByText('destination unavailable')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
     expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: Unavailable')
@@ -66,18 +70,70 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run history-1 in Alpha research', expanded: false,
     }))
-    expect(screen.getByText('destination unavailable')).toBeVisible()
+    expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
     expect(useStore.getState().jobsQuery).toContain('run=history-1')
   })
 
   it('keeps filters in the route and passes them to the bounded API', async () => {
     render(<JobsView />)
     await screen.findByText('Alpha research')
+    openAdvancedFilters()
     fireEvent.change(screen.getByLabelText('Filter jobs by status'), { target: { value: 'running' } })
     await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=running'))
     await waitFor(() => expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({
       limit: 50, status: 'running',
     })))
+  })
+
+  it('maps quick views to existing status and time query fields', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(new Date('2026-07-21T12:00:00Z').getTime())
+    try {
+      render(<JobsView />)
+      await screen.findByText('Alpha research')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Queued' }))
+      await waitFor(() => expect(useStore.getState().jobsQuery).toBe('status=queued'))
+      expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'queued' }))
+
+      fireEvent.click(screen.getByRole('button', { name: 'Recent' }))
+      await waitFor(() => expect(useStore.getState().jobsQuery).toBe('after=2026-07-14T12%3A00%3A00.000Z'))
+      expect(mocks.workspaceJobs).toHaveBeenLastCalledWith(expect.objectContaining({ after: '2026-07-14T12:00:00.000Z', status: undefined }))
+
+      fireEvent.click(screen.getByRole('button', { name: 'All' }))
+      await waitFor(() => expect(useStore.getState().jobsQuery).toBe(''))
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('keeps exact evidence closed until a researcher asks for it', async () => {
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run run-1 in Alpha research', expanded: false }))
+
+    expect(screen.getByRole('alert')).toHaveTextContent('destination unavailable')
+    const evidence = screen.getByText('Technical evidence').closest('details')!
+    expect(evidence).not.toHaveAttribute('open')
+    expect(screen.getByText('Current attempt:')).not.toBeVisible()
+
+    openTechnicalEvidence()
+    expect(screen.getByText('Current attempt:')).toBeVisible()
+    expect(screen.getByText('Run:').closest('div')).toHaveTextContent('run-1')
+  })
+
+  it('rechecks the same unavailable deep link after returning to Jobs', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+    const deepLink = 'status=failed&canvas=canvas-1&run=missing-run&output=write-1%3Aout'
+    useStore.setState({ jobsQuery: deepLink } as never)
+    render(<JobsView />)
+
+    expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Back to Jobs' }))
+    expect(useStore.getState().jobsQuery).toBe('status=failed&canvas=canvas-1')
+    expect(screen.queryByText('This Job is unavailable or you no longer have access.')).not.toBeInTheDocument()
+
+    useStore.setState({ jobsQuery: deepLink } as never)
+    expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
+    expect(mocks.workspaceJobs).toHaveBeenCalledTimes(3)
   })
 
   it('uses authorized canvas names and current-page node/backend context while retaining canonical IDs', async () => {
@@ -93,6 +149,7 @@ describe('JobsView', () => {
     render(<JobsView />)
 
     await screen.findAllByText('Research')
+    openAdvancedFilters()
     expect(screen.getByRole('option', { name: 'Research · canvas-1' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Research · canvas-2' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Publish · Research (canvas-1) · publish' })).toBeVisible()
@@ -120,12 +177,12 @@ describe('JobsView', () => {
     useStore.setState({ jobsQuery: 'canvas=not-accessible&node=exact-node&backend=exact-backend' } as never)
     render(<JobsView />)
 
+    openAdvancedFilters()
     expect(await screen.findByRole('option', { name: 'Exact canvas ID: not-accessible' })).toBeVisible()
     expect(screen.getByRole('option', { name: 'Exact node ID: exact-node' })).toBeVisible()
     expect(screen.getByLabelText('Filter jobs by node')).toHaveValue(JSON.stringify(['not-accessible', 'exact-node']))
     expect(screen.getByRole('option', { name: 'Exact backend ID: exact-backend' })).toBeVisible()
     expect(screen.getByLabelText('Filter jobs by backend')).toHaveValue('exact-backend')
-    fireEvent.click(screen.getByText('Advanced exact IDs'))
     expect(screen.getByLabelText('Filter jobs by canvas id (exact)')).toHaveValue('not-accessible')
     expect(screen.getByLabelText('Filter jobs by node id (exact)')).toHaveValue('exact-node')
     expect(screen.getByLabelText('Filter jobs by backend id (exact)')).toHaveValue('exact-backend')
@@ -268,6 +325,7 @@ describe('JobsView', () => {
       name: 'Open run task-1 in Alpha research', expanded: false,
     }))
 
+    openTechnicalEvidence()
     expect(screen.getByText(/dataset-1@revision-7/)).toBeVisible()
     expect(screen.getByText(/#1 running/).closest('li')).toHaveTextContent('Progress 50%')
     expect(screen.getByText('Progress:').closest('div')).toHaveTextContent('Progress: 50%')
@@ -284,6 +342,7 @@ describe('JobsView', () => {
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
+    openTechnicalEvidence()
     expect(screen.getByText('Column merge:', { exact: true })).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
     await waitFor(() => expect(mocks.cancelMergeColumnsTask).toHaveBeenCalledWith('merge-1'))
@@ -311,6 +370,7 @@ describe('JobsView', () => {
     mocks.datasetRevision.mockRejectedValueOnce(new Error('gone'))
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-done in Alpha research', expanded: false }))
+    openTechnicalEvidence()
     fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
     expect(await screen.findByText(/Exact revision unavailable: gone/)).toBeVisible()
     expect(mocks.datasetRevision).toHaveBeenCalledWith('dataset-1', 'rev-gone')
@@ -339,6 +399,7 @@ describe('JobsView', () => {
     fireEvent.click(await screen.findByRole('button', {
       name: 'Open run task-manifest in Alpha research', expanded: false,
     }))
+    openTechnicalEvidence()
     expect(mocks.executionManifest).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: /Execution manifest/ }))
 
