@@ -366,6 +366,11 @@ export interface WorkspaceResource {
   localPlacement?: WorkspaceLocalPlacementCapability | null
   /** Provider resources are never mutated by Workspace Canvas actions. */
   providerMutation?: boolean
+  /** Local Folder authority is explicit; provider hierarchy never gains it. */
+  canCreateFolder?: boolean
+  canRenameFolder?: boolean
+  canDeleteFolder?: boolean
+  folderMutationUnavailableReason?: string | null
 }
 export interface WorkspaceSourceStatus {
   id: string
@@ -431,6 +436,10 @@ export interface WorkspaceMoveCanvasResult {
   resource: WorkspaceResource
   previousContainer: WorkspaceResource
   container: WorkspaceResource
+}
+export interface WorkspaceFolderActionResult {
+  ok: boolean
+  resource: WorkspaceResource
 }
 export interface CatalogMetadata { folder?: string; tags?: string[]; owner?: string | null; description?: string | null; name?: string | null }
 export interface CatalogEdit { expectedRevision: string; folder: string; tags: string[]; owner: string | null; description: string | null; name?: string | null; declaredKey: string[] }
