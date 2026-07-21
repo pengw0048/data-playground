@@ -52,6 +52,62 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  postgres-journey:
+    name: keyed-upsert acceptance on PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+        env:
+          POSTGRES_USER: dp
+          POSTGRES_PASSWORD: dp-test-only
+          POSTGRES_DB: dp_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dp -d dp_e2e"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    env:
+      CI: "true"
+      DP_E2E_FIXTURE_PROFILE: full
+      DP_E2E_DATABASE_URL: postgresql+psycopg://dp:dp-test-only@127.0.0.1:5432/dp_e2e
+      DP_E2E_RESTART_DATABASE_URL: postgresql+psycopg://dp:dp-test-only@127.0.0.1:5432/dp_e2e_restart
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Create the restart-recovery database
+        env:
+          PGPASSWORD: dp-test-only
+        run: createdb -h 127.0.0.1 -U dp dp_e2e_restart
+      - name: Install and build web
+        run: cd web && npm ci && npm run build
+      - name: Install kernel (with Postgres driver)
+        run: cd kernel && uv sync --extra dev --extra postgres
+      - name: Install Playwright browser
+        run: cd web && npx playwright install --with-deps chromium
+      - name: Run keyed-upsert and default-write journeys on Postgres
+        run: cd web && npx playwright test --no-deps --project=chromium keyed-upsert-journey.spec.ts default-write-journey.spec.ts
+      - name: Upload Postgres acceptance diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ux-acceptance-postgres-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            web/playwright-report/
+            web/test-results/
+            docs/acceptance/issue-639/
+            docs/acceptance/issue-635/
+          if-no-files-found: warn
+          retention-days: 14
+
   golden-workflow-blockers:
     name: P0/P1 golden-workflow issue gate
     runs-on: ubuntu-latest
