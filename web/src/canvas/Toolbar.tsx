@@ -6,9 +6,9 @@ import { categoryOrder, color, kindAccent, type Category } from '../theme/tokens
 import { Icon, type IconName } from '../ui/Icon'
 import { Tooltip } from '../ui/Tooltip'
 import { Popover } from '../ui/Popover'
-import type { CanvasNode } from '../types/graph'
 import { NodeFinder } from './NodeFinder'
 import { ExistingNodeLocator } from './ExistingNodeLocator'
+import { locateNode } from './locateNode'
 import { cn } from '@/lib/utils'
 
 const CATEGORY_ICON: Record<Category, IconName> = {
@@ -43,12 +43,8 @@ export function Toolbar() {
   }
 
   const locate = (id: string) => {
-    const node = useStore.getState().doc.nodes.find((candidate) => candidate.id === id)
-    if (!node) return
     select(id)
-    const position = absolutePosition(useStore.getState().doc.nodes, node)
-    setCenter(position.x + 116, position.y + 72, { zoom: Math.max(0.8, Math.min(getZoom(), 1.3)), duration: 350 })
-    setLocatorOpen(false)
+    if (locateNode(useStore.getState().doc.nodes, id, { setCenter, getZoom })) setLocatorOpen(false)
   }
 
   if (!roleCanEdit(canvasRole)) {
@@ -103,23 +99,6 @@ export function Toolbar() {
       {locatorOpen && <ExistingNodeLocator nodes={doc.nodes} onPick={locate} onClose={() => setLocatorOpen(false)} />}
     </div>
   )
-}
-
-function absolutePosition(nodes: CanvasNode[], node: CanvasNode): { x: number; y: number } {
-  const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>()
-  let current = node
-  let x = current.position.x
-  let y = current.position.y
-  while (current.parentId && !seen.has(current.parentId)) {
-    seen.add(current.parentId)
-    const parent = byId.get(current.parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    current = parent
-  }
-  return { x, y }
 }
 
 function CategoryButton({ cat, open, onToggle, onClose, specs, onPick }: {

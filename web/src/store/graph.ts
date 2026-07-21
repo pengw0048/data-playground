@@ -961,6 +961,8 @@ function cancelDetachedProfileJob(job: ProfileJobState | undefined): void {
 
 export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
 
+export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string }
+
 interface Store {
   doc: CanvasDoc
   canvasRole: CanvasRole | null     // authoritative role for the open canvas; null fails closed
@@ -976,6 +978,7 @@ interface Store {
 
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
+  nodeRevealRequest: NodeRevealRequest | null // URL-originated only; Canvas consumes it without autosaving
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
@@ -1005,6 +1008,7 @@ interface Store {
   connect: (edge: CanvasEdge) => void
   removeEdge: (id: string) => void
   select: (id: string | null) => void
+  requestNodeReveal: (canvasId: string, nodeId: string) => void
   setSelection: (ids: string[]) => void
   selectAll: () => void
   removeSelected: () => void
@@ -1450,6 +1454,7 @@ export const useStore = create<Store>((set, get) => ({
   sizes: {},
   selectedId: null,
   selectedIds: [],
+  nodeRevealRequest: null,
   openPanels: {},
   previews: {},
   previewBindings: {},
@@ -1664,6 +1669,10 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
+
+  requestNodeReveal: (canvasId, nodeId) => set((state) => ({
+    nodeRevealRequest: { id: (state.nodeRevealRequest?.id ?? 0) + 1, canvasId, nodeId },
+  })),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
 
@@ -2748,6 +2757,14 @@ export const useStore = create<Store>((set, get) => ({
         : undefined
       const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId)
         : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId) : false
+      if (opened && route.view === 'canvas' && route.canvasId && route.nodeId
+          && get().doc.id === route.canvasId) {
+        const nodeExists = get().doc.nodes.some((node) => node.id === route.nodeId)
+        if (nodeExists) {
+          get().select(route.nodeId)
+          get().requestNodeReveal(route.canvasId, route.nodeId)
+        } else get().pushToast('The requested node is no longer in this Canvas.', 'info')
+      }
       if (!opened) {
         if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
         else if (fallback) await get().openFile(fallback)
@@ -3467,7 +3484,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], past: [], future: [],
+        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {

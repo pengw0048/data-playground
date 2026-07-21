@@ -190,6 +190,57 @@ test.describe('Data Playground canvas', () => {
     await page.unroute(`**/api/canvas/${canvasId}`)
   })
 
+  test('a node deep link reveals once, preserves later viewport control, and handles a deleted node', async ({ page }) => {
+    const canvasId = `node-deep-link-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Node deep link', version: 1,
+      nodes: [
+        { id: 'near', type: 'filter', position: { x: 80, y: 80 }, data: { title: 'Near node', status: 'idle', config: {} } },
+        { id: 'off-screen', type: 'filter', position: { x: 8000, y: 6000 }, data: { title: 'Off-screen node', status: 'idle', config: {} } },
+      ], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    const saves: string[] = []
+    await page.route(`**/api/canvas/${canvasId}`, async (route) => {
+      if (route.request().method() === 'PUT') saves.push(route.request().postData() ?? '')
+      await route.continue()
+    })
+
+    const offScreen = page.locator('.react-flow__node[data-id="off-screen"]')
+    const isInCanvas = async () => {
+      const node = await offScreen.boundingBox()
+      const canvas = await page.locator('.react-flow').boundingBox()
+      return !!node && !!canvas && node.x >= canvas.x && node.y >= canvas.y
+        && node.x + node.width <= canvas.x + canvas.width && node.y + node.height <= canvas.y + canvas.height
+    }
+
+    await page.goto(`/#/canvas/${canvasId}?node=off-screen`)
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(offScreen).toHaveClass(/selected/)
+    await expect(page.getByTestId('inspector').getByRole('button', { name: 'View data' })).toBeVisible()
+    await expect.poll(isInCanvas).toBe(true)
+
+    // The route consumes its reveal once. A later user zoom remains in control rather than being
+    // replaced by another route-driven center operation.
+    const viewport = page.locator('.react-flow__viewport')
+    await page.locator('.react-flow__controls-zoomin').click()
+    const afterUserZoom = await viewport.getAttribute('style')
+    await page.waitForTimeout(500)
+    expect(await viewport.getAttribute('style')).toBe(afterUserZoom)
+    await page.waitForTimeout(700) // longer than autosave debounce: route presentation never saves
+    expect(saves).toEqual([])
+
+    await page.reload()
+    await expect(offScreen).toHaveClass(/selected/)
+    await expect.poll(isInCanvas).toBe(true)
+
+    await page.goto(`/#/canvas/${canvasId}?node=deleted-node`)
+    await expect(page.getByText('The requested node is no longer in this Canvas.')).toBeVisible()
+    await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${canvasId}$`))
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await page.unroute(`**/api/canvas/${canvasId}`)
+  })
+
   test('ReactFlow click, shift, and rubber-band selections stay synchronized with Inspector', async ({ page }) => {
     const canvasId = `selection-sync-${Date.now()}`
     const created = await page.request.post('/api/canvas', { data: {

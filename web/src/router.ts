@@ -104,7 +104,7 @@ export function canvasLink(id: string): string {
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
+  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; pushToast: (message: string, kind?: 'info' | 'error') => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => void
 }
 
@@ -147,7 +147,11 @@ export function initRouter(store: RouterStore): void {
         const nodeExists = !!r.nodeId && current.doc.id === r.canvasId
           && current.doc.nodes.some((node) => node.id === r.nodeId)
         current.select(nodeExists ? r.nodeId! : null)
-        if (r.nodeId && !nodeExists) history.replaceState(null, '', hashFor(store.getState()))
+        if (nodeExists) current.requestNodeReveal(r.canvasId, r.nodeId!)
+        else if (r.nodeId) {
+          current.pushToast('The requested node is no longer in this Canvas.', 'info')
+          history.replaceState(null, '', hashFor(store.getState()))
+        }
       } else if (r.view === 'workspace' && (st.view !== 'workspace'
           || st.workspaceResourceId !== (r.workspaceResourceId ?? null)
           || st.workspaceScope !== (r.workspaceScope ?? 'all')
