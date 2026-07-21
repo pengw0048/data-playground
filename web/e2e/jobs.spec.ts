@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
 const failedJob = {
   id: 'history-failed', runId: 'run-failed', jobType: 'run', status: 'failed',
@@ -8,6 +8,42 @@ const failedJob = {
   executionManifestSha256: 'a'.repeat(64), executionManifestSchemaVersion: 1,
   executionManifestAvailability: 'available', executionManifestReconstructable: true,
   createdAt: '2026-07-16T12:00:00Z',
+}
+
+const jobFilterLabels = [
+  'Filter jobs by status',
+  'Filter jobs by canvas',
+  'Filter jobs by node',
+  'Filter jobs by backend',
+  'Filter jobs from time',
+  'Filter jobs to time',
+  'Filter jobs by text',
+]
+
+async function expectJobsFiltersToFit(page: Page) {
+  const filters = page.getByLabel('Job filters')
+  await expect(filters).toBeVisible()
+  const viewport = page.viewportSize()
+  if (!viewport) throw new Error('viewport is unavailable')
+  const boxes = await Promise.all(jobFilterLabels.map(async (label) => {
+    const control = page.getByLabel(label, { exact: true })
+    await expect(control, `${label} should remain visible`).toBeVisible()
+    const box = await control.boundingBox()
+    if (!box) throw new Error(`${label} has no bounding box`)
+    expect(box.width, `${label} should remain usable`).toBeGreaterThan(0)
+    expect(box.x + box.width, `${label} should not overflow the viewport`).toBeLessThanOrEqual(viewport.width + 0.5)
+    return { label, ...box }
+  }))
+  for (let left = 0; left < boxes.length; left += 1) {
+    for (let right = left + 1; right < boxes.length; right += 1) {
+      const a = boxes[left]
+      const b = boxes[right]
+      const intersects = a.x < b.x + b.width && b.x < a.x + a.width
+        && a.y < b.y + b.height && b.y < a.y + a.height
+      expect(intersects, `${a.label} overlaps ${b.label}`).toBe(false)
+    }
+  }
+  expect(await filters.evaluate((element) => element.scrollWidth <= element.clientWidth), 'Job filters should not require horizontal scrolling').toBe(true)
 }
 
 test('filters, deep-links, and preserves a partial Jobs page at the supported viewport @ux-smoke', async ({ page }) => {
@@ -48,6 +84,10 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
+  for (const width of [1024, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 720 })
+    await expectJobsFiltersToFit(page)
+  }
   await page.getByLabel('Filter jobs by canvas', { exact: true }).selectOption('canvas-jobs')
   await expect(page).toHaveURL(/canvas=canvas-jobs/)
   await page.getByLabel('Filter jobs by node', { exact: true }).selectOption(JSON.stringify(['canvas-jobs', 'publish']))
