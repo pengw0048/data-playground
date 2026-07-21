@@ -259,28 +259,28 @@ export function JobsView() {
         </Button>
       </header>
 
-      <section aria-label="Job filters" className="grid grid-cols-2 gap-2 border-b border-border bg-card/60 px-4 py-3 sm:grid-cols-4 xl:grid-cols-7 xl:px-7">
-        <label className="grid gap-1 text-[10.5px] text-muted-foreground">Status
-          <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+      <section aria-label="Job filters" className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-2 border-b border-border bg-card/60 px-4 py-3 sm:px-7">
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Status
+          <select aria-label="Filter jobs by status" value={params.get('status') ?? ''} onChange={(event) => update('status', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             {STATUSES.map((value) => <option key={value} value={value}>{value || 'All states'}</option>)}
           </select></label>
         <CanvasSelector canvases={canvases} value={params.get('canvas') ?? ''} onChange={selectCanvas} />
-        <label className="grid gap-1 text-[10.5px] text-muted-foreground">Node
-          <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Node
+          <select aria-label="Filter jobs by node" value={selectedNodeChoice} onChange={(event) => selectNode(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             <option value="">All nodes on loaded Jobs</option>
             {!listedNode && selectedNodeChoice && <option value={selectedNodeChoice}>Exact node ID: {params.get('node')}</option>}
             {nodeChoices.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
           </select></label>
-        <label className="grid gap-1 text-[10.5px] text-muted-foreground">Backend
-          <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Backend
+          <select aria-label="Filter jobs by backend" value={backend} onChange={(event) => update('backend', event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
             <option value="">All backends on loaded Jobs</option>
             {!listedBackend && backend && <option value={backend}>Exact backend ID: {backend}</option>}
             {backendChoices.map((backend) => <option key={backend} value={backend}>{backend}</option>)}
           </select></label>
-        <label className="grid gap-1 text-[10.5px] text-muted-foreground">From
-          <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
-        <label className="grid gap-1 text-[10.5px] text-muted-foreground">To
-          <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">From
+          <input aria-label="Filter jobs from time" type="datetime-local" value={localDate(params.get('after'))} onChange={(event) => update('after', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+        <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">To
+          <input aria-label="Filter jobs to time" type="datetime-local" value={localDate(params.get('before'))} onChange={(event) => update('before', isoDate(event.target.value))} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
         <Filter label="Text" name="q" value={params.get('q') ?? ''} onChange={update} placeholder="Run, canvas, failure…" />
       </section>
 
@@ -328,8 +328,8 @@ export function JobsView() {
 
 function CanvasSelector({ canvases, value, onChange }: { canvases: CanvasFile[]; value: string; onChange: (value: string) => void }) {
   const listed = canvases.some((canvas) => canvas.id === value)
-  return <label className="grid gap-1 text-[10.5px] text-muted-foreground">Canvas
-    <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
+  return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">Canvas
+    <select aria-label="Filter jobs by canvas" value={value} onChange={(event) => onChange(event.target.value)} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground">
       <option value="">All accessible canvases</option>
       {!listed && value && <option value={value}>Exact canvas ID: {value}</option>}
       {canvases.map((canvas) => <option key={canvas.id} value={canvas.id}>{canvasLabel(canvas)}</option>)}
@@ -362,7 +362,7 @@ function currentPageNodeChoices(items: WorkspaceJobDto[]) {
 function Filter({ label, name, value, onChange, placeholder }: { label: string; name: string; value: string; onChange: (name: string, value: string) => void; placeholder?: string }) {
   const [draft, setDraft] = useState(value)
   useEffect(() => setDraft(value), [value])
-  return <label className="grid gap-1 text-[10.5px] text-muted-foreground">{label}<input aria-label={`Filter jobs by ${label.toLowerCase()}`} value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onBlur={() => onChange(name, draft.trim())} onKeyDown={(event) => { if (event.key === 'Enter') onChange(name, draft.trim()) }} className="h-8 min-w-0 rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
+  return <label className="grid min-w-0 gap-1 text-[10.5px] text-muted-foreground">{label}<input aria-label={`Filter jobs by ${label.toLowerCase()}`} value={draft} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} onBlur={() => onChange(name, draft.trim())} onKeyDown={(event) => { if (event.key === 'Enter') onChange(name, draft.trim()) }} className="h-8 min-w-0 w-full rounded-md border border-border bg-background px-2 text-[12px] text-foreground" /></label>
 }
 
 function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, acting, onClone }: { item: WorkspaceJobDto; expanded: boolean; onSelect: () => void; onOutput: (key: string) => void; selectedOutput: string | null; onAction: (action: 'cancel' | 'retry') => void; acting: boolean; onClone?: () => void }) {
