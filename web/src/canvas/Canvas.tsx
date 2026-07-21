@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, Controls, MiniMap,
   applyNodeChanges, applyEdgeChanges, useReactFlow,
@@ -20,6 +20,7 @@ import { PanelHost } from '../panels/PanelHost'
 import { PeerCursors } from './PeerCursors'
 import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
+import { locateNode } from './locateNode'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -97,6 +98,8 @@ export function Canvas() {
   const previews = useStore((s) => s.previews)
   const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
+  const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
+  const acknowledgeNodeReveal = useStore((s) => s.acknowledgeNodeReveal)
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
@@ -107,6 +110,7 @@ export function Canvas() {
   const bypass = useStore((s) => s.bypass)
   const disable = useStore((s) => s.disable)
   const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
+  const revealedRequestId = useRef<number | null>(null)
 
   // realtime collaboration: join this canvas's presence room; leave on switch/unmount
   const docId = doc.id
@@ -177,6 +181,21 @@ export function Canvas() {
       return [...mapped.filter((n) => !n.parentId), ...mapped.filter((n) => n.parentId)]
     })
   }, [doc.nodes, selectedIds])
+
+  // A route request is intentionally distinct from normal selection: a click in the Canvas updates
+  // the shareable node= URL but must never seize the user's viewport. Wait for React Flow to mount
+  // the requested card, then consume this exact request once.
+  useEffect(() => {
+    if (!nodeRevealRequest || nodeRevealRequest.canvasId !== doc.id
+        || revealedRequestId.current === nodeRevealRequest.id) return
+    const mounted = Array.from(document.querySelectorAll<HTMLElement>('.react-flow__node'))
+      .some((element) => element.dataset.id === nodeRevealRequest.nodeId)
+    if (!mounted) return
+    if (locateNode(doc.nodes, nodeRevealRequest.nodeId, { setCenter, getZoom })) {
+      revealedRequestId.current = nodeRevealRequest.id
+      acknowledgeNodeReveal(nodeRevealRequest.id)
+    }
+  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, setCenter, getZoom, acknowledgeNodeReveal])
 
   // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes

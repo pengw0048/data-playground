@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { parseHash, routeHash } from './router'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { initRouter, parseHash, routeHash } from './router'
 
 describe('Workspace routes', () => {
   afterEach(() => { window.location.hash = '' })
@@ -80,6 +80,58 @@ describe('Workspace routes', () => {
       view: 'transforms', transformId: 'tr_exact', transformVersion: 'v2',
       transformCanvasId: 'canvas-1', transformNodeId: 'node-1',
       transformQuery: 'q=robot&source=promoted',
+    })
+  })
+
+  it('does not let a stale invalid Canvas route clear a newer node reveal', async () => {
+    let resolveOldOpen!: (opened: boolean) => void
+    const oldOpen = new Promise<boolean>((resolve) => { resolveOldOpen = resolve })
+    const state = {
+      view: 'canvas' as const,
+      doc: { id: 'canvas-new', nodes: [{ id: 'node-new' }] },
+      selectedId: null as string | null,
+      workspaceResourceId: null,
+      workspaceSearchQuery: '',
+      workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '',
+      jobsQuery: '', inboxQuery: '', transformResourceId: null, transformVersion: null,
+      transformUpgradeCanvasId: null, transformUpgradeNodeId: null, transformLibraryQuery: '',
+      nodeRevealRequest: null as { canvasId: string; nodeId: string } | null,
+    }
+    const openFile = vi.fn(async (id: string) => id === 'canvas-old' ? oldOpen : false)
+    const store = {
+      getState: () => ({
+        ...state,
+        setView: (view: typeof state.view) => { state.view = view },
+        select: (id: string | null) => { state.selectedId = id },
+        requestNodeReveal: (canvasId: string, nodeId: string) => {
+          state.nodeRevealRequest = { canvasId, nodeId }
+        },
+        clearNodeReveal: () => { state.nodeRevealRequest = null },
+        pushToast: vi.fn(), setWorkspaceResource: vi.fn(), setWorkspaceSearchQuery: vi.fn(),
+        setWorkspaceScope: vi.fn(), setWorkspaceDatasetQuery: vi.fn(), setJobsQuery: vi.fn(),
+        setInboxQuery: vi.fn(), setTransformResource: vi.fn(), setTransformLibraryQuery: vi.fn(),
+        openFile,
+      }),
+      subscribe: vi.fn(),
+    }
+    initRouter(store)
+
+    history.replaceState(null, '', '#/canvas/canvas-old?node=missing')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(openFile).toHaveBeenCalledWith('canvas-old'))
+
+    history.replaceState(null, '', '#/canvas/canvas-new?node=node-new')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(state.nodeRevealRequest).toEqual({
+      canvasId: 'canvas-new', nodeId: 'node-new',
+    }))
+
+    resolveOldOpen(false)
+    await vi.waitFor(() => {
+      expect(state.selectedId).toBe('node-new')
+      expect(state.nodeRevealRequest).toEqual({ canvasId: 'canvas-new', nodeId: 'node-new' })
+      expect(location.hash).toBe('#/canvas/canvas-new?node=node-new')
     })
   })
 })
