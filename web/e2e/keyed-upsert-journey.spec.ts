@@ -250,7 +250,8 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
     await mkdir(path.join(workspace, 'data'), { recursive: true })
     const port = await freePort()
     const base = `http://127.0.0.1:${port}`
-    const dbUrl = `sqlite:///${path.join(workspace, 'restart-meta.db')}`
+    // Postgres acceptance points the restarted durable owner at a live server; default stays SQLite.
+    const dbUrl = process.env.DP_E2E_RESTART_DATABASE_URL ?? `sqlite:///${path.join(workspace, 'restart-meta.db')}`
     const pythonBin = path.join(KERNEL_DIR, '.venv', 'bin', 'python')
 
     let hub: ChildProcess | null = null
@@ -266,6 +267,17 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
     }
 
     try {
+      // A live Postgres owner survives the restart, so reset it to a clean migrated schema each
+      // attempt — the parity the throwaway SQLite file gets for free from rm -rf.
+      if (dbUrl.startsWith('postgres')) {
+        await runToCompletion(pythonBin, ['-c',
+          'import os, psycopg\n'
+          + 'with psycopg.connect(os.environ["RESET_URL"], autocommit=True) as conn:\n'
+          + '    conn.execute("DROP SCHEMA IF EXISTS public CASCADE")\n'
+          + '    conn.execute("CREATE SCHEMA public")'],
+          { ...process.env, RESET_URL: dbUrl.replace('+psycopg', '') })
+        await runToCompletion(pythonBin, ['-m', 'hub.cli', 'migrate'], { ...process.env, DP_DATABASE_URL: dbUrl })
+      }
       await startHub()
       const stamp = Date.now()
       const target = await bootstrap(page.request, base, `issue-639-rs-target-${stamp}`, `issue-639-rs-target-${stamp}.parquet`, 'id < 3')
@@ -295,6 +307,14 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
     }
   })
 })
+
+async function runToCompletion(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn(command, args, { cwd: KERNEL_DIR, env, stdio: 'ignore' })
+    proc.on('error', reject)
+    proc.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${command} ${args[0]} exited ${code}`))))
+  })
+}
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {

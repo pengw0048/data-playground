@@ -10,6 +10,14 @@ const REFERENCE_VIEWPORT = { width: 1440, height: 900 }
 const providerAcceptanceDependency = process.env.DP_E2E_PROVIDER_ACCEPTANCE
   ? ' --no-cache --with ../examples/plugins/dp_file_catalog_provider'
   : ''
+// Metadata DB for the shared kernel. Defaults to the throwaway SQLite file; the Postgres acceptance
+// variant points it at a live server, which needs the psycopg extra and an explicit up-front migrate
+// (SQLite auto-migrates on first run; a production Postgres DB does not).
+const databaseUrl = process.env.DP_E2E_DATABASE_URL ?? 'sqlite:///e2e-test.db'
+const kernelPackage = databaseUrl.startsWith('postgres') ? "'.[postgres]'" : '.'
+const migrateStep = databaseUrl.startsWith('postgres')
+  ? `DP_DATABASE_URL=${databaseUrl} uv run --with ${kernelPackage} dataplay migrate && `
+  : ''
 
 const chromiumLaunch = process.env.DP_E2E_CHROME
   ? { launchOptions: { executablePath: process.env.DP_E2E_CHROME } }
@@ -83,7 +91,7 @@ export default defineConfig({
   ],
   webServer: {
     // fresh metadata DB per run (the metadata DB persists canvases; tests need a clean slate)
-    command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && DP_DATABASE_URL=sqlite:///e2e-test.db uv run --with . --with ../examples/plugins/dp_descriptor_contract${providerAcceptanceDependency} dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
+    command: `cd ../kernel && WORKSPACE=../web/.e2e-workspace && rm -f e2e-test.db* && rm -rf "$WORKSPACE" && uv run python ../scripts/build_ux_fixtures.py --profile ${fixtureProfile} --output "$WORKSPACE/data" && ${migrateStep}DP_DATABASE_URL=${databaseUrl} uv run --with ${kernelPackage} --with ../examples/plugins/dp_descriptor_contract${providerAcceptanceDependency} dataplay --workspace "$WORKSPACE" --port ${PORT} --no-open`,
     url: `http://127.0.0.1:${PORT}/api/livez`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

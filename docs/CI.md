@@ -101,6 +101,14 @@ The same `full`-profile gate covers the keyed-upsert release certification
 checked against independently recomputed evidence, plus response-loss replay, hub-restart recovery,
 and headless-API parity, with reviewable evidence in `docs/acceptance/issue-639`.
 
+`ux-acceptance.yml` also carries a `postgres-journey` job that re-runs the keyed-upsert and
+default-write journeys, unforked, against a hub whose metadata database is PostgreSQL 16 (issue #666).
+The harness is parameterized (`DP_E2E_DATABASE_URL`, `DP_E2E_RESTART_DATABASE_URL`) rather than the
+specs; a Postgres database needs an explicit `dataplay migrate` before boot, and the SIGKILL
+restart-recovery test runs against a Postgres-backed durable owner. See
+[`docs/acceptance/issue-666/POSTGRES.md`](acceptance/issue-666/POSTGRES.md). It stays a scheduled-tier
+job and adds no per-PR gate.
+
 Run one manually from the Actions page or with, for example:
 
 ```bash
