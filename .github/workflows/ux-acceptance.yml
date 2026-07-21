@@ -103,8 +103,6 @@ jobs:
           path: |
             web/playwright-report/
             web/test-results/
-            docs/acceptance/issue-639/
-            docs/acceptance/issue-635/
           if-no-files-found: warn
           retention-days: 14
 

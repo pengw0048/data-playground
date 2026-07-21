@@ -2,8 +2,8 @@ name: Performance envelope
 
 # Intentionally separate from the required PR checks: it runs a small seeded set of local
 # workflows on a schedule, on demand, and as a release prerequisite, recording wall time, peak RSS,
-# spill behavior, and the honest out-of-memory outcome. The committed reference lives in
-# docs/acceptance/issue-640/envelope.json; this job regenerates one on Linux and uploads it.
+# spill behavior, and the honest out-of-memory outcome. It measures the envelope on Linux and
+# uploads it as a workflow artifact.
 on:
   schedule:
     - cron: "37 4 * * *"
