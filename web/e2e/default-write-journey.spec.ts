@@ -7,7 +7,8 @@
  * Runs under the scheduled/on-demand acceptance policy (docs/CI.md), not per-PR: gated on the `full`
  * fixture profile the way ux-full-matrix.spec.ts is, so the required PR e2e job skips it and the daily
  * ux-acceptance workflow exercises it. It captures named 1440x900 light/dark screenshots and a
- * machine-readable visual-review.json into docs/acceptance/issue-635, following the existing convention.
+ * machine-readable visual-review.json into the gitignored web/test-results tree, uploaded as the
+ * workflow's artifacts rather than committed.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -21,7 +22,7 @@ import { goToWorkspace, workspaceResource } from './support/workspace'
 const fullProfile = process.env.DP_E2E_FIXTURE_PROFILE === 'full'
 const REPO_ROOT = path.resolve(process.cwd(), '..')
 const KERNEL_DIR = path.join(REPO_ROOT, 'kernel')
-const EVIDENCE_DIR = path.join(REPO_ROOT, 'docs', 'acceptance', 'issue-635')
+const EVIDENCE_DIR = path.join(REPO_ROOT, 'web', 'test-results', 'acceptance', 'issue-635')
 const SCREENSHOT_DIR = path.join(EVIDENCE_DIR, 'screenshots')
 const VIEWPORT = { width: 1440, height: 900 }
 

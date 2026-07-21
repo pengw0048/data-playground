@@ -243,8 +243,8 @@ def _full_width_golden() -> tuple[pa.Table, pa.Table, pa.Table]:
 
 def test_full_width_golden_add_replace_history_and_durable_replay(local_catalog, tmp_path):
     base, sidecar, expected = _full_width_golden()
-    manifest = json.loads((Path(__file__).parents[3] / "docs" / "acceptance" / "issue-585"
-                           / "fixture-manifest.json").read_text())
+    manifest = json.loads(
+        (Path(__file__).parent / "merge_columns_fixture_manifest.json").read_text())
     fixture = manifest["fixtures"]["full_width_add_replace"]
     assert fixture["base"] == {"rows": base.num_rows, "columns": base.schema.names,
                                "sha256": _fixture_checksum(base)}

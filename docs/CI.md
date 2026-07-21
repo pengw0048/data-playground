@@ -94,19 +94,19 @@ have scheduled health runs because external services and base images can drift:
 default fresh-workspace write-journey certification (`web/e2e/default-write-journey.spec.ts`,
 issue #635) so it never runs per-PR: it certifies, on the unmodified default kernel backend, the
 Workspace → Source → transform → Write → managed revision + receipt → Jobs/Inbox → exact-revision
-reopen → hub-restart-recovery path, and writes reviewable evidence to `docs/acceptance/issue-635`.
+reopen → hub-restart-recovery path. Its screenshots and visual-review are written to the gitignored
+`web/test-results` tree and uploaded with the workflow's artifacts, not committed.
 
 The same `full`-profile gate covers the keyed-upsert release certification
 (`web/e2e/keyed-upsert-journey.spec.ts`, issue #639): the shipped Write-Inspector upsert journey
 checked against independently recomputed evidence, plus response-loss replay, hub-restart recovery,
-and headless-API parity, with reviewable evidence in `docs/acceptance/issue-639`.
+and headless-API parity; its evidence is likewise uploaded with the workflow's artifacts.
 
 `ux-acceptance.yml` also carries a `postgres-journey` job that re-runs the keyed-upsert and
 default-write journeys, unforked, against a hub whose metadata database is PostgreSQL 16 (issue #666).
 The harness is parameterized (`DP_E2E_DATABASE_URL`, `DP_E2E_RESTART_DATABASE_URL`) rather than the
 specs; a Postgres database needs an explicit `dataplay migrate` before boot, and the SIGKILL
-restart-recovery test runs against a Postgres-backed durable owner. See
-[`docs/acceptance/issue-666/POSTGRES.md`](acceptance/issue-666/POSTGRES.md). It stays a scheduled-tier
+restart-recovery test runs against a Postgres-backed durable owner. It stays a scheduled-tier
 job and adds no per-PR gate.
 
 Run one manually from the Actions page or with, for example:
