@@ -466,7 +466,9 @@ export function Canvas() {
             <MiniMap
               pannable
               position="bottom-left"
-              style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
+              // Keep the minimap above the centered toolbar at the supported 1024px viewport, where
+              // the labelled Add group reaches the left edge even though the View group does not.
+              style={{ marginBottom: 84, marginLeft: 12, width: 168, height: 108 }}
               maskColor="rgba(128,128,128,0.2)"
               nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
               nodeStrokeWidth={0}

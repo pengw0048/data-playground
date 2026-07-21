@@ -562,16 +562,22 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByTestId('autosave')).toHaveText(/saved$/, { timeout: 8_000 })
   })
 
-  test('minimap and labelled view controls are both present and do not overlap', async ({ page }) => {
+  test('minimap and the labelled toolbar do not overlap in either Inspector state', async ({ page }) => {
     await fresh(page)
     await addNode(page, 'Shape', 'filter') // minimap + viewport controls only mount once the canvas has a node to navigate
     const minimap = page.locator('.react-flow__minimap')
+    const toolbar = page.getByTestId('toolbar')
     const controls = page.getByTestId('toolbar-view-controls')
     await expect(minimap).toBeVisible()
+    await expect(toolbar).toBeVisible()
     await expect(controls).toBeVisible()
     await expect(controls.getByRole('button', { name: 'Fit view' })).toBeVisible()
     await expect(controls.getByText('Fit view', { exact: true })).toBeVisible()
-    expect(overlaps(await boxOf(minimap), await boxOf(controls)), 'minimap overlaps zoom controls').toBe(false)
+    expect(overlaps(await boxOf(minimap), await boxOf(toolbar)), 'minimap overlaps toolbar with Inspector expanded').toBe(false)
+
+    await controls.getByRole('button', { name: 'Hide Inspector' }).click()
+    await expect(controls.getByRole('button', { name: 'Show Inspector' })).toBeVisible()
+    expect(overlaps(await boxOf(minimap), await boxOf(toolbar)), 'minimap overlaps toolbar with Inspector collapsed').toBe(false)
   })
 
   test('toolbar groups view controls and exposes current toggle state', async ({ page }) => {

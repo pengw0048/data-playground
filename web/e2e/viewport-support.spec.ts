@@ -32,12 +32,21 @@ async function expectToolbarGroupsDoNotOverlap(page: Page, label: string) {
   const toolbar = page.getByTestId('toolbar')
   const addControls = page.getByTestId('toolbar-add-controls')
   const viewControls = page.getByTestId('toolbar-view-controls')
+  const minimap = page.locator('.react-flow__minimap')
   await expectFullyInViewport(page, toolbar, `${label} toolbar`)
   await expectFullyInViewport(page, addControls, `${label} add controls`)
   await expectFullyInViewport(page, viewControls, `${label} view controls`)
+  await expectFullyInViewport(page, minimap, `${label} minimap`)
   const addBox = await boxOf(addControls)
   const viewBox = await boxOf(viewControls)
   expect(addBox.x + addBox.width, `${label} add and view controls overlap`).toBeLessThanOrEqual(viewBox.x + 0.5)
+  const toolbarBox = await boxOf(toolbar)
+  const minimapBox = await boxOf(minimap)
+  const overlaps = toolbarBox.x < minimapBox.x + minimapBox.width
+    && toolbarBox.x + toolbarBox.width > minimapBox.x
+    && toolbarBox.y < minimapBox.y + minimapBox.height
+    && toolbarBox.y + toolbarBox.height > minimapBox.y
+  expect(overlaps, `${label} toolbar overlaps minimap`).toBe(false)
 }
 
 async function goToWorkspaceShell(page: Page) {
