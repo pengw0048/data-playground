@@ -22,7 +22,7 @@ from hub import durable_tasks, local_run_inputs, metadb
 from hub.deps import Deps
 from hub.local_run_inputs import LOCAL_FILE_INPUT_PROVIDER
 from hub.local_writes import write_managed_local_file
-from hub.models import Graph, RunStatus
+from hub.models import Graph, RunOutput, RunStatus
 from hub.routers import runs
 from hub.routers.runs import (
     _inject_write_intent, _local_run_intent_sha256, _resolve_local_run_manifest,
@@ -313,6 +313,15 @@ def test_restarted_worker_reads_snapshot_after_source_mutation(tmp_path, monkeyp
     receipt = task["output_receipt"]
     assert receipt is not None
     assert pq.read_table(receipt["publication"]["artifactUri"])["value"].to_pylist() == [1, 2]
+    history = next(item for item in metadb.list_runs(str(graph.id))
+                   if item["runId"] == task["id"])
+    assert history["inputManifest"] == task["input_manifest"]
+    with metadb.session() as session:
+        retained = session.scalar(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "run_record",
+            metadb.LocalResultReference.owner_key == history["id"],
+        ))
+        assert retained is not None
     source_config = task["graph_doc"]["nodes"][0]["data"]["config"]
     assert "uri" not in source_config and "_inputArtifactUri" not in source_config
     restarted.storage.close()
@@ -512,6 +521,25 @@ def test_submission_is_atomic_idempotent_and_projects_into_jobs(task_identity):
             submission_id=task_identity[2], target_node_id="write",
             intent_sha256="b" * 64, graph_doc=task_identity[4],
             input_manifest=[], write_intent=changed)))
+
+
+def test_mirrored_source_free_managed_write_keeps_recorded_empty_manifest(task_identity):
+    task, _ = _submit(task_identity)
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"])
+        assert row is not None
+        metadb._mirror_durable_managed_write_history(
+            session, rows=0, outputs=[RunOutput(
+                node_id="write", port_id="out", wire="dataset", publication_kind="catalog",
+                outcome="committed", uri="file:///source-free.parquet", table="source-free",
+                version="v1", rows=0,
+            )], task=row)
+
+    history = next(item for item in metadb.list_runs(task_identity[1])
+                   if item["runId"] == task["id"])
+    assert history["inputManifest"] == []
+    jobs = metadb.list_workspace_runs(task_identity[0], run_id=task["id"])
+    assert jobs["items"][0]["inputManifest"] == []
 
 
 def test_legacy_frozen_task_recovers_without_manifest_backfill(task_identity):
@@ -785,6 +813,9 @@ def test_committed_response_loss_restarts_and_reconciles_one_receipt(tmp_path):
         == receipt.publication.artifact_uri
     assert metadb.catalog_managed_local_write_head(
         admission.destination)["revision_id"] == receipt.revision_id
+    history = next(item for item in metadb.list_runs(canvas_id)
+                   if item["runId"] == task["id"])
+    assert history["inputManifest"] == task["input_manifest"]
     deps.storage.close()
 
 
