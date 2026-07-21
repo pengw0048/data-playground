@@ -77,6 +77,8 @@ test.describe('provider Workspace Source acceptance', () => {
     expect(createBody.providerDatasetRefs).toHaveLength(1)
     expect(writes).toEqual(['/api/workspace/canvases'])
     await expect(page.getByTestId('toolbar')).toBeVisible()
+    const canvasLocation = page.getByRole('navigation', { name: 'Canvas Workspace location' })
+    await expect(canvasLocation).toContainText(`Workspace/${containerName}`)
     const source = page.locator('.react-flow__node').filter({ hasText: datasetName })
     await expect(source).toHaveCount(1)
     await expect(source.locator(
@@ -132,5 +134,27 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node').filter({ hasText: datasetName })).toHaveCount(1)
+
+    // The Canvas location came from the stable overlay parent. Returning uses that opaque id and
+    // never writes to the provider.
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
+    await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    expect(writes).toEqual(['/api/workspace/canvases'])
+
+    await page.route(`**/api/workspace/resources/${encodeURIComponent(`canvas:${canvasId}`)}`, (route) => route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        resource: { id: `canvas:${canvasId}`, kind: 'canvas', name: 'provider context Canvas', parentId: externalPage.container.id, detached: false, source: 'local' },
+        ancestors: [],
+        source: { id: 'mount:browser-provider', kind: 'provider', completeness: 'unavailable', referenceState: 'detached', error: 'resource detached' },
+      }),
+    }))
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    await expect(page.getByRole('status')).toHaveText('Its Workspace location is unavailable.')
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
+    await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    expect(writes).toEqual(['/api/workspace/canvases'])
   })
 })

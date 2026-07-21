@@ -1122,6 +1122,7 @@ interface Store {
   /** Switch the two Workspace lenses atomically. The optional opaque resource is context, never a path. */
   switchWorkspaceScope: (scope: 'all' | 'datasets', context?: {
     resourceId?: string | null
+    searchQuery?: string
     datasetQuery?: string
   }) => void
   workspaceDatasetQuery: string
@@ -1426,6 +1427,9 @@ export const useStore = create<Store>((set, get) => ({
     set({
       workspaceScope,
       workspaceResourceId: context?.resourceId ?? null,
+      ...(context?.searchQuery !== undefined ? {
+        workspaceSearchQuery: context.searchQuery.trim().replace(/\s+/g, ' '),
+      } : {}),
       ...(context?.datasetQuery !== undefined ? { workspaceDatasetQuery: context.datasetQuery } : {}),
       view: 'workspace',
     })
