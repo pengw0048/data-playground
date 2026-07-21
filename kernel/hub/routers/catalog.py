@@ -386,8 +386,20 @@ def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
 
 def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> DatasetRevision:
     return DatasetRevision(dataset_id=dataset_id, revision_id=str(raw["revision_id"]),
-                           committed_at=raw.get("committed_at"),
+                           committed_at=_core_owned_committed_at(raw.get("committed_at"), adapter),
                            retention_owner=getattr(adapter, "retention_owner", "provider"))
+
+
+def _core_owned_committed_at(value: Any, adapter: DatasetRevisionAdapter) -> Any:
+    """Restore SQLite's lost UTC marker only for the core-managed revision ledger.
+
+    A provider may legitimately expose an offset-free timestamp with provider-specific semantics.
+    This boundary must not guess that such a value is UTC.
+    """
+    if (getattr(adapter, "retention_owner", "provider") == "core"
+            and isinstance(value, datetime.datetime)):
+        return metadb._core_utc_datetime(value)
+    return value
 
 
 def _revision_capabilities(
@@ -456,20 +468,33 @@ def resolve_dataset_revision(table_id: str,
     except RevisionUnavailable:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    committed_at = raw.get("committed_at")
+    committed_at = _core_owned_committed_at(raw.get("committed_at"), adapter)
     if as_of is not None:
-        if isinstance(committed_at, str):
+        ordering_timestamp = committed_at
+        if isinstance(ordering_timestamp, str):
             try:
-                committed_at = datetime.datetime.fromisoformat(committed_at.replace("Z", "+00:00"))
+                ordering_timestamp = datetime.datetime.fromisoformat(
+                    ordering_timestamp.replace("Z", "+00:00"))
             except ValueError:
-                committed_at = None
-        if isinstance(committed_at, datetime.datetime) and (
-                committed_at.tzinfo is None or committed_at.utcoffset() is None):
-            committed_at = committed_at.replace(tzinfo=datetime.timezone.utc)
-        if (not isinstance(committed_at, datetime.datetime)
-                or committed_at.astimezone(datetime.timezone.utc) > as_of):
+                ordering_timestamp = None
+        if (isinstance(ordering_timestamp, datetime.datetime)
+                and (ordering_timestamp.tzinfo is None
+                     or ordering_timestamp.utcoffset() is None)
+                and getattr(adapter, "revision_timezone", None) == "UTC"):
+            # A provider that explicitly advertises UTC ordering (for example Lance's native API)
+            # supplies the missing interpretation. Arbitrary provider-naive values remain ambiguous.
+            ordering_timestamp = ordering_timestamp.replace(tzinfo=datetime.timezone.utc)
+        # Provider-naive timestamps cannot establish an as-of ordering contract without that explicit
+        # provider guarantee. Core-managed values reached this branch through
+        # _core_owned_committed_at above.
+        if (not isinstance(ordering_timestamp, datetime.datetime)
+                or ordering_timestamp.tzinfo is None or ordering_timestamp.utcoffset() is None
+                or ordering_timestamp.astimezone(datetime.timezone.utc) > as_of):
             raise APIError(409, "dataset_revision_resolution_ambiguous",
                            code=APIErrorCode.CONFLICT, retryable=False)
+        # An as-of resolution becomes durable exact-reference evidence, so return the validated
+        # absolute instant rather than the provider's offset-free transport representation.
+        committed_at = ordering_timestamp
     return DatasetRevisionResolution(dataset_id=binding["dataset_id"],
                                      revision_id=str(raw["revision_id"]),
                                      committed_at=committed_at,
@@ -522,7 +547,8 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     preview_rows = _table_to_rows(table.slice(0, DATASET_REVISION_PREVIEW_ROWS))
     return DatasetRevisionDetail(
         dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
-        committed_at=raw.get("committed_at"), parent_revision_id=raw.get("parent_revision_id"),
+        committed_at=_core_owned_committed_at(raw.get("committed_at"), adapter),
+        parent_revision_id=raw.get("parent_revision_id"),
         producer_operation=raw.get("producer_operation"),
         retention_owner=getattr(adapter, "retention_owner", "provider"),
         summary=DatasetRevisionSummary(
