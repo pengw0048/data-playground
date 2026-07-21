@@ -28,4 +28,20 @@ describe('navigation ownership', () => {
       workspaceDatasetQuery: 'dq=robot&sort=updated',
     })
   })
+
+  it('clears incompatible Workspace filters with the exact Canvas parent atomically', () => {
+    useStore.setState({
+      view: 'canvas', workspaceScope: 'datasets', workspaceResourceId: null,
+      workspaceSearchQuery: 'old search', workspaceDatasetQuery: 'dq=robot&folder=research',
+    })
+
+    useStore.getState().switchWorkspaceScope('all', {
+      resourceId: 'container:exact-parent', searchQuery: '', datasetQuery: '',
+    })
+
+    expect(useStore.getState()).toMatchObject({
+      view: 'workspace', workspaceScope: 'all', workspaceResourceId: 'container:exact-parent',
+      workspaceSearchQuery: '', workspaceDatasetQuery: '',
+    })
+  })
 })

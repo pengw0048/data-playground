@@ -101,7 +101,7 @@ export function TopBar() {
     }
     // A non-empty search and the Datasets lens do not establish that the Canvas is visible at this
     // placement. Reset them atomically so #705 emits one owned navigation destination.
-    store.switchWorkspaceScope('all', { resourceId, searchQuery: '' })
+    store.switchWorkspaceScope('all', { resourceId, searchQuery: '', datasetQuery: '' })
   }
 
   return (

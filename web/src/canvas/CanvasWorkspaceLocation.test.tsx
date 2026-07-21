@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   state: {
     doc: { id: 'canvas-1' },
     currentDraftId: null as string | null,
+    localDrafts: [] as Array<{ draftId: string; baseVersion: number | null }>,
   },
 }))
 
@@ -30,6 +31,7 @@ describe('CanvasWorkspaceLocation', () => {
     vi.clearAllMocks()
     mocks.state.doc.id = 'canvas-1'
     mocks.state.currentDraftId = null
+    mocks.state.localDrafts = []
   })
   afterEach(cleanup)
 
@@ -66,16 +68,28 @@ describe('CanvasWorkspaceLocation', () => {
 
   it('does not fabricate a location for a local draft or an unplaced Canvas', async () => {
     mocks.state.currentDraftId = 'draft-1'
+    mocks.state.localDrafts = [{ draftId: 'draft-1', baseVersion: null }]
     const { rerender } = render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
     expect(mocks.workspaceResource).not.toHaveBeenCalled()
     expect(onReturnDestination).toHaveBeenLastCalledWith(undefined)
 
     mocks.state.currentDraftId = null
+    mocks.state.localDrafts = []
     mocks.workspaceResource.mockRejectedValue(new Error('Workspace resource not found'))
     rerender(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith('canvas:canvas-1'))
     expect(screen.queryByRole('navigation', { name: 'Canvas Workspace location' })).not.toBeInTheDocument()
     expect(onReturnDestination).toHaveBeenLastCalledWith(undefined)
+  })
+
+  it('retains authoritative placement for a draft shadowing an existing Canvas', async () => {
+    mocks.state.currentDraftId = 'canvas-1'
+    mocks.state.localDrafts = [{ draftId: 'canvas-1', baseVersion: 3 }]
+    mocks.workspaceResource.mockResolvedValue({ resource: CANVAS, ancestors: [ROOT, RESEARCH, ROBOTICS], source: COMPLETE })
+    render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+
+    await expect(screen.findByRole('navigation', { name: 'Canvas Workspace location' })).resolves.toBeTruthy()
+    expect(onReturnDestination).toHaveBeenLastCalledWith(ROBOTICS.id)
   })
 
   it('ignores an older Canvas resolution that settles after a newer Canvas opens', async () => {
@@ -92,5 +106,19 @@ describe('CanvasWorkspaceLocation', () => {
     resolveOld({ resource: CANVAS, ancestors: [ROOT], source: COMPLETE })
     await waitFor(() => expect(screen.getByText('Fresh Canvas')).toBeInTheDocument())
     expect(screen.queryByText('Purchases per user')).not.toBeInTheDocument()
+  })
+
+  it('ignores a placement response superseded by a local-draft transition', async () => {
+    let resolveOld!: (value: unknown) => void
+    mocks.workspaceResource.mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
+    const { rerender } = render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+    mocks.state.currentDraftId = 'draft-1'
+    mocks.state.localDrafts = [{ draftId: 'draft-1', baseVersion: null }]
+    rerender(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+
+    resolveOld({ resource: CANVAS, ancestors: [ROOT, RESEARCH, ROBOTICS], source: COMPLETE })
+    await waitFor(() => expect(onReturnDestination).toHaveBeenLastCalledWith(undefined))
+    expect(mocks.workspaceResource).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('navigation', { name: 'Canvas Workspace location' })).not.toBeInTheDocument()
   })
 })

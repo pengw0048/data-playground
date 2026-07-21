@@ -136,7 +136,10 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
 
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
-    await expect(page.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
+    await page.getByRole('tab', { name: 'Datasets' }).click()
+    await expect(search).toHaveValue('')
     await search.fill('issue497_')
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()
     await page.getByRole('checkbox', { name: `Select ${uploaded.name}` }).check()

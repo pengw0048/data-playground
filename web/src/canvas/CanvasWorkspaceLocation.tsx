@@ -35,13 +35,18 @@ function displayAncestors(ancestors: WorkspaceResource[]): WorkspaceResource[] {
 export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Props) {
   const canvasId = useStore((state) => state.doc.id)
   const currentDraftId = useStore((state) => state.currentDraftId)
+  const currentDraftBaseVersion = useStore((state) => state.localDrafts.find(
+    (draft) => draft.draftId === state.currentDraftId,
+  )?.baseVersion ?? null)
   const [state, setState] = useState<LocationState>({ kind: 'hidden' })
 
   useEffect(() => {
     let current = true
     setState({ kind: 'hidden' })
     onReturnDestination(undefined)
-    if (currentDraftId) return () => { current = false }
+    // A local-only draft has no authoritative Workspace identity to resolve. A draft shadowing an
+    // existing server Canvas keeps its server base and may still use that Canvas's placement.
+    if (currentDraftId && currentDraftBaseVersion == null) return () => { current = false }
 
     void api.workspaceResource(`canvas:${canvasId}`).then((resolved) => {
       if (!current || resolved.resource?.kind !== 'canvas') return
@@ -61,7 +66,7 @@ export function CanvasWorkspaceLocation({ onReturnDestination, onNavigate }: Pro
       setState({ kind: 'hidden' })
     })
     return () => { current = false }
-  }, [canvasId, currentDraftId, onReturnDestination])
+  }, [canvasId, currentDraftBaseVersion, currentDraftId, onReturnDestination])
 
   if (state.kind === 'hidden') return null
   if (state.kind === 'unavailable') {
