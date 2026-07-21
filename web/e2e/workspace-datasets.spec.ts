@@ -103,6 +103,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.goForward()
     await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
 
+    await page.getByRole('button', { name: 'All datasets' }).click()
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()
     await page.getByRole('checkbox', { name: `Select ${uploaded.name}` }).check()
     const selection = page.getByTestId('catalog-selection-bar')
