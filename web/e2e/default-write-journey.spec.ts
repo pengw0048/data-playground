@@ -92,10 +92,15 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const runId = started.runId
     const receipt = inspector.getByLabel('Write receipt')
     await expect(receipt).toContainText('durable revision', { timeout: 30_000 })
-    const jobs = await ok<{ items: Array<{ status: string; outputReceipt?: { datasetId: string; revisionId: string } | null }> }>(
-      await page.request.get(`/api/jobs?run_id=${encodeURIComponent(runId)}&limit=1`), 'read Jobs receipt')
-    expect(jobs.items[0]?.status).toBe('done')
-    const dataset = jobs.items[0]?.outputReceipt
+    type JobItem = { status: string; outputReceipt?: { datasetId: string; revisionId: string } | null }
+    let job: JobItem | undefined
+    // Poll the mirrored Jobs record until it converges on the run's terminal state.
+    await expect.poll(async () => {
+      job = (await ok<{ items: JobItem[] }>(
+        await page.request.get(`/api/jobs?run_id=${encodeURIComponent(runId)}&limit=1`), 'read Jobs receipt')).items[0]
+      return job?.status
+    }, { timeout: 30_000 }).toBe('done')
+    const dataset = job?.outputReceipt
     expect(dataset?.revisionId, 'Jobs surfaces the managed revision id').toBeTruthy()
     // The inspector receipt names the same durable revision the Jobs surface published.
     await expect(receipt).toContainText(dataset!.revisionId)
