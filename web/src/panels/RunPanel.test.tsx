@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   clearBinding: vi.fn(),
   submit: vi.fn(),
   edit: vi.fn(),
+  setJobsQuery: vi.fn(),
 }))
 
 vi.mock('../store/graph', () => ({
@@ -37,7 +38,7 @@ describe('RunPanel typed parameter gate', () => {
       estimate: vi.fn(), run: vi.fn(), cancelRun: vi.fn(), refreshPreviewInputs: vi.fn(),
       previewBindings: {}, canvasRole: 'owner', setRunParameterBinding: mocks.setBinding,
       clearRunParameterBinding: mocks.clearBinding, submitRunParameters: mocks.submit,
-      editRunParameters: mocks.edit,
+      editRunParameters: mocks.edit, setJobsQuery: mocks.setJobsQuery,
     }
   })
 
@@ -197,5 +198,41 @@ describe('RunPanel typed parameter gate', () => {
     mocks.state.runs = { target: { phase: 'idle' } }
     render(<RunPanel nodeId="target" />)
     await waitFor(() => expect(mocks.state.estimate).toHaveBeenCalledWith('target'))
+  })
+
+  it.each([
+    ['queued managed Write', 'running', 'queued'],
+    ['running Job', 'running', 'running'],
+    ['completed Job', 'done', 'done'],
+    ['failed Job', 'failed', 'failed'],
+    ['cancelled Job', 'idle', 'cancelled'],
+  ])('opens the exact authorized Job for a %s', (_label, phase, status) => {
+    mocks.state.runs.target = {
+      phase,
+      status: {
+        runId: `job-${phase}`, status, jobType: 'run', targetNodeId: 'target', rowsProcessed: 0,
+        ms: 0, placement: 'local', perNode: [], outputs: [],
+      },
+    }
+    render(<RunPanel nodeId="target" />)
+    fireEvent.click(screen.getByRole('button', { name: 'View in Jobs' }))
+    expect(mocks.setJobsQuery).toHaveBeenCalledWith(`run=job-${phase}`)
+  })
+
+  it('omits View in Jobs without a known Job identity or after an unrelated estimate failure', () => {
+    mocks.state.runs.target = {
+      phase: 'failed',
+      status: { runId: '', status: 'failed', jobType: 'run', targetNodeId: 'target', rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [] },
+    }
+    const { rerender } = render(<RunPanel nodeId="target" />)
+    expect(screen.queryByRole('button', { name: 'View in Jobs' })).toBeNull()
+
+    mocks.state.runs.target = {
+      phase: 'estimated',
+      status: { runId: 'old-failed-job', status: 'failed', jobType: 'run', targetNodeId: 'target', rowsProcessed: 0, ms: 0, placement: 'local', perNode: [], outputs: [] },
+      estimate: { rows: 1, placement: 'local', needsConfirm: false },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.queryByRole('button', { name: 'View in Jobs' })).toBeNull()
   })
 })
