@@ -279,13 +279,15 @@ function WorkspaceMixedExplorer() {
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
   const [folderCreateParent, setFolderCreateParent] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
-  const [folderRenameResource, setFolderRenameResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
-  const [folderDeleteResource, setFolderDeleteResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
+  const [folderRenameResource, setFolderRenameResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[]; fromSearch?: boolean } | null>(null)
+  const [folderDeleteResource, setFolderDeleteResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[]; fromSearch?: boolean } | null>(null)
   const [canvasRenameResource, setCanvasRenameResource] = useState<WorkspaceResource | null>(null)
   const [canvasDeleteResource, setCanvasDeleteResource] = useState<WorkspaceResource | null>(null)
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
   const [providerDatasetAction, setProviderDatasetAction] = useState<WorkspaceResource | null>(null)
-  const [moveResource, setMoveResource] = useState<WorkspaceResource | null>(null)
+  const [moveResource, setMoveResource] = useState<{
+    resource: WorkspaceResource; sourceContainer: WorkspaceResource; sourcePath: WorkspaceResource[]
+  } | null>(null)
   const [relinkResource, setRelinkResource] = useState<WorkspaceResource | null>(null)
   const [undoMove, setUndoMove] = useState<{
     resource: WorkspaceResource; previousContainer: WorkspaceResource; destination: WorkspaceResource
@@ -455,6 +457,34 @@ function WorkspaceMixedExplorer() {
   // Re-resolve the stable resource before reloading. This keeps rename/move refreshes truthful and
   // retries the same deep link rather than silently falling back to a different container.
   const reload = () => setRevision((current) => current + 1)
+  const searchActionRequest = useRef(0)
+  useEffect(() => () => { searchActionRequest.current += 1 }, [searchQuery])
+  const startSearchAction = async (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => {
+    const sequence = ++searchActionRequest.current
+    try {
+      const resolved = await api.workspaceResource(resource.id)
+      if (sequence !== searchActionRequest.current || !resolved.resource) return
+      const exact = resolved.resource
+      const path = exact.kind === 'container' ? [...resolved.ancestors, exact] : resolved.ancestors
+      const editableCanvas = exact.kind === 'canvas' && !exact.detached
+        && ['owner', 'editor'].includes(files.find((file) => file.id === identity(exact))?.role ?? '')
+      if (action === 'rename-folder' && exact.kind === 'container' && exact.canRenameFolder) {
+        setFolderRenameResource({ resource: exact, path, fromSearch: true })
+      } else if (action === 'delete-folder' && exact.kind === 'container' && folderDeleteMode(exact)) {
+        setFolderDeleteResource({ resource: exact, path, fromSearch: true })
+      } else if (action === 'rename-canvas' && editableCanvas) {
+        setCanvasRenameResource(exact)
+      } else if (action === 'move-canvas' && editableCanvas) {
+        const sourceContainer = resolved.ancestors[resolved.ancestors.length - 1]
+        if (sourceContainer) setMoveResource({ resource: exact, sourceContainer, sourcePath: path })
+      } else if (action === 'delete-canvas' && exact.kind === 'canvas'
+        && files.find((file) => file.id === identity(exact))?.role === 'owner') {
+        setCanvasDeleteResource(exact)
+      }
+    } catch (caught) {
+      if (sequence === searchActionRequest.current) pushToast(`Could not load this search result's actions: ${errorMessage(caught)}`, 'error')
+    }
+  }
   const undoLastMove = async () => {
     const destination = canvasDestination(undoMove?.previousContainer ?? null, 'move')
     if (!undoMove?.resource.placementId || undoMove.resource.version == null || !destination) return
@@ -549,7 +579,8 @@ function WorkspaceMixedExplorer() {
       </div>}
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
-        {searchQuery ? <WorkspaceSearchResults query={searchQuery} onOpen={open} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
+        {searchQuery ? <WorkspaceSearchResults query={searchQuery} revision={revision} onOpen={open}
+          onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
           <button onClick={reload} className="font-semibold underline">Retry</button>
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : items.length ? <div className="mx-auto grid max-w-5xl gap-2">
@@ -560,11 +591,11 @@ function WorkspaceMixedExplorer() {
               ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
             onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
               ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
-            onMove={resource.kind === 'canvas' && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
-              ? () => setMoveResource(resource) : undefined}
-            onRenameCanvas={resource.kind === 'canvas' && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+            onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+              ? () => container && setMoveResource({ resource, sourceContainer: container, sourcePath: crumbs }) : undefined}
+            onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
               ? () => setCanvasRenameResource(resource) : undefined}
-            onDeleteCanvas={resource.kind === 'canvas' && files.find((file) => file.id === identity(resource))?.role === 'owner'
+            onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && files.find((file) => file.id === identity(resource))?.role === 'owner'
               ? () => setCanvasDeleteResource(resource) : undefined} />)}
           {loadMoreError && <div role="alert" className="mx-auto mt-2 text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
           {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
@@ -606,7 +637,9 @@ function WorkspaceMixedExplorer() {
         }} />}
       {folderRenameResource && <FolderRenameDialog resource={folderRenameResource.resource} path={folderRenameResource.path}
         onClose={() => setFolderRenameResource(null)} onRenamed={(resource) => {
-          setFolderRenameResource(null); reload(); setWorkspaceResource(resource.id)
+          const fromSearch = folderRenameResource.fromSearch
+          setFolderRenameResource(null); reload()
+          if (!fromSearch) setWorkspaceResource(resource.id)
         }} />}
       {folderDeleteResource && <FolderDeleteDialog resource={folderDeleteResource.resource} path={folderDeleteResource.path}
         onClose={() => setFolderDeleteResource(null)} onDeleted={() => {
@@ -624,7 +657,7 @@ function WorkspaceMixedExplorer() {
         onOpened={(canvasId) => {
           setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
         }} />}
-      {moveResource && container && <MoveCanvasDialog resource={moveResource} sourceContainer={container} sourcePath={crumbs} onClose={() => setMoveResource(null)}
+      {moveResource && <MoveCanvasDialog resource={moveResource.resource} sourceContainer={moveResource.sourceContainer} sourcePath={moveResource.sourcePath} onClose={() => setMoveResource(null)}
         onMoved={(result, destinationPath) => {
           setMoveResource(null)
           setUndoMove({ resource: result.resource, previousContainer: result.previousContainer, destination: result.container,
@@ -834,8 +867,10 @@ function WorkspaceDatasets() {
   </div>
 }
 
-function WorkspaceSearchResults({ query, onOpen }: {
-  query: string; onOpen: (resource: WorkspaceResource) => void
+function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
+  query: string; revision: number; onOpen: (resource: WorkspaceResource) => void
+  onAction: (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  files: CanvasFile[]
 }) {
   const [groups, setGroups] = useState<WorkspaceSearchGroup[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
@@ -880,7 +915,7 @@ function WorkspaceSearchResults({ query, onOpen }: {
   useEffect(() => {
     void load()
     return () => { request.current += 1 }
-  }, [load])
+  }, [load, revision])
 
   const resultCount = groups.reduce((count, group) => count + group.items.length, 0)
   if (loading) return <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Searching Workspace…</div>
@@ -896,7 +931,7 @@ function WorkspaceSearchResults({ query, onOpen }: {
       <span> for “{query}”</span>
       {completeness === 'partial' && <span> — unavailable, stale, or unsupported sources are labeled below.</span>}
     </div>
-    {groups.map((group) => <SearchSourceGroup key={group.source.id} group={group} onOpen={onOpen} />)}
+    {groups.map((group) => <SearchSourceGroup key={group.source.id} group={group} onOpen={onOpen} onAction={onAction} files={files} />)}
     {!resultCount && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[13px] text-muted-foreground">
       {completeness === 'partial'
         ? 'No matches were returned by the available sources. This is not a complete empty result.'
@@ -913,8 +948,10 @@ function WorkspaceSearchResults({ query, onOpen }: {
   </div>
 }
 
-function SearchSourceGroup({ group, onOpen }: {
+function SearchSourceGroup({ group, onOpen, onAction, files }: {
   group: WorkspaceSearchGroup; onOpen: (resource: WorkspaceResource) => void
+  onAction: (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  files: CanvasFile[]
 }) {
   const source = group.source
   const name = source.kind === 'local' ? 'Local Workspace'
@@ -932,7 +969,15 @@ function SearchSourceGroup({ group, onOpen }: {
       <span>{detail}</span>
       {error && <span className="text-amber-700 dark:text-amber-300">— {error}</span>}
     </div>
-    {group.items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => onOpen(resource)} />)}
+    {group.items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => onOpen(resource)}
+      onRenameFolder={resource.kind === 'container' && resource.canRenameFolder ? () => onAction(resource, 'rename-folder') : undefined}
+      onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource) ? () => onAction(resource, 'delete-folder') : undefined}
+      onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+        ? () => onAction(resource, 'rename-canvas') : undefined}
+      onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+        ? () => onAction(resource, 'move-canvas') : undefined}
+      onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && files.find((file) => file.id === identity(resource))?.role === 'owner'
+        ? () => onAction(resource, 'delete-canvas') : undefined} />)}
     {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
       {source.completeness === 'complete' ? 'No matches from this source.'
         : error ?? `This source is ${source.completeness}.`}
@@ -1089,22 +1134,29 @@ function CanvasRenameDialog({ resource, onClose, onRenamed }: {
   const [name, setName] = useState(resource.name)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const active = useRef(true)
+  useEffect(() => () => { active.current = false }, [])
+  const close = () => { active.current = false; onClose() }
   const submit = async () => {
-    if (!name.trim() || resource.version == null || busy) return
+    if (!name.trim() || busy) return
     setBusy(true); setError(null)
     try {
       const doc = await api.getCanvas(identity(resource))
-      await api.saveCanvas({ ...doc, name: name.trim() }, false, resource.version)
+      // Workspace placement versions protect placement moves, not the Canvas document. Read the
+      // exact document first and use its own CAS token for this document mutation.
+      if (!active.current) return
+      await api.saveCanvas({ ...doc, name: name.trim() }, false, doc.version)
+      if (!active.current) return
       onRenamed()
-    } catch (caught) { setError(errorMessage(caught)) }
-    finally { setBusy(false) }
+    } catch (caught) { if (active.current) setError(errorMessage(caught)) }
+    finally { if (active.current) setBusy(false) }
   }
-  return <Modal label={`Rename ${resource.name}`} onClose={onClose}>
+  return <Modal label={`Rename ${resource.name}`} onClose={close}>
     <label className="grid gap-1 text-[11px] text-muted-foreground">Canvas name
       <input autoFocus aria-label="Canvas name" value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
     </label>
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
-    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
+    <div className="flex justify-end gap-2"><button onClick={close} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
       <button onClick={() => void submit()} disabled={!name.trim() || name.trim() === resource.name || busy} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Renaming…' : 'Rename'}</button></div>
   </Modal>
 }
@@ -1297,11 +1349,17 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
         : resource.kind === 'canvas' ? 'Local'
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
+  const providerFolderExplanation = resource.kind === 'container' && isExternal(resource)
+    && !resource.canCreateFolder && !resource.canRenameFolder && !folderDeleteMode(resource)
+    ? canvasDestination(resource, 'create')
+      ? 'This catalog manages its folders. You can still create a local Canvas here. Folder rename, move, and delete are unavailable here; this does not change the connected catalog.'
+      : 'This catalog manages its folders. Folder rename, move, and delete are unavailable here. No local Canvas placement is available here.'
+    : null
   return <div className="flex min-w-0 items-center rounded-lg border border-border bg-card hover:border-primary/40 hover:bg-accent">
     <button type="button" onClick={onOpen} aria-label={openLabel}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span></span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{providerFolderExplanation && <span className="block truncate text-[11px] text-muted-foreground">{providerFolderExplanation}</span>}</span>
       {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>

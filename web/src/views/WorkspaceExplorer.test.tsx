@@ -216,10 +216,10 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(mocks.workspaceDeleteFolder).toHaveBeenCalledWith('cleanup-folder', { expectedVersion: 1 }))
   })
 
-  it('renames and deletes only an owned local Canvas through confirmation dialogs with its exact version', async () => {
+  it('renames and deletes only an owned local Canvas through confirmation dialogs with the Canvas document CAS token', async () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS], nextCursor: null, hasMore: false, completeness: 'complete' })
-    mocks.getCanvas.mockResolvedValue({ id: 'canvas-1', name: 'Analysis', version: 3, nodes: [], edges: [] })
-    mocks.saveCanvas.mockResolvedValue({ ok: true, id: 'canvas-1', version: 4 })
+    mocks.getCanvas.mockResolvedValue({ id: 'canvas-1', name: 'Analysis', version: 17, nodes: [], edges: [] })
+    mocks.saveCanvas.mockResolvedValue({ ok: true, id: 'canvas-1', version: 18 })
     mocks.deleteCanvas.mockResolvedValue({ ok: true })
     render(<WorkspaceExplorer />)
 
@@ -228,8 +228,8 @@ describe('WorkspaceExplorer', () => {
     fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'Renamed Analysis' } })
     fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
     await waitFor(() => expect(mocks.saveCanvas).toHaveBeenCalledWith({
-      id: 'canvas-1', name: 'Renamed Analysis', version: 3, nodes: [], edges: [],
-    }, false, 3))
+      id: 'canvas-1', name: 'Renamed Analysis', version: 17, nodes: [], edges: [],
+    }, false, 17))
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
@@ -239,6 +239,33 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(screen.getByRole('menuitem', { name: 'Delete' }))
     fireEvent.click(within(screen.getByRole('dialog', { name: 'Delete Analysis' })).getByRole('button', { name: 'Delete' }))
     await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledWith('canvas-1'))
+  })
+
+  it('fences a closed Canvas Rename fetch so an old row cannot save or close a newer dialog', async () => {
+    const secondCanvas = { ...CANVAS, id: 'canvas:canvas-2', name: 'Second analysis', placementId: 'canvas-placement-2', version: 4 }
+    let resolveFirst: ((value: { id: string; name: string; version: number; nodes: never[]; edges: never[] }) => void) | undefined
+    store.files = [
+      { id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' },
+      { id: 'canvas-2', name: 'Second analysis', version: 4, role: 'owner' },
+    ]
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [CANVAS, secondCanvas], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.getCanvas.mockReturnValueOnce(new Promise((resolve) => { resolveFirst = resolve }))
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
+    fireEvent.change(screen.getByLabelText('Canvas name'), { target: { value: 'Old rename' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
+    await waitFor(() => expect(mocks.getCanvas).toHaveBeenCalledWith('canvas-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Second analysis' }), { button: 0, ctrlKey: false })
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
+    expect(screen.getByRole('dialog', { name: 'Rename Second analysis' })).toBeVisible()
+    await act(async () => { resolveFirst?.({ id: 'canvas-1', name: 'Analysis', version: 17, nodes: [], edges: [] }) })
+
+    expect(mocks.saveCanvas).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog', { name: 'Rename Second analysis' })).toBeVisible()
   })
 
   it('does not expose local Canvas mutations to a viewer', async () => {
@@ -261,6 +288,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('menuitem', { name: 'New folder' })).not.toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+    expect(screen.getByText('This catalog manages its folders. You can still create a local Canvas here. Folder rename, move, and delete are unavailable here; this does not change the connected catalog.')).toBeVisible()
     expect(mocks.workspaceCreateFolder).not.toHaveBeenCalled()
     expect(mocks.workspaceRenameFolder).not.toHaveBeenCalled()
     expect(mocks.workspaceDeleteFolder).not.toHaveBeenCalled()
@@ -282,6 +310,34 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open dataset observations' }))
     expect(store.setWorkspaceResource).toHaveBeenCalledWith(DATASET.id)
     expect(mocks.workspaceSearch).toHaveBeenCalledWith('observations', { limit: 25, cursor: undefined })
+  })
+
+  it('keeps capability-driven Folder and Canvas actions available from search results without leaving search context', async () => {
+    const searchableFolder = { ...FOLDER, canRenameFolder: true, canDeleteFolder: true }
+    const searchableCanvas = { ...CANVAS, parentId: FOLDER.id }
+    store.workspaceSearchQuery = 'analysis'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'analysis', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{ source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' }, items: [searchableFolder, searchableCanvas] }],
+    })
+    mocks.workspaceResource.mockImplementation(async (id: string) => id === searchableFolder.id
+      ? { resource: searchableFolder, ancestors: [ROOT], source: { id: 'local', kind: 'local', completeness: 'complete' } }
+      : { resource: searchableCanvas, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
+    mocks.workspaceRenameFolder.mockResolvedValue({ ok: true, resource: { ...searchableFolder, name: 'Renamed research' } })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Research' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Research' })).toHaveTextContent('OpenRenameDelete')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith(searchableFolder.id))
+    fireEvent.change(screen.getByLabelText('Folder name'), { target: { value: 'Renamed research' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }))
+    await waitFor(() => expect(mocks.workspaceRenameFolder).toHaveBeenCalledWith('folder-1', { expectedVersion: 1, name: 'Renamed research' }))
+    expect(screen.getByTestId('workspace-search-results')).toBeVisible()
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(searchableFolder.id)
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('OpenRenameMoveDelete')
   })
 
   it('keeps completed search pages visible when loading the continuation fails', async () => {
