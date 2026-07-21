@@ -1469,7 +1469,8 @@ test.describe('Data Playground canvas', () => {
     const canvasHash = await page.evaluate(() => location.hash)
     // navigate to Workspace → URL updates
     await backToWorkspace(page)
-    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/workspace')
+    await expect.poll(() => page.evaluate(() => location.hash))
+      .toBe('#/workspace/container%3Aworkspace-local-root')
     // browser Back returns to the canvas editor
     await page.goBack()
     await expect(page.getByTestId('toolbar')).toBeVisible()

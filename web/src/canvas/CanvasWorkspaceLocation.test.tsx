@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   workspaceResource: vi.fn(),
   state: {
     doc: { id: 'canvas-1' },
+    serverVersion: 1 as number | null,
     currentDraftId: null as string | null,
     localDrafts: [] as Array<{ draftId: string; baseVersion: number | null }>,
   },
@@ -30,6 +31,7 @@ describe('CanvasWorkspaceLocation', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.state.doc.id = 'canvas-1'
+    mocks.state.serverVersion = 1
     mocks.state.currentDraftId = null
     mocks.state.localDrafts = []
   })
@@ -80,6 +82,20 @@ describe('CanvasWorkspaceLocation', () => {
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith('canvas:canvas-1'))
     expect(screen.queryByRole('navigation', { name: 'Canvas Workspace location' })).not.toBeInTheDocument()
     expect(onReturnDestination).toHaveBeenLastCalledWith(undefined)
+  })
+
+  it('waits for bootstrap before resolving the authoritative server Canvas', async () => {
+    mocks.state.serverVersion = null
+    const { rerender } = render(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+
+    expect(mocks.workspaceResource).not.toHaveBeenCalled()
+    expect(onReturnDestination).toHaveBeenLastCalledWith(undefined)
+
+    mocks.state.serverVersion = 2
+    mocks.workspaceResource.mockResolvedValue({ resource: CANVAS, ancestors: [ROOT, RESEARCH, ROBOTICS], source: COMPLETE })
+    rerender(<CanvasWorkspaceLocation onReturnDestination={onReturnDestination} onNavigate={onNavigate} />)
+    await screen.findByRole('navigation', { name: 'Canvas Workspace location' })
+    expect(mocks.workspaceResource).toHaveBeenCalledTimes(1)
   })
 
   it('retains authoritative placement for a draft shadowing an existing Canvas', async () => {
