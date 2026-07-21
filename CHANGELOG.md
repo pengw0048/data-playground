@@ -24,8 +24,8 @@ workstation) with a Python wheel (`data-playground`) and application container i
 
 ### Metadata schema
 
-- **Current Alembic history:** `0001_schema_baseline` through `0012_linear_checkpoint_admission`
-  (head).
+- **Current Alembic history:** `0001_schema_baseline` through `0038_inbox_dataset_scoped`
+  (head), a linear chain of forward migrations.
 - Databases created by pre-baseline commits (before `0001_schema_baseline`) are intentionally
   unsupported. Recreate the workspace/SQLite database or PostgreSQL schema; there is no upgrade or
   backfill path into this baseline.

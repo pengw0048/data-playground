@@ -18,11 +18,12 @@ Frontend checks (from `web/`): `npx tsc --noEmit`, `npx vitest run`, `npm run bu
 
 Reproduce CI's clean environment locally: `cd kernel && uv sync --extra dev --frozen && uv run --no-sync pytest`.
 
-Data Playground has not published its first release. Until that happens, metadata schema changes edit
-`kernel/hub/migrations/versions/0001_schema_baseline.py` and its fresh-database tests directly instead
-of accumulating upgrade revisions for unreleased databases. Never use `Base.metadata.create_all()` as a
-migration substitute. Once a public tag exists, this policy ends and every schema change requires a new
-forward migration from the released head.
+Metadata schema changes add a new forward Alembic migration from the current head — a linear chain
+rooted at `kernel/hub/migrations/versions/0001_schema_baseline.py` — and extend its fresh-database
+tests (`kernel/hub/tests/test_migrations.py` pins the full chain and every migration's content hash).
+Never use `Base.metadata.create_all()` as a migration substitute. Databases created before
+`0001_schema_baseline` are unsupported: recreate the workspace/SQLite database or PostgreSQL schema;
+there is no backfill path into the baseline.
 
 ## Before you open a PR
 
