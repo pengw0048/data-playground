@@ -166,6 +166,7 @@ export function JobsView() {
   useEffect(() => {
     const runId = params.get('run')
     if (!runId) {
+      deepLinkRequest.current = ''
       setSelectedRunUnavailable(false)
       return
     }

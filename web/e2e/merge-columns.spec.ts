@@ -141,6 +141,7 @@ test('certifies the real Write Inspector merge journey and exact revision histor
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
     const job = page.getByRole('button', { name: `Open run ${task.taskId} in Issue 585 exact merge canvas` })
     await expect(job).toBeVisible()
+    await page.getByText('Technical evidence', { exact: true }).click()
     await expect(page.getByText('Column merge:', { exact: true })).toBeVisible()
     await page.getByRole('button', { name: 'Open exact revision' }).click()
     await expect(page.getByLabel('Exact revision detail')).toContainText(`Parent ${base.revisionId}`)

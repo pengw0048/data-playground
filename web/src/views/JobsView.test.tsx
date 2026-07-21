@@ -120,14 +120,20 @@ describe('JobsView', () => {
     expect(screen.getByText('Run:').closest('div')).toHaveTextContent('run-1')
   })
 
-  it('shows a non-leaking unavailable state and keeps ordinary filters when returning to Jobs', async () => {
+  it('rechecks the same unavailable deep link after returning to Jobs', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
-    useStore.setState({ jobsQuery: 'status=failed&canvas=canvas-1&run=missing-run&output=write-1%3Aout' } as never)
+    const deepLink = 'status=failed&canvas=canvas-1&run=missing-run&output=write-1%3Aout'
+    useStore.setState({ jobsQuery: deepLink } as never)
     render(<JobsView />)
 
     expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'Back to Jobs' }))
     expect(useStore.getState().jobsQuery).toBe('status=failed&canvas=canvas-1')
+    expect(screen.queryByText('This Job is unavailable or you no longer have access.')).not.toBeInTheDocument()
+
+    useStore.setState({ jobsQuery: deepLink } as never)
+    expect(await screen.findByText('This Job is unavailable or you no longer have access.')).toBeVisible()
+    expect(mocks.workspaceJobs).toHaveBeenCalledTimes(3)
   })
 
   it('uses authorized canvas names and current-page node/backend context while retaining canonical IDs', async () => {
