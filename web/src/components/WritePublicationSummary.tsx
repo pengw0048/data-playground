@@ -111,16 +111,17 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
+  const summaryAdmission = completed ? outcomeAdmission : admission
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
       <div><span className="font-semibold text-foreground">Output name</span><div className="font-mono text-foreground">{outputName}</div></div>
       <div><span className="font-semibold text-foreground">Destination</span><div className="text-muted-foreground">{destination}</div></div>
-      <div><span className="font-semibold text-foreground">Publication mode</span><div className="text-muted-foreground">{publicationMode(admission?.mode)}</div></div>
-      {admission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
-        <strong>Cannot publish until</strong> {admission.blocker}
+      <div><span className="font-semibold text-foreground">Publication mode</span><div className="text-muted-foreground">{publicationMode(summaryAdmission?.mode)}</div></div>
+      {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+        <strong>Cannot publish until</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">Publication outcome is unknown; no exact receipt was recorded.</div>
-        : admission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish</div>
+        : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish</div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
         <strong>{outputName} published</strong> · {receipt.rows.toLocaleString()} rows

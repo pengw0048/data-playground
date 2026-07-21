@@ -169,16 +169,38 @@ describe('Inspector — effective named outputs', () => {
     expect(publication).toHaveTextContent('dataset-1@rev-1')
   })
 
-  it('keeps blockers visible and links only a receipt-backed exact revision', () => {
+  it('keeps current admission blockers visible before publication', () => {
     selectNode('write', undefined)
     useStore.setState({
       runs: { node: {
-        phase: 'done',
+        phase: 'estimated',
         writeAdmission: {
           nodeId: 'node', managed: true, destination: '/outputs/existing.lance',
           mode: 'append', provider: 'managed-local-lance', expectedSchema: cols,
           partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' }, blocker: 'the destination head moved',
         },
+        status: { outputs: [] },
+      } },
+    } as any)
+
+    render(<Inspector />)
+
+    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the destination head moved')
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the completed admission and exact receipt above a blocked next admission', () => {
+    selectNode('write', undefined)
+    const outcomeAdmission = {
+      nodeId: 'node', managed: true, destination: '/outputs/existing.lance',
+      mode: 'append', provider: 'managed-local-lance', expectedSchema: cols,
+      partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
+    }
+    useStore.setState({
+      runs: { node: {
+        phase: 'done',
+        writeAdmission: { ...outcomeAdmission, mode: 'replace', blocker: 'the next destination head moved' },
+        writeOutcomeAdmission: outcomeAdmission,
         status: { outputs: [{ writeReceipt: {
           datasetId: 'dataset-lance', revisionId: '8', rows: 12, bytes: 1024,
           durable: true, head: { datasetId: 'dataset-lance', revisionId: '8', retentionOwner: 'core' },
@@ -191,7 +213,8 @@ describe('Inspector — effective named outputs', () => {
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the destination head moved')
+    expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
+    expect(screen.getByText('Publication mode').parentElement).toHaveTextContent('Append to the selected dataset')
     expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     fireEvent.click(screen.getByText('Publication details'))
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')

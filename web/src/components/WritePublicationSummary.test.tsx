@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ datasetRevision: vi.fn() }))
@@ -16,6 +16,29 @@ const receipt = {
 } as any
 
 describe('WritePublicationSummary exact receipt action', () => {
+  it('keeps the completed admission in the task-first summary after active admission cleanup or replacement', () => {
+    const outcomeAdmission = {
+      nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create', destination: 'managed://dataset-1',
+      expectedSchema: [], partitions: [],
+    } as any
+    const nextAdmission = { ...outcomeAdmission, mode: 'replace', blocker: 'Next run is blocked' }
+    const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
+      outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
+
+    const summaryMode = screen.getByText('Publication mode').parentElement!
+    expect(within(summaryMode).getByText('Create a new dataset')).toBeVisible()
+
+    rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
+      admission={nextAdmission} outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
+    expect(within(screen.getByText('Publication mode').parentElement!).getByText('Create a new dataset')).toBeVisible()
+    expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Exact publication receipt recorded')
+
+    rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
+    expect(within(screen.getByText('Publication mode').parentElement!)
+      .getByText('Publication mode is not available yet')).toBeVisible()
+  })
+
   it('opens only the receipt-backed exact revision and fails closed when it is unavailable', async () => {
     mocks.datasetRevision.mockRejectedValueOnce(new Error('revision compacted'))
     render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
