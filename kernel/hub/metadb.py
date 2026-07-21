@@ -6038,6 +6038,8 @@ def _inbox_completed_write(task: DurableTask | None, item: DurableTaskInboxItem)
         status = RunStatus.model_validate(json.loads(task.status_doc))
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+    if status.run_id != task.id or status.status != "done" or status.job_type != "run":
+        return None
     committed = [output for output in status.outputs if output.outcome == "committed"]
     if len(committed) != 1:
         return None

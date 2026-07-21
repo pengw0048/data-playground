@@ -727,6 +727,7 @@ export type InboxTaskKind =
   | 'external_wait'
   | 'linear_checkpoint_write'
   | 'bounded_fanout_write'
+  | 'merge_columns_write'
   | 'restore_revision_write'
   | 'keyed_upsert_write'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }

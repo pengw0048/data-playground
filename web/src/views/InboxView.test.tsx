@@ -80,12 +80,24 @@ describe('InboxView', () => {
     expect(screen.getByText('Canvas unavailable')).toBeInTheDocument()
   })
 
+  it('never describes a failed item without a diagnostic as successful', async () => {
+    mocks.inboxList.mockResolvedValue({
+      items: [item({ outcome: 'failed', diagnosticCode: null })],
+      hasMore: false,
+      nextCursor: null,
+    })
+    render(<InboxView />)
+    expect(await screen.findByText('Work failed')).toBeInTheDocument()
+    expect(screen.queryByText('Finished successfully')).toBeNull()
+  })
+
   it('labels every declared task kind for each terminal outcome and diagnoses unknown runtime kinds', async () => {
     const kinds = [
       ['managed_local_write', 'Managed local write'],
       ['external_wait', 'External wait'],
       ['linear_checkpoint_write', 'Checkpointed write'],
       ['bounded_fanout_write', 'Bounded fan-out write'],
+      ['merge_columns_write', 'Merge columns write'],
     ] as const
     const outcomes = ['completed', 'failed', 'cancelled'] as const
     const rows = kinds.flatMap(([taskKind, label]) => outcomes.map((outcome) => item({

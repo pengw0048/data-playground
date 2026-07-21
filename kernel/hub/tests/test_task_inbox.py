@@ -200,6 +200,22 @@ def test_completed_summary_omits_corrupt_embedded_receipt_mismatch():
     assert item.get("completed_write") is None
 
 
+def test_completed_summary_omits_status_with_a_different_run_identity():
+    uid, canvas_id = _user_canvas("summary-run-identity")
+    task = _submit_local(uid, canvas_id)
+    attempt = metadb.claim_durable_task(task["id"], "owner")["attempts"][-1]
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt["id"], "owner",
+        _done_status(task["id"], task["write_intent"]["idempotencyKey"]))
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"], with_for_update=True)
+        status = json.loads(row.status_doc)
+        status["run_id"] = "different-run"
+        row.status_doc = json.dumps(status)
+    item = _inbox_for(uid, task["id"])[0]
+    assert item.get("completed_write") is None
+
+
 def test_superseded_attempt_replay_does_not_duplicate_completed_inbox():
     """A fenced attempt replaying an identical done payload must not mint a second item."""
     uid, canvas_id = _user_canvas("supersede")

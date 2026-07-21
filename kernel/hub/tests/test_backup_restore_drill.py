@@ -1716,10 +1716,8 @@ def _assert_durable_task_recovery(info: dict, *, outputs_root: Path) -> None:
               expected["id"])
         check(f"inbox read state {task_id}",
               item.get("read_at") is not None if item else None, expected["read"])
-        task = metadb.durable_task(task_id)
-        check(f"inbox manifest identity {task_id}",
-              item.get("execution_manifest_sha256") if item else None,
-              task["execution_manifest_sha256"] if task else None)
+        check(f"public inbox manifest omitted {task_id}",
+              "execution_manifest_sha256" not in item if item else None, True)
     check("external wait has no Inbox item",
           any(item["task_id"] == fixture["external"]["task_id"] for item in inbox), False)
 

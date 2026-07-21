@@ -23,6 +23,7 @@ function outcomeSummary(item: InboxItemDto): string {
     return `“${item.completedWrite.outputName}” written · ${item.completedWrite.rowCount} rows`
   }
   if (item.outcome === 'failed' && item.diagnosticCode) return item.diagnosticCode.replace(/_/g, ' ')
+  if (item.outcome === 'failed') return 'Work failed'
   return item.outcome === 'cancelled' ? 'Cancelled before completion' : 'Finished successfully'
 }
 
@@ -31,6 +32,7 @@ const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
   external_wait: 'External wait',
   linear_checkpoint_write: 'Checkpointed write',
   bounded_fanout_write: 'Bounded fan-out write',
+  merge_columns_write: 'Merge columns write',
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
 }
