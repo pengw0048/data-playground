@@ -2606,6 +2606,19 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.filter((toast) => toast.msg.includes('permission'))).toHaveLength(2)
   })
 
+  it('replaces an explicit pristine blank with an example in place', async () => {
+    const blank = emptyTestDoc('pristine')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    apiMocks.saveCanvas.mockResolvedValue({ ok: true, id: 'pristine', version: 2 })
+
+    expect(await useStore.getState().newFromExample('purchases')).toMatchObject({ ok: true, canvasId: 'pristine' })
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.saveCanvas).toHaveBeenCalledWith(expect.objectContaining({ id: 'pristine' }), false, 1)
+    expect(useStore.getState().doc.nodes.length).toBeGreaterThan(0)
+  })
+
   it('fails the current canvas closed when new-file creation returns 401', async () => {
     apiMocks.listCanvases.mockResolvedValue([{ id: 'c', name: 'test', version: 1, role: 'owner' }])
     await useStore.getState().refreshFiles()

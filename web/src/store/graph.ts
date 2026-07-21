@@ -2788,7 +2788,8 @@ export const useStore = create<Store>((set, get) => ({
       if (!opened) {
         if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
         else if (fallback) await get().openFile(fallback)
-        else await get().newFile()
+        // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
+        else set({ view: 'files' })
         // A Workspace dataset/container deep link carries more identity than the top-level view.
         // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
         // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
@@ -2998,13 +2999,23 @@ export const useStore = create<Store>((set, get) => ({
   newFromExample: async (key) => {
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
-    const id = `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
+    const current = get()
+    const replacePristine = current.canvasRole === 'owner'
+      && current.currentDraftId == null && current.serverVersion != null
+      && current.doc.name === 'untitled' && current.doc.nodes.length === 0 && current.doc.edges.length === 0
+    const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
     if (!doc) return get().newFile()
     let persistence: CanvasPersistence = 'remote'
     try {
-      const created = await api.createCanvas(doc)
-      if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
+      if (replacePristine) {
+        const saved = await api.saveCanvas(doc, false, current.serverVersion ?? undefined)
+        if (!saved.ok || saved.id !== doc.id) return { ok: false }
+        doc.version = saved.version
+      } else {
+        const created = await api.createCanvas(doc)
+        if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
+      }
       if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()
