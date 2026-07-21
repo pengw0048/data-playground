@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({ datasetRevision: vi.fn() }))
@@ -8,7 +8,11 @@ import { WritePublicationSummary } from './WritePublicationSummary'
 
 const receipt = {
   datasetId: 'dataset-1', revisionId: 'revision-7', rows: 2, bytes: 128, durable: true,
-  head: { datasetId: 'dataset-1', revisionId: 'revision-7', retentionOwner: 'core' }, schema: [], partitions: [], publication: {},
+  head: { datasetId: 'dataset-1', revisionId: 'revision-7', committedAt: '2026-07-21T12:00:00Z', retentionOwner: 'core' },
+  schema: [{ name: 'id', type: 'bigint' }], partitions: [], publication: {
+    provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'file:///revision-7.parquet',
+    publishSequence: 7, idempotencyKey: 'write-7', catalogVersion: 'catalog-7', backendVersion: '8.0.0',
+  }, executionManifestSha256: 'a'.repeat(64),
 } as any
 
 describe('WritePublicationSummary exact receipt action', () => {
@@ -43,5 +47,26 @@ describe('WritePublicationSummary exact receipt action', () => {
     fireEvent.click(action)
     expect(await screen.findByRole('alert')).toHaveTextContent('Latest was not substituted')
     expect(screen.queryByLabelText('Exact revision detail')).not.toBeInTheDocument()
+  })
+
+  it('cannot install stale exact detail after the receipt changes', async () => {
+    let resolveFirst!: (value: unknown) => void
+    mocks.datasetRevision.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+      .mockResolvedValueOnce({
+        datasetId: 'dataset-1', revisionId: 'revision-8', summary: { rowCount: 3 }, preview: { columns: [] },
+      })
+    const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
+    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
+
+    const nextReceipt = { ...receipt, revisionId: 'revision-8', head: { ...receipt.head, revisionId: 'revision-8' } }
+    rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={nextReceipt} completed />)
+    fireEvent.click(screen.getByRole('button', { name: 'Open exact revision' }))
+    await waitFor(() => expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('dataset-1@revision-8'))
+
+    await act(async () => resolveFirst({
+      datasetId: 'dataset-1', revisionId: 'revision-7', summary: { rowCount: 2 }, preview: { columns: [] },
+    }))
+    expect(screen.getByLabelText('Exact revision detail')).toHaveTextContent('dataset-1@revision-8')
+    expect(screen.getByLabelText('Exact revision detail')).not.toHaveTextContent('revision-7')
   })
 })

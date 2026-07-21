@@ -1060,6 +1060,10 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run).toHaveBeenCalledWith(
       doc, 'write', false, submissionId, undefined, intent)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeOutcomeAdmission).toMatchObject({
+      mode: 'create', intent: { idempotencyKey: 'write-key' },
+    })
   })
 
   it('surfaces a stale write admission as re-admission work, not a size confirmation', async () => {

@@ -378,14 +378,19 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
   const destPath = String(cfg.destPath ?? '')
-  const admission = useStore((s) => s.runs[nodeId]?.writeAdmission)
+  const admission = useStore((s) => s.runs[nodeId]?.writeAdmission
+    ?? (s.runs[nodeId]?.phase === 'done' ? s.runs[nodeId]?.writeOutcomeAdmission : undefined))
+  const outcomeAdmission = useStore((s) => s.runs[nodeId]?.writeOutcomeAdmission)
   const phase = useStore((s) => s.runs[nodeId]?.phase)
-  const receipt = useStore((s) => s.runs[nodeId]?.status?.outputs
-    .find((output) => output.writeReceipt)?.writeReceipt)
+  const statusOutputs = useStore((s) => s.runs[nodeId]?.status?.outputs)
+  const outputs = statusOutputs ?? []
+  const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
   const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
     <Section title="Publication">
-      <WritePublicationSummary outputName={filename} destination={destination} admission={admission} receipt={receipt ?? admission?.recoveredReceipt} completed={phase === 'done'} />
+      <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
+        outcomeAdmission={outcomeAdmission} receipt={receipt ?? admission?.recoveredReceipt}
+        outputs={outputs} completed={phase === 'done'} />
       <div className="mt-2">
         <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
       </div>

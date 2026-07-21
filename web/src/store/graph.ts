@@ -455,6 +455,9 @@ interface RunState {
   inputDrift?: InputDrift
   driftInputManifest?: RunInputManifestItem[]
   writeAdmission?: WriteAdmission
+  // Read-only evidence for the completed output. Unlike writeAdmission, this snapshot is never
+  // reused for dispatch; the next run must obtain a fresh exact-head admission and submission id.
+  writeOutcomeAdmission?: WriteAdmission
   writeSubmissionId?: string
   writeAdmissionFingerprint?: string
   parameterBindings?: CanvasParameterBinding[]
@@ -2239,6 +2242,7 @@ export const useStore = create<Store>((set, get) => ({
       writeSubmissionId: submissionId,
       writeAdmissionFingerprint: fingerprint,
       writeAdmission: undefined,
+      writeOutcomeAdmission: undefined,
     } } }))
     const binding = currentPreviewBinding(get(), id)
     const admission = parameterBindings?.length
@@ -2348,7 +2352,7 @@ export const useStore = create<Store>((set, get) => ({
             ? await api.run(doc, id, confirmed, submissionId, undefined, undefined, get().runs[id]?.parameterBindings)
             : await api.run(doc, id, confirmed, submissionId)
       set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), status, phase: 'running' } } }))
-      pollRun(get, set, id, status.runId)
+      pollRun(get, set, id, status.runId, undefined, writeAdmission)
     } catch (e) {
       if (e instanceof KernelError && e.status === 409 && !e.message.includes('write admission')) {
         set((s) => ({ runs: { ...s.runs, [id]: { ...(s.runs[id] ?? {}), phase: 'confirm' } } }))
@@ -4338,7 +4342,8 @@ function pollProfile(get: () => Store, set: (p: Partial<Store> | ((s: Store) => 
 const _polling = new Map<string, { token: symbol; reattachGeneration?: number }>()
 
 function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Partial<Store>)) => void,
-                 nodeId: string, runId: string, reattachGeneration?: number) {
+                 nodeId: string, runId: string, reattachGeneration?: number,
+                 writeOutcomeAdmission?: WriteAdmission) {
   const existing = _polling.get(runId)
   if (existing && (reattachGeneration === undefined
       || existing.reattachGeneration === reattachGeneration)) return
@@ -4390,6 +4395,7 @@ function pollRun(get: () => Store, set: (p: Partial<Store> | ((s: Store) => Part
       const resultOutputCount = status.outputs.length > 1 ? status.outputs.length : undefined
       set((s: Store) => ({ runs: { ...s.runs, [nodeId]: {
         ...(s.runs[nodeId] ?? { phase } as any), status, phase,
+        writeOutcomeAdmission: status.status === 'done' ? writeOutcomeAdmission : undefined,
         writeAdmission: undefined, writeSubmissionId: undefined,
         writeAdmissionFingerprint: undefined,
       } } }))

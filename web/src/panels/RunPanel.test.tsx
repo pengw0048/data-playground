@@ -207,15 +207,21 @@ describe('RunPanel typed parameter gate', () => {
     }]
     mocks.state.doc.parameters = []
     mocks.state.runs = { target: {
-      phase: 'done', writeAdmission: {
+      phase: 'done', writeOutcomeAdmission: {
+        nodeId: 'target',
         mode: 'append', provider: 'managed-local-file', destination: '/outputs/results.parquet',
         managed: true, expectedSchema: [], partitions: [],
       }, status: {
         runId: 'write-job', status: 'done', jobType: 'run', targetNodeId: 'target', rowsProcessed: 2,
         totalRows: 2, ms: 10, placement: 'local', perNode: [], outputs: [{
-          nodeId: 'target', portId: 'out', outcome: 'committed', rows: 2,
+          nodeId: 'target', portId: 'out', wire: 'dataset', publicationKind: 'catalog', outcome: 'committed',
+          uri: 'managed://dataset-1', table: 'results', version: 'revision-9', rows: 2,
           writeReceipt: { datasetId: 'dataset-1', revisionId: 'revision-9', rows: 2, bytes: 128,
-            durable: true, head: { datasetId: 'dataset-1', revisionId: 'revision-9', retentionOwner: 'core' }, schema: [], partitions: [], publication: {} },
+            durable: true, head: { datasetId: 'dataset-1', revisionId: 'revision-9', committedAt: '2026-07-21T12:00:00Z', retentionOwner: 'core' },
+            schema: [{ name: 'id', type: 'bigint' }], partitions: [], publication: {
+              provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'file:///revision-9.parquet',
+              publishSequence: 9, idempotencyKey: 'write-9', catalogVersion: 'catalog-9', backendVersion: '8.0.0',
+            }, executionManifestSha256: 'a'.repeat(64) },
         }],
       },
     } }
@@ -225,6 +231,14 @@ describe('RunPanel typed parameter gate', () => {
     expect(publication).toHaveTextContent('results.parquet published · 2 rows')
     expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
+    const details = screen.getByText('Publication details').closest('details')!
+    expect(details).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Publication details'))
+    expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('committed · catalog · dataset')
+    expect(screen.getByLabelText('Write output evidence')).toHaveTextContent('managed://dataset-1')
+    expect(publication).toHaveTextContent('file:///revision-9.parquet')
+    expect(publication).toHaveTextContent('catalog-9')
+    expect(publication).toHaveTextContent('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
   })
 
   it.each([

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { api } from '../api/client'
-import type { DatasetRevisionDetail, WriteAdmission, WriteReceipt } from '../types/api'
+import type { DatasetRevisionDetail, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
 
 export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
   if (mode === 'create') return 'Create a new dataset'
@@ -36,36 +36,79 @@ function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
   </>
 }
 
-function PublicationDetails({ admission, receipt }: { admission?: WriteAdmission | null; receipt?: WriteReceipt | null }) {
-  if (!admission && !receipt) return null
+function schemaText(fields: { name: string; type: string }[]): string {
+  return fields.length ? fields.map((field) => `${field.name}: ${field.type}`).join(', ') : 'unknown'
+}
+
+function partitionText(partitions: { field: string }[]): string {
+  return partitions.length ? partitions.map((partition) => partition.field).join(', ') : 'unpartitioned'
+}
+
+function AdmissionDetails({ label, admission }: { label: string; admission: WriteAdmission }) {
+  return <>
+    <div><strong>{label}:</strong> node <span className="font-mono">{admission.nodeId}</span> · {admission.managed ? 'managed' : 'provider-neutral'} · mode <span className="font-mono">{admission.mode}</span></div>
+    <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
+    <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
+    <div><strong>Schema:</strong> {schemaText(admission.expectedSchema)}</div>
+    <div><strong>Partitions:</strong> {partitionText(admission.partitions)}</div>
+    {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
+    {admission.intent && <>
+      <div><strong>Frozen destination:</strong> <span className="font-mono">{admission.intent.destination.logicalUri}</span> · {admission.intent.destination.name} · {admission.intent.destination.provider}{admission.intent.destination.datasetId ? ` · dataset ${admission.intent.destination.datasetId}` : ''}</div>
+      <div><strong>Idempotency key:</strong> <span className="font-mono">{admission.intent.idempotencyKey}</span></div>
+      <div><strong>Frozen provenance:</strong> <span className="font-mono">{JSON.stringify(admission.intent.provenance)}</span></div>
+    </>}
+  </>
+}
+
+function sameAdmission(left: WriteAdmission | null | undefined, right: WriteAdmission | null | undefined): boolean {
+  if (!left || !right) return false
+  return left.mode === right.mode && left.destination === right.destination
+    && left.intent?.idempotencyKey === right.intent?.idempotencyKey
+}
+
+function PublicationDetails({ admission, outcomeAdmission, receipt, outputs = [] }: {
+  admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]
+}) {
+  if (!admission && !outcomeAdmission && !receipt && outputs.length === 0) return null
   return <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
     <summary className="cursor-pointer font-semibold text-foreground">Publication details</summary>
     <div className="mt-2 grid gap-1 break-all">
-      {admission && <>
-        <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
-        <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
-        <div><strong>Schema:</strong> {admission.expectedSchema.length
-          ? admission.expectedSchema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'unknown'}</div>
-        <div><strong>Partitions:</strong> {admission.partitions.length
-          ? admission.partitions.map((partition) => partition.field).join(', ') : 'unpartitioned'}</div>
-        {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
-        {admission.intent && <div><strong>Idempotency key:</strong> <span className="font-mono">{admission.intent.idempotencyKey}</span></div>}
-      </>}
+      {outcomeAdmission && <AdmissionDetails label="Completed admission" admission={outcomeAdmission} />}
+      {admission && !sameAdmission(admission, outcomeAdmission)
+        && <AdmissionDetails label={outcomeAdmission ? 'Next admission' : 'Admission'} admission={admission} />}
       {receipt && <>
         <div><strong>Receipt:</strong> <span className="font-mono">{receipt.datasetId}@{receipt.revisionId}</span></div>
+        <div><strong>Durable:</strong> yes</div>
+        <div><strong>Head:</strong> <span className="font-mono">{receipt.head.datasetId}@{receipt.head.revisionId}</span>{receipt.head.committedAt ? ` · committed ${receipt.head.committedAt}` : ''} · retention {receipt.head.retentionOwner}</div>
+        <div><strong>Rows:</strong> {receipt.rows.toLocaleString()}</div>
         <div><strong>Bytes:</strong> {receipt.bytes.toLocaleString()}</div>
+        <div><strong>Receipt schema:</strong> {schemaText(receipt.schema)}</div>
+        <div><strong>Receipt partitions:</strong> {partitionText(receipt.partitions)}</div>
+        <div><strong>Publication provider:</strong> <span className="font-mono">{receipt.publication.provider}</span></div>
+        <div><strong>Logical URI:</strong> <span className="font-mono">{receipt.publication.logicalUri}</span></div>
+        <div><strong>Artifact URI:</strong> <span className="font-mono">{receipt.publication.artifactUri}</span></div>
         <div><strong>Publication sequence:</strong> {receipt.publication?.publishSequence ?? 'unknown'}</div>
         <div><strong>Idempotency key:</strong> <span className="font-mono">{receipt.publication?.idempotencyKey ?? 'unknown'}</span></div>
+        <div><strong>Catalog version:</strong> {receipt.publication?.catalogVersion ?? 'unknown'}</div>
         {receipt.parentHead && <div><strong>Parent:</strong> <span className="font-mono">{receipt.parentHead.datasetId}@{receipt.parentHead.revisionId}</span></div>}
         <div><strong>Backend:</strong> {receipt.publication?.backendVersion ?? 'unknown'}</div>
         {receipt.executionManifestSha256 && <div><strong>Execution manifest:</strong> <span className="font-mono">{receipt.executionManifestSha256}</span></div>}
       </>}
+      {outputs.map((output) => <div key={`${output.nodeId}:${output.portId}`} className="mt-1 rounded border border-border bg-background p-1.5" aria-label="Write output evidence">
+        <div><strong>Output:</strong> <span className="font-mono">{output.nodeId}:{output.portId}</span>{output.portLabel ? ` · ${output.portLabel}` : ''}</div>
+        <div><strong>Outcome:</strong> {output.outcome} · {output.publicationKind} · {output.wire}</div>
+        {output.uri && <div><strong>URI:</strong> <span className="font-mono">{output.uri}</span></div>}
+        {output.table && <div><strong>Table:</strong> <span className="font-mono">{output.table}</span></div>}
+        {output.version && <div><strong>Version:</strong> <span className="font-mono">{output.version}</span></div>}
+        {output.rows != null && <div><strong>Output rows:</strong> {output.rows.toLocaleString()}</div>}
+        {output.error && <div className="text-destructive"><strong>Error:</strong> {output.error}</div>}
+      </div>)}
     </div>
   </details>
 }
 
-export function WritePublicationSummary({ outputName, destination, admission, receipt, compact = false, completed = false }: {
-  outputName: string; destination: string; admission?: WriteAdmission | null; receipt?: WriteReceipt | null; compact?: boolean; completed?: boolean
+export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false }: {
+  outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
   return <section aria-label="Write publication" className={classes}>
@@ -84,6 +127,6 @@ export function WritePublicationSummary({ outputName, destination, admission, re
         <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
       </div>}
     </div>
-    <PublicationDetails admission={admission} receipt={receipt} />
+    <PublicationDetails admission={admission} outcomeAdmission={outcomeAdmission} receipt={receipt} outputs={outputs} />
   </section>
 }

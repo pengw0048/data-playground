@@ -45,6 +45,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const st = run?.status
   const pinnedInputs = pinnedSourceInputs(doc, nodeId)
   const writeAdmission = run?.writeAdmission
+    ?? (run?.phase === 'done' ? run.writeOutcomeAdmission : undefined)
   const writeSubmissionUnresolved = Boolean(
     writeAdmission?.managed && writeAdmission.intent && run?.writeSubmissionId,
   )
@@ -184,7 +185,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       {phase === 'done' && st && (
         isWrite ? <>
           <Label>PUBLISHED</Label>
-          <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} completed />
+          <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
+            outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed />
           <PerNode st={st} compact />
         </> : <>
           <Label>DONE</Label>

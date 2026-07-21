@@ -1586,6 +1586,7 @@ test.describe('Data Playground canvas', () => {
       const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
+      await expect(publication).toContainText('Replace the selected dataset')
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
       await page.request.put('/api/settings', { data: {

@@ -181,8 +181,10 @@ describe('Inspector — effective named outputs', () => {
         },
         status: { outputs: [{ writeReceipt: {
           datasetId: 'dataset-lance', revisionId: '8', rows: 12, bytes: 1024,
+          durable: true, head: { datasetId: 'dataset-lance', revisionId: '8', retentionOwner: 'core' },
+          schema: cols, partitions: [],
           parentHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
-          publication: { backendVersion: '8.0.0' },
+          publication: { provider: 'managed-local-lance', logicalUri: 'managed://dataset-lance', artifactUri: 'file:///dataset-lance', publishSequence: 8, idempotencyKey: 'write-8', backendVersion: '8.0.0' },
         } }] },
       } },
     } as any)
