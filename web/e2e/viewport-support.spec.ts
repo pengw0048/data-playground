@@ -52,7 +52,9 @@ async function openCanvasWithSource(page: Page) {
   const starterTable = process.env.DP_E2E_FIXTURE_PROFILE === 'full' ? 'catalog_000' : 'events'
   await (await workspaceResource(page, 'dataset', starterTable)).click()
   await page.getByTestId('detail-use').click()
-  await page.getByRole('button', { name: /^Add to canvas/ }).click()
+  const chooseCanvas = page.getByRole('button', { name: /^Choose a Canvas/ })
+  await expect(chooseCanvas).toBeEnabled()
+  await chooseCanvas.click()
   await page.getByLabel('Target canvas').selectOption(canvasId)
   await page.getByRole('button', { name: 'Add and open' }).click()
   await expect(page.getByTestId('toolbar')).toBeVisible()
