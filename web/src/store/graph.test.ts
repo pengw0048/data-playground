@@ -1064,6 +1064,14 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeOutcomeAdmission).toMatchObject({
       mode: 'create', intent: { idempotencyKey: 'write-key' },
     })
+
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace',
+      provider: 'managed-local-file', expectedSchema: intent.expectedSchema, partitions: [],
+    })
+    await useStore.getState().prepareWrite('write')
+    expect(useStore.getState().runs.write.writeOutcomeAdmission).toMatchObject({ mode: 'create' })
+    expect(useStore.getState().runs.write.writeAdmission).toMatchObject({ mode: 'replace' })
   })
 
   it('surfaces a stale write admission as re-admission work, not a size confirmation', async () => {

@@ -1577,7 +1577,10 @@ test.describe('Data Playground canvas', () => {
       const publicationDetails = publication.locator('details')
       const firstReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
       expect(firstReceiptId).toBeTruthy()
-      await expect(publication).toContainText('Replace the selected dataset')
+      const summaryMode = publication.getByText('Publication mode').locator('..')
+      await expect(summaryMode).toContainText('Create a new dataset')
+      await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
+      await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       await expect(publicationDetails).not.toContainText(firstReceiptId!, { timeout: 20_000 })
@@ -1586,7 +1589,7 @@ test.describe('Data Playground canvas', () => {
       const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
       expect(secondRevision).toBeTruthy()
       expect(secondRevision).not.toBe(firstRevision)
-      await expect(publication).toContainText('Replace the selected dataset')
+      await expect(summaryMode).toContainText('Replace the selected dataset')
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
       await page.request.put('/api/settings', { data: {

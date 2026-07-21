@@ -2242,7 +2242,6 @@ export const useStore = create<Store>((set, get) => ({
       writeSubmissionId: submissionId,
       writeAdmissionFingerprint: fingerprint,
       writeAdmission: undefined,
-      writeOutcomeAdmission: undefined,
     } } }))
     const binding = currentPreviewBinding(get(), id)
     const admission = parameterBindings?.length
@@ -2327,7 +2326,7 @@ export const useStore = create<Store>((set, get) => ({
     // no openPanels here — status shows on the card; the user opens details if they want them
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? {}), phase: 'running', inputDrift: undefined,
-      driftInputManifest: undefined, error: undefined,
+      driftInputManifest: undefined, error: undefined, writeOutcomeAdmission: undefined,
     } } }))
     get().updateData(id, { status: 'running' })
     try {
