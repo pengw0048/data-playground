@@ -3037,9 +3037,16 @@ export const useStore = create<Store>((set, get) => ({
         currentDraftId: latest.currentDraftId,
         serverVersion: latest.serverVersion,
       }
-      replacePristine = runsEmpty
-        && isPristineExampleReplacement(latestCandidate)
+      const sameCandidate = isPristineExampleReplacement(latestCandidate)
         && isSameExampleReplacementSnapshot(candidate, latestCandidate)
+      // A user edit can still be inside the autosave debounce window. Navigating to a newly-created
+      // example here would replace the in-memory document before that edit is persisted. Cancel this
+      // click instead; the edited Canvas stays mounted and autosave can complete normally.
+      if (!sameCandidate) {
+        get().pushToast('Canvas changed while preparing the example; your edit was kept. Choose the example again.', 'info')
+        return { ok: false }
+      }
+      replacePristine = runsEmpty
     }
     const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file

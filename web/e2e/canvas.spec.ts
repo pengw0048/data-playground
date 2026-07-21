@@ -136,17 +136,39 @@ test.describe('Data Playground canvas', () => {
     await page.waitForTimeout(500)
     expect(await viewport.getAttribute('style')).toBe(manual)
 
-    // Any graph content is user work: the example must be a separate Canvas.
+    // An edit made while the mutation revalidates run history must stay on this Canvas and reach
+    // durable storage; cancelling this click gives the existing autosave debounce time to finish.
     const exampleHash = await page.evaluate(() => location.hash)
     await page.getByTestId('app-menu').click()
     await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New file', exact: true }).click()
     await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(exampleHash)
     await expect(page.locator('.react-flow__node')).toHaveCount(0)
     const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const blankHash = await page.evaluate(() => location.hash)
     const afterBlankCount = (await canvasesFor(page)).length
+    await expect(page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' })).toBeVisible()
+    let historyRequestStarted = false
+    let releaseHistory!: () => void
+    await page.route(`**/api/canvas/${blankId}/runs`, async (route) => {
+      historyRequestStarted = true
+      await new Promise<void>((resolve) => { releaseHistory = resolve })
+      await route.fulfill({ json: [] })
+    })
+
+    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await expect.poll(() => historyRequestStarted).toBe(true)
     await page.getByRole('button', { name: '+ Add a source' }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
-    // Once the Canvas has content, examples remain available from its file menu and must fork.
+    releaseHistory()
+    await expect(page.getByText(/Canvas changed while preparing the example; your edit was kept/)).toBeVisible()
+    expect((await page.evaluate(() => location.hash)).split('?')[0]).toBe(blankHash.split('?')[0])
+    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])).toBe(blankId)
+    expect(await canvasesFor(page)).toHaveLength(afterBlankCount)
+    await expect.poll(async () => (await canvasFor(page, blankId)).nodes.length).toBe(1)
+
+    // The edit immediately changes the displayed action to a separate create; choosing it again
+    // creates the example without replacing the now-persisted source Canvas.
+    await page.unroute(`**/api/canvas/${blankId}/runs`)
     await page.getByTestId('file-menu').click()
     await page.getByRole('menuitem', { name: 'Create example Canvas: Purchases per user' }).click()
     await expect(page.locator('.react-flow__node')).toHaveCount(5)

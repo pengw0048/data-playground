@@ -2704,7 +2704,7 @@ describe('graph store — core authority ops', () => {
     expect(blank.parameters).toEqual([{ name: 'threshold', type: 'float', default: 0.5 }])
   })
 
-  it('downgrades an intended replacement when durable content changes while run history is loading', async () => {
+  it('cancels an intended replacement when requirements or parameters change while run history is loading', async () => {
     const blank = emptyTestDoc('edited-during-history')
     blank.name = 'untitled'
     useStore.getState().loadDoc(blank, 'owner')
@@ -2720,12 +2720,41 @@ describe('graph store — core authority ops', () => {
     const edited = useStore.getState().doc
     finishRuns([])
 
-    expect(await creation).toMatchObject({ ok: true })
+    expect(await creation).toEqual({ ok: false })
     expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
-    expect(apiMocks.createCanvas).toHaveBeenCalledOnce()
-    expect((apiMocks.createCanvas.mock.calls[0][0] as { id: string }).id).not.toBe(blank.id)
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().doc).toBe(edited)
     expect(edited.requirements).toEqual(['duckdb>=1'])
     expect(edited.parameters).toEqual([{ name: 'limit', type: 'integer', default: 100 }])
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('your edit was kept')
+  })
+
+  it('keeps an added source mounted when an in-place example check resolves late', async () => {
+    register({
+      kind: 'deferred-example-source', title: 'source', category: 'io', inputs: [],
+      outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'source', status: 'draft', config: {} }),
+    }, () => null)
+    const blank = emptyTestDoc('node-edited-during-history')
+    blank.name = 'untitled'
+    useStore.getState().loadDoc(blank, 'owner')
+    useStore.setState({ serverVersion: 1, currentDraftId: null })
+    let finishRuns!: (runs: unknown[]) => void
+    apiMocks.listRuns.mockReturnValue(new Promise((resolve) => { finishRuns = resolve }))
+
+    const creation = useStore.getState().newFromExample('purchases', 'replace-pristine')
+    const source = useStore.getState().addNode('deferred-example-source', { x: 20, y: 40 })
+    const edited = useStore.getState().doc
+    finishRuns([])
+
+    expect(await creation).toEqual({ ok: false })
+    expect(source).not.toBeNull()
+    expect(apiMocks.saveCanvas).not.toHaveBeenCalled()
+    expect(apiMocks.createCanvas).not.toHaveBeenCalled()
+    expect(useStore.getState().doc).toBe(edited)
+    expect(useStore.getState().doc.id).toBe(blank.id)
+    expect(useStore.getState().doc.nodes.map((node) => node.id)).toContain(source!.id)
+    expect(useStore.getState().toasts.at(-1)?.msg).toContain('Choose the example again')
   })
 
   it('downgrades an intended replacement when run history cannot be confirmed', async () => {
