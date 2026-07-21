@@ -140,10 +140,17 @@ export function initRouter(store: RouterStore): void {
       if (r.view === 'canvas' && r.canvasId) {
         if (st.doc.id !== r.canvasId) {
           const ok = await st.openFile(r.canvasId)  // may be a shared canvas → authorized server-side
+          // openFile is generation-fenced and returns false when a newer navigation wins. The older
+          // apply must stop here: otherwise its invalid-link cleanup can erase the newer route's
+          // selection and pending reveal request.
+          const latest = parseHash()
+          if (latest.view !== 'canvas' || latest.canvasId !== r.canvasId
+              || latest.nodeId !== r.nodeId) return
           if (!ok) {
             // bad / revoked / unauthorized link: reflect the ACTUAL (unchanged) state and REPLACE the
             // bad history entry, so Back doesn't return to it and the store→hash sync doesn't bounce.
             history.replaceState(null, '', hashFor(store.getState()))
+            return
           }
         } else if (st.view !== 'canvas') st.setView('canvas')
         const current = store.getState()
