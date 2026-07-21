@@ -85,14 +85,22 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await page.goto(`/#/canvas/${canvasId}`)
     await page.locator('.react-flow__node[data-id="write"]').click()
     const inspector = page.getByTestId('inspector')
-    await expect(inspector.getByLabel('Write admission')).toContainText('create · managed-local-file')
+    const publication = inspector.getByLabel('Write publication')
+    await expect(publication.getByText('Publication mode').locator('..')).toContainText('Create a new dataset')
+    await expect(publication.getByLabel('Write readiness')).toContainText('Ready to publish')
+    const publicationDetails = publication.locator('details')
+    await expect(publicationDetails).not.toHaveAttribute('open')
+    await publicationDetails.locator('summary').click()
+    await expect(publicationDetails).toContainText(/Admission:.*node write.*mode create/)
+    await expect(publicationDetails).toContainText('managed-local-file')
     const runResponse = page.waitForResponse((response) =>
       response.url().endsWith('/api/run') && response.request().method() === 'POST')
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const started = await ok<{ runId: string }>(await runResponse, 'submit default-kernel write')
     const runId = started.runId
-    const receipt = inspector.getByLabel('Write receipt')
-    await expect(receipt).toContainText('durable revision', { timeout: 30_000 })
+    await expect(publication.getByLabel('Published result')).toContainText(`${filename} published`, { timeout: 30_000 })
+    await expect(publication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    await expect(publicationDetails).toContainText('Durable: yes')
     type JobItem = { status: string; outputReceipt?: { datasetId: string; revisionId: string } | null }
     let job: JobItem | undefined
     // Poll the mirrored Jobs record until it converges on the run's terminal state.
@@ -104,7 +112,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const dataset = job?.outputReceipt
     expect(dataset?.revisionId, 'Jobs surfaces the managed revision id').toBeTruthy()
     // The inspector receipt names the same durable revision the Jobs surface published.
-    await expect(receipt).toContainText(dataset!.revisionId)
+    await expect(publicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
 
     // Run History must mirror the same immutable admission as the durable Task; it must not label
     // this current managed write as a pre-manifest legacy run.
@@ -154,7 +162,13 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await page.goto(`/#/canvas/${canvasId}`)
     await setTheme(page, 'dark')
     await page.locator('.react-flow__node[data-id="write"]').click()
-    await expect(inspector.getByLabel('Write receipt')).toContainText('durable revision')
+    const darkPublication = inspector.getByLabel('Write publication')
+    await expect(darkPublication.getByLabel('Published result')).toContainText(`${filename} published`)
+    await expect(darkPublication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    const darkPublicationDetails = darkPublication.locator('details')
+    await darkPublicationDetails.locator('summary').click()
+    await expect(darkPublicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
+    await expect(darkPublicationDetails).toContainText('Durable: yes')
     await shoot(page, 'dark', 'canvas')
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()

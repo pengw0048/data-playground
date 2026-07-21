@@ -16,6 +16,7 @@ const store = vi.hoisted(() => ({
   setWorkspaceResource: vi.fn(), openFile: vi.fn(), rememberTables: vi.fn(), pushToast: vi.fn(),
   kernelInfo: { capabilities: ['catalog.folder_mutation', 'catalog.atomic_metadata_edit', 'catalog.cas_unregister'] },
   uploadDataset: vi.fn(),
+  doc: { id: '', version: 0 },
   files: [] as { id: string; name: string; version: number; role: 'owner' | 'editor' | 'viewer' }[],
   refreshFiles: vi.fn(),
 }))
@@ -84,6 +85,7 @@ describe('WorkspaceExplorer', () => {
     store.workspaceSearchQuery = ''
     store.workspaceScope = 'all'
     store.workspaceDatasetQuery = ''
+    store.doc = { id: 'canvas-1', version: 3 }
     store.files = [{ id: 'canvas-1', name: 'Analysis', version: 3, role: 'owner' }]
     store.refreshFiles.mockResolvedValue(true)
     store.openFile.mockResolvedValue(true)
@@ -487,7 +489,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('observations · dataset:dataset-1')
+    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('observations')
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
       containerId: 'folder-1', expectedContainerVersion: 1,
@@ -507,14 +509,57 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    fireEvent.click(screen.getByRole('button', { name: /^Add to canvas/ }))
-    expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas')
+    expect(screen.getByRole('button', { name: /^Explore in a new Canvas/ })).toBeVisible()
+    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeVisible()
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    await waitFor(() => expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas'))
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
       datasetIds: ['dataset-1'], expectedCanvasVersion: 9,
     }))
     expect(store.openFile).toHaveBeenCalledWith('target-canvas')
+  })
+
+  it('adds a local dataset to the exact editable current Canvas only after its list refresh completes', async () => {
+    store.workspaceResourceId = DATASET.id
+    store.doc = { id: 'current-canvas', version: 12 }
+    let finishRefresh!: () => void
+    store.refreshFiles.mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+      finishRefresh = () => {
+        store.files = [{ id: 'current-canvas', name: 'Current analysis', version: 12, role: 'editor' }]
+        resolve(true)
+      }
+    }))
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'current-canvas', version: 13 })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
+    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeDisabled()
+    act(() => finishRefresh())
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-canvas', {
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 12,
+    }))
+  })
+
+  it('fails closed instead of offering stale Canvas targets when the list refresh fails', async () => {
+    store.workspaceResourceId = DATASET.id
+    store.doc = { id: 'stale-current', version: 4 }
+    store.files = [{ id: 'stale-current', name: 'Stale target', version: 4, role: 'owner' }]
+    store.refreshFiles.mockResolvedValueOnce(false)
+    mocks.workspaceBrowse.mockResolvedValue({ container: FOLDER, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
+    await waitFor(() => expect(store.refreshFiles).toHaveBeenCalled())
+    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeDisabled()
+    expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
   })
 
   it('renders the shared bounded Catalog inside the Datasets scope and preserves independent URL state', async () => {
@@ -951,7 +996,9 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
     )
-    fireEvent.click(screen.getByRole('button', { name: /^Add to canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Choose a Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
       providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
@@ -960,6 +1007,27 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('adds a provider reference to the exact editable current Canvas without provider mutation', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.doc = { id: 'current-provider-canvas', version: 9 }
+    store.files = [{ id: 'current-provider-canvas', name: 'Current provider analysis', version: 9, role: 'owner' }]
+    mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'current-provider-canvas', version: 10 })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-provider-canvas', {
+      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
+    }))
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
   })
 
   it('explores a provider dataset in the surrounding external local overlay without mutating the provider', async () => {

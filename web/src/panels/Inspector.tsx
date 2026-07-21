@@ -13,6 +13,7 @@ import { miniInputClass } from '../ui/controls'
 import { api } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { UpsertControl } from '../components/UpsertControl'
+import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
 import type { ColumnSchema } from '../types/graph'
 import { Button } from '@/components/ui/button'
@@ -199,8 +200,13 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {/* Observation and exact navigation remain available to viewers. MergeColumnsControl owns
             its own edit/action guards; wrapping it in the destination fieldset would also disable
             the read-only Jobs and receipt links. */}
-        <MergeColumnsControl nodeId={nodeId} />
-        <UpsertControl nodeId={nodeId} />
+        {configuredMerge ? <MergeColumnsControl nodeId={nodeId} />
+          : configuredUpsert ? <UpsertControl nodeId={nodeId} />
+            : <details className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
+              <summary className="cursor-pointer font-semibold text-foreground">Advanced write operations</summary>
+              <MergeColumnsControl nodeId={nodeId} />
+              <UpsertControl nodeId={nodeId} />
+            </details>}
       </>}
 
       {/* code snippet + open the full editor (Monaco panel; fullscreen editor is a later step) */}
@@ -372,43 +378,22 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
   const destPath = String(cfg.destPath ?? '')
-  const admission = useStore((s) => s.runs[nodeId]?.writeAdmission)
-  const receipt = useStore((s) => s.runs[nodeId]?.status?.outputs
-    .find((output) => output.writeReceipt)?.writeReceipt)
+  const admission = useStore((s) => s.runs[nodeId]?.writeAdmission
+    ?? (s.runs[nodeId]?.phase === 'done' ? s.runs[nodeId]?.writeOutcomeAdmission : undefined))
+  const outcomeAdmission = useStore((s) => s.runs[nodeId]?.writeOutcomeAdmission)
+  const phase = useStore((s) => s.runs[nodeId]?.phase)
+  const statusOutputs = useStore((s) => s.runs[nodeId]?.status?.outputs)
+  const outputs = statusOutputs ?? []
+  const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
+  const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
-    <Section title="Output">
-      <div className="text-[11.5px] text-muted-foreground">
-        <div className="dp-mono text-foreground">{filename}</div>
-        <div className="mt-[3px] flex items-center gap-[5px] text-muted-foreground">
-          <Icon name="export" size={11} /> {destName}{destPath ? `/${destPath}` : ''}
-        </div>
-      </div>
+    <Section title="Publication">
+      <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
+        outcomeAdmission={outcomeAdmission} receipt={receipt ?? admission?.recoveredReceipt}
+        outputs={outputs} completed={phase === 'done'} />
       <div className="mt-2">
         <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
       </div>
-      {admission && (
-        <div aria-label="Write admission" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-          <div className="font-semibold text-foreground">
-            {admission.managed ? `${admission.mode} · ${admission.provider}` : `${admission.mode} · provider-neutral`}
-          </div>
-          <div className="dp-mono mt-0.5 break-all">{admission.destination}</div>
-          <div className="mt-0.5">
-            {admission.expectedSchema.length} schema field{admission.expectedSchema.length === 1 ? '' : 's'}
-            {admission.partitions.length ? ` · partitions ${admission.partitions.map((item) => item.field).join(', ')}` : ' · unpartitioned'}
-          </div>
-          {admission.expectedHead && <div className="dp-mono mt-0.5 break-all">expected revision {admission.expectedHead.revisionId}</div>}
-          {admission.blocker && <div className="mt-1 text-destructive">{admission.blocker}</div>}
-        </div>
-      )}
-      {receipt && (
-        <div aria-label="Write receipt" className="mt-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-          <div className="font-semibold text-foreground">durable revision {receipt.revisionId}</div>
-          <div className="dp-mono mt-0.5 break-all">dataset {receipt.datasetId}</div>
-          <div className="mt-0.5">{receipt.rows.toLocaleString()} rows · {receipt.bytes.toLocaleString()} bytes</div>
-          {receipt.parentHead && <div className="dp-mono mt-0.5">parent revision {receipt.parentHead.revisionId}</div>}
-          {receipt.publication?.backendVersion && <div className="mt-0.5">backend {receipt.publication.backendVersion}</div>}
-        </div>
-      )}
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />

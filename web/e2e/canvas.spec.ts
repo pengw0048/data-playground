@@ -76,7 +76,7 @@ async function addWorkspaceDatasetToCurrentCanvas(page: Page, name: string) {
   await backToWorkspace(page)
   await openWorkspaceDataset(page, name)
   await page.getByTestId('detail-use').click()
-  await page.getByRole('button', { name: /^Add to canvas/ }).click()
+  await page.getByRole('button', { name: /^Choose a Canvas/ }).click()
   await page.getByLabel('Target canvas').selectOption(canvasId)
   await page.getByRole('button', { name: 'Add and open' }).click()
   await expect(page.getByTestId('toolbar')).toBeVisible()
@@ -1537,17 +1537,23 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByText('Workspace outputs')).toBeVisible() // target shown in the inspector
   })
 
-  test('a default-local write certifies create then replace and exposes exact receipts', async ({ page }) => {
+  test('a default-local Write keeps task-first publication and an exact receipt @ux-smoke', async ({ page }) => {
     const settings = await page.request.get('/api/settings')
     const previousBackend = (await settings.json()).global?.backend ?? ''
     await page.request.put('/api/settings', { data: {
       scope: 'global', key: 'backend', value: 'local-out-of-core',
     } })
+    const canvasId = `issue-688-write-${Date.now()}`
     try {
-      await fresh(page)
-      await addWorkspaceDatasetToCurrentCanvas(page, 'events')
-      await page.locator('.react-flow__node .react-flow__handle-right').first().click()
-      await page.locator('.dp-panel').getByText('write', { exact: true }).click()
+      const created = await page.request.post('/api/canvas', { data: {
+        id: canvasId, name: 'Issue 688 task-first Write', version: 1, requirements: [], nodes: [
+          { id: 'source', type: 'source', position: { x: 80, y: 120 }, data: { title: 'Events', config: { uri: 'events' } } },
+          { id: 'write', type: 'write', position: { x: 420, y: 120 }, data: { title: 'Write', config: { filename: 'output.parquet' } } },
+        ], edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      } })
+      expect(created.ok()).toBeTruthy()
+      await page.goto(`/#/canvas/${canvasId}`)
+      await page.locator('.react-flow__node[data-id="write"]').click()
       const inspector = page.getByTestId('inspector')
       const filename = `issue399-${Date.now()}.parquet`
       await inspector.getByRole('button', { name: /Change destination/ }).click()
@@ -1555,23 +1561,37 @@ test.describe('Data Playground canvas', () => {
       await dialog.locator('input').fill(filename)
       await dialog.getByRole('button', { name: 'Save', exact: true }).click()
 
-      const admission = inspector.getByLabel('Write admission')
-      await expect(admission).toContainText('create · managed-local-file')
-      await expect(admission).toContainText(/schema field/)
-      await expect(admission).toContainText('unpartitioned')
+      const publication = inspector.getByLabel('Write publication')
+      await expect(publication).toContainText(filename)
+      await expect(publication).toContainText('Create a new dataset')
+      await expect(publication).toContainText('Ready to publish')
+      await expect(publication.locator('details')).not.toHaveAttribute('open')
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      const firstReceipt = inspector.getByLabel('Write receipt')
-      await expect(firstReceipt).toContainText('durable revision', { timeout: 20_000 })
-      const firstRevision = (await firstReceipt.textContent())?.match(/durable revision\s+(\S+)/)?.[1]
+      const firstReceipt = publication.getByRole('button', { name: 'Open exact revision' })
+      await expect(firstReceipt).toBeVisible({ timeout: 20_000 })
+      await firstReceipt.click()
+      const firstRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
       expect(firstRevision).toBeTruthy()
+      await expect(publication).toContainText(/published.*rows/)
+
+      const publicationDetails = publication.locator('details')
+      const firstReceiptId = (await publicationDetails.textContent())?.match(/Receipt:\s*(\S+)/)?.[1]
+      expect(firstReceiptId).toBeTruthy()
+      const summaryMode = publication.getByText('Publication mode').locator('..')
+      await expect(summaryMode).toContainText('Create a new dataset')
+      await expect(publicationDetails).toContainText(/Completed admission:.*mode create/)
+      await expect(publicationDetails).toContainText(/Next admission:.*mode replace/)
 
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
-      await expect.poll(async () => {
-        const text = await inspector.getByLabel('Write receipt').textContent()
-        return text?.match(/durable revision\s+(\S+)/)?.[1]
-      }, { timeout: 20_000 }).not.toBe(firstRevision)
-      await expect(inspector.getByLabel('Write receipt')).toContainText(/dataset .* rows .* bytes/)
+      await expect(publicationDetails).not.toContainText(firstReceiptId!, { timeout: 20_000 })
+      const secondReceipt = publication.getByRole('button', { name: 'Open exact revision' })
+      await secondReceipt.click()
+      const secondRevision = (await publication.getByLabel('Exact revision detail').textContent())?.match(/Exact revision\s+\S+@(\S+)/)?.[1]
+      expect(secondRevision).toBeTruthy()
+      expect(secondRevision).not.toBe(firstRevision)
+      await expect(summaryMode).toContainText('Replace the selected dataset')
     } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
       await page.request.put('/api/settings', { data: {
         scope: 'global', key: 'backend', value: previousBackend,
       } })
@@ -1594,7 +1614,7 @@ test.describe('Data Playground canvas', () => {
       const dialog = page.locator('.dp-modal-overlay')
       await dialog.locator('input').fill(`issue399-recovery-${Date.now()}.parquet`)
       await dialog.getByRole('button', { name: 'Save', exact: true }).click()
-      await expect(inspector.getByLabel('Write admission')).toContainText('create · managed-local-file')
+      await expect(inspector.getByLabel('Write publication')).toContainText('Create a new dataset')
 
       await page.route('**/api/run/estimate', async (route) => {
         const response = await route.fetch()
@@ -1620,9 +1640,7 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      await expect(inspector.getByLabel('Write receipt')).toContainText(
-        'durable revision', { timeout: 20_000 },
-      )
+      await expect(inspector.getByLabel('Write publication').getByRole('button', { name: 'Open exact revision' })).toBeVisible({ timeout: 20_000 })
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
     } finally {
@@ -1654,7 +1672,7 @@ test.describe('Data Playground canvas', () => {
 
       // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
       // destination for the typed append journey below.
-      await expect(inspector.getByLabel('Write admission')).toContainText('overwrite · provider-neutral')
+      await expect(inspector.getByLabel('Write publication')).toContainText('Replace the selected dataset')
       let fixtureRunId: string | undefined
       page.on('response', async (response) => {
         if (!response.url().endsWith('/api/run') || response.request().method() !== 'POST') return
@@ -1681,9 +1699,14 @@ test.describe('Data Playground canvas', () => {
         await route.fulfill({ response, json: body })
       })
       await page.getByRole('combobox', { name: 'mode' }).selectOption('append')
-      const appendAdmission = inspector.getByLabel('Write admission')
-      await expect(appendAdmission).toContainText('append · managed-local-lance')
-      await expect(appendAdmission).toContainText('expected revision 1')
+      const appendPublication = inspector.getByLabel('Write publication')
+      await expect(appendPublication.getByText('Publication mode').locator('..'))
+        .toContainText('Replace the selected dataset')
+      await expect(appendPublication.getByLabel('Write readiness'))
+        .toContainText('Publication outcome is unknown; no exact receipt was recorded.')
+      const appendDetails = appendPublication.locator('details')
+      await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
+      await expect(appendDetails).toContainText(/Next admission:.*mode append/)
       await expect.poll(() => captured).toBeTruthy()
 
       // Hold the UI request only after it contains its frozen intent. A competing admission from the
@@ -1742,10 +1765,10 @@ test.describe('Data Playground canvas', () => {
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
-      const receipt = inspector.getByLabel('Write receipt')
-      await expect(receipt).toContainText('durable revision 3', { timeout: 20_000 })
-      await expect(receipt).toContainText('parent revision 2')
-      await expect(receipt).toContainText(/backend \d/)
+      const receipt = inspector.getByLabel('Write publication').getByRole('button', { name: 'Open exact revision' })
+      await expect(receipt).toBeVisible({ timeout: 20_000 })
+      await receipt.click()
+      await expect(inspector.getByLabel('Exact revision detail')).toContainText('@3')
       expect(submissionIds).toHaveLength(4)
       expect(new Set(submissionIds).size).toBe(1)
 
