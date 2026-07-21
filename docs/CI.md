@@ -96,6 +96,11 @@ issue #635) so it never runs per-PR: it certifies, on the unmodified default ker
 Workspace → Source → transform → Write → managed revision + receipt → Jobs/Inbox → exact-revision
 reopen → hub-restart-recovery path, and writes reviewable evidence to `docs/acceptance/issue-635`.
 
+The same `full`-profile gate covers the keyed-upsert release certification
+(`web/e2e/keyed-upsert-journey.spec.ts`, issue #639): the shipped Write-Inspector upsert journey
+checked against independently recomputed evidence, plus response-loss replay, hub-restart recovery,
+and headless-API parity, with reviewable evidence in `docs/acceptance/issue-639`.
+
 Run one manually from the Actions page or with, for example:
 
 ```bash
