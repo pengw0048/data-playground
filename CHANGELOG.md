@@ -8,19 +8,23 @@ uses semver-shaped versions from `kernel/pyproject.toml` / `web/package.json`.
 Every release candidate must retain a passing [researcher UX acceptance](docs/UX_ACCEPTANCE.md) result
 for its exact commit before publication.
 
-## [Unreleased]
+## [0.1.0] — 2026-07-21
 
-No public tag or release has been published. The planned first release targets Profile A (local
-workstation) with a Python wheel (`data-playground`) and application container image.
+First public release, certified against commit `e510bec3a7c325a6f3585e2b9a7456ae694415eb` (see #663).
+Shipped as a Python wheel (`data-playground`) and an application container image. Supported profiles:
+Profile A (local workstation — single user or trusted collaborators, SQLite + local storage) and
+Profile B (trusted-team shared service — `DP_DEPLOYMENT_MODE=shared`, PostgreSQL). MCP (HTTP + stdio)
+is in scope; the dp_ray distributed backend (Profile C) ships as an optional plugin, outside the
+release gate.
 
 ### Supported platforms
 
 - **Python:** 3.11–3.13 (`requires-python = ">=3.11,<3.14"` in `kernel/pyproject.toml`).
 - **Browsers:** modern desktop Chromium, Firefox, and Safari (desktop-first; the Playwright e2e suite
   runs Chromium). Mobile viewports are not a release support claim.
-- **Deployment profiles:** Profile A (local workstation) is the first-release target. Profiles B
-  (trusted-team shared service) and C (distributed Ray) remain certification gates — see
-  `docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md`.
+- **Deployment profiles:** Profile A (local workstation) and Profile B (trusted-team shared service,
+  PostgreSQL) are supported this release. Profile C (distributed Ray) ships as an optional plugin and
+  remains outside the release gate — see `docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md`.
 
 ### Metadata schema
 
