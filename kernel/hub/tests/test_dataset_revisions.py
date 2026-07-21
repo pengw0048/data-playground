@@ -14,7 +14,8 @@ from fastapi.testclient import TestClient
 from hub.main import app
 from hub.models import CatalogTable, Graph
 from hub.plugins.adapters import (
-    LanceAdapter, RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable,
+    LanceAdapter, ManagedLocalFileRevisionAdapter, RevisionPermissionLost,
+    RevisionProviderOffline, RevisionUnavailable,
 )
 from hub.routers import catalog as catalog_router
 
@@ -242,6 +243,21 @@ def test_as_of_resolution_rejects_ambiguous_evidence_and_capability_absence(monk
     )
     assert unavailable.status_code == 501
     assert unavailable.json()["detail"] == "dataset_revision_as_of_unavailable"
+
+
+def test_revision_timestamp_normalization_is_limited_to_core_owned_evidence():
+    naive = datetime.datetime(2026, 7, 21, 18, 28, 35)
+
+    provider = catalog_router._revision(
+        "provider-dataset", {"revision_id": "provider-revision", "committed_at": naive},
+        LanceAdapter())
+    core = catalog_router._revision(
+        "core-dataset", {"revision_id": "core-revision", "committed_at": naive},
+        ManagedLocalFileRevisionAdapter())
+
+    assert provider.committed_at == naive
+    assert provider.committed_at.tzinfo is None
+    assert core.committed_at == naive.replace(tzinfo=datetime.timezone.utc)
 
 
 def test_lance_exact_revision_detail_is_bounded_and_keeps_parent_after_head_moves(tmp_path):

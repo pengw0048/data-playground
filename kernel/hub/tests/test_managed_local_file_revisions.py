@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pathlib
@@ -174,9 +175,23 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
     assert page.items[0].dataset_id == second["dataset_id"]
     assert page.items[0].revision_id == second["revision_id"]
     assert page.items[0].retention_owner == "core"
+    assert page.items[0].committed_at is not None
+    assert page.items[0].committed_at.utcoffset() == datetime.timedelta(0)
+    page_stamp = page.model_dump(by_alias=True, mode="json")["items"][0]["committedAt"]
+    assert datetime.datetime.fromisoformat(page_stamp.replace("Z", "+00:00")).utcoffset() == datetime.timedelta(0)
+    resolved = catalog_routes.resolve_dataset_revision(table_id, as_of=None)
+    assert resolved.committed_at is not None
+    assert resolved.committed_at.utcoffset() == datetime.timedelta(0)
+    resolved_stamp = resolved.model_dump(by_alias=True, mode="json")["committedAt"]
+    assert datetime.datetime.fromisoformat(
+        resolved_stamp.replace("Z", "+00:00")).utcoffset() == datetime.timedelta(0)
     exact = catalog_routes.open_dataset_revision(second["dataset_id"], first["revision_id"])
     assert exact.revision_id == first["revision_id"]
     assert exact.retention_owner == "core"
+    assert exact.committed_at is not None
+    assert exact.committed_at.utcoffset() == datetime.timedelta(0)
+    exact_stamp = exact.model_dump(by_alias=True, mode="json")["committedAt"]
+    assert datetime.datetime.fromisoformat(exact_stamp.replace("Z", "+00:00")).utcoffset() == datetime.timedelta(0)
     assert exact.parent_revision_id is None
     assert exact.summary.row_count == 1 and exact.summary.data_file_count == 1
     assert exact.preview.rows == [{"value": 1}]

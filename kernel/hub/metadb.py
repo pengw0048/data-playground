@@ -9376,7 +9376,7 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                    "executionManifestSha256": r.execution_manifest_sha256,
                    "profile": json.loads(r.profile) if r.profile else None,
                    "perNode": json.loads(r.per_node) if r.per_node else None,
-                   "createdAt": r.created_at.isoformat() if r.created_at else None}
+                   "createdAt": _core_utc_iso(r.created_at)}
                   for r in rows]
     summaries = _execution_manifest_summaries({
         item["executionManifestSha256"] for item in result})
@@ -9412,13 +9412,21 @@ def _workspace_run_cursor_decode(cursor: str | None) -> tuple[datetime.datetime,
     return created_at, identity
 
 
-def _workspace_utc_iso(value: datetime.datetime | None) -> str | None:
-    """Serialize one metadata timestamp without letting SQLite-naive UTC become browser-local."""
+def _core_utc_datetime(value: datetime.datetime | None) -> datetime.datetime | None:
+    """Return one core-owned metadata instant without SQLite erasing its UTC offset."""
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=datetime.timezone.utc)
-    return value.astimezone(datetime.timezone.utc).isoformat()
+        # Core metadata is written as UTC. SQLite cannot round-trip the SQLAlchemy timezone marker,
+        # so only this core-owned boundary may restore that recorded fact.
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
+
+
+def _core_utc_iso(value: datetime.datetime | None) -> str | None:
+    """Serialize one core-owned metadata instant as an offset-aware UTC ISO value."""
+    instant = _core_utc_datetime(value)
+    return instant.isoformat() if instant is not None else None
 
 
 def _workspace_progress(value) -> float | None:
@@ -9441,7 +9449,8 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
         per_node = json.loads(row.per_node) if row.per_node else None
         placement = str((state_doc or {}).get("placement") or ("distributed" if backend else "local"))
         profile_attempt = (state_doc or {}).get("profile_attempt_order")
-        created_at = row.created_at or _now()
+        created_at = _core_utc_datetime(row.created_at or _now())
+        assert created_at is not None
         identity = f"h:{row.id}"
         doc = {
             "id": row.id, "runId": row.run_id, "requestId": row.request_id,
@@ -9453,7 +9462,7 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
             "executionManifestSha256": row.execution_manifest_sha256,
             "executionManifestReconstructable": row.execution_manifest_sha256 is not None,
             "perNode": per_node, "createdAt": created_at.isoformat(),
-            "updatedAt": _workspace_utc_iso(state_updated_at),
+            "updatedAt": _core_utc_iso(state_updated_at),
         }
     else:
         assert state_doc is not None
@@ -9461,7 +9470,8 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
         per_node = state_doc.get("per_node") or []
         placement = str(state_doc.get("placement") or ("distributed" if backend else "local"))
         profile_attempt = state_doc.get("profile_attempt_order")
-        created_at = row.created_at or row.updated_at or _now()
+        created_at = _core_utc_datetime(row.created_at or row.updated_at or _now())
+        assert created_at is not None
         identity = f"s:{row.run_id}"
         doc = {
             "id": identity, "runId": row.run_id, "requestId": row.request_id,
@@ -9475,11 +9485,8 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
             "executionManifestReconstructable": row.execution_manifest_sha256 is not None,
             "outputs": outputs, "profile": state_doc.get("profile"),
             "perNode": per_node or None, "createdAt": created_at.isoformat(),
-            "updatedAt": _workspace_utc_iso(state_updated_at),
+            "updatedAt": _core_utc_iso(state_updated_at),
         }
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
-        doc["createdAt"] = created_at.isoformat()
     target = doc.get("targetNodeId")
     node_label = next((str(item.get("label")) for item in (doc.get("perNode") or [])
                        if isinstance(item, dict) and item.get("node_id") == target
@@ -10141,7 +10148,7 @@ def list_workspace_runs(
                 "executionManifestReconstructable": task.execution_manifest_sha256 is not None,
                 "outputs": outputs, "profile": None,
                 "perNode": per_node or None, "createdAt": created_at.isoformat(),
-                "updatedAt": _workspace_utc_iso(task.updated_at),
+                "updatedAt": _core_utc_iso(task.updated_at),
                 "canvasId": task.canvas_id, "canvasName": name, "nodeLabel": node_label,
                 "backend": "local", "placement": "local", "attempt": latest["id"],
                 "taskId": task.id,
@@ -10157,7 +10164,7 @@ def list_workspace_runs(
                               else item["error"]),
                     "startedAt": item["started_at"].isoformat() if item["started_at"] else None,
                     "completedAt": item["completed_at"].isoformat() if item["completed_at"] else None,
-                    "updatedAt": _workspace_utc_iso(item["updated_at"]),
+                    "updatedAt": _core_utc_iso(item["updated_at"]),
                 } for item in attempts],
                 "cancelRequested": task.cancel_requested,
                 "canRetry": can_retry,
@@ -10258,7 +10265,7 @@ def list_workspace_runs(
                     "executionManifestReconstructable": False,
                     "outputs": [], "profile": None, "perNode": None,
                     "createdAt": created_at.isoformat(),
-                    "updatedAt": _workspace_utc_iso(task.updated_at),
+                    "updatedAt": _core_utc_iso(task.updated_at),
                     "canvasId": None, "canvasName": None,
                     "nodeLabel": view.name, "backend": "local", "placement": "local",
                     "attempt": latest["id"], "taskId": task.id,
@@ -10273,7 +10280,7 @@ def list_workspace_runs(
                         if item["started_at"] else None,
                         "completedAt": item["completed_at"].isoformat()
                         if item["completed_at"] else None,
-                        "updatedAt": _workspace_utc_iso(item["updated_at"]),
+                        "updatedAt": _core_utc_iso(item["updated_at"]),
                     } for item in attempts],
                     "cancelRequested": task.cancel_requested,
                     "canRetry": can_retry,
@@ -10359,7 +10366,7 @@ def list_workspace_runs(
                     "executionManifestReconstructable": False,
                     "outputs": [], "profile": None, "perNode": None,
                     "createdAt": created_at.isoformat(),
-                    "updatedAt": _workspace_utc_iso(task.updated_at),
+                    "updatedAt": _core_utc_iso(task.updated_at),
                     "canvasId": None, "canvasName": None,
                     "nodeLabel": (dataset_context or {}).get("name"),
                     "backend": "local", "placement": "local",
@@ -10375,7 +10382,7 @@ def list_workspace_runs(
                         if item["started_at"] else None,
                         "completedAt": item["completed_at"].isoformat()
                         if item["completed_at"] else None,
-                        "updatedAt": _workspace_utc_iso(item["updated_at"]),
+                        "updatedAt": _core_utc_iso(item["updated_at"]),
                     } for item in attempts],
                     "cancelRequested": task.cancel_requested,
                     "canRetry": can_retry, "canCancel": can_cancel,

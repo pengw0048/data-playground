@@ -5,6 +5,7 @@ import json
 import uuid
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from hub import metadb
 from hub.tests.task_manifest_helpers import with_task_manifest
@@ -135,6 +136,29 @@ def test_workspace_jobs_project_only_owned_progress_and_canonical_update_times()
     malformed_page = WorkspaceRunPage.model_validate(
         metadb.list_workspace_runs(uid, run_id=live_id))
     assert malformed_page.items[0].progress is None
+
+
+def test_canvas_history_and_jobs_serialize_one_core_timestamp_as_utc():
+    uid, suffix = _identity()
+    canvas_id = f"jobs-a-{suffix}"
+    run_id = f"timestamp-{suffix}"
+    instant = datetime.datetime(2026, 7, 21, 18, 28, 35, tzinfo=datetime.timezone.utc)
+    assert metadb.record_run(canvas_id, None, "run", "done", run_id=run_id)
+    with metadb.session() as session:
+        row = session.scalar(select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+        assert row is not None
+        row.created_at = instant
+
+    headers = {"X-DP-User": uid}
+    jobs = client.get("/api/jobs", params={"run_id": run_id}, headers=headers)
+    history = client.get(f"/api/canvas/{canvas_id}/runs", headers=headers)
+
+    assert jobs.status_code == 200, jobs.text
+    assert history.status_code == 200, history.text
+    jobs_stamp = jobs.json()["items"][0]["createdAt"]
+    history_stamp = next(row["createdAt"] for row in history.json() if row["runId"] == run_id)
+    assert jobs_stamp == history_stamp == "2026-07-21T18:28:35+00:00"
+    assert datetime.datetime.fromisoformat(jobs_stamp).utcoffset() == datetime.timedelta(0)
 
 
 def test_workspace_jobs_project_task_attempt_progress_updates_and_viewer_actions():
