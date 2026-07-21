@@ -115,6 +115,43 @@ async function waitForCollabRoom(page: Page, canvasId: string) {
 }
 
 test.describe('Data Playground canvas', () => {
+  test('direct first-entry example fits every node once at 1280x720 and preserves manual viewport control @first-run', async ({ page }) => {
+    let exampleId: string | null = null
+    try {
+      await page.goto('/')
+      expect(await canvasesFor(page)).toEqual([])
+      await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
+      const nodes = page.locator('.react-flow__node')
+      await expect(nodes).toHaveCount(5)
+      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+
+      const allNodesInsideFlow = async () => {
+        const flow = await page.locator('.react-flow').boundingBox()
+        const nodeBoxes = await nodes.evaluateAll((elements) => elements.map((element) => {
+          const box = element.getBoundingClientRect()
+          return { x: box.x, y: box.y, width: box.width, height: box.height }
+        }))
+        return !!flow && nodeBoxes.length === 5 && nodeBoxes.every((node) => (
+          node.x >= flow.x && node.y >= flow.y
+          && node.x + node.width <= flow.x + flow.width
+          && node.y + node.height <= flow.y + flow.height
+        ))
+      }
+      await expect.poll(allNodesInsideFlow).toBe(true)
+
+      // The one-shot request is already consumed. A user zoom followed by an ordinary selection
+      // rerender must not invoke fitView again or reset the chosen viewport.
+      const viewport = page.locator('.react-flow__viewport')
+      await page.locator('.react-flow__controls-zoomin').click()
+      const manualViewport = await viewport.getAttribute('style')
+      await nodes.first().click()
+      await page.waitForTimeout(500)
+      expect(await viewport.getAttribute('style')).toBe(manualViewport)
+    } finally {
+      if (exampleId) await page.request.delete(`/api/canvas/${encodeURIComponent(exampleId)}`)
+    }
+  })
+
   test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page }) => {
     await page.goto('/')
     expect(await canvasesFor(page)).toEqual([])

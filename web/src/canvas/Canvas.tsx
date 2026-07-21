@@ -9,7 +9,9 @@ import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
 import { WireEdge } from '../wires/WireEdge'
 import { canConnect, portWire, portMulti, getSpec } from '../nodes/registry'
 import { schemaWarnings } from '../nodes/schema'
-import { currentPreviews, useStore, newId, freePosition, roleCanEdit } from '../store/graph'
+import {
+  canvasViewportDocumentIdentity, currentPreviews, useStore, newId, freePosition, roleCanEdit,
+} from '../store/graph'
 import { api } from '../api/client'
 import { examples } from '../examples'
 import { kindAccent, color } from '../theme/tokens'
@@ -104,6 +106,8 @@ export function Canvas() {
   const selectedIds = useStore((s) => s.selectedIds)
   const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
   const acknowledgeNodeReveal = useStore((s) => s.acknowledgeNodeReveal)
+  const viewportFitRequest = useStore((s) => s.viewportFitRequest)
+  const acknowledgeViewportFit = useStore((s) => s.acknowledgeViewportFit)
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
@@ -113,8 +117,9 @@ export function Canvas() {
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
   const disable = useStore((s) => s.disable)
-  const { screenToFlowPosition, setCenter, getZoom } = useReactFlow()
+  const { screenToFlowPosition, setCenter, getZoom, fitView } = useReactFlow()
   const revealedRequestId = useRef<number | null>(null)
+  const fittedRequestId = useRef<number | null>(null)
 
   // realtime collaboration: join this canvas's presence room; leave on switch/unmount
   const docId = doc.id
@@ -185,6 +190,29 @@ export function Canvas() {
       return [...mapped.filter((n) => !n.parentId), ...mapped.filter((n) => n.parentId)]
     })
   }, [doc.nodes, selectedIds])
+
+  // React Flow's fitView prop applies only at mount (when a first-run Canvas is still empty). A
+  // successful example open therefore carries one explicit, document-bound request. Consume it only
+  // after every card is measured; the request is then gone, so later renders and user pan/zoom remain
+  // entirely presentation-local.
+  useEffect(() => {
+    if (!viewportFitRequest || viewportFitRequest.canvasId !== doc.id
+        || fittedRequestId.current === viewportFitRequest.id) return
+    if (viewportFitRequest.documentIdentity !== canvasViewportDocumentIdentity(doc)) {
+      acknowledgeViewportFit(viewportFitRequest.id)
+      return
+    }
+    if (rfNodes.length !== doc.nodes.length || rfNodes.length === 0) return
+    const measured = rfNodes.every((node) => {
+      const width = node.measured?.width ?? node.width
+      const height = node.measured?.height ?? node.height
+      return typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0
+    })
+    if (!measured) return
+    fittedRequestId.current = viewportFitRequest.id
+    void fitView({ padding: 0.3, maxZoom: 1 })
+    acknowledgeViewportFit(viewportFitRequest.id)
+  }, [viewportFitRequest, doc, rfNodes, fitView, acknowledgeViewportFit])
 
   // A route request is intentionally distinct from normal selection: a click in the Canvas updates
   // the shareable node= URL but must never seize the user's viewport. Wait for React Flow to mount

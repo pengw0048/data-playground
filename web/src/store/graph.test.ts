@@ -130,7 +130,7 @@ describe('graph store — core authority ops', () => {
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
       canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
-      serverVersion: 1, saved: true,
+      serverVersion: 1, saved: true, viewportFitRequest: null,
     })
   })
 
@@ -2621,6 +2621,13 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.createCanvas).not.toHaveBeenCalled()
     expect(apiMocks.saveCanvas).toHaveBeenCalledWith(expect.objectContaining({ id: 'pristine' }), false, 1)
     expect(useStore.getState().doc.nodes.length).toBeGreaterThan(0)
+    const fitRequest = useStore.getState().viewportFitRequest
+    expect(fitRequest).toMatchObject({ canvasId: 'pristine' })
+    expect(fitRequest?.documentIdentity).toContain('pristine')
+    useStore.getState().acknowledgeViewportFit(fitRequest!.id)
+    expect(useStore.getState().viewportFitRequest).toBeNull()
+    useStore.setState({ saved: false }) // an ordinary rerender must not manufacture another request
+    expect(useStore.getState().viewportFitRequest).toBeNull()
   })
 
   it('creates a separate example when an otherwise blank Canvas has run history', async () => {
@@ -2754,6 +2761,7 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc).toBe(edited)
     expect(useStore.getState().doc.id).toBe(blank.id)
     expect(useStore.getState().doc.nodes.map((node) => node.id)).toContain(source!.id)
+    expect(useStore.getState().viewportFitRequest).toBeNull()
     expect(useStore.getState().toasts.at(-1)?.msg).toContain('Choose the example again')
   })
 

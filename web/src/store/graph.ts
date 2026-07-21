@@ -73,6 +73,7 @@ let _previewRequestGeneration = 0 // every preview captures its own generation; 
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
 let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
+let _viewportFitGeneration = 0    // example fits are one-shot even when the same Canvas is reused
 const _draftSyncInFlight = new Set<string>()
 // True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
 // still refreshes the browser cache, but must not PUT that presentation-only normalization back into
@@ -969,6 +970,17 @@ function cancelDetachedProfileJob(job: ProfileJobState | undefined): void {
 export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
 
 export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string }
+export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
+
+// Fit identity is deliberately geometry-only: transient run badges may settle while React Flow is
+// measuring, but a different node set or position must never consume an example's viewport request.
+export function canvasViewportDocumentIdentity(doc: CanvasDoc): string {
+  return JSON.stringify([
+    doc.id,
+    doc.version,
+    doc.nodes.map((node) => [node.id, node.type, node.parentId ?? null, node.position.x, node.position.y]),
+  ])
+}
 
 interface Store {
   doc: CanvasDoc
@@ -986,6 +998,7 @@ interface Store {
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
   nodeRevealRequest: NodeRevealRequest | null // URL-originated only; Canvas consumes it without autosaving
+  viewportFitRequest: CanvasViewportFitRequest | null // successful example open only; consumed once after measurement
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
@@ -1021,6 +1034,8 @@ interface Store {
   requestNodeReveal: (canvasId: string, nodeId: string) => void
   acknowledgeNodeReveal: (requestId: number) => void
   clearNodeReveal: () => void
+  requestViewportFit: (doc: CanvasDoc) => void
+  acknowledgeViewportFit: (requestId: number) => void
   setSelection: (ids: string[]) => void
   selectAll: () => void
   removeSelected: () => void
@@ -1476,6 +1491,7 @@ export const useStore = create<Store>((set, get) => ({
   selectedId: null,
   selectedIds: [],
   nodeRevealRequest: null,
+  viewportFitRequest: null,
   openPanels: {},
   previews: {},
   previewBindings: {},
@@ -1703,6 +1719,18 @@ export const useStore = create<Store>((set, get) => ({
   )),
 
   clearNodeReveal: () => set({ nodeRevealRequest: null }),
+
+  requestViewportFit: (doc) => set({
+    viewportFitRequest: {
+      id: ++_viewportFitGeneration,
+      canvasId: doc.id,
+      documentIdentity: canvasViewportDocumentIdentity(doc),
+    },
+  }),
+
+  acknowledgeViewportFit: (requestId) => set((state) => (
+    state.viewportFitRequest?.id === requestId ? { viewportFitRequest: null } : {}
+  )),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
 
@@ -3109,6 +3137,7 @@ export const useStore = create<Store>((set, get) => ({
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
     set({ view: 'canvas', firstRunChoice: false })
+    get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
   },
 
@@ -3575,7 +3604,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, past: [], future: [],
+        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {

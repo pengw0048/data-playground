@@ -48,6 +48,7 @@ export default defineConfig({
       grep: /@first-run/,
       use: {
         ...devices['Desktop Chrome'],
+        viewport: { width: 1280, height: 720 },
         ...chromiumLaunch,
       },
     },
