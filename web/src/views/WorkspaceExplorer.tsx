@@ -253,6 +253,7 @@ function WorkspaceMixedExplorer() {
   const setWorkspaceSearchQuery = useStore((s) => s.setWorkspaceSearchQuery)
   const openFile = useStore((s) => s.openFile)
   const files = useStore((s) => s.files)
+  const currentCanvasId = useStore((s) => s.doc?.id ?? '')
   const refreshFiles = useStore((s) => s.refreshFiles)
   const rememberTables = useStore((s) => s.rememberTables)
   const pushToast = useStore((s) => s.pushToast)
@@ -652,10 +653,10 @@ function WorkspaceMixedExplorer() {
       {canvasDeleteResource && <CanvasDeleteDialog resource={canvasDeleteResource} onClose={() => setCanvasDeleteResource(null)}
         onDeleted={() => { setCanvasDeleteResource(null); void refreshFiles(); reload() }} />}
       {datasetAction && container?.version != null && <DatasetActionDialog action={datasetAction} container={container}
-        files={files} onClose={() => setDatasetAction(null)}
+        files={files} currentCanvasId={currentCanvasId} onClose={() => setDatasetAction(null)}
         onOpened={(canvasId) => { setDatasetAction(null); setSelectedTable(null); setSelectedDataset(null); void openFile(canvasId) }} />}
       {providerDatasetAction && <ProviderDatasetActionDialog resource={providerDatasetAction}
-        container={container} files={files} onClose={() => setProviderDatasetAction(null)}
+        container={container} files={files} currentCanvasId={currentCanvasId} onClose={() => setProviderDatasetAction(null)}
         onOpened={(canvasId) => {
           setProviderDatasetAction(null); setSelectedDataset(null); void openFile(canvasId)
         }} />}
@@ -698,6 +699,7 @@ function WorkspaceDatasets() {
   const uploadDataset = useStore((state) => state.uploadDataset)
   const rememberTables = useStore((state) => state.rememberTables)
   const files = useStore((state) => state.files)
+  const currentCanvasId = useStore((state) => state.doc?.id ?? '')
   const refreshFiles = useStore((state) => state.refreshFiles)
   const openFile = useStore((state) => state.openFile)
   const pushToast = useStore((state) => state.pushToast)
@@ -863,7 +865,7 @@ function WorkspaceDatasets() {
         onRetryWorkspaceLocation={() => setDetailResolutionRevision((current) => current + 1)} />
     </div>
     {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
-      destinationError={destinationError} files={files} onClose={() => setDatasetAction(null)}
+      destinationError={destinationError} files={files} currentCanvasId={currentCanvasId} onClose={() => setDatasetAction(null)}
       onRetryDestination={() => setDestinationRevision((current) => current + 1)}
       onOpened={(canvasId) => { setDatasetAction(null); void openFile(canvasId) }} />}
   </div>
@@ -1184,19 +1186,20 @@ function CanvasDeleteDialog({ resource, onClose, onDeleted }: {
   </Modal>
 }
 
-function DatasetActionDialog({ action, container, destinationError, files, onClose, onOpened, onRetryDestination }: {
+function DatasetActionDialog({ action, container, destinationError, files, currentCanvasId, onClose, onOpened, onRetryDestination }: {
   action: { tables: CatalogTable[] }; container: WorkspaceResource | null; destinationError?: string | null
-  files: CanvasFile[]; onClose: () => void; onOpened: (canvasId: string) => void
+  files: CanvasFile[]; currentCanvasId: string; onClose: () => void; onOpened: (canvasId: string) => void
   onRetryDestination?: () => void
 }) {
   const editable = files.filter((file) => file.role === 'owner' || file.role === 'editor')
   const datasetIds = action.tables.flatMap((table) => table.registrationId ? [table.registrationId] : [])
   const label = action.tables.length === 1 ? action.tables[0].name : `${action.tables.length} datasets`
-  const [mode, setMode] = useState<'explore' | 'add'>('explore')
+  const [mode, setMode] = useState<'explore' | 'current' | 'choose'>('explore')
   const [name, setName] = useState(`${label} exploration`)
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const currentCanvas = editable.find((file) => file.id === currentCanvasId)
   useEffect(() => {
     if (!editable.some((file) => file.id === canvasId)) setCanvasId(editable[0]?.id ?? '')
   }, [canvasId, files])
@@ -1217,7 +1220,7 @@ function DatasetActionDialog({ action, container, destinationError, files, onClo
         })
         onOpened(created.id)
       } else {
-        const target = editable.find((file) => file.id === canvasId)
+        const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) { setError('Choose an editable target canvas'); return }
         await api.workspaceAddDatasets(target.id, {
           datasetIds, expectedCanvasVersion: target.version,
@@ -1229,20 +1232,24 @@ function DatasetActionDialog({ action, container, destinationError, files, onClo
   }
   return <Modal label={`Use ${label}`} onClose={onClose}>
     <div className="max-h-24 overflow-y-auto rounded-md border border-border bg-muted/25 px-2 py-1 text-[10.5px] text-muted-foreground">
-      {action.tables.map((table) => <div key={table.id} className="truncate">{table.name} · dataset:{table.registrationId ?? 'identity unavailable'}</div>)}
+      {action.tables.map((table) => <div key={table.id} className="truncate">{table.name}</div>)}
     </div>
     <p className="text-[11px] text-muted-foreground">Bounded to {CATALOG_BATCH_LIMIT} datasets. The selected sources are applied atomically under one Canvas version precondition.</p>
-    <div className="grid grid-cols-2 gap-2">
+    <div className="grid gap-2 sm:grid-cols-3">
       <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}>
-        <span className="block text-[12px] font-semibold">Explore in new canvas</span><span className="text-[10.5px] text-muted-foreground">{container ? `Create in ${container.name}` : 'Loading exact destination…'}</span>
+        <span className="block text-[12px] font-semibold">Explore in a new Canvas</span><span className="text-[10.5px] text-muted-foreground">{container ? `Create in ${container.name}` : 'Loading exact destination…'}</span>
       </button>
-      <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}>
-        <span className="block text-[12px] font-semibold">Add to canvas</span><span className="text-[10.5px] text-muted-foreground">Choose one exact target</span>
+      <button onClick={() => setMode('current')} disabled={!currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}>
+        <span className="block text-[12px] font-semibold">Add to this Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable current Canvas'}</span>
+      </button>
+      <button onClick={() => setMode('choose')} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}>
+        <span className="block text-[12px] font-semibold">Choose a Canvas</span><span className="text-[10.5px] text-muted-foreground">Select an editable destination</span>
       </button>
     </div>
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name
       <input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" />
-    </label> : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Target canvas
+    </label> : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong></div>
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas
       <select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">
         {editable.map((file) => <option key={file.id} value={file.id}>{file.name} · {file.id}</option>)}
       </select>
@@ -1250,7 +1257,7 @@ function DatasetActionDialog({ action, container, destinationError, files, onClo
     {destinationError && mode === 'explore' && <div role="alert" className="flex items-center justify-between gap-2 text-[12px] text-destructive"><span>Couldn't load the Workspace destination: {destinationError}</span>{onRetryDestination && <button onClick={onRetryDestination} className="font-semibold underline">Retry</button>}</div>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
     <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button>
-      <button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
+      <button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !container : mode === 'current' ? !currentCanvas : !canvasId)} className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
   </Modal>
 }
 
@@ -1412,18 +1419,19 @@ function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink, o
   </div>
 }
 
-function ProviderDatasetActionDialog({ resource, container, files, onClose, onOpened }: {
-  resource: WorkspaceResource; container: WorkspaceResource | null; files: CanvasFile[]
+function ProviderDatasetActionDialog({ resource, container, files, currentCanvasId, onClose, onOpened }: {
+  resource: WorkspaceResource; container: WorkspaceResource | null; files: CanvasFile[]; currentCanvasId: string
   onClose: () => void; onOpened: (canvasId: string) => void
 }) {
   const editable = files.filter((file) => file.role === 'owner' || file.role === 'editor')
-  const [mode, setMode] = useState<'explore' | 'add'>('explore')
+  const [mode, setMode] = useState<'explore' | 'current' | 'choose'>('explore')
   const [name, setName] = useState(`${resource.name} exploration`)
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
   const destination = canvasDestination(container, 'create')
+  const currentCanvas = editable.find((file) => file.id === currentCanvasId)
   const submit = async () => {
     if (busy) return
     setBusy(true); setError(null)
@@ -1443,7 +1451,7 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
         })
         onOpened(created.id)
       } else {
-        const target = editable.find((file) => file.id === canvasId)
+        const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) throw new Error('Choose an editable target canvas')
         await api.workspaceAddDatasets(target.id, {
           providerDatasetRefs: [resource.id], expectedCanvasVersion: target.version,
@@ -1455,16 +1463,18 @@ function ProviderDatasetActionDialog({ resource, container, files, onClose, onOp
   }
   return <Modal label={`Use ${resource.name}`} onClose={onClose}>
     <p className="text-[11px] leading-5 text-muted-foreground">Only the stable provider identity and display metadata are stored locally; data and credentials are not copied, and the provider is never mutated. {isExternal(container) && destination && 'The new Canvas is a locally owned overlay beside this source-only provider resource.'}</p>
-    <div className="grid grid-cols-2 gap-2">
-      <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in new canvas</span></button>
-      <button onClick={() => setMode('add')} aria-pressed={mode === 'add'} className={`rounded-lg border p-3 text-left ${mode === 'add' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to canvas</span></button>
+    <div className="grid gap-2 sm:grid-cols-3">
+      <button onClick={() => setMode('explore')} aria-pressed={mode === 'explore'} className={`rounded-lg border p-3 text-left ${mode === 'explore' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Explore in a new Canvas</span></button>
+      <button onClick={() => setMode('current')} disabled={!currentCanvas} aria-pressed={mode === 'current'} className={`rounded-lg border p-3 text-left disabled:opacity-50 ${mode === 'current' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Add to this Canvas</span><span className="text-[10.5px] text-muted-foreground">{currentCanvas ? currentCanvas.name : 'No editable current Canvas'}</span></button>
+      <button onClick={() => setMode('choose')} aria-pressed={mode === 'choose'} className={`rounded-lg border p-3 text-left ${mode === 'choose' ? 'border-primary bg-primary/5' : 'border-border'}`}><span className="block text-[12px] font-semibold">Choose a Canvas</span></button>
     </div>
     {mode === 'explore' ? <label className="grid gap-1 text-[11px] text-muted-foreground">New canvas name<input value={name} onChange={(event) => setName(event.target.value)} className="dp-input" /></label>
-      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Target canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
+      : mode === 'current' && currentCanvas ? <div className="text-[11px] text-muted-foreground">Selected Canvas: <strong className="text-foreground">{currentCanvas.name}</strong></div>
+      : editable.length ? <label className="grid gap-1 text-[11px] text-muted-foreground">Choose a Canvas<select aria-label="Target canvas" value={canvasId} onChange={(event) => setCanvasId(event.target.value)} className="dp-input">{editable.map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>
         : <div role="status" className="text-[12px] text-muted-foreground">No editable canvas is available.</div>}
     {mode === 'explore' && !destination && <div role="status" className="text-[12px] text-muted-foreground">{canvasDestinationTitle(container, 'create')}</div>}
     {error && <div role="alert" className="text-[12px] text-destructive">{error}</div>}
-    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !destination : !canvasId)}
+    <div className="flex justify-end gap-2"><button onClick={onClose} className="rounded-md border border-border px-3 py-1.5 text-[12px]">Cancel</button><button onClick={() => void submit()} disabled={busy || (mode === 'explore' ? !name.trim() || !destination : mode === 'current' ? !currentCanvas : !canvasId)}
       title={mode === 'explore' && !destination ? canvasDestinationTitle(container, 'create') : undefined}
       className="rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">{busy ? 'Applying…' : mode === 'explore' ? 'Create and open' : 'Add and open'}</button></div>
   </Modal>

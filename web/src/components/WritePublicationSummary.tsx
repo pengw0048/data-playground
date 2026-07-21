@@ -1,0 +1,89 @@
+import { useState } from 'react'
+import { api } from '../api/client'
+import type { DatasetRevisionDetail, WriteAdmission, WriteReceipt } from '../types/api'
+
+export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
+  if (mode === 'create') return 'Create a new dataset'
+  if (mode === 'append') return 'Append to the selected dataset'
+  if (mode === 'replace' || mode === 'overwrite') return 'Replace the selected dataset'
+  return 'Publication mode is not available yet'
+}
+
+function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
+  const open = async () => {
+    setLoading(true); setError(''); setDetail(null)
+    try {
+      // A receipt supplies both immutable ids. Never resolve or substitute a latest revision here.
+      setDetail(await api.datasetRevision(receipt.datasetId, receipt.revisionId))
+    } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)) }
+    finally { setLoading(false) }
+  }
+  const schemaFieldCount = detail?.preview?.columns?.length ?? 0
+  return <>
+    <button type="button" className="ml-2 font-semibold text-primary underline" onClick={() => void open()} disabled={loading}>
+      {loading ? 'Opening exact revision…' : 'Open exact revision'}
+    </button>
+    {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-background p-2 text-muted-foreground">
+      <div className="font-semibold text-foreground">Exact revision {detail.datasetId}@{detail.revisionId}</div>
+      <div>Committed {detail.committedAt ?? 'unknown'}</div>
+      <div>{detail.summary?.rowCount?.toLocaleString?.() ?? 'unknown'} rows · {schemaFieldCount} schema {schemaFieldCount === 1 ? 'field' : 'fields'}</div>
+      <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'}</div>
+    </div>}
+    {error && <div role="alert" className="mt-1 text-destructive">Exact revision unavailable: {error}. Latest was not substituted.</div>}
+  </>
+}
+
+function PublicationDetails({ admission, receipt }: { admission?: WriteAdmission | null; receipt?: WriteReceipt | null }) {
+  if (!admission && !receipt) return null
+  return <details className="mt-2 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px] text-muted-foreground">
+    <summary className="cursor-pointer font-semibold text-foreground">Publication details</summary>
+    <div className="mt-2 grid gap-1 break-all">
+      {admission && <>
+        <div><strong>Provider:</strong> <span className="font-mono">{admission.provider}</span></div>
+        <div><strong>Admission destination:</strong> <span className="font-mono">{admission.destination}</span></div>
+        <div><strong>Schema:</strong> {admission.expectedSchema.length
+          ? admission.expectedSchema.map((field) => `${field.name}: ${field.type}`).join(', ') : 'unknown'}</div>
+        <div><strong>Partitions:</strong> {admission.partitions.length
+          ? admission.partitions.map((partition) => partition.field).join(', ') : 'unpartitioned'}</div>
+        {admission.expectedHead && <div><strong>Expected head:</strong> <span className="font-mono">{admission.expectedHead.datasetId}@{admission.expectedHead.revisionId}</span></div>}
+        {admission.intent && <div><strong>Idempotency key:</strong> <span className="font-mono">{admission.intent.idempotencyKey}</span></div>}
+      </>}
+      {receipt && <>
+        <div><strong>Receipt:</strong> <span className="font-mono">{receipt.datasetId}@{receipt.revisionId}</span></div>
+        <div><strong>Bytes:</strong> {receipt.bytes.toLocaleString()}</div>
+        <div><strong>Publication sequence:</strong> {receipt.publication?.publishSequence ?? 'unknown'}</div>
+        <div><strong>Idempotency key:</strong> <span className="font-mono">{receipt.publication?.idempotencyKey ?? 'unknown'}</span></div>
+        {receipt.parentHead && <div><strong>Parent:</strong> <span className="font-mono">{receipt.parentHead.datasetId}@{receipt.parentHead.revisionId}</span></div>}
+        <div><strong>Backend:</strong> {receipt.publication?.backendVersion ?? 'unknown'}</div>
+        {receipt.executionManifestSha256 && <div><strong>Execution manifest:</strong> <span className="font-mono">{receipt.executionManifestSha256}</span></div>}
+      </>}
+    </div>
+  </details>
+}
+
+export function WritePublicationSummary({ outputName, destination, admission, receipt, compact = false, completed = false }: {
+  outputName: string; destination: string; admission?: WriteAdmission | null; receipt?: WriteReceipt | null; compact?: boolean; completed?: boolean
+}) {
+  const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
+  return <section aria-label="Write publication" className={classes}>
+    <div className="grid gap-1.5">
+      <div><span className="font-semibold text-foreground">Output name</span><div className="font-mono text-foreground">{outputName}</div></div>
+      <div><span className="font-semibold text-foreground">Destination</span><div className="text-muted-foreground">{destination}</div></div>
+      <div><span className="font-semibold text-foreground">Publication mode</span><div className="text-muted-foreground">{publicationMode(admission?.mode)}</div></div>
+      {admission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
+        <strong>Cannot publish until</strong> {admission.blocker}
+      </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
+        : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">Publication outcome is unknown; no exact receipt was recorded.</div>
+        : admission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish</div>
+        : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
+      {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
+        <strong>{outputName} published</strong> · {receipt.rows.toLocaleString()} rows
+        <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
+      </div>}
+    </div>
+    <PublicationDetails admission={admission} receipt={receipt} />
+  </section>
+}

@@ -139,32 +139,37 @@ describe('Inspector — effective named outputs', () => {
     expect(screen.getByRole('status')).toHaveTextContent(/maximum 64 output ports/i)
   })
 
-  it('shows managed create admission and the exact durable revision receipt', () => {
+  it.each([
+    ['create', 'Create a new dataset'],
+    ['replace', 'Replace the selected dataset'],
+    ['append', 'Append to the selected dataset'],
+  ] as const)('puts %s Write mode behind the task-first default hierarchy', (mode, label) => {
     selectNode('write', undefined)
     useStore.setState({
       runs: { node: {
-        phase: 'done',
+        phase: 'estimated',
         writeAdmission: {
           nodeId: 'node', managed: true, destination: '/outputs/output.parquet',
-          mode: 'replace', provider: 'managed-local-file', expectedSchema: cols,
+          mode, provider: 'managed-local-file', expectedSchema: cols,
           partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'rev-1' },
-        },
-        status: { outputs: [{ writeReceipt: {
-          datasetId: 'dataset-1', revisionId: 'rev-2', rows: 2, bytes: 512,
-        } }] },
+        }, status: { outputs: [] },
       } },
     } as any)
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/replace.*managed-local-file/i)
-    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/expected revision rev-1/i)
-    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/durable revision rev-2/i)
-    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/512 bytes/i)
-    expect(screen.queryByText(/^overwrite$/i)).not.toBeInTheDocument()
+    const publication = screen.getByLabelText('Write publication')
+    expect(publication).toHaveTextContent('Output name')
+    expect(publication).toHaveTextContent('Workspace outputs')
+    expect(publication).toHaveTextContent(label)
+    expect(publication).toHaveTextContent('Ready to publish')
+    expect(screen.getByText('Publication details').closest('details')).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Publication details'))
+    expect(publication).toHaveTextContent('managed-local-file')
+    expect(publication).toHaveTextContent('dataset-1@rev-1')
   })
 
-  it('shows the frozen Lance parent and backend version without a physical path', () => {
+  it('keeps blockers visible and links only a receipt-backed exact revision', () => {
     selectNode('write', undefined)
     useStore.setState({
       runs: { node: {
@@ -172,7 +177,7 @@ describe('Inspector — effective named outputs', () => {
         writeAdmission: {
           nodeId: 'node', managed: true, destination: '/outputs/existing.lance',
           mode: 'append', provider: 'managed-local-lance', expectedSchema: cols,
-          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' },
+          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' }, blocker: 'the destination head moved',
         },
         status: { outputs: [{ writeReceipt: {
           datasetId: 'dataset-lance', revisionId: '8', rows: 12, bytes: 1024,
@@ -184,12 +189,34 @@ describe('Inspector — effective named outputs', () => {
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/append.*managed-local-lance/i)
-    expect(screen.getByLabelText('Write admission')).toHaveTextContent(/expected revision 7/i)
-    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/durable revision 8/i)
-    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/parent revision 7/i)
-    expect(screen.getByLabelText('Write receipt')).toHaveTextContent(/backend 8\.0\.0/i)
-    expect(screen.getByLabelText('Write receipt')).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the destination head moved')
+    expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
+    fireEvent.click(screen.getByText('Publication details'))
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@7')
+  })
+
+  it('does not invent an exact result when no receipt exists', () => {
+    selectNode('write', undefined)
+    useStore.setState({ runs: { node: {
+      phase: 'done', writeAdmission: {
+        nodeId: 'node', managed: true, destination: '/outputs/unknown.parquet', mode: 'replace',
+        provider: 'managed-local-file', expectedSchema: cols, partitions: [],
+      }, status: { outputs: [] },
+    } } } as any)
+    render(<Inspector />)
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Publication outcome is unknown; no exact receipt was recorded.')
+  })
+
+  it('keeps merge and upsert controls out of the ordinary Write flow until Advanced opens', () => {
+    selectNode('write', undefined)
+    render(<Inspector />)
+    const advanced = screen.getByText('Advanced write operations').closest('details')
+    expect(advanced).not.toHaveAttribute('open')
+    fireEvent.click(screen.getByText('Advanced write operations'))
+    expect(advanced).toHaveAttribute('open')
+    expect(screen.getByLabelText('Certified column merge')).toBeInTheDocument()
   })
 })
 

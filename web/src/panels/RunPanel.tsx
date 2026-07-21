@@ -5,6 +5,7 @@ import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { UpsertControl } from '../components/UpsertControl'
+import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
 import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
@@ -57,6 +58,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
     || (phase === 'failed' && st.status === 'failed')
     || (phase === 'idle' && st.status === 'cancelled')
   ) ? st.runId : null
+  const writeConfig = (target?.data.config ?? {}) as Record<string, unknown>
+  const outputName = String(writeConfig.filename ?? writeConfig.name ?? target?.data.title ?? 'output')
+  const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
+  const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
 
   if (isConfiguredMerge) return (
     <div className="p-3.5">
@@ -107,7 +112,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </span>
           </div>
           {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
-          {writeAdmission && <WriteAdmissionSummary admission={writeAdmission} />}
+          {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
           {pinnedInputs.length > 0 && (
             <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
               <div className="font-semibold text-foreground">Pinned exact inputs for this run</div>
@@ -176,10 +181,12 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         </>
       )}
 
-      {isWrite && <MergeColumnsControl nodeId={nodeId} compact />}
-
       {phase === 'done' && st && (
-        <>
+        isWrite ? <>
+          <Label>PUBLISHED</Label>
+          <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} completed />
+          <PerNode st={st} compact />
+        </> : <>
           <Label>DONE</Label>
           <div className="mt-0.5 flex items-baseline gap-2">
             <span className="text-base" style={{ color: color.latest }}>✓</span>
@@ -416,20 +423,6 @@ function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
           </div>
         )
       })}
-    </div>
-  )
-}
-
-function WriteAdmissionSummary({ admission }: { admission: import('../types/api').WriteAdmission }) {
-  return (
-    <div aria-label="Write admission" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-      <div className="font-semibold text-foreground">
-        {admission.managed ? `${admission.mode} · ${admission.provider}` : `${admission.mode} · provider-neutral`}
-      </div>
-      <div className="dp-mono mt-0.5 break-all">{admission.destination}</div>
-      <div className="mt-0.5">{admission.expectedSchema.length} schema fields · {admission.partitions.length ? `${admission.partitions.length} partitions` : 'unpartitioned'}</div>
-      {admission.expectedHead && <div className="dp-mono mt-0.5">expected revision {admission.expectedHead.revisionId}</div>}
-      {admission.blocker && <div className="mt-1 text-destructive">{admission.blocker}</div>}
     </div>
   )
 }

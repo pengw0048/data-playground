@@ -487,7 +487,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('observations · dataset:dataset-1')
+    expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent('observations')
     fireEvent.click(screen.getByRole('button', { name: 'Create and open' }))
     await waitFor(() => expect(mocks.workspaceCreateCanvas).toHaveBeenCalledWith({
       containerId: 'folder-1', expectedContainerVersion: 1,
@@ -507,7 +507,9 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Use' }))
-    fireEvent.click(screen.getByRole('button', { name: /^Add to canvas/ }))
+    expect(screen.getByRole('button', { name: /^Explore in a new Canvas/ })).toBeVisible()
+    expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
     expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas')
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
@@ -951,7 +953,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
       'Only the stable provider identity and display metadata are stored locally',
     )
-    fireEvent.click(screen.getByRole('button', { name: /^Add to canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
     await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
       providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
