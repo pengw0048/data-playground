@@ -34,6 +34,8 @@ export interface CatalogDiscoveryProps {
   onQueryStateChange?: (state: CatalogDiscoveryQueryState) => void
   selectedRegistrationId?: string | null
   onSelectedTableChange?: (table: CatalogTable | null) => void
+  /** Optional Workspace bridge; Catalog remains independently reusable without it. */
+  onOpenInWorkspace?: (table: CatalogTable) => void
 }
 
 export interface CatalogDiscoveryQueryState {
@@ -53,7 +55,7 @@ export const emptyCatalogDiscoveryQuery = (): CatalogDiscoveryQueryState => ({
 
 export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
-  queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange,
+  queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange, onOpenInWorkspace,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -452,7 +454,14 @@ export function CatalogDiscovery({
 
       {selected && (
         <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
-          onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }} onFolder={(f) => { setFolder(f); selectTable(null) }}
+          onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }}
+          onFolder={(folder) => {
+            if (onOpenInWorkspace) void onOpenInWorkspace(selected)
+            else { setFolder(folder); selectTable(null) }
+          }}
+          folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
+          folderActionDisabled={!!onOpenInWorkspace && !selected.registrationId}
+          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.' : undefined}
           onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
           onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
       )}
@@ -827,10 +836,13 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 }
 
 // ---- detail drawer: columns + metadata editor + lineage ---------------------
-export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn }: {
+export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
+  folderActionLabel = 'Browse folder', folderActionDisabled = false, folderActionTitle,
+}: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
   onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void
+  folderActionLabel?: string; folderActionDisabled?: boolean; folderActionTitle?: string
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1106,7 +1118,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             <Icon name="lineage" size={12} /> View relationship graph →
           </button>
           {table.folder && (
-            <button onClick={() => onFolder(table.folder!)} className="self-start text-[11.5px] text-primary hover:underline">Browse folder “{table.folder}” →</button>
+            <button onClick={() => onFolder(table.folder!)} disabled={folderActionDisabled} title={folderActionTitle}
+              className="self-start text-[11.5px] text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-45">{folderActionLabel} “{table.folder}” →</button>
           )}
           <button onClick={() => void unregister()} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
             title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'

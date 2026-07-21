@@ -64,6 +64,49 @@ const statusMessage = (status: WorkspaceSourceStatus) => status.error
 
 const DATASET_SORTS = new Set<CatalogDiscoveryQueryState['sort']>(['name', 'rows', 'updated', 'usage', 'folder'])
 
+type WorkspaceFolderContext = {
+  resource: WorkspaceResource | null
+  reason?: string
+}
+
+// Folder paths are only a Catalog filter. Navigation is always to the opaque projected container
+// returned while resolving a stable dataset identity, so a same-named local container cannot win.
+function projectedFolderFromResolution(folder: string, resolved: { resource: WorkspaceResource | null; ancestors: WorkspaceResource[]; source: WorkspaceSourceStatus }): WorkspaceFolderContext {
+  if (resolved.source.completeness !== 'complete') {
+    return { resource: null, reason: statusMessage(resolved.source) ?? 'Workspace is only partially available' }
+  }
+  const candidate = resolved.resource?.kind === 'container'
+    ? resolved.resource : resolved.ancestors[resolved.ancestors.length - 1] ?? null
+  if (!candidate || candidate.kind !== 'container' || candidate.detached
+      || candidate.catalogFolderState !== 'current' || candidate.catalogFolderPath !== folder) {
+    return { resource: null, reason: 'This dataset is not currently available in Workspace.' }
+  }
+  return { resource: candidate }
+}
+
+async function resolveProjectedFolder(folder: string, knownResourceId?: string | null): Promise<WorkspaceFolderContext> {
+  if (!folder) return { resource: null }
+  if (knownResourceId) {
+    try {
+      const known = projectedFolderFromResolution(folder, await api.workspaceResource(knownResourceId))
+      if (known.resource || known.reason?.startsWith('Workspace')) return known
+    } catch {
+      // The route may point at a dataset that was removed while this query was open. Fall through
+      // to one bounded Catalog lookup; it still has to resolve an opaque Workspace resource below.
+    }
+  }
+  try {
+    const page = await api.tablesPage({ folder, limit: 1 })
+    const table = page.items[0]
+    if (!table?.registrationId || table.folder !== folder) {
+      return { resource: null, reason: 'This folder is not currently available in Workspace.' }
+    }
+    return projectedFolderFromResolution(folder, await api.workspaceResource(`dataset:${table.registrationId}`))
+  } catch (caught) {
+    return { resource: null, reason: errorMessage(caught) }
+  }
+}
+
 export function parseWorkspaceDatasetQuery(value: string): CatalogDiscoveryQueryState {
   const params = new URLSearchParams(value)
   const state = emptyCatalogDiscoveryQuery()
@@ -114,6 +157,7 @@ function WorkspaceMixedExplorer() {
   const rememberTables = useStore((s) => s.rememberTables)
   const pushToast = useStore((s) => s.pushToast)
   const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
+  const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
   const [containerId, setContainerId] = useState(LOCAL_ROOT_ID)
   const [container, setContainer] = useState<WorkspaceResource | null>(null)
   const [crumbs, setCrumbs] = useState<WorkspaceResource[]>([])
@@ -323,6 +367,23 @@ function WorkspaceMixedExplorer() {
     } finally { setUndoBusy(false) }
   }
   const undoDestination = undoMove ? canvasDestination(undoMove.previousContainer, 'move') : null
+  const switchToDatasets = () => {
+    // Only a current built-in Catalog projection has a stable counterpart in the Datasets lens.
+    // Local folders and provider mounts intentionally remain in All Workspace rather than being
+    // guessed from their display name.
+    const mappedFolder = container?.catalogFolderState === 'current' && container.catalogFolderPath != null
+      ? container.catalogFolderPath : null
+    if (mappedFolder == null) {
+      switchWorkspaceScope('datasets')
+      return
+    }
+    const next = parseWorkspaceDatasetQuery(workspaceDatasetQuery)
+    next.folder = mappedFolder
+    switchWorkspaceScope('datasets', {
+      resourceId: container?.id ?? null,
+      datasetQuery: serializeWorkspaceDatasetQuery(next),
+    })
+  }
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -334,7 +395,9 @@ function WorkspaceMixedExplorer() {
             {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1"><span>/</span><button onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground">{crumb.name}</button></span>)}
           </nav>
         </div>
-        <WorkspaceScopeTabs active="all" onChange={switchWorkspaceScope} />
+        <WorkspaceScopeTabs active="all" onChange={(next) => {
+          if (next === 'datasets') switchToDatasets()
+        }} />
         <span className="flex-1" />
         <form aria-label="Workspace search" onSubmit={(event) => {
           event.preventDefault()
@@ -368,6 +431,9 @@ function WorkspaceMixedExplorer() {
 
       {!searchQuery && (sources.some((source) => source.kind !== 'local') || completeness === 'partial')
         && <SourceStatusBar sources={sources} completeness={completeness} />}
+      {container?.catalogFolderState === 'current' && !container.detached && <div className="border-b border-border bg-muted/30 px-7 py-1.5 text-[11.5px] text-muted-foreground">
+        Folder organization comes from this catalog. Canvases stored here are local to Data Playground.
+      </div>}
       {resolutionError && <div role="alert" className="flex items-center gap-3 border-b border-amber-300/50 bg-amber-50 px-7 py-2 text-[12px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
         <span className="min-w-0 flex-1 truncate">This selection could not be fully refreshed: {resolutionError}</span>
         <button onClick={reload} disabled={loading} className="shrink-0 font-semibold underline disabled:opacity-50">Retry</button>
@@ -395,7 +461,15 @@ function WorkspaceMixedExplorer() {
 
       {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
-        onOpenTable={setSelectedTable} onFolder={() => pushToast('Dataset folders are not Workspace containers.', 'info')}
+        folderActionLabel="Open in Workspace"
+        folderActionDisabled={container?.catalogFolderState !== 'current' || !!container?.detached}
+        folderActionTitle={container?.catalogFolderState !== 'current' || !!container?.detached
+          ? 'This dataset is not currently available in Workspace.' : undefined}
+        onOpenTable={setSelectedTable} onFolder={() => {
+          if (container?.kind === 'container' && container.catalogFolderState === 'current' && !container.detached) {
+            setWorkspaceResource(container.id)
+          } else pushToast('This dataset is not currently available in Workspace.', 'error')
+        }}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
       {selectedView && <DatasetViewDetail definition={selectedView} onClose={closeDetail} onDeleted={() => {
         setSelectedView(null)
@@ -430,13 +504,16 @@ function WorkspaceMixedExplorer() {
   )
 }
 
-function WorkspaceScopeTabs({ active, onChange }: {
+function WorkspaceScopeTabs({ active, onChange, disabled = false, disabledTitle }: {
   active: 'all' | 'datasets'; onChange: (scope: 'all' | 'datasets') => void
+  disabled?: boolean; disabledTitle?: string
 }) {
   return <div role="tablist" aria-label="Workspace scope" className="flex shrink-0 items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
     {([['all', 'All Workspace'], ['datasets', 'Datasets']] as const).map(([scope, label]) => (
-      <button key={scope} role="tab" aria-selected={active === scope} onClick={() => onChange(scope)}
-        className={`rounded-md px-2.5 py-1 ${active === scope ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
+      <button key={scope} role="tab" aria-selected={active === scope}
+        disabled={scope !== active && disabled} title={scope !== active ? disabledTitle : undefined}
+        onClick={() => onChange(scope)}
+        className={`rounded-md px-2.5 py-1 disabled:cursor-not-allowed disabled:opacity-45 ${active === scope ? 'bg-accent font-semibold text-accent-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
         {label}
       </button>
     ))}
@@ -464,6 +541,14 @@ function WorkspaceDatasets() {
   const [rootContainer, setRootContainer] = useState<WorkspaceResource | null>(null)
   const [destinationError, setDestinationError] = useState<string | null>(null)
   const [destinationRevision, setDestinationRevision] = useState(0)
+  const [folderContext, setFolderContext] = useState<{
+    state: 'ready' | 'resolving' | 'unavailable'
+    reason?: string
+  }>({ state: 'ready' })
+
+  // A failed resolution belongs only to this exact filter/deep-link pair. Selecting another folder
+  // must immediately make its own resolution attempt possible rather than leaving a stale disabled tab.
+  useEffect(() => { setFolderContext({ state: 'ready' }) }, [query.folder, requestedResourceId])
 
   useEffect(() => {
     let cancelled = false
@@ -493,11 +578,39 @@ function WorkspaceDatasets() {
     void refreshFiles()
   }
 
+  const openTableInWorkspace = async (table: CatalogTable) => {
+    if (!table.registrationId) return
+    const context = await resolveProjectedFolder(table.folder ?? '', `dataset:${table.registrationId}`)
+    if (!context.resource) {
+      pushToast(context.reason ?? 'This dataset is not currently available in Workspace.', 'error')
+      return
+    }
+    switchWorkspaceScope('all', { resourceId: context.resource.id })
+  }
+
+  const switchToAll = async () => {
+    if (!query.folder) {
+      switchWorkspaceScope('all')
+      return
+    }
+    setFolderContext({ state: 'resolving' })
+    const context = await resolveProjectedFolder(query.folder, requestedResourceId)
+    if (!context.resource) {
+      setFolderContext({ state: 'unavailable', reason: context.reason })
+      return
+    }
+    setFolderContext({ state: 'ready' })
+    switchWorkspaceScope('all', { resourceId: context.resource.id })
+  }
+
   return <div className="flex h-full min-w-0 flex-col">
     <div className="flex items-center gap-3 border-b border-border px-7 py-2">
       <span className="text-[13px] font-bold text-foreground">Workspace</span>
-      <WorkspaceScopeTabs active="datasets" onChange={switchWorkspaceScope} />
-      <span className="ml-auto text-[11px] text-muted-foreground">Catalog folders are dataset metadata, not Workspace containers.</span>
+      <WorkspaceScopeTabs active="datasets" onChange={(scope) => { if (scope === 'all') void switchToAll() }}
+        disabled={folderContext.state === 'resolving' || (folderContext.state === 'unavailable' && !!query.folder)}
+        disabledTitle={folderContext.state === 'resolving' ? 'Resolving this folder in Workspace…'
+          : folderContext.reason ?? 'This folder is not currently available in Workspace.'} />
+      <span className="ml-auto text-[11px] text-muted-foreground">Open a dataset’s folder in All Workspace to work beside its local Canvases.</span>
     </div>
     <div className="min-h-0 flex-1">
       <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
@@ -509,7 +622,8 @@ function WorkspaceDatasets() {
           else if (table.registrationId) setWorkspaceResource(`dataset:${table.registrationId}`)
           else pushToast('This dataset has no stable Workspace identity', 'error')
         }}
-        onUseTables={useTables} onUploadDataset={uploadDataset} />
+        onUseTables={useTables} onUploadDataset={uploadDataset}
+        onOpenInWorkspace={openTableInWorkspace} />
     </div>
     {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
       destinationError={destinationError} files={files} onClose={() => setDatasetAction(null)}
@@ -818,13 +932,13 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
 
 function ResourceRow({ resource, onOpen, onMove }: { resource: WorkspaceResource; onOpen: () => void; onMove?: () => void }) {
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
-  const kind = resource.kind === 'container' ? (isCatalogFolder(resource) ? 'Catalog folder' : 'Container') : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
+  const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
-    : isCatalogFolder(resource) ? 'Local Catalog projection'
-      : resource.kind === 'dataset' ? 'Local Catalog'
+    : isCatalogFolder(resource) ? 'Catalog organization'
+      : resource.kind === 'dataset' ? 'Catalog'
         : resource.kind === 'dataset_view' ? 'Local exact view'
-        : resource.kind === 'canvas' ? 'Local overlay'
-          : 'Local container'
+        : resource.kind === 'canvas' ? 'Local'
+          : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
   return <div className="flex min-w-0 items-center rounded-lg border border-border bg-card hover:border-primary/40 hover:bg-accent">
     <button type="button" onClick={onOpen} aria-label={openLabel}

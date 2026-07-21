@@ -29,7 +29,7 @@ test.describe('provider Workspace Source acceptance', () => {
     test.setTimeout(60_000)
     await page.goto('/#/workspace')
     const container = page.getByRole('button', {
-      name: new RegExp(`Open container ${containerName} from Source-only mount browser-provider`),
+      name: new RegExp(`Open folder ${containerName} from Source-only mount browser-provider`),
     })
     await expect(container).toBeVisible({ timeout: 20_000 })
     const externalBrowse = page.waitForResponse((response) =>
