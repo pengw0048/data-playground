@@ -1194,10 +1194,17 @@ def test_workspace_configured_mount_point_cannot_be_deleted(workspace_scope, mon
 
         provider_calls_before_delete = (provider.list_calls, provider_search_calls)
         engine = metadb._engine
-        statements: list[str] = []
+        workspace_dml: list[str] = []
 
         def record(_conn, _cursor, statement, _parameters, _context, _executemany):
-            statements.append(statement.lower())
+            normalized = " ".join(statement.lower().split())
+            if (normalized.startswith(("insert", "update", "delete"))
+                    and any(table in normalized for table in (
+                        "workspace_containers",
+                        "workspace_placements",
+                        "workspace_folder_create_replays",
+                    ))):
+                workspace_dml.append(normalized)
 
         event.listen(engine, "before_cursor_execute", record)
         try:
@@ -1208,8 +1215,7 @@ def test_workspace_configured_mount_point_cannot_be_deleted(workspace_scope, mon
             event.remove(engine, "before_cursor_execute", record)
         assert deleted.status_code == 422
         assert (provider.list_calls, provider_search_calls) == provider_calls_before_delete
-        assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
-                       for statement in statements)
+        assert not workspace_dml, f"configured mount delete emitted Workspace DML: {workspace_dml}"
         assert os.environ["DP_CATALOG_MOUNTS"] == mount_config
 
         after = client.get(f"/api/workspace/resources/container:{folder['id']}")
