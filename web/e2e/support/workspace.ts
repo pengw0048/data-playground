@@ -16,7 +16,10 @@ export async function workspaceResource(
   kind: 'canvas' | 'dataset' | 'container' | 'catalog folder',
   name: string,
 ): Promise<Locator> {
-  const resource = page.getByRole('button', { name: `Open ${kind} ${name}`, exact: true })
+  // Catalog-managed folders are one user-facing Folder model in All Workspace. Their authority is
+  // visible in supporting copy, not encoded in a separate accessible resource kind.
+  const resourceKind = kind === 'catalog folder' ? 'folder' : kind
+  const resource = page.getByRole('button', { name: `Open ${resourceKind} ${name}`, exact: true })
   const loadMore = page.getByTestId('workspace-load-more')
   for (let pageIndex = 0; pageIndex < 30; pageIndex++) {
     await expect(resource.or(loadMore).first()).toBeVisible({ timeout: 15_000 })

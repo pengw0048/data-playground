@@ -43,7 +43,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
 
     await page.getByRole('tab', { name: 'All Workspace' }).click()
     const catalogRoot = await workspaceResource(page, 'catalog folder', 'research')
-    await expect(catalogRoot.locator('..')).toContainText('Catalog folder · Local Catalog projection')
+    await expect(catalogRoot.locator('..')).toContainText('Folder · Catalog organization')
     await catalogRoot.click()
     const projectedFolder = await workspaceResource(page, 'catalog folder', `issue-497-${suffix}`)
     await projectedFolder.click()
@@ -52,6 +52,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.reload()
     await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
     await page.getByRole('tab', { name: 'Datasets' }).click()
+    await page.getByRole('button', { name: 'All datasets' }).click()
 
     const uploadedResponse = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upload') && response.request().method() === 'POST')
     await page.locator('input[type="file"]').setInputFiles({
@@ -83,6 +84,26 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page.getByRole('button', { name: `Open dataset ${registeredName}` })).toBeVisible()
     await expect(page.getByRole('button', { name: `Open dataset ${uploaded.name}` })).toBeVisible()
 
+    // A Catalog folder is displayed in both lenses, but the destination is an opaque projected
+    // container resolved from the dataset registration—not a same-named local path.
+    await page.getByRole('button', { name: `Open dataset ${registeredName}` }).click()
+    await page.getByRole('button', { name: /Open in Workspace/ }).click()
+    await expect(page).toHaveURL(/#\/workspace\/container%3A/)
+    await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
+    await expect(page.getByText('Folder organization comes from this catalog. Canvases stored here are local to Data Playground.')).toBeVisible()
+    await page.getByRole('tab', { name: 'Datasets' }).click()
+    const folderQuery = `folder=${encodeURIComponent(registeredFolder)}`
+    await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
+    await page.reload()
+    await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
+    await expect(page.getByRole('button', { name: `Open dataset ${registeredName}` })).toBeVisible()
+    await page.goBack()
+    await expect(page).toHaveURL(/#\/workspace\/container%3A/)
+    await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
+    await page.goForward()
+    await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
+
+    await page.getByRole('button', { name: 'All datasets' }).click()
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()
     await page.getByRole('checkbox', { name: `Select ${uploaded.name}` }).check()
     const selection = page.getByTestId('catalog-selection-bar')

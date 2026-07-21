@@ -1091,7 +1091,11 @@ interface Store {
   setWorkspaceSearchQuery: (query: string) => void
   workspaceScope: 'all' | 'datasets'
   setWorkspaceScope: (scope: 'all' | 'datasets') => void
-  switchWorkspaceScope: (scope: 'all' | 'datasets') => void
+  /** Switch the two Workspace lenses atomically. The optional opaque resource is context, never a path. */
+  switchWorkspaceScope: (scope: 'all' | 'datasets', context?: {
+    resourceId?: string | null
+    datasetQuery?: string
+  }) => void
   workspaceDatasetQuery: string
   setWorkspaceDatasetQuery: (query: string) => void
   jobsQuery: string
@@ -1381,9 +1385,14 @@ export const useStore = create<Store>((set, get) => ({
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceScope, view: 'workspace' })
   },
-  switchWorkspaceScope: (workspaceScope) => {
+  switchWorkspaceScope: (workspaceScope, context) => {
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
-    set({ workspaceScope, workspaceResourceId: null, view: 'workspace' })
+    set({
+      workspaceScope,
+      workspaceResourceId: context?.resourceId ?? null,
+      ...(context?.datasetQuery !== undefined ? { workspaceDatasetQuery: context.datasetQuery } : {}),
+      view: 'workspace',
+    })
   },
   workspaceDatasetQuery: '',
   setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {
