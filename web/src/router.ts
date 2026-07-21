@@ -104,7 +104,7 @@ export function canvasLink(id: string): string {
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; pushToast: (message: string, kind?: 'info' | 'error') => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
+  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => void
 }
 
@@ -134,6 +134,9 @@ export function initRouter(store: RouterStore): void {
     const st = store.getState()
     applying = true  // held across the await so openFile's sets don't trigger the store→hash push
     try {
+      // A reveal belongs to one explicit node= route only. Leaving the Canvas or returning through a
+      // bare Canvas URL invalidates any request that has not yet been consumed by React Flow.
+      if (r.view !== 'canvas' || !r.nodeId) st.clearNodeReveal()
       if (r.view === 'canvas' && r.canvasId) {
         if (st.doc.id !== r.canvasId) {
           const ok = await st.openFile(r.canvasId)  // may be a shared canvas → authorized server-side
@@ -149,6 +152,7 @@ export function initRouter(store: RouterStore): void {
         current.select(nodeExists ? r.nodeId! : null)
         if (nodeExists) current.requestNodeReveal(r.canvasId, r.nodeId!)
         else if (r.nodeId) {
+          current.clearNodeReveal()
           current.pushToast('The requested node is no longer in this Canvas.', 'info')
           history.replaceState(null, '', hashFor(store.getState()))
         }

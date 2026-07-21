@@ -234,6 +234,20 @@ test.describe('Data Playground canvas', () => {
     await expect(offScreen).toHaveClass(/selected/)
     await expect.poll(isInCanvas).toBe(true)
 
+    // The completed request must not survive a Canvas unmount. A later bare Canvas route uses the
+    // user's latest viewport and must not replay the old off-screen center operation.
+    await page.getByRole('button', { name: 'Locate existing node', exact: true }).click()
+    const locator = page.getByRole('dialog', { name: 'Locate an existing node' })
+    await locator.getByRole('textbox', { name: 'Search existing nodes' }).fill('near')
+    await locator.getByRole('textbox', { name: 'Search existing nodes' }).press('Enter')
+    await expect.poll(isInCanvas).toBe(false)
+    await backToWorkspace(page)
+    await (await workspaceResource(page, 'canvas', 'Node deep link')).click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    await expect(offScreen).not.toHaveClass(/selected/)
+    await page.waitForTimeout(500)
+    expect(await isInCanvas()).toBe(false)
+
     await page.goto(`/#/canvas/${canvasId}?node=deleted-node`)
     await expect(page.getByText('The requested node is no longer in this Canvas.')).toBeVisible()
     await expect(page).toHaveURL(new RegExp(`#\\/canvas\\/${canvasId}$`))

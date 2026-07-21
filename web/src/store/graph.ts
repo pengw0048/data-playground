@@ -1009,6 +1009,8 @@ interface Store {
   removeEdge: (id: string) => void
   select: (id: string | null) => void
   requestNodeReveal: (canvasId: string, nodeId: string) => void
+  acknowledgeNodeReveal: (requestId: number) => void
+  clearNodeReveal: () => void
   setSelection: (ids: string[]) => void
   selectAll: () => void
   removeSelected: () => void
@@ -1673,6 +1675,14 @@ export const useStore = create<Store>((set, get) => ({
   requestNodeReveal: (canvasId, nodeId) => set((state) => ({
     nodeRevealRequest: { id: (state.nodeRevealRequest?.id ?? 0) + 1, canvasId, nodeId },
   })),
+
+  // Acknowledge only the request that actually moved the viewport. If a newer route arrived while
+  // React Flow was mounting, the older effect must not erase that replacement request.
+  acknowledgeNodeReveal: (requestId) => set((state) => (
+    state.nodeRevealRequest?.id === requestId ? { nodeRevealRequest: null } : {}
+  )),
+
+  clearNodeReveal: () => set({ nodeRevealRequest: null }),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
 

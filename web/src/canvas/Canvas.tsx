@@ -99,6 +99,7 @@ export function Canvas() {
   const catalog = useStore((s) => s.catalog)
   const selectedIds = useStore((s) => s.selectedIds)
   const nodeRevealRequest = useStore((s) => s.nodeRevealRequest)
+  const acknowledgeNodeReveal = useStore((s) => s.acknowledgeNodeReveal)
   const setNodes = useStore((s) => s.setNodes)
   const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
@@ -192,8 +193,9 @@ export function Canvas() {
     if (!mounted) return
     if (locateNode(doc.nodes, nodeRevealRequest.nodeId, { setCenter, getZoom })) {
       revealedRequestId.current = nodeRevealRequest.id
+      acknowledgeNodeReveal(nodeRevealRequest.id)
     }
-  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, setCenter, getZoom])
+  }, [nodeRevealRequest, doc.id, doc.nodes, rfNodes, setCenter, getZoom, acknowledgeNodeReveal])
 
   // nodes whose config references a column absent from their (known) input — drives the amber wire cue.
   // Keyed by a stable membership string so warnedIds only changes IDENTITY when the set actually changes
