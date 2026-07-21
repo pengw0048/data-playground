@@ -221,4 +221,42 @@ describe('Workspace routes', () => {
     await vi.waitFor(() => expect(state.doc.id).toBe('canvas-b'))
     expect(openFile).toHaveBeenCalledTimes(4)
   })
+
+  it('coalesces one history traversal and removes both listeners plus the store subscription', async () => {
+    const state = {
+      view: 'canvas' as DpView,
+      doc: { id: 'canvas-current', nodes: [] as { id: string }[] }, selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+    }
+    const openFile = vi.fn(async () => false)
+    const unsubscribe = vi.fn()
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: vi.fn(), select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(),
+        pushToast: vi.fn(), openFile,
+      }),
+      subscribe: vi.fn(() => unsubscribe),
+    }
+    const addListener = vi.spyOn(window, 'addEventListener')
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+    history.replaceState(null, '', '#/canvas/canvas-history')
+
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(openFile).toHaveBeenCalledTimes(1))
+
+    const hashListener = addListener.mock.calls.find(([type]) => type === 'hashchange')?.[1]
+    const popListener = addListener.mock.calls.find(([type]) => type === 'popstate')?.[1]
+    resetRouterForTests()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(removeListener).toHaveBeenCalledWith('hashchange', hashListener)
+    expect(removeListener).toHaveBeenCalledWith('popstate', popListener)
+  })
 })
