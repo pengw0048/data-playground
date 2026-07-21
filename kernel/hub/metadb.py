@@ -5807,6 +5807,13 @@ _INBOX_PRODUCER_KINDS = frozenset({
 })
 # Canvas-less durable tasks whose Jobs/Inbox subject is a dataset revision history, not a canvas.
 _DATASET_SCOPED_TASK_KINDS = frozenset({"restore_revision_write", "keyed_upsert_write"})
+# Inbox generic write copy is reserved for Canvas-owned publication tasks. Dataset-scoped restore
+# and upsert outcomes deliberately keep their revision-history subject instead of pretending to be
+# a newly named Canvas output.
+_INBOX_COMPLETED_WRITE_SUMMARY_KINDS = frozenset({
+    "managed_local_write", "external_wait", "linear_checkpoint_write",
+    "bounded_fanout_write", "merge_columns_write",
+})
 # Task kinds that carry their terminal failure code into the Inbox diagnostic allowlist.
 _DIAGNOSTIC_BEARING_TASK_KINDS = frozenset(
     {"merge_columns_write"} | _DATASET_SCOPED_TASK_KINDS)
@@ -6020,9 +6027,49 @@ def _inbox_dataset_contexts(s, task_ids: set[str]) -> dict[str, dict]:
     return contexts
 
 
+def _inbox_completed_write(task: DurableTask | None, item: DurableTaskInboxItem) -> dict | None:
+    """Return only a bounded human output summary, never a receipt or storage identity."""
+    if (task is None or task.task_kind not in _INBOX_COMPLETED_WRITE_SUMMARY_KINDS
+            or item.outcome != "completed" or not task.output_receipt):
+        return None
+    from hub.models import RunStatus, WriteReceipt
+    try:
+        receipt = WriteReceipt.model_validate(json.loads(task.output_receipt))
+        status = RunStatus.model_validate(json.loads(task.status_doc))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    committed = [output for output in status.outputs if output.outcome == "committed"]
+    if len(committed) != 1:
+        return None
+    output = committed[0]
+    # ``table`` is the existing human catalog subject. Reject path-shaped values rather than
+    # turning malformed historical state into a raw URI in the Inbox.
+    name = output.table
+    if (not isinstance(name, str) or not name or "/" in name or "\\" in name
+            or "://" in name or output.rows != receipt.rows
+            or output.write_receipt != receipt):
+        return None
+    return {"output_name": name, "row_count": receipt.rows}
+
+
+def _inbox_completed_writes(s, items: list[DurableTaskInboxItem]) -> dict[str, dict]:
+    """Map only page items to their authorized, sanitized completed Write summaries."""
+    task_ids = {item.task_id for item in items if item.outcome == "completed"}
+    if not task_ids:
+        return {}
+    tasks = s.scalars(select(DurableTask).where(DurableTask.id.in_(task_ids))).all()
+    by_task_id = {task.id: task for task in tasks}
+    return {
+        item.id: summary
+        for item in items
+        if (task := by_task_id.get(item.task_id)) is not None
+        and (summary := _inbox_completed_write(task, item)) is not None
+    }
+
+
 def _inbox_public_doc(
         item: DurableTaskInboxItem, *, authorized_names: dict[str, str],
-        dataset_context: dict | None = None) -> dict:
+        dataset_context: dict | None = None, completed_write: dict | None = None) -> dict:
     """Owner-scoped Inbox wire shape for #417 — no raw docs, tokens, or route URLs."""
     canvas_name = authorized_names.get(item.canvas_id) if item.canvas_id is not None else None
     return {
@@ -6032,10 +6079,9 @@ def _inbox_public_doc(
         "canvas_name": canvas_name,
         "task_kind": item.task_kind,
         "dataset_context": dataset_context,
-        "execution_manifest_sha256": item.execution_manifest_sha256,
-        "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
         "outcome": item.outcome,
         "diagnostic_code": item.diagnostic_code,
+        "completed_write": completed_write,
         "terminal_at": _inbox_stamp(item.terminal_at),
         "read_at": _inbox_stamp(item.read_at),
         "job_available": (
@@ -6133,8 +6179,10 @@ def list_durable_task_inbox_items(
             s, owner_id, {row.canvas_id for row in page if row.canvas_id is not None})
         dataset_contexts = _inbox_dataset_contexts(
             s, {row.task_id for row in page if row.canvas_id is None})
+        completed_writes = _inbox_completed_writes(s, page)
         items = [_inbox_public_doc(row, authorized_names=authorized,
-                                   dataset_context=dataset_contexts.get(row.task_id))
+                                   dataset_context=dataset_contexts.get(row.task_id),
+                                   completed_write=completed_writes.get(row.id))
                  for row in page]
         has_more = len(rows) > limit
         next_cursor = (
@@ -6166,8 +6214,10 @@ def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | Non
             s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
         dataset_context = (_durable_task_dataset_context(s, item.task_id)
                            if item.canvas_id is None else None)
+        completed_write = _inbox_completed_write(s.get(DurableTask, item.task_id), item)
         return _inbox_public_doc(item, authorized_names=authorized,
-                                 dataset_context=dataset_context)
+                                 dataset_context=dataset_context,
+                                 completed_write=completed_write)
 
 
 def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
@@ -6180,8 +6230,10 @@ def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
             s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
         dataset_context = (_durable_task_dataset_context(s, item.task_id)
                            if item.canvas_id is None else None)
+        completed_write = _inbox_completed_write(s.get(DurableTask, item.task_id), item)
         return _inbox_public_doc(item, authorized_names=authorized,
-                                 dataset_context=dataset_context)
+                                 dataset_context=dataset_context,
+                                 completed_write=completed_write)
 
 
 def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> str:

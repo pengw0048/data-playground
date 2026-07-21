@@ -301,6 +301,7 @@ def test_keyed_upsert_task_surfaces_in_jobs_and_inbox_for_owner_only(tmp_path, m
     assert inbox[0].canvas_id is None
     assert inbox[0].dataset_context is not None
     assert inbox[0].dataset_context.dataset_id == base["dataset_id"]
+    assert inbox[0].completed_write is None
 
     # Owner-scoped: a stranger sees neither surface, and a canvas filter excludes the canvas-less row.
     assert [item for item in _jobs("stranger").items if item.run_id == task.task_id] == []

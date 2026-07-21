@@ -717,6 +717,7 @@ export interface InboxItemDto {
   taskKind: InboxTaskKind
   outcome: 'completed' | 'failed' | 'cancelled'
   diagnosticCode?: string | null
+  completedWrite?: { outputName: string; rowCount: number } | null
   terminalAt: string
   readAt?: string | null
   jobAvailable: boolean
