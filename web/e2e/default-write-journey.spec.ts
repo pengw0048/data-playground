@@ -105,6 +105,25 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     expect(dataset?.revisionId, 'Jobs surfaces the managed revision id').toBeTruthy()
     // The inspector receipt names the same durable revision the Jobs surface published.
     await expect(receipt).toContainText(dataset!.revisionId)
+
+    // Run History must mirror the same immutable admission as the durable Task; it must not label
+    // this current managed write as a pre-manifest legacy run.
+    const historyRows = await ok<Array<{ runId?: string; inputManifest?: unknown }>>(
+      await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}/runs`),
+      'read mirrored run history',
+    )
+    const historyRow = historyRows.find((item) => item.runId === runId)
+    expect(historyRow?.inputManifest).toEqual(expect.arrayContaining([
+      expect.objectContaining({ node_id: 'source' }),
+    ]))
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Run history', { exact: true }).click()
+    const historyDialog = page.getByRole('dialog').filter({
+      has: page.getByRole('heading', { name: 'Run history' }),
+    })
+    await historyDialog.getByRole('button', { name: /Admitted inputs/ }).click()
+    await expect(historyDialog.getByText('ordered exact bindings')).toBeVisible()
+    await historyDialog.getByRole('button', { name: 'Close' }).click()
     await shoot(page, 'light', 'canvas')
 
     // 5. Jobs evidence: the durable task and its output receipt are visible in the shipped Jobs surface.

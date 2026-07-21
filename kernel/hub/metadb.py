@@ -5601,6 +5601,13 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
 
 _RUN_HISTORY_MAX = 500  # per-canvas run_records cap — bound the local DB (older history is pruned)
 _RUN_RECORD_OUTPUTS_MAX_BYTES = 1_048_576
+
+
+class _RunHistoryInputManifestUnset:
+    """Distinguish an ordinary RunInputAdmission lookup from an explicit null manifest."""
+
+
+_RUN_HISTORY_INPUT_MANIFEST_UNSET = _RunHistoryInputManifestUnset()
 _RUN_INPUT_MANIFEST_MAX_BYTES = 262_144
 _DURABLE_TASK_DOC_MAX_BYTES = 4 * 1_048_576
 _DURABLE_TASK_LEASE_SECONDS = 15
@@ -6951,6 +6958,9 @@ def _mirror_durable_managed_write_history(
     against this history row (list_workspace_runs), so it stays a single Jobs entry."""
     if task.task_kind != "managed_local_write":
         return
+    # Managed writes do not create a RunInputAdmission row.  Their immutable execution manifest is
+    # the canonical admission, including the meaningful distinction between [] and legacy null.
+    admission = _durable_task_admission(s, task)
     _upsert_run_record(
         s, canvas_id=task.canvas_id, target_node_id=target_node_id or task.target_node_id,
         target_port_id=target_port_id, job_type=job_type or "run", status="done",
@@ -6959,6 +6969,7 @@ def _mirror_durable_managed_write_history(
         per_node=per_node, profile=profile,
         run_id=task.id, request_id=None,
         execution_manifest_sha256=task.execution_manifest_sha256, execution_manifest_doc=None,
+        input_manifest=admission["input_manifest"],
     )
 
 
@@ -9020,12 +9031,20 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
                        run_id: str | None = None,
                        request_id: str | None = None,
                        execution_manifest_sha256: str | None = None,
-                       execution_manifest_doc: str | None = None) -> bool:
+                       execution_manifest_doc: str | None = None,
+                       input_manifest: (
+                           list[dict[str, str]] | None | _RunHistoryInputManifestUnset
+                       ) = _RUN_HISTORY_INPUT_MANIFEST_UNSET) -> bool:
     """Session-scoped history upsert shared by normal completion and backend publication."""
     if not canvas_id:
         return False
     from hub.models import RunHistoryRecord
     # One model owns the complete public history invariant before any row/ref/local-owner mutation.
+    admission = s.get(RunInputAdmission, str(run_id)) if run_id else None
+    resolved_input_manifest = (
+        json.loads(admission.manifest) if admission is not None
+        else None
+    ) if input_manifest is _RUN_HISTORY_INPUT_MANIFEST_UNSET else input_manifest
     history = RunHistoryRecord.model_validate({
         "id": "validation",
         "run_id": run_id,
@@ -9037,6 +9056,7 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         "rows": rows,
         "ms": ms,
         "error": error,
+        "input_manifest": resolved_input_manifest,
         "outputs": outputs if outputs is not None else [],
         "profile": profile,
         "per_node": per_node,
@@ -9062,8 +9082,13 @@ def _upsert_run_record(s, *, canvas_id: str | None, target_node_id: str | None,
         history.target_node_id, history.target_port_id,
         history.job_type, history.status)
     rec.rows, rec.ms, rec.error = history.rows, history.ms, history.error
-    admission = s.get(RunInputAdmission, str(run_id)) if run_id else None
-    rec.input_manifest = admission.manifest if admission is not None else None
+    if input_manifest is _RUN_HISTORY_INPUT_MANIFEST_UNSET:
+        rec.input_manifest = admission.manifest if admission is not None else None
+    else:
+        rec.input_manifest = (
+            json.dumps(history.input_manifest, separators=(",", ":"))
+            if history.input_manifest is not None else None
+        )
     state = s.get(RunState, str(run_id)) if run_id else None
     owner_manifest_sha256s = {
         identity for identity in (
@@ -9372,7 +9397,8 @@ def list_runs(canvas_id: str, limit: int = 50) -> list[dict]:
                    "targetPortId": r.target_port_id, "jobType": r.job_type,
                    "rows": r.rows, "ms": r.ms, "error": r.error,
                    "outputs": json.loads(r.outputs),
-                   "inputManifest": json.loads(r.input_manifest) if r.input_manifest else None,
+                   "inputManifest": (
+                       json.loads(r.input_manifest) if r.input_manifest is not None else None),
                    "executionManifestSha256": r.execution_manifest_sha256,
                    "profile": json.loads(r.profile) if r.profile else None,
                    "perNode": json.loads(r.per_node) if r.per_node else None,
@@ -9444,7 +9470,7 @@ def _workspace_run_doc(row, *, canvas_name: str, state_doc: dict | None,
     """Normalize terminal history and live state without inventing another lifecycle."""
     if source == "history":
         outputs = json.loads(row.outputs)
-        input_manifest = json.loads(row.input_manifest) if row.input_manifest else None
+        input_manifest = json.loads(row.input_manifest) if row.input_manifest is not None else None
         profile = json.loads(row.profile) if row.profile else None
         per_node = json.loads(row.per_node) if row.per_node else None
         placement = str((state_doc or {}).get("placement") or ("distributed" if backend else "local"))
