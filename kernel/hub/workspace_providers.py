@@ -112,6 +112,12 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
     return mounts, invalid
 
 
+def is_configured_mount_container(container_id: str) -> bool:
+    """Whether operator configuration reserves this local Folder as a provider mount point."""
+    mounts, _invalid = _configured_mounts()
+    return any(mounted.container_id == container_id for mounted in mounts)
+
+
 @functools.lru_cache(maxsize=64)
 def _provider_factory(name: str) -> Callable[[], object]:
     entry = next((item for item in entry_points(group="dataplay.catalog_providers")
@@ -648,6 +654,14 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
         if next_state is not None else None
     )
     partial = any(status["completeness"] in _ERROR_STATES for status in statuses)
+    if local_mounts:
+        container = {
+            **container,
+            "canDeleteFolder": False,
+            "folderMutationUnavailableReason": (
+                "This Folder is configured as a provider mount point and cannot be deleted."
+            ),
+        }
     return {
         "container": container,
         "items": items,

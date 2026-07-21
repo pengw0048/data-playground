@@ -964,6 +964,8 @@ def delete_workspace_folder(container_id: str, body: WorkspaceDeleteFolderBody,
     """Delete only an empty local Folder; this endpoint never reparents children or placements."""
     del uid  # Local Folder authority is installation-local; request authentication is the guard.
     try:
+        if workspace_providers.is_configured_mount_container(container_id):
+            raise ValueError("a configured provider mount point cannot be deleted")
         return metadb.workspace_delete_folder_action(
             container_id=container_id, expected_version=body.expected_version)
     except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:

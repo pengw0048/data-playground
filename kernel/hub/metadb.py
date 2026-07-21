@@ -3167,6 +3167,7 @@ def workspace_create_folder_action(*, uid: str, parent_id: str,
         if replay is not None:
             return replay
         parent = _workspace_container_at_version(s, str(parent_id), expected_parent_version)
+        _workspace_writable_destination_locked(s, parent.id)
         if _workspace_external_overlay_anchor_for_container(s, parent.id) is not None:
             raise ValueError("a provider location does not support local Folder changes")
         if s.scalar(select(WorkspaceContainer.id).where(
@@ -5009,6 +5010,23 @@ def _workspace_after(ordinal_column, name_column, id_column, rank: int, cursor):
     )
 
 
+def _workspace_has_detached_catalog_ancestor(s, row: WorkspaceContainer) -> bool:
+    """Whether this local Folder is inside a Catalog tombstone recovery area."""
+    current_id = row.parent_id
+    visited: set[str] = {row.id}
+    while current_id is not None:
+        if current_id in visited:
+            raise RuntimeError("Workspace container hierarchy contains a cycle")
+        visited.add(current_id)
+        current = s.get(WorkspaceContainer, current_id)
+        if current is None:
+            raise RuntimeError("Workspace container parent is missing")
+        if current.catalog_folder_state == "detached":
+            return True
+        current_id = current.parent_id
+    return False
+
+
 def _workspace_folder_capabilities(s, row: WorkspaceContainer) -> dict:
     """Report only mutation authority that the local Workspace can actually exercise."""
     if _workspace_external_overlay_anchor_for_container(s, row.id) is not None:
@@ -5035,6 +5053,19 @@ def _workspace_folder_capabilities(s, row: WorkspaceContainer) -> dict:
         WorkspaceContainer.parent_id == row.id).limit(1)) is not None
     has_placements = s.scalar(select(WorkspacePlacement.id).where(
         WorkspacePlacement.container_id == row.id).limit(1)) is not None
+    if _workspace_has_detached_catalog_ancestor(s, row):
+        can_delete = not has_children and not has_placements
+        return {
+            "canCreateFolder": False,
+            "canRenameFolder": False,
+            "canDeleteFolder": can_delete,
+            "folderMutationUnavailableReason": (
+                "This Folder is below a detached Catalog folder; only empty local Folder "
+                "recovery cleanup is available."
+                if can_delete else
+                "This Folder is below a detached Catalog folder and is not empty."
+            ),
+        }
     return {
         "canCreateFolder": True,
         "canRenameFolder": True,
