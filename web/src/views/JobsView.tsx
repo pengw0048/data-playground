@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, type CanvasFile, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
+import { api, type CanvasFile, type DatasetTaskKind, type WorkspaceJobDto, type WorkspaceJobsQuery } from '../api/client'
 import type { DatasetRevisionDetail, WriteReceipt } from '../types/api'
 import { routeHash } from '../router'
 import { useStore } from '../store/graph'
@@ -48,6 +48,11 @@ const updateLabel = (updatedAt: string | null | undefined) => (
   updatedAt ? new Date(updatedAt).toLocaleString() : 'Unavailable'
 )
 const refreshLabel = (refreshedAt: number) => new Date(refreshedAt).toLocaleTimeString()
+
+const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
+  restore_revision_write: 'Dataset restore',
+  keyed_upsert_write: 'Keyed upsert',
+}
 
 function jobPhase(item: WorkspaceJobDto): string | null {
   if (item.mergeColumns) return `Column merge · ${readable(item.mergeColumns.phase)}`
@@ -366,14 +371,17 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const rows = item.rows ?? item.profile?.rowCount ?? null
   const phase = jobPhase(item)
   const report = item.distributionReport
+  const dataset = item.datasetContext
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
-  const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}` : item.canvasName || 'Unavailable canvas'
+  const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
+    : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
+    : item.canvasName || 'Unavailable canvas'
   return <article className="border-b border-border last:border-b-0">
     <button type="button" onClick={onSelect} aria-expanded={expanded}
       aria-label={`Open run ${item.runId ?? item.id} in ${subject}`}
       className="grid w-full grid-cols-[108px_minmax(170px,1fr)_minmax(150px,1fr)_110px_120px_105px] gap-3 px-3 py-2.5 text-left text-[12px] hover:bg-muted/35">
       <span className="flex flex-wrap items-center gap-1.5"><span style={{ color: token.color }}>{token.glyph}</span><Badge variant="secondary" className="capitalize">{item.status}</Badge>{item.progress != null && <span className="text-[10.5px] text-muted-foreground">{progressLabel(item.progress)}</span>}</span>
-      <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{subject}</span><span className="block truncate text-muted-foreground">{report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report' : item.nodeLabel || item.targetNodeId || 'Whole canvas'}</span></span>
+      <span className="min-w-0"><span className="block truncate font-semibold text-foreground">{subject}</span><span className="block truncate text-muted-foreground">{report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report' : dataset ? `Dataset ${dataset.datasetId}` : item.nodeLabel || item.targetNodeId || 'Whole canvas'}</span></span>
       <span className="min-w-0"><span className="block truncate font-mono text-[10.5px] text-muted-foreground" title={item.attempt}>{item.attempt}</span><span>{report ? report.measuredRows == null ? 'Report pending' : `${report.measuredRows.toLocaleString()} measured rows` : committed.length ? `${committed.length} retained output${committed.length === 1 ? '' : 's'}` : rows != null ? `${rows.toLocaleString()} rows` : 'No retained output'}</span></span>
       <span className="truncate text-muted-foreground" title={item.backend}>{item.backend}</span>
       <span className="text-muted-foreground">{item.ms != null ? fmtMs(item.ms) : 'In progress'}{rows != null && <span className="block">{rows.toLocaleString()} rows</span>}</span>
@@ -385,6 +393,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
+        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}

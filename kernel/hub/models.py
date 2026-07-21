@@ -1674,16 +1674,26 @@ class RestoreRevisionTaskV1(Wire):
     receipt: WriteReceipt | None = None
 
 
+class DurableTaskDatasetContextView(Wire):
+    """Dataset revision-history subject for a canvas-less durable Task in Jobs / Inbox."""
+
+    task_kind: Literal["restore_revision_write", "keyed_upsert_write"]
+    dataset_id: str = Field(min_length=1, max_length=128)
+    name: str | None = None
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
     id: str
     task_id: str
-    canvas_id: str
+    canvas_id: str | None = None
     canvas_name: str | None = None
+    dataset_context: DurableTaskDatasetContextView | None = None
     task_kind: Literal[
         "managed_local_write", "external_wait", "linear_checkpoint_write",
         "bounded_fanout_write", "merge_columns_write",
+        "restore_revision_write", "keyed_upsert_write",
     ]
     execution_manifest_sha256: PlanDigest | None = None
     execution_manifest_reconstructable: bool = False
@@ -1698,7 +1708,18 @@ class DurableTaskInboxItemView(Wire):
         if self.execution_manifest_reconstructable != (
                 self.execution_manifest_sha256 is not None):
             raise ValueError("Inbox reconstructability must match its manifest identity")
+        if self.dataset_context is not None and self.canvas_id is not None:
+            raise ValueError("a canvas-less dataset Inbox item cannot also carry a canvas")
         return self
+
+    @model_serializer(mode="wrap")
+    def _omit_null_dataset_context(self, handler):
+        # Canvas-scoped items stay byte-identical: the dataset subject is present only for the
+        # canvas-less restore/upsert kinds.
+        data = handler(self)
+        if self.dataset_context is None:
+            data.pop("datasetContext", None)
+        return data
 
 
 class DurableTaskInboxPage(Wire):
@@ -1755,6 +1776,7 @@ class WorkspaceRunRecord(Wire):
     bounded_fanout: DurableBoundedFanoutView | None = None
     merge_columns: DurableMergeColumnsView | None = None
     distribution_report: DurableDistributionReportView | None = None
+    dataset_context: DurableTaskDatasetContextView | None = None
 
     @model_validator(mode="after")
     def _unique_workspace_outputs(self) -> "WorkspaceRunRecord":
@@ -1781,6 +1803,8 @@ class WorkspaceRunRecord(Wire):
                 raise ValueError("distribution report Jobs rows require their report projection only")
         elif self.distribution_report is not None:
             raise ValueError("ordinary Jobs rows cannot carry a distribution report projection")
+        if self.dataset_context is not None and self.canvas_id is not None:
+            raise ValueError("a dataset-scoped Jobs row cannot also carry a canvas")
         return self
 
     @model_serializer(mode="wrap")
@@ -1795,6 +1819,8 @@ class WorkspaceRunRecord(Wire):
             data.pop("mergeColumns", None)
         if self.distribution_report is None:
             data.pop("distributionReport", None)
+        if self.dataset_context is None:
+            data.pop("datasetContext", None)
         return data
 
 

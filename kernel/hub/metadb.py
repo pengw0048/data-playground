@@ -688,13 +688,16 @@ class DurableTaskInboxItem(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'distribution_report')",
+            "'distribution_report','restore_revision_write','keyed_upsert_write')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
             "AND dataset_view_id IS NOT NULL) OR "
-            "(task_kind <> 'distribution_report' AND canvas_id IS NOT NULL "
-            "AND dataset_view_id IS NULL)",
+            "(task_kind IN ('restore_revision_write','keyed_upsert_write') "
+            "AND canvas_id IS NULL AND dataset_view_id IS NULL) OR "
+            "(task_kind NOT IN "
+            "('distribution_report','restore_revision_write','keyed_upsert_write') "
+            "AND canvas_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_inbox_subject"),
         CheckConstraint(
             "outcome IN ('completed','failed','cancelled')",
@@ -5610,7 +5613,13 @@ _JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write", "distribution_report",
+    "restore_revision_write", "keyed_upsert_write",
 })
+# Canvas-less durable tasks whose Jobs/Inbox subject is a dataset revision history, not a canvas.
+_DATASET_SCOPED_TASK_KINDS = frozenset({"restore_revision_write", "keyed_upsert_write"})
+# Task kinds that carry their terminal failure code into the Inbox diagnostic allowlist.
+_DIAGNOSTIC_BEARING_TASK_KINDS = frozenset(
+    {"merge_columns_write"} | _DATASET_SCOPED_TASK_KINDS)
 _INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
@@ -5657,6 +5666,16 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "distribution_report_revision_unavailable",
         "distribution_report_deadline",
     }),
+    "restore_revision_write": frozenset({
+        "durable_task_attempts_exhausted",
+        "stale_expected_head",
+        "revision_unavailable",
+    }),
+    "keyed_upsert_write": frozenset({
+        "durable_task_attempts_exhausted",
+        "stale_expected_head",
+        "revision_unavailable",
+    }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
     "managed_local_write": "managed_local_write_failed",
@@ -5665,6 +5684,8 @@ _INBOX_DIAGNOSTIC_FALLBACK = {
     "bounded_fanout_write": "bounded_fanout_write_failed",
     "merge_columns_write": "merge_columns_write_failed",
     "distribution_report": "distribution_report_failed",
+    "restore_revision_write": "restore_write_failed",
+    "keyed_upsert_write": "keyed_upsert_write_failed",
 }
 
 
@@ -5760,8 +5781,58 @@ def _inbox_authorized_canvas_names(s, uid: str, canvas_ids: set[str]) -> dict[st
     return authorized
 
 
+def _dataset_context_from_write_intent(task_kind: str, write_intent: str | None) -> dict | None:
+    """Frozen dataset subject (logical id + admission name) for a canvas-less durable Task.
+
+    The logical dataset id is what the revision APIs and the workspace ``dataset:`` deep-link accept;
+    the name is captured at admission so a later rename or unregister cannot leak current catalog state.
+    """
+    if task_kind not in _DATASET_SCOPED_TASK_KINDS or not write_intent:
+        return None
+    try:
+        destination = json.loads(write_intent).get("destination") or {}
+    except (TypeError, ValueError):
+        return None
+    dataset_id = destination.get("datasetId")
+    if not isinstance(dataset_id, str) or not dataset_id:
+        return None
+    name = destination.get("name")
+    return {
+        "task_kind": task_kind,
+        "dataset_id": dataset_id,
+        "name": name if isinstance(name, str) and name else None,
+    }
+
+
+def _durable_task_dataset_context(s, task_id: str) -> dict | None:
+    """Frozen dataset subject for one canvas-less dataset-scoped durable Task, or ``None``."""
+    task = s.get(DurableTask, str(task_id))
+    if task is None:
+        return None
+    return _dataset_context_from_write_intent(task.task_kind, task.write_intent)
+
+
+def _inbox_dataset_contexts(s, task_ids: set[str]) -> dict[str, dict]:
+    """Map dataset-scoped Inbox task ids to their frozen dataset subject in one query."""
+    if not task_ids:
+        return {}
+    rows = s.execute(select(
+        DurableTask.id, DurableTask.task_kind, DurableTask.write_intent,
+    ).where(
+        DurableTask.id.in_(task_ids),
+        DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
+    )).all()
+    contexts: dict[str, dict] = {}
+    for task_id, task_kind, write_intent in rows:
+        context = _dataset_context_from_write_intent(task_kind, write_intent)
+        if context is not None:
+            contexts[task_id] = context
+    return contexts
+
+
 def _inbox_public_doc(
-        item: DurableTaskInboxItem, *, authorized_names: dict[str, str]) -> dict:
+        item: DurableTaskInboxItem, *, authorized_names: dict[str, str],
+        dataset_context: dict | None = None) -> dict:
     """Owner-scoped Inbox wire shape for #417 — no raw docs, tokens, or route URLs."""
     canvas_name = authorized_names.get(item.canvas_id) if item.canvas_id is not None else None
     return {
@@ -5770,6 +5841,7 @@ def _inbox_public_doc(
         "canvas_id": item.canvas_id,
         "canvas_name": canvas_name,
         "task_kind": item.task_kind,
+        "dataset_context": dataset_context,
         "execution_manifest_sha256": item.execution_manifest_sha256,
         "execution_manifest_reconstructable": item.execution_manifest_sha256 is not None,
         "outcome": item.outcome,
@@ -5777,7 +5849,8 @@ def _inbox_public_doc(
         "terminal_at": _inbox_stamp(item.terminal_at),
         "read_at": _inbox_stamp(item.read_at),
         "job_available": (
-            canvas_name is not None and item.task_kind not in _JOBS_HIDDEN_TASK_KINDS),
+            (canvas_name is not None or dataset_context is not None)
+            and item.task_kind not in _JOBS_HIDDEN_TASK_KINDS),
     }
 
 
@@ -5868,7 +5941,11 @@ def list_durable_task_inbox_items(
         page = rows[:limit]
         authorized = _inbox_authorized_canvas_names(
             s, owner_id, {row.canvas_id for row in page if row.canvas_id is not None})
-        items = [_inbox_public_doc(row, authorized_names=authorized) for row in page]
+        dataset_contexts = _inbox_dataset_contexts(
+            s, {row.task_id for row in page if row.canvas_id is None})
+        items = [_inbox_public_doc(row, authorized_names=authorized,
+                                   dataset_context=dataset_contexts.get(row.task_id))
+                 for row in page]
         has_more = len(rows) > limit
         next_cursor = (
             _inbox_cursor_encode(filter_name, page[-1].terminal_at, page[-1].id)
@@ -5897,7 +5974,10 @@ def mark_durable_task_inbox_item_read(owner_id: str, item_id: str) -> dict | Non
             item.read_at = _durable_task_db_now(s)
         authorized = _inbox_authorized_canvas_names(
             s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
-        return _inbox_public_doc(item, authorized_names=authorized)
+        dataset_context = (_durable_task_dataset_context(s, item.task_id)
+                           if item.canvas_id is None else None)
+        return _inbox_public_doc(item, authorized_names=authorized,
+                                 dataset_context=dataset_context)
 
 
 def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
@@ -5908,7 +5988,10 @@ def durable_task_inbox_item(owner_id: str, item_id: str) -> dict | None:
             return None
         authorized = _inbox_authorized_canvas_names(
             s, owner_id, {item.canvas_id} if item.canvas_id is not None else set())
-        return _inbox_public_doc(item, authorized_names=authorized)
+        dataset_context = (_durable_task_dataset_context(s, item.task_id)
+                           if item.canvas_id is None else None)
+        return _inbox_public_doc(item, authorized_names=authorized,
+                                 dataset_context=dataset_context)
 
 
 def durable_task_submission_id(uid: str, canvas_id: str, submission_id: str) -> str:
@@ -7197,7 +7280,8 @@ def finish_durable_task_attempt(
         _terminalize_hidden_task_envelope(s, task, now)
         _emit_durable_task_inbox_item(
             s, task=task, attempt=attempt, task_status=status.status,
-            diagnostic_code=(status.error if task.task_kind == "merge_columns_write" else None),
+            diagnostic_code=(status.error if task.task_kind in _DIAGNOSTIC_BEARING_TASK_KINDS
+                             else None),
             now=now)
         return True
 
@@ -10206,6 +10290,99 @@ def list_workspace_runs(
                             coverage.reported_column_count if coverage is not None else None),
                         "deepLink": f"/distribution-reports/{envelope.report_id}",
                     },
+                }))
+
+        # Restore-revision and keyed-upsert Tasks are canvas-less and owner-scoped: their subject is a
+        # dataset's revision history, not a canvas. Project them through their own owner-scoped query so
+        # the Canvas authorization join never fabricates a canvas for them.
+        if not canvas_id and not node_id and (backend is None or backend == "local"):
+            dataset_task_identity = literal("t:") + DurableTask.id
+            dataset_task_predicates = [
+                DurableTask.owner_id == str(uid),
+                DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
+            ]
+            if run_id:
+                dataset_task_predicates.append(DurableTask.id == run_id)
+            if status:
+                dataset_task_predicates.append(DurableTask.status == status)
+            if recorded_after:
+                dataset_task_predicates.append(DurableTask.created_at >= recorded_after)
+            if recorded_before:
+                dataset_task_predicates.append(DurableTask.created_at <= recorded_before)
+            if normalized_text:
+                literal_text = normalized_text.replace(
+                    "\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                pattern = f"%{literal_text}%"
+                dataset_task_predicates.append(or_(
+                    func.lower(DurableTask.id).like(pattern, escape="\\"),
+                    func.lower(DurableTask.target_node_id).like(pattern, escape="\\"),
+                    func.lower(func.coalesce(DurableTask.error, "")).like(pattern, escape="\\"),
+                    func.lower(func.coalesce(DurableTask.write_intent, "")).like(
+                        pattern, escape="\\"),
+                ))
+            if decoded:
+                stamp, identity = decoded
+                dataset_task_predicates.append(or_(
+                    DurableTask.created_at < stamp,
+                    and_(DurableTask.created_at == stamp, dataset_task_identity < identity),
+                ))
+            dataset_task_rows = list(s.scalars(select(DurableTask).where(
+                *dataset_task_predicates).order_by(
+                DurableTask.created_at.desc(), DurableTask.id.desc()).limit(fetch_limit)))
+            for task in dataset_task_rows:
+                task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
+                status_doc = task_doc["status_doc"]
+                created_at = task.created_at or _now()
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+                attempts = task_doc["attempts"]
+                latest = attempts[-1] if attempts else {
+                    "id": "missing", "attempt_number": task.retry_count + 1,
+                    "status": "failed", "progress": None, "error": task.error,
+                    "started_at": None, "completed_at": task.completed_at,
+                    "updated_at": task.updated_at,
+                }
+                can_retry = (task.status in ("failed", "cancelled")
+                             and latest["attempt_number"] < task.max_attempts
+                             and task.error != "stale_expected_head")
+                can_cancel = task.status in ("queued", "running")
+                dataset_context = _dataset_context_from_write_intent(
+                    task.task_kind, task.write_intent)
+                candidates.append(((created_at, f"t:{task.id}"), {
+                    "id": f"t:{task.id}", "runId": task.id, "requestId": None,
+                    "jobType": "run", "status": task.status,
+                    "targetNodeId": task.target_node_id, "targetPortId": None,
+                    "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
+                    "progress": _workspace_progress(task.progress),
+                    "error": task.error, "inputManifest": task_doc["input_manifest"],
+                    "executionManifestSha256": None,
+                    "executionManifestReconstructable": False,
+                    "outputs": [], "profile": None, "perNode": None,
+                    "createdAt": created_at.isoformat(),
+                    "updatedAt": _workspace_utc_iso(task.updated_at),
+                    "canvasId": None, "canvasName": None,
+                    "nodeLabel": (dataset_context or {}).get("name"),
+                    "backend": "local", "placement": "local",
+                    "attempt": latest["id"], "taskId": task.id,
+                    "taskAttempts": [{
+                        "id": item["id"], "attemptNumber": item["attempt_number"],
+                        "executionManifestSha256": None,
+                        "executionManifestReconstructable": False,
+                        "status": item["status"],
+                        "progress": _workspace_progress(item["progress"]),
+                        "error": item["error"],
+                        "startedAt": item["started_at"].isoformat()
+                        if item["started_at"] else None,
+                        "completedAt": item["completed_at"].isoformat()
+                        if item["completed_at"] else None,
+                        "updatedAt": _workspace_utc_iso(item["updated_at"]),
+                    } for item in attempts],
+                    "cancelRequested": task.cancel_requested,
+                    "canRetry": can_retry, "canCancel": can_cancel,
+                    "writeIntent": task_doc["write_intent"],
+                    "outputReceipt": task_doc["output_receipt"],
+                    "externalWait": None,
+                    "datasetContext": dataset_context,
                 }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]

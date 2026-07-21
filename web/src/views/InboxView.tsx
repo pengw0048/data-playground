@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, type InboxItemDto, type InboxTaskKind } from '../api/client'
+import { routeHash } from '../router'
 import { useStore } from '../store/graph'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
@@ -23,6 +24,8 @@ const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
   external_wait: 'External wait',
   linear_checkpoint_write: 'Checkpointed write',
   bounded_fanout_write: 'Bounded fan-out write',
+  restore_revision_write: 'Dataset restore',
+  keyed_upsert_write: 'Keyed upsert',
 }
 
 export function kindLabel(kind: InboxItemDto['taskKind'] | string): string {
@@ -217,11 +220,14 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                       <span className="text-[11px] text-muted-foreground">{kindLabel(item.taskKind)}</span>
                     </div>
                     <div className="mt-1 text-[13px] font-medium text-foreground">
-                      {item.canvasName ?? 'Canvas unavailable'}
+                      {item.datasetContext
+                        ? (item.datasetContext.name || item.datasetContext.datasetId)
+                        : item.canvasName ?? 'Canvas unavailable'}
                     </div>
                     <div className="mt-0.5 text-[11.5px] text-muted-foreground">
                       {relTime(item.terminalAt)}
-                      {item.canvasName == null && ' · authorization revoked or canvas missing'}
+                      {item.datasetContext && ` · Dataset ${item.datasetContext.datasetId}`}
+                      {item.canvasName == null && !item.datasetContext && ' · authorization revoked or canvas missing'}
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -233,6 +239,18 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                         onClick={() => void markRead(item)}
                       >
                         Mark read
+                      </Button>
+                    )}
+                    {item.datasetContext && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        asChild
+                      >
+                        <a href={routeHash('workspace', undefined, `dataset:${item.datasetContext.datasetId}`)}
+                           onClick={() => void markRead(item)}>
+                          Revision history
+                        </a>
                       </Button>
                     )}
                     <Button

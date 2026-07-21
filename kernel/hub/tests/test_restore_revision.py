@@ -10,8 +10,16 @@ import pytest
 from hub import metadb, restore_revision_tasks
 from hub.api_errors import APIError
 from hub.deps import Deps
-from hub.models import RestoreRevisionRequestV1
+from hub.models import DurableTaskInboxPage, RestoreRevisionRequestV1, WorkspaceRunPage
 from hub.routers import restore_revision as api
+
+
+def _jobs(uid: str, **kwargs) -> WorkspaceRunPage:
+    return WorkspaceRunPage.model_validate(metadb.list_workspace_runs(uid, **kwargs))
+
+
+def _inbox(uid: str) -> DurableTaskInboxPage:
+    return DurableTaskInboxPage.model_validate(metadb.list_durable_task_inbox_items(uid, limit=200))
 
 
 @pytest.fixture(autouse=True)
@@ -159,3 +167,46 @@ def test_status_is_owner_scoped_and_never_echoes_the_task_id(tmp_path, monkeypat
     with pytest.raises(APIError) as caught:
         api.status(task.task_id, "intruder")
     assert caught.value.status_code == 404 and task.task_id not in str(caught.value.detail)
+
+
+def test_restore_task_surfaces_in_jobs_and_inbox_for_owner_only(tmp_path, monkeypatch):
+    deps, dataset_id, old_revision, head_revision = _dataset(tmp_path, monkeypatch)
+    with metadb.session() as session:
+        session.add(metadb.User(id="stranger", name="Stranger"))
+    task = api.submit(dataset_id, old_revision,
+                      RestoreRevisionRequestV1(submission_id="s1", expected_head_revision_id=head_revision),
+                      "owner")
+
+    # Running: one canvas-less Jobs row with a dataset subject; no Inbox item yet.
+    queued = [item for item in _jobs("owner").items if item.run_id == task.task_id]
+    assert len(queued) == 1
+    row = queued[0]
+    assert row.status == "queued" and row.canvas_id is None and row.can_cancel is True
+    assert row.dataset_context is not None
+    assert row.dataset_context.task_kind == "restore_revision_write"
+    assert row.dataset_context.dataset_id == dataset_id
+    # The dataset id resolves the workspace deep-link / revision-history binding.
+    assert metadb.catalog_revision_binding(row.dataset_context.dataset_id) is not None
+    assert _inbox("owner").items == []
+
+    _run(deps, task.task_id)
+
+    # Terminal: still exactly one Jobs row (no RunRecord history twin), now done with a receipt.
+    done = [item for item in _jobs("owner").items if item.run_id == task.task_id]
+    assert len(done) == 1
+    assert done[0].status == "done" and done[0].output_receipt is not None
+    assert done[0].can_cancel is False
+
+    # One Inbox completion item, dataset-scoped and job-linkable.
+    inbox = [item for item in _inbox("owner").items if item.task_id == task.task_id]
+    assert len(inbox) == 1
+    assert inbox[0].outcome == "completed" and inbox[0].job_available is True
+    assert inbox[0].canvas_id is None
+    assert inbox[0].dataset_context is not None
+    assert inbox[0].dataset_context.dataset_id == dataset_id
+
+    # Owner-scoped: a stranger sees neither surface, and a canvas filter excludes the canvas-less row.
+    assert [item for item in _jobs("stranger").items if item.run_id == task.task_id] == []
+    assert _inbox("stranger").items == []
+    assert [item for item in _jobs("owner", canvas_id=dataset_id).items
+            if item.run_id == task.task_id] == []

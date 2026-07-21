@@ -4295,12 +4295,55 @@
         "title": "DurableTaskAttemptView",
         "type": "object"
       },
+      "DurableTaskDatasetContextView": {
+        "description": "Dataset revision-history subject for a canvas-less durable Task in Jobs / Inbox.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "taskKind": {
+            "enum": [
+              "restore_revision_write",
+              "keyed_upsert_write"
+            ],
+            "title": "Taskkind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskKind",
+          "datasetId"
+        ],
+        "title": "DurableTaskDatasetContextView",
+        "type": "object"
+      },
       "DurableTaskInboxItemView": {
         "description": "One personal Inbox outcome for a terminal certified durable TaskAttempt.",
         "properties": {
           "canvasId": {
-            "title": "Canvasid",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvasid"
           },
           "canvasName": {
             "anyOf": [
@@ -4312,6 +4355,16 @@
               }
             ],
             "title": "Canvasname"
+          },
+          "datasetContext": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableTaskDatasetContextView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "diagnosticCode": {
             "anyOf": [
@@ -4383,7 +4436,9 @@
               "external_wait",
               "linear_checkpoint_write",
               "bounded_fanout_write",
-              "merge_columns_write"
+              "merge_columns_write",
+              "restore_revision_write",
+              "keyed_upsert_write"
             ],
             "title": "Taskkind",
             "type": "string"
@@ -4397,7 +4452,6 @@
         "required": [
           "id",
           "taskId",
-          "canvasId",
           "taskKind",
           "outcome",
           "terminalAt",
@@ -10701,6 +10755,16 @@
               }
             ],
             "title": "Createdat"
+          },
+          "datasetContext": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableTaskDatasetContextView"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "distributionReport": {
             "anyOf": [

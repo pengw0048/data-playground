@@ -13,7 +13,16 @@ from sqlalchemy import select
 from hub import keyed_upsert_tasks, metadb
 from hub.api_errors import APIError
 from hub.deps import Deps
+from hub.models import DurableTaskInboxPage, WorkspaceRunPage
 from hub.routers import keyed_upsert as api
+
+
+def _jobs(uid: str, **kwargs) -> WorkspaceRunPage:
+    return WorkspaceRunPage.model_validate(metadb.list_workspace_runs(uid, **kwargs))
+
+
+def _inbox(uid: str) -> DurableTaskInboxPage:
+    return DurableTaskInboxPage.model_validate(metadb.list_durable_task_inbox_items(uid, limit=200))
 
 
 @pytest.fixture(autouse=True)
@@ -258,3 +267,43 @@ def test_postgres_submission_serializes_on_the_owner_row(tmp_path, monkeypatch):
         results = [first.result(timeout=15), second.result(timeout=15)]
     assert results[0].task_id == results[1].task_id
     assert _revisions(deps, base["dataset_id"]) == 1
+
+
+def test_keyed_upsert_task_surfaces_in_jobs_and_inbox_for_owner_only(tmp_path, monkeypatch):
+    deps, base = _dataset(tmp_path, monkeypatch)
+    with metadb.session() as session:
+        session.add(metadb.User(id="stranger", name="Stranger"))
+    payload = _payload(deps, _table([2, 3, 4], ["B", "C", "D"]))
+    task = api.submit(_request(base, payload), "owner")
+
+    # Running: one canvas-less Jobs row keyed to the dataset; no Inbox item yet.
+    queued = [item for item in _jobs("owner").items if item.run_id == task.task_id]
+    assert len(queued) == 1
+    row = queued[0]
+    assert row.status == "queued" and row.canvas_id is None and row.can_cancel is True
+    assert row.dataset_context is not None
+    assert row.dataset_context.task_kind == "keyed_upsert_write"
+    assert row.dataset_context.dataset_id == base["dataset_id"]
+    assert metadb.catalog_revision_binding(row.dataset_context.dataset_id) is not None
+    assert _inbox("owner").items == []
+
+    _run(deps, task.task_id)
+
+    # Terminal: still exactly one Jobs row (no history twin), done with a receipt.
+    done = [item for item in _jobs("owner").items if item.run_id == task.task_id]
+    assert len(done) == 1
+    assert done[0].status == "done" and done[0].output_receipt is not None
+    assert done[0].can_cancel is False
+
+    inbox = [item for item in _inbox("owner").items if item.task_id == task.task_id]
+    assert len(inbox) == 1
+    assert inbox[0].outcome == "completed" and inbox[0].job_available is True
+    assert inbox[0].canvas_id is None
+    assert inbox[0].dataset_context is not None
+    assert inbox[0].dataset_context.dataset_id == base["dataset_id"]
+
+    # Owner-scoped: a stranger sees neither surface, and a canvas filter excludes the canvas-less row.
+    assert [item for item in _jobs("stranger").items if item.run_id == task.task_id] == []
+    assert _inbox("stranger").items == []
+    assert [item for item in _jobs("owner", canvas_id=base["dataset_id"]).items
+            if item.run_id == task.task_id] == []
