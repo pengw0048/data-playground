@@ -16,6 +16,7 @@ import { CanvasCopyModal, type CanvasCopySource } from './CanvasCopyModal'
 // Charts are native inline SVG (no external lib) so they work fully offline and theme-aware.
 export function RunHistoryModal({ onClose }: { onClose: () => void }) {
   const canvasId = useStore((s) => s.doc.id)
+  const setJobsQuery = useStore((s) => s.setJobsQuery)
   const [runs, setRuns] = useState<RunRecordDto[] | null>(null)
   const [err, setErr] = useState('')
   const [open, setOpen] = useState<string | null>(null)  // expanded run id → per-node breakdown
@@ -44,6 +45,7 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
               const st = statusTok[r.status as keyof typeof statusTok] ?? statusTok.draft
               const hasNodes = !!r.perNode && r.perNode.length > 0
               const isOpen = open === r.id
+              const jobRunId = r.runId ?? null
               return (
                 <div key={r.id} className="border-b border-border">
                   <div
@@ -65,6 +67,13 @@ export function RunHistoryModal({ onClose }: { onClose: () => void }) {
                     {r.rows != null && <span className="text-muted-foreground">{r.rows.toLocaleString()} rows</span>}
                     {r.ms != null && <span className="w-16 text-right text-muted-foreground">{fmtMs(r.ms)}</span>}
                     <span className="w-32 text-right text-[11px] text-muted-foreground">{r.createdAt ? new Date(r.createdAt).toLocaleString() : ''}</span>
+                    {jobRunId && <Button size="sm" variant="ghost" className="h-7 shrink-0 px-2 text-[10.5px]"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setJobsQuery(new URLSearchParams({ run: jobRunId }).toString())
+                      }}>
+                      View in Jobs
+                    </Button>}
                   </div>
                   {isOpen && hasNodes && <PerNodeBreakdown nodes={r.perNode!} />}
                   <ExecutionManifestDetail canvasId={canvasId} subjectId={r.id} summary={r}

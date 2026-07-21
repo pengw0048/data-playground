@@ -24,6 +24,7 @@ import { CanvasDraftMenu } from './LocalDrafts'
 import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
+import { api } from '../api/client'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -46,6 +47,7 @@ export function TopBar() {
   const [importOpen, setImportOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [copyOpen, setCopyOpen] = useState(false)
+  const [inboxUnreadCount, setInboxUnreadCount] = useState<number | null>(null)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
@@ -69,6 +71,16 @@ export function TopBar() {
     return () => window.removeEventListener('dp-open-settings', onOpen)
   }, [])
 
+  // Canvas only shows a count the existing endpoint has actually confirmed. Unlike the Workspace
+  // rail's retained shell state, a Canvas fetch failure has no prior Canvas value to preserve.
+  useEffect(() => {
+    let live = true
+    void api.inboxUnreadCount()
+      .then(({ count }) => { if (live) setInboxUnreadCount(count) })
+      .catch(() => { if (live) setInboxUnreadCount(null) })
+    return () => { live = false }
+  }, [])
+
   const openSettings = (trigger: HTMLElement) => {
     settingsTrigger.current = trigger
     setSettingsOpen(true)
@@ -82,6 +94,7 @@ export function TopBar() {
     <>
       <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
         <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && saved && !currentDraftId} />
+        {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
         <span data-testid="autosave" title={!canEdit ? 'Editing is disabled for your current access level' : currentDraft?.lastError ?? (!kernelUp && saved ? 'Kernel offline — saved to this browser only' : undefined)} className={cn('ml-0.5 text-[11px]', currentDraft?.syncState === 'conflict' || currentDraft?.syncState === 'error' ? 'text-destructive' : 'text-muted-foreground')}>· {saveLabel}</span>
@@ -139,6 +152,8 @@ function PeerAvatars() {
 // The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
 function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
   const setView = useStore((s) => s.setView)
+  const setJobsQuery = useStore((s) => s.setJobsQuery)
+  const setInboxQuery = useStore((s) => s.setInboxQuery)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   return (
@@ -160,13 +175,29 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativ
             propagating is caught by the just-mounted dialog's dismiss layer and closes it instantly */}
         {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> Run history</DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="all Workspace work" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setInboxQuery('')}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my terminal outcomes" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> <MenuDestination label="Run history" detail="this Canvas audit trail" /></DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onSettings)}><Icon name="settings" size={14} /> Settings</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
+}
+
+function MenuDestination({ label, detail }: { label: string; detail: string }) {
+  return <span className="flex min-w-0 flex-1 items-baseline justify-between gap-3"><span>{label}</span><span aria-hidden className="truncate text-[10px] text-muted-foreground">{detail}</span></span>
+}
+
+function CanvasInboxIndicator({ count }: { count: number }) {
+  const setInboxQuery = useStore((s) => s.setInboxQuery)
+  const bounded = count > 99 ? '99+' : String(count)
+  return <button type="button" data-testid="canvas-inbox-unread-badge" onClick={() => setInboxQuery('')}
+    aria-label={`Inbox, ${count} unread outcomes`} title={`${count} Inbox outcome${count === 1 ? '' : 's'} need attention`}
+    className="relative grid h-6 min-w-6 place-items-center rounded-full bg-foreground px-1 text-[10px] font-bold text-background hover:bg-foreground/85">
+    {bounded}
+  </button>
 }
 
 function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {

@@ -32,6 +32,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const clearParameterBinding = useStore((s) => s.clearRunParameterBinding)
   const editParameters = useStore((s) => s.editRunParameters)
   const submitParameters = useStore((s) => s.submitRunParameters)
+  const setJobsQuery = useStore((s) => s.setJobsQuery)
 
   useEffect(() => {
     if (!isConfiguredMerge && !isConfiguredUpsert && (!run || run.phase === 'idle')) estimate(nodeId)
@@ -50,6 +51,12 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const parameterBindings = new Map((run?.parameterBindings ?? []).map((item) => [item.name, item.value]))
   const parameterErrors = parameterDeclarations.map((item) => parameterValueError(
     item, parameterBindings.has(item.name), parameterBindings.get(item.name)))
+  const currentJobRunId = st?.runId && (
+    (phase === 'running' && (st.status === 'queued' || st.status === 'running'))
+    || (phase === 'done' && st.status === 'done')
+    || (phase === 'failed' && st.status === 'failed')
+    || (phase === 'idle' && st.status === 'cancelled')
+  ) ? st.runId : null
 
   if (isConfiguredMerge) return (
     <div className="p-3.5">
@@ -210,6 +217,11 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           </div>
         </div>
       )}
+
+      {currentJobRunId && <Button size="sm" variant="outline" className="mt-3 w-full"
+        onClick={() => setJobsQuery(new URLSearchParams({ run: currentJobRunId }).toString())}>
+        <Icon name="clock" size={12} /> View in Jobs
+      </Button>}
 
       {parameterDeclarations.length > 0 && phase !== 'parameters' && (
         <Button size="sm" variant="outline" onClick={() => editParameters(nodeId)}

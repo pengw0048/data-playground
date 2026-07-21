@@ -117,6 +117,22 @@ describe('PerNodeBreakdown — per-node horizontal bars', () => {
   })
 })
 
+describe('Run history Jobs identity', () => {
+  it('does not substitute a history-row id for a missing durable Job identity', async () => {
+    apiMock.listRuns.mockResolvedValue([
+      { id: 'history-row-only', status: 'done', outputs: [] },
+      { id: 'history-row', runId: 'authorized-run', status: 'failed', outputs: [] },
+    ])
+    const user = userEvent.setup()
+    render(<RunHistoryModal onClose={() => {}} />)
+
+    const links = await screen.findAllByRole('button', { name: 'View in Jobs' })
+    expect(links).toHaveLength(1)
+    await user.click(links[0])
+    expect(useStore.getState().jobsQuery).toBe('run=authorized-run')
+  })
+})
+
 describe('admitted run inputs', () => {
   const manifestItem = (nodeId: string, datasetId: string, revisionId: string) => ({
     node_id: nodeId, dataset_id: datasetId, revision_id: revisionId,
