@@ -22,6 +22,12 @@ import {
   canvasDocsEqual, canvasEditableContentEqual, deleteCanvasDraft, readCanvasDrafts, writeCanvasDraft,
   type LocalCanvasDraft,
 } from './canvasDrafts'
+import {
+  isPristineExampleReplacement,
+  isSameExampleReplacementSnapshot,
+  type ExampleCreationIntent,
+  type ExampleReplacementSnapshot,
+} from './exampleReplacement'
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
@@ -67,6 +73,7 @@ let _previewRequestGeneration = 0 // every preview captures its own generation; 
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
 let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
+let _viewportFitGeneration = 0    // example fits are one-shot even when the same Canvas is reused
 const _draftSyncInFlight = new Set<string>()
 // True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
 // still refreshes the browser cache, but must not PUT that presentation-only normalization back into
@@ -963,6 +970,17 @@ function cancelDetachedProfileJob(job: ProfileJobState | undefined): void {
 export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[] }
 
 export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string }
+export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
+
+// Fit identity is deliberately geometry-only: transient run badges may settle while React Flow is
+// measuring, but a different node set or position must never consume an example's viewport request.
+export function canvasViewportDocumentIdentity(doc: CanvasDoc): string {
+  return JSON.stringify([
+    doc.id,
+    doc.version,
+    doc.nodes.map((node) => [node.id, node.type, node.parentId ?? null, node.position.x, node.position.y]),
+  ])
+}
 
 interface Store {
   doc: CanvasDoc
@@ -980,6 +998,7 @@ interface Store {
   selectedId: string | null        // primary selection (drives panels)
   selectedIds: string[]            // full multi-selection (box/shift-select)
   nodeRevealRequest: NodeRevealRequest | null // URL-originated only; Canvas consumes it without autosaving
+  viewportFitRequest: CanvasViewportFitRequest | null // successful example open only; consumed once after measurement
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
@@ -992,6 +1011,9 @@ interface Store {
   currentDraftId: string | null
   localDrafts: LocalCanvasDraft[]
   draftStorageErrors: string[]
+  // Set only after bootstrap has authoritatively established that this principal has neither a
+  // remote Canvas nor a recoverable local draft.  The Workspace consumes it as the first-run choice.
+  firstRunChoice: boolean
   numericParamDrafts: Record<string, Record<string, string>>  // invalid/pending text; never persisted
 
   agentOpen: boolean
@@ -1012,6 +1034,8 @@ interface Store {
   requestNodeReveal: (canvasId: string, nodeId: string) => void
   acknowledgeNodeReveal: (requestId: number) => void
   clearNodeReveal: () => void
+  requestViewportFit: (doc: CanvasDoc) => void
+  acknowledgeViewportFit: (requestId: number) => void
   setSelection: (ids: string[]) => void
   selectAll: () => void
   removeSelected: () => void
@@ -1136,7 +1160,7 @@ interface Store {
   refreshUsers: () => Promise<void>
   openFile: (id: string, options?: { serverCopy?: boolean }) => Promise<boolean>
   newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
-  newFromExample: (key: string) => Promise<CanvasCreationResult>
+  newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
   setRequirements: (reqs: string[]) => void
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
@@ -1467,6 +1491,7 @@ export const useStore = create<Store>((set, get) => ({
   selectedId: null,
   selectedIds: [],
   nodeRevealRequest: null,
+  viewportFitRequest: null,
   openPanels: {},
   previews: {},
   previewBindings: {},
@@ -1479,6 +1504,7 @@ export const useStore = create<Store>((set, get) => ({
   currentDraftId: null,
   localDrafts: [],
   draftStorageErrors: [],
+  firstRunChoice: false,
   numericParamDrafts: {},
   agentOpen: false,
   agentLog: [],
@@ -1693,6 +1719,18 @@ export const useStore = create<Store>((set, get) => ({
   )),
 
   clearNodeReveal: () => set({ nodeRevealRequest: null }),
+
+  requestViewportFit: (doc) => set({
+    viewportFitRequest: {
+      id: ++_viewportFitGeneration,
+      canvasId: doc.id,
+      documentIdentity: canvasViewportDocumentIdentity(doc),
+    },
+  }),
+
+  acknowledgeViewportFit: (requestId) => set((state) => (
+    state.viewportFitRequest?.id === requestId ? { viewportFitRequest: null } : {}
+  )),
 
   setSelection: (ids) => set({ selectedIds: ids, selectedId: ids[ids.length - 1] ?? null }),
 
@@ -2761,8 +2799,11 @@ export const useStore = create<Store>((set, get) => ({
       get().refreshLocalDrafts()
       const users = await api.users()
       set({ users })
-      await get().refreshFiles()
+      const filesRefreshed = await get().refreshFiles()
       const files = get().files
+      // Do not infer a fresh workspace from an empty stale list: only an authoritative list can
+      // establish that there is no existing Canvas. A local draft is user work too.
+      set({ firstRunChoice: filesRefreshed && files.length === 0 && get().localDrafts.length === 0 })
       // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
       // last-opened / newest / a fresh file. A #/workspace or #/transforms link still loads a
       // current canvas underneath, then switches to that shell view below.
@@ -2788,7 +2829,8 @@ export const useStore = create<Store>((set, get) => ({
       if (!opened) {
         if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
         else if (fallback) await get().openFile(fallback)
-        else await get().newFile()
+        // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
+        else get().setView('workspace')
         // A Workspace dataset/container deep link carries more identity than the top-level view.
         // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
         // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
@@ -2990,21 +3032,66 @@ export const useStore = create<Store>((set, get) => ({
     }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
-    set({ view: 'canvas' })
+    set({ view: 'canvas', firstRunChoice: false })
     if (signal && persistence === 'remote') void get().refreshFiles()
     return { ok: true, canvasId: doc.id, persistence }
   },
 
-  newFromExample: async (key) => {
+  newFromExample: async (key, intent = 'create-separate') => {
     const generation = ++_fileNavigationGeneration
     const userId = get().currentUser?.id ?? null
-    const id = `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
+    const current = get()
+    const candidate: ExampleReplacementSnapshot = {
+      doc: current.doc,
+      canvasRole: current.canvasRole,
+      currentDraftId: current.currentDraftId,
+      serverVersion: current.serverVersion,
+    }
+    // The mutation may downgrade a UI-confirmed replacement, but it must never upgrade an action
+    // that the UI described as creating a separate Canvas.
+    let replacePristine = intent === 'replace-pristine' && isPristineExampleReplacement(candidate)
+    // A blank graph is not necessarily pristine: a run is durable user work.  Fail closed when
+    // history cannot be read, so an offline/revoked tab creates a separate example instead.
+    if (replacePristine) {
+      let runsEmpty = false
+      try { runsEmpty = (await api.listRuns(current.doc.id)).length === 0 }
+      catch { /* fail closed below */ }
+      const latest = get()
+      if (generation !== _fileNavigationGeneration || (latest.currentUser?.id ?? null) !== userId
+          || latest.doc.id !== current.doc.id) return { ok: false }
+      const latestCandidate: ExampleReplacementSnapshot = {
+        doc: latest.doc,
+        canvasRole: latest.canvasRole,
+        currentDraftId: latest.currentDraftId,
+        serverVersion: latest.serverVersion,
+      }
+      const sameCandidate = isPristineExampleReplacement(latestCandidate)
+        && isSameExampleReplacementSnapshot(candidate, latestCandidate)
+      // A user edit can still be inside the autosave debounce window. Navigating to a newly-created
+      // example here would replace the in-memory document before that edit is persisted. Cancel this
+      // click instead; the edited Canvas stays mounted and autosave can complete normally.
+      if (!sameCandidate) {
+        get().pushToast('Canvas changed while preparing the example; your edit was kept. Choose the example again.', 'info')
+        return { ok: false }
+      }
+      replacePristine = runsEmpty
+    }
+    const id = replacePristine ? current.doc.id : `canvas_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 8)}`
     const doc = exampleDoc(key, id)  // a runnable starter on the seeded data; falls back to a blank file
     if (!doc) return get().newFile()
+    // A response-lost in-place save must retain the known server base. Retrying it as a create could
+    // collide with the original Canvas and turn an uncertain update into a different document.
+    if (replacePristine) doc.version = current.serverVersion!
     let persistence: CanvasPersistence = 'remote'
     try {
-      const created = await api.createCanvas(doc)
-      if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
+      if (replacePristine) {
+        const saved = await api.saveCanvas(doc, false, current.serverVersion ?? undefined)
+        if (!saved.ok || saved.id !== doc.id) return { ok: false }
+        doc.version = saved.version
+      } else {
+        const created = await api.createCanvas(doc)
+        if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
+      }
       if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()
@@ -3032,12 +3119,15 @@ export const useStore = create<Store>((set, get) => ({
     if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
     if (persistence === 'local-draft' && userId) {
-      const draft = draftForDoc(userId, doc, null, undefined, doc)
+      const draft = draftForDoc(
+        userId, doc, replacePristine ? current.serverVersion : null, undefined,
+        replacePristine ? null : doc,
+      )
       const stored = writeCanvasDraft(draft)
       const visibleDraft = draftAfterStorageWrite(draft, stored)
       set((state) => ({
         currentDraftId: draft.draftId,
-        serverVersion: null,
+        serverVersion: replacePristine ? current.serverVersion : null,
         localDrafts: replaceDraft(state.localDrafts, visibleDraft),
         saved: stored.ok,
         draftStorageErrors: stored.ok ? state.draftStorageErrors : [...state.draftStorageErrors, stored.error!],
@@ -3046,7 +3136,8 @@ export const useStore = create<Store>((set, get) => ({
     }
     const uid = get().currentUser?.id
     if (uid) localStorage.setItem(OPEN_KEY(uid), doc.id)
-    set({ view: 'canvas' })
+    set({ view: 'canvas', firstRunChoice: false })
+    get().requestViewportFit(get().doc)
     return { ok: true, canvasId: doc.id, persistence }
   },
 
@@ -3112,13 +3203,22 @@ export const useStore = create<Store>((set, get) => ({
     // permanent + not undoable → confirm first (guards both the file menu and the Recents trash)
     const f = get().files.find((x) => x.id === id)
     if (typeof window !== 'undefined' && !window.confirm(`Delete "${f?.name || 'this canvas'}"? This can't be undone.`)) return
-    try { await api.deleteCanvas(id); await get().refreshFiles() } catch { /* offline */ }
+    let filesRefreshed = false
+    try {
+      await api.deleteCanvas(id)
+      filesRefreshed = await get().refreshFiles()
+    } catch { return } // do not navigate away from a Canvas whose deletion was not confirmed
     // only load a replacement (which navigates to the editor) if the deleted file was the one open
     // IN the editor; deleting from the Recents grid should just drop the card and stay in the shell.
     if (get().doc.id === id && get().view === 'canvas') {
       const next = get().files[0]?.id
       if (next) await get().openFile(next)
-      else await get().newFile()
+      // Deleting the final Canvas must not manufacture a replacement. Reuse the complete first-run
+      // choice only when the now-empty list and local-draft index were both read authoritatively.
+      else set({
+        view: 'workspace',
+        firstRunChoice: filesRefreshed && get().localDrafts.length === 0,
+      })
     }
   },
 
@@ -3504,7 +3604,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, past: [], future: [],
+        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {

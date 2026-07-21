@@ -16,6 +16,24 @@ function overlaps(a: { x: number; y: number; width: number; height: number }, b:
   return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y
 }
 
+// The first-run project executes before the other mutating E2E projects against a fresh kernel.
+// Keep the assertion in one journey so later steps cannot depend on resetting shared metadata.
+async function canvasesFor(page: Page): Promise<Array<{ id: string }>> {
+  return page.evaluate(async () => {
+    const response = await fetch('/api/canvas')
+    if (!response.ok) throw new Error(`Canvas list failed: ${response.status}`)
+    return response.json()
+  })
+}
+
+async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown[] }> {
+  return page.evaluate(async (canvas) => {
+    const response = await fetch(`/api/canvas/${encodeURIComponent(canvas)}`)
+    if (!response.ok) throw new Error(`Canvas fetch failed: ${response.status}`)
+    return response.json()
+  }, canvasId)
+}
+
 // Open a bottom-toolbar category by its aria-label and click a node kind inside the menu.
 async function addNode(page: Page, category: string, kindTitle: string) {
   await page.getByRole('button', { name: category, exact: true }).click()
@@ -27,6 +45,10 @@ async function addNode(page: Page, category: string, kindTitle: string) {
 // without this a prior test's nodes would leak in and break count assertions.
 async function fresh(page: Page) {
   await page.goto('/')
+  // A new workspace deliberately lands on the explicit first-run choice. Tests that need a Canvas
+  // take that same user-visible action instead of depending on bootstrap to create a remote blank.
+  const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
+  if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
   await page.getByTestId('file-menu').click()
@@ -93,6 +115,126 @@ async function waitForCollabRoom(page: Page, canvasId: string) {
 }
 
 test.describe('Data Playground canvas', () => {
+  test('direct first-entry example fits every node once at 1280x720 and preserves manual viewport control @first-run', async ({ page }) => {
+    let exampleId: string | null = null
+    try {
+      await page.goto('/')
+      expect(await canvasesFor(page)).toEqual([])
+      await page.getByRole('button', { name: 'Open example Purchases per user' }).click()
+      const nodes = page.locator('.react-flow__node')
+      await expect(nodes).toHaveCount(5)
+      exampleId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+
+      const allNodesInsideFlow = async () => {
+        const flow = await page.locator('.react-flow').boundingBox()
+        const nodeBoxes = await nodes.evaluateAll((elements) => elements.map((element) => {
+          const box = element.getBoundingClientRect()
+          return { x: box.x, y: box.y, width: box.width, height: box.height }
+        }))
+        return !!flow && nodeBoxes.length === 5 && nodeBoxes.every((node) => (
+          node.x >= flow.x && node.y >= flow.y
+          && node.x + node.width <= flow.x + flow.width
+          && node.y + node.height <= flow.y + flow.height
+        ))
+      }
+      await expect.poll(allNodesInsideFlow).toBe(true)
+
+      // The one-shot request is already consumed. A user zoom followed by an ordinary selection
+      // rerender must not invoke fitView again or reset the chosen viewport.
+      const viewport = page.locator('.react-flow__viewport')
+      await page.locator('.react-flow__controls-zoomin').click()
+      const manualViewport = await viewport.getAttribute('style')
+      await nodes.first().click()
+      await page.waitForTimeout(500)
+      expect(await viewport.getAttribute('style')).toBe(manualViewport)
+    } finally {
+      if (exampleId) await page.request.delete(`/api/canvas/${encodeURIComponent(exampleId)}`)
+    }
+  })
+
+  test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page }) => {
+    await page.goto('/')
+    expect(await canvasesFor(page)).toEqual([])
+    await expect(page.getByRole('button', { name: 'Start a blank Canvas' })).toBeVisible()
+    await expect(page.getByRole('button', { name: /Open example/i }).first()).toBeVisible()
+
+    // Explicit blank + no durable run history is the sole in-place replacement case.
+    await page.getByRole('button', { name: 'Start a blank Canvas' }).click()
+    await expect(page.getByTestId('toolbar')).toBeVisible()
+    const pristineId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    expect(await canvasesFor(page)).toHaveLength(1)
+    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await expect(page.locator('.react-flow__node').first()).toBeVisible()
+    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).toBe(pristineId)
+    expect(await canvasesFor(page)).toHaveLength(1)
+    const viewport = page.locator('.react-flow__viewport')
+    await page.locator('.react-flow__controls-zoomin').click()
+    const manual = await viewport.getAttribute('style')
+    await page.waitForTimeout(500)
+    expect(await viewport.getAttribute('style')).toBe(manual)
+
+    // An edit made while the mutation revalidates run history must stay on this Canvas and reach
+    // durable storage; cancelling this click gives the existing autosave debounce time to finish.
+    const exampleHash = await page.evaluate(() => location.hash)
+    await page.getByTestId('app-menu').click()
+    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New file', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(exampleHash)
+    await expect(page.locator('.react-flow__node')).toHaveCount(0)
+    const blankId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const blankHash = await page.evaluate(() => location.hash)
+    const afterBlankCount = (await canvasesFor(page)).length
+    await expect(page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' })).toBeVisible()
+    let historyRequestStarted = false
+    let releaseHistory!: () => void
+    await page.route(`**/api/canvas/${blankId}/runs`, async (route) => {
+      historyRequestStarted = true
+      await new Promise<void>((resolve) => { releaseHistory = resolve })
+      await route.fulfill({ json: [] })
+    })
+
+    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await expect.poll(() => historyRequestStarted).toBe(true)
+    await page.getByRole('button', { name: '+ Add a source' }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    releaseHistory()
+    await expect(page.getByText(/Canvas changed while preparing the example; your edit was kept/)).toBeVisible()
+    expect((await page.evaluate(() => location.hash)).split('?')[0]).toBe(blankHash.split('?')[0])
+    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!.split('?')[0])).toBe(blankId)
+    expect(await canvasesFor(page)).toHaveLength(afterBlankCount)
+    await expect.poll(async () => (await canvasFor(page, blankId)).nodes.length).toBe(1)
+
+    // The edit immediately changes the displayed action to a separate create; choosing it again
+    // creates the example without replacing the now-persisted source Canvas.
+    await page.unroute(`**/api/canvas/${blankId}/runs`)
+    await page.getByTestId('file-menu').click()
+    await page.getByRole('menuitem', { name: 'Create example Canvas: Purchases per user' }).click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(5)
+    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).not.toBe(blankId)
+    expect(await canvasesFor(page)).toHaveLength(afterBlankCount + 1)
+
+    // A lost PUT response retains a version-fenced local draft; it must not turn into a speculative create.
+    const forkedExampleHash = await page.evaluate(() => location.hash)
+    await page.getByTestId('app-menu').click()
+    await page.locator('[role="menu"]').last().getByRole('menuitem', { name: 'New file', exact: true }).click()
+    await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(forkedExampleHash)
+    await expect(page.locator('.react-flow__node')).toHaveCount(0)
+    const responseLossId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    let abortedPut = false
+    await page.route(`**/api/canvas/${responseLossId}*`, (route) => {
+      if (route.request().method() === 'PUT') {
+        abortedPut = true
+        return route.abort('connectionreset')
+      }
+      return route.continue()
+    })
+
+    await page.getByRole('button', { name: 'Use example in this Canvas: Purchases per user' }).click()
+    await expect.poll(() => abortedPut).toBe(true)
+    await expect(page.locator('.react-flow__node').first()).toBeVisible()
+    expect(decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)).toBe(responseLossId)
+    expect((await canvasFor(page, responseLossId)).nodes).toEqual([])
+  })
+
   test('loads with no console errors', async ({ page }) => {
     const errors: string[] = []
     page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))

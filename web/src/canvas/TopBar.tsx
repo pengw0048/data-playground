@@ -25,6 +25,7 @@ import { exportCanvas } from '../lib/exporters'
 import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { api } from '../api/client'
+import { useExampleCreationIntent } from './useExampleCreationIntent'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -213,6 +214,8 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
   const currentDraftId = useStore((s) => s.currentDraftId)
   const canvasRole = useStore((s) => s.canvasRole)
   const canEdit = roleCanEdit(canvasRole)
+  const exampleIntent = useExampleCreationIntent(open && canEdit)
+  const exampleCreatesSeparate = exampleIntent === 'create-separate'
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
@@ -256,9 +259,12 @@ function FileMenu({ onCanvasSettings }: { onCanvasSettings: () => void }) {
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setTimeout(onCanvasSettings)}><Icon name="settings" size={14} /> Canvas settings…</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
-        <div className="px-2.5 pb-1 pt-1.5 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">New from example</div>
+        <div className="px-2.5 pb-1 pt-1.5 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
+          {exampleCreatesSeparate ? 'Create example Canvas' : 'New from example'}
+        </div>
         {examples.map((ex) => (
-          <DropdownMenuItem key={ex.key} onSelect={() => newFromExample(ex.key)} title={ex.blurb}>
+          <DropdownMenuItem key={ex.key} onSelect={() => { setOpen(false); void newFromExample(ex.key, exampleIntent) }} title={ex.blurb}
+            aria-label={exampleCreatesSeparate ? `Create example Canvas: ${ex.name}` : ex.name}>
             <Icon name="grid" size={14} /> {ex.name}
           </DropdownMenuItem>
         ))}

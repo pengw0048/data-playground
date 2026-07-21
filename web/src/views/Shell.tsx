@@ -238,7 +238,7 @@ function FilesContent() {
     <>
       <ViewHeader title="Recents" action={
         <button onClick={() => newFile()} data-testid="new-file" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '8px 14px', border: 'none', borderRadius: 9, background: color.ink, color: 'hsl(var(--background))', fontSize: 12.5, fontWeight: 600, cursor: 'pointer' }}>
-          <Icon name="plus" size={13} /> New file
+          <Icon name="plus" size={13} /> Start a blank Canvas
         </button>
       } />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: 16, padding: '4px 28px 28px' }}>
@@ -268,7 +268,7 @@ function FilesContent() {
           <>
             {/* a fresh install lands here with nothing — offer runnable starters, not just a dead end */}
             <div style={{ gridColumn: '1 / -1', color: color.text3, fontSize: 12.5, padding: '2px 2px 4px' }}>
-              No files yet — open a runnable example, or “New file”.
+              Choose a runnable example, or start a blank Canvas.
             </div>
             {examples.map((ex) => (
               <button key={ex.key} type="button" className="dp-file-card" onClick={() => { void newFromExample(ex.key) }}

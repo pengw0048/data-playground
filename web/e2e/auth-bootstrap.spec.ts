@@ -38,8 +38,11 @@ test('auth bootstrap stays fenced while unavailable and recovers on Retry withou
   recovered = true
   await page.getByRole('button', { name: 'Retry connection' }).click()
 
-  await expect(page.getByTestId('toolbar')).toBeVisible()
-  await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
+  // Recovery restores the product's normal entry state: an existing Canvas opens, while a truly
+  // fresh workspace offers its explicit Canvas choice.
+  await expect.poll(async () => (
+    await page.getByTestId('toolbar').count() + await page.getByTestId('first-run-canvas-choice').count()
+  )).toBeGreaterThan(0)
   expect(authRequests).toBe(4)
   expect(bootstrapRequests).toBeGreaterThan(0)
   expect(pageLoads).toBe(1)

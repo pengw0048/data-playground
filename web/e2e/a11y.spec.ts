@@ -7,6 +7,10 @@ import { backToWorkspace, goToWorkspace, workspaceResource } from './support/wor
 
 async function fresh(page: Page) {
   await page.goto('/')
+  // A fresh workspace has an explicit entry choice; tests create a blank Canvas through that UI
+  // rather than relying on the retired implicit bootstrap Canvas.
+  const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
+  if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
   await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
   const previous = await page.evaluate(() => location.hash)
   await page.getByTestId('file-menu').click()
@@ -168,6 +172,8 @@ test.describe('accessibility gate @ux-smoke', () => {
     // Build the target canvas via the API so the keyboard assertion doesn't ride the fragile
     // file-menu rename, which flakes when a just-created canvas re-renders the menu away.
     await page.goto('/')
+    const firstRun = page.getByRole('button', { name: 'Start a blank Canvas' })
+    if (await firstRun.isVisible().catch(() => false)) await firstRun.click()
     await expect.poll(() => page.evaluate(() => location.hash)).toMatch(/^#\/canvas\/.+/)
     const canvasName = `a11y-space-${Date.now()}`
     expect((await page.request.post('/api/canvas', { data: {

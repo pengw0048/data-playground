@@ -41,9 +41,22 @@ export default defineConfig({
   // container) point Playwright at it instead of downloading one; unset → Playwright's own browser.
   projects: [
     {
+      // This one journey needs the initial empty metadata DB. It runs before every other project
+      // that creates Canvas records, so the assertion is a real first-run check rather than a mock.
+      name: 'chromium-first-run',
+      testMatch: '**/canvas.spec.ts',
+      grep: /@first-run/,
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: { width: 1280, height: 720 },
+        ...chromiumLaunch,
+      },
+    },
+    {
       // Required researcher workflows run first. Keeping them in a dependency project gives CI a
       // focused failure and prevents another project's dependency graph from rerunning fixed-id fixtures.
       name: 'chromium-ux-smoke',
+      dependencies: ['chromium-first-run'],
       testIgnore: '**/viewport-support.spec.ts',
       grep: /@ux-smoke/,
       use: {
@@ -57,7 +70,7 @@ export default defineConfig({
       name: 'chromium',
       dependencies: ['chromium-ux-smoke'],
       testIgnore: '**/viewport-support.spec.ts',
-      grepInvert: /@ux-smoke/,
+      grepInvert: /@ux-smoke|@first-run/,
       use: {
         ...devices['Desktop Chrome'],
         ...chromiumLaunch,
