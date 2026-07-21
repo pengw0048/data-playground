@@ -75,7 +75,7 @@ jobs:
           curl -fsS http://127.0.0.1:8471/api/version > /tmp/wheel-api-version.json
           cat /tmp/wheel-api-version.json
 
-      - name: Verify the wheel-installed baseline migration
+      - name: Verify the wheel-installed migration chain
         run: |
           VENV="/tmp/dp-wheel-venv"
           "$VENV/bin/python" - /tmp/dp-wheel-workspace/dataplay.db <<'PY'
@@ -88,13 +88,13 @@ jobs:
           migration_root = Path(metadb._MIGRATIONS_DIR).resolve()
           assert migration_root.is_relative_to(Path(sys.prefix).resolve()), migration_root
           revisions = sorted(path.name for path in (migration_root / "versions").glob("*.py"))
-          assert revisions == ["0001_schema_baseline.py"], revisions
+          assert "0001_schema_baseline.py" in revisions, revisions
           with sqlite3.connect(sys.argv[1]) as connection:
               stored_head = connection.execute(
                   "SELECT version_num FROM alembic_version"
               ).fetchone()
           assert stored_head == (metadb.expected_schema_head(),), stored_head
-          print("packaged metadata baseline:", stored_head[0])
+          print(f"packaged migration chain: {len(revisions)} revisions, fresh head {stored_head[0]}")
           PY
 
       - name: Version identity (wheel surfaces)
