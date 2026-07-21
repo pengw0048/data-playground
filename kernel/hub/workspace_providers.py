@@ -433,6 +433,10 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         "lastResolvedAt": binding["lastResolvedAt"],
         "localPlacement": local_placement,
         "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
     }
 
 

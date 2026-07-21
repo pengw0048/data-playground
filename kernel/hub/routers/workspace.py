@@ -437,6 +437,22 @@ class WorkspaceMoveCanvasBody(_StrictAuthBody):
     expected_version: int = Field(ge=1)
 
 
+class WorkspaceCreateFolderBody(_StrictAuthBody):
+    parent_id: str = Field(min_length=1, max_length=128)
+    expected_parent_version: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=512)
+    request_id: UUID = Field(strict=False)
+
+
+class WorkspaceRenameFolderBody(_StrictAuthBody):
+    expected_version: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=512)
+
+
+class WorkspaceDeleteFolderBody(_StrictAuthBody):
+    expected_version: int = Field(ge=1)
+
+
 class NativeCanvasValidateBody(_StrictAuthBody):
     filename: str = Field(min_length=1, max_length=256)
     import_id: UUID = Field(alias="importId", strict=False)
@@ -913,6 +929,43 @@ def move_workspace_canvas(placement_id: str, body: WorkspaceMoveCanvasBody,
             uid=uid, placement_id=placement_id, expected_version=body.expected_version,
             container_id=body.container_id,
             expected_container_version=body.expected_container_version)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.post("/workspace/folders")
+def create_workspace_folder(body: WorkspaceCreateFolderBody,
+                            uid: str = Depends(current_user)) -> dict:
+    """Create one local Folder at an explicitly versioned parent, safely replayable by request id."""
+    try:
+        return metadb.workspace_create_folder_action(
+            uid=uid, parent_id=body.parent_id,
+            expected_parent_version=body.expected_parent_version,
+            name=body.name, request_id=str(body.request_id))
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.patch("/workspace/folders/{container_id}")
+def rename_workspace_folder(container_id: str, body: WorkspaceRenameFolderBody,
+                            uid: str = Depends(current_user)) -> dict:
+    """Rename one locally managed Folder without changing its identity or placement children."""
+    del uid  # Local Folder authority is installation-local; request authentication is the guard.
+    try:
+        return metadb.workspace_rename_folder_action(
+            container_id=container_id, expected_version=body.expected_version, name=body.name)
+    except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
+        _workspace_action_error(exc)
+
+
+@router.delete("/workspace/folders/{container_id}")
+def delete_workspace_folder(container_id: str, body: WorkspaceDeleteFolderBody,
+                            uid: str = Depends(current_user)) -> dict:
+    """Delete only an empty local Folder; this endpoint never reparents children or placements."""
+    del uid  # Local Folder authority is installation-local; request authentication is the guard.
+    try:
+        return metadb.workspace_delete_folder_action(
+            container_id=container_id, expected_version=body.expected_version)
     except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
         _workspace_action_error(exc)
 

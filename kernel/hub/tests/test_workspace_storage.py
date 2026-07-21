@@ -109,6 +109,77 @@ def test_root_and_container_paths_are_stable_and_local(workspace_scope):
             right["id"], expected_version=right["version"], parent_id=left["id"])
 
 
+def test_workspace_folder_actions_are_capability_gated_cas_safe_and_replayable(workspace_scope):
+    root = metadb.local_workspace_root()
+    request_id = str(uuid.uuid4())
+    with TestClient(app) as client:
+        created = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Research", "requestId": request_id,
+        })
+        assert created.status_code == 200, created.text
+        folder = created.json()["resource"]
+        assert folder["id"].startswith("container:")
+        assert folder["canCreateFolder"] is True
+        assert folder["canRenameFolder"] is True
+        assert folder["canDeleteFolder"] is True
+
+        replay = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Research", "requestId": request_id,
+        })
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["resource"]["id"] == folder["id"]
+        conflict = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Different", "requestId": request_id,
+        })
+        assert conflict.status_code == 422
+
+        folder_id = folder["id"].removeprefix("container:")
+        canvas = metadb.workspace_create_canvas_action(
+            uid=metadb.DEFAULT_USER_ID, container_id=folder_id,
+            expected_container_version=folder["version"], name="Placed canvas")
+        renamed = client.patch(f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": folder["version"], "name": "Renamed research",
+        })
+        assert renamed.status_code == 200, renamed.text
+        renamed_folder = renamed.json()["resource"]
+        assert renamed_folder["id"] == folder["id"]
+        assert renamed_folder["name"] == "Renamed research"
+        canvas_resolution = client.get(f"/api/workspace/resources/canvas:{canvas['id']}")
+        assert canvas_resolution.status_code == 200, canvas_resolution.text
+        assert canvas_resolution.json()["resource"]["parentId"] == folder["id"]
+        stale = client.patch(f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": folder["version"], "name": "Stale rename",
+        })
+        assert stale.status_code == 409
+        nonempty_delete = client.request("DELETE", f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": renamed_folder["version"],
+        })
+        assert nonempty_delete.status_code == 422
+
+        empty = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Empty", "requestId": str(uuid.uuid4()),
+        })
+        assert empty.status_code == 200, empty.text
+        empty_resource = empty.json()["resource"]
+        empty_id = empty_resource["id"].removeprefix("container:")
+        deleted = client.request("DELETE", f"/api/workspace/folders/{empty_id}", json={
+            "expectedVersion": empty_resource["version"],
+        })
+        assert deleted.status_code == 200, deleted.text
+        assert client.get(f"/api/workspace/resources/{empty_resource['id']}").status_code == 404
+
+        root_page = client.get(f"/api/workspace/containers/{root['id']}")
+        assert root_page.status_code == 200, root_page.text
+        root_resource = root_page.json()["container"]
+        assert root_resource["canCreateFolder"] is True
+        assert root_resource["canRenameFolder"] is False
+        assert root_resource["canDeleteFolder"] is False
+
+
 def test_delete_recreate_and_placement_moves_preserve_independent_targets(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root_id = metadb.local_workspace_root()["id"]

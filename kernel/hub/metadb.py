@@ -184,6 +184,19 @@ class WorkspaceCanvasCreateReplay(Base):
     )
 
 
+class WorkspaceFolderCreateReplay(Base):
+    """Durable one-intent/one-result record for client-retried local Folder creation."""
+    __tablename__ = "workspace_folder_create_replays"
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint("length(intent_sha256) = 64", name="ck_workspace_folder_create_replay_sha"),
+    )
+
+
 class DatasetView(Base):
     """One owner-scoped immutable DatasetView plus a retained submission tombstone."""
 
@@ -3110,6 +3123,87 @@ def workspace_create_container(parent_id: str, name: str, *, ordinal: int = 0) -
         return _workspace_container_doc(row)
 
 
+def _workspace_folder_create_request_id(request_id: str) -> str:
+    normalized = str(request_id).strip()
+    if not normalized or normalized != request_id or "\x00" in normalized or len(normalized) > 128:
+        raise ValueError("Folder create request id must be a trimmed, NUL-free value of at most 128 characters")
+    return normalized
+
+
+def _workspace_folder_create_intent_sha256(intent: dict) -> str:
+    payload = json.dumps(intent, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _workspace_folder_create_replay_in_session(
+        s, *, uid: str, request_id: str, intent_sha256: str) -> dict | None:
+    replay = s.get(WorkspaceFolderCreateReplay, (uid, request_id), with_for_update=True)
+    if replay is None:
+        return None
+    if replay.intent_sha256 != intent_sha256:
+        raise ValueError("Folder create request id was reused for a different semantic request")
+    try:
+        result = json.loads(replay.result_doc)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - committed server record
+        raise RuntimeError("Folder create replay record is corrupt") from exc
+    if not isinstance(result, dict):  # pragma: no cover - committed server record
+        raise RuntimeError("Folder create replay record is corrupt")
+    return result
+
+
+def workspace_create_folder_action(*, uid: str, parent_id: str,
+                                   expected_parent_version: int, name: str,
+                                   request_id: str) -> dict:
+    """Create one local Folder at an exact parent, with durable unknown-outcome replay."""
+    normalized_name = _workspace_name(name)
+    normalized_request_id = _workspace_folder_create_request_id(request_id)
+    intent_sha256 = _workspace_folder_create_intent_sha256({
+        "parentId": str(parent_id), "expectedParentVersion": int(expected_parent_version),
+        "name": normalized_name,
+    })
+    with _workspace_write_session() as s:
+        replay = _workspace_folder_create_replay_in_session(
+            s, uid=uid, request_id=normalized_request_id, intent_sha256=intent_sha256)
+        if replay is not None:
+            return replay
+        parent = _workspace_container_at_version(s, str(parent_id), expected_parent_version)
+        if _workspace_external_overlay_anchor_for_container(s, parent.id) is not None:
+            raise ValueError("a provider location does not support local Folder changes")
+        if s.scalar(select(WorkspaceContainer.id).where(
+                WorkspaceContainer.parent_id == parent.id,
+                WorkspaceContainer.name == normalized_name,
+                WorkspaceContainer.catalog_folder_id.is_(None))) is not None:
+            raise WorkspaceNameConflict(
+                f"workspace container '{normalized_name}' already exists under its parent")
+        row = WorkspaceContainer(parent_id=parent.id, name=normalized_name, ordinal=0)
+        s.add(row)
+        s.flush()
+        result = {"ok": True, "resource": _workspace_container_resource(s, row)}
+        s.add(WorkspaceFolderCreateReplay(
+            owner_id=uid, request_id=normalized_request_id, intent_sha256=intent_sha256,
+            result_doc=json.dumps(result, separators=(",", ":")),
+        ))
+        s.flush()
+        return result
+
+
+def workspace_rename_folder_action(*, container_id: str, expected_version: int, name: str) -> dict:
+    """Rename one locally managed Folder without moving it or changing its opaque identity."""
+    updated = workspace_update_container(
+        container_id, expected_version=expected_version, name=name)
+    with session() as s:
+        row = s.get(WorkspaceContainer, updated["id"])
+        if row is None:  # pragma: no cover - update committed it
+            raise RuntimeError("renamed Workspace Folder is missing")
+        return {"ok": True, "resource": _workspace_container_resource(s, row)}
+
+
+def workspace_delete_folder_action(*, container_id: str, expected_version: int) -> dict:
+    """Delete only an empty locally managed Folder; children and placements are never rehomed."""
+    workspace_delete_container(container_id, expected_version=expected_version)
+    return {"ok": True}
+
+
 def _workspace_parent_is_descendant(s, candidate_parent_id: str, container_id: str) -> bool:
     current_id: str | None = candidate_parent_id
     while current_id is not None:
@@ -4915,7 +5009,43 @@ def _workspace_after(ordinal_column, name_column, id_column, rank: int, cursor):
     )
 
 
-def _workspace_container_resource(row: WorkspaceContainer) -> dict:
+def _workspace_folder_capabilities(s, row: WorkspaceContainer) -> dict:
+    """Report only mutation authority that the local Workspace can actually exercise."""
+    if _workspace_external_overlay_anchor_for_container(s, row.id) is not None:
+        return {
+            "canCreateFolder": False, "canRenameFolder": False, "canDeleteFolder": False,
+            "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
+        }
+    if row.catalog_folder_state == "detached":
+        return {
+            "canCreateFolder": False, "canRenameFolder": False, "canDeleteFolder": False,
+            "folderMutationUnavailableReason": "This Folder is detached and read-only.",
+        }
+    if row.is_root:
+        return {
+            "canCreateFolder": True, "canRenameFolder": False, "canDeleteFolder": False,
+            "folderMutationUnavailableReason": "The Workspace root cannot be renamed or deleted.",
+        }
+    if row.catalog_folder_id is not None:
+        return {
+            "canCreateFolder": True, "canRenameFolder": False, "canDeleteFolder": False,
+            "folderMutationUnavailableReason": "This Folder is managed by the Catalog.",
+        }
+    has_children = s.scalar(select(WorkspaceContainer.id).where(
+        WorkspaceContainer.parent_id == row.id).limit(1)) is not None
+    has_placements = s.scalar(select(WorkspacePlacement.id).where(
+        WorkspacePlacement.container_id == row.id).limit(1)) is not None
+    return {
+        "canCreateFolder": True,
+        "canRenameFolder": True,
+        "canDeleteFolder": not has_children and not has_placements,
+        **({} if not has_children and not has_placements else {
+            "folderMutationUnavailableReason": "Move or remove this Folder's contents before deleting it.",
+        }),
+    }
+
+
+def _workspace_container_resource(s, row: WorkspaceContainer) -> dict:
     return {
         "id": _workspace_ref("container", row.id), "kind": "container", "name": row.name,
         "parentId": _workspace_ref("container", row.parent_id) if row.parent_id else None,
@@ -4923,6 +5053,7 @@ def _workspace_container_resource(row: WorkspaceContainer) -> dict:
         "catalogFolderId": row.catalog_folder_id,
         "catalogFolderState": row.catalog_folder_state,
         "catalogFolderPath": row.catalog_folder_path,
+        **_workspace_folder_capabilities(s, row),
     }
 
 
@@ -4960,13 +5091,17 @@ def _workspace_provider_container_resource(
         "lastResolvedAt": binding.last_resolved_at,
         "localPlacement": local_placement,
         "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
     }
 
 
 def _workspace_public_container_resource(s, row: WorkspaceContainer) -> dict:
     anchor = _workspace_external_overlay_anchor_for_container(s, row.id)
     if anchor is None:
-        return _workspace_container_resource(row)
+        return _workspace_container_resource(s, row)
     binding = s.get(WorkspaceProviderBinding, anchor.binding_id)
     if binding is None or binding.kind != "container":  # pragma: no cover - FK-protected invariant
         raise RuntimeError("external Workspace overlay anchor binding is missing")
@@ -5353,7 +5488,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
 
         rows: list[tuple[tuple, dict]] = []
         for row in containers:
-            rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(row)))
+            rows.append(((row.ordinal, 0, row.name, row.id), _workspace_container_resource(s, row)))
         for row in placements:
             rank = {"canvas": 1, "dataset": 2, "dataset_view": 3}[row.target_kind]
             live = (row.target_id in live_canvases if row.target_kind == "canvas" else
@@ -5365,7 +5500,7 @@ def workspace_browse(container_id: str, *, uid: str, limit: int = 50,
         has_more = len(rows) > limit
         next_cursor = (_workspace_cursor_encode(*page[-1][0]) if has_more and page else None)
         return {
-            "container": _workspace_container_resource(container),
+            "container": _workspace_container_resource(s, container),
             "items": [item for _key, item in page], "nextCursor": next_cursor,
             "hasMore": has_more, "completeness": "page" if has_more else "complete",
         }
@@ -5518,7 +5653,7 @@ def workspace_search(query: str, *, uid: str, limit: int = 25,
             CatalogEntry.registration_id.in_(dataset_ids)))) if dataset_ids else set()
         rows: list[tuple[tuple[str, int, str], dict]] = []
         rows.extend(
-            ((row.name.lower(), 0, row.id), _workspace_container_resource(row))
+            ((row.name.lower(), 0, row.id), _workspace_container_resource(s, row))
             for row in containers
         )
         rows.extend(
@@ -5559,7 +5694,7 @@ def _workspace_ancestors(s, container_id: str) -> list[dict]:
         row = s.get(WorkspaceContainer, current_id)
         if row is None:
             raise RuntimeError("Workspace placement parent is missing")
-        ancestors.append(_workspace_container_resource(row))
+        ancestors.append(_workspace_container_resource(s, row))
         current_id = row.parent_id
     return list(reversed(ancestors))
 
@@ -5577,7 +5712,7 @@ def workspace_resolve(resource_id: str, *, uid: str) -> dict:
             row = s.get(WorkspaceContainer, identity)
             if row is None or _workspace_external_overlay_anchor_for_container(s, identity) is not None:
                 raise KeyError(f"Workspace resource '{resource_id}' not found")
-            return {"resource": _workspace_container_resource(row),
+            return {"resource": _workspace_container_resource(s, row),
                     "ancestors": _workspace_ancestors(s, row.parent_id) if row.parent_id else []}
         placement = s.scalar(select(WorkspacePlacement).where(
             WorkspacePlacement.target_kind == kind, WorkspacePlacement.target_id == identity,
