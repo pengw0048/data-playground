@@ -112,6 +112,12 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
     return mounts, invalid
 
 
+def is_configured_mount_container(container_id: str) -> bool:
+    """Whether operator configuration reserves this local Folder as a provider mount point."""
+    mounts, _invalid = _configured_mounts()
+    return any(mounted.container_id == container_id for mounted in mounts)
+
+
 @functools.lru_cache(maxsize=64)
 def _provider_factory(name: str) -> Callable[[], object]:
     entry = next((item for item in entry_points(group="dataplay.catalog_providers")
@@ -433,6 +439,10 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         "lastResolvedAt": binding["lastResolvedAt"],
         "localPlacement": local_placement,
         "providerMutation": False,
+        "canCreateFolder": False,
+        "canRenameFolder": False,
+        "canDeleteFolder": False,
+        "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
     }
 
 

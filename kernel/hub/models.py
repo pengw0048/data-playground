@@ -711,6 +711,12 @@ class WorkspaceResource(Wire):
     last_known: bool = False
     last_resolved_at: datetime.datetime | None = None
     local_placement: WorkspaceLocalPlacementCapability | None = None
+    # Folder authority is local and explicit.  A provider/overlay location may still expose a
+    # local Canvas placement capability, but it must never be mistaken for Folder mutation rights.
+    can_create_folder: bool = False
+    can_rename_folder: bool = False
+    can_delete_folder: bool = False
+    folder_mutation_unavailable_reason: str | None = Field(default=None, max_length=256)
     # Provider mounts stay source-only.  This explicit false is intentionally independent of the
     # local placement capability so clients cannot mistake a local Canvas move for provider writeback.
     provider_mutation: bool = False

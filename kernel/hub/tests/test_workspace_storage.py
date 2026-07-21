@@ -7,6 +7,7 @@ import base64
 import contextlib
 import datetime
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -109,6 +110,77 @@ def test_root_and_container_paths_are_stable_and_local(workspace_scope):
             right["id"], expected_version=right["version"], parent_id=left["id"])
 
 
+def test_workspace_folder_actions_are_capability_gated_cas_safe_and_replayable(workspace_scope):
+    root = metadb.local_workspace_root()
+    request_id = str(uuid.uuid4())
+    with TestClient(app) as client:
+        created = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Research", "requestId": request_id,
+        })
+        assert created.status_code == 200, created.text
+        folder = created.json()["resource"]
+        assert folder["id"].startswith("container:")
+        assert folder["canCreateFolder"] is True
+        assert folder["canRenameFolder"] is True
+        assert folder["canDeleteFolder"] is True
+
+        replay = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Research", "requestId": request_id,
+        })
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["resource"]["id"] == folder["id"]
+        conflict = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Different", "requestId": request_id,
+        })
+        assert conflict.status_code == 422
+
+        folder_id = folder["id"].removeprefix("container:")
+        canvas = metadb.workspace_create_canvas_action(
+            uid=metadb.DEFAULT_USER_ID, container_id=folder_id,
+            expected_container_version=folder["version"], name="Placed canvas")
+        renamed = client.patch(f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": folder["version"], "name": "Renamed research",
+        })
+        assert renamed.status_code == 200, renamed.text
+        renamed_folder = renamed.json()["resource"]
+        assert renamed_folder["id"] == folder["id"]
+        assert renamed_folder["name"] == "Renamed research"
+        canvas_resolution = client.get(f"/api/workspace/resources/canvas:{canvas['id']}")
+        assert canvas_resolution.status_code == 200, canvas_resolution.text
+        assert canvas_resolution.json()["resource"]["parentId"] == folder["id"]
+        stale = client.patch(f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": folder["version"], "name": "Stale rename",
+        })
+        assert stale.status_code == 409
+        nonempty_delete = client.request("DELETE", f"/api/workspace/folders/{folder_id}", json={
+            "expectedVersion": renamed_folder["version"],
+        })
+        assert nonempty_delete.status_code == 422
+
+        empty = client.post("/api/workspace/folders", json={
+            "parentId": root["id"], "expectedParentVersion": root["version"],
+            "name": "Empty", "requestId": str(uuid.uuid4()),
+        })
+        assert empty.status_code == 200, empty.text
+        empty_resource = empty.json()["resource"]
+        empty_id = empty_resource["id"].removeprefix("container:")
+        deleted = client.request("DELETE", f"/api/workspace/folders/{empty_id}", json={
+            "expectedVersion": empty_resource["version"],
+        })
+        assert deleted.status_code == 200, deleted.text
+        assert client.get(f"/api/workspace/resources/{empty_resource['id']}").status_code == 404
+
+        root_page = client.get(f"/api/workspace/containers/{root['id']}")
+        assert root_page.status_code == 200, root_page.text
+        root_resource = root_page.json()["container"]
+        assert root_resource["canCreateFolder"] is True
+        assert root_resource["canRenameFolder"] is False
+        assert root_resource["canDeleteFolder"] is False
+
+
 def test_delete_recreate_and_placement_moves_preserve_independent_targets(workspace_scope):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root_id = metadb.local_workspace_root()["id"]
@@ -209,6 +281,8 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
         uid=metadb.DEFAULT_USER_ID, container_id=projection_id,
         expected_container_version=projection_version, name="Folder overlay")
     nested = metadb.workspace_create_container(projection_id, f"workspace-{token}-nested-overlay")
+    recovery_cleanup = metadb.workspace_create_container(
+        nested["id"], f"workspace-{token}-recovery-cleanup")
     metadb.catalog_folder_rename(original.rsplit("/", 1)[0], renamed.rsplit("/", 1)[0])
     with metadb.session() as session:
         renamed_folder = session.scalar(select(metadb.CatalogFolder).where(
@@ -246,6 +320,36 @@ def test_catalog_folder_projection_preserves_identity_and_tombstones_canvas_over
             created["resource"]["placementId"],
             expected_version=created["resource"]["version"],
             container_id=nested["id"])
+    with TestClient(app) as client:
+        nested_resource = client.get(f"/api/workspace/resources/container:{nested['id']}")
+        assert nested_resource.status_code == 200, nested_resource.text
+        nested_dto = nested_resource.json()["resource"]
+        assert nested_dto["canCreateFolder"] is False
+        assert nested_dto["canRenameFolder"] is False
+        assert nested_dto["canDeleteFolder"] is False
+        assert nested_dto["folderMutationUnavailableReason"] == (
+            "This Folder is below a detached Catalog folder and is not empty."
+        )
+        blocked_create = client.post("/api/workspace/folders", json={
+            "parentId": nested["id"], "expectedParentVersion": nested["version"],
+            "name": "Blocked", "requestId": str(uuid.uuid4()),
+        })
+        assert blocked_create.status_code == 422
+        blocked_rename = client.patch(f"/api/workspace/folders/{nested['id']}", json={
+            "expectedVersion": nested["version"], "name": "Blocked rename",
+        })
+        assert blocked_rename.status_code == 422
+        cleanup_resource = client.get(
+            f"/api/workspace/resources/container:{recovery_cleanup['id']}")
+        assert cleanup_resource.status_code == 200, cleanup_resource.text
+        cleanup_dto = cleanup_resource.json()["resource"]
+        assert cleanup_dto["canCreateFolder"] is False
+        assert cleanup_dto["canRenameFolder"] is False
+        assert cleanup_dto["canDeleteFolder"] is True
+        cleaned = client.request("DELETE", f"/api/workspace/folders/{recovery_cleanup['id']}", json={
+            "expectedVersion": recovery_cleanup["version"],
+        })
+        assert cleaned.status_code == 200, cleaned.text
     escaped = metadb.workspace_update_container(
         nested["id"], expected_version=nested["version"],
         parent_id=metadb.LOCAL_WORKSPACE_ROOT_ID)
@@ -1030,6 +1134,87 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
     # A timed-out synchronous read is intentionally allowed to finish in the bounded executor. Let
     # this fixture relinquish its two short-lived leases before later concurrency-cap tests run.
     time.sleep(0.03)
+
+
+def test_workspace_configured_mount_point_cannot_be_deleted(workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-configured-provider-mount")
+    provider = _WorkspaceFixtureProvider()
+    provider_search_calls = 0
+    provider_search = provider.search
+
+    def counted_search(*args, **kwargs):
+        nonlocal provider_search_calls
+        provider_search_calls += 1
+        return provider_search(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "search", counted_search)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    mount_config = json.dumps([{
+        "id": "protected-folder", "provider": "fixture", "containerId": folder["id"],
+    }])
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", mount_config)
+
+    def assert_delete_fenced(resource):
+        assert resource["id"] == f"container:{folder['id']}"
+        assert resource["canCreateFolder"] is True
+        assert resource["canRenameFolder"] is True
+        assert resource["canDeleteFolder"] is False
+        assert resource["folderMutationUnavailableReason"] == (
+            "This Folder is configured as a provider mount point and cannot be deleted."
+        )
+
+    with TestClient(app) as client:
+        parent = client.get(f"/api/workspace/containers/{root['id']}", params={"limit": 100})
+        assert parent.status_code == 200, parent.text
+        parent_row = next(
+            item for item in parent.json()["items"]
+            if item["id"] == f"container:{folder['id']}")
+        assert_delete_fenced(parent_row)
+
+        browsed = client.get(f"/api/workspace/containers/{folder['id']}")
+        assert browsed.status_code == 200, browsed.text
+        assert any(item.get("resourceId") == "dataset-a" for item in browsed.json()["items"])
+        assert_delete_fenced(browsed.json()["container"])
+
+        resolved = client.get(f"/api/workspace/resources/container:{folder['id']}")
+        assert resolved.status_code == 200, resolved.text
+        assert_delete_fenced(resolved.json()["resource"])
+
+        searched = client.get("/api/workspace/search", params={"q": folder["name"]})
+        assert searched.status_code == 200, searched.text
+        local_group = next(
+            group for group in searched.json()["groups"] if group["source"]["id"] == "local")
+        search_row = next(
+            item for item in local_group["items"]
+            if item["id"] == f"container:{folder['id']}")
+        assert_delete_fenced(search_row)
+
+        provider_calls_before_delete = (provider.list_calls, provider_search_calls)
+        engine = metadb._engine
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+            statements.append(statement.lower())
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            deleted = client.request("DELETE", f"/api/workspace/folders/{folder['id']}", json={
+                "expectedVersion": folder["version"],
+            })
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert deleted.status_code == 422
+        assert (provider.list_calls, provider_search_calls) == provider_calls_before_delete
+        assert not any(statement.lstrip().startswith(("insert", "update", "delete"))
+                       for statement in statements)
+        assert os.environ["DP_CATALOG_MOUNTS"] == mount_config
+
+        after = client.get(f"/api/workspace/resources/container:{folder['id']}")
+        assert after.status_code == 200, after.text
+        assert_delete_fenced(after.json()["resource"])
 
 
 def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
