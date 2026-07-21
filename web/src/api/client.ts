@@ -703,14 +703,17 @@ export interface BoundedFanoutJobDto {
 }
 export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
-export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null }
+export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write'
+export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; name?: string | null }
+export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
 export interface InboxItemDto {
   id: string
   taskId: string
-  canvasId: string
+  canvasId?: string | null
   canvasName?: string | null
+  datasetContext?: DatasetTaskContextDto | null
   taskKind: InboxTaskKind
   outcome: 'completed' | 'failed' | 'cancelled'
   diagnosticCode?: string | null
@@ -723,6 +726,8 @@ export type InboxTaskKind =
   | 'external_wait'
   | 'linear_checkpoint_write'
   | 'bounded_fanout_write'
+  | 'restore_revision_write'
+  | 'keyed_upsert_write'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface InboxUnreadCount { count: number }
 export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }

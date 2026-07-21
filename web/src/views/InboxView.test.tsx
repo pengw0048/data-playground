@@ -123,6 +123,19 @@ describe('InboxView', () => {
     expect(screen.queryByText('Unread', { selector: 'span' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull()
   })
+
+  it('renders a canvas-less dataset item with a revision-history deep-link', async () => {
+    mocks.inboxList.mockResolvedValue({ items: [item({
+      taskKind: 'keyed_upsert_write', canvasId: null, canvasName: null, readAt: '2026-07-17T12:05:00Z',
+      datasetContext: { taskKind: 'keyed_upsert_write', datasetId: 'ds-logical-7', name: 'Sensor upserts' },
+    })], hasMore: false, nextCursor: null })
+    render(<InboxView />)
+    await screen.findByText('Sensor upserts')
+    expect(screen.getByText('Keyed upsert')).toBeInTheDocument()
+    expect(screen.queryByText(/authorization revoked/i)).toBeNull()
+    const link = screen.getByRole('link', { name: 'Revision history' })
+    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')
+  })
 })
 
 describe('mergeMonotonic (load-more ordering)', () => {

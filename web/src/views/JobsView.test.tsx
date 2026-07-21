@@ -418,4 +418,18 @@ describe('JobsView', () => {
     expect(screen.getByText('Phase:').closest('div')).toHaveTextContent('Phase: Checkpoint · materializing')
     expect(screen.getByText('Checkpoint:').closest('div')).toHaveTextContent('checkpoint:out')
   })
+
+  it('renders a canvas-less dataset task with a revision-history deep-link', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      id: 't:restore-1', runId: 'restore-1', status: 'done', canvasId: null, canvasName: null,
+      taskId: 'restore-1', nodeLabel: 'Climate observations', error: null,
+      datasetContext: { taskKind: 'restore_revision_write', datasetId: 'ds-logical-9', name: 'Climate observations' },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+
+    expect(await screen.findByText('Dataset restore · Climate observations')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
+    const link = screen.getByRole('link', { name: 'Open revision history' })
+    expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9')
+  })
 })
