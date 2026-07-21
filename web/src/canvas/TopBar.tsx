@@ -155,6 +155,7 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativ
   const setView = useStore((s) => s.setView)
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
+  const inboxQuery = useStore((s) => s.inboxQuery)
   const newFile = useStore((s) => s.newFile)
   const foreignImporterAvailable = useStore((s) => s.kernelInfo?.capabilities.includes('pipeline-importer') ?? false)
   return (
@@ -177,7 +178,7 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativ
         {foreignImporterAvailable && <DropdownMenuItem data-testid="import-pipeline" onSelect={() => setTimeout(onImport)}><Icon name="import" size={14} /> Import pipeline…</DropdownMenuItem>}
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => setJobsQuery('')}><Icon name="clock" size={14} /> <MenuDestination label="Jobs" detail="all Workspace work" /></DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => setInboxQuery('')}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my terminal outcomes" /></DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setInboxQuery(inboxQuery)}><Icon name="note" size={14} /> <MenuDestination label="Inbox" detail="my terminal outcomes" /></DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onRunHistory)}><Icon name="clock" size={14} /> <MenuDestination label="Run history" detail="this Canvas audit trail" /></DropdownMenuItem>
         <DropdownMenuItem onSelect={() => setTimeout(onVersionHistory)}><Icon name="refresh" size={14} /> Version history</DropdownMenuItem>
         <DropdownMenuSeparator />
@@ -193,8 +194,9 @@ function MenuDestination({ label, detail }: { label: string; detail: string }) {
 
 function CanvasInboxIndicator({ count }: { count: number }) {
   const setInboxQuery = useStore((s) => s.setInboxQuery)
+  const inboxQuery = useStore((s) => s.inboxQuery)
   const bounded = count > 99 ? '99+' : String(count)
-  return <button type="button" data-testid="canvas-inbox-unread-badge" onClick={() => setInboxQuery('')}
+  return <button type="button" data-testid="canvas-inbox-unread-badge" onClick={() => setInboxQuery(inboxQuery)}
     aria-label={`Inbox, ${count} unread outcomes`} title={`${count} Inbox outcome${count === 1 ? '' : 's'} need attention`}
     className="relative grid h-6 min-w-6 place-items-center rounded-full bg-foreground px-1 text-[10px] font-bold text-background hover:bg-foreground/85">
     {bounded}

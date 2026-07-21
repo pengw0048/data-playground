@@ -727,6 +727,7 @@ export interface InboxItemDto {
   taskKind: InboxTaskKind
   outcome: 'completed' | 'failed' | 'cancelled'
   diagnosticCode?: string | null
+  completedWrite?: { outputName: string; rowCount: number } | null
   terminalAt: string
   readAt?: string | null
   jobAvailable: boolean
@@ -736,6 +737,7 @@ export type InboxTaskKind =
   | 'external_wait'
   | 'linear_checkpoint_write'
   | 'bounded_fanout_write'
+  | 'merge_columns_write'
   | 'restore_revision_write'
   | 'keyed_upsert_write'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }

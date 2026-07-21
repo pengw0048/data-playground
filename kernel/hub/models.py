@@ -1688,6 +1688,13 @@ class DurableTaskDatasetContextView(Wire):
     name: str | None = None
 
 
+class DurableTaskInboxCompletedWriteView(Wire):
+    """Bounded, display-safe facts from one authorized committed Write receipt."""
+
+    output_name: str = Field(min_length=1, max_length=512)
+    row_count: int = Field(ge=0)
+
+
 class DurableTaskInboxItemView(Wire):
     """One personal Inbox outcome for a terminal certified durable TaskAttempt."""
 
@@ -1701,21 +1708,19 @@ class DurableTaskInboxItemView(Wire):
         "bounded_fanout_write", "merge_columns_write",
         "restore_revision_write", "keyed_upsert_write",
     ]
-    execution_manifest_sha256: PlanDigest | None = None
-    execution_manifest_reconstructable: bool = False
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)
+    completed_write: DurableTaskInboxCompletedWriteView | None = None
     terminal_at: datetime.datetime
     read_at: datetime.datetime | None = None
     job_available: bool
 
     @model_validator(mode="after")
-    def _manifest_identity_matches_reconstructability(self) -> "DurableTaskInboxItemView":
-        if self.execution_manifest_reconstructable != (
-                self.execution_manifest_sha256 is not None):
-            raise ValueError("Inbox reconstructability must match its manifest identity")
+    def _inbox_subject_is_consistent(self) -> "DurableTaskInboxItemView":
         if self.dataset_context is not None and self.canvas_id is not None:
             raise ValueError("a canvas-less dataset Inbox item cannot also carry a canvas")
+        if self.completed_write is not None and self.outcome != "completed":
+            raise ValueError("only completed Inbox items can carry a Write summary")
         return self
 
     @model_serializer(mode="wrap")
@@ -1725,6 +1730,8 @@ class DurableTaskInboxItemView(Wire):
         data = handler(self)
         if self.dataset_context is None:
             data.pop("datasetContext", None)
+        if self.completed_write is None:
+            data.pop("completedWrite", None)
         return data
 
 

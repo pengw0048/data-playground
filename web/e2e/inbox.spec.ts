@@ -8,6 +8,7 @@ const completedLocal = {
   taskKind: 'managed_local_write',
   outcome: 'completed',
   diagnosticCode: null,
+  completedWrite: { outputName: 'annual-results', rowCount: 12 },
   terminalAt: '2026-07-17T12:00:00Z',
   readAt: null,
   jobAvailable: true,
@@ -63,16 +64,25 @@ test('Inbox badge, filter, open job, and redacted outcomes @ux-smoke', async ({ 
   })
 
   await page.goto('/#/workspace')
+  await expect(page.getByTestId('inbox-unread-badge')).toHaveCount(1)
   await expect(page.getByTestId('inbox-unread-badge')).toHaveText('3')
   await page.getByTestId('rail-inbox').click()
   await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible()
   await expect(page.getByText('Climate analysis').first()).toBeVisible()
+  await expect(page.getByText('“annual-results” written · 12 rows')).toBeVisible()
   await expect(page.getByText('external wait deadline')).toBeVisible()
-  await expect(page.getByText('Cancelled')).toBeVisible()
+  await expect(page.getByText('Cancelled', { exact: true })).toBeVisible()
   await expect(page.getByText(/traceback|secret boom/i)).toHaveCount(0)
 
   const disabledOpen = page.getByRole('button', { name: 'Open job' }).nth(2)
   await expect(disabledOpen).toBeDisabled()
   await page.getByRole('button', { name: 'Open job' }).first().click()
   await expect(page).toHaveURL(/#\/jobs\?run=task-local/)
+
+  await page.goto('/#/inbox?filter=unread')
+  await page.getByTestId('rail-workspace').click()
+  await page.getByTestId('rail-inbox').click()
+  await expect(page).toHaveURL(/#\/inbox\?filter=unread/)
+  await page.reload()
+  await expect(page.getByRole('combobox', { name: 'Filter inbox items' })).toHaveValue('unread')
 })

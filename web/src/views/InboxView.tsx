@@ -13,10 +13,18 @@ const FILTERS = ['all', 'unread'] as const
 function outcomeLabel(item: InboxItemDto): string {
   if (item.outcome === 'completed') return 'Completed'
   if (item.outcome === 'cancelled') return 'Cancelled'
-  if (item.diagnosticCode) {
-    return item.diagnosticCode.replace(/_/g, ' ')
-  }
   return 'Failed'
+}
+
+function outcomeSummary(item: InboxItemDto): string {
+  if (item.taskKind === 'restore_revision_write' && item.outcome === 'completed') return 'Revision restored'
+  if (item.taskKind === 'keyed_upsert_write' && item.outcome === 'completed') return 'Revision upserted'
+  if (item.completedWrite) {
+    return `“${item.completedWrite.outputName}” written · ${item.completedWrite.rowCount} rows`
+  }
+  if (item.outcome === 'failed' && item.diagnosticCode) return item.diagnosticCode.replace(/_/g, ' ')
+  if (item.outcome === 'failed') return 'Work failed'
+  return item.outcome === 'cancelled' ? 'Cancelled before completion' : 'Finished successfully'
 }
 
 const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
@@ -24,6 +32,7 @@ const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
   external_wait: 'External wait',
   linear_checkpoint_write: 'Checkpointed write',
   bounded_fanout_write: 'Bounded fan-out write',
+  merge_columns_write: 'Merge columns write',
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
 }
@@ -162,7 +171,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
       <header className="flex min-h-[68px] flex-wrap items-center gap-3 border-b border-border px-4 py-3 sm:px-7">
         <div>
           <h1 className="text-[20px] font-bold text-foreground">Inbox</h1>
-          <p className="text-[11.5px] text-muted-foreground">Personal durable Task outcomes</p>
+          <p className="text-[11.5px] text-muted-foreground">Completed work and failures assigned to you</p>
         </div>
         <span className="flex-1" />
         <label className="grid gap-1 text-[10.5px] text-muted-foreground">Filter
@@ -196,7 +205,7 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
         )}
         {!loading && !error && items.length === 0 && (
           <div className="rounded-lg border border-dashed border-border p-8 text-center text-[12.5px] text-muted-foreground">
-            {filter === 'unread' ? 'No unread outcomes.' : 'No durable Task outcomes yet.'}
+            {filter === 'unread' ? 'You’re all caught up.' : 'No completed work yet. Finished runs and failures you own will appear here.'}
           </div>
         )}
         {items.length > 0 && (
@@ -224,9 +233,11 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                         ? (item.datasetContext.name || item.datasetContext.datasetId)
                         : item.canvasName ?? 'Canvas unavailable'}
                     </div>
+                    <div className="mt-0.5 text-[11.5px] text-muted-foreground">{outcomeSummary(item)}</div>
                     <div className="mt-0.5 text-[11.5px] text-muted-foreground">
                       {relTime(item.terminalAt)}
-                      {item.datasetContext && ` · Dataset ${item.datasetContext.datasetId}`}
+                      {item.datasetContext && !item.datasetContext.name
+                        && ` · Dataset ${item.datasetContext.datasetId}`}
                       {item.canvasName == null && !item.datasetContext && ' · authorization revoked or canvas missing'}
                     </div>
                   </div>

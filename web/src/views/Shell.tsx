@@ -57,6 +57,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   const view = useStore((s) => s.view)
   const setView = useStore((s) => s.setView)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
+  const inboxQuery = useStore((s) => s.inboxQuery)
   const currentUser = useStore((s) => s.currentUser)
   const authEnabled = useStore((s) => s.authEnabled)
   const [collapsed, setCollapsed] = useCollapsibleRegion('navigation')
@@ -64,7 +65,7 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
   const logout = async () => { await api.logout().catch(() => {}); location.reload() }
 
   const item = (v: DpView, icon: IconName, label: string, badge?: number) => (
-    <Button variant="ghost" onClick={() => (v === 'inbox' ? setInboxQuery('') : setView(v))} data-testid={`rail-${v}`}
+    <Button variant="ghost" onClick={() => (v === 'inbox' ? setInboxQuery(inboxQuery) : setView(v))} data-testid={`rail-${v}`}
       title={collapsed ? label : undefined}
       aria-label={collapsed ? (badge ? `${label}, ${badge} unread` : label) : undefined}
       className={cn('h-auto w-full gap-2.5 px-2.5 py-2 text-[13px] font-medium text-muted-foreground',
@@ -82,9 +83,6 @@ function Rail({ onSettings, unreadCount }: { onSettings: (trigger: HTMLElement) 
         )}
       </span>
       <span className={collapsed ? 'sr-only' : undefined}>{label}</span>
-      {!collapsed && !!badge && badge > 0 && (
-        <span className="ml-auto text-[11px] font-semibold text-foreground">{badge > 99 ? '99+' : badge}</span>
-      )}
     </Button>
   )
 

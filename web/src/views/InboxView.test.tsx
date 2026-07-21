@@ -51,6 +51,16 @@ describe('InboxView', () => {
     expect(useStore.getState().jobsQuery).toContain('run=task-1')
   })
 
+  it('renders only the bounded committed Write facts and omits an unknown summary', async () => {
+    mocks.inboxList.mockResolvedValue({ items: [
+      item({ completedWrite: { outputName: 'annual-results', rowCount: 42 } }),
+      item({ id: 'unknown-write', canvasName: 'Archive', completedWrite: null }),
+    ], hasMore: false, nextCursor: null })
+    render(<InboxView />)
+    expect(await screen.findByText('“annual-results” written · 42 rows')).toBeInTheDocument()
+    expect(screen.queryByText(/undefined written/i)).toBeNull()
+  })
+
   it('disables Open job when authorization is unavailable and redacts failures', async () => {
     mocks.inboxList.mockResolvedValue({
       items: [item({
@@ -70,12 +80,24 @@ describe('InboxView', () => {
     expect(screen.getByText('Canvas unavailable')).toBeInTheDocument()
   })
 
+  it('never describes a failed item without a diagnostic as successful', async () => {
+    mocks.inboxList.mockResolvedValue({
+      items: [item({ outcome: 'failed', diagnosticCode: null })],
+      hasMore: false,
+      nextCursor: null,
+    })
+    render(<InboxView />)
+    expect(await screen.findByText('Work failed')).toBeInTheDocument()
+    expect(screen.queryByText('Finished successfully')).toBeNull()
+  })
+
   it('labels every declared task kind for each terminal outcome and diagnoses unknown runtime kinds', async () => {
     const kinds = [
       ['managed_local_write', 'Managed local write'],
       ['external_wait', 'External wait'],
       ['linear_checkpoint_write', 'Checkpointed write'],
       ['bounded_fanout_write', 'Bounded fan-out write'],
+      ['merge_columns_write', 'Merge columns write'],
     ] as const
     const outcomes = ['completed', 'failed', 'cancelled'] as const
     const rows = kinds.flatMap(([taskKind, label]) => outcomes.map((outcome) => item({
@@ -99,8 +121,7 @@ describe('InboxView', () => {
         const row = within(screen.getByTestId(`inbox-item-${taskKind}-${outcome}`))
         expect(row.getByText(label)).toBeInTheDocument()
         expect(row.getByText(outcome === 'completed' ? 'Completed' : outcome === 'failed'
-          ? `${taskKind} failed`.replace(/_/g, ' ')
-          : 'Cancelled')).toBeInTheDocument()
+          ? 'Failed' : 'Cancelled')).toBeInTheDocument()
       }
     }
     expect(within(screen.getByTestId('inbox-item-future-kind')).getByText('Unknown task type: future_task_kind')).toBeInTheDocument()
@@ -124,6 +145,33 @@ describe('InboxView', () => {
     expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull()
   })
 
+  it('keeps the item unread until mark-read succeeds', async () => {
+    let resolveMark!: (value: ReturnType<typeof item>) => void
+    const onUnreadChange = vi.fn()
+    mocks.inboxMarkRead.mockReturnValueOnce(new Promise((resolve) => { resolveMark = resolve }))
+    render(<InboxView onUnreadChange={onUnreadChange} />)
+    await screen.findByText('Climate analysis')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Mark read' }))
+    expect(screen.getByText('Unread', { selector: 'span' })).toBeInTheDocument()
+    resolveMark(item({ readAt: '2026-07-17T12:05:00Z' }))
+    await waitFor(() => expect(screen.queryByText('Unread', { selector: 'span' })).toBeNull())
+    expect(onUnreadChange).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes server truth and the badge callback when mark-read fails', async () => {
+    const onUnreadChange = vi.fn()
+    mocks.inboxList
+      .mockResolvedValueOnce({ items: [item()], hasMore: false, nextCursor: null })
+      .mockResolvedValueOnce({ items: [item({ readAt: '2026-07-17T12:06:00Z' })], hasMore: false, nextCursor: null })
+    mocks.inboxMarkRead.mockRejectedValueOnce(new Error('network lost'))
+    render(<InboxView onUnreadChange={onUnreadChange} />)
+    await screen.findByText('Climate analysis')
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Mark read' }))
+    await waitFor(() => expect(mocks.inboxList).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Mark read' })).toBeNull())
+    expect(onUnreadChange).toHaveBeenCalledTimes(1)
+  })
+
   it('renders a canvas-less dataset item with a revision-history deep-link', async () => {
     mocks.inboxList.mockResolvedValue({ items: [item({
       taskKind: 'keyed_upsert_write', canvasId: null, canvasName: null, readAt: '2026-07-17T12:05:00Z',
@@ -132,6 +180,8 @@ describe('InboxView', () => {
     render(<InboxView />)
     await screen.findByText('Sensor upserts')
     expect(screen.getByText('Keyed upsert')).toBeInTheDocument()
+    expect(screen.getByText('Revision upserted')).toBeInTheDocument()
+    expect(screen.queryByText('Dataset ds-logical-7')).toBeNull()
     expect(screen.queryByText(/authorization revoked/i)).toBeNull()
     const link = screen.getByRole('link', { name: 'Revision history' })
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')

@@ -70,6 +70,21 @@ test('a real managed Write opens its exact Job from Canvas and after reload @ux-
     await expect(history.getByRole('button', { name: 'View in Jobs' })).toHaveCount(1)
     await history.getByRole('button', { name: 'View in Jobs' }).click()
     await expect(page).toHaveURL(new RegExp(`#\\/jobs\\?run=${runId}$`))
+
+    // The real owner-scoped Inbox projection is deliberately tiny: it carries only the human
+    // output name and exact row count, never the receipt/path/revision identity used by Jobs.
+    const inbox = await json<{ items: Array<{
+      taskId: string; completedWrite?: { outputName: string; rowCount: number }; [key: string]: unknown
+    }> }>(await page.request.get('/api/inbox?filter=unread'), 'read real Inbox outcome')
+    const outcome = inbox.items.find((item) => item.taskId === runId)
+    expect(outcome?.completedWrite?.outputName).toBeTruthy()
+    expect(outcome?.completedWrite?.rowCount).toBeGreaterThanOrEqual(0)
+    expect(outcome).not.toHaveProperty('outputReceipt')
+    expect(outcome).not.toHaveProperty('executionManifestSha256')
+    await page.goto('/#/inbox?filter=unread')
+    await expect(page.getByText(
+      `“${outcome!.completedWrite!.outputName}” written · ${outcome!.completedWrite!.rowCount} rows`,
+    )).toBeVisible()
   } finally { /* no shared execution settings are changed by this journey */ }
 })
 

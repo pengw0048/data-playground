@@ -4331,6 +4331,28 @@
         "title": "DurableTaskDatasetContextView",
         "type": "object"
       },
+      "DurableTaskInboxCompletedWriteView": {
+        "description": "Bounded, display-safe facts from one authorized committed Write receipt.",
+        "properties": {
+          "outputName": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Outputname",
+            "type": "string"
+          },
+          "rowCount": {
+            "minimum": 0.0,
+            "title": "Rowcount",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "outputName",
+          "rowCount"
+        ],
+        "title": "DurableTaskInboxCompletedWriteView",
+        "type": "object"
+      },
       "DurableTaskInboxItemView": {
         "description": "One personal Inbox outcome for a terminal certified durable TaskAttempt.",
         "properties": {
@@ -4356,6 +4378,16 @@
             ],
             "title": "Canvasname"
           },
+          "completedWrite": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableTaskInboxCompletedWriteView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "datasetContext": {
             "anyOf": [
               {
@@ -4377,25 +4409,6 @@
               }
             ],
             "title": "Diagnosticcode"
-          },
-          "executionManifestReconstructable": {
-            "default": false,
-            "title": "Executionmanifestreconstructable",
-            "type": "boolean"
-          },
-          "executionManifestSha256": {
-            "anyOf": [
-              {
-                "maxLength": 64,
-                "minLength": 64,
-                "pattern": "^[0-9a-f]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Executionmanifestsha256"
           },
           "id": {
             "title": "Id",

@@ -91,6 +91,8 @@ def test_inbox_routes_owner_isolation_cursor_and_mark_read():
     assert "error" not in body
     assert "ownerId" not in body
     assert "diagnosticCode" in body
+    assert "executionManifestSha256" not in body
+    assert "outputReceipt" not in body
 
     stranger = client.get("/api/inbox", headers={"X-DP-User": owner_b})
     assert {row["taskId"] for row in stranger.json()["items"]} == {task_b["id"]}

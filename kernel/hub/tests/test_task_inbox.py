@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import uuid
 
@@ -134,8 +135,8 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     done_items = _inbox_for(uid, done_task["id"])
     assert len(done_items) == 1
     assert done_items[0]["outcome"] == "completed"
-    assert done_items[0]["execution_manifest_sha256"] == done_task[
-        "execution_manifest_sha256"]
+    assert done_items[0]["completed_write"] == {"output_name": "result", "row_count": 1}
+    assert "execution_manifest_sha256" not in done_items[0]
     assert done_task["attempts"][0]["execution_manifest_sha256"] == done_task[
         "execution_manifest_sha256"]
     finished = metadb.durable_task(done_task["id"])
@@ -153,8 +154,7 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
         failed_task["id"], attempt["id"], "owner-fail", failed.model_dump())
     failed_items = _inbox_for(uid, failed_task["id"])
     assert len(failed_items) == 1 and failed_items[0]["outcome"] == "failed"
-    assert failed_items[0]["execution_manifest_sha256"] == failed_task[
-        "execution_manifest_sha256"]
+    assert failed_items[0].get("completed_write") is None
     # Raw exception text must not become a diagnostic code.
     assert failed_items[0]["diagnostic_code"] is None
 
@@ -163,8 +163,7 @@ def test_managed_local_completed_failed_cancelled_emit_one_item_each():
     assert metadb.claim_durable_task(cancel_task["id"], "owner-cancel") is None
     cancel_items = _inbox_for(uid, cancel_task["id"])
     assert len(cancel_items) == 1 and cancel_items[0]["outcome"] == "cancelled"
-    assert cancel_items[0]["execution_manifest_sha256"] == cancel_task[
-        "execution_manifest_sha256"]
+    assert cancel_items[0].get("completed_write") is None
 
 
 def test_stale_owner_and_progress_emit_nothing():
@@ -176,12 +175,45 @@ def test_stale_owner_and_progress_emit_nothing():
     assert metadb.update_durable_task_status(
         task["id"], attempt["id"], "owner", running.model_dump()) is True
     assert _inbox_for(uid, task["id"]) == []
-
     stale = RunStatus(
         run_id=task["id"], status="failed", target_node_id="write", error="late")
     assert metadb.finish_durable_task_attempt(
         task["id"], attempt["id"], "not-owner", stale.model_dump()) is False
     assert _inbox_for(uid, task["id"]) == []
+
+
+def test_completed_summary_omits_corrupt_embedded_receipt_mismatch():
+    uid, canvas_id = _user_canvas("summary-corrupt")
+    task = _submit_local(uid, canvas_id)
+    attempt = metadb.claim_durable_task(task["id"], "owner")["attempts"][-1]
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt["id"], "owner",
+        _done_status(task["id"], task["write_intent"]["idempotencyKey"]))
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"], with_for_update=True)
+        status = json.loads(row.status_doc)
+        embedded = status["outputs"][0]["write_receipt"]
+        embedded["revision_id"] = "different-revision"
+        embedded["head"]["revision_id"] = "different-revision"
+        row.status_doc = json.dumps(status)
+    item = _inbox_for(uid, task["id"])[0]
+    assert item.get("completed_write") is None
+
+
+def test_completed_summary_omits_status_with_a_different_run_identity():
+    uid, canvas_id = _user_canvas("summary-run-identity")
+    task = _submit_local(uid, canvas_id)
+    attempt = metadb.claim_durable_task(task["id"], "owner")["attempts"][-1]
+    assert metadb.finish_durable_task_attempt(
+        task["id"], attempt["id"], "owner",
+        _done_status(task["id"], task["write_intent"]["idempotencyKey"]))
+    with metadb.session() as session:
+        row = session.get(metadb.DurableTask, task["id"], with_for_update=True)
+        status = json.loads(row.status_doc)
+        status["run_id"] = "different-run"
+        row.status_doc = json.dumps(status)
+    item = _inbox_for(uid, task["id"])[0]
+    assert item.get("completed_write") is None
 
 
 def test_superseded_attempt_replay_does_not_duplicate_completed_inbox():
@@ -294,8 +326,7 @@ def test_external_wait_terminals_and_corrupt_recovery_emit():
     assert len(items) == 1
     assert items[0]["outcome"] == "failed"
     assert items[0]["diagnostic_code"] == "external_wait_deadline"
-    assert items[0]["execution_manifest_sha256"] == deadline_task[
-        "execution_manifest_sha256"]
+    assert "execution_manifest_sha256" not in items[0]
 
     cancel_submission = str(uuid.uuid4())
     cancel_intent = {**intent, "idempotencyKey": f"external-wait-test:{cancel_submission}"}
@@ -340,13 +371,15 @@ def test_owner_list_count_mark_read_and_cross_owner_isolation():
     owner_b, canvas_b = _user_canvas("owner-b")
     task_a = _submit_local(owner_a, canvas_a)
     task_b = _submit_local(owner_b, canvas_b)
-    for task, owner_token in ((task_a, "a"), (task_b, "b")):
-        claimed = metadb.claim_durable_task(task["id"], owner_token)
-        attempt = claimed["attempts"][-1]
-        failed = RunStatus(
-            run_id=task["id"], status="failed", target_node_id="write", error="x")
-        assert metadb.finish_durable_task_attempt(
-            task["id"], attempt["id"], owner_token, failed.model_dump())
+    claimed_a = metadb.claim_durable_task(task_a["id"], "a")
+    assert metadb.finish_durable_task_attempt(
+        task_a["id"], claimed_a["attempts"][-1]["id"], "a",
+        _done_status(task_a["id"], task_a["write_intent"]["idempotencyKey"]))
+    claimed_b = metadb.claim_durable_task(task_b["id"], "b")
+    failed_b = RunStatus(
+        run_id=task_b["id"], status="failed", target_node_id="write", error="x")
+    assert metadb.finish_durable_task_attempt(
+        task_b["id"], claimed_b["attempts"][-1]["id"], "b", failed_b.model_dump())
 
     page_a = metadb.list_durable_task_inbox_items(owner_a)
     page_b = metadb.list_durable_task_inbox_items(owner_b)
@@ -354,6 +387,8 @@ def test_owner_list_count_mark_read_and_cross_owner_isolation():
     assert {item["task_id"] for item in page_b["items"]} == {task_b["id"]}
     assert page_a["items"][0]["job_available"] is True
     assert page_a["items"][0]["canvas_name"] == "owner-a"
+    assert page_a["items"][0]["completed_write"] == {"output_name": "result", "row_count": 1}
+    assert page_b["items"][0].get("completed_write") is None
     assert metadb.count_durable_task_inbox_unread(owner_a) == 1
     item_a = page_a["items"][0]
     assert metadb.durable_task_inbox_item(owner_b, item_a["id"]) is None
