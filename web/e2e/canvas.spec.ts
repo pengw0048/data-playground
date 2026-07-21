@@ -1699,8 +1699,14 @@ test.describe('Data Playground canvas', () => {
         await route.fulfill({ response, json: body })
       })
       await page.getByRole('combobox', { name: 'mode' }).selectOption('append')
-      const appendAdmission = inspector.getByLabel('Write publication')
-      await expect(appendAdmission).toContainText('Append to the selected dataset')
+      const appendPublication = inspector.getByLabel('Write publication')
+      await expect(appendPublication.getByText('Publication mode').locator('..'))
+        .toContainText('Replace the selected dataset')
+      await expect(appendPublication.getByLabel('Write readiness'))
+        .toContainText('Publication outcome is unknown; no exact receipt was recorded.')
+      const appendDetails = appendPublication.locator('details')
+      await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
+      await expect(appendDetails).toContainText(/Next admission:.*mode append/)
       await expect.poll(() => captured).toBeTruthy()
 
       // Hold the UI request only after it contains its frozen intent. A competing admission from the
