@@ -99,11 +99,21 @@ test('Canvas Inbox count omits failures and refreshes from confirmed mark-read s
   await page.goto(`/#/canvas/${canvasId}`)
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveCount(0)
   unread = 2
+  let releaseCanvas!: () => void
+  const canvasHydration = new Promise<void>((resolve) => { releaseCanvas = resolve })
+  await page.route(`**/api/canvas/${canvasId}`, async (route) => {
+    await canvasHydration
+    await route.continue()
+  })
   await page.reload()
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('2')
   await page.getByTestId('canvas-inbox-unread-badge').click()
+  await expect(page).toHaveURL(/#\/inbox$/)
+  releaseCanvas()
   await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible()
   await page.getByRole('button', { name: 'Mark read' }).click()
+  await expect(page).toHaveURL(/#\/inbox$/)
+  await page.unroute(`**/api/canvas/${canvasId}`)
   await page.goto(`/#/canvas/${canvasId}`)
   await expect(page.getByTestId('canvas-inbox-unread-badge')).toHaveText('1')
 })

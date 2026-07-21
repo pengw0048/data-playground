@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => ({
   bootstrap: vi.fn(),
   initRouter: vi.fn(),
+  settleBootstrap: vi.fn(),
   syncPluginCapabilities: vi.fn(),
 }))
 
@@ -40,6 +41,8 @@ describe('App auth bootstrap', () => {
     })
     vi.restoreAllMocks()
     mocks.bootstrap.mockReset().mockResolvedValue(undefined)
+    mocks.initRouter.mockReset().mockReturnValue({ settleBootstrap: mocks.settleBootstrap })
+    mocks.settleBootstrap.mockReset()
     useStore.setState({ bootstrap: mocks.bootstrap, view: 'canvas', authEnabled: false } as never)
     localStorage.clear()
   })

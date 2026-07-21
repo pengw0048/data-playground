@@ -11,7 +11,8 @@ import type {
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, registerGenericNodes, nodeInvalidReason, numericDraftInvalidReason } from '../nodes/generic'
 import type { SchemaMap } from '../nodes/schema'
-import { parseHash } from '../router'
+import { parseHash, type Route } from '../router'
+import { ownsNavigation, startNavigation, type NavigationToken } from '../navigationOwnership'
 import { exampleDoc } from '../examples'
 import {
   api, KernelError, setApiUser,
@@ -37,6 +38,9 @@ export type CanvasPersistence = 'remote' | 'local-draft'
 export type CanvasCreationResult =
   | { ok: true; canvasId: string; persistence: CanvasPersistence }
   | { ok: false }
+
+type NavigationOptions = { navigationToken?: NavigationToken }
+type OpenFileOptions = NavigationOptions & { serverCopy?: boolean }
 
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
@@ -1082,7 +1086,7 @@ interface Store {
   // fetched/searched ones — NOT the whole catalog (which can be thousands of tables and is browsed
   // server-side, paginated, in the Workspace dataset scope). It exists so canvas source nodes can resolve their
   // columns and pickers have a warm cache; it is never assumed to be complete.
-  bootstrap: () => Promise<void>
+  bootstrap: (options?: NavigationOptions) => Promise<NavigationToken>
   refreshCatalog: () => Promise<void>
   // ensure the tables a canvas's source nodes point at are in the working set (fetched on demand)
   ensureCanvasTables: (doc: CanvasDoc, opts?: { force?: boolean }) => Promise<void>
@@ -1134,6 +1138,8 @@ interface Store {
   setTransformResource: (resourceId: string | null, version?: string | null,
     upgrade?: { canvasId: string; nodeId: string } | null) => void
   setTransformLibraryQuery: (query: string) => void
+  /** Router/bootstrap-only atomic projection of an already parsed route. */
+  applyRoute: (route: Route, navigationToken: NavigationToken) => void
   // drop a catalog dataset / library transform onto the open canvas and navigate to it (Tables/Transforms)
   addToCanvas: (kind: string, config: Partial<NodeConfig>, title?: string) => void
   // a full-viewport Monaco editor for one node's code param (opened from the Inspector)
@@ -1158,7 +1164,7 @@ interface Store {
   files: CanvasFile[]
   refreshFiles: () => Promise<boolean>  // true only when this user's authoritative list was refreshed
   refreshUsers: () => Promise<void>
-  openFile: (id: string, options?: { serverCopy?: boolean }) => Promise<boolean>
+  openFile: (id: string, options?: OpenFileOptions) => Promise<boolean>
   newFile: (options?: { signal?: AbortSignal }) => Promise<CanvasCreationResult>
   newFromExample: (key: string, intent?: ExampleCreationIntent) => Promise<CanvasCreationResult>
   renameFile: (name: string) => void
@@ -1166,7 +1172,7 @@ interface Store {
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
-  openLocalDraft: (draftId: string) => boolean
+  openLocalDraft: (draftId: string, options?: NavigationOptions) => boolean
   retryLocalDraft: (draftId: string) => Promise<void>
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
@@ -1383,6 +1389,7 @@ export const useStore = create<Store>((set, get) => ({
   canvasRole: null,
   view: 'canvas',
   setView: (view) => {
+    startNavigation()
     if (get().view !== view) _fileNavigationGeneration += 1
     set(view === 'transforms' && get().view !== 'transforms'
       ? { view, transformResourceId: null, transformVersion: null,
@@ -1391,25 +1398,30 @@ export const useStore = create<Store>((set, get) => ({
   },
   erFocusUri: null,
   openRelationships: (uri) => {
+    startNavigation()
     if (get().view !== 'relationships') _fileNavigationGeneration += 1
     set({ erFocusUri: uri, view: 'relationships' })
   },
   workspaceResourceId: null,
   setWorkspaceResource: (resourceId) => {
+    startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceResourceId: resourceId, view: 'workspace' })
   },
   workspaceSearchQuery: '',
   setWorkspaceSearchQuery: (query) => {
+    startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceSearchQuery: query.trim().replace(/\s+/g, ' '), view: 'workspace' })
   },
   workspaceScope: 'all',
   setWorkspaceScope: (workspaceScope) => {
+    startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceScope, view: 'workspace' })
   },
   switchWorkspaceScope: (workspaceScope, context) => {
+    startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({
       workspaceScope,
@@ -1420,16 +1432,19 @@ export const useStore = create<Store>((set, get) => ({
   },
   workspaceDatasetQuery: '',
   setWorkspaceDatasetQuery: (workspaceDatasetQuery) => {
+    startNavigation()
     if (get().view !== 'workspace') _fileNavigationGeneration += 1
     set({ workspaceDatasetQuery, view: 'workspace' })
   },
   jobsQuery: '',
   setJobsQuery: (query) => {
+    startNavigation()
     if (get().view !== 'jobs') _fileNavigationGeneration += 1
     set({ jobsQuery: query, view: 'jobs' })
   },
   inboxQuery: '',
   setInboxQuery: (query) => {
+    startNavigation()
     if (get().view !== 'inbox') _fileNavigationGeneration += 1
     set({ inboxQuery: query, view: 'inbox' })
   },
@@ -1439,6 +1454,7 @@ export const useStore = create<Store>((set, get) => ({
   transformUpgradeNodeId: null,
   transformLibraryQuery: '',
   setTransformResource: (transformResourceId, transformVersion = null, upgrade = null) => {
+    startNavigation()
     if (get().view !== 'transforms') _fileNavigationGeneration += 1
     set({
       transformResourceId, transformVersion,
@@ -1448,8 +1464,29 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
   setTransformLibraryQuery: (transformLibraryQuery) => {
+    startNavigation()
     if (get().view !== 'transforms') _fileNavigationGeneration += 1
     set({ transformLibraryQuery, view: 'transforms' })
+  },
+  applyRoute: (route, navigationToken) => {
+    if (!ownsNavigation(navigationToken)) return
+    if (route.view === 'workspace') {
+      const workspaceScope = route.workspaceScope ?? 'all'
+      set({
+        view: 'workspace', workspaceResourceId: route.workspaceResourceId ?? null, workspaceScope,
+        ...(workspaceScope === 'datasets'
+          ? { workspaceDatasetQuery: route.workspaceDatasetQuery ?? '' }
+          : { workspaceSearchQuery: route.workspaceQuery ?? '' }),
+      })
+    } else if (route.view === 'jobs') set({ view: 'jobs', jobsQuery: route.jobsQuery ?? '' })
+    else if (route.view === 'inbox') set({ view: 'inbox', inboxQuery: route.inboxQuery ?? '' })
+    else if (route.view === 'transforms') set({
+      view: 'transforms', transformLibraryQuery: route.transformQuery ?? '',
+      transformResourceId: route.transformId ?? null, transformVersion: route.transformVersion ?? null,
+      transformUpgradeCanvasId: route.transformCanvasId ?? null,
+      transformUpgradeNodeId: route.transformNodeId ?? null,
+    })
+    else set({ view: route.view })
   },
   addToCanvas: (kind, config, title) => {
     if (!roleCanEdit(get().canvasRole)) {
@@ -2767,7 +2804,9 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
-  bootstrap: async () => {
+  bootstrap: async (options) => {
+    const navigationToken = options?.navigationToken ?? startNavigation()
+    const route = parseHash()
     const rememberedUser = localStorage.getItem(LAST_USER_KEY)
     setApiUser(rememberedUser)  // restore chosen user (server defaults to 'local')
     if (!get().authEnabled && confirmedLocalMode() && rememberedUser) {
@@ -2804,10 +2843,11 @@ export const useStore = create<Store>((set, get) => ({
       // Do not infer a fresh workspace from an empty stale list: only an authoritative list can
       // establish that there is no existing Canvas. A local draft is user work too.
       set({ firstRunChoice: filesRefreshed && files.length === 0 && get().localDrafts.length === 0 })
-      // honor a deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
+      // Honor the startup route only while it still owns navigation. The router is already wired,
+      // so a user destination claimed during hydration must not be replaced by this fallback.
+      // A deep link (#/canvas/<id>, incl. a shared canvas resolved server-side); else the
       // last-opened / newest / a fresh file. A #/workspace or #/transforms link still loads a
       // current canvas underneath, then switches to that shell view below.
-      const route = parseHash()
       const last = localStorage.getItem(OPEN_KEY(me.id))
       const fallbackDraft = last ? get().localDrafts.find((draft) => draft.canvasId === last) : undefined
       const fallback = last && files.some((f) => f.id === last) ? last : files[0]?.id
@@ -2816,42 +2856,30 @@ export const useStore = create<Store>((set, get) => ({
       const routeDraft = route.view === 'canvas' && route.canvasId
         ? get().localDrafts.find((draft) => draft.canvasId === route.canvasId)
         : undefined
-      const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId)
-        : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId) : false
-      if (opened && route.view === 'canvas' && route.canvasId && route.nodeId
-          && get().doc.id === route.canvasId) {
-        const nodeExists = get().doc.nodes.some((node) => node.id === route.nodeId)
-        if (nodeExists) {
-          get().select(route.nodeId)
-          get().requestNodeReveal(route.canvasId, route.nodeId)
-        } else get().pushToast('The requested node is no longer in this Canvas.', 'info')
-      }
-      if (!opened) {
-        if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId)
-        else if (fallback) await get().openFile(fallback)
-        // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
-        else get().setView('workspace')
-        // A Workspace dataset/container deep link carries more identity than the top-level view.
-        // Preserve it before initRouter reflects bootstrapped state back into the hash; setting only
-        // the view here would replace a reload of #/workspace/<resource> with bare #/workspace.
-        if (route.view === 'workspace') {
-          get().setWorkspaceResource(route.workspaceResourceId ?? null)
-          get().setWorkspaceScope(route.workspaceScope ?? 'all')
-          if ((route.workspaceScope ?? 'all') === 'datasets') {
-            get().setWorkspaceDatasetQuery(route.workspaceDatasetQuery ?? '')
-          } else get().setWorkspaceSearchQuery(route.workspaceQuery ?? '')
+      if (ownsNavigation(navigationToken)) {
+        const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId, { navigationToken })
+          : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId, { navigationToken }) : false
+        if (ownsNavigation(navigationToken)) {
+          if (opened && route.view === 'canvas' && route.canvasId && route.nodeId
+              && get().doc.id === route.canvasId) {
+            const nodeExists = get().doc.nodes.some((node) => node.id === route.nodeId)
+            if (nodeExists) {
+              get().select(route.nodeId)
+              get().requestNodeReveal(route.canvasId, route.nodeId)
+            } else get().pushToast('The requested node is no longer in this Canvas.', 'info')
+          }
+          if (!opened) {
+            if (fallbackDraft) get().openLocalDraft(fallbackDraft.draftId, { navigationToken })
+            else if (fallback) await get().openFile(fallback, { navigationToken })
+            if (ownsNavigation(navigationToken)) {
+              // A first-run workspace is an intentional choice, not an implicit remote "untitled" Canvas.
+              if (!fallbackDraft && !fallback) get().applyRoute({ view: 'workspace' }, navigationToken)
+              // Apply an exact shell route in one state write, so a first-run deep link cannot briefly
+              // publish a bare Workspace URL or a second history entry.
+              if (route.view !== 'canvas') get().applyRoute(route, navigationToken)
+            }
+          }
         }
-        else if (route.view === 'jobs') get().setJobsQuery(route.jobsQuery ?? '')
-        else if (route.view === 'inbox') get().setInboxQuery(route.inboxQuery ?? '')
-        else if (route.view === 'transforms') {
-          get().setTransformLibraryQuery(route.transformQuery ?? '')
-          get().setTransformResource(
-            route.transformId ?? null, route.transformVersion ?? null,
-            route.transformCanvasId && route.transformNodeId
-              ? { canvasId: route.transformCanvasId, nodeId: route.transformNodeId } : null,
-          )
-        }
-        else if (route.view !== 'canvas') get().setView(route.view)
       }
     } catch {
       // Only a server-confirmed principal may see its local drafts. If identity was confirmed before
@@ -2863,11 +2891,12 @@ export const useStore = create<Store>((set, get) => ({
         const last = localStorage.getItem(OPEN_KEY(principalId))
         const draft = get().localDrafts.find((candidate) => candidate.canvasId === last)
           ?? get().localDrafts[0]
-        if (draft) get().openLocalDraft(draft.draftId)
+        if (draft && ownsNavigation(navigationToken)) get().openLocalDraft(draft.draftId, { navigationToken })
       }
     }
     _bootstrapped = true  // now the real doc is loaded → autosave may persist edits (not the throwaway empty doc)
     void get().refreshSchemas()
+    return navigationToken
   },
 
   refreshFiles: async () => {
@@ -2905,14 +2934,17 @@ export const useStore = create<Store>((set, get) => ({
 
   openFile: async (id, options) => {
     const generation = ++_fileNavigationGeneration
+    const navigationToken = options?.navigationToken ?? startNavigation()
+    if (!ownsNavigation(navigationToken)) return false
     const userId = get().currentUser?.id
     if (!userId) {
       get().pushToast('Your identity is not available yet', 'error')
       return false
     }
     const localDraft = get().localDrafts.find((draft) => draft.canvasId === id && draft.principalId === userId)
-    if (localDraft && !options?.serverCopy) return get().openLocalDraft(localDraft.draftId)
-    const isCurrent = () => generation === _fileNavigationGeneration && get().currentUser?.id === userId
+    if (localDraft && !options?.serverCopy) return get().openLocalDraft(localDraft.draftId, { navigationToken })
+    const isCurrent = () => ownsNavigation(navigationToken)
+      && generation === _fileNavigationGeneration && get().currentUser?.id === userId
     try {
       const doc = await api.getCanvas(id)
       if (!isCurrent()) return false
@@ -2935,6 +2967,7 @@ export const useStore = create<Store>((set, get) => ({
       } catch {
         if (isCurrent()) set({ canvasTransformReferences: [] })
       }
+      if (!isCurrent()) return false
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
@@ -2956,10 +2989,12 @@ export const useStore = create<Store>((set, get) => ({
 
   newFile: async (options) => {
     const generation = ++_fileNavigationGeneration
+    const navigationToken = startNavigation()
     const userId = get().currentUser?.id ?? null
     const doc = emptyDoc()
     const signal = options?.signal
     const isCurrent = () => !signal?.aborted
+      && ownsNavigation(navigationToken)
       && generation === _fileNavigationGeneration
       && (get().currentUser?.id ?? null) === userId
     const cleanUpCancelledRemoteDraft = async () => {
@@ -3039,6 +3074,7 @@ export const useStore = create<Store>((set, get) => ({
 
   newFromExample: async (key, intent = 'create-separate') => {
     const generation = ++_fileNavigationGeneration
+    const navigationToken = startNavigation()
     const userId = get().currentUser?.id ?? null
     const current = get()
     const candidate: ExampleReplacementSnapshot = {
@@ -3057,7 +3093,7 @@ export const useStore = create<Store>((set, get) => ({
       try { runsEmpty = (await api.listRuns(current.doc.id)).length === 0 }
       catch { /* fail closed below */ }
       const latest = get()
-      if (generation !== _fileNavigationGeneration || (latest.currentUser?.id ?? null) !== userId
+      if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (latest.currentUser?.id ?? null) !== userId
           || latest.doc.id !== current.doc.id) return { ok: false }
       const latestCandidate: ExampleReplacementSnapshot = {
         doc: latest.doc,
@@ -3092,11 +3128,11 @@ export const useStore = create<Store>((set, get) => ({
         const created = await api.createCanvas(doc)
         if (!created.ok || !created.created || created.id !== doc.id) return { ok: false }
       }
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+      if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       rememberRole(userId, doc.id, 'owner') // create response confirms ownership
       await get().refreshFiles()
     } catch (e) {
-      if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+      if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
       if (e instanceof KernelError) {
         if (e.status >= 500) {
           persistence = 'local-draft'
@@ -3116,7 +3152,7 @@ export const useStore = create<Store>((set, get) => ({
       // Transport failure: keep the runnable example as an offline local-first draft.
       persistence = 'local-draft'
     }
-    if (generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
+    if (!ownsNavigation(navigationToken) || generation !== _fileNavigationGeneration || (get().currentUser?.id ?? null) !== userId) return { ok: false }
     get().loadDoc(doc, 'owner')
     if (persistence === 'local-draft' && userId) {
       const draft = draftForDoc(
@@ -3233,7 +3269,9 @@ export const useStore = create<Store>((set, get) => ({
     for (const error of result.errors) get().pushToast(error, 'error')
   },
 
-  openLocalDraft: (draftId) => {
+  openLocalDraft: (draftId, options) => {
+    const navigationToken = options?.navigationToken ?? startNavigation()
+    if (!ownsNavigation(navigationToken)) return false
     const principalId = get().currentUser?.id
     const draft = get().localDrafts.find((candidate) => (
       candidate.draftId === draftId && candidate.principalId === principalId
