@@ -66,6 +66,7 @@ let _fileListGeneration = 0       // stale same-user list responses cannot overw
 let _previewRequestGeneration = 0 // every preview captures its own generation; latest request for a node wins
 let _profileRequestGeneration = 0 // whole-dataset profile jobs use the same latest-wins rule as previews
 let _reattachRunsGeneration = 0   // same-canvas reloads also need latest-navigation-wins recovery
+let _nodeRevealGeneration = 0     // consumed requests still need unique IDs for later routes
 const _draftSyncInFlight = new Set<string>()
 // True only while loadDoc synchronously installs an in-memory settled copy. The autosave subscriber
 // still refreshes the browser cache, but must not PUT that presentation-only normalization back into
@@ -1672,9 +1673,9 @@ export const useStore = create<Store>((set, get) => ({
 
   select: (id) => set({ selectedId: id, selectedIds: id ? [id] : [] }),
 
-  requestNodeReveal: (canvasId, nodeId) => set((state) => ({
-    nodeRevealRequest: { id: (state.nodeRevealRequest?.id ?? 0) + 1, canvasId, nodeId },
-  })),
+  requestNodeReveal: (canvasId, nodeId) => set({
+    nodeRevealRequest: { id: ++_nodeRevealGeneration, canvasId, nodeId },
+  }),
 
   // Acknowledge only the request that actually moved the viewport. If a newer route arrived while
   // React Flow was mounting, the older effect must not erase that replacement request.

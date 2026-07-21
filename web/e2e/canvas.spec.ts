@@ -206,9 +206,10 @@ test.describe('Data Playground canvas', () => {
       await route.continue()
     })
 
+    const near = page.locator('.react-flow__node[data-id="near"]')
     const offScreen = page.locator('.react-flow__node[data-id="off-screen"]')
-    const isInCanvas = async () => {
-      const node = await offScreen.boundingBox()
+    const isInCanvas = async (target = offScreen) => {
+      const node = await target.boundingBox()
       const canvas = await page.locator('.react-flow').boundingBox()
       return !!node && !!canvas && node.x >= canvas.x && node.y >= canvas.y
         && node.x + node.width <= canvas.x + canvas.width && node.y + node.height <= canvas.y + canvas.height
@@ -233,6 +234,12 @@ test.describe('Data Playground canvas', () => {
     await page.reload()
     await expect(offScreen).toHaveClass(/selected/)
     await expect.poll(isInCanvas).toBe(true)
+
+    // Consuming the first request must not reuse its identity. A second valid node= route on the
+    // same mounted Canvas selects and reveals the new target instead of looking already consumed.
+    await page.evaluate((hash) => { location.hash = hash }, `#/canvas/${canvasId}?node=near`)
+    await expect(near).toHaveClass(/selected/)
+    await expect.poll(() => isInCanvas(near)).toBe(true)
 
     // The completed request must not survive a Canvas unmount. A later bare Canvas route uses the
     // user's latest viewport and must not replay the old off-screen center operation.
