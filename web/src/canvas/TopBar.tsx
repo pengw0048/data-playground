@@ -26,6 +26,7 @@ import { NativeCanvasImportModal } from '../panels/NativeCanvasImportModal'
 import { CanvasCopyModal } from '../panels/CanvasCopyModal'
 import { api } from '../api/client'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
+import { CanvasWorkspaceLocation } from './CanvasWorkspaceLocation'
 
 export function TopBar() {
   const kernelUp = useStore((s) => s.kernelUp)
@@ -49,6 +50,7 @@ export function TopBar() {
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [copyOpen, setCopyOpen] = useState(false)
   const [inboxUnreadCount, setInboxUnreadCount] = useState<number | null>(null)
+  const [workspaceReturnDestination, setWorkspaceReturnDestination] = useState<string | null | undefined>(undefined)
   const settingsTrigger = useRef<HTMLElement | null>(null)
   const saveLabel = !canEdit
     ? (canvasRole === 'viewer' ? 'view only' : 'read only')
@@ -90,11 +92,22 @@ export function TopBar() {
     setSettingsOpen(false)
     requestAnimationFrame(() => settingsTrigger.current?.focus())
   }
+  const navigateToWorkspace = (resourceId: string | null | undefined) => {
+    const store = useStore.getState()
+    if (resourceId === undefined) {
+      // No placement was proven (local draft/unplaced Canvas): retain the existing generic entry.
+      store.setView('workspace')
+      return
+    }
+    // A non-empty search and the Datasets lens do not establish that the Canvas is visible at this
+    // placement. Reset them atomically so #705 emits one owned navigation destination.
+    store.switchWorkspaceScope('all', { resourceId, searchQuery: '', datasetQuery: '' })
+  }
 
   return (
     <>
       <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, left: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <AppMenu onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && saved && !currentDraftId} />
+        <AppMenu onWorkspace={() => navigateToWorkspace(workspaceReturnDestination)} onSettings={() => openSettings(document.querySelector<HTMLElement>('[data-testid="app-menu"]')!)} onRunHistory={() => setRunsOpen(true)} onVersionHistory={() => setVersionsOpen(true)} onImport={() => setImportOpen(true)} onNativeImport={() => setNativeImportOpen(true)} onNativeExport={() => { void exportCanvas() }} onCopy={() => setCopyOpen(true)} copyable={!!canvasRole && saved && !currentDraftId} />
         {inboxUnreadCount != null && inboxUnreadCount > 0 && <CanvasInboxIndicator count={inboxUnreadCount} />}
         <span className="text-[13.5px] text-muted-foreground">/</span>
         <FileMenu onCanvasSettings={() => setCanvasSettingsOpen(true)} />
@@ -104,6 +117,9 @@ export function TopBar() {
           <IconBtn name="redo" label="Redo" disabled={!canEdit || !canRedo} onClick={() => useStore.getState().redo()} />
           <ThemeToggle />
         </span>
+      </div>
+      <div style={{ position: 'absolute', top: kernelUp ? 45 : 77, left: 74, zIndex: 15, maxWidth: 'calc(100% - 94px)' }}>
+        <CanvasWorkspaceLocation onReturnDestination={setWorkspaceReturnDestination} onNavigate={navigateToWorkspace} />
       </div>
 
       <div style={{ position: 'absolute', top: kernelUp ? 16 : 48, right: 20, zIndex: 15, display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -151,8 +167,7 @@ function PeerAvatars() {
 }
 
 // The app menu (Figma-style hamburger): Back to files, New file, Import pipeline, Run/Version history, Settings.
-function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
-  const setView = useStore((s) => s.setView)
+function AppMenu({ onWorkspace, onSettings, onRunHistory, onVersionHistory, onImport, onNativeImport, onNativeExport, onCopy, copyable }: { onWorkspace: () => void; onSettings: () => void; onRunHistory: () => void; onVersionHistory: () => void; onImport: () => void; onNativeImport: () => void; onNativeExport: () => void; onCopy: () => void; copyable: boolean }) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
   const setInboxQuery = useStore((s) => s.setInboxQuery)
   const inboxQuery = useStore((s) => s.inboxQuery)
@@ -168,7 +183,7 @@ function AppMenu({ onSettings, onRunHistory, onVersionHistory, onImport, onNativ
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-[210px]">
-        <DropdownMenuItem onSelect={() => setView('workspace')}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
+        <DropdownMenuItem onSelect={onWorkspace}><Icon name="chevronLeft" size={14} /> Back to Workspace</DropdownMenuItem>
         <DropdownMenuItem onSelect={() => newFile()}><Icon name="plus" size={14} /> New file</DropdownMenuItem>
         <DropdownMenuItem data-testid="copy-canvas" disabled={!copyable} onSelect={() => setTimeout(onCopy)}><Icon name="duplicate" size={14} /> Save a copy…</DropdownMenuItem>
         <DropdownMenuItem data-testid="export-native-canvas" onSelect={() => setTimeout(onNativeExport)}><Icon name="export" size={14} /> Export native Canvas…</DropdownMenuItem>

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { expect, test } from '@playwright/test'
 
@@ -27,6 +27,8 @@ test.describe('provider Workspace Source acceptance', () => {
 
   test('creates a local Canvas overlay, then uses, previews, runs, and inspects an exact provider Source in Chromium', async ({ page }) => {
     test.setTimeout(60_000)
+    const providerCatalogBefore = readFileSync(resolve(providerRoot!, 'catalog.json'))
+    const providerDatasetBefore = readFileSync(resolve(providerRoot!, 'observations.csv'))
     await page.goto('/#/workspace')
     const container = page.getByRole('button', {
       name: new RegExp(`Open folder ${containerName} from Source-only mount browser-provider`),
@@ -77,6 +79,8 @@ test.describe('provider Workspace Source acceptance', () => {
     expect(createBody.providerDatasetRefs).toHaveLength(1)
     expect(writes).toEqual(['/api/workspace/canvases'])
     await expect(page.getByTestId('toolbar')).toBeVisible()
+    const canvasLocation = page.getByRole('navigation', { name: 'Canvas Workspace location' })
+    await expect(canvasLocation).toContainText(`Workspace/${containerName}`)
     const source = page.locator('.react-flow__node').filter({ hasText: datasetName })
     await expect(source).toHaveCount(1)
     await expect(source.locator(
@@ -120,6 +124,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
     await history.getByRole('button', { name: /Execution manifest/ }).click()
     await expect(history.getByText(/browser-provider-revision-v1/).first()).toBeVisible()
+    await history.getByRole('button', { name: 'Close' }).click()
 
     const deepLink = await page.request.get(`/api/workspace/resources/canvas:${canvasId}`)
     expect(deepLink.ok()).toBeTruthy()
@@ -132,5 +137,43 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(page.locator('.react-flow__node').filter({ hasText: datasetName })).toHaveCount(1)
+
+    // The Canvas location came from the stable overlay parent. Returning uses that opaque id and
+    // never writes to the provider.
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
+    await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    expect(writes).toEqual(expect.arrayContaining(['/api/workspace/canvases', '/api/run']))
+    expect(writes.every((path) => [
+      /^\/api\/workspace\/canvases$/,
+      /^\/api\/canvas\/[^/]+$/,
+      /^\/api\/graph\/(plan|schema|estimate)$/,
+      /^\/api\/run(\/preview|\/estimate|\/input-drift)?$/,
+    ].some((allowed) => allowed.test(path)))).toBe(true)
+    const writesBeforeUnavailableReturn = [...writes]
+
+    let unavailableIntercepted = false
+    await page.route((url) => (
+      decodeURIComponent(url.pathname.split('/').pop() ?? '') === `canvas:${canvasId}`
+    ), (route) => {
+      unavailableIntercepted = true
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          resource: { id: `canvas:${canvasId}`, kind: 'canvas', name: 'provider context Canvas', parentId: externalPage.container.id, detached: false, source: 'local' },
+          ancestors: [],
+          source: { id: 'mount:browser-provider', kind: 'provider', completeness: 'unavailable', referenceState: 'detached', error: 'resource detached' },
+        }),
+      })
+    })
+    await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+    await expect.poll(() => unavailableIntercepted).toBe(true)
+    await expect(page.getByText('Its Workspace location is unavailable.', { exact: true })).toBeVisible()
+    await page.getByTestId('app-menu').click()
+    await page.getByText('Back to Workspace', { exact: true }).click()
+    await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    expect(writes).toEqual(writesBeforeUnavailableReturn)
+    expect(readFileSync(resolve(providerRoot!, 'catalog.json'))).toEqual(providerCatalogBefore)
+    expect(readFileSync(resolve(providerRoot!, 'observations.csv'))).toEqual(providerDatasetBefore)
   })
 })
