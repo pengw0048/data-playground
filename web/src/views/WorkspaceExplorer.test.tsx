@@ -279,6 +279,18 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
   })
 
+  it('does not expose Canvas mutations for a detached placement', async () => {
+    const detachedCanvas = { ...CANVAS, detached: true }
+    mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [detachedCanvas], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu')).toHaveTextContent('Open')
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
+  })
+
   it('keeps a source-only provider Folder free of Folder writes while retaining local Canvas creation', async () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [EXTERNAL_FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
@@ -313,7 +325,7 @@ describe('WorkspaceExplorer', () => {
   })
 
   it('keeps capability-driven Folder and Canvas actions available from search results without leaving search context', async () => {
-    const searchableFolder = { ...FOLDER, canRenameFolder: true, canDeleteFolder: true }
+    const searchableFolder = { ...FOLDER, canCreateFolder: true, canRenameFolder: true, canDeleteFolder: true }
     const searchableCanvas = { ...CANVAS, parentId: FOLDER.id }
     store.workspaceSearchQuery = 'analysis'
     mocks.workspaceSearch.mockResolvedValue({
@@ -327,7 +339,12 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Research' }), { button: 0, ctrlKey: false })
-    expect(screen.getByRole('menu', { name: 'More actions for Research' })).toHaveTextContent('OpenRenameDelete')
+    expect(screen.getByRole('menu', { name: 'More actions for Research' })).toHaveTextContent('OpenNew folderRenameDelete')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'New folder' }))
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith(searchableFolder.id))
+    expect(screen.getByRole('dialog', { name: 'New folder' })).toHaveTextContent('Parent: Workspace / Research')
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Research' }), { button: 0, ctrlKey: false })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Rename' }))
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledWith(searchableFolder.id))
     fireEvent.change(screen.getByLabelText('Folder name'), { target: { value: 'Renamed research' } })
@@ -338,6 +355,22 @@ describe('WorkspaceExplorer', () => {
 
     fireEvent.pointerDown(screen.getByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
     expect(screen.getByRole('menu', { name: 'More actions for Analysis' })).toHaveTextContent('OpenRenameMoveDelete')
+  })
+
+  it('keeps detached Canvas search results read-only', async () => {
+    const detachedCanvas = { ...CANVAS, detached: true }
+    store.workspaceSearchQuery = 'analysis'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'analysis', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{ source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' }, items: [detachedCanvas] }],
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.pointerDown(await screen.findByRole('button', { name: 'More actions for Analysis' }), { button: 0, ctrlKey: false })
+    expect(screen.getByRole('menu')).toHaveTextContent('Open')
+    expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Move' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
   })
 
   it('keeps completed search pages visible when loading the continuation fails', async () => {

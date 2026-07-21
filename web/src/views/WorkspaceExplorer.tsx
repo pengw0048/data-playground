@@ -459,7 +459,7 @@ function WorkspaceMixedExplorer() {
   const reload = () => setRevision((current) => current + 1)
   const searchActionRequest = useRef(0)
   useEffect(() => () => { searchActionRequest.current += 1 }, [searchQuery])
-  const startSearchAction = async (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => {
+  const startSearchAction = async (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => {
     const sequence = ++searchActionRequest.current
     try {
       const resolved = await api.workspaceResource(resource.id)
@@ -468,7 +468,9 @@ function WorkspaceMixedExplorer() {
       const path = exact.kind === 'container' ? [...resolved.ancestors, exact] : resolved.ancestors
       const editableCanvas = exact.kind === 'canvas' && !exact.detached
         && ['owner', 'editor'].includes(files.find((file) => file.id === identity(exact))?.role ?? '')
-      if (action === 'rename-folder' && exact.kind === 'container' && exact.canRenameFolder) {
+      if (action === 'new-folder' && exact.kind === 'container' && exact.canCreateFolder) {
+        setFolderCreateParent({ resource: exact, path })
+      } else if (action === 'rename-folder' && exact.kind === 'container' && exact.canRenameFolder) {
         setFolderRenameResource({ resource: exact, path, fromSearch: true })
       } else if (action === 'delete-folder' && exact.kind === 'container' && folderDeleteMode(exact)) {
         setFolderDeleteResource({ resource: exact, path, fromSearch: true })
@@ -593,9 +595,9 @@ function WorkspaceMixedExplorer() {
               ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
             onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
               ? () => container && setMoveResource({ resource, sourceContainer: container, sourcePath: crumbs }) : undefined}
-            onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+            onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
               ? () => setCanvasRenameResource(resource) : undefined}
-            onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && files.find((file) => file.id === identity(resource))?.role === 'owner'
+            onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
               ? () => setCanvasDeleteResource(resource) : undefined} />)}
           {loadMoreError && <div role="alert" className="mx-auto mt-2 text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
           {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
@@ -869,7 +871,7 @@ function WorkspaceDatasets() {
 
 function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
   query: string; revision: number; onOpen: (resource: WorkspaceResource) => void
-  onAction: (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
   files: CanvasFile[]
 }) {
   const [groups, setGroups] = useState<WorkspaceSearchGroup[]>([])
@@ -950,7 +952,7 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
 
 function SearchSourceGroup({ group, onOpen, onAction, files }: {
   group: WorkspaceSearchGroup; onOpen: (resource: WorkspaceResource) => void
-  onAction: (resource: WorkspaceResource, action: 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
+  onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
   files: CanvasFile[]
 }) {
   const source = group.source
@@ -970,13 +972,14 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
       {error && <span className="text-amber-700 dark:text-amber-300">— {error}</span>}
     </div>
     {group.items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => onOpen(resource)}
+      onNewFolder={resource.kind === 'container' && resource.canCreateFolder ? () => onAction(resource, 'new-folder') : undefined}
       onRenameFolder={resource.kind === 'container' && resource.canRenameFolder ? () => onAction(resource, 'rename-folder') : undefined}
       onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource) ? () => onAction(resource, 'delete-folder') : undefined}
       onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
         ? () => onAction(resource, 'rename-canvas') : undefined}
       onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
         ? () => onAction(resource, 'move-canvas') : undefined}
-      onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && files.find((file) => file.id === identity(resource))?.role === 'owner'
+      onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
         ? () => onAction(resource, 'delete-canvas') : undefined} />)}
     {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
       {source.completeness === 'complete' ? 'No matches from this source.'
@@ -1359,7 +1362,7 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
     <button type="button" onClick={onOpen} aria-label={openLabel}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{providerFolderExplanation && <span className="block truncate text-[11px] text-muted-foreground">{providerFolderExplanation}</span>}</span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
       {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
