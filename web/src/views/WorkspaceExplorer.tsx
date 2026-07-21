@@ -20,6 +20,8 @@ const errorMessage = (error: unknown) => error instanceof Error ? error.message 
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
 const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
+const isCurrentCatalogLocation = (resource: WorkspaceResource | null) => !!resource && !resource.detached
+  && (identity(resource) === LOCAL_ROOT_ID || resource.catalogFolderState === 'current')
 type CanvasDestination = { containerId: string; expectedContainerVersion: number; externalOverlay: boolean }
 
 // Provider containers expose a localPlacement capability rather than mutation authority.  This
@@ -67,30 +69,67 @@ const DATASET_SORTS = new Set<CatalogDiscoveryQueryState['sort']>(['name', 'rows
 type WorkspaceFolderContext = {
   resource: WorkspaceResource | null
   reason?: string
+  retryable?: boolean
 }
 
 // Folder paths are only a Catalog filter. Navigation is always to the opaque projected container
 // returned while resolving a stable dataset identity, so a same-named local container cannot win.
 function projectedFolderFromResolution(folder: string, resolved: { resource: WorkspaceResource | null; ancestors: WorkspaceResource[]; source: WorkspaceSourceStatus }): WorkspaceFolderContext {
   if (resolved.source.completeness !== 'complete') {
-    return { resource: null, reason: statusMessage(resolved.source) ?? 'Workspace is only partially available' }
+    return {
+      resource: null,
+      reason: statusMessage(resolved.source) ?? 'Workspace is only partially available',
+      retryable: resolved.source.completeness !== 'unsupported'
+        && resolved.source.referenceState !== 'detached'
+        && resolved.source.referenceState !== 'permission_lost',
+    }
   }
   const candidate = resolved.resource?.kind === 'container'
     ? resolved.resource : resolved.ancestors[resolved.ancestors.length - 1] ?? null
+  const exactRoot = !folder && candidate?.id === `container:${LOCAL_ROOT_ID}`
+  const exactProjection = !!folder && candidate?.catalogFolderState === 'current'
+    && candidate.catalogFolderPath === folder
   if (!candidate || candidate.kind !== 'container' || candidate.detached
-      || candidate.catalogFolderState !== 'current' || candidate.catalogFolderPath !== folder) {
+      || (!exactRoot && !exactProjection)) {
     return { resource: null, reason: 'This dataset is not currently available in Workspace.' }
   }
   return { resource: candidate }
 }
 
+function retryableResolutionError(caught: unknown): boolean {
+  if (!caught || typeof caught !== 'object') return true
+  const error = caught as { status?: unknown; retryable?: unknown }
+  if (typeof error.retryable === 'boolean') return error.retryable
+  if (typeof error.status !== 'number') return true
+  return error.status === 429 || error.status >= 500
+}
+
+async function resolveSelectedDatasetFolder(table: CatalogTable): Promise<WorkspaceFolderContext> {
+  if (!table.registrationId) {
+    return { resource: null, reason: 'This dataset is not currently available in Workspace.' }
+  }
+  try {
+    return projectedFolderFromResolution(
+      table.folder ?? '', await api.workspaceResource(`dataset:${table.registrationId}`),
+    )
+  } catch (caught) {
+    return {
+      resource: null, reason: errorMessage(caught), retryable: retryableResolutionError(caught),
+    }
+  }
+}
+
 async function resolveProjectedFolder(folder: string, knownResourceId?: string | null): Promise<WorkspaceFolderContext> {
   if (!folder) return { resource: null }
+  let knownError: string | undefined
+  let knownRetryable = false
   if (knownResourceId) {
     try {
       const known = projectedFolderFromResolution(folder, await api.workspaceResource(knownResourceId))
-      if (known.resource || known.reason?.startsWith('Workspace')) return known
-    } catch {
+      if (known.resource || known.retryable) return known
+    } catch (caught) {
+      knownError = errorMessage(caught)
+      knownRetryable = retryableResolutionError(caught)
       // The route may point at a dataset that was removed while this query was open. Fall through
       // to one bounded Catalog lookup; it still has to resolve an opaque Workspace resource below.
     }
@@ -99,12 +138,22 @@ async function resolveProjectedFolder(folder: string, knownResourceId?: string |
     const page = await api.tablesPage({ folder, limit: 1 })
     const table = page.items[0]
     if (!table?.registrationId || table.folder !== folder) {
-      return { resource: null, reason: 'This folder is not currently available in Workspace.' }
+      return knownError
+        ? { resource: null, reason: knownError, retryable: knownRetryable }
+        : { resource: null, reason: 'This folder is not currently available in Workspace.' }
     }
     return projectedFolderFromResolution(folder, await api.workspaceResource(`dataset:${table.registrationId}`))
   } catch (caught) {
-    return { resource: null, reason: errorMessage(caught) }
+    return {
+      resource: null, reason: errorMessage(caught), retryable: retryableResolutionError(caught),
+    }
   }
+}
+
+function unavailableWorkspaceLocation(subject: 'dataset' | 'folder', reason?: string): string {
+  const message = `This ${subject} is not currently available in Workspace.`
+  return !reason || /^This (dataset|folder) is not currently available in Workspace\.$/.test(reason)
+    ? message : `${message} ${reason}`
 }
 
 export function parseWorkspaceDatasetQuery(value: string): CatalogDiscoveryQueryState {
@@ -462,12 +511,13 @@ function WorkspaceMixedExplorer() {
       {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
         onChanged={(table) => { setSelectedTable(table); void load(containerId) }} onDeleted={closeDetail}
         folderActionLabel="Open in Workspace"
-        folderActionDisabled={container?.catalogFolderState !== 'current' || !!container?.detached}
-        folderActionTitle={container?.catalogFolderState !== 'current' || !!container?.detached
+        folderActionVisible
+        folderActionDisabled={!isCurrentCatalogLocation(container)}
+        folderActionTitle={!isCurrentCatalogLocation(container)
           ? 'This dataset is not currently available in Workspace.' : undefined}
         onOpenTable={setSelectedTable} onFolder={() => {
-          if (container?.kind === 'container' && container.catalogFolderState === 'current' && !container.detached) {
-            setWorkspaceResource(container.id)
+          if (container?.kind === 'container' && isCurrentCatalogLocation(container)) {
+            setWorkspaceResource(identity(container) === LOCAL_ROOT_ID ? null : container.id)
           } else pushToast('This dataset is not currently available in Workspace.', 'error')
         }}
         onColumn={() => pushToast('Column filters are available from the dataset detail only.', 'info')} />}
@@ -541,14 +591,64 @@ function WorkspaceDatasets() {
   const [rootContainer, setRootContainer] = useState<WorkspaceResource | null>(null)
   const [destinationError, setDestinationError] = useState<string | null>(null)
   const [destinationRevision, setDestinationRevision] = useState(0)
+  const [selectedWorkspaceTable, setSelectedWorkspaceTable] = useState<CatalogTable | null>(null)
+  const [detailResolutionRevision, setDetailResolutionRevision] = useState(0)
+  const detailResolutionSeq = useRef(0)
+  const selectedWorkspaceKey = selectedWorkspaceTable?.registrationId
+    ? `${selectedWorkspaceTable.registrationId}\u0000${selectedWorkspaceTable.folder ?? ''}` : null
+  const [detailContext, setDetailContext] = useState<{
+    key: string
+    state: 'resolving' | 'available' | 'unavailable'
+    resourceId?: string
+    reason?: string
+    retryable?: boolean
+  } | null>(null)
+  const folderResolutionKey = `${query.folder}\u0000${requestedResourceId ?? ''}`
+  const folderResolutionKeyRef = useRef(folderResolutionKey)
+  folderResolutionKeyRef.current = folderResolutionKey
+  const folderResolutionSeq = useRef(0)
   const [folderContext, setFolderContext] = useState<{
+    key: string
     state: 'ready' | 'resolving' | 'unavailable'
     reason?: string
-  }>({ state: 'ready' })
+    retryable?: boolean
+  }>({ key: folderResolutionKey, state: 'ready' })
 
   // A failed resolution belongs only to this exact filter/deep-link pair. Selecting another folder
   // must immediately make its own resolution attempt possible rather than leaving a stale disabled tab.
-  useEffect(() => { setFolderContext({ state: 'ready' }) }, [query.folder, requestedResourceId])
+  useEffect(() => {
+    folderResolutionSeq.current += 1
+    setFolderContext({ key: folderResolutionKey, state: 'ready' })
+  }, [folderResolutionKey])
+
+  useEffect(() => {
+    const request = ++detailResolutionSeq.current
+    if (!selectedWorkspaceTable) {
+      setDetailContext(null)
+      return
+    }
+    const key = selectedWorkspaceKey
+    if (!key || !selectedWorkspaceTable.registrationId) {
+      setDetailContext({
+        key: key ?? '', state: 'unavailable',
+        reason: 'This dataset is not currently available in Workspace.',
+      })
+      return
+    }
+    setDetailContext({ key, state: 'resolving' })
+    void resolveSelectedDatasetFolder(selectedWorkspaceTable).then((context) => {
+      if (request !== detailResolutionSeq.current) return
+      if (context.resource) {
+        setDetailContext({ key, state: 'available', resourceId: context.resource.id })
+      } else {
+        setDetailContext({
+          key, state: 'unavailable', retryable: context.retryable,
+          reason: unavailableWorkspaceLocation('dataset', context.reason),
+        })
+      }
+    })
+    return () => { detailResolutionSeq.current += 1 }
+  }, [selectedWorkspaceKey, detailResolutionRevision])
 
   useEffect(() => {
     let cancelled = false
@@ -578,14 +678,12 @@ function WorkspaceDatasets() {
     void refreshFiles()
   }
 
-  const openTableInWorkspace = async (table: CatalogTable) => {
-    if (!table.registrationId) return
-    const context = await resolveProjectedFolder(table.folder ?? '', `dataset:${table.registrationId}`)
-    if (!context.resource) {
-      pushToast(context.reason ?? 'This dataset is not currently available in Workspace.', 'error')
-      return
-    }
-    switchWorkspaceScope('all', { resourceId: context.resource.id })
+  const openTableInWorkspace = (table: CatalogTable) => {
+    const key = table.registrationId ? `${table.registrationId}\u0000${table.folder ?? ''}` : null
+    if (!key || detailContext?.key !== key || detailContext.state !== 'available'
+        || !detailContext.resourceId) return
+    if (detailContext.resourceId === `container:${LOCAL_ROOT_ID}`) switchWorkspaceScope('all')
+    else switchWorkspaceScope('all', { resourceId: detailContext.resourceId })
   }
 
   const switchToAll = async () => {
@@ -593,23 +691,37 @@ function WorkspaceDatasets() {
       switchWorkspaceScope('all')
       return
     }
-    setFolderContext({ state: 'resolving' })
+    const key = folderResolutionKey
+    const request = ++folderResolutionSeq.current
+    setFolderContext({ key, state: 'resolving' })
     const context = await resolveProjectedFolder(query.folder, requestedResourceId)
+    if (request !== folderResolutionSeq.current || folderResolutionKeyRef.current !== key) return
     if (!context.resource) {
-      setFolderContext({ state: 'unavailable', reason: context.reason })
+      setFolderContext({
+        key, state: 'unavailable', retryable: context.retryable,
+        reason: unavailableWorkspaceLocation('folder', context.reason),
+      })
       return
     }
-    setFolderContext({ state: 'ready' })
+    setFolderContext({ key, state: 'ready' })
     switchWorkspaceScope('all', { resourceId: context.resource.id })
   }
+
+  const activeFolderContext = folderContext.key === folderResolutionKey
+    ? folderContext : { key: folderResolutionKey, state: 'ready' as const }
+  const activeDetailContext = selectedWorkspaceKey && detailContext?.key === selectedWorkspaceKey
+    ? detailContext : selectedWorkspaceKey ? { key: selectedWorkspaceKey, state: 'resolving' as const } : undefined
 
   return <div className="flex h-full min-w-0 flex-col">
     <div className="flex items-center gap-3 border-b border-border px-7 py-2">
       <span className="text-[13px] font-bold text-foreground">Workspace</span>
       <WorkspaceScopeTabs active="datasets" onChange={(scope) => { if (scope === 'all') void switchToAll() }}
-        disabled={folderContext.state === 'resolving' || (folderContext.state === 'unavailable' && !!query.folder)}
-        disabledTitle={folderContext.state === 'resolving' ? 'Resolving this folder in Workspace…'
-          : folderContext.reason ?? 'This folder is not currently available in Workspace.'} />
+        disabled={activeFolderContext.state === 'resolving' || (activeFolderContext.state === 'unavailable' && !!query.folder)}
+        disabledTitle={activeFolderContext.state === 'resolving' ? 'Resolving this folder in Workspace…'
+          : activeFolderContext.reason ?? 'This folder is not currently available in Workspace.'} />
+      {activeFolderContext.state === 'unavailable' && activeFolderContext.retryable
+        && <button type="button" onClick={() => { void switchToAll() }}
+          className="text-[11px] font-semibold text-primary hover:underline">Retry Workspace location</button>}
       <span className="ml-auto text-[11px] text-muted-foreground">Open a dataset’s folder in All Workspace to work beside its local Canvases.</span>
     </div>
     <div className="min-h-0 flex-1">
@@ -618,12 +730,15 @@ function WorkspaceDatasets() {
         onQueryStateChange={(next) => setEncodedQuery(serializeWorkspaceDatasetQuery(next))}
         selectedRegistrationId={selectedRegistrationId}
         onSelectedTableChange={(table) => {
+          setSelectedWorkspaceTable(table)
           if (!table) setWorkspaceResource(null)
           else if (table.registrationId) setWorkspaceResource(`dataset:${table.registrationId}`)
           else pushToast('This dataset has no stable Workspace identity', 'error')
         }}
         onUseTables={useTables} onUploadDataset={uploadDataset}
-        onOpenInWorkspace={openTableInWorkspace} />
+        onOpenInWorkspace={openTableInWorkspace}
+        workspaceLocation={activeDetailContext}
+        onRetryWorkspaceLocation={() => setDetailResolutionRevision((current) => current + 1)} />
     </div>
     {datasetAction && <DatasetActionDialog action={datasetAction} container={rootContainer}
       destinationError={destinationError} files={files} onClose={() => setDatasetAction(null)}

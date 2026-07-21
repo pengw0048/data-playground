@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DatasetViewDefinition } from '../types/api'
 
@@ -24,12 +24,15 @@ vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => u
 vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
-  CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId, onOpenInWorkspace }: {
+  CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
+    onOpenInWorkspace, workspaceLocation, onRetryWorkspaceLocation }: {
     onUseTables: (tables: { id: string; registrationId: string; name: string; uri: string; columns: never[] }[]) => void
     onQueryStateChange: (query: object) => void
-    onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; columns: never[] } | null) => void
+    onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] } | null) => void
     selectedRegistrationId?: string | null
     onOpenInWorkspace?: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] }) => void
+    workspaceLocation?: { state: 'resolving' | 'available' | 'unavailable'; reason?: string; retryable?: boolean }
+    onRetryWorkspaceLocation?: () => void
   }) => <div data-testid="catalog-discovery">
     <span>Selected registration: {selectedRegistrationId ?? 'none'}</span>
     <button onClick={() => onUseTables([
@@ -37,8 +40,17 @@ vi.mock('./CatalogDiscovery', () => ({
       { id: 't2', registrationId: 'dataset-2', name: 'actions', uri: 'file:///actions.parquet', columns: [] },
     ])}>Use selected datasets</button>
     <button onClick={() => onQueryStateChange({ q: 'robot hands', folder: 'robotics', tags: ['gold'], owner: '', hasColumns: ['frame_id'], sort: 'updated', order: 'desc', match: 'meaning' })}>Change dataset query</button>
-    <button onClick={() => onSelectedTableChange({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })}>Open dataset</button>
-    {onOpenInWorkspace && <button onClick={() => onOpenInWorkspace({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] })}>Open in Workspace</button>}
+    <button onClick={() => onSelectedTableChange({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] })}>Open dataset</button>
+    <button onClick={() => onSelectedTableChange({ id: 'root-table', registrationId: 'root-dataset', name: 'root observations', uri: 'file:///root.parquet', columns: [] })}>Open root dataset</button>
+    {onOpenInWorkspace && <button
+      disabled={workspaceLocation?.state !== 'available'}
+      title={workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…' : workspaceLocation?.reason}
+      onClick={() => onOpenInWorkspace({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] })}>Open in Workspace</button>}
+    {onOpenInWorkspace && <button
+      disabled={workspaceLocation?.state !== 'available'}
+      onClick={() => onOpenInWorkspace({ id: 'root-table', registrationId: 'root-dataset', name: 'root observations', uri: 'file:///root.parquet', columns: [] })}>Open root in Workspace</button>}
+    {workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
+      && <button onClick={onRetryWorkspaceLocation}>Retry</button>}
   </div>,
   CatalogDetail: ({ table, onClose, onUse }: { table: { name: string }; onClose: () => void; onUse: (table: { name: string }) => void }) =>
     <div data-testid="catalog-detail">{table.name}<button onClick={() => onUse(table)}>Use</button><button onClick={onClose}>close detail</button></div>,
@@ -375,9 +387,32 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'All Workspace' }))
     await waitFor(() => expect(screen.getByRole('tab', { name: 'All Workspace' })).toBeDisabled())
     expect(screen.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute(
-      'title', 'This dataset is not currently available in Workspace.',
+      'title', 'This folder is not currently available in Workspace.',
     )
     expect(store.switchWorkspaceScope).not.toHaveBeenCalledWith('all', expect.anything())
+  })
+
+  it('offers an explicit retry for a partial folder resolution', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceDatasetQuery = 'folder=robotics'
+    mocks.workspaceResource.mockResolvedValueOnce({
+      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
+      source: { id: 'local', kind: 'local', completeness: 'partial', error: 'catalog temporarily offline' },
+    }).mockResolvedValue({
+      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'All Workspace' }))
+    const tab = screen.getByRole('tab', { name: 'All Workspace' })
+    await waitFor(() => expect(tab).toBeDisabled())
+    expect(tab.getAttribute('title')).toContain('This folder is not currently available in Workspace.')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry Workspace location' }))
+
+    await waitFor(() => expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', {
+      resourceId: CATALOG_FOLDER.id,
+    }))
   })
 
   it('opens a dataset detail in the exact resolved Workspace folder', async () => {
@@ -388,8 +423,131 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Open in Workspace' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
+    await waitFor(() => expect(open).toBeEnabled())
+    fireEvent.click(open)
     await waitFor(() => expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', { resourceId: CATALOG_FOLDER.id }))
+  })
+
+  it('opens a root dataset detail at the exact Workspace root', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockResolvedValue({
+      resource: { ...DATASET, id: 'dataset:root-dataset', parentId: ROOT.id }, ancestors: [ROOT],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open root dataset' }))
+    const open = screen.getByRole('button', { name: 'Open root in Workspace' })
+    await waitFor(() => expect(open).toBeEnabled())
+    fireEvent.click(open)
+
+    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all')
+  })
+
+  it('disables an unresolvable dataset location without offering a false retry', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockResolvedValue({
+      resource: DATASET, ancestors: [ROOT, { ...FOLDER, name: 'robotics' }],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
+    await waitFor(() => expect(open).toBeDisabled())
+    expect(open).toHaveAttribute('title', 'This dataset is not currently available in Workspace.')
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
+  })
+
+  it('does not borrow another dataset projection when the selected registration is detached', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockResolvedValue({
+      resource: DATASET, ancestors: [ROOT, { ...FOLDER, name: 'robotics' }],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    mocks.tablesPage.mockResolvedValue({
+      items: [{ id: 'other', registrationId: 'other-registration', name: 'other', uri: 'file:///other.parquet', folder: 'robotics', columns: [] }],
+      total: 1, hasMore: false,
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
+    await waitFor(() => expect(open).toHaveAttribute(
+      'title', 'This dataset is not currently available in Workspace.',
+    ))
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(mocks.tablesPage).not.toHaveBeenCalled()
+  })
+
+  it('does not offer retry for a stable dataset-resolution error', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockRejectedValue(Object.assign(new Error('dataset missing'), { status: 404 }))
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
+    await waitFor(() => expect(open.getAttribute('title')).toContain('dataset missing'))
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+  })
+
+  it('offers retry for a transient dataset-resolution error', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockRejectedValue(Object.assign(new Error('catalog unavailable'), { status: 503 }))
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible())
+  })
+
+  it('retries a partial dataset location and opens only the recovered opaque folder', async () => {
+    store.workspaceScope = 'datasets'
+    mocks.workspaceResource.mockResolvedValueOnce({
+      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
+      source: { id: 'local', kind: 'local', completeness: 'partial', error: 'catalog temporarily offline' },
+    }).mockResolvedValue({
+      resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
+      source: { id: 'local', kind: 'local', completeness: 'complete' },
+    })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace' })
+    await waitFor(() => expect(open).toBeDisabled())
+    expect(open.getAttribute('title')).toContain('This dataset is not currently available in Workspace.')
+    expect(open.getAttribute('title')).toContain('catalog temporarily offline')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(open).toBeEnabled())
+    fireEvent.click(open)
+
+    expect(store.switchWorkspaceScope).toHaveBeenCalledWith('all', { resourceId: CATALOG_FOLDER.id })
+  })
+
+  it('ignores an obsolete folder resolution after the Datasets route changes', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceDatasetQuery = 'folder=robotics'
+    store.workspaceResourceId = 'dataset:dataset-1'
+    let finish!: (value: unknown) => void
+    const pending = new Promise<unknown>((resolve) => { finish = resolve })
+    mocks.workspaceResource.mockReturnValueOnce(pending)
+    const { rerender } = render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('tab', { name: 'All Workspace' }))
+    store.workspaceDatasetQuery = 'folder=other'
+    store.workspaceResourceId = 'dataset:dataset-2'
+    rerender(<WorkspaceExplorer />)
+    await act(async () => {
+      finish({
+        resource: DATASET, ancestors: [ROOT, CATALOG_FOLDER],
+        source: { id: 'local', kind: 'local', completeness: 'complete' },
+      })
+      await pending
+    })
+
+    expect(store.switchWorkspaceScope).not.toHaveBeenCalled()
   })
 
   it('uses a bounded dataset selection atomically in one exact new Canvas destination', async () => {

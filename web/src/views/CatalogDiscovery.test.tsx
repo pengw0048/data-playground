@@ -106,6 +106,50 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(store.addToCanvas).not.toHaveBeenCalled()
   })
 
+  it('keeps an unavailable Workspace location disabled and exposes only an explicit retry', async () => {
+    const onOpenInWorkspace = vi.fn()
+    const onRetryWorkspaceLocation = vi.fn()
+    const props = {
+      sourceIdentity: store.kernelInfo, foldersMutable: true,
+      onUseTables: vi.fn(), onUploadDataset: store.uploadDataset,
+      onOpenInWorkspace, onRetryWorkspaceLocation,
+    }
+    const { rerender } = render(<CatalogDiscovery {...props} workspaceLocation={{
+      state: 'unavailable', retryable: true,
+      reason: 'This dataset is not currently available in Workspace. catalog temporarily offline',
+    }} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open dataset orders' }))
+
+    const open = screen.getByRole('button', { name: /Open in Workspace/ })
+    expect(open).toBeDisabled()
+    expect(open).toHaveAttribute(
+      'title', 'This dataset is not currently available in Workspace. catalog temporarily offline',
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(onRetryWorkspaceLocation).toHaveBeenCalledTimes(1)
+    expect(onOpenInWorkspace).not.toHaveBeenCalled()
+
+    rerender(<CatalogDiscovery {...props} workspaceLocation={{ state: 'available' }} />)
+    expect(open).toBeEnabled()
+    fireEvent.click(open)
+    expect(onOpenInWorkspace).toHaveBeenCalledWith(TABLE)
+  })
+
+  it('shows Open in Workspace for a root dataset without inventing a folder label', async () => {
+    const rootTable = { ...TABLE_2, folder: undefined }
+    const onOpenInWorkspace = vi.fn()
+    mocks.tablesPage.mockResolvedValue({ items: [rootTable], total: 1, hasMore: false })
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset}
+      onOpenInWorkspace={onOpenInWorkspace} workspaceLocation={{ state: 'available' }} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Open dataset customers' }))
+    const open = screen.getByRole('button', { name: 'Open in Workspace →' })
+    expect(open).toBeEnabled()
+    fireEvent.click(open)
+    expect(onOpenInWorkspace).toHaveBeenCalledWith(rootTable)
+  })
+
   it('keeps a 5,000-dataset discovery path bounded to pages, facets, and the lazy tree', async () => {
     mocks.tablesPage
       .mockResolvedValueOnce({ items: [TABLE], total: 5_000, hasMore: true })

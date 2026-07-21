@@ -36,6 +36,12 @@ export interface CatalogDiscoveryProps {
   onSelectedTableChange?: (table: CatalogTable | null) => void
   /** Optional Workspace bridge; Catalog remains independently reusable without it. */
   onOpenInWorkspace?: (table: CatalogTable) => void
+  workspaceLocation?: {
+    state: 'resolving' | 'available' | 'unavailable'
+    reason?: string
+    retryable?: boolean
+  }
+  onRetryWorkspaceLocation?: () => void
 }
 
 export interface CatalogDiscoveryQueryState {
@@ -56,9 +62,12 @@ export const emptyCatalogDiscoveryQuery = (): CatalogDiscoveryQueryState => ({
 export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
   queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange, onOpenInWorkspace,
+  workspaceLocation, onRetryWorkspaceLocation,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
+  const selectedTableChangeRef = useRef(onSelectedTableChange)
+  selectedTableChangeRef.current = onSelectedTableChange
 
   // query state
   const [localQuery, setLocalQuery] = useState<CatalogDiscoveryQueryState>(emptyCatalogDiscoveryQuery)
@@ -167,11 +176,18 @@ export function CatalogDiscovery({
     if (selectedRegistrationId === undefined) return
     const requestId = ++selectionSeq.current
     setSelectionError(null)
-    if (!selectedRegistrationId) { setSelected(null); return }
+    if (!selectedRegistrationId) {
+      setSelected(null)
+      selectedTableChangeRef.current?.(null)
+      return
+    }
     if (selected?.registrationId === selectedRegistrationId) return
     setSelected(null)
     api.tableByRegistration(selectedRegistrationId).then((table) => {
-      if (requestId === selectionSeq.current) setSelected(table)
+      if (requestId === selectionSeq.current) {
+        setSelected(table)
+        selectedTableChangeRef.current?.(table)
+      }
     }).catch((caught) => {
       if (requestId === selectionSeq.current) setSelectionError(errorMessage(caught))
     })
@@ -460,8 +476,15 @@ export function CatalogDiscovery({
             else { setFolder(folder); selectTable(null) }
           }}
           folderActionLabel={onOpenInWorkspace ? 'Open in Workspace' : undefined}
-          folderActionDisabled={!!onOpenInWorkspace && !selected.registrationId}
-          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.' : undefined}
+          folderActionVisible={!!onOpenInWorkspace || !!selected.folder}
+          folderActionDisabled={!!onOpenInWorkspace && (!selected.registrationId
+            || workspaceLocation?.state === 'resolving' || workspaceLocation?.state === 'unavailable')}
+          folderActionTitle={!selected.registrationId ? 'This dataset is not currently available in Workspace.'
+            : workspaceLocation?.state === 'resolving' ? 'Resolving this dataset’s Workspace location…'
+              : workspaceLocation?.state === 'unavailable'
+                ? workspaceLocation.reason ?? 'This dataset is not currently available in Workspace.' : undefined}
+          onFolderRetry={workspaceLocation?.state === 'unavailable' && workspaceLocation.retryable
+            ? onRetryWorkspaceLocation : undefined}
           onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
           onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
       )}
@@ -837,12 +860,15 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 
 // ---- detail drawer: columns + metadata editor + lineage ---------------------
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
-  folderActionLabel = 'Browse folder', folderActionDisabled = false, folderActionTitle,
+  folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
+  folderActionDisabled = false, folderActionTitle, onFolderRetry,
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
   onDeleted: () => void; onOpenTable: (t: CatalogTable) => void; onColumn: (name: string) => void
-  folderActionLabel?: string; folderActionDisabled?: boolean; folderActionTitle?: string
+  folderActionLabel?: string; folderActionVisible?: boolean
+  folderActionDisabled?: boolean; folderActionTitle?: string
+  onFolderRetry?: () => void
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1117,9 +1143,15 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             className="inline-flex items-center gap-1.5 self-start text-[11.5px] text-primary hover:underline">
             <Icon name="lineage" size={12} /> View relationship graph →
           </button>
-          {table.folder && (
-            <button onClick={() => onFolder(table.folder!)} disabled={folderActionDisabled} title={folderActionTitle}
-              className="self-start text-[11.5px] text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-45">{folderActionLabel} “{table.folder}” →</button>
+          {folderActionVisible && (
+            <div className="flex items-center gap-2">
+              <button onClick={() => onFolder(table.folder ?? '')} disabled={folderActionDisabled} title={folderActionTitle}
+                className="self-start text-[11.5px] text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-45">
+                {folderActionLabel}{table.folder ? ` “${table.folder}”` : ''} →
+              </button>
+              {onFolderRetry && <button type="button" onClick={onFolderRetry}
+                className="text-[11.5px] font-semibold text-primary hover:underline">Retry</button>}
+            </div>
           )}
           <button onClick={() => void unregister()} disabled={deleting || !unregisterSupported || !base.registrationId || !base.metadataRevision} data-testid="detail-unregister"
             title={!unregisterSupported ? 'This catalog provider does not support versioned unregister'
