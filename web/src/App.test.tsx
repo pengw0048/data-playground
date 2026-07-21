@@ -1,9 +1,11 @@
+import { StrictMode } from 'react'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   bootstrap: vi.fn(),
   initRouter: vi.fn(),
+  settleBootstrap: vi.fn(),
   syncPluginCapabilities: vi.fn(),
 }))
 
@@ -40,6 +42,8 @@ describe('App auth bootstrap', () => {
     })
     vi.restoreAllMocks()
     mocks.bootstrap.mockReset().mockResolvedValue(undefined)
+    mocks.initRouter.mockReset().mockReturnValue({ settleBootstrap: mocks.settleBootstrap })
+    mocks.settleBootstrap.mockReset()
     useStore.setState({ bootstrap: mocks.bootstrap, view: 'canvas', authEnabled: false } as never)
     localStorage.clear()
   })
@@ -94,6 +98,19 @@ describe('App auth bootstrap', () => {
     expect(screen.getByTestId('canvas')).toBeVisible()
     expect(screen.queryByTestId('login')).not.toBeInTheDocument()
     expect(useStore.getState().authEnabled).toBe(true)
+  })
+
+  it('installs one router and bootstrap owner under StrictMode effect replay', async () => {
+    vi.spyOn(api, 'authStatus').mockResolvedValue({ authEnabled: false, userId: null })
+    mocks.bootstrap.mockImplementation(async ({ navigationToken }) => navigationToken)
+
+    render(<StrictMode><App /></StrictMode>)
+
+    await waitFor(() => expect(mocks.bootstrap).toHaveBeenCalledTimes(1))
+    expect(mocks.initRouter).toHaveBeenCalledTimes(1)
+    const navigationToken = mocks.bootstrap.mock.calls[0][0].navigationToken
+    expect(mocks.initRouter).toHaveBeenCalledWith(useStore, navigationToken)
+    await waitFor(() => expect(mocks.settleBootstrap).toHaveBeenCalledWith(navigationToken))
   })
 
   it('recovers from an unavailable bootstrap when retry confirms local mode', async () => {

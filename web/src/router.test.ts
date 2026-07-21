@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { initRouter, parseHash, routeHash } from './router'
+import { initRouter, parseHash, resetRouterForTests, routeHash } from './router'
+import type { DpView } from './store/graph'
+import { ownsNavigation, startNavigation } from './navigationOwnership'
 
 describe('Workspace routes', () => {
-  afterEach(() => { window.location.hash = '' })
+  afterEach(() => { resetRouterForTests(); window.location.hash = '' })
 
   it('round-trips an opaque stable Workspace resource ID', () => {
     const resourceId = 'dataset:registration/with spaces'
@@ -87,7 +89,7 @@ describe('Workspace routes', () => {
     let resolveOldOpen!: (opened: boolean) => void
     const oldOpen = new Promise<boolean>((resolve) => { resolveOldOpen = resolve })
     const state = {
-      view: 'canvas' as const,
+      view: 'canvas' as DpView,
       doc: { id: 'canvas-new', nodes: [{ id: 'node-new' }] },
       selectedId: null as string | null,
       workspaceResourceId: null,
@@ -102,7 +104,8 @@ describe('Workspace routes', () => {
     const store = {
       getState: () => ({
         ...state,
-        setView: (view: typeof state.view) => { state.view = view },
+        applyRoute: (route: { view: DpView }) => { state.view = route.view },
+        setView: (view: DpView) => { state.view = view },
         select: (id: string | null) => { state.selectedId = id },
         requestNodeReveal: (canvasId: string, nodeId: string) => {
           state.nodeRevealRequest = { canvasId, nodeId }
@@ -113,13 +116,32 @@ describe('Workspace routes', () => {
         setInboxQuery: vi.fn(), setTransformResource: vi.fn(), setTransformLibraryQuery: vi.fn(),
         openFile,
       }),
-      subscribe: vi.fn(),
+      subscribe: vi.fn(() => () => {}),
     }
-    initRouter(store)
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+
+    // A user Canvas open owns a newer token while its fetch is pending. Bootstrap settling must
+    // release only its own suppression, never re-apply the still-old URL and cancel that request.
+    startNavigation()
+    router.settleBootstrap(bootstrapToken)
+    expect(openFile).not.toHaveBeenCalled()
 
     history.replaceState(null, '', '#/canvas/canvas-old?node=missing')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
-    await vi.waitFor(() => expect(openFile).toHaveBeenCalledWith('canvas-old'))
+    await vi.waitFor(() => expect(openFile).toHaveBeenCalledWith('canvas-old', {
+      navigationToken: expect.any(Number),
+    }))
+
+    history.replaceState(null, '', '#/inbox')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(state.view).toBe('inbox'))
+    expect(location.hash).toBe('#/inbox')
+
+    history.replaceState(null, '', '#/jobs?status=failed')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(state.view).toBe('jobs'))
+    expect(location.hash).toBe('#/jobs?status=failed')
 
     history.replaceState(null, '', '#/canvas/canvas-new?node=node-new')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
@@ -133,5 +155,108 @@ describe('Workspace routes', () => {
       expect(state.nodeRevealRequest).toEqual({ canvasId: 'canvas-new', nodeId: 'node-new' })
       expect(location.hash).toBe('#/canvas/canvas-new?node=node-new')
     })
+  })
+
+  it('keeps a user Canvas open owned through stale bootstrap settle and browser history', async () => {
+    let releaseInitialA!: () => void
+    let releaseUserB!: () => void
+    const initialA = new Promise<void>((resolve) => { releaseInitialA = resolve })
+    const userB = new Promise<void>((resolve) => { releaseUserB = resolve })
+    let firstA = true
+    let firstB = true
+    const state = {
+      view: 'canvas' as DpView,
+      doc: { id: 'canvas-a', nodes: [] as { id: string }[] }, selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+    }
+    const subscribers = new Set<(snapshot: typeof state) => void>()
+    const publish = () => { for (const subscriber of subscribers) subscriber({ ...state }) }
+    const openFile = vi.fn(async (id: string, options?: { navigationToken?: number }) => {
+      const navigationToken = options?.navigationToken ?? startNavigation()
+      if (id === 'canvas-a' && firstA) { firstA = false; await initialA }
+      if (id === 'canvas-b' && firstB) { firstB = false; await userB }
+      // This models the real store's post-await ownership check before it installs a Canvas.
+      if (!ownsNavigation(navigationToken)) return false
+      state.doc = { id, nodes: [] }
+      state.view = 'canvas'
+      publish()
+      return true
+    })
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: (route: { view: DpView }) => { state.view = route.view; publish() },
+        select: (id: string | null) => { state.selectedId = id; publish() },
+        requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(), pushToast: vi.fn(), openFile,
+      }),
+      subscribe: (subscriber: (snapshot: typeof state) => void) => {
+        subscribers.add(subscriber)
+        return () => { subscribers.delete(subscriber) }
+      },
+    }
+    history.replaceState(null, '', '#/canvas/canvas-a')
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    const bootstrapOpen = openFile('canvas-a', { navigationToken: bootstrapToken })
+    const userOpen = openFile('canvas-b')
+
+    router.settleBootstrap(bootstrapToken)
+    expect(openFile).toHaveBeenCalledTimes(2)
+
+    releaseUserB()
+    await expect(userOpen).resolves.toBe(true)
+    expect(location.hash).toBe('#/canvas/canvas-b')
+    expect(openFile).toHaveBeenCalledTimes(2) // store publication did not re-enter router apply
+
+    releaseInitialA()
+    await expect(bootstrapOpen).resolves.toBe(false)
+    expect(state.doc.id).toBe('canvas-b')
+
+    history.back()
+    await vi.waitFor(() => expect(state.doc.id).toBe('canvas-a'))
+    history.forward()
+    await vi.waitFor(() => expect(state.doc.id).toBe('canvas-b'))
+    expect(openFile).toHaveBeenCalledTimes(4)
+  })
+
+  it('coalesces one history traversal and removes both listeners plus the store subscription', async () => {
+    const state = {
+      view: 'canvas' as DpView,
+      doc: { id: 'canvas-current', nodes: [] as { id: string }[] }, selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+    }
+    const openFile = vi.fn(async () => false)
+    const unsubscribe = vi.fn()
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: vi.fn(), select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(),
+        pushToast: vi.fn(), openFile,
+      }),
+      subscribe: vi.fn(() => unsubscribe),
+    }
+    const addListener = vi.spyOn(window, 'addEventListener')
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+    history.replaceState(null, '', '#/canvas/canvas-history')
+
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.waitFor(() => expect(openFile).toHaveBeenCalledTimes(1))
+
+    const hashListener = addListener.mock.calls.find(([type]) => type === 'hashchange')?.[1]
+    const popListener = addListener.mock.calls.find(([type]) => type === 'popstate')?.[1]
+    resetRouterForTests()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(removeListener).toHaveBeenCalledWith('hashchange', hashListener)
+    expect(removeListener).toHaveBeenCalledWith('popstate', popListener)
   })
 })

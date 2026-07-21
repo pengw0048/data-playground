@@ -4,6 +4,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // (Autosave is gated on _bootstrapped=false at import, so no PUT fires here anyway.)
 const apiMocks = vi.hoisted(() => ({
   listCanvases: vi.fn(), listRuns: vi.fn(), getCanvas: vi.fn(), createCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(), preview: vi.fn(),
+  canvasTransformReferences: vi.fn(),
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   executionManifest: vi.fn(),
@@ -18,6 +19,8 @@ vi.mock('../api/client', () => ({
         ? apiMocks.listRuns
       : property === 'getCanvas'
         ? apiMocks.getCanvas
+        : property === 'canvasTransformReferences'
+          ? apiMocks.canvasTransformReferences
         : property === 'createCanvas'
           ? apiMocks.createCanvas
           : property === 'saveCanvas'
@@ -65,6 +68,7 @@ import {
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
+import type { CanvasTransformReference } from '../types/api'
 import { writeCanvasDraft } from './canvasDrafts'
 
 const storage = new Map<string, string>()
@@ -92,6 +96,7 @@ describe('graph store — core authority ops', () => {
     apiMocks.listCanvases.mockReset().mockResolvedValue([])
     apiMocks.listRuns.mockReset().mockResolvedValue([])
     apiMocks.getCanvas.mockReset()
+    apiMocks.canvasTransformReferences.mockReset().mockResolvedValue([])
     apiMocks.createCanvas.mockReset().mockImplementation(async (doc: { id: string }) => (
       { ok: true, id: doc.id, created: true }
     ))
@@ -2506,6 +2511,39 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.id).toBe('b')
     expect(useStore.getState().canvasRole).toBe('owner')
   })
+
+  it.each(['resolve', 'reject'] as const)(
+    'does not let a stale transform-reference %s write reclaim an explicit Inbox destination',
+    async (settlement) => {
+      let resolveReferences!: (references: CanvasTransformReference[]) => void
+      let rejectReferences!: (error: Error) => void
+      apiMocks.getCanvas.mockResolvedValue(emptyTestDoc('deferred-references'))
+      apiMocks.listCanvases.mockResolvedValue([
+        { id: 'deferred-references', name: 'deferred-references', version: 1, role: 'owner' },
+      ])
+      apiMocks.canvasTransformReferences.mockImplementationOnce(() => new Promise((resolve, reject) => {
+        resolveReferences = resolve
+        rejectReferences = reject
+      }))
+
+      const opening = useStore.getState().openFile('deferred-references')
+      await vi.waitFor(() => expect(apiMocks.canvasTransformReferences).toHaveBeenCalledWith('deferred-references'))
+      useStore.getState().setInboxQuery('status=unread')
+      const ownedReferences: CanvasTransformReference[] = [{
+        id: 'newer-destination', version: 'v1', nodeIds: [], availability: 'active',
+      }]
+      useStore.setState({ canvasTransformReferences: ownedReferences })
+
+      if (settlement === 'resolve') resolveReferences([])
+      else rejectReferences(new Error('references unavailable'))
+
+      await expect(opening).resolves.toBe(false)
+      expect(useStore.getState().view).toBe('inbox')
+      expect(useStore.getState().inboxQuery).toBe('status=unread')
+      expect(useStore.getState().canvasTransformReferences).toBe(ownedReferences)
+      expect(localStorage.getItem('dp-open-alice')).not.toBe('deferred-references')
+    },
+  )
 
   it('isolates cached roles by user and fails closed across an identity change', async () => {
     const doc = { id: 'shared', version: 1, name: 'shared', nodes: [], edges: [] }

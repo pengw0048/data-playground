@@ -2,6 +2,7 @@
 // so the browser back/forward buttons work, a refresh restores where you were, and Share can produce
 // a link that opens straight into a specific canvas (#/canvas/<id>).
 import type { DpView } from './store/graph'
+import { ownsNavigation, startNavigation, type NavigationToken } from './navigationOwnership'
 
 export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string }
 
@@ -104,8 +105,8 @@ export function canvasLink(id: string): string {
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { setView: (v: DpView) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; setWorkspaceResource: (id: string | null) => void; setWorkspaceSearchQuery: (query: string) => void; setWorkspaceScope: (scope: 'all' | 'datasets') => void; setWorkspaceDatasetQuery: (query: string) => void; setJobsQuery: (query: string) => void; setInboxQuery: (query: string) => void; setTransformResource: (id: string | null, version?: string | null, upgrade?: { canvasId: string; nodeId: string } | null) => void; setTransformLibraryQuery: (query: string) => void; openFile: (id: string) => Promise<boolean> }
-  subscribe: (fn: (s: RouterState) => void) => void
+  getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken }) => Promise<boolean> }
+  subscribe: (fn: (s: RouterState) => void) => () => void
 }
 
 const hashFor = (s: RouterState) =>
@@ -123,36 +124,44 @@ const hashFor = (s: RouterState) =>
     s.view === 'transforms' ? s.transformUpgradeCanvasId ?? undefined : undefined,
     s.view === 'transforms' ? s.transformUpgradeNodeId ?? undefined : undefined)
 
-let _inited = false
-/** Wire the store ↔ the URL hash (two-way, loop-guarded). Call once at startup, after bootstrap. */
-export function initRouter(store: RouterStore): void {
-  if (_inited) return  // idempotent (React StrictMode double-invokes effects in dev)
-  _inited = true
-  let applying = false
+export interface RouterController {
+  settleBootstrap: (navigationToken: NavigationToken) => void
+}
+
+let _router: RouterController | null = null
+let _resetForTests: (() => void) | null = null
+
+export function resetRouterForTests(): void {
+  _resetForTests?.()
+  _resetForTests = null
+  _router = null
+}
+
+/** Wire the store ↔ the URL hash before bootstrap; bootstrap settles its own initial route token. */
+export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken): RouterController {
+  if (_router) return _router  // idempotent (React StrictMode double-invokes effects in dev)
+  let applyingToken: NavigationToken | null = bootstrapToken ?? null
   const apply = async () => {
+    const navigationToken = startNavigation()
     const r = parseHash()
     const st = store.getState()
-    applying = true  // held across the await so openFile's sets don't trigger the store→hash push
+    applyingToken = navigationToken
     try {
       // A reveal belongs to one explicit node= route only. Leaving the Canvas or returning through a
       // bare Canvas URL invalidates any request that has not yet been consumed by React Flow.
       if (r.view !== 'canvas' || !r.nodeId) st.clearNodeReveal()
       if (r.view === 'canvas' && r.canvasId) {
         if (st.doc.id !== r.canvasId) {
-          const ok = await st.openFile(r.canvasId)  // may be a shared canvas → authorized server-side
-          // openFile is generation-fenced and returns false when a newer navigation wins. The older
-          // apply must stop here: otherwise its invalid-link cleanup can erase the newer route's
-          // selection and pending reveal request.
-          const latest = parseHash()
-          if (latest.view !== 'canvas' || latest.canvasId !== r.canvasId
-              || latest.nodeId !== r.nodeId) return
+          const ok = await st.openFile(r.canvasId, { navigationToken })  // may be shared; server authorizes
+          if (!ownsNavigation(navigationToken)) return
           if (!ok) {
             // bad / revoked / unauthorized link: reflect the ACTUAL (unchanged) state and REPLACE the
             // bad history entry, so Back doesn't return to it and the store→hash sync doesn't bounce.
             history.replaceState(null, '', hashFor(store.getState()))
             return
           }
-        } else if (st.view !== 'canvas') st.setView('canvas')
+        } else if (st.view !== 'canvas') st.applyRoute({ view: 'canvas' }, navigationToken)
+        if (!ownsNavigation(navigationToken)) return
         const current = store.getState()
         const nodeExists = !!r.nodeId && current.doc.id === r.canvasId
           && current.doc.nodes.some((node) => node.id === r.nodeId)
@@ -161,44 +170,26 @@ export function initRouter(store: RouterStore): void {
         else if (r.nodeId) {
           current.clearNodeReveal()
           current.pushToast('The requested node is no longer in this Canvas.', 'info')
-          history.replaceState(null, '', hashFor(store.getState()))
+          if (ownsNavigation(navigationToken)) history.replaceState(null, '', hashFor(store.getState()))
         }
-      } else if (r.view === 'workspace' && (st.view !== 'workspace'
-          || st.workspaceResourceId !== (r.workspaceResourceId ?? null)
-          || st.workspaceScope !== (r.workspaceScope ?? 'all')
-          || ((r.workspaceScope ?? 'all') === 'all'
-            ? st.workspaceSearchQuery !== (r.workspaceQuery ?? '')
-            : st.workspaceDatasetQuery !== (r.workspaceDatasetQuery ?? '')))) {
-        st.setWorkspaceResource(r.workspaceResourceId ?? null)
-        st.setWorkspaceScope(r.workspaceScope ?? 'all')
-        if ((r.workspaceScope ?? 'all') === 'datasets') {
-          st.setWorkspaceDatasetQuery(r.workspaceDatasetQuery ?? '')
-        } else st.setWorkspaceSearchQuery(r.workspaceQuery ?? '')
-      } else if (r.view === 'jobs' && (st.view !== 'jobs' || st.jobsQuery !== (r.jobsQuery ?? ''))) {
-        st.setJobsQuery(r.jobsQuery ?? '')
-      } else if (r.view === 'inbox' && (st.view !== 'inbox' || st.inboxQuery !== (r.inboxQuery ?? ''))) {
-        st.setInboxQuery(r.inboxQuery ?? '')
-      } else if (r.view === 'transforms' && (st.view !== 'transforms'
-          || st.transformResourceId !== (r.transformId ?? null)
-          || st.transformVersion !== (r.transformVersion ?? null)
-          || st.transformUpgradeCanvasId !== (r.transformCanvasId ?? null)
-          || st.transformUpgradeNodeId !== (r.transformNodeId ?? null)
-          || st.transformLibraryQuery !== (r.transformQuery ?? ''))) {
-        st.setTransformLibraryQuery(r.transformQuery ?? '')
-        st.setTransformResource(
-          r.transformId ?? null, r.transformVersion ?? null,
-          r.transformCanvasId && r.transformNodeId
-            ? { canvasId: r.transformCanvasId, nodeId: r.transformNodeId } : null,
-        )
-      } else if (st.view !== r.view) {
-        st.setView(r.view)
-      }
-    } finally { applying = false }
+      } else if (ownsNavigation(navigationToken)) st.applyRoute(r, navigationToken)
+    } finally {
+      if (applyingToken === navigationToken) applyingToken = null
+    }
   }
-  window.addEventListener('hashchange', () => { void apply() })
+  let applyQueued = false
+  const requestApply = () => {
+    if (applyQueued) return
+    applyQueued = true
+    queueMicrotask(() => { applyQueued = false; void apply() })
+  }
+  window.addEventListener('hashchange', requestApply)
+  window.addEventListener('popstate', requestApply)
   // store → hash: only when the view or open canvas actually changes (not on every autosave)
-  store.subscribe((s) => {
-    if (applying) return
+  const unsubscribe = store.subscribe((s) => {
+    // A pending route token suppresses only its own writes. A user action claims a newer token,
+    // immediately re-enabling publication while the older Canvas request is still awaiting.
+    if (applyingToken !== null && ownsNavigation(applyingToken)) return
     const want = hashFor(s)
     if (location.hash !== want) {
       // Node focus is a deep-linkable selection inside one canvas, not a new destination. Keep the
@@ -206,9 +197,23 @@ export function initRouter(store: RouterStore): void {
       const sameCanvas = location.hash.split('?', 1)[0] === want.split('?', 1)[0]
         && want.startsWith('#/canvas/')
       if (sameCanvas) history.replaceState(null, '', want)
-      else location.hash = want  // destination/filter changes remain real back/forward entries
+      // State-owned navigation must not emit hashchange and make the router claim a competing token.
+      // pushState preserves Back/Forward; popstate above is the router's history entrypoint.
+      else history.pushState(null, '', want)
     }
   })
-  // reflect the state bootstrap just settled into the URL, without adding a history entry
-  if (location.hash !== hashFor(store.getState())) history.replaceState(null, '', hashFor(store.getState()))
+  _router = {
+    settleBootstrap: (navigationToken) => {
+      if (applyingToken === navigationToken) applyingToken = null
+      if (ownsNavigation(navigationToken)) {
+        if (location.hash !== hashFor(store.getState())) history.replaceState(null, '', hashFor(store.getState()))
+      }
+    },
+  }
+  _resetForTests = () => {
+    window.removeEventListener('hashchange', requestApply)
+    window.removeEventListener('popstate', requestApply)
+    unsubscribe()
+  }
+  return _router
 }

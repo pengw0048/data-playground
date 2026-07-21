@@ -14,6 +14,7 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 import { api } from './api/client'
 import { useStore } from './store/graph'
 import { initRouter } from './router'
+import { startNavigation } from './navigationOwnership'
 import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { useCollapsibleRegion } from './layoutPreferences'
@@ -105,8 +106,10 @@ export default function App() {
   useEffect(() => {
     if ((auth.kind === 'local' || auth.kind === 'authenticated') && !booted) {
       setBooted(true)
-      bootstrap().then(() => {
-        initRouter(useStore)  // wire URL ↔ state once the initial canvas is settled
+      const navigationToken = startNavigation()
+      const router = initRouter(useStore, navigationToken)  // wire URL ↔ state before initial Canvas hydration
+      bootstrap({ navigationToken }).then((settledToken) => {
+        router.settleBootstrap(settledToken)
         // register generic viewer tabs for plugin capabilities that declare one (§5.6, no per-plugin FE code)
         syncPluginCapabilities(useStore.getState().kernelInfo?.capabilityViews ?? [])
       })
