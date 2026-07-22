@@ -10,10 +10,11 @@ for its exact commit before publication.
 
 ## [0.1.0] — 2026-07-21
 
-First public release. The `v0.1.0` tag points to
-`172866586a503d3df7e9a2ed399bc20b9e510129`; that commit only adds this Changelog entry, so the
-published wheel and application image are byte-identical to the artifacts certified from the frozen
-product surface at `e510bec3a7c325a6f3585e2b9a7456ae694415eb` (see #663). Supported profiles:
+First public release. The annotated `v0.1.0` tag points to
+`172866586a503d3df7e9a2ed399bc20b9e510129`; its release workflow built and published the wheel and
+application image from that commit. Release-candidate certification had previously covered the frozen
+product surface at `e510bec3a7c325a6f3585e2b9a7456ae694415eb` (see #663); the only repository change
+between those commits is this Changelog entry. Supported profiles:
 Profile A (local workstation — single user or trusted collaborators, SQLite + local storage) and
 Profile B (trusted-team shared service — `DP_DEPLOYMENT_MODE=shared`, PostgreSQL). MCP (HTTP + stdio)
 is in scope. The `dp_ray` distributed backend (Profile C) is optional and outside the supported A/B

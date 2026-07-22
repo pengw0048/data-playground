@@ -20,9 +20,9 @@ The primary path is a local workstation: one process, embedded metadata and stor
 cloud account. A researcher can discover a dataset, inspect bounded samples and profiles, build a graph,
 preview an operation, and run the same graph over the full data from the browser or CLI.
 
-The product is designed for research data. Dataset, graph, preview, run, artifact, and lineage views
-must retain enough context for a researcher to understand what was inspected and how a result was
-produced.
+The product is designed for research workflows centered on datasets and reproducible data processing.
+Dataset, graph, preview, run, artifact, and lineage views must retain enough context for a researcher
+to understand what was inspected and how a result was produced.
 
 The repository is pre-1.0. It supports a single user or trusted collaborators; it is not a hardened,
 multi-tenant service. User-authored code, installed plugins, execution workers, and administrators are
