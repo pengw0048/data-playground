@@ -1,78 +1,89 @@
-# Data Playground — kernel
+# Data Playground kernel
 
-One FastAPI server that serves the SPA + API + WebSocket **and** runs the engine.
-Backend-agnostic core; the default setup runs fully offline and out-of-core.
+The kernel is the Python backend for Data Playground.  In the default local
+setup, one FastAPI process serves the built web app, the HTTP and WebSocket
+APIs, and the local execution engine.  It uses SQLite and the local filesystem
+by default; PostgreSQL, object storage, Ray, Kubernetes, and agent integration
+are optional deployment or extension paths.
 
-## Run
+For the product overview and the normal quick start, begin at the
+[repository README](../README.md).  This page is the backend contributor's
+map: where a request enters, where a canvas is executed, and where to make a
+change without treating the package layout as public API.
+
+## Run and test
+
+From this directory:
 
 ```bash
 uv sync --extra dev
-uv run python -m hub.seed         # generic sample datasets into ./data
-uv run dataplay --workspace . --port 8471   # serve SPA+API+engine, open browser
-uv run pytest -q                     # end-to-end tests (real engine on real files)
+uv run python -m hub.seed
+uv run dataplay --workspace "$PWD" --port 8471
+uv run pytest -q
 ```
 
-Optional Lance support: `uv sync --extra lance`.
+`dataplay` creates the workspace and seeds sample data when needed.  The
+repository root also provides `make run`, `make test`, `make e2e`, and the
+fast pre-submission gate `make preflight`; see
+[Contributing](../.github/CONTRIBUTING.md) for the complete development loop.
 
-## The engine (default runner) — a node builds a plan
+## Start here
 
-`dataset` = a lazy **DuckDB relation**. Each node builds a relation transform (out-of-core,
-spills) or, for `transform`, a Python UDF over Arrow batches. The runner executes the composed
-relation; preview runs the SAME build with a bounded source sample (faithful — honest previews).
+| Need | Entry point | Notes |
+| --- | --- | --- |
+| Start the application or run a saved canvas headlessly | [`hub/cli.py`](hub/cli.py) | Implements the `dataplay` command, including `mcp` and headless runs. |
+| Add or trace an HTTP, WebSocket, or SPA-serving route | [`hub/main.py`](hub/main.py), [`hub/routers/`](hub/routers/) | `main.py` creates the FastAPI app and mounts routers and the built SPA. |
+| Understand startup composition and plugin loading | [`hub/deps.py`](hub/deps.py) | Builds the default dependencies and discovers plugin packs. |
+| Change graph validation, planning, placement, or run lifecycle | [`hub/compiler.py`](hub/compiler.py), [`hub/planner.py`](hub/planner.py), [`hub/run_controller.py`](hub/run_controller.py) | Keep admission, execution ownership, and persisted run state aligned. |
+| Change built-in node semantics or preview/full execution | [`hub/nodespecs.py`](hub/nodespecs.py), [`hub/executors/`](hub/executors/) | The engine builds lazy DuckDB relations; preview has explicit bounded-input rules. |
+| Add a file format, execution backend, catalog behavior, or node capability | [`hub/plugins/`](hub/plugins/), [`hub/backends.py`](hub/backends.py), [`hub/sdk.py`](hub/sdk.py) | Core extension seams; the public contract is documented separately. |
+| Change metadata models or schema | [`hub/metadb.py`](hub/metadb.py), [`hub/migrations/`](hub/migrations/) | Add a forward Alembic revision; do not edit historical migrations. |
+| Find the nearest automated contract | [`hub/tests/`](hub/tests/) | Tests use isolated metadata storage by default; focused tests sit beside their domain. |
 
-| op | build |
-|---|---|
-| filter/select/sort/dedup | `rel.filter/.project/.order/.distinct` |
-| join / aggregate | DuckDB out-of-core hash join / group-by |
-| sql | `rel` as a view → `duckdb.sql(query)` (references `input`) |
-| sample | `USING SAMPLE n ROWS (reservoir)` |
-| transform | Python over Arrow `RecordBatch`es (map/map_batches/filter/flat_map) |
-| vector-search | cosine similarity top-K (Lance ANN when available) |
-| write | streaming sink → Parquet/CSV/Lance, registered in the catalog |
+## Execution path
 
-Not sample-previewable: `aggregate`, `write`, `section` → "needs a full pass".
+A browser, MCP client, or headless invocation reaches the same core flow:
 
-## Layout
+1. `hub/main.py` or `hub/cli.py` establishes the workspace and dependencies.
+2. A route or command validates the canvas graph and asks the planner to choose
+   an admissible execution path.
+3. The selected backend owns an ordinary run.  `hub/run_controller.py` owns
+   runs that the planner genuinely splits across multiple execution regions.
+4. `hub/executors/engine.py` turns built-in nodes into lazy DuckDB relation
+   operations or bounded Arrow-batch transforms.  Dataset adapters and sinks
+   handle reads and writes.
+5. Metadata, catalog facts, outputs, and run status are persisted through the
+   metadata and storage layers so the UI and API can report the same result.
 
-```
-kernel/
-  cli.py           `dataplay` — one-command launcher (seed + serve + open browser)
-  main.py          FastAPI routes + /ws
-  nodespecs.py     built-in node schemas served at /api/nodes (powers generic rendering)
-  compiler.py      graph → typed logical plan
-  sandbox.py       ad-hoc cell compiler (soft sandbox + time budget)
-  seed.py          generic sample datasets
-  sdk.py           dataplay.sdk — what a plugin author imports (NodeSpec/Port/Param + ctx)
-  deps.py          composition root + plugin discovery (plugins/ folder + entry points)
-  db.py            shared DuckDB connection
-  executors/
-    engine.py      the build engine (relation per node, out-of-core)
-    preview.py     sample-preview (same build, bounded source)
-  plugins/
-    adapters.py    Parquet/CSV/JSON/Arrow + Lance adapters (lazy scan + fingerprint)
-    runner.py      local out-of-core runner + estimate/placement + content-addressed cache
-    catalog.py     workspace catalog + lineage
-    capabilities.py media + vector
-    processors.py  processor registry (promote-to-library)
-```
+The default runner is deliberately local and out-of-core.  Distributed runners
+are optional backends with their own support and validation boundaries; do not
+infer their availability from the local execution path.
 
-## API
+## Boundaries worth preserving
 
-`GET /api/kernel` · `GET /api/nodes` (every node's schema) · `GET /api/plugins` ·
-`GET /api/catalog/tables[/{id}]` · `POST /api/catalog/register` · `GET /api/catalog/lineage?uri=` ·
-`POST /api/data/sample` · `POST /api/graph/compile` · `POST /api/run/preview` ·
-`POST /api/run/estimate` · `POST /api/run` · `GET /api/run/{id}` · `POST /api/run/{id}/cancel` ·
-`WS /ws/run/{id}`.
+- Keep transport concerns in `main.py` and `routers/`; put reusable execution
+  and data semantics behind the kernel and backend interfaces.
+- Keep the default product usable offline.  Provider-specific catalogs,
+  destinations, runners, and model integrations belong in plugin packs rather
+  than in the core.
+- Treat run identity, output ownership, dataset revisions, and catalog lineage
+  as persisted facts.  A UI convenience must not manufacture or overwrite
+  those facts.
+- Migrations move forward only.  When repairing old data, add a new repair
+  migration rather than changing a revision that users may already have run.
 
-## Plugins — the extension model
+## Owning references
 
-A plugin is a Python package with a `register(reg)` that adds nodes/adapters/runners/capabilities/
-catalog/planner. Discovered two ways:
-
-- **drop-in:** `<workspace>/plugins/<pack>/__init__.py` (+ `dataplay.toml` manifest) — restart to load.
-- **installed:** a pip package exposing a `dataplay.plugins` entry point, or `DP_PLUGINS=mod1,mod2`.
-
-`reg.add_node(spec, build)` registers a typed node; `build(engine, node, inputs) -> relation` builds
-its plan step with the `ctx` helpers (`ctx.sql`, `ctx.arrow_map`, `ctx.polars`). The SPA renders it
-from `/api/nodes` — no frontend code. Private or third-party backends (managed catalog, cluster runner,
-model pipelines) belong in such a pack, never in the core.
+- [HTTP API contract](../docs/API.md) — generated OpenAPI snapshot and its
+  drift check.
+- [Plugin guide](../docs/PLUGINS.md) — supported extension seams, manifests,
+  discovery, and reference plugins.
+- [Catalog guide](../docs/CATALOG.md) — catalog, lineage, and provider-facing
+  behavior.
+- [Versioned data and durable execution](../docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md)
+  — current revision/write/task guarantees and remaining limits.
+- [Ray](../docs/RAY.md) and [Ray Jobs](../docs/RAY_JOBS.md) — distributed
+  execution support boundaries and production gates.
+- [CI and release gates](../docs/CI.md) — which checks run where and why.
+- [Supported deployments and trust model](../docs/SUPPORT.md) — supported
+  operator profiles and responsibilities.
