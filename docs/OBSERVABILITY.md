@@ -1,140 +1,182 @@
-# Observability and audit contracts
+# Observability for operators and plugin authors
 
-This document is the **stable, versioned contract** for Data Playground metrics, audit events, and
-trace/request-ID propagation (roadmap slice 12 / OPS-01, first PR). Core defines shapes and sink seams;
-it ships **no** OpenTelemetry, Prometheus, StatsD, or vendor exporter. A future plugin implements those
-adapters against the seams below.
+Data Playground can report process health, emit typed metric and audit events, and fan out one
+normalized record when a run finishes. Core provides those event and plugin contracts. It does **not**
+ship a Prometheus or OpenTelemetry collector, a dashboard, alerting, a log backend, or retention.
+Choose and operate those services outside Data Playground, then connect a trusted plugin to the
+appropriate sink.
 
-Schema version for typed models in [`kernel/hub/observability.py`](../kernel/hub/observability.py):
-**`schema_version = 1`**.
+This guide starts with the operational task. The [reference contracts](#reference-contracts) at the end
+define the stable event shapes and inventories.
 
-## Design rules
+## Choose the right path
 
-1. **Low cardinality by construction.** Metric *labels* may only use the allow-listed keys below, with
-   short enum / bucket values. Raw IDs (`run_*`, canvas ids), URIs, user input, and error strings are
-   **never** label values. Correlation IDs live on event fields (`request_id`, `run_id`, `attempt_id`),
-   not labels.
-2. **Redaction.** Audit `attrs` never carry passwords, tokens, API keys, credential URIs, or raw row /
-   column sample values. Failed validation rejects the event (logged) rather than emitting a leak.
-3. **Failure isolation.** Each registered sink owns one daemon worker and a 256-event queue. Callers
-   only enqueue; they never wait for plugin I/O. A callback that raises stays usable for later events,
-   while a permanently wedged callback can consume only its own worker. Core allows at most 32 sink
-   workers process-wide.
-4. **Offline-first.** Registering zero sinks is valid; nothing is exported until a plugin attaches.
+| Need | Use | Do not assume |
+| --- | --- | --- |
+| Tell whether this process can serve traffic | `/api/livez` and `/api/readyz` | That either probe checks a sink, collector, dashboard, or alert route |
+| Retain a record after each completed run | A trusted `add_telemetry_sink` plugin | That the Jobs history is an external log backend |
+| Export typed counters, timings, or audit actions | A trusted metric or audit sink | That core exports Prometheus, OTLP, or vendor data by default |
+| Run a shared observability service | Your collector, storage, access policy, retention, and alerts | That a green core health probe certifies that service |
 
-When a queue is full, the newest event is dropped. Core logs the sink kind, queue capacity, and
-cumulative drop count on the first drop and then at powers of two, keeping overload visible without a
-log storm. Delivery is intentionally best-effort: queues are in memory and are not replayed after a
-crash. Graceful shutdown drains healthy sinks within one shared one-second deadline and then returns;
-a wedged daemon worker cannot hold process shutdown open. Registrations and workers are process-scoped,
-not tied to one FastAPI lifespan, so an embedded app can stop and start again without re-registering.
+## 1. Inspect the built-in health and run evidence
 
-## Trace / request ID propagation
+Use the probes from the process that serves the API:
 
-| Hop | Behavior |
-| --- | --- |
-| HTTP entry | Middleware reads `X-Request-Id` (or mints `req_<hex>`), sets a contextvar, echoes the header on every handled response (a framework-level 500 short-circuits before the middleware). |
-| WebSocket entry | Same mint/normalize from the handshake `X-Request-Id` header into the contextvar. |
-| Run start | `start_run` stamps `RunStatus.request_id` and persists it on `run_states.request_id`. |
-| Durable history | Finished runs store `run_records.request_id`. |
-| Backend port | Optional kwargs `request_id` / `run_id` / `attempt_id` are forwarded when an `ExecutionBackend.run` implementation accepts them (`invoke_backend_run`). |
-| Kernel | `KernelBackend` includes `request_id` in the kernel `/run` body; `RunBody` accepts it. |
+- `GET /api/livez` returns `{"ok": true}` when that process is serving. It deliberately does not test
+  the database, storage, a plugin, or an external observability service.
+- `GET /api/readyz` checks that the metadata database responds, its schema is at this build's head, and
+  DuckDB is responsive. It returns `503` with the individual checks when the process is not ready.
+- `GET /api/version` reports redacted deployment identity such as package version, commit SHA, selected
+  backend names, and core-library versions. It does not return database credentials or a storage path.
 
-Clients should treat `X-Request-Id` as opaque. Correlating a run uses `request_id` + `run_id` (+
-`attempt_id` for managed object publication).
+The Jobs UI and run APIs retain the run's status, result metadata, and `request_id`; they are the
+application's run history. They are not a general event store. With no registered sink, metric, audit,
+and finished-run telemetry events stay local to the process and are not exported or replayed later.
 
-## Metric catalog
+Every handled HTTP or WebSocket request receives an opaque `X-Request-Id` (or supplies a safe one), and
+the same identifier follows a submitted run into its durable history. Use it with `run_id` and, for
+managed publication, `attempt_id` when correlating evidence across a system you operate.
 
-Each metric is a typed `MetricEvent`: `{schema_version, name, type, unit, value, labels, ts, request_id?, run_id?, attempt_id?}`.
+## 2. Attach a telemetry sink
 
-### Allowed label keys
+For one bounded record after every finished run, start with the task-first
+[finished-run telemetry guide](PLUGIN_ONBOARDING.md#record-finished-run-telemetry). Its smallest
+reference, [`dp_run_log`](../examples/plugins/dp_run_log/), registers a trusted telemetry sink and
+appends one JSON line per completed run to its configured `DP_RUN_LOG` path.
 
-`status`, `outcome`, `placement`, `backend`, `method`, `route_class`, `action`, `kind`, `error_class`,
-`probe`, `ready`.
+The sink is for observation only. If an external system must schedule, execute, cancel, or publish a
+run, it belongs behind an execution backend instead. If it needs typed metrics or audit actions, use
+`Registry.add_metric_sink` or `Registry.add_audit_sink`; their exact registration contracts are in the
+[plugin reference](PLUGINS.md#the-rest-of-the-spi).
 
-`route_class` values are dotted buckets such as `api.run`, `api.auth`, `api.livez` (never raw URL paths
-or path IDs).
+Before relying on a wheel, run the installed-wheel conformance check. It builds only the core and
+`dp_run_log` candidates, discovers the plugin through its entry point in a clean environment, delivers
+a finished-run record, and stops the sink worker:
 
-Cardinality bound: every label value is a short enum/bucket (≤ 64 chars). Distinct canvases, datasets,
-users, or URIs must **not** enlarge the label set.
-
-| Name | Type | Unit | Labels | When emitted |
-| --- | --- | --- | --- | --- |
-| `dp.http.requests` | counter | `1` | `method`, `route_class`, `outcome` | Every HTTP response leave |
-| `dp.http.duration_ms` | histogram | `ms` | `method`, `route_class`, `outcome` | Every HTTP response leave |
-| `dp.run.state_transitions` | counter | `1` | `status`, `outcome`, `placement`, `error_class` | Run status transitions at finish (and queue→running when available) |
-| `dp.run.duration_ms` | histogram | `ms` | `status`, `outcome`, `placement`, `error_class` | Finished run (`RunStatus.ms`) |
-| `dp.run.queue_delay_ms` | histogram | `ms` | `placement`, `backend` | When queue delay is known (reserved; emitted when measured) |
-| `dp.run.retries` | counter | `1` | `backend`, `error_class` | Retryable backend/storage retry (reserved for adapters) |
-| `dp.run.cancel_latency_ms` | histogram | `ms` | `backend`, `outcome` | Cancel acknowledgement path (reserved when measured) |
-| `dp.run.finished` | counter | `1` | `status`, `outcome`, `placement`, `error_class` | Once per finished logical run (alongside the legacy telemetry sink) |
-| `dp.publication.events` | counter | `1` | `kind=publication`, `outcome`, `error_class` | Managed publication success/failure boundaries |
-| `dp.storage.gc` | counter | `1` | `kind=gc`, `outcome`, `error_class` | Object-attempt GC batch outcomes |
-| `dp.kernel.health` | gauge | `1` | `probe`, `ready` | `/api/livez` and `/api/readyz` probes |
-| `dp.provider.errors` | counter | `1` | `error_class`, `kind` | Provider failures funneled through hub boundaries |
-
-## Audit-event catalog
-
-Each event is a typed `AuditEvent`: `{schema_version, action, outcome, principal_id?, resource_type?,
-resource_id?, request_id?, run_id?, attempt_id?, attrs, ts}`.
-
-| Action | Outcome | Principal / resource | Notes |
-| --- | --- | --- | --- |
-| `auth.login` | success / failure | principal = user id | Password never present |
-| `auth.logout` | success | principal = user id | |
-| `auth.password_change` | success / failure | principal = user id | |
-| `admin.settings_change` | success / denied | principal = admin; resource = setting key | Values redacted; secret keys noted only as `sensitive=true` |
-| `sharing.change` | success / denied | principal = owner; resource = canvas id | `attrs.op` = `share` / `unshare` / `visibility` |
-| `dataset.access` | success / denied | resource = dataset id | Emitted when access checks exist |
-| `dataset.mutation` | success / failure / denied | resource = dataset id | Register / delete / upload |
-| `agent.egress` | success / denied | — | **Schema only** until egress policy (#106) |
-| `job.submit` | success / failure / denied | principal = caller; `run_id` | |
-| `job.cancel` | success / failure / denied | principal = caller; `run_id` | |
-| `secret_ref.change` | success / failure | — | **Schema only** until secret references (#107) |
-| `policy.denial` | denied | principal + resource | **Schema only** until policy surfaces land |
-| `workspace.relink` | success / failure / denied | principal + provider binding | Explicit manual external Workspace binding replacement; no provider config or URI |
-
-Redaction rules: never include raw row values, plaintext secrets, or credential-bearing URIs in
-`attrs` or metric labels. Use resource identity (dataset id / canvas id / setting key) only.
-
-## Sink seams
-
-| Seam | Registrar | Payload | Notes |
-| --- | --- | --- | --- |
-| Finished-run telemetry (legacy) | `Registry.add_telemetry_sink(fn)` | `dict` with `canvas_id`, `target_node_id`, `run_id`, `job_type`, `status`, `rows`, `ms`, `error`, declaration-ordered `outputs`, `placement`, `per_node`, and **`request_id`** | Best-effort asynchronous callback. Reference consumer: [`examples/plugins/dp_run_log`](../examples/plugins/dp_run_log/). |
-| Metrics | `Registry.add_metric_sink(fn)` / `hub.observability.add_metric_sink` | `MetricEvent` | In-memory sink for tests: `InMemoryObservabilitySink`. |
-| Audit | `Registry.add_audit_sink(fn)` / `hub.observability.add_audit_sink` | `AuditEvent` | Same isolation guarantees. |
-
-### Relationship to `add_telemetry_sink`
-
-`add_telemetry_sink` is **retained as-is** for the finished-run JSONL / custom-integration callback. New
-ops tooling should prefer `MetricEvent` / `AuditEvent`. On each finished run the hub:
-
-1. Persists history (`run_records`, including `request_id`).
-2. Fans out the legacy telemetry dict (now with `request_id`).
-3. Emits `dp.run.finished` + `dp.run.duration_ms` (and a state-transition counter) through metric sinks.
-
-A plugin may implement only the legacy sink, only the new sinks, or both.
-
-## In-memory test sink
-
-```python
-from hub.observability import InMemoryObservabilitySink, clear_sinks, drain_sinks
-
-clear_sinks()
-sink = InMemoryObservabilitySink().register()
-# … exercise HTTP / runs …
-assert drain_sinks(timeout=1)
-assert sink.metrics and sink.audits
+```bash
+cd kernel
+uv run pytest -q hub/tests/test_plugin_wheel_conformance.py::test_run_log_wheel_conformance_uses_only_its_entry_point
 ```
 
-Contract tests cover event shape validity, redaction, bounded label cardinality, request-ID
-propagation to a fake `ExecutionBackend`, queue/worker bounds, overload logging, deterministic
-shutdown, and fault isolation (raising + permanently blocked sinks).
+Use the same pattern for a third-party wheel, then add integration tests for its actual collector or
+storage. The core check proves plugin activation and the bounded callback contract; it cannot prove a
+network service, credentials, retention policy, or alert route. The [full telemetry conformance
+reference](PLUGINS.md#verifying-it) explains the installed-wheel boundary.
 
-## Out of scope (follow-ups)
+## 3. Verify delivery, redaction, and shutdown expectations
 
-- OpenTelemetry / Prometheus / StatsD adapters and any hosted backend.
-- Dashboards, SLO definitions, alert policies, log retention.
-- Emitting `agent.egress`, `secret_ref.change`, or `policy.denial` until those features land.
-- Ray operator metrics and job links (planned issue on top of this contract).
+Sink delivery is intentionally best-effort and isolated from the request and run paths:
+
+- Each registered metric, audit, or telemetry sink has one daemon worker and a queue of at most 256
+  events. At most 32 sink workers are registered process-wide.
+- Producers enqueue and continue. A slow or raising callback cannot change a request result, run result,
+  or stored data. When a queue is full, the newest event is dropped and core logs the first drop and
+  later powers of two.
+- Queues are in memory. Core makes no durable-delivery, replay, ordering-across-processes, or lossless
+  delivery promise. On application shutdown it gives healthy workers one shared second to drain; a
+  wedged daemon worker cannot hold the process open.
+- Metric labels are restricted to short, low-cardinality buckets. Audit attributes reject
+  secret-shaped keys or values and must not contain row samples. A rejected metric or audit event is
+  logged rather than delivered.
+
+The finished-run telemetry record has a different trust boundary: it intentionally contains run and
+canvas identifiers, status, error text, and output metadata. Committed output metadata can include a
+URI or catalog version. Treat a sink and its destination as trusted with that information; do not expose
+the `dp_run_log` file or a custom sink endpoint as a public event feed.
+
+Run the core contract suite when changing an observability plugin or relying on these limits:
+
+```bash
+cd kernel
+uv run pytest -q hub/tests/test_observability_contracts.py
+```
+
+It covers event validation and redaction, request-ID propagation, bounded queues and workers, overload
+logging, fault isolation, and bounded shutdown. It is not a substitute for testing the service that
+receives the events.
+
+## 4. Operate a trusted-team shared service
+
+The supported shared-service boundary is defined in [Supported deployments and trust model](SUPPORT.md).
+In that profile, the operator supplies authentication, TLS, Postgres, durable storage, backups, network
+controls, capacity, and the external observability system. Collector availability, storage retention,
+access control, alerting, incident response, and service-level objectives are operator responsibilities.
+
+Plugins and their dependencies are trusted code: registration hooks run in every trusted Data Playground
+process that loads them, and can use that process's available capabilities. Review the package, its
+configuration, its credential access, and the destination that receives events before installing it.
+Neither a sink plugin nor its queue is a tenant-isolation boundary.
+
+Registrations and delivery workers are process-scoped. A multi-process deployment must load and configure
+the sink in each process that should emit to the external service; core does not aggregate events across
+hubs. Monitor the collector and its credentials separately from `/api/livez` and `/api/readyz`.
+
+## Reference contracts
+
+This section is a reference, not a setup guide. The typed models use `schema_version = 1` in
+[`kernel/hub/observability.py`](../kernel/hub/observability.py). A model change is a contract change.
+
+### Event shapes and correlation
+
+| Event | Shape |
+| --- | --- |
+| `MetricEvent` | `schema_version`, `name`, `type`, `unit`, `value`, `labels`, `ts`, and optional `request_id`, `run_id`, `attempt_id` |
+| `AuditEvent` | `schema_version`, `action`, `outcome`, optional principal/resource/request/run/attempt identifiers, `attrs`, and `ts` |
+| Finished-run telemetry | `canvas_id`, `target_node_id`, `run_id`, `request_id`, `job_type`, `status`, `rows`, `ms`, `error`, declaration-ordered `outputs`, `placement`, and `per_node` |
+
+`X-Request-Id` is accepted only as a short safe token; otherwise core mints `req_<hex>`. It is forwarded
+when an execution backend accepts the optional `request_id`, `run_id`, and `attempt_id` arguments. A
+finished logical run is persisted first, then its telemetry record and finished-run metrics are fanned
+out. Internal region runs do not create separate logical telemetry records.
+
+### Sink registrations
+
+| Contract | Registration | Intended payload |
+| --- | --- | --- |
+| Finished-run telemetry | `Registry.add_telemetry_sink(fn)` | One normalized `dict` after a finished logical run |
+| Metrics | `Registry.add_metric_sink(fn)` or `hub.observability.add_metric_sink(fn)` | `MetricEvent` |
+| Audit | `Registry.add_audit_sink(fn)` or `hub.observability.add_audit_sink(fn)` | `AuditEvent` |
+
+All three registrations use the delivery limits described above. A plugin can implement one or more of
+them, but should claim only the capabilities it actually tests. `InMemoryObservabilitySink` is a core test
+helper, not an operator-facing collector.
+
+### Metric inventory
+
+Every metric label key is one of `status`, `outcome`, `placement`, `backend`, `method`, `route_class`,
+`action`, `kind`, `error_class`, `probe`, or `ready`. Label values must be short buckets; never put a
+raw URI, canvas ID, user input, error message, or `run_` / `req_` / `att_` identifier in a label.
+
+| Metric | Type / unit | Current emission boundary |
+| --- | --- | --- |
+| `dp.http.requests` | counter / `1` | Each handled HTTP response |
+| `dp.http.duration_ms` | histogram / `ms` | Each handled HTTP response |
+| `dp.run.finished` | counter / `1` | Each finished logical run |
+| `dp.run.state_transitions` | counter / `1` | Each finished logical run |
+| `dp.run.duration_ms` | histogram / `ms` | Finished runs with a measured duration |
+| `dp.publication.events` | counter / `1` | Managed publication success or failure boundary |
+| `dp.storage.gc` | counter / `1` | Managed object-attempt GC outcomes |
+| `dp.provider.errors` | counter / `1` | Provider failures surfaced by managed GC |
+| `dp.kernel.health` | gauge / `1` | `/api/livez` and `/api/readyz` |
+| `dp.run.queue_delay_ms` | histogram / `ms` | Declared for a backend that measures queue delay; core does not emit it yet |
+| `dp.run.retries` | counter / `1` | Declared for retrying adapters/backends; core does not emit it yet |
+| `dp.run.cancel_latency_ms` | histogram / `ms` | Declared for a measured cancellation acknowledgement; core does not emit it yet |
+
+### Audit inventory
+
+`AuditEvent.attrs` is small, redacted metadata, not a general payload field. The following actions are
+currently emitted by their corresponding application paths: `auth.login`, `auth.logout`,
+`auth.password_change`, `admin.settings_change`, `sharing.change`, `dataset.access`,
+`dataset.mutation`, `job.submit`, `job.cancel`, and `workspace.relink`. Their outcomes are `success`,
+`failure`, or `denied` as appropriate to that path.
+
+`agent.egress`, `secret_ref.change`, and `policy.denial` are schema members only; current core does not
+emit them. Do not build an alert or compliance claim around those actions until the owning product path
+exists.
+
+### Deliberate non-goals
+
+Core does not provide an exporter, collector, dashboard, alert policy, retention system, hosted
+observability service, or a production readiness assertion for a third-party backend. A plugin can
+connect to such a system, but its owner must provide the deployment, credentials, access controls, and
+capability-specific integration evidence.
