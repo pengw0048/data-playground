@@ -409,12 +409,29 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
         if (status.status === 'failed') throw new Error(status.error ?? 'recovered run failed')
         return status.status
       }, { timeout: 40_000 }).toBe('done')
+
+      // Make a cheaper, ordinary Source run the newest record. Every check below must still resolve
+      // the original recovered managed Write by identity instead of silently substituting latest.
+      const later = await ok<{ runId: string }>(await page.request.post(`${base}/api/run`, {
+        data: { graph, targetNodeId: 'source', confirmed: true, submissionId: randomUUID() },
+      }), 'submit later Source run')
+      expect(later.runId).not.toBe(started.runId)
+      await expect.poll(async () => {
+        const status = await ok<{ status: string; error?: string | null }>(
+          await page.request.get(`${base}/api/run/${encodeURIComponent(later.runId)}`), 'poll later Source run')
+        if (status.status === 'failed') throw new Error(status.error ?? 'later Source run failed')
+        return status.status
+      }, { timeout: 30_000 }).toBe('done')
+
       type RestartInput = { node_id: string; dataset_id: string; revision_id: string; provider: string }
       type RestartReceipt = { datasetId: string; revisionId: string }
       type RestartJob = {
         runId: string; status: string; createdAt: string; inputManifest: RestartInput[]
         outputReceipt?: RestartReceipt | null
       }
+      const latest = await ok<{ items: RestartJob[] }>(
+        await page.request.get(`${base}/api/jobs?canvas_id=${encodeURIComponent(canvasId)}&limit=1`), 'read latest Jobs record')
+      expect(latest.items[0]?.runId).toBe(later.runId)
       const jobs = await ok<{ items: RestartJob[] }>(
         await page.request.get(`${base}/api/jobs?run_id=${encodeURIComponent(started.runId)}&limit=1`), 'read recovered Jobs receipt')
       const recoveredJob = exactOne(jobs.items, (item) => item.runId === started.runId, 'one recovered Jobs record')
