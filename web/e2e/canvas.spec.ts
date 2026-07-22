@@ -1088,6 +1088,7 @@ test.describe('Data Playground canvas', () => {
 
   test('a section editor uses canvas containment instead of inline nodes', async ({ page }) => {
     await fresh(page)
+    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
     await addNode(page, 'Compute', 'section')
     await expect(page.locator('.react-flow__node')).toHaveCount(1)
     await page.getByText('Edit script →').click()
@@ -1095,7 +1096,7 @@ test.describe('Data Playground canvas', () => {
     await expect(page.getByText('contained nodes (on the canvas)')).toBeVisible()
     await expect(page.getByText(/Drop nodes onto the section frame/)).toBeVisible()
     await expect(page.getByRole('button', { name: 'add node' })).toHaveCount(0)
-    await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
+    await expect.poll(async () => (await canvasFor(page, canvasId)).nodes.length).toBe(1)
 
     await page.reload()
     const section = page.locator('.react-flow__node').filter({ hasText: 'SECTION' })
