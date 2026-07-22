@@ -106,9 +106,43 @@ _DUCK_TYPE = {
 # element types of list/struct/map) rather than collapsing everything to a coarse bucket. canonical_type
 # accepts BOTH the user dialect (`list<int>`, `struct<a:int>`, `decimal(38,9)`, `timestamp[ns]`) and the
 # DuckDB dialect (`INTEGER[]`, `STRUCT(a INTEGER)`, `DECIMAL(38,9)`, `TIMESTAMP_NS`).
-_INT_NAMES = {"int", "integer", "bigint", "long", "smallint", "tinyint", "hugeint", "ubigint",
-              "uinteger", "usmallint", "utinyint", "uint", "int2", "int4", "int8", "int16", "int32",
-              "int64", "uint8", "uint16", "uint32", "uint64"}
+_COARSE_INT_NAMES = {
+    "int", "integer", "bigint", "long", "smallint", "tinyint", "hugeint", "ubigint",
+    "uinteger", "usmallint", "utinyint", "uint", "int2", "int4",
+}
+_PRECISE_INT_NAMES = {
+    "int8": ("int", "signed", 8),
+    "int16": ("int", "signed", 16),
+    "int32": ("int", "signed", 32),
+    "int64": ("int", "signed", 64),
+    "uint8": ("int", "unsigned", 8),
+    "uint16": ("int", "unsigned", 16),
+    "uint32": ("int", "unsigned", 32),
+    "uint64": ("int", "unsigned", 64),
+}
+# DuckDB renders relation types with these uppercase spellings. Preserve the original case so a
+# lowercase user contract such as `integer` stays intentionally coarse while actual `INTEGER` carries
+# its known 32-bit width. This distinction also survives recursively inside list/map/struct types.
+_PRECISE_DUCKDB_INT_NAMES = {
+    "TINYINT": ("int", "signed", 8),
+    "SMALLINT": ("int", "signed", 16),
+    "INTEGER": ("int", "signed", 32),
+    "BIGINT": ("int", "signed", 64),
+    "UTINYINT": ("int", "unsigned", 8),
+    "USMALLINT": ("int", "unsigned", 16),
+    "UINTEGER": ("int", "unsigned", 32),
+    "UBIGINT": ("int", "unsigned", 64),
+}
+_PRECISE_INT_DUCK_TYPES = {
+    ("signed", 8): "TINYINT",
+    ("signed", 16): "SMALLINT",
+    ("signed", 32): "INTEGER",
+    ("signed", 64): "BIGINT",
+    ("unsigned", 8): "UTINYINT",
+    ("unsigned", 16): "USMALLINT",
+    ("unsigned", 32): "UINTEGER",
+    ("unsigned", 64): "UBIGINT",
+}
 _FLOAT_NAMES = {"float", "double", "real", "number", "float4", "float8", "double precision"}
 _STR_NAMES = {"string", "str", "text", "varchar", "char", "bpchar", "utf8", "uuid"}
 _BYTES_NAMES = {"blob", "bytes", "binary", "varbinary", "bytea"}
@@ -187,7 +221,11 @@ def canonical_type(t: object) -> tuple:
             unit = None  # microsecond is DuckDB's unmarked default → coarse, so `TIMESTAMP` == `timestamp[us]`
         tz = True if ("time zone" in low or low.endswith("tz")) else None
         return ("timestamp", unit, tz)
-    if head in _INT_NAMES:
+    if s in _PRECISE_DUCKDB_INT_NAMES:
+        return _PRECISE_DUCKDB_INT_NAMES[s]
+    if head in _PRECISE_INT_NAMES:
+        return _PRECISE_INT_NAMES[head]
+    if head in _COARSE_INT_NAMES:
         return ("int",)
     if head in _FLOAT_NAMES:
         return ("float",)
@@ -217,6 +255,10 @@ def type_satisfies(want: tuple, actual: tuple) -> bool:
         return True       # coarsest want, accepts any actual. (An unrecognized non-empty type is ("other",
                           # head) and stays STRICT, so `<i8` never silently becomes a wildcard.)
     wk = want[0]
+    if wk == "int":
+        # A bare integer declaration asserts only the numeric family and remains compatible with any
+        # known width/signedness. An explicit width is strict, including inside nested type recursion.
+        return actual[0] == "int" and (len(want) == 1 or want == actual)
     if wk == "float":  # numeric coarse: a float contract also accepts a decimal actual
         return actual[0] in ("float", "decimal")
     if wk == "decimal":
@@ -248,6 +290,8 @@ def type_satisfies(want: tuple, actual: tuple) -> bool:
 def _canon_to_duck(c: tuple) -> str:
     """A canonical type → a DuckDB type string for the schema-only stand-in relation."""
     k = c[0]
+    if k == "int" and len(c) == 3:
+        return _PRECISE_INT_DUCK_TYPES[(c[1], c[2])]
     simple = {"int": "BIGINT", "float": "DOUBLE", "string": "VARCHAR", "bool": "BOOLEAN",
               "date": "DATE", "time": "TIME", "bytes": "BLOB", "json": "JSON"}
     if k in simple:

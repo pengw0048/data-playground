@@ -2329,10 +2329,38 @@ def test_schema_contract_type_model_is_specificity_faithful():
     assert S(C("timestamp with time zone"), C("TIMESTAMP WITH TIME ZONE"))
     assert not S(C("timestamp with time zone"), C("TIMESTAMP"))
 
+    # Explicit integer widths and signedness remain precise across the declared and DuckDB dialects.
+    # Lowercase SQL-ish names retain their historical coarse meaning, while DuckDB's uppercase actual
+    # type spellings carry the physical evidence needed by schema enforcement and Write admission.
+    precise_integers = {
+        "int8": "TINYINT", "int16": "SMALLINT", "int32": "INTEGER", "int64": "BIGINT",
+        "uint8": "UTINYINT", "uint16": "USMALLINT", "uint32": "UINTEGER", "uint64": "UBIGINT",
+    }
+    for declared, actual in precise_integers.items():
+        assert _duck_type(declared) == actual
+        assert S(C(declared), C(actual))
+        assert S(C("int"), C(actual))  # a coarse integer contract still accepts every precise actual
+    assert not S(C("int32"), C("BIGINT"))
+    assert not S(C("uint64"), C("BIGINT"))
+    assert S(C("list<int32>"), C("INTEGER[]"))
+    assert not S(C("list<int32>"), C("BIGINT[]"))
+    assert S(C("map<string,uint32>"), C("MAP(VARCHAR, UINTEGER)"))
+    assert not S(C("map<string,uint32>"), C("MAP(VARCHAR, BIGINT)"))
+    assert S(
+        C("struct<signed:int16,unsigned:uint32>"),
+        C("STRUCT(signed SMALLINT, unsigned UINTEGER)"),
+    )
+    assert S(C("list<int>"), C("UINTEGER[]"))
+    assert S(C("map<string,int>"), C("MAP(VARCHAR, UINTEGER)"))
+    assert S(C("struct<value:int>"), C("STRUCT(value UINTEGER)"))
+
     # _duck_type now builds a PRECISE stand-in so a declared contract propagates faithfully downstream
     assert _duck_type("decimal(38,9)") == "DECIMAL(38,9)"
     assert _duck_type("list<int>") == "BIGINT[]"
     assert _duck_type("int") == "BIGINT" and _duck_type("string") == "VARCHAR"  # coarse still coarse
+    assert _duck_type("integer") == "BIGINT"
+    assert _duck_type("tinyint") == "BIGINT" and _duck_type("smallint") == "BIGINT"
+    assert _duck_type("bigint") == "BIGINT" and _duck_type("ubigint") == "BIGINT"
 
 
 def test_write_mode_append_builds_a_readable_directory_dataset():
