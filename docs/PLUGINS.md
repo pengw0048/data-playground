@@ -79,7 +79,8 @@ Three discovery paths (see `kernel/hub/deps.py`):
 1. Drop-in — copy the folder into `<workspace>/plugins/<pack>/` and restart:
 
    ```bash
-   cp -r examples/plugins/dp_example "$DP_WORKSPACE/plugins/"
+   mkdir -p /absolute/path/to/workspace/plugins
+   cp -r examples/plugins/dp_example /absolute/path/to/workspace/plugins/
    ```
 
 2. `DP_PLUGINS` — comma-separated importable module names, for example `DP_PLUGINS=dp_example`.

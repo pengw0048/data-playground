@@ -6,7 +6,8 @@ preview steps against real rows, run the graph, and read the output. Canvases sh
 like any other.
 
 This is the mirror image of the [built-in agent](../README.md#agents-and-automation): there the kernel
-calls a model; here a model calls the kernel. No API key is required.
+calls a model; here a model calls the kernel. Data Playground itself requires no MCP API key, though an
+MCP client or a hosted model it uses may require its own credentials.
 
 ## Two ways to connect
 
@@ -40,7 +41,7 @@ claude mcp add dataplay -- \
 Use absolute paths; the MCP client may launch the command from another directory. Choose the workspace
 that should own the metadata database, catalog, canvases, and outputs.
 
-Canvases persist to the shared workspace DB and appear under Files. If a canvas is already open,
+Canvases persist to the shared workspace DB and appear in Workspace. If a canvas is already open,
 reload to pick up stdio edits — an out-of-process client is not in the browser's live collab room.
 
 Optional flags:

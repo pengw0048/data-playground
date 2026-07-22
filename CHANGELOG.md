@@ -10,12 +10,15 @@ for its exact commit before publication.
 
 ## [0.1.0] — 2026-07-21
 
-First public release, certified against commit `e510bec3a7c325a6f3585e2b9a7456ae694415eb` (see #663).
-Shipped as a Python wheel (`data-playground`) and an application container image. Supported profiles:
+First public release. The annotated `v0.1.0` tag points to
+`172866586a503d3df7e9a2ed399bc20b9e510129`; its release workflow built and published the wheel and
+application image from that commit. Release-candidate certification had previously covered the frozen
+product surface at `e510bec3a7c325a6f3585e2b9a7456ae694415eb` (see #663); the only repository change
+between those commits is this Changelog entry. Supported profiles:
 Profile A (local workstation — single user or trusted collaborators, SQLite + local storage) and
 Profile B (trusted-team shared service — `DP_DEPLOYMENT_MODE=shared`, PostgreSQL). MCP (HTTP + stdio)
-is in scope; the dp_ray distributed backend (Profile C) ships as an optional plugin, outside the
-release gate.
+is in scope. The `dp_ray` distributed backend (Profile C) is optional and outside the supported A/B
+deployment profiles, but Ray and Ray Jobs acceptance are release-publication gates.
 
 ### Supported platforms
 
@@ -23,8 +26,9 @@ release gate.
 - **Browsers:** modern desktop Chromium, Firefox, and Safari (desktop-first; the Playwright e2e suite
   runs Chromium). Mobile viewports are not a release support claim.
 - **Deployment profiles:** Profile A (local workstation) and Profile B (trusted-team shared service,
-  PostgreSQL) are supported this release. Profile C (distributed Ray) ships as an optional plugin and
-  remains outside the release gate — see `docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md`.
+  PostgreSQL) are supported this release. Profile C (distributed Ray) is optional and outside those
+  supported profiles; Ray and Ray Jobs acceptance remain required before release publication — see
+  `docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md`.
 
 ### Metadata schema
 
@@ -48,7 +52,7 @@ release gate.
 ### Breaking changes
 
 - All metadata databases created before `0001_schema_baseline` must be recreated. This destructive
-  reset is allowed only because no public release exists.
+  reset was permitted before the first public release; it is not an upgrade path for released databases.
 - Callers that scraped `GET /api/version` should expect a `version` field (package version) in
   addition to the existing `sha` / backend identity fields.
 
@@ -57,8 +61,8 @@ release gate.
 - Soft sandbox: canvas code runs as the hub/kernel OS user; Profile A trusts the local machine.
 - The baseline downgrade deletes every metadata table and exists only for schema/startup tests; it is
   not an operational rollback path.
-- Profile B/C gates (OIDC, multi-replica collab certification, Ray production matrix, SBOM for the
-  Ray worker image) are out of scope for the first release.
+- Profile B still lacks OIDC and multi-replica collaboration certification. The Ray worker-image SBOM
+  is also outside this release; Ray and Ray Jobs acceptance nevertheless gate publication.
 - Wheel/image publication targets GitHub Releases + GHCR only (not PyPI).
 
 ### Rollback constraints

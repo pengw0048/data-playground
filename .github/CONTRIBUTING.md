@@ -45,7 +45,7 @@ core edits, no frontend code for a typed node. Start from a reference plugin and
 - `examples/plugins/dp_example/` — a `redact` compute node (the smallest `add_node`).
 - `examples/plugins/dp_upper/` — a node whose DuckDB build + engine-neutral `ir` hook share one
   operator, so it also runs on a distributed backend.
-- `docs/PLUGINS.md` — the full SPI reference and a table of all twelve reference plugins, each with
+- `docs/PLUGINS.md` — the full SPI reference and a table of reference plugins, each with
   a copyable test in `kernel/hub/tests/test_kernel.py`.
 
 Drop a plugin folder into `<workspace>/plugins/` and it loads on kernel start.
