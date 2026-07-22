@@ -1,13 +1,10 @@
 # Drive Data Playground from your own agent (MCP)
 
-Data Playground speaks [MCP](https://modelcontextprotocol.io). Point Claude Code or another MCP client
-at your workspace to explore the catalog, open a canvas, wire typed nodes, write `transform` Python,
-preview steps against real rows, run the graph, and read the output. Canvases show up in the browser
-like any other.
-
-This is the mirror image of the [built-in agent](../README.md#agents-and-automation): there the kernel
-calls a model; here a model calls the kernel. Data Playground itself requires no MCP API key, though an
-MCP client or a hosted model it uses may require its own credentials.
+Data Playground speaks [MCP](https://modelcontextprotocol.io), so an external client such as Claude
+Code can work directly with a workspace. Use it to explore the catalog, open a canvas, wire typed
+nodes, write `transform` Python, preview steps against real rows, run the graph, and read the output.
+Canvases show up in the browser like any other. Data Playground itself requires no MCP API key,
+though an MCP client or a hosted model it uses may require its own credentials.
 
 ## Two ways to connect
 
@@ -71,7 +68,7 @@ stdio cannot do that; reload to see its edits.
 `sample_result`.
 
 Both transports share the workspace metadata DB, catalog, and storage. Graph-edit, preview, catalog,
-and canvas tools reuse the same building blocks as the HTTP API and the built-in agent.
+and canvas tools reuse the same building blocks as the HTTP API.
 
 ## Tools
 
