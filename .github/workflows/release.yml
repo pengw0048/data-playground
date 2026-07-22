@@ -103,7 +103,7 @@ jobs:
 
   publish:
     name: publish release + SBOM + attestations
-    needs: [core-ci, codeql, secret-scan, artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
+    needs: [release-identity, core-ci, codeql, secret-scan, artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 40

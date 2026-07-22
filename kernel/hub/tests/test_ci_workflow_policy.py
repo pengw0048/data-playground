@@ -227,9 +227,11 @@ def test_release_publish_waits_for_every_required_gate() -> None:
     }
     for job, called_workflow in expected.items():
         assert jobs[job]["uses"] == called_workflow
-    expected |= {
+    core_gates = {
         "core-ci": "./.github/workflows/ci.yml",
         "codeql": "./.github/workflows/codeql.yml",
         "secret-scan": "./.github/workflows/secret-scan.yml",
     }
-    assert set(jobs["publish"]["needs"]) == set(expected)
+    for job, called_workflow in core_gates.items():
+        assert jobs[job]["uses"] == called_workflow
+    assert set(jobs["publish"]["needs"]) == {"release-identity", *expected, *core_gates}
