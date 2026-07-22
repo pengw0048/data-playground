@@ -1,5 +1,33 @@
 # Durable Ray Jobs execution
 
+## Choose durable Ray Jobs when
+
+Choose this path only when a supported **whole graph** must survive a hub-process restart. It is not the
+default per-canvas kernel and it is not a general Ray cluster integration. The current reference path
+requires the installed `dp_ray` plugin, an operator-protected HTTP(S) Jobs endpoint, a durable SQL
+metadata store, shared object storage, and an immutable image plus stable cluster identity asserted by the
+operator. The exact variables and endpoint restrictions are in the
+[deployment contract](#reference-deployment-contract).
+
+The supported remote shape is deliberately narrow: one built-in file-adapter, non-partitioned Parquet
+overwrite sink backed by a core-managed immutable object attempt. It excludes non-write targets,
+multiple sinks, host-local paths, external catalogs for managed writes, and the process-local
+multi-region parent. Use the [per-canvas kernel](RAY.md#choose-an-execution-path) for exact-revision
+inputs or a graph outside that shape; use [Ray Data](RAY.md#reference-ray-data-contract) only for its
+documented distributable data shapes.
+
+The durable contract is control-plane durability, not universal workload recovery: a replacement hub can
+reattach to the deterministic submission, cancellation intent is persisted before a remote stop is
+claimed, and terminal catalog/history publication is atomic. Acknowledged cancellation proves the
+worker can no longer publish, but cannot undo a sink that committed before it stopped. Jobs has request
+timeouts, not an automatic execution deadline; worker/head failure, capacity, HA, upgrade, and runtime
+operations remain operator-owned.
+
+Jobs does not yet serialize or deliver the hub's admitted exact-revision input manifest. Until
+[#303](https://github.com/pengw0048/data-playground/issues/303) is implemented, a run carrying that
+manifest is rejected before run/attempt identity, envelope or result-artifact allocation, driver start,
+or Jobs API submission. Jobs must not independently reopen a mutable source head as a substitute.
+
 `dp_ray` supports two driver modes over the same IR:
 
 - With no `DP_RAY_JOBS_ADDRESS`, it keeps the development `Popen` driver and the manifest-v2 region
@@ -9,24 +37,18 @@
   still in-memory, so Jobs mode deliberately does not claim placed child regions. Explicit Ray/GPU pins
   use whole-graph admission instead and therefore cannot silently fall back to local execution.
 
-Ray Jobs does not yet serialize or deliver the hub's admitted exact-revision input manifest. Until
-[#303](https://github.com/pengw0048/data-playground/issues/303) is implemented, a run carrying that
-manifest is rejected before run/attempt identity, envelope or result-artifact allocation, driver start,
-or Jobs API submission. It cannot independently reopen mutable source head under the durable v4
-contract.
-
 This is a durable lifecycle implementation, not a claim that the whole Ray backend or the example
 deployment is production-ready. The remaining scale, health, resilience, and operator gates are in
 [`RAY.md`](RAY.md). It operates within the trusted-workspace boundary in
 [Supported deployments and trust model](SUPPORT.md): workers, runtime images, plugins, storage
 administrators, and operators are trusted with the workspace.
 
-## Real-service acceptance gate
+## Repository evidence: real-service acceptance
 
 The restart contract has a separate acceptance workflow so unrelated pull requests and the Ray data
 differential do not pay for it. It runs when a pull request changes an owned Jobs lifecycle path,
-weekly, on demand, and before publishing a release. See [CI and release gates](CI.md). Run it locally
-with:
+weekly, on demand, and through [`release.yml`](../.github/workflows/release.yml) on the exact version
+candidate SHA. See [CI and release gates](CI.md). Run it locally with:
 
 ```bash
 scripts/ray-jobs-acceptance.sh
@@ -43,7 +65,7 @@ cancellation acknowledgement and prove that a `SUCCEEDED` job with a missing or 
 is published as failed without exposing its output. Logs, service state, image identity, and disk/Docker
 diagnostics are retained as workflow artifacts on both success and failure.
 
-## Required contract
+## Reference: deployment contract
 
 ```bash
 DP_RAY_JOBS_ADDRESS=https://ray-dashboard.example:8265
@@ -76,7 +98,7 @@ embedding credential values in graph configuration.
 hash-binds and compares; Data Playground does not independently read a container digest or Ray cluster UUID.
 The deployment system must inject an immutable image digest and a stable cluster identity, then verify that
 attestation outside this plugin. See the remaining runtime-image gate in
-[`RAY.md`](RAY.md#production-ownership-gates).
+[`RAY.md`](RAY.md#reference-production-ownership-gates).
 
 The durable Jobs sink contract is deliberately narrow: it supports only the built-in file adapter
 writing non-partitioned Parquet in overwrite mode, backed by a core-managed immutable object attempt.
@@ -86,7 +108,7 @@ rejects incomplete image/cluster identity and host-local input or output paths b
 future transactional external sink can provide a stronger idempotency contract, but that extension is
 not implemented by the reference Jobs backend today.
 
-## Execution envelope and TOCTOU boundary
+## Reference: execution envelope and TOCTOU boundary
 
 The hub resolves sinks and schema references, then creates an exact-field JSON envelope containing the
 complete graph, target, target-cone resources, code/module/entrypoint identity, remote paths, and a frozen
@@ -134,7 +156,7 @@ Prefer distinct hub and Ray service identities. The current workload allowlist c
 `DP_S3_*`, or Google credential references for compatibility; those remain broad capabilities. This is
 compatible with the trusted-team profile, but it does not provide mutually hostile tenant isolation.
 
-## Frozen semantics and credential rotation
+## Reference: frozen semantics and credential rotation
 
 Settings that change execution meaning—plugin selection, memory/shuffle/runtime flags, storage endpoints,
 workspace/data paths, and Ray labels—are frozen in the envelope and participate in the attempt hash.
@@ -145,7 +167,7 @@ launch uses the operator's current allowlisted data credentials, so key rotation
 logical attempt. Hub metadata identity (`DP_DATABASE_URL`), auth signing material, and provider/control
 API keys are never sent to the driver.
 
-## Durable state machine
+## Reference: durable state machine
 
 1. The hub first commits `run_id`, authorized `created_by`, and `auth_canvas_id`. Only then may it allocate
    a write-once job envelope. A future workload-identity provider observes that principal in the hub-side
@@ -242,7 +264,7 @@ binds from resurrecting a completed run even when no history row exists or bound
 A stale supervisor that loses its publication claim or finds the backend row already pruned consults this
 fence, converges its local status, and stops supervising instead of restarting forever.
 
-## Recovery and cancellation
+## Reference: recovery and cancellation
 
 The SQL binding stores the original control address, canonical job envelope, and `cancel_requested`.
 Restart recovery does not depend on a PID, local temp directory, or process-local event. Missing local
@@ -293,7 +315,7 @@ stopped, not that no physical side effect occurred.
 | `DP_RAY_JOBS_REQUEST_TIMEOUT_S` | `30` | Connect/read timeout for every official Jobs API request |
 | `DP_RAY_JOBS_MAX_LEASE_HOLD_S` | `300` | Maximum continuous renewal window for one submit/publication owner |
 
-## Logs and operator access
+## Reference: logs and operator access
 
 Shared status exposes only a stable failure code/type. It does not copy Ray Job messages or driver logs,
 because remote text can contain credentials that have since rotated and can no longer be reliably
@@ -301,7 +323,7 @@ redacted. `RayRunner.logs` likewise returns no remote payload until a protected 
 surface exists. Use a Ray Dashboard/log backend protected by TLS, network policy, and the cluster's
 authentication boundary. Do not expose port 8265 directly to end users.
 
-## Current limits
+## Reference: current limits
 
 - Durable Jobs covers whole-graph execution only. Region data publication uses manifest v2, but the
   multi-region parent is not restart-durable.
