@@ -47,9 +47,10 @@ in scope. Ray and Ray Jobs remain optional backends and release gates, not defau
 
 - **Alembic history:** `0001_schema_baseline` through `0039_folder_replays` (head), advancing released
   workspaces from `0038_inbox_dataset_scoped` with one forward migration.
-- Follow [the in-place upgrade runbook](docs/UPGRADING.md): take one complete consistency backup, stop
-  every hub, kernel, MCP process, CLI run, worker, and scheduler that can write the workspace, run one
-  `dataplay migrate`, and start `v0.2.0` only after the schema reaches `0039_folder_replays`.
+- Follow [the in-place upgrade runbook](docs/UPGRADING.md): record the source identity; stop and confirm
+  every hub, kernel, MCP process, CLI run, worker, and scheduler that can write the workspace has exited;
+  then take one complete consistency backup, run one `dataplay migrate`, and start `v0.2.0` only after
+  the schema reaches `0039_folder_replays`.
 - An object-backed deployment also needs the version-preserving replica and namespace evidence in
   [Backup and restore](docs/BACKUP_RESTORE.md); a database dump and workspace copy alone are incomplete.
 - Live or zero-downtime upgrade and database downgrade are not supported. On failure, stop the new
