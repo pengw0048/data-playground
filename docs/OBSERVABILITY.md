@@ -33,9 +33,10 @@ The Jobs UI and run APIs retain the run's status, result metadata, and `request_
 application's run history. They are not a general event store. With no registered sink, metric, audit,
 and finished-run telemetry events stay local to the process and are not exported or replayed later.
 
-Every handled HTTP or WebSocket request receives an opaque `X-Request-Id` (or supplies a safe one), and
-the same identifier follows a submitted run into its durable history. Use it with `run_id` and, for
-managed publication, `attempt_id` when correlating evidence across a system you operate.
+Every handled HTTP or WebSocket request is assigned an opaque request ID (or supplies a safe one). HTTP
+responses echo it as `X-Request-Id`; the same identifier follows a submitted run into its durable
+history. Use it with `run_id` and, for managed publication, `attempt_id` when correlating evidence
+across a system you operate.
 
 ## 2. Attach a telemetry sink
 
