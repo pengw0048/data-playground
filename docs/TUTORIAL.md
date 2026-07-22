@@ -37,9 +37,9 @@ The **Use** button in the dataset detail does not silently modify a graph. It op
   dataset as a Source.
 - **Choose a Canvas** lets you select one exact editable destination before adding the Source.
 
-That is the path for your own analysis. For the rest of this short tour, close the `events` detail and
-choose **Open example Purchases per user** from the Workspace welcome panel. It creates a separate,
-runnable Canvas whose Source is the same seeded dataset.
+That is the path for your own analysis. For the rest of this short tour, open the Canvas app menu and
+choose **Create example Canvas → Purchases per user**. It creates a separate, runnable Canvas whose
+Source is the same seeded dataset.
 
 ## 3. Inspect the graph, then respect the full-pass boundary
 
@@ -61,7 +61,8 @@ can preserve the operation's meaning. The same rule applies to writes and other 
 ## 4. Publish a managed result
 
 Select the `top_users` **Write** card. It is configured to publish to **Workspace outputs** as
-`top_users` with the default create-or-replace mode. Then choose **Rerun all** in the Canvas header.
+`top_users`. The first run creates that managed dataset; a later run replaces it only after admitting
+the exact currently published revision. Then choose **Rerun all** in the Canvas header.
 
 The graph runs over the full input. When it finishes, the Write card reports its published revision
 and row count. A successful managed write has a receipt: it identifies the output dataset and the
