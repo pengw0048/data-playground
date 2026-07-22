@@ -14,7 +14,7 @@ After building a wheel or running a container, the same offline starter-canvas s
 
 ```bash
 # Hub already serving (e.g. dataplay --no-open --workspace /tmp/ws):
-python3 scripts/release_smoke.py --base-url http://127.0.0.1:8471 --expect-version 0.2.0
+python3 scripts/release_smoke.py --base-url http://127.0.0.1:8471 --expect-version 0.2.1
 
 # Version surfaces must agree (pyproject / package.json / wheel /api/version / image label):
 python3 scripts/check_release_versions.py \

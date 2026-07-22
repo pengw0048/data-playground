@@ -8,6 +8,12 @@ uses semver-shaped versions from `kernel/pyproject.toml` / `web/package.json`.
 Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 [researcher UX acceptance](docs/UX_ACCEPTANCE.md) results for its exact commit before publication.
 
+## [0.2.1] — 2026-07-22
+
+### Fixed
+
+- Managed Write admission preserves declared signed and unsigned integer schema widths.
+
 ## [0.2.0] — 2026-07-22
 
 This release makes the existing versioned-data and durable-execution foundation easier to use as one
