@@ -169,6 +169,7 @@ def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
 def test_non_subsystem_heavy_acceptance_is_not_a_pull_request_gate() -> None:
     expected_events = {
         "release-artifacts.yml": {"workflow_dispatch", "workflow_call"},
+        "upgrade-drill.yml": {"schedule", "workflow_dispatch", "workflow_call"},
         "ux-acceptance.yml": {"schedule", "workflow_dispatch", "workflow_call"},
     }
     for name, expected in expected_events.items():
@@ -221,6 +222,7 @@ def test_release_publish_waits_for_every_required_gate() -> None:
     jobs = _workflow("release.yml")["jobs"]
     expected = {
         "artifacts": "./.github/workflows/release-artifacts.yml",
+        "upgrade-drill": "./.github/workflows/upgrade-drill.yml",
         "ux-acceptance": "./.github/workflows/ux-acceptance.yml",
         "ray-validation": "./.github/workflows/ray-validation.yml",
         "ray-jobs-acceptance": "./.github/workflows/ray-jobs-acceptance.yml",
@@ -235,3 +237,24 @@ def test_release_publish_waits_for_every_required_gate() -> None:
     for job, called_workflow in core_gates.items():
         assert jobs[job]["uses"] == called_workflow
     assert set(jobs["publish"]["needs"]) == {"release-identity", *expected, *core_gates}
+
+
+def test_upgrade_drill_uses_exact_candidate_and_both_metadata_backends() -> None:
+    workflow = _workflow("upgrade-drill.yml")
+    assert set(workflow["on"]) == {"schedule", "workflow_dispatch", "workflow_call"}
+    assert "pull_request" not in workflow["on"] and "push" not in workflow["on"]
+    expected_sha = workflow["on"]["workflow_call"]["inputs"]["expected_sha"]
+    assert expected_sha == {"description": "Immutable candidate commit to build and certify.",
+                            "required": True, "type": "string"}
+    steps = workflow["jobs"]["upgrade"]["steps"]
+    assert steps[0]["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
+    commands = "\n".join(step.get("run", "") for step in steps)
+    assert "--backend sqlite" in commands
+    assert "--backend postgres" in commands
+
+    release_job = _workflow("release.yml")["jobs"]["upgrade-drill"]
+    assert release_job["needs"] == "release-identity"
+    assert release_job["uses"] == "./.github/workflows/upgrade-drill.yml"
+    assert release_job["with"] == {
+        "expected_sha": "${{ needs.release-identity.outputs.sha }}"
+    }

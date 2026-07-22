@@ -88,6 +88,7 @@ Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying be
 
 - [Support and deployment boundary](docs/SUPPORT.md)
 - [Backup and restore](docs/BACKUP_RESTORE.md)
+- [In-place upgrades](docs/UPGRADING.md)
 - [CI and test matrix](docs/CI.md)
 - [Observability](docs/OBSERVABILITY.md)
 - [UX acceptance](docs/UX_ACCEPTANCE.md)
