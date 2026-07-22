@@ -9,11 +9,8 @@ the exact candidate wheel. It retains a bounded evidence document for both metad
 
 ## 1. Stop and identify the source
 
-Block new requests, stop every hub, MCP, CLI run, worker, and scheduler process that can use
-the workspace, and wait for them to exit. Do not take an in-place backup while any writer is
-running.
-
-Before stopping the final hub, record its public identity:
+Block new requests and stop every writer except the final hub used to identify the source.
+While that hub is still running, record its public identity:
 
 ```bash
 BACKUP=/secure/backups/data-playground-v0.1.0-$(date -u +%Y%m%dT%H%M%SZ)
@@ -21,7 +18,9 @@ mkdir -p "$BACKUP"
 curl -fsS http://127.0.0.1:8471/api/version | tee "$BACKUP/source-version.json"
 ```
 
-Then record the metadata schema after all processes are stopped:
+Now stop the final hub and confirm that every hub, MCP, CLI run, worker, and scheduler process
+that can use the workspace has exited. Do not read the schema or take an in-place backup while
+any writer is running. After all processes are stopped, record the metadata schema:
 
 ```bash
 # SQLite
