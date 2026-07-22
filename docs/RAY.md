@@ -1,25 +1,39 @@
 # Ray backend: support and production readiness
 
-`dp_ray` is a working distributed execution backend for Data Playground. Its supported data path fails
+`dp_ray` is an opt-in distributed execution backend for Data Playground. Its supported data path fails
 closed: large Parquet inputs and simple Parquet overwrite outputs stay off the driver, and every
-remaining compatibility collect has an explicit byte ceiling. The multi-node differential in
-[`ray-validation.yml`](../.github/workflows/ray-validation.yml) verifies that contract on Ray and
-MinIO when a pull request changes its owned execution paths, on a weekly schedule, on demand, and as a
-required version-release gate.
+remaining compatibility collect has an explicit byte ceiling.
 
 These claims use the trusted-workspace boundary in [Supported deployments and trust model](SUPPORT.md).
 Workers, runtime images, execution plugins, and cluster administrators are trusted with the workspace;
 the backend does not claim mutually hostile tenant isolation.
 
 The Compose and KubeRay files in this repository are validation harnesses, not deployment manifests.
-A green differential does not certify an operator's IAM, capacity, KubeRay configuration, or incident
-procedures. The final section separates backend guarantees from deployment responsibilities.
+The reference evidence below separates the backend contract from deployment responsibilities.
 
-For whole-graph execution, the optional [Ray Jobs lifecycle](RAY_JOBS.md) now persists an attempt and
-submission binding, reattaches after hub restart, persists cancel intent, and atomically publishes
-terminal SQL state/history. It does not make the in-memory multi-region parent orchestration durable.
+## Choose an execution path
 
-## Current execution contract
+- **Use the per-canvas kernel (the default)** for ordinary local or trusted-team work, exact-revision
+  input runs, and any graph that does not fit the Ray shapes below. It needs no Ray plugin or cluster;
+  it is the product default and retains the core managed-write and durable-task behavior.
+- **Use Ray Data (`ray-data`)** when the graph has a documented distributable shape and the data can be
+  read and written under the [Ray Data contract](#reference-ray-data-contract). This is an explicit
+  backend selection, not an automatic scale-out path. It is appropriate for the supported Parquet,
+  map/filter, constrained aggregate/window/dedup, broadcast-join, and plain-key-sort cases; unsupported
+  or semantically uncertain shapes fall back or fail before Ray dispatch as described below.
+- **Use durable Ray Jobs** only when a supported *whole graph* must continue through a hub restart. It
+  needs the Ray Data plugin plus SQL, shared object storage, an operator-protected Jobs endpoint, and
+  an immutable image/cluster assertion. The current durable sink is one built-in, non-partitioned
+  Parquet overwrite; it does not make placed multi-region orchestration durable. See
+  [Durable Ray Jobs execution](RAY_JOBS.md).
+
+Neither Ray path transports the hub's admitted exact-revision input manifest. Such a run is rejected
+before Ray allocation or Jobs submission; choose the default kernel instead. All three paths operate
+inside the [trusted-workspace boundary](SUPPORT.md), not a hostile-tenant isolation model.
+
+## Reference: Ray Data contract
+
+### Execution contract
 
 Install the Ray extra, load [`examples/plugins/dp_ray`](../examples/plugins/dp_ray/), and select
 `ray-data` in Settings or with `DP_EXECUTION=ray-data`. A placed region is claimed only when its
@@ -180,7 +194,15 @@ schema rather than a stale declaration; this adds a stage boundary but does not 
 driver. Transforms with `enforceSchema=true` fall back to the local engine; an explicit Ray pin fails
 before dispatch until distributed schema enforcement is implemented.
 
-## What the validation gate proves
+## Reference: Ray Data validation and release evidence
+
+For a version release, [`release.yml`](../.github/workflows/release.yml) invokes this Ray differential
+and the separate [Ray Jobs acceptance](RAY_JOBS.md#repository-evidence-real-service-acceptance) against
+the exact candidate SHA. The Ray differential certifies only the backend contract exercised below: the
+pinned image/version handshake, selected multi-node operators, worker-direct object-store output, and
+the stated fault/degraded-rerun controls. It does **not** certify a particular operator cluster,
+network policy, autoscaler, storage account, KubeRay installation, capacity plan, or incident runbook.
+Those remain operator responsibilities under [Supported deployments and trust model](SUPPORT.md).
 
 This real-cluster matrix is a path-gated pull-request check, not an unconditional PR or post-merge
 check. Required PR unit and contract tests provide fast feedback for every change; the complete
@@ -231,7 +253,7 @@ Build the shared image before creating any cluster container, and keep `--no-dep
 driver run. This prevents a differential from recreating the head service and replacing the GCS
 cluster identity underneath the persistent workers.
 
-## Production-readiness matrix
+## Reference: readiness matrix
 
 Current status versus what production ownership still needs:
 
@@ -263,7 +285,7 @@ Current status versus what production ownership still needs:
 - Deployment security and HA — operator-owned; immutable images, secrets/IAM, TLS/network policy, pod
   security, quotas, autoscaling, and HA storage
 
-## Production ownership gates
+## Reference: production ownership gates
 
 The correctness fences above are implemented and tested, but production ownership is specific to a
 deployment and workload shape. Within the supported trusted-team profile, separate remaining backend

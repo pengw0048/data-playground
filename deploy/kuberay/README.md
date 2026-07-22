@@ -1,13 +1,22 @@
-# Multi-node validation of the Ray reference backend (`dp_ray`)
+# KubeRay validation example for the Ray reference backend (`dp_ray`)
 
-This harness checks selected `dp_ray` operations against single-node DuckDB on a real multi-node
-cluster. Both paths below run `hub/ray_multinode_check.py`: a distributed GROUP BY and broadcast join,
-written worker-direct to object storage, compared with DuckDB. It does not certify every supported
-operation or make `dp_ray` production-capable; see the [support/readiness matrix](../../docs/RAY.md).
-The optional whole-graph Ray Jobs control-plane lifecycle is documented separately in
-[Durable Ray Jobs execution](../../docs/RAY_JOBS.md). Expose and protect the head Dashboard/Jobs endpoint
-according to cluster policy; the application does not proxy an authenticated logs route, and these
-validation manifests deliberately do not publish the Dashboard.
+Use this only to validate the documented [Ray Data](../../docs/RAY.md#reference-ray-data-contract)
+contract on disposable Kubernetes pods. It runs selected `dp_ray` operations against single-node DuckDB
+on a real multi-node cluster: a distributed GROUP BY and broadcast join, written worker-direct to object
+storage and compared with DuckDB. It is not a Ray Jobs deployment procedure and does not configure a
+Data Playground shared service.
+
+The KubeRay path needs Docker, `kind`, `kubectl`, Helm, a disposable kind cluster, and a KubeRay operator
+installed in that cluster. The checked-in manifests use fixed workers, ephemeral MinIO, and test
+credentials. They are an example/operator reference, not a secure, highly available, or production-sized
+manifest. A PASS does not certify every Ray operation, or an operator's KubeRay installation, cluster,
+network, autoscaler, IAM, storage, or incident procedures. Those responsibilities remain in the
+[support boundary](../../docs/SUPPORT.md); the durable whole-graph Jobs lifecycle is a separate
+[Ray Jobs reference](../../docs/RAY_JOBS.md).
+
+Expose and protect the head Dashboard/Jobs endpoint according to cluster policy; the application does
+not proxy an authenticated logs route, and these validation manifests deliberately do not publish the
+Dashboard.
 
 ## 1. docker-compose (fastest — a head + 2 worker containers + MinIO)
 
