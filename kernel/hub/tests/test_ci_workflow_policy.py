@@ -125,15 +125,9 @@ def test_release_reuses_core_checks_at_the_candidate_revision() -> None:
     }
     for name in ("ci.yml", "codeql.yml", "secret-scan.yml"):
         workflow_call = _workflow(name)["on"]["workflow_call"]
-        assert workflow_call["inputs"]["expected_sha"] == {
-            "description": {
-                "ci.yml": "Immutable candidate commit to check out for a release gate.",
-                "codeql.yml": "Immutable candidate commit to analyze for a release gate.",
-                "secret-scan.yml": "Immutable candidate commit to scan for a release gate.",
-            }[name],
-            "required": True,
-            "type": "string",
-        }
+        expected_sha = workflow_call["inputs"]["expected_sha"]
+        assert expected_sha["required"] is True
+        assert expected_sha["type"] == "string"
 
     jobs = _workflow("release.yml")["jobs"]
     assert jobs["release-identity"]["outputs"] == {

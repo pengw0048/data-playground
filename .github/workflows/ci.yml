@@ -19,8 +19,7 @@ on:
         required: true
         type: string
 
-# Least-privilege default for the functional CI suite. Adding this block is the
-# only intentional change to this workflow for #113; jobs and steps are unchanged.
+# Least-privilege default for the functional CI suite.
 permissions:
   contents: read
 
