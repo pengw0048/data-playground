@@ -33,7 +33,7 @@ The seeded **Purchases per user** example is a complete first pass through the p
 5. **Let work finish in the background.** Use **Jobs**, Canvas run history, and **Inbox** to follow durable work and terminal outcomes rather than keeping the Canvas open.
 6. **Reuse the evidence.** Reopen the Canvas, an admitted run input, or a published revision when you want to inspect, extend, or rerun the work.
 
-For the click-by-click version, see the [5-minute tour](docs/TUTORIAL.md). For the data and execution model behind this loop, see [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
+For the click-by-click version, see the [Workspace-to-Canvas tour](docs/TUTORIAL.md). For the data and execution model behind this loop, see [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
 
 ## What this gives you
 
@@ -59,7 +59,7 @@ Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying be
 
 ### Use
 
-- [5-minute tour](docs/TUTORIAL.md)
+- [Workspace-to-Canvas tour](docs/TUTORIAL.md)
 - [Catalog and discovery](docs/CATALOG.md)
 - [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md)
 - [Browser and viewport support](docs/BROWSER_SUPPORT.md)
