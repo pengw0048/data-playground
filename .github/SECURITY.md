@@ -1,73 +1,57 @@
-# Security Policy
+# Security policy
 
-## Reporting a vulnerability
+## Report a security-related bug
 
-Please report security issues **privately** — do not open a public issue.
+For a reproducible security-related bug, open a GitHub issue with the affected version or commit, a
+minimal sanitized reproduction, impact, and relevant deployment details. Do not post credentials,
+tokens, private data, or a reproduction that exposes a live system.
 
-Use GitHub's private vulnerability reporting: on the repository's **Security** tab, click
-**Report a vulnerability** ([Security Advisories](https://github.com/pengw0048/data-playground/security/advisories/new)).
-We'll acknowledge the report and work with you on a fix and disclosure timeline.
+Data Playground does not currently operate a private vulnerability-reporting intake or publish an
+acknowledgement, fix, disclosure, or backport SLA. Maintainers assess reports through the ordinary issue
+workflow and may ask for a safer reproduction when needed.
 
-## Automated scanning
+## Supported trust boundary
 
-Repository-owned GitHub Actions enforce the following supply-chain and security gates
-(see `.github/workflows/`):
+Data Playground supports a local workstation and a shared service operated by a trusted team. It does
+not support mutually distrusting tenants or provide a hostile-code sandbox. The canonical deployment,
+trust, and operator boundary is [Supported deployments and trust model](../docs/SUPPORT.md).
 
-| Gate | Workflow | When it runs |
-| --- | --- | --- |
-| Dependency review | `dependency-review.yml` | Every pull request — OSV-Scanner diffs lockfiles vs the PR base and fails on newly introduced vulnerabilities at severity **high** or above (`FAIL_ON_SEVERITY`; switches to `actions/dependency-review-action` once Dependency Graph is enabled) |
-| SAST (CodeQL) | `codeql.yml` | Pull requests, pushes to `main`, weekly schedule, and `workflow_dispatch` — results on the **Code scanning** tab |
-| Secret scanning (CI) | `secret-scan.yml` | Pull requests, pushes to `main`, and `workflow_dispatch` — [gitleaks](https://github.com/gitleaks/gitleaks) fails the job on detected secrets |
-| Application image scan | `image-scan.yml` | Path-gated on `Dockerfile` / lockfile changes, weekly schedule, and `workflow_dispatch` — Trivy fails on fixable **CRITICAL/HIGH** |
+In particular, users who can run arbitrary Python or section code, installed plugins and their
+dependencies, execution workers, and workspace/storage administrators are trusted with workspace data
+and process capabilities. A plugin, subprocess, container, dataset-root policy, or PodSpawner does not
+make that code a tenant-isolation boundary.
 
-### GitHub-native secret scanning (admin settings)
+Ordinary application controls within the supported profiles remain in scope. Please report, for example,
+an authentication or authorization bypass, session or revocation failure, cross-origin or collaboration
+WebSocket exposure, a supported declarative path/SQL-policy bypass, plaintext-secret disclosure,
+selected-credential fallback, or redaction failure. If you are unsure whether behavior crosses the
+boundary, open a sanitized issue that describes the observed behavior and affected path.
 
-In addition to the gitleaks CI job, maintainers should keep these repository settings enabled
-(Settings → Code security):
+The checked-in Compose file is a local, loopback HTTP reference. A trusted-team service must supply its
+own TLS-terminating reverse proxy and configure only its real trusted-proxy addresses. See the
+[transport and deployment boundary](../docs/SUPPORT.md) rather than treating Compose as a shared-service
+production manifest.
 
-- **Secret scanning** — alert on known secret patterns in the default branch and history
-- **Push protection** — block pushes that contain known secrets
+## Current automated evidence
 
-These toggles are admin-only and cannot be expressed in YAML; record changes here when the
-enabled state is confirmed or deliberately changed.
+The workflow definitions are the current source of truth; [CI and release gates](../docs/CI.md) owns the
+complete trigger and release contract.
 
-### Known accepted advisories
+| Evidence | Current workflow boundary |
+| --- | --- |
+| Dependency changes | `dependency-review.yml` compares the Python and web lockfiles with the pull-request base. Its checked-in policy decides whether a newly introduced finding blocks the change; this document does not keep an advisory allowlist or count. |
+| Static analysis and secret detection | `codeql.yml` and `secret-scan.yml` run for pull requests and integrated `main`; CodeQL also has a weekly health run. Both can be run manually. |
+| Application-image findings | `image-scan.yml` is path-gated for relevant pull requests and also runs weekly or manually. It is separate from the tag-triggered release workflow. |
+| Release candidate | A `v*` tag starts `release.yml`. It records the immutable candidate SHA and reruns core CI, CodeQL, and Gitleaks on that exact commit before publication, alongside the documented release gates. A later passing `main` run is not substituted for tag evidence. |
 
-Advisories the dependency-review gate reports but does not block (severity below its HIGH threshold),
-kept here rather than silenced in CI (per [#148](https://github.com/pengw0048/data-playground/issues/148)):
+Repository-native secret scanning and push protection are GitHub administration settings, not repository
+YAML. They are useful additional controls when enabled, but this policy does not claim their current
+setting state.
 
-- **`dompurify` (moderate/low)** — pulled in transitively by `monaco-editor` in `web/package-lock.json`
-  (~16 moderate/low DOMPurify sanitizer/mXSS advisories; no HIGH/CRITICAL). Accepted: the app's only
-  consumer is the Monaco code editor's own internal rendering with a non-attacker-controlled config, so
-  the exposure is low, and a transitive bump is pinned by `monaco-editor`. Revisit when `monaco-editor`
-  ships a `dompurify` ≥ 3.4.11, or force it via a `package.json` override if a concrete exploit path
-  through Monaco is found.
+## Versions and fixes
 
-## Scope — what is and isn't a security boundary
-
-Data Playground's canonical profiles and trust assumptions are in
-[Supported deployments and trust model](../docs/SUPPORT.md). The primary profiles are a local
-workstation and a shared service operated by a trusted team; mutually distrusting tenants are not
-supported.
-
-- **Arbitrary code is trusted.** Transform and section code runs with the kernel or worker's process
-  permissions. Installed plugins and their `register()` hooks do too. `DP_DATASET_ROOTS` and SQL policy
-  constrain the declarative paths they govern, but a subprocess, container, or PodSpawner does not turn
-  arbitrary Python into a tenant boundary by itself.
-- **Ordinary application controls remain in scope.** Please report authentication or authorization
-  bypass, session-forgery or revocation failures, cross-site/cross-origin or collaboration-WebSocket
-  holes, traversal outside `DP_DATASET_ROOTS` through a supported declarative data path, unsafe SQL
-  policy bypass, plaintext-secret persistence or disclosure, selected-credential fallback to the wrong
-  identity, or redaction failures in browser/API/log surfaces.
-- **Trusted-code behavior is not a vulnerability by itself.** A user who may edit and run arbitrary
-  Python, an installed plugin, an execution worker, or a workspace administrator is trusted with the
-  workspace data and process capabilities. Likewise, the absence of mutually hostile tenant isolation
-  is an explicit unsupported profile, not an undisclosed sandbox escape.
-
-If a report crosses these categories—for example, read-only access becomes code execution, or an
-unauthenticated request reaches a trusted-code capability—please report it privately so we can assess
-the actual boundary crossing.
-
-## Supported versions
-
-This is a young project; security fixes land on `main`. Please test against the latest `main`.
+Use the [latest published release](https://github.com/pengw0048/data-playground/releases/latest) when
+reporting an affected released build. Current maintenance is a single `main` line: security fixes land on
+`main` and are available in a later tagged release when maintainers publish one. There are no maintained
+patch or release branches, so older tags have no promised security backports. Test against current `main`
+when possible and include the released version in a report when it is affected.

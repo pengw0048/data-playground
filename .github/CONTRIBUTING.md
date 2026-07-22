@@ -52,5 +52,5 @@ Drop a plugin folder into `<workspace>/plugins/` and it loads on kernel start.
 
 ## Reporting bugs / ideas
 
-Open an issue (templates provided). For anything security-related, see
-[SECURITY.md](SECURITY.md) — do not file a public issue.
+Open an issue (templates provided). For a security-related bug, read
+[SECURITY.md](SECURITY.md) first; it explains what can be shared safely in an issue.
