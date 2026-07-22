@@ -1,9 +1,14 @@
-# Writing your first plugin
+# Plugin SPI reference
+
+If you are deciding what to extend, start with the task-first
+[plugin onboarding guide](PLUGIN_ONBOARDING.md). It maps common integration jobs to the right
+extension boundary, a smallest shipped example, and a verification command. This document is the
+complete Plugin SPI reference: use it after you have chosen that boundary.
 
 A plugin can add nodes, dataset adapters, execution backends, capabilities, a catalog, or a pipeline
 importer. Register a node and it shows up on the canvas typed, wired, and previewable — no core or
-frontend change. This guide builds from the shipped example in
-[`examples/plugins/dp_example/`](../examples/plugins/dp_example/).
+frontend change. The shipped [`examples/plugins/dp_example/`](../examples/plugins/dp_example/)
+demonstrates the smallest typed node package.
 
 Plugins are trusted code, not a sandbox boundary. Plugin modules and registration hooks execute in every
 trusted Data Playground process that loads the plugin registry, including the hub and per-canvas kernels;
