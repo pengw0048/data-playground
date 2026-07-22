@@ -1,14 +1,14 @@
 # Security policy
 
-## Report a vulnerability privately
+## Report a security-related bug
 
-Do not open a public issue for a suspected vulnerability. Use GitHub's private vulnerability-reporting
-flow from the repository **Security** tab, or open a report directly through
-[Security Advisories](https://github.com/pengw0048/data-playground/security/advisories/new).
+For a reproducible security-related bug, open a GitHub issue with the affected version or commit, a
+minimal sanitized reproduction, impact, and relevant deployment details. Do not post credentials,
+tokens, private data, or a reproduction that exposes a live system.
 
-Include the affected version or commit, a minimal reproduction, impact, and any relevant deployment
-details. Maintainers assess reports and coordinate disclosure privately. This project does not publish
-an acknowledgement, fix, disclosure, or backport SLA.
+This small OSS project does not operate a private vulnerability-reporting intake or publish an
+acknowledgement, fix, disclosure, or backport SLA. Maintainers assess reports through the ordinary issue
+workflow and may ask for a safer reproduction when needed.
 
 ## Supported trust boundary
 
@@ -24,8 +24,8 @@ make that code a tenant-isolation boundary.
 Ordinary application controls within the supported profiles remain in scope. Please report, for example,
 an authentication or authorization bypass, session or revocation failure, cross-origin or collaboration
 WebSocket exposure, a supported declarative path/SQL-policy bypass, plaintext-secret disclosure,
-selected-credential fallback, or redaction failure. If a report may cross the boundary, report it
-privately so maintainers can assess the actual behavior.
+selected-credential fallback, or redaction failure. If you are unsure whether behavior crosses the
+boundary, open a sanitized issue that describes the observed behavior and affected path.
 
 The checked-in Compose file is a local, loopback HTTP reference. A trusted-team service must supply its
 own TLS-terminating reverse proxy and configure only its real trusted-proxy addresses. See the
