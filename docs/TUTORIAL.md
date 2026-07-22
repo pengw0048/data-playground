@@ -1,6 +1,12 @@
-# 5-minute tour
+# From Workspace to a reusable result
 
-Build a small pipeline on the seeded sample data: events → purchases → spend per user → save.
+This tour follows one complete researcher loop: find a dataset in **Workspace**, make a Canvas
+choice, inspect what a preview can honestly show, run a managed write, and return to the revision and
+durable Job evidence afterward.
+
+It uses the seeded `events` dataset and the shipped **Purchases per user** example. The result is the
+managed `top_users` dataset, with its revision, lineage, Job, and Inbox outcome still available after
+you leave the Canvas.
 
 ## 0. Launch
 
@@ -8,91 +14,94 @@ Build a small pipeline on the seeded sample data: events → purchases → spend
 make setup && make run
 ```
 
-Open <http://127.0.0.1:8471>. After setup you can also start with:
+Open <http://127.0.0.1:8471>. The first run creates a local Workspace and seeds `events`, `images`,
+and `movies`. This tour starts with `events`, which has 2,000 rows and the columns `id`, `user_id`,
+`event`, and `amount`.
 
-```bash
-cd kernel && uv run dataplay
+## 1. Start in Workspace
+
+Open **Workspace**, then select `events`. Its detail panel is the place to establish context before
+making a graph: it shows the registered name and location, row and column counts, current version
+information when the adapter provides it, columns, organization fields, and existing lineage.
+
+Click **Preview**. The seeded file shows a **bounded prefix preview**: the panel says how many rows it
+requested and returned, whether it knows the total, the input revision it read, and that the rows are
+not representative or random. Treat it as a quick structural check, not as a statistical conclusion
+about the whole dataset.
+
+## 2. Choose the Canvas deliberately
+
+The **Use** button in the dataset detail does not silently modify a graph. It opens a choice:
+
+- **Explore in a new Canvas** creates a named, editable Canvas in the current Workspace and adds this
+  dataset as a Source.
+- **Choose a Canvas** lets you select one exact editable destination before adding the Source.
+
+That is the path for your own analysis. For the rest of this short tour, open the Canvas app menu and
+choose **Create example Canvas → Purchases per user**. It creates a separate, runnable Canvas whose
+Source is the same seeded dataset.
+
+## 3. Inspect the graph, then respect the full-pass boundary
+
+The example is:
+
+```text
+events → filter purchases → aggregate by user → sort by total → Write top_users
 ```
 
-For Docker Compose, follow the README migrate-then-start sequence. First run seeds three datasets in
-**Workspace**: `images` (with an embedding column), `movies`, and `events`
-(`id`, `user_id`, `event`, `amount` — 2,000 rows). This tour uses `events`.
+Select the `events` Source and choose **View data** in the Inspector. Canvas previews report their
+own bound: the source-read limit, returned rows, and the fact that an output prefix is not necessarily
+the first rows of a final result.
 
-If you want the finished graph without building it by hand, use **New from example → Purchases per
-user** in the file menu.
+Now select `aggregate` and choose **View data**. Its panel says **Not sample-previewable** and offers
+**Run a full pass →**. A grouped aggregate needs every relevant input row; presenting a prefix total
+as though it were the result would be misleading. This is deliberate: a preview is shown only when it
+can preserve the operation's meaning. The same rule applies to writes and other global operations.
 
-## 1. Add a source
+## 4. Publish a managed result
 
-The empty canvas prompts you to add a source. Click that, or use the Add-node toolbar →
-**Sources & sinks** → `source`. Bind the **events** dataset. The output port fills in once the node
-is typed as `dataset`.
+Select the `top_users` **Write** card. It is configured to publish to **Workspace outputs** as
+`top_users`. The first run creates that managed dataset; a later run replaces it only after admitting
+the exact currently published revision. Then choose **Rerun all** in the Canvas header.
 
-## 2. Preview the rows
+The graph runs over the full input. When it finishes, the Write card reports its published revision
+and row count. A successful managed write has a receipt: it identifies the output dataset and the
+revision that was actually published, rather than merely saying that a node ran.
 
-Hover the node and click the eye icon. The Data viewer shows a bounded sample of
-`id`, `user_id`, `event`, `amount`. Previews stay on a sample so they stay fast. The same graph runs
-over the full dataset when you execute it.
+## 5. Leave the Canvas and inspect the evidence
 
-## 3. Keep only purchases
+You do not need to keep the Canvas open while work finishes or to prove what happened later.
 
-Click the source output port and pick **filter**. Set the predicate to:
+1. Open **Jobs** from the navigation or Canvas app menu. The completed entry for **Purchases per
+   user** shows the terminal state, backend, duration, row count, and **1 output published**. Expand
+   it to open the Canvas, the Write node, or the retained output artifact.
+2. Open **Inbox**. The terminal outcome states that `top_users` was written and records its row count;
+   **Open job** returns to the same durable Job.
+3. Return to **Workspace** and open `top_users`. Its detail panel has **Revision history**. Open the
+   listed revision to inspect that exact retained result. Its lineage names `events` as a parent after
+   this example has run.
 
-```
-event = 'purchase'
-```
+These are different views of one outcome: Workspace organizes the dataset, the revision identifies a
+retained state, Jobs records the submitted work, and Inbox is the researcher-facing terminal notice.
 
-Preview again. Only purchase rows remain. `filter` lowers to SQL and pushes down.
+## 6. Continue from the result
 
-## 4. Optional: assert on amounts
+Use `top_users` as a new Source when you want to extend the analysis, reopen **Purchases per user** to
+change its graph, or reopen the Job when you need the recorded output evidence. A later catalog head
+does not rewrite the identity of a completed managed publication or its admitted inputs.
 
-From the filter output, add an **assert** with predicate `amount > 0`. The node has two ports:
+## Build your own variant
 
-- `passes` forwards every input row unchanged — wire this downstream
-- `violations` holds the failing rows — preview it to see bad purchases
-
-With **severity** `error`, any violation fails the run before a write commits. With `warn`, every row
-still passes through and the violation count is recorded. This checks values; schema hints only check
-that a column exists.
-
-## 5. Total spend per user
-
-From the filter output — or from assert `passes` if you added step 4 — add an **aggregate**:
-
-- group by: `user_id`
-- aggregations: `sum(amount) AS spend, count(*) AS purchases`
-
-A group-by cannot be sampled honestly from a prefix, so the panel says **needs a full pass** instead of
-showing wrong totals. Click **Run a full pass →** for one row per user over the whole input.
-
-Writes and global aggregates use that rule. Downstream ops that can preview faithfully (for example
-`sort`) do not.
-
-## 6. Optional: biggest spenders first
-
-Add a **sort** with **by** set to `spend DESC`. Preview shows the ordered sample after the aggregate's
-full pass has materialized upstream.
-
-## 7. Save and run
-
-Add a **write**. Name the output `top_spenders.parquet`, leave the default **overwrite** mode, and
-keep the default Workspace outputs destination. Click **Run (▶)** on the write node.
-
-Writes always need a full pass. On the default managed-local destination, the create or replacement is
-admitted before work starts and a successful write publishes a new managed revision. When the run
-finishes, open **Workspace** and you should see `top_spenders`, ready to use as a later `source`.
-
-## What just happened
-
-Each node added one step to a logical plan. Previews ran on a bounded sample when that preserved
-meaning; the full run executed the same plan out of core, with per-node progress and a Run history
-entry. Edit a node and it — plus everything downstream — goes stale. Re-running a target whose inputs
-have not changed can reuse a content-addressed cached result.
+After step 2, choose **Explore in a new Canvas** instead of the example. The Source is already added.
+Use the Canvas Add controls to connect a filter, aggregate, or other typed operation, inspect each
+step through **View data**, and add a **Write** only when you are ready to publish. The same
+preview/full-pass and Jobs/Inbox rules apply.
 
 ## Where next
 
-- Agent dock: describe the same outcome and let a configured model build the nodes.
-- Pin an output-schema contract on a code node (Inspector → Output schema) and set `enforce` to fail
-  on drift.
-- Add your own node with [PLUGINS.md](PLUGINS.md).
-- The local engine spills sorts, joins, and aggregates to disk, so the same graph can run past RAM.
-- The README covers collaboration, auth, and multi-instance deploy.
+- [Catalog and Workspace guide](CATALOG.md) explains browsing, search, relationships, lineage, and
+  revision inspection in more depth.
+- [Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md) explains admitted
+  inputs, revisions, receipts, and their supported boundaries.
+- [Plugin onboarding](PLUGIN_ONBOARDING.md) shows where adapters, destinations, catalogs, and
+  execution backends fit without changing the open-source core.
