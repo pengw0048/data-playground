@@ -337,6 +337,17 @@ def bind_manifest(
             if binding is not None:
                 source_uri = str(binding["uri"])
                 source_binding = metadb.catalog_revision_binding_for_uri(source_uri)
+            elif item["dataset_id"].startswith("workspace-provider:"):
+                # Workspace provider datasets deliberately have no catalog row. Their canonical
+                # identity embeds the durable binding id, which is sufficient to restore the
+                # synthetic logical URI and re-run the existing binding/adapter exact checks below.
+                try:
+                    source_uri = workspace_providers.provider_dataset_uri(
+                        item["dataset_id"].removeprefix("workspace-provider:"))
+                except ValueError as exc:
+                    raise LocalRunInputError(
+                        "local run input manifest does not match the graph") from exc
+                provider_dataset_id = workspace_providers.provider_dataset_identity(source_uri)
         if item["provider"] == LOCAL_FILE_INPUT_PROVIDER:
             if (source_binding is None
                     or str(source_binding["dataset_id"]) != item["dataset_id"]
