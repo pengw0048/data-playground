@@ -135,6 +135,8 @@ def test_release_reuses_core_checks_at_the_candidate_revision() -> None:
     }
     identity_checkout = jobs["release-identity"]["steps"][0]
     assert identity_checkout["with"]["ref"] == "${{ github.sha }}"
+    publish_checkout = jobs["publish"]["steps"][0]
+    assert publish_checkout["with"]["ref"] == "${{ needs.release-identity.outputs.sha }}"
     for job, called_workflow in expected.items():
         assert jobs[job]["uses"] == called_workflow
         assert jobs[job]["needs"] == "release-identity"
