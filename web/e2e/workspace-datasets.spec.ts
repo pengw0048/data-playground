@@ -134,6 +134,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
       }))
     }).toEqual(['done', 'done'])
 
+    await expect(page.getByRole('navigation', { name: 'Canvas Workspace location' })).toBeVisible()
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace').click()
     await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
