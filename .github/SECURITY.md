@@ -6,7 +6,7 @@ For a reproducible security-related bug, open a GitHub issue with the affected v
 minimal sanitized reproduction, impact, and relevant deployment details. Do not post credentials,
 tokens, private data, or a reproduction that exposes a live system.
 
-This small OSS project does not operate a private vulnerability-reporting intake or publish an
+Data Playground does not currently operate a private vulnerability-reporting intake or publish an
 acknowledgement, fix, disclosure, or backport SLA. Maintainers assess reports through the ordinary issue
 workflow and may ask for a safer reproduction when needed.
 
