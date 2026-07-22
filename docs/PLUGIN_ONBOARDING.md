@@ -19,6 +19,7 @@ plugin in a shared service.
 | Read a new URI scheme or data format | A dataset adapter | A catalog provider |
 | Offer a new save location | A destination | A dataset adapter |
 | Dispatch durable work to another engine | An execution backend | A node or adapter |
+| Record finished runs for an external observer | A telemetry sink | An execution backend |
 
 The [Plugin SPI reference](PLUGINS.md) is the source of truth for every API signature and capability.
 The sections below are intentionally smaller: pick one boundary, run its test, then read the linked
@@ -60,8 +61,15 @@ respectively.
 is an installed `dataplay.catalog_providers` wheel. It reads a configured `catalog.json` and never
 writes it.
 
-**Verify:** install the provider wheel into an environment containing Data Playground, then run its
-public conformance check without importing provider source files:
+**Verify:** the shipped example's installed-wheel test builds the wheel, installs it into a clean
+environment, and runs the public conformance check without importing provider source files:
+
+```bash
+cd kernel && uv run pytest -q hub/tests/test_catalog_provider.py::test_file_provider_wheel_passes_public_conformance
+```
+
+After installing your own provider wheel into an environment containing Data Playground, run the same
+public check against it:
 
 ```bash
 python -m hub.catalog_provider_conformance your-provider \
@@ -111,8 +119,9 @@ preview.
 **Verify:** install the optional dependency, then run the deterministic adapter test:
 
 ```bash
-cd kernel && uv sync --extra dev --extra hf
-cd kernel && uv run pytest -q hub/tests/test_kernel.py::test_hf_datasets_adapter_reference_plugin
+cd kernel
+uv sync --extra dev --extra hf
+uv run pytest -q hub/tests/test_kernel.py::test_hf_datasets_adapter_reference_plugin
 ```
 
 Read [`add_adapter`](PLUGINS.md#the-rest-of-the-spi) for the required methods and honest preview,
@@ -161,6 +170,28 @@ Read [`add_runner` and `add_runner_factory`](PLUGINS.md#the-rest-of-the-spi) and
 [execution IR contract](PLUGINS.md#running-on-another-engine--the-execution-ir). A live backend also
 needs integration tests against the engine it dispatches to; the local gating test does not prove a
 cluster deployment.
+
+## Record finished-run telemetry
+
+**Use when:** an external observer needs one bounded record after each run finishes, without changing
+how the graph is dispatched or where its outputs are published.
+
+**Do not use when:** the external system must schedule, execute, cancel, or publish a run. Those are
+execution-backend responsibilities, even if that system also emits logs or metrics.
+
+**Smallest reference:** [`dp_run_log`](../examples/plugins/dp_run_log/) registers a telemetry sink
+that appends one JSON line per finished run to the configured `DP_RUN_LOG` path.
+
+**Verify:** the installed-wheel conformance test builds the core and plugin wheels, installs only
+those candidates into a clean environment, delivers a finished-run record, and stops the sink worker:
+
+```bash
+cd kernel && uv run pytest -q hub/tests/test_plugin_wheel_conformance.py::test_run_log_wheel_conformance_uses_only_its_entry_point
+```
+
+Read the [telemetry conformance reference](PLUGINS.md#verifying-it) before adding a sink. It defines
+the installed-wheel test boundary; capability-specific integration tests remain the plugin's
+responsibility.
 
 ## Before publishing a plugin
 
