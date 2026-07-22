@@ -43,7 +43,8 @@ reload to pick up stdio edits — an out-of-process client is not in the browser
 
 Optional flags:
 
-- `--workspace` / `--data-dir` — project directory (default: CWD)
+- `--workspace` — project directory (default: CWD)
+- `--data-dir` — dataset directory (default: `<workspace>/data`)
 - `--base-url` — URL used only to build clickable canvas links (default `$DP_BASE_URL` or
   `http://127.0.0.1:8471`)
 - `--user` — which user id the server acts as (default: the local user). This is an identity selector,
