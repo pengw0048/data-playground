@@ -112,7 +112,7 @@ processes that load them; they are not a sandbox or a tenant-isolation mechanism
 
 | Area | Current boundary |
 | --- | --- |
-| External sources | Exact reopening and revision history require real immutable revision evidence from the adapter. A mutable-only source cannot be described into reproducibility. |
+| External sources | Exact reopening and revision history require real immutable revision evidence from the adapter. A mutable-only source cannot be made reproducible just by adding a description. |
 | Provider write-back | Browsing or using a provider source does not grant provider-native write permission. A destination must implement and attest its own publication contract. |
 | Distributed execution | Optional backends are supported only for the shapes documented and tested by that backend. In particular, the bundled Ray Jobs path does not independently carry the hub’s admitted exact-revision manifest, so it is not an alternative way to run an exact admitted source. |
 | General orchestration | Core has durable task lifecycles, not a general scheduler or a universal multi-provider submit/wait/gather language. |

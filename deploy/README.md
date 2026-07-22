@@ -100,9 +100,14 @@ in for “data on shared storage” so the hub and every kernel Pod see the same
 
 ## Adapt before real use
 
-Data must be reachable from the kernel Pods. The verify image bakes seed data into the image; a real
-deployment points `DP_STORAGE_URL` at object storage (`s3://` or `gs://`) so every Pod reads the same
-data. A local per-Pod path only works here because the image is read-only.
+Input data must be reachable from every kernel Pod. PodSpawner passes its configured `data_dir` as
+`--data-dir`, so mount that path in every Pod or configure Source adapters with a URI they can reach.
+The verify image bakes seed data into the image; a local per-Pod path works there only because the
+image is read-only.
+
+`DP_STORAGE_URL` is separate: it selects result storage and the shared object tier used for
+cross-backend handoffs. Point it at reachable object storage (`s3://` or `gs://`) when those results
+or handoffs must be shared; it does not make Source inputs or `data_dir` reachable.
 
 `DP_KERNEL_IMAGE` must be an image where `python -m hub.kernel` runs — `hub` importable by that
 image's `python`. The bundled Dockerfile puts the venv on `PATH` for this.

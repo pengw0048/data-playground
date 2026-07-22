@@ -8,8 +8,10 @@ the local substrate's single-host limit (a hub can't SIGKILL a process on anothe
 
 REFERENCE, not turnkey: it needs the `kubernetes` client (`kernel[pod]` extra), in-cluster RBAC to
 create/delete Pods+Services, a `DP_KERNEL_IMAGE` that can run `hub.kernel`, a shared `DP_DATABASE_URL`
-(Postgres) reachable from the pods, and the DATA reachable from the pod (object storage via
-`DP_STORAGE_URL`, or a mounted PVC — mounting is left to the operator). Verify on your own cluster.
+(Postgres) reachable from the pods, and Source inputs reachable from each pod. PodSpawner passes
+`data_dir` as `--data-dir`, so mount that path or configure a Source adapter with a reachable URI.
+`DP_STORAGE_URL` separately selects result storage and shared cross-backend handoff storage; it does
+not make Source inputs reachable. Verify on your own cluster.
 """
 
 from __future__ import annotations

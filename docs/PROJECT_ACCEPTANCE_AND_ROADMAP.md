@@ -71,7 +71,7 @@ A release should demonstrate the following outcomes on its release commit:
 | --- | --- |
 | A new researcher can create or open a workspace and complete a starter dataflow | [Tutorial](TUTORIAL.md), browser end-to-end tests, and the default example data |
 | Dataset discovery, previews, profiles, lineage, and exports state their scope truthfully | [Catalog](CATALOG.md) and kernel/web tests |
-| Saved canvases can be run headlessly without creating a second pipeline definition | [README](../README.md) and CLI tests |
+| Saved canvases can be run headlessly without creating a second pipeline definition | [Run a saved Canvas headlessly](../README.md#run-a-saved-canvas-headlessly) and CLI tests |
 | Deployment and security claims remain within the supported trust model | [Supported deployments and trust model](SUPPORT.md), [Security policy](../.github/SECURITY.md), and shared-mode tests |
 | Optional distributed execution stays within a tested support boundary | [Ray](RAY.md), [Ray Jobs](RAY_JOBS.md), and Ray validation |
 | Public plugins can extend the product without forking the core | [Plugins](PLUGINS.md), plugin examples, and contract tests |

@@ -22,6 +22,18 @@ make run
 
 Open <http://127.0.0.1:8471>. The first run creates a local workspace and seeds `events.parquet`, `movies.csv`, and `images.parquet`; no cloud account or separate service is required.
 
+## Run a saved Canvas headlessly
+
+To run a Canvas already saved in a workspace from a shell, cron job, or CI, pass its ID or unique name
+and that workspace path. If you omit `--workspace`, the current directory is the workspace.
+
+```bash
+cd kernel
+uv run dataplay run "<canvas-id-or-unique-name>" --workspace /path/to/saved-workspace
+```
+
+Run `uv run dataplay run --help` for optional node targeting, parameters, timeout, and JSON output.
+
 ## Follow one researcher loop
 
 The seeded **Purchases per user** example is a complete first pass through the product:
