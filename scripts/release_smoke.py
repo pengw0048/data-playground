@@ -11,7 +11,7 @@ Local usage (hub already serving on :8471 with seeded sample data)::
 Expect a version identity (optional)::
 
     python3 scripts/release_smoke.py --base-url http://127.0.0.1:8471 \\
-        --expect-version 0.2.1 --expect-sha-not-unknown
+        --expect-version 0.2.2 --expect-sha-not-unknown
 """
 from __future__ import annotations
 

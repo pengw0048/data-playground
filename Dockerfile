@@ -17,7 +17,7 @@ RUN npm run build          # → /web/dist
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf AS app
 # Release identity (REL-01 / issue #114): bake package version + build SHA so /api/version never
 # reports "unknown" from a published image, and so `docker inspect` can read the OCI version label.
-ARG DP_VERSION=0.2.1
+ARG DP_VERSION=0.2.2
 ARG DP_GIT_SHA=unknown
 LABEL org.opencontainers.image.title="Data Playground" \
       org.opencontainers.image.version="${DP_VERSION}" \

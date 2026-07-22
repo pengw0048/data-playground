@@ -11,7 +11,7 @@ Examples::
       --package-json web/package.json \\
       --wheel dist/*.whl \\
       --api-version-json /tmp/version.json \\
-      --image-label 0.2.1 \\
+      --image-label 0.2.2 \\
       --git-tag          # only when GITHUB_REF_TYPE=tag
 
     # Fail unless every named source was supplied and agreed:

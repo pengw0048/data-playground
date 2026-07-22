@@ -1899,7 +1899,7 @@ class KernelInfo(Wire):
     mode: Literal["local", "distributed"] = "local"
     backend: str = "duckdb"
     warm: bool = True
-    version: str = "0.2.1"
+    version: str = "0.2.2"
     adapters: list[str] = []
     runners: list[str] = []
     processors: list[str] = []
