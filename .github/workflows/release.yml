@@ -82,6 +82,14 @@ jobs:
     permissions:
       contents: read
 
+  upgrade-drill:
+    needs: release-identity
+    uses: ./.github/workflows/upgrade-drill.yml
+    with:
+      expected_sha: ${{ needs.release-identity.outputs.sha }}
+    permissions:
+      contents: read
+
   ux-acceptance:
     needs: release-identity
     uses: ./.github/workflows/ux-acceptance.yml
@@ -103,7 +111,7 @@ jobs:
 
   publish:
     name: publish release + SBOM + attestations
-    needs: [release-identity, core-ci, codeql, secret-scan, artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
+    needs: [release-identity, core-ci, codeql, secret-scan, artifacts, upgrade-drill, ux-acceptance, ray-validation, ray-jobs-acceptance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 40
