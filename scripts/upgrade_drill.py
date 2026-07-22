@@ -18,12 +18,14 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
+from email.parser import BytesParser
+from email.policy import default
 from pathlib import Path
 from typing import Any
 
 
 SOURCE_VERSION = "0.1.0"
-TARGET_VERSION = "0.2.0"
 SOURCE_SCHEMA = "0038_inbox_dataset_scoped"
 TARGET_SCHEMA = "0039_folder_replays"
 SOURCE_SHA = "172866586a503d3df7e9a2ed399bc20b9e510129"
@@ -34,6 +36,9 @@ SOURCE_WHEEL_URL = (
 SOURCE_SUMS_URL = (
     "https://github.com/pengw0048/data-playground/releases/download/v0.1.0/SHA256SUMS"
 )
+_CANDIDATE_METADATA_ERROR = "candidate wheel has invalid package metadata"
+_STRICT_RELEASE_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 
 
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -81,6 +86,41 @@ def install(uv: str, venv: Path, wheel: Path, *, postgres: bool) -> None:
     if postgres:
         packages.append("psycopg[binary]>=3.1.18,<4")
     run(uv, "pip", "install", "--python", str(venv), *packages)
+
+
+def candidate_wheel_version(wheel: Path) -> str:
+    """Read the candidate package version from its wheel metadata, not the running API."""
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_paths = [
+                path for path in archive.namelist()
+                if path.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_paths) != 1:
+                raise RuntimeError(_CANDIDATE_METADATA_ERROR)
+            metadata = BytesParser(policy=default).parsebytes(archive.read(metadata_paths[0]))
+    except (OSError, KeyError, zipfile.BadZipFile):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR) from None
+    headers = {
+        header: [value for name, value in metadata.raw_items() if name.lower() == header.lower()]
+        for header in ("Metadata-Version", "Name", "Version")
+    }
+    if any(len(values) != 1 or not values[0] for values in headers.values()):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR)
+    name = headers["Name"][0]
+    version = headers["Version"][0]
+    canonical_name = re.sub(r"[-_.]+", "-", name).lower()
+    if canonical_name != "data-playground" or not _STRICT_RELEASE_VERSION.fullmatch(version):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR)
+    return version
+
+
+def assert_candidate_identity(
+    api_version: dict[str, Any], candidate_version: str, candidate_sha: str,
+) -> None:
+    if (api_version.get("version"), api_version.get("sha")) != (candidate_version, candidate_sha):
+        raise RuntimeError(
+            f"candidate is not v{candidate_version}: {api_version!r}")
 
 
 def start_hub(dataplay: Path, workspace: Path, env: dict[str, str], port: int, log: Path) \
@@ -393,6 +433,7 @@ def main() -> None:
     source_venv, candidate_venv = root / "venv-v0.1.0", root / "venv-candidate"
     install(uv, source_venv, source_wheel, postgres=args.backend == "postgres")
     install(uv, candidate_venv, args.candidate_wheel.resolve(), postgres=args.backend == "postgres")
+    candidate_version = candidate_wheel_version(args.candidate_wheel)
     candidate_sha256 = hashlib.sha256(args.candidate_wheel.read_bytes()).hexdigest()
     env = os.environ.copy()
     env.update({
@@ -430,15 +471,13 @@ def main() -> None:
         process = start_hub(candidate_venv / "bin" / "dataplay", workspace, candidate_env, args.port,
                             root / "candidate.log")
         target_version = request(base_url, "GET", "/api/version")
-        if (target_version.get("version"), target_version.get("sha")) \
-                != (TARGET_VERSION, args.candidate_sha):
-            raise RuntimeError(f"candidate is not v{TARGET_VERSION}: {target_version!r}")
+        assert_candidate_identity(target_version, candidate_version, args.candidate_sha)
         after = collect(base_url, before["identity"])
         if after != before:
             raise RuntimeError("bounded retained-state evidence changed:\n" + json.dumps(
                 {"before": before, "after": after}, indent=2))
         evidence = {
-            "contract": f"v{SOURCE_VERSION}/{SOURCE_SCHEMA} -> v{TARGET_VERSION}/{TARGET_SCHEMA}",
+            "contract": f"v{SOURCE_VERSION}/{SOURCE_SCHEMA} -> v{candidate_version}/{TARGET_SCHEMA}",
             "backend": args.backend, "sourceVersion": source_version,
             "targetVersion": target_version, "backup": backup, "retainedState": after,
             "artifacts": {
