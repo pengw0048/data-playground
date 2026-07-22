@@ -5,7 +5,10 @@ This runbook covers a stopped, in-place upgrade from the published `v0.1.0` rele
 metadata profiles. It does not support a live upgrade or a database downgrade.
 
 The automated release drill performs these same steps with the published v0.1.0 wheel and
-the exact candidate wheel. It retains a bounded evidence document for both metadata backends.
+the exact candidate wheel. It certifies SQLite with local files and PostgreSQL metadata with a
+local workspace, and retains a bounded evidence document for both metadata backends. Deployments
+whose `DP_STORAGE_URL` uses object storage must also follow Profile B in
+[Backup and restore](BACKUP_RESTORE.md).
 
 ## 1. Stop and identify the source
 
@@ -59,6 +62,11 @@ cp -a "$DP_WORKSPACE/." "$BACKUP/workspace/"
 Record checksums for the backup set and keep the source version and schema records beside it.
 Do not resume old processes after this point.
 
+If `DP_STORAGE_URL` uses object storage, a PostgreSQL dump and workspace copy are not complete.
+Before upgrading, use [Backup and restore](BACKUP_RESTORE.md) Profile B to verify a
+version-preserving replica, its object-generation manifest, and the installation namespace marker;
+include all of them in the same consistency backup set.
+
 ## 3. Install and migrate the candidate
 
 Install the exact candidate artifact into a new environment. Keep the old release environment
@@ -109,6 +117,8 @@ If migration or verification fails, stop every v0.2.0 process. Restore the **ent
 set—SQLite workspace or PostgreSQL dump plus workspace managed bytes/config—and then start the
 old v0.1.0 release against that restored set. A database-only or files-only restore is not a
 rollback because metadata identities and managed revision bytes are one consistency unit.
+For object storage, restore the version-preserving object generations and namespace marker from
+that same set under the Profile B contract; a database dump plus local workspace is not rollback.
 
 For general backup handling, restore isolation, object-store profiles, and credential-reference
 requirements, see [Backup and restore](BACKUP_RESTORE.md).

@@ -39,7 +39,12 @@ SOURCE_SUMS_URL = (
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     display = [re.sub(r"(?<=://)[^/@\s]+(?=@)", "***", part) for part in command]
     print("+", " ".join(display), flush=True)
-    return subprocess.run(command, env=env, check=True, text=True, capture_output=True)
+    try:
+        return subprocess.run(command, env=env, check=True, text=True, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"command failed with exit code {exc.returncode}: {' '.join(display)}"
+        ) from None
 
 
 def request(base_url: str, method: str, path: str, body: Any | None = None) -> Any:
