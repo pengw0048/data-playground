@@ -36,6 +36,9 @@ SOURCE_WHEEL_URL = (
 SOURCE_SUMS_URL = (
     "https://github.com/pengw0048/data-playground/releases/download/v0.1.0/SHA256SUMS"
 )
+_CANDIDATE_METADATA_ERROR = "candidate wheel has invalid package metadata"
+_STRICT_RELEASE_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 
 
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -87,16 +90,28 @@ def install(uv: str, venv: Path, wheel: Path, *, postgres: bool) -> None:
 
 def candidate_wheel_version(wheel: Path) -> str:
     """Read the candidate package version from its wheel metadata, not the running API."""
-    with zipfile.ZipFile(wheel) as archive:
-        metadata_paths = [
-            path for path in archive.namelist()
-            if path.endswith(".dist-info/METADATA")
-        ]
-        if len(metadata_paths) != 1:
-            raise RuntimeError(f"candidate wheel has invalid metadata: {wheel}")
-        metadata = BytesParser(policy=default).parsebytes(archive.read(metadata_paths[0]))
-    if metadata.get("Name") != "data-playground" or not (version := metadata.get("Version")):
-        raise RuntimeError(f"candidate wheel has invalid package metadata: {wheel}")
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            metadata_paths = [
+                path for path in archive.namelist()
+                if path.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_paths) != 1:
+                raise RuntimeError(_CANDIDATE_METADATA_ERROR)
+            metadata = BytesParser(policy=default).parsebytes(archive.read(metadata_paths[0]))
+    except (OSError, KeyError, zipfile.BadZipFile):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR) from None
+    headers = {
+        header: [value for name, value in metadata.raw_items() if name.lower() == header.lower()]
+        for header in ("Metadata-Version", "Name", "Version")
+    }
+    if any(len(values) != 1 or not values[0] for values in headers.values()):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR)
+    name = headers["Name"][0]
+    version = headers["Version"][0]
+    canonical_name = re.sub(r"[-_.]+", "-", name).lower()
+    if canonical_name != "data-playground" or not _STRICT_RELEASE_VERSION.fullmatch(version):
+        raise RuntimeError(_CANDIDATE_METADATA_ERROR)
     return version
 
 
