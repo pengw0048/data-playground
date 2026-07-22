@@ -5331,7 +5331,7 @@
             "type": "array"
           },
           "version": {
-            "default": "0.1.0",
+            "default": "0.2.0",
             "title": "Version",
             "type": "string"
           },
@@ -11933,7 +11933,7 @@
   },
   "info": {
     "title": "Data Playground kernel",
-    "version": "0.1.0"
+    "version": "0.2.0"
   },
   "openapi": "3.1.0",
   "paths": {

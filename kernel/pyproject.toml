@@ -1,6 +1,6 @@
 [project]
 name = "data-playground"
-version = "0.1.0"
+version = "0.2.0"
 description = "An open-source, node-based canvas for data — like ComfyUI, but for typed columnar dataflow. Works offline on real Parquet/CSV/JSON/Arrow/Lance, out-of-core."
 readme = "README.md"
 license = "Apache-2.0"
