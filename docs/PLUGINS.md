@@ -243,13 +243,16 @@ For `resolve`, set `ProviderResourceResult.failure` to `offline`, `permission_lo
 `provider_error` when the result is not ready. Workspace treats `not_found` as a terminal detached
 binding: a later object with the same display name or provider ID does not revive the old reference;
 the user must explicitly relink it. Providers must not put credentials or unauthorized metadata in
-`reason`.
+`reason`. Workspace keeps passive browse on a short one-second deadline. Explicit user actions — search,
+resource resolve, relink, and admitting a selected provider dataset as a Canvas Source — use a separate
+five-second deadline. Both are bounded by the same isolated provider workers; this is not a retry policy
+or a provider-specific setting, so providers should still enforce suitable bounds on their own I/O.
 
 Lexical search is optional and must be declared with `ProviderCapabilities(search=True)`. A declared
 provider implements `search(mount, query, limit=, cursor=)` and returns `ProviderSearchPage`, including
 `freshness` as `current`, `stale`, or `unknown`. Workspace search never probes an undeclared method: a
-mount without this capability is labeled unsupported, while a declared search runs under the same
-bounded read deadline and keeps its errors and continuation separate from every other source.
+mount without this capability is labeled unsupported, while a declared search uses the bounded explicit
+interaction deadline and keeps its errors and continuation separate from every other source.
 
 Distribute a provider wheel through the `dataplay.catalog_providers` entry-point group. The entry point
 is a zero-argument factory returning the provider; mount configuration is passed on each call. Verify

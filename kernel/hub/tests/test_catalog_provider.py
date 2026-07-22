@@ -16,8 +16,8 @@ import pytest
 
 from hub.catalog_provider import (
     _PROVIDER_READ_CONCURRENCY, CatalogMount, CatalogResource, ProviderAncestors, ProviderPage,
-    ProviderResourceResult, bounded_ancestors, bounded_dataset_detail, bounded_list_children,
-    bounded_resolve,
+    ProviderCapabilities, ProviderResourceResult, ProviderSearchPage, bounded_ancestors,
+    bounded_dataset_detail, bounded_list_children, bounded_resolve, bounded_search,
 )
 
 
@@ -108,6 +108,40 @@ def test_bounded_listing_caps_background_work_and_normalizes_failures():
     time.sleep(0.25)
     cancelled = bounded_list_children(_CancelledProvider(), mount, None, limit=1)
     assert cancelled.state == "unavailable" and cancelled.reason == "request cancelled"
+
+
+def test_bounded_search_can_complete_with_an_explicit_deadline_or_stay_sanitized():
+    class GateProvider:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def capabilities(self, _mount):
+            return ProviderCapabilities(search=True)
+
+        def search(self, _mount, _query, *, limit, cursor=None):
+            del limit, cursor
+            self.entered.set()
+            assert self.release.wait(timeout=1), "test did not release provider search"
+            return ProviderSearchPage()
+
+    mount = CatalogMount(id="local", provider="test")
+    timed_out_provider = GateProvider()
+    timed_out = bounded_search(timed_out_provider, mount, "query", limit=1, timeout=0.001)
+    assert timed_out_provider.entered.wait(timeout=1)
+    assert timed_out.state == "unavailable" and timed_out.reason == "deadline exceeded"
+    timed_out_provider.release.set()
+
+    interactive_provider = GateProvider()
+    result: list[ProviderSearchPage] = []
+    worker = threading.Thread(target=lambda: result.append(
+        bounded_search(interactive_provider, mount, "query", limit=1, timeout=0.1)))
+    worker.start()
+    assert interactive_provider.entered.wait(timeout=1)
+    interactive_provider.release.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert result[0].state == "ready"
 
 
 def test_resource_failures_are_explicitly_classified():
