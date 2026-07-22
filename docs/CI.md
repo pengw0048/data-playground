@@ -8,13 +8,13 @@ release must prove the complete artifact, UX, and optional distributed-execution
 
 | Gate | Pull request | Push to `main` | Schedule or manual | `v*` release |
 | --- | --- | --- | --- | --- |
-| Core kernel, web, type, migration, backup, and browser tests | Required | Required integration run | Manual | Latest `main` result is release evidence |
-| UX golden-workflow smoke | Required inside normal browser CI | Repeated inside the integration run | Manual | Latest `main` result is release evidence |
+| Core kernel, web, type, migration, backup, and browser tests | Required | Required integration run | Manual | Required on the exact candidate SHA |
+| UX golden-workflow smoke | Required inside normal browser CI | Repeated inside the integration run | Manual | Included in core CI on the exact candidate SHA |
 | Full researcher UX fixture matrix and P0/P1 issue gate | No | No | Daily or manual | Required before publish |
 | Wheel and application-image clean-install smoke | No | No | Manual | Required before publish |
 | Real multi-container Ray differential | Relevant execution-contract PRs | No | Weekly or manual | Required before publish |
 | Ray Jobs restart/cancel/result acceptance | Relevant lifecycle-contract PRs | No | Weekly or manual | Required before publish |
-| CodeQL and Gitleaks | Required | Required integration run | Scheduled/manual where configured | A release does not bypass an unresolved result |
+| CodeQL and Gitleaks | Required | Required integration run | Scheduled/manual where configured | Required on the exact candidate SHA |
 | Dependency review and path-gated image scan | Relevant PRs | Path/workflow-specific | Scheduled/manual where configured | A release does not bypass an unresolved result |
 
 Direct changes to `main` remain blocked, but pull requests do not have to be rebased after every
@@ -127,7 +127,9 @@ heavy gate against the exact release revision regardless of changed paths.
 
 ## Release contract
 
-A `v*` tag starts [`.github/workflows/release.yml`](../.github/workflows/release.yml). The release
-workflow calls all four heavy acceptance workflows in parallel. Publishing the wheel, image, SBOMs,
-checksums, and attestations cannot start until every called gate succeeds. A manual run exercises the
-same acceptance graph but never publishes.
+A `v*` tag starts [`.github/workflows/release.yml`](../.github/workflows/release.yml). It first records
+the tag target in the run summary, then passes that SHA to the ordinary core CI, CodeQL, and Gitleaks
+checkouts and calls all four heavy acceptance workflows from the same immutable revision. Publishing
+the wheel, image, SBOMs, checksums, and attestations cannot start until every called gate succeeds; a
+passing result on a later `main` commit is not substituted for tag evidence. A manual run records the
+selected commit and exercises the same non-publishing gate graph.
