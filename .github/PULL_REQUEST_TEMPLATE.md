@@ -4,10 +4,14 @@
 <!-- What does this change, and what problem does it solve? -->
 
 ## How it was tested
-<!-- kernel `make test`; if you touched web/, tsc + vitest + build. New behavior should have a test. -->
+
+<!-- List make preflight and focused kernel, web, browser, migration, or manual evidence. -->
+<!-- Required CI gates and path-owned specialized suites run after push. -->
 
 ## Checklist
-- [ ] `make test` passes (and `tsc` + `vitest` + `build` if `web/` changed)
-- [ ] New behavior has a test (mirrors the nearest one in `kernel/hub/tests/test_kernel.py`)
+
+- [ ] `make preflight` passes
+- [ ] Relevant focused evidence is listed above (kernel, web, browser, migration, or manual)
+- [ ] New behavior extends the nearest owning test or browser journey
 - [ ] Change is focused — no unrelated scope
 - [ ] Core stays provider-agnostic + offline-first (vendor-specific code lives behind a plugin seam)
