@@ -117,8 +117,11 @@ If migration or verification fails, stop every v0.2.0 process. Restore the **ent
 set—SQLite workspace or PostgreSQL dump plus workspace managed bytes/config—and then start the
 old v0.1.0 release against that restored set. A database-only or files-only restore is not a
 rollback because metadata identities and managed revision bytes are one consistency unit.
-For object storage, restore the version-preserving object generations and namespace marker from
-that same set under the Profile B contract; a database dump plus local workspace is not rollback.
+For object storage, rollback is certified only when candidate verification remained read-only and
+the original object store and namespace marker are intact. Keep traffic blocked and do not write.
+After restoring the PostgreSQL metadata dump and workspace, continue using that unchanged original
+store; never use the replica to reclaim its namespace. If the original object store itself needs
+recovery, stop: Profile B provides backup evidence, not a supported disaster-recovery takeover.
 
 For general backup handling, restore isolation, object-store profiles, and credential-reference
 requirements, see [Backup and restore](BACKUP_RESTORE.md).
