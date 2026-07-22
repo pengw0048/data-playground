@@ -1,27 +1,77 @@
-# The data catalog
+# Catalog and Workspace
 
-The catalog is the index of every dataset a `source` node can bind: schema, row count, keys, lineage,
-and organization (folder, tags, owner, description).
+Use **Workspace** to find data before making a Canvas. It combines locally placed datasets and
+Canvases with the catalog capabilities supplied by the connected provider. The catalog records the
+metadata that makes a dataset useful in a research workflow: schema and basic profile facts, revision
+availability, organization, relationships, and lineage from published outputs.
 
-Reads are server-side and bounded. Browse, search, facets, the folder tree, and lineage each query the
-metadata database with a page or depth limit. No view loads the whole catalog into memory.
+This first part is a researcher guide. The [reference section](#reference-built-in-catalog-api-and-provider-boundaries)
+below preserves the API, database, and provider contracts for operators and extension authors.
 
-## What you can do
+## Find a dataset
 
-Browse a paginated, virtualized list. Filter by folder, tag, owner, or “has column X” (click a column
-in the detail drawer). Sort by name, size, recency, or most-used.
+Open **Workspace**. **All Workspace** shows datasets, Canvases, and folders together; **Datasets**
+narrows the list to data. Search matches dataset and Workspace names, then open an item to inspect it.
+The built-in catalog serves browse, search, facets, folder tree, and lineage requests in bounded pages
+or graphs, so opening a Workspace view does not require loading an entire catalog into the browser.
 
-Search across name, folder, description, tags, and column names. Lexical search requires every
-whitespace token to match somewhere (`curated images` finds `demo/images/curated`; `%` and `_` are
-literal). With an embedder plugin installed, the search box also offers meaning (semantic) and hybrid
-modes.
+With the built-in catalog, search covers names, folders, descriptions, tags, and column names. Lexical
+search requires every whitespace token to match somewhere (`curated images` finds
+`demo/images/curated`; `%` and `_` are literal). An installed embedder can additionally offer semantic
+and hybrid search; without one, search remains lexical.
 
-Organize datasets from the detail drawer: folder path (`prod/images/curated`), tags, owner, and
-description. The facet rail shows tag and owner counts for the current filters. Lineage follows
-upstream and downstream datasets recorded when runs write outputs; the graph is depth- and node-capped.
-Declare primary keys and join relationships, then view them as an ER diagram scoped to a folder.
+## Read context before adding data to a Canvas
 
-## How it scales
+Open a dataset from Workspace. Its detail panel shows its registered name and location, row and column
+counts (the basic profile), columns, and current version information when the adapter has it. Use
+**Preview** to check rows and schema, but read the status alongside the table: it states the bound,
+completeness, and input revision where available. A bounded prefix is useful for checking shape; it is
+not automatically a representative sample or a whole-dataset result.
+
+The same detail panel is where you keep organization metadata close to the data: name, folder, tags,
+owner, and description. Those fields are generic rather than a claim that every connected catalog uses
+the same taxonomy.
+
+## Understand relationships and lineage
+
+Dataset details list upstream parents and downstream children recorded for published outputs. **View
+relationship graph** opens the bounded graph around the selected dataset. When your provider supports
+declared keys and relationships, use the relationship view to inspect the ER diagram in its current
+folder scope.
+
+Lineage answers a different question from folder placement: it records which source datasets
+contributed to a publication. In the [Workspace-to-Canvas tour](TUTORIAL.md), running the example
+creates `top_users`; opening it shows `events` as a parent. The graph is deliberately depth- and
+node-capped, so use it to orient an investigation rather than assuming it is an unbounded history
+export.
+
+## Inspect an exact revision when it exists
+
+Some adapters expose immutable revision history. For those datasets, the detail panel offers
+**Revision history**; choose **Open revision** to inspect that exact retained version. If history is
+unavailable, Data Playground says so and does not substitute the current head for a missing revision.
+
+Managed local outputs expose a retained core revision after a successful write. Open the result from
+Workspace, Jobs, or the write receipt, then use its revision entry when you need to verify the published
+state. See [Versioned data and durable execution](VERSIONED_DATA_AND_DURABLE_EXECUTION.md) for what
+admitted inputs, managed revisions, and receipts guarantee.
+
+## Add the exact dataset you chose
+
+Click **Use** in a dataset detail. Choose **Explore in a new Canvas** to create an editable Canvas in
+the current Workspace, **Add to this Canvas** when there is an editable current Canvas, or **Choose a
+Canvas** to select an exact destination. The selected sources are applied atomically under one Canvas
+version precondition; opening a dataset never silently changes an unrelated graph.
+
+For the complete path from discovery through a managed write and back to Job, Inbox, revision, and
+lineage evidence, follow the [Workspace-to-Canvas tour](TUTORIAL.md).
+
+## Reference: built-in catalog, API, and provider boundaries
+
+The rest of this page is reference material. It describes the built-in metadata store, bounded HTTP
+API, and extension boundaries; it is not a second Workspace tutorial.
+
+## Built-in metadata store and bounded API
 
 The metadata database (SQLite locally, Postgres in a shared deploy) is the source of truth.
 Filterable fields are promoted from the stored JSON document into indexed columns, with join tables for
@@ -91,7 +141,7 @@ dataplay seed-catalog --count 5000
 
 Open **Workspace** afterward. `--remove` cleans the synthetic entries up.
 
-## Semantic search
+### Semantic search
 
 Semantic and hybrid search need a pluggable embedder. Core ships none. A plugin calls
 `reg.add_embedder(fn, model)` with `fn(list[str]) -> list[list[float]]`. The catalog stores a vector
@@ -99,7 +149,7 @@ per dataset, ranks by cosine similarity, and fuses with lexical results (recipro
 hybrid. With no embedder, search falls back to lexical. See `examples/plugins/dp_semantic_catalog` for
 a local `sentence-transformers` implementation.
 
-## Lineage evidence and external catalogs
+### Lineage evidence and external catalogs
 
 Larger orgs often already have a central metadata service. Data Playground offers two deliberately
 separate integration models, so reading an external catalog never silently grants permission to change
