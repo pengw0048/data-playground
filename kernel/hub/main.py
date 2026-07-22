@@ -321,7 +321,7 @@ async def _lifespan(_app):
             drain_sinks()
 
 
-app = FastAPI(title="Data Playground kernel", version="0.2.2", lifespan=_lifespan)
+app = FastAPI(title="Data Playground kernel", version="0.2.3", lifespan=_lifespan)
 _SENSITIVE_VALIDATION_BODY_DETAILS = {
     "/api/auth/login": "invalid authentication request body",
     "/api/auth/password": "invalid authentication request body",
