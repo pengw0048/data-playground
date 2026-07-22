@@ -47,7 +47,7 @@ For the click-by-click version, see the [5-minute tour](docs/TUTORIAL.md). For t
 
 Data Playground's extension boundary is a Python plugin package. Plugins can add typed Canvas nodes, data adapters, catalog/search providers, destinations, execution backends, importers, viewers, and telemetry. The core stays useful with local files and embedded metadata; an integration owns the capabilities it adds and reports unsupported operations explicitly.
 
-Start with the [plugin guide](docs/PLUGINS.md) and the tested packages in [`examples/plugins/`](examples/plugins/). This is also the boundary for a team to connect its own catalog, scheduler, or compute system without adding provider-specific branches to the open-source core.
+Start with [plugin onboarding](docs/PLUGIN_ONBOARDING.md) and the tested packages in [`examples/plugins/`](examples/plugins/). This is also the boundary for a team to connect its own catalog, scheduler, or compute system without adding provider-specific branches to the open-source core.
 
 ## Support boundary
 
@@ -67,7 +67,7 @@ Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying be
 
 ### Extend
 
-- [Plugin guide](docs/PLUGINS.md)
+- [Plugin onboarding](docs/PLUGIN_ONBOARDING.md)
 - [Plugin examples](examples/plugins/)
 - [HTTP API contract](docs/API.md)
 - [Kernel and API architecture](kernel/README.md)
