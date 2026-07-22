@@ -29,9 +29,26 @@ const VIEWPORT = { width: 1440, height: 900 }
 type Theme = 'light' | 'dark'
 const visualReview: Array<{ viewport: string; theme: Theme; consoleOrPageErrors: string[] }> = []
 
+function exactOne<T>(items: T[], matches: (item: T) => boolean, label: string): T {
+  const exact = items.filter(matches)
+  expect(exact, label).toHaveLength(1)
+  const [item] = exact
+  if (!item) throw new Error(`${label} was missing after its exact-match assertion`)
+  return item
+}
+
+function offsetInstant(value: string | null | undefined, label: string): number {
+  expect(value, `${label} is present`).toBeTruthy()
+  expect(value, `${label} carries an explicit UTC offset`).toMatch(/(?:Z|[+-]\d{2}:\d{2})$/)
+  const instant = Date.parse(value!)
+  expect(Number.isNaN(instant), `${label} parses as an instant`).toBe(false)
+  return instant
+}
+
 test.describe('default fresh-workspace write journey @acceptance-default-journey', () => {
   test.skip(!fullProfile, 'default-journey acceptance runs under the scheduled full-profile workflow, not per-PR')
   test.describe.configure({ mode: 'serial' })
+  test.use({ timezoneId: 'America/New_York' })
 
   async function ok<T>(response: { ok(): boolean; status(): number; text(): Promise<string>; json(): Promise<unknown> }, label: string): Promise<T> {
     expect(response.ok(), `${label}: ${response.status()} ${await response.text()}`).toBeTruthy()
@@ -67,6 +84,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const stamp = Date.now()
     const canvasId = `issue-635-journey-${stamp}`
     const filename = `issue-635-out-${stamp}.parquet`
+    const outputName = filename.replace(/\.parquet$/, '')
     const graph = {
       id: canvasId, name: 'Issue 635 default journey', version: 1, requirements: [],
       nodes: [
@@ -83,6 +101,13 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
 
     // 4. Write on the DEFAULT kernel through the shipped Write Inspector → managed revision + receipt.
     await page.goto(`/#/canvas/${canvasId}`)
+    await page.getByText('Starter events', { exact: true }).click()
+    await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+    const dataPanel = page.getByTestId('panel-data')
+    await expect(dataPanel).toBeVisible()
+    await expect(dataPanel.getByText(/^rows \d+–\d+$/)).toBeVisible({ timeout: 15_000 })
+    await dataPanel.getByTitle('Close').click()
+    await expect(dataPanel).toHaveCount(0)
     await page.locator('.react-flow__node[data-id="write"]').click()
     const inspector = page.getByTestId('inspector')
     const publication = inspector.getByLabel('Write publication')
@@ -101,58 +126,102 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await expect(publication.getByLabel('Published result')).toContainText(`${filename} published`, { timeout: 30_000 })
     await expect(publication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     await expect(publicationDetails).toContainText('Durable: yes')
-    type JobItem = { status: string; outputReceipt?: { datasetId: string; revisionId: string } | null }
+    type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
+    type Receipt = { datasetId: string; revisionId: string; rows: number }
+    type JobItem = {
+      runId: string; status: string; createdAt: string; inputManifest: Input[]
+      outputReceipt?: Receipt | null
+    }
     let job: JobItem | undefined
     // Poll the mirrored Jobs record until it converges on the run's terminal state.
     await expect.poll(async () => {
-      job = (await ok<{ items: JobItem[] }>(
-        await page.request.get(`/api/jobs?run_id=${encodeURIComponent(runId)}&limit=1`), 'read Jobs receipt')).items[0]
+      const jobs = await ok<{ items: JobItem[] }>(
+        await page.request.get(`/api/jobs?run_id=${encodeURIComponent(runId)}&limit=1`), 'read Jobs receipt')
+      job = exactOne(jobs.items, (item) => item.runId === runId, 'one Jobs record for the submitted run')
       return job?.status
     }, { timeout: 30_000 }).toBe('done')
     const dataset = job?.outputReceipt
     expect(dataset?.revisionId, 'Jobs surfaces the managed revision id').toBeTruthy()
+    expect(job?.inputManifest).toEqual([
+      expect.objectContaining({ node_id: 'source', dataset_id: expect.any(String), revision_id: expect.any(String), provider: expect.any(String) }),
+    ])
+    const [admittedInput] = job!.inputManifest
+    expect(admittedInput).toBeTruthy()
     // The inspector receipt names the same durable revision the Jobs surface published.
     await expect(publicationDetails).toContainText(`Receipt: ${dataset!.datasetId}@${dataset!.revisionId}`)
 
     // Run History must mirror the same immutable admission as the durable Task; it must not label
     // this current managed write as a pre-manifest legacy run.
-    const historyRows = await ok<Array<{ runId?: string; inputManifest?: unknown }>>(
+    const historyRows = await ok<Array<{
+      runId?: string; createdAt?: string; inputManifest?: Input[] | null
+      outputs: Array<{ nodeId: string; writeReceipt?: Receipt | null }>
+    }>>(
       await page.request.get(`/api/canvas/${encodeURIComponent(canvasId)}/runs`),
       'read mirrored run history',
     )
-    const historyRow = historyRows.find((item) => item.runId === runId)
-    expect(historyRow?.inputManifest).toEqual(expect.arrayContaining([
-      expect.objectContaining({ node_id: 'source' }),
-    ]))
+    const historyRow = exactOne(historyRows, (item) => item.runId === runId, 'one Canvas history record for the submitted run')
+    expect(historyRow.inputManifest).toEqual(job!.inputManifest)
+    offsetInstant(job!.createdAt, 'Jobs createdAt')
+    offsetInstant(historyRow.createdAt, 'Run history createdAt')
+    const writeOutput = exactOne(historyRow.outputs, (output) => output.nodeId === 'write', 'one Write output in Run history')
+    expect(writeOutput.writeReceipt).toMatchObject({ datasetId: dataset!.datasetId, revisionId: dataset!.revisionId, rows: dataset!.rows })
+    const [localJobsTime, localHistoryTime] = await page.evaluate(
+      (stamps) => stamps.map((stamp) => new Date(stamp).toLocaleString()), [job!.createdAt, historyRow.createdAt],
+    )
     await page.getByTestId('app-menu').click()
     await page.getByText('Run history', { exact: true }).click()
     const historyDialog = page.getByRole('dialog').filter({
       has: page.getByRole('heading', { name: 'Run history' }),
     })
+    await expect(historyDialog).toContainText(localHistoryTime)
     await historyDialog.getByRole('button', { name: /Admitted inputs/ }).click()
     await expect(historyDialog.getByText('ordered exact bindings')).toBeVisible()
+    await expect(historyDialog.getByText(`Exact revision ${admittedInput!.revision_id}`)).toBeVisible()
+    await expect(historyDialog.getByText('No admitted input manifest was recorded for this legacy run.')).toHaveCount(0)
     await historyDialog.getByRole('button', { name: 'Close' }).click()
     await shoot(page, 'light', 'canvas')
 
     // 5. Jobs evidence: the durable task and its output receipt are visible in the shipped Jobs surface.
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-    await expect(page.getByRole('button', { name: `Open run ${runId} in Issue 635 default journey` })).toBeVisible({ timeout: 15_000 })
+    const jobRow = page.getByRole('button', { name: `Open run ${runId} in Issue 635 default journey` })
+    await expect(jobRow).toBeVisible({ timeout: 15_000 })
+    await expect(jobRow).toContainText(localJobsTime)
     await shoot(page, 'light', 'jobs')
 
     // 6. Inbox evidence: the completed durable write is announced in the Inbox.
     await page.goto('/#/inbox')
     await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible()
+    const inbox = await ok<{ items: Array<{
+      taskId: string; terminalAt: string; completedWrite?: { outputName: string; rowCount: number }
+      [key: string]: unknown
+    }> }>(await page.request.get('/api/inbox?filter=unread'), 'read Inbox outcome for the submitted run')
+    const outcome = exactOne(inbox.items, (item) => item.taskId === runId, 'one Inbox outcome for the submitted run')
+    expect(outcome.completedWrite).toEqual({ outputName, rowCount: dataset!.rows })
+    offsetInstant(outcome.terminalAt, 'Inbox terminalAt')
+    expect(outcome).not.toHaveProperty('outputReceipt')
+    await expect(page.getByText(`“${outputName}” written · ${dataset!.rows} rows`)).toBeVisible()
 
-    // 7. Exact-revision reopen from the published receipt.
+    // 7. Discover the same published human output in Workspace, then open its receipt revision.
+    await goToWorkspace(page)
+    await (await workspaceResource(page, 'dataset', outputName)).click()
+    const revisionHistory = page.getByTestId('dataset-revision-history')
+    await expect(revisionHistory).toBeVisible({ timeout: 15_000 })
+    await revisionHistory.getByRole('button', { name: `Open revision ${dataset!.revisionId}` }).click()
+    await expect(revisionHistory.getByText(`Exact revision ${dataset!.revisionId}`)).toBeVisible()
+
+    // 8. Reopen that same revision through Jobs technical evidence too.
     await page.goto(`/#/jobs?run=${encodeURIComponent(runId)}`)
     await page.getByText('Technical evidence', { exact: true }).click()
     await page.getByRole('button', { name: 'Open exact revision' }).click()
     await expect(page.getByLabel('Exact revision detail')).toBeVisible()
-    const detail = await ok<{ revisionId: string; preview: { columns: Array<{ name: string }> } }>(
+    const detail = await ok<{ revisionId: string; committedAt: string; preview: { columns: Array<{ name: string }> } }>(
       await page.request.get(`/api/catalog/revisions/${encodeURIComponent(dataset!.datasetId)}/${encodeURIComponent(dataset!.revisionId)}`),
       'reopen exact published revision')
     expect(detail.revisionId).toBe(dataset!.revisionId)
+    offsetInstant(detail.committedAt, 'exact revision committedAt')
+    const localRevisionTime = await page.evaluate((stamp) => new Date(stamp).toLocaleString(), detail.committedAt)
+    await expect(page.getByLabel('Exact revision detail')).toContainText(localRevisionTime)
     expect(detail.preview.columns.map((column) => column.name)).toEqual(['id', 'user_id', 'amount'])
     await shoot(page, 'light', 'revision')
 
@@ -340,10 +409,36 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
         if (status.status === 'failed') throw new Error(status.error ?? 'recovered run failed')
         return status.status
       }, { timeout: 40_000 }).toBe('done')
-      const jobs = await ok<{ items: Array<{ status: string; outputReceipt?: { revisionId: string } | null }> }>(
+      type RestartInput = { node_id: string; dataset_id: string; revision_id: string; provider: string }
+      type RestartReceipt = { datasetId: string; revisionId: string }
+      type RestartJob = {
+        runId: string; status: string; createdAt: string; inputManifest: RestartInput[]
+        outputReceipt?: RestartReceipt | null
+      }
+      const jobs = await ok<{ items: RestartJob[] }>(
         await page.request.get(`${base}/api/jobs?run_id=${encodeURIComponent(started.runId)}&limit=1`), 'read recovered Jobs receipt')
-      expect(jobs.items[0]?.status).toBe('done')
-      expect(jobs.items[0]?.outputReceipt?.revisionId, 'exactly one recovered receipt with a revision').toBeTruthy()
+      const recoveredJob = exactOne(jobs.items, (item) => item.runId === started.runId, 'one recovered Jobs record')
+      expect(recoveredJob.status).toBe('done')
+      expect(recoveredJob.outputReceipt?.revisionId, 'exactly one recovered receipt with a revision').toBeTruthy()
+      expect(recoveredJob.inputManifest).toEqual([
+        expect.objectContaining({ node_id: 'source', dataset_id: expect.any(String), revision_id: expect.any(String), provider: expect.any(String) }),
+      ])
+
+      const history = await ok<Array<{
+        runId?: string; createdAt?: string; inputManifest?: RestartInput[] | null
+        outputs: Array<{ nodeId: string; writeReceipt?: RestartReceipt | null }>
+      }>>(await page.request.get(`${base}/api/canvas/${encodeURIComponent(canvasId)}/runs`), 'read recovered Canvas history')
+      const recoveredHistory = exactOne(history, (item) => item.runId === started.runId, 'one recovered Canvas history record')
+      expect(recoveredHistory.inputManifest).toEqual(recoveredJob.inputManifest)
+      offsetInstant(recoveredJob.createdAt, 'recovered Jobs createdAt')
+      offsetInstant(recoveredHistory.createdAt, 'recovered Run history createdAt')
+      const recoveredOutput = exactOne(recoveredHistory.outputs, (output) => output.nodeId === 'write', 'one recovered Write output')
+      expect(recoveredOutput.writeReceipt).toMatchObject(recoveredJob.outputReceipt!)
+      const recoveredRevision = await ok<{ revisionId: string; committedAt: string }>(
+        await page.request.get(`${base}/api/catalog/revisions/${encodeURIComponent(recoveredJob.outputReceipt!.datasetId)}/${encodeURIComponent(recoveredJob.outputReceipt!.revisionId)}`),
+        'reopen exact recovered revision')
+      expect(recoveredRevision.revisionId).toBe(recoveredJob.outputReceipt!.revisionId)
+      offsetInstant(recoveredRevision.committedAt, 'recovered exact revision committedAt')
 
       // The reloaded browser shows the recovered terminal state from the restarted hub.
       await page.setViewportSize(VIEWPORT)
