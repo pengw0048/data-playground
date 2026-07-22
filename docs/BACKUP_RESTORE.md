@@ -168,9 +168,11 @@ mc alias set dp-backup "$DP_OBJECT_BACKUP_ENDPOINT" \
   "$DP_OBJECT_BACKUP_KEY" "$DP_OBJECT_BACKUP_SECRET"
 mc ls --json --versions --recursive "dp/${DP_S3_BUCKET}" \
   | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
+  | sort \
   > backup/object-versions.primary.jsonl
 mc ls --json --versions --recursive "dp-backup/${DP_OBJECT_BACKUP_BUCKET}" \
   | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
+  | sort \
   > backup/object-versions.replica.jsonl
 cmp backup/object-versions.primary.jsonl backup/object-versions.replica.jsonl
 

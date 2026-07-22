@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the only object-history preservation mechanism documented in
+# Verify the version-history preservation mechanism documented in
 # docs/BACKUP_RESTORE.md. This is an operator/release drill, not a CI job.
 set -euo pipefail
 
@@ -10,10 +10,13 @@ NETWORK="${RUN_ID}-network"
 SOURCE="${RUN_ID}-source"
 REPLICA="${RUN_ID}-replica"
 COPY_TARGET="${RUN_ID}-copy-target"
+CLIENT="${RUN_ID}-mc"
+WORK_DIR="$(mktemp -d)"
 
 cleanup() {
-  docker rm -f "$SOURCE" "$REPLICA" "$COPY_TARGET" >/dev/null 2>&1 || true
+  docker rm -f "$SOURCE" "$REPLICA" "$COPY_TARGET" "$CLIENT" >/dev/null 2>&1 || true
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
+  rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
@@ -24,76 +27,142 @@ for container in "$SOURCE" "$REPLICA" "$COPY_TARGET"; do
     -e MINIO_ROOT_PASSWORD=dp-backup-drill-password \
     "$MINIO_IMAGE" server /data >/dev/null
 done
+docker run -d --name "$CLIENT" --network "$NETWORK" \
+  --entrypoint /bin/sh "$MC_IMAGE" -c 'while :; do sleep 3600; done' >/dev/null
 
-for _ in $(seq 1 30); do
-  if docker run --rm --network "$NETWORK" "$MC_IMAGE" \
-    alias set source "http://${SOURCE}:9000" dp-backup-drill dp-backup-drill-password \
-    >/dev/null 2>&1; then
-    break
+mc() {
+  docker exec \
+    -e DP_DRILL_SOURCE="$SOURCE" \
+    -e DP_DRILL_REPLICA="$REPLICA" \
+    -e DP_DRILL_COPY_TARGET="$COPY_TARGET" \
+    "$CLIENT" /bin/sh -ceu '
+    mc alias set source "http://${DP_DRILL_SOURCE}:9000" dp-backup-drill dp-backup-drill-password >/dev/null
+    mc alias set replica "http://${DP_DRILL_REPLICA}:9000" dp-backup-drill dp-backup-drill-password >/dev/null
+    mc alias set copy "http://${DP_DRILL_COPY_TARGET}:9000" dp-backup-drill dp-backup-drill-password >/dev/null
+    mc "$@"
+  ' -- "$@"
+}
+
+normalize_manifest() {
+  python3 -c '
+import json
+import sys
+
+entries = []
+for line in sys.stdin:
+    item = json.loads(line)
+    entries.append(
+        {
+            "etag": item.get("etag", ""),
+            "isDeleteMarker": item.get("isDeleteMarker", False),
+            "key": item["key"],
+            "size": item.get("size", 0),
+            "versionId": item["versionId"],
+        }
+    )
+for item in sorted(
+    entries,
+    key=lambda item: (
+        item["key"],
+        item["versionId"],
+        item["isDeleteMarker"],
+        item["size"],
+        item["etag"],
+    ),
+):
+    print(json.dumps(item, sort_keys=True, separators=(",", ":")))
+'
+}
+
+for alias in source replica copy; do
+  ready=false
+  for _ in $(seq 1 30); do
+    if mc ls "$alias" >/dev/null 2>&1; then
+      ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ready" != true ]; then
+    echo "MinIO service $alias did not become ready" >&2
+    exit 1
   fi
-  sleep 1
 done
 
-docker run --rm --network "$NETWORK" --entrypoint /bin/sh "$MC_IMAGE" -ceu "
-  mc alias set source http://${SOURCE}:9000 dp-backup-drill dp-backup-drill-password
-  mc alias set replica http://${REPLICA}:9000 dp-backup-drill dp-backup-drill-password
-  mc alias set copy http://${COPY_TARGET}:9000 dp-backup-drill dp-backup-drill-password
+mc mb source/production
+mc mb replica/backup
+mc version enable source/production
+mc version enable replica/backup
 
-  mc mb source/production
-  mc mb replica/backup
-  mc version enable source/production
-  mc version enable replica/backup
+# Replication must exist before the protected writes. The control below proves
+# why a later copy cannot replace it.
+mc replicate add source/production \
+  --remote-bucket "http://dp-backup-drill:dp-backup-drill-password@${REPLICA}:9000/backup" \
+  --replicate 'existing-objects,delete,delete-marker' --priority 1 --sync
 
-  # Replication must exist before the protected writes. The control below proves
-  # why a later mc cp backup cannot replace it.
-  mc replicate add source/production \\
-    --remote-bucket http://dp-backup-drill:dp-backup-drill-password@${REPLICA}:9000/backup \\
-    --replicate 'existing-objects,delete,delete-marker' --priority 1 --sync
+printf 'first-generation\n' >"$WORK_DIR/first.txt"
+printf 'second-generation\n' >"$WORK_DIR/second.txt"
+printf 'deleted-generation\n' >"$WORK_DIR/deleted.txt"
+docker cp "$WORK_DIR/first.txt" "$CLIENT:/tmp/first.txt"
+docker cp "$WORK_DIR/second.txt" "$CLIENT:/tmp/second.txt"
+docker cp "$WORK_DIR/deleted.txt" "$CLIENT:/tmp/deleted.txt"
+mc cp /tmp/first.txt source/production/history/object.txt
+mc cp /tmp/second.txt source/production/history/object.txt
+mc cp /tmp/deleted.txt source/production/tombstone/object.txt
+mc rm source/production/tombstone/object.txt
 
-  printf 'first-generation\\n' >/tmp/first.txt
-  printf 'second-generation\\n' >/tmp/second.txt
-  printf 'deleted-generation\\n' >/tmp/deleted.txt
-  mc cp /tmp/first.txt source/production/history/object.txt
-  mc cp /tmp/second.txt source/production/history/object.txt
-  mc cp /tmp/deleted.txt source/production/tombstone/object.txt
-  mc rm source/production/tombstone/object.txt
+mc ls --json --versions --recursive source/production \
+  | normalize_manifest >"$WORK_DIR/source-versions.jsonl"
+mc ls --json --versions --recursive replica/backup \
+  | normalize_manifest >"$WORK_DIR/replica-versions.jsonl"
+cmp "$WORK_DIR/source-versions.jsonl" "$WORK_DIR/replica-versions.jsonl"
+test "$(wc -l <"$WORK_DIR/source-versions.jsonl" | tr -d '[:space:]')" = 4
 
-  # Strip the endpoint-only URL field before comparing exact object facts.
-  # The pinned mc image intentionally has no general-purpose text processor;
-  # url is the seventh comma-delimited JSON field emitted by this mc release.
-  mc ls --json --versions --recursive source/production \\
-    | cut -d, -f1-6,8- >/tmp/source-versions.jsonl
-  mc ls --json --versions --recursive replica/backup \\
-    | cut -d, -f1-6,8- >/tmp/replica-versions.jsonl
-  test \"\$(sha256sum /tmp/source-versions.jsonl | cut -d' ' -f1)\" = \\
-    \"\$(sha256sum /tmp/replica-versions.jsonl | cut -d' ' -f1)\"
+historical_version="$(python3 - "$WORK_DIR/source-versions.jsonl" <<'PY'
+import json
+import sys
 
-  historical_version=\$(head -n 2 /tmp/source-versions.jsonl | tail -n 1 | cut -d, -f7 | cut -d'\"' -f4)
-  test -n \"\$historical_version\"
-  mc cp --version-id \"\$historical_version\" replica/backup/history/object.txt /tmp/recovered-historical.txt
-  test \"\$(sha256sum /tmp/first.txt | cut -d' ' -f1)\" = \\
-    \"\$(sha256sum /tmp/recovered-historical.txt | cut -d' ' -f1)\"
+entries = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+versions = [
+    item["versionId"]
+    for item in entries
+    if item["key"] == "history/object.txt"
+    and item["size"] == len(b"first-generation\n")
+    and not item["isDeleteMarker"]
+]
+if len(versions) != 1:
+    raise SystemExit(f"expected one first historical generation, found {versions!r}")
+if sum(item["isDeleteMarker"] for item in entries) != 1:
+    raise SystemExit("expected exactly one delete marker")
+print(versions[0])
+PY
+)"
+mc cp --version-id "$historical_version" replica/backup/history/object.txt /tmp/recovered-historical.txt
+docker cp "$CLIENT:/tmp/recovered-historical.txt" "$WORK_DIR/recovered-historical.txt"
+cmp "$WORK_DIR/first.txt" "$WORK_DIR/recovered-historical.txt"
 
-  # Negative control: the former runbook command copies only the current object.
-  mkdir -p /tmp/cp-backup
-  mc cp --recursive source/production/ /tmp/cp-backup/
-  mc mb copy/restore
-  mc version enable copy/restore
-  mc cp --recursive /tmp/cp-backup/ copy/restore/
-  mc ls --json --versions --recursive copy/restore \\
-    | cut -d, -f1-6,8- >/tmp/cp-versions.jsonl
-  case \"\$(cat /tmp/cp-versions.jsonl)\" in
-    *\"\\\"versionId\\\":\\\"\$historical_version\\\"\"*)
-    echo 'mc cp unexpectedly retained a historical version ID' >&2
-    exit 1
-    ;;
-  esac
-  if [ \"\$(wc -l </tmp/cp-versions.jsonl)\" -ge \"\$(wc -l </tmp/source-versions.jsonl)\" ]; then
-    echo 'mc cp control did not lose version or delete-marker history' >&2
-    exit 1
-  fi
+# Negative control: the former runbook command copies only the current object.
+mc cp --recursive source/production/ /tmp/cp-backup/
+mc mb copy/restore
+mc version enable copy/restore
+mc cp --recursive /tmp/cp-backup/ copy/restore/
+mc ls --json --versions --recursive copy/restore \
+  | normalize_manifest >"$WORK_DIR/cp-versions.jsonl"
+python3 - "$WORK_DIR/source-versions.jsonl" "$WORK_DIR/cp-versions.jsonl" "$historical_version" <<'PY'
+import json
+import sys
 
-  echo \"VERSIONED_OBJECT_BACKUP_EVIDENCE source=source/production replica=replica/backup historical_version=\$historical_version\"
-  echo \"VERSIONED_OBJECT_BACKUP_CP_CONTROL=lost_history\"
-  mc --version
-"
+source = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+copied = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8")]
+historical_version = sys.argv[3]
+if len(copied) >= len(source):
+    raise SystemExit("mc cp control did not lose version or delete-marker history")
+if any(item["versionId"] == historical_version for item in copied):
+    raise SystemExit("mc cp unexpectedly retained a historical version ID")
+if any(item["isDeleteMarker"] for item in copied):
+    raise SystemExit("mc cp unexpectedly retained a delete marker")
+PY
+
+echo "VERSIONED_OBJECT_BACKUP_EVIDENCE source=source/production replica=replica/backup historical_version=$historical_version"
+echo "VERSIONED_OBJECT_BACKUP_CP_CONTROL=lost_history"
+mc --version
