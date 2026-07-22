@@ -122,8 +122,7 @@ describe('AgentDock — AgentDataPolicy preflight disclosure', () => {
   it('keeps the standalone-request disclosure visible after a completed request', async () => {
     mocks.state.agentLog = [{ role: 'user', text: 'build a filter' }]
     render(<AgentDock />)
-    await waitFor(() => expect(mocks.agentStatus).toHaveBeenCalled())
-    expect(screen.getByTestId('agent-egress-disclosure')).toBeInTheDocument()
+    expect(await screen.findByTestId('agent-egress-disclosure')).toBeInTheDocument()
     expect(screen.getByText(/Earlier requests and results shown here are display-only/)).toBeInTheDocument()
     expect(screen.getByTestId('agent-completed-request')).toHaveTextContent('build a filter')
   })
