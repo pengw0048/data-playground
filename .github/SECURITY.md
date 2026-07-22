@@ -50,8 +50,8 @@ setting state.
 
 ## Versions and fixes
 
-The latest published release is [v0.1.0](https://github.com/pengw0048/data-playground/releases/tag/v0.1.0).
-Current maintenance is a single `main` line: security fixes land on `main` and are available in a later
-tagged release when maintainers publish one. There are no maintained patch or release branches, so older
-tags have no promised security backports. Test against current `main` when possible and include the
-released version in a report when it is affected.
+Use the [latest published release](https://github.com/pengw0048/data-playground/releases/latest) when
+reporting an affected released build. Current maintenance is a single `main` line: security fixes land on
+`main` and are available in a later tagged release when maintainers publish one. There are no maintained
+patch or release branches, so older tags have no promised security backports. Test against current `main`
+when possible and include the released version in a report when it is affected.
