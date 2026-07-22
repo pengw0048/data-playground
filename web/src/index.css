@@ -154,7 +154,6 @@ input, textarea, select { font-family: inherit; }
   box-shadow: 0 0 0 2px var(--focus);
   border-radius: 2px;
 }
-.react-flow__controls { box-shadow: none; border-radius: 10px; overflow: hidden; }
 .react-flow__minimap { border-radius: 10px; overflow: hidden; border: 1px solid hsl(var(--border)); }
 
 /* Files home cards — visible focus for the open/delete controls (native buttons). */

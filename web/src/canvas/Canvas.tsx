@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ReactFlow, Background, BackgroundVariant, Controls, MiniMap,
+  ReactFlow, Background, BackgroundVariant, MiniMap,
   applyNodeChanges, applyEdgeChanges, useReactFlow,
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
 } from '@xyflow/react'
@@ -457,17 +457,18 @@ export function Canvas() {
         deleteKeyCode={null}
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="var(--dots)" />  {/* themed: light/dark via --dots */}
-        {/* zoom controls + minimap only once there's something to navigate — on an empty canvas they'd
-            just be stray boxes over the "add a source" prompt. (zoom controls sit ABOVE the minimap.) */}
+        {/* The Toolbar owns product-labelled view controls. Keep the minimap only once there's something
+            to navigate — on an empty canvas it would just be a stray box over the first-run prompt. */}
         {doc.nodes.length > 0 && (
           <>
-            <Controls showInteractive={false} position="bottom-left" style={{ marginBottom: 132, marginLeft: 12 }} />
             {/* MiniMap paints to a 2D canvas where CSS vars don't resolve, so maskColor + the nodeColor
                 fallback are literals (a theme-neutral gray veil; not the now-var color.text3). */}
             <MiniMap
               pannable
               position="bottom-left"
-              style={{ marginBottom: 12, marginLeft: 12, width: 168, height: 108 }}
+              // Keep the minimap above the centered toolbar at the supported 1024px viewport, where
+              // the labelled Add group reaches the left edge even though the View group does not.
+              style={{ marginBottom: 84, marginLeft: 12, width: 168, height: 108 }}
               maskColor="rgba(128,128,128,0.2)"
               nodeColor={(n) => kindAccent[n.type ?? ''] ?? '#98a0ac'}
               nodeStrokeWidth={0}

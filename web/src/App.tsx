@@ -130,7 +130,7 @@ export default function App() {
             <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
               <Canvas />
               <TopBar />
-              <Toolbar />
+              <Toolbar inspectorCollapsed={inspectorCollapsed} onInspectorToggle={() => setInspectorCollapsed((value) => !value)} />
               <AgentDock />
             </div>
             {/* collapsible right property panel (Figma-style) */}
