@@ -47,8 +47,8 @@ A browser, MCP client, or headless invocation reaches the same core flow:
 1. `hub/main.py` or `hub/cli.py` establishes the workspace and dependencies.
 2. A route or command validates the canvas graph and asks the planner to choose
    an admissible execution path.
-3. `hub/run_controller.py` creates and owns the run state; the selected backend
-   executes the graph.
+3. The selected backend owns an ordinary run.  `hub/run_controller.py` owns
+   runs that the planner genuinely splits across multiple execution regions.
 4. `hub/executors/engine.py` turns built-in nodes into lazy DuckDB relation
    operations or bounded Arrow-batch transforms.  Dataset adapters and sinks
    handle reads and writes.
