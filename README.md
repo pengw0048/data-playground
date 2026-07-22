@@ -215,9 +215,10 @@ model and the [security policy](.github/SECURITY.md) for private vulnerability r
 
 ### Docker reference setup
 
-The Compose file is an authenticated, Postgres-backed reference setup. It deliberately separates the
-release migration from application startup. Export every required secret first — Compose fails closed
-if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
+The Compose file is an authenticated, Postgres-backed **local HTTP** reference. It binds only
+`127.0.0.1:8471`, deliberately separates the release migration from application startup, and leaves
+the session cookie non-`Secure` so a browser can sign in over that local connection. Export every
+required secret first — Compose fails closed if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
 
 ```bash
 export DP_AUTH_SECRET="$(openssl rand -hex 32)"
@@ -231,9 +232,10 @@ unset DP_AUTH_PASSWORD
 docker compose up -d kernel
 ```
 
-Sign in as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and `DP_POSTGRES_PASSWORD`
-stable across restarts. Before a later migration, stop every process that writes the metadata
-database. The [Kubernetes reference](deploy/README.md) documents that release contract, the
+Sign in at http://127.0.0.1:8471 as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and
+`DP_POSTGRES_PASSWORD` stable across restarts. Before a later migration, stop every process that
+writes the metadata database. This Compose file is not a shared-service manifest: do not publish its
+HTTP port. The [Kubernetes reference](deploy/README.md) documents the release contract, the
 PodSpawner validation path, and what must be adapted for a real deployment.
 
 ### Deployment modes
@@ -243,18 +245,19 @@ PodSpawner validation path, and what must be adapted for a real deployment.
 | Mode | When to use | Startup behavior |
 | --- | --- | --- |
 | `local` (default) | Laptop / zero-config HTTP on loopback | Unchanged: plain HTTP works; `dp_session` stays `HttpOnly` + `SameSite=Lax` without `Secure` unless you opt in |
-| `shared` | Multi-user service behind TLS | Fails before binding if auth, Secure cookies, or a transport declaration is missing |
+| `shared` | Multi-user service behind a TLS reverse proxy | Fails before binding if auth, Secure cookies, or the proxy allow-list is missing |
 
 Shared mode requires all of:
 
 1. `DP_AUTH_SECRET` — signed session cookies (already required by Compose)
 2. `DP_AUTH_SECURE_COOKIE=1` — browsers will only send `dp_session` over HTTPS
-3. Either `DP_AUTH_DIRECT_TLS=1` (TLS terminates at the hub process) or
-   `DP_TRUSTED_PROXIES=<proxy-ip>[,...]` (TLS terminates at those reverse proxies; only they may set
-   `X-Forwarded-For` / `X-Forwarded-Proto` used for login rate limiting)
+3. `DP_TRUSTED_PROXIES=<proxy-ip-or-cidr>[,...]` — the actual immediate TLS-terminating reverse
+   proxies; only those peers may supply `X-Forwarded-For` / `X-Forwarded-Proto` used for login rate
+   limiting
 
-Unset mode keeps today's localhost defaults. The Compose reference sets `shared` with Secure cookies and
-`DP_AUTH_DIRECT_TLS=1`; swap in `DP_TRUSTED_PROXIES` when a proxy terminates TLS instead.
+The hub does not terminate TLS itself. The checked-in Compose reference intentionally keeps the
+`local` default for its loopback HTTP URL; adapt it with a real TLS reverse proxy, Secure cookies, and
+the proxy's precise addresses or CIDRs before serving a team.
 
 ## Documentation
 

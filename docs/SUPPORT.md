@@ -46,8 +46,9 @@ the workspace or deployment, not to mutually hostile tenants.
 
 Within the profiles above, supported core paths preserve these requirements:
 
-- Shared mode fails before binding unless signed sessions, Secure cookies, and a direct-TLS or trusted
-  reverse-proxy declaration are configured. Canvas and administrative actions remain role-gated.
+- Shared mode fails before binding unless signed sessions, Secure cookies, and a real TLS-terminating
+  reverse proxy's precise `DP_TRUSTED_PROXIES` allow-list are configured. Canvas and administrative
+  actions remain role-gated.
 - Cred secret fields and plugin settings marked `secret` persist SecretRefs such as `env:NAME` or
   `file:/path`, not resolved values. Supported APIs redact residual plaintext, and one-shot subruns and
   Ray drivers do not receive the hub's session-signing or metadata-database credentials.

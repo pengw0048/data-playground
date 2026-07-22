@@ -423,7 +423,7 @@ app.include_router(runs.router, prefix="/api", dependencies=_GATE, responses=API
 app.include_router(workspace.router, prefix="/api", dependencies=_GATE, responses=API_ERROR_RESPONSES)
 
 # Fail before opening the metadata DB when the hub has a missing/known-weak signing secret, or when
-# shared mode lacks Secure cookies / an explicit TLS or trusted-proxy declaration. A spawned kernel
+# shared mode lacks Secure cookies / a trusted TLS-proxy declaration. A spawned kernel
 # child keeps DP_AUTH_MODE only for confinement and never imports this web-app module.
 auth.reject_weak_secret()
 auth.reject_unsafe_transport()
