@@ -62,12 +62,14 @@ Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying be
 - [5-minute tour](docs/TUTORIAL.md)
 - [Catalog and discovery](docs/CATALOG.md)
 - [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md)
+- [Browser and viewport support](docs/BROWSER_SUPPORT.md)
 - [MCP integration](docs/MCP.md)
 
 ### Extend
 
 - [Plugin guide](docs/PLUGINS.md)
 - [Plugin examples](examples/plugins/)
+- [HTTP API contract](docs/API.md)
 - [Kernel and API architecture](kernel/README.md)
 
 ### Operate
@@ -75,6 +77,9 @@ Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying be
 - [Support and deployment boundary](docs/SUPPORT.md)
 - [Backup and restore](docs/BACKUP_RESTORE.md)
 - [CI and test matrix](docs/CI.md)
+- [Observability](docs/OBSERVABILITY.md)
+- [UX acceptance](docs/UX_ACCEPTANCE.md)
+- [Project acceptance and roadmap](docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md)
 - [Ray backend](docs/RAY.md) and [Ray Jobs](docs/RAY_JOBS.md)
 - [Deployment reference](deploy/README.md)
 
