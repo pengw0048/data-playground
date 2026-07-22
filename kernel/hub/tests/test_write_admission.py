@@ -14,11 +14,11 @@ from fastapi.testclient import TestClient
 
 from hub import metadb
 from hub.api_errors import APIErrorCode
-from hub.models import Graph
+from hub.models import ColumnSchema, Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
-from hub.plugins.processors import ProcessorRegistry
+from hub.plugins.processors import ProcessorRegistry, RegisteredProcessor
 from hub.routers.runs import _write_admission_for_graph
 from hub.routers.runs import _inject_write_intent
 from hub.routers.runs import _local_run_intent_sha256
@@ -378,6 +378,98 @@ def test_local_runner_consumes_frozen_intent_and_publishes_receipt(
     assert second.revision_id != first.revision_id
     assert replaced.outputs[0].uri == second.publication.artifact_uri
     assert replaced.outputs[0].version == second.publication.catalog_version
+
+
+def test_precise_library_integer_schema_matches_managed_write_runtime(contract):
+    from hub.compiler import compile_plan
+    from hub.plugins.runner import LocalRunner
+
+    deps, base_graph = contract
+    source_uri = next(node for node in base_graph.nodes if node.id == "source").data["config"]["uri"]
+
+    def processor_factory(_params):
+        def add_integer_widths(row):
+            return {
+                "signed_value": pa.scalar(row["value"], type=pa.int32()),
+                "unsigned_value": pa.scalar((1 << 63) + row["value"], type=pa.uint64()),
+            }
+
+        return add_integer_widths
+
+    deps.registry.register(RegisteredProcessor(
+        id="test.precise-integers",
+        version="v1",
+        title="Precise integers",
+        mode="map",
+        input_schema=[ColumnSchema(name="value", type="int")],
+        output_schema=[
+            ColumnSchema(name="signed_value", type="int32"),
+            ColumnSchema(name="unsigned_value", type="uint64"),
+        ],
+        fn_factory=processor_factory,
+    ))
+    graph = Graph.model_validate({
+        "id": "precise-integer-write-admission",
+        "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "data": {"config": {"uri": source_uri}}},
+            {"id": "transform", "type": "transform", "data": {"config": {
+                "source": "library",
+                "processor": "test.precise-integers",
+                "version": "v1",
+                "mode": "map",
+                "outputSchema": [
+                    {"name": "signed_value", "type": "int32"},
+                    {"name": "unsigned_value", "type": "uint64"},
+                ],
+            }}},
+            {"id": "write", "type": "write", "data": {"title": "precise-output", "config": {
+                "filename": "precise-output.parquet",
+                "writeMode": "overwrite",
+            }}},
+        ],
+        "edges": [
+            {"id": "source-transform", "source": "source", "target": "transform"},
+            {"id": "transform-write", "source": "transform", "target": "write"},
+        ],
+    })
+    submission = "73333333-3333-4333-8333-333333333333"
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", submission)
+    assert admission.intent is not None
+    assert [
+        (column.name, column.type, column.physical_type, column.nullable)
+        for column in admission.expected_schema
+    ] == [
+        ("signed_value", "int", "INTEGER", None),
+        ("unsigned_value", "int", "UBIGINT", None),
+    ]
+
+    _inject_write_intent(graph, "write", admission.intent)
+    node_specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    runner = LocalRunner(
+        deps.resolve_adapter, deps.registry, deps.catalog, deps.workspace,
+        node_specs=node_specs, storage=deps.storage)
+    run_id = metadb.local_run_submission_id("researcher", graph.id, submission)
+    started = runner.run(
+        compile_plan(graph, "write", deps.registry, node_specs),
+        graph, "write", "local", run_id=run_id)
+    deadline = time.monotonic() + 2
+    status = started
+    while status.status not in ("done", "failed", "cancelled"):
+        assert time.monotonic() < deadline, status
+        time.sleep(0.01)
+        status = runner.status(run_id)
+    assert runner.wait_for_worker(run_id, timeout=2)
+    assert status.status == "done", status.error
+    receipt = status.outputs[0].write_receipt
+    assert receipt is not None
+    published = pq.read_table(receipt.publication.artifact_uri)
+    assert published.schema.types == [pa.int32(), pa.uint64()]
+    assert published.to_pylist() == [
+        {"signed_value": 1, "unsigned_value": (1 << 63) + 1},
+        {"signed_value": 2, "unsigned_value": (1 << 63) + 2},
+    ]
 
 
 def test_lance_append_admission_freezes_registered_exact_head_without_allocation(
