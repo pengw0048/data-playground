@@ -15,7 +15,7 @@ steps below differ by profile.
 |---|---|
 | **Metadata database** | Canvases (`canvases.doc` JSON), canvas version snapshots, run history and run state, catalog entries, columns, lineage facts, publication receipts, embeddings, settings and Cred rows, the local-result artifact registry, managed object-attempt lifecycle rows, and the `installation_identity` singleton (owner token + storage namespace). For versioned data this explicitly includes `catalog_logical_datasets` (including unregistered tombstones), `managed_local_file_revisions`, `run_input_admissions`, `run_records.input_manifest`, `local_result_artifacts`, `local_result_references`, and the object-attempt ref / lease / inventory tables. Exact execution history additionally requires `execution_manifests` and every `execution_manifest_sha256` owner on admissions, run state/history, receipts/revisions, lineage, durable Tasks/Attempts, and Inbox items. Durable task recovery also requires `durable_tasks`, `durable_task_attempts`, `durable_task_inbox_items`, `durable_external_waits`, `durable_checkpoints`, and the bounded fan-out plan, unit, attempt, and slot tables. These rows are one consistency unit: never reconstruct identity or references from a path or display name after restore. Publication receipts are required to preserve exact-replay tombstones after facts or catalog entries are unregistered. |
 | **Workspace files** | Under `DP_WORKSPACE`: `dataplay.db` when using SQLite, `outputs/` (run results plus immutable core-owned revision artifacts under `.dp-results/`), and `plugins/` (operator-installed packs). Preserve the complete `.dp-results` namespace metadata and record hashes for every core-owned artifact referenced by `managed_local_file_revisions`; copying only current catalog heads loses retained history. |
-| **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), back up object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. |
+| **Object-store generations + namespace marker** | When `DP_STORAGE_URL` points at `s3://` / `gs://` (or compatible), retain object generations under the installation's storage namespace **and** the conditional marker at `_dp_control/namespaces/<namespace>.json`. The metadata DB alone is not enough: `local_result_artifacts` and attempt rows reference exact URIs. For MinIO, this means a version-preserving replica configured before protected writes, not `mc cp --recursive`; see Profile B. |
 | **Provider-owned history evidence (not provider bytes)** | The database retains opaque registration / dataset IDs, exact provider revision IDs, pinned Source refs, and admitted run manifests. The logical backup does **not** include provider-owned Lance or plugin-provider bytes. Back those up through the provider's own system if required, and classify each restored exact read as available or unavailable instead of treating a current same-name/path dataset as the old revision. |
 | **Credential references** | Cred rows and plugin `secret` settings contain SecretRefs plus non-secret connection metadata, not resolved credential values. Back up the referenced environment, files, or external secret manager separately; a metadata restore cannot recreate them. |
 | **Release identity** | Record `GET /api/version` (`sha`, `db` dialect, `storage` scheme) and the Alembic revision stored in the metadata DB (`alembic_version.version_num`, also exposed by `metadb.expected_schema_head()` / `metadb.require_schema_at_head()`). A restore must land on a release that understands that schema. |
@@ -23,7 +23,7 @@ steps below differ by profile.
 ### Consistency ordering
 
 1. **Stop every metadata writer** before the snapshot window begins: hub replicas, per-canvas kernels, MCP servers, headless runs, and any external worker using the same database or writing into the same object-store namespace. Wait until they have exited; scaling a Deployment is asynchronous.
-2. Snapshot the **metadata database** and the **artifact / object store** as close together as possible. Prefer: freeze writers → dump DB → copy object generations and the namespace marker → copy local workspace files that are not already in the DB dump.
+2. Snapshot the **metadata database** and the **artifact / object store** as close together as possible. Prefer: freeze writers → dump DB → verify the version-preserving object replica and namespace marker → copy local workspace files that are not already in the DB dump.
 3. Resume writers only after the backup set is complete and verified (checksums or byte sizes recorded).
 
 A backup taken while writers are still active can leave dangling artifact URIs, a retention ref
@@ -161,13 +161,18 @@ PY
 # Example libpq URL for the compose harness:
 #   postgresql://dp:dp@127.0.0.1:5432/dataplay
 
-# 4. Copy object generations for the installation namespace AND the marker.
-#    Marker path: s3://<bucket>/_dp_control/namespaces/<namespace>.json
-#    With the MinIO harness (endpoint from DP_S3_ENDPOINT):
+# 4. Record the already-configured version-preserving replica's exact manifest.
+#    The replica must have been created before this installation wrote protected objects.
 mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
-NS="$(uv run --project kernel python -c 'from hub import metadb; metadb.init_db(); print(metadb.object_storage_namespace())')"
-mc cp --recursive "dp/${DP_S3_BUCKET}/" "backup/objects/"
-# Prefer filtering to the namespace prefix + _dp_control/namespaces/${NS}.json when the bucket is shared.
+mc alias set dp-backup "$DP_OBJECT_BACKUP_ENDPOINT" \
+  "$DP_OBJECT_BACKUP_KEY" "$DP_OBJECT_BACKUP_SECRET"
+mc ls --json --versions --recursive "dp/${DP_S3_BUCKET}" \
+  | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
+  > backup/object-versions.primary.jsonl
+mc ls --json --versions --recursive "dp-backup/${DP_OBJECT_BACKUP_BUCKET}" \
+  | jq -S -c '{key, versionId, isDeleteMarker: (.isDeleteMarker // false), size, etag}' \
+  > backup/object-versions.replica.jsonl
+cmp backup/object-versions.primary.jsonl backup/object-versions.replica.jsonl
 
 # 5. Workspace plugins (optional but recommended):
 cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
@@ -175,10 +180,59 @@ cp -a "$DP_WORKSPACE/plugins" backup/plugins 2>/dev/null || true
 # as in Profile A; PostgreSQL does not move local revision bytes into the object store.
 ```
 
-Consistency ordering for this profile: stop writers → `pg_dump` → object-store copy (generations
-+ `_dp_control/namespaces/<namespace>.json`) → workspace plugins. Reversing DB and object copy
-while writers are stopped is acceptable only if both finish before any writer resumes; do not
-interleave either with live writes.
+`mc cp --recursive` is intentionally absent: MinIO documents that it copies only the latest or a
+specified version, without version information. The old command therefore loses non-current
+generations and delete markers, and writes new version IDs on a target bucket. A matching current
+object is not an exact-generation restore.
+
+### Configure the object replica before protected writes
+
+The documented object-history mechanism is MinIO bucket replication to an independent, versioned
+bucket. Configure it **before** the first Data Playground object write for the installation. The
+replica is a warm backup: it is not a one-time `mc cp` archive and it must be in a distinct failure
+domain from the source object store.
+
+```bash
+# Run while the source bucket is new/empty, before protected writes.
+mc alias set dp "$DP_S3_ENDPOINT" "$DP_S3_KEY" "$DP_S3_SECRET"
+mc alias set dp-backup "$DP_OBJECT_BACKUP_ENDPOINT" \
+  "$DP_OBJECT_BACKUP_KEY" "$DP_OBJECT_BACKUP_SECRET"
+mc mb --ignore-existing "dp-backup/${DP_OBJECT_BACKUP_BUCKET}"
+mc version enable "dp/${DP_S3_BUCKET}"
+mc version enable "dp-backup/${DP_OBJECT_BACKUP_BUCKET}"
+mc replicate add "dp/${DP_S3_BUCKET}" \
+  --remote-bucket "dp-backup/${DP_OBJECT_BACKUP_BUCKET}" \
+  --replicate 'existing-objects,delete,delete-marker' --priority 1 --sync
+```
+
+Do not treat `existing-objects` as a retrofit guarantee. This runbook certifies the procedure only
+when the replication rule is in place before the objects it protects are written. For an existing
+bucket, establish a provider-supported migration with its own evidence before relying on the
+replica.
+
+Consistency ordering for this profile: configure and continuously verify the replica → stop writers
+→ `pg_dump` → compare primary and replica version manifests (including the namespace marker) →
+workspace plugins. Resume writers only after the manifests match. The two manifest files are
+operator evidence; the replica holds the versioned bytes.
+
+The repository's executable drill uses the same digest-pinned MinIO and `mc` images as the Ray
+compose harness. It writes two versions of one key and a delete marker, proves a specific
+non-current version is readable from the replica, and proves that the former `mc cp` sequence loses
+history:
+
+```bash
+bash scripts/verify_versioned_object_backup.sh
+```
+
+It prints `VERSIONED_OBJECT_BACKUP_EVIDENCE` only after the exact version manifest matches, and
+`VERSIONED_OBJECT_BACKUP_CP_CONTROL=lost_history` only when the negative control has lost the
+historical version and delete-marker entries. Run it as release/operator evidence; it intentionally
+does not run in the ordinary CI matrix because it starts three disposable MinIO servers.
+
+MinIO's [mc cp reference](https://docs.min.io/community/minio-object-store/reference/minio-mc/mc-cp.html)
+documents the current-version limitation. Its [bucket replication reference](https://docs.min.io/community/minio-object-store/administration/bucket-replication.html)
+is the supported version/history mechanism. Use versions of MinIO and `mc` compatible with the
+release you operate; the drill's pinned versions are listed in its output.
 
 ### Restore (isolated clone — default)
 
@@ -190,8 +244,9 @@ createdb -U dp dataplay_restore   # or restore into an empty database owned by t
 pg_restore --clean --if-exists --no-owner --no-acl -d "$RESTORE_DATABASE_URL_LIBPQ" backup/dataplay.dump
 cp -a backup/version.json "$RESTORE/version.json"
 
-# Copy objects into a scratch prefix if you need file presence for local checks; the clone must
-# NOT claim the source namespace marker. Isolation creates a new claim under the replacement namespace.
+# Do not restore `backup/objects` with mc cp: that archive cannot preserve exact version IDs.
+# The exact generations remain on the already-verified replica. This isolated clone still must
+# NOT claim the source namespace marker; isolation creates a new claim under the replacement namespace.
 # Restore any built-in local `outputs/` tree at the same absolute mount path recorded by
 # `local_result_artifacts.storage_root`, and set DP_STORAGE_URL to its parent outputs directory;
 # a new Postgres database does not rewrite file URIs or local read-lease ownership.
@@ -210,6 +265,12 @@ PY
 export DP_STORAGE_NAMESPACE="<replacement>"
 # Start hub / migrate-at-head checks against the restore DB only.
 ```
+
+The replica preserves object bytes and version IDs for an audited recovery point, but it does **not**
+turn this isolated-clone procedure into disaster recovery. Data Playground currently rejects a clone
+that tries to claim the original namespace marker, so operating the replica as the original
+installation remains unsupported. Use `mc cp --version-id <id>` against the replica only for
+object-level verification or provider-level recovery until an audited takeover workflow exists.
 
 ## What restore is not
 
