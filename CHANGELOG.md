@@ -8,6 +8,12 @@ uses semver-shaped versions from `kernel/pyproject.toml` / `web/package.json`.
 Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 [researcher UX acceptance](docs/UX_ACCEPTANCE.md) results for its exact commit before publication.
 
+## [0.2.3] — 2026-07-22
+
+### Fixed
+
+- Durable Tasks rebind exact Workspace-provider inputs after worker reconstruction. (#757, #758)
+
 ## [0.2.2] — 2026-07-22
 
 ### Fixed

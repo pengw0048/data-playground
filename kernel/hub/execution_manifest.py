@@ -50,7 +50,7 @@ def core_package_version() -> str:
     try:
         return package_version("data-playground")
     except PackageNotFoundError:
-        return "0.2.2"
+        return "0.2.3"
 
 
 def assert_secret_free(
