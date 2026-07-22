@@ -55,7 +55,7 @@ def auth_enabled() -> bool:
 _WEAK_SECRETS = {"change-me-in-production", "changeme", "secret", "dev", "test"}
 
 # Declared deployment modes. ``local`` (default) keeps zero-config localhost HTTP; ``shared`` fails
-# closed unless Secure cookies and an explicit TLS/trusted-proxy transport declaration are present.
+# closed unless Secure cookies and a declared TLS-terminating reverse proxy are present.
 _DEPLOYMENT_MODES = frozenset({"local", "shared"})
 
 
@@ -83,11 +83,6 @@ def secure_cookie_enabled() -> bool:
     return bool(os.environ.get("DP_AUTH_SECURE_COOKIE"))
 
 
-def direct_tls_declared() -> bool:
-    """Operator declaration that TLS terminates at the hub process itself (not a reverse proxy)."""
-    return bool(os.environ.get("DP_AUTH_DIRECT_TLS"))
-
-
 def trusted_proxies() -> list[str]:
     """CIDRs/IPs whose X-Forwarded-* headers the hub may trust for client identity.
 
@@ -113,7 +108,7 @@ def reject_weak_secret() -> None:
 
 
 def reject_unsafe_transport() -> None:
-    """Fail closed when shared mode is missing secure-cookie / TLS / trusted-proxy expectations.
+    """Fail closed when shared mode is missing secure-cookie / trusted-proxy expectations.
 
     Called once at hub startup alongside :func:`reject_weak_secret` from ``hub.main`` and the
     ``dataplay`` CLI so a misconfigured shared deployment never binds a port.
@@ -127,17 +122,17 @@ def reject_unsafe_transport() -> None:
     if not secure_cookie_enabled():
         raise RuntimeError(
             "DP_DEPLOYMENT_MODE=shared refuses Secure-less session cookies. "
-            "Set DP_AUTH_SECURE_COOKIE=1 after terminating TLS at the hub or a reverse proxy.")
+            "Set DP_AUTH_SECURE_COOKIE=1 after terminating TLS at a reverse proxy.")
     proxies = trusted_proxies()
     if "*" in proxies:
         raise RuntimeError(
             "DP_TRUSTED_PROXIES=* trusts every peer and is not allowed in shared mode. "
             "List the proxy addresses or CIDRs that terminate TLS in front of the hub.")
-    if not direct_tls_declared() and not proxies:
+    if not proxies:
         raise RuntimeError(
-            "DP_DEPLOYMENT_MODE=shared requires an explicit transport declaration. "
-            "Set DP_AUTH_DIRECT_TLS=1 if TLS terminates at the hub process, "
-            "or DP_TRUSTED_PROXIES=<proxy-ip>[,...] if a reverse proxy forwards client addresses.")
+            "DP_DEPLOYMENT_MODE=shared requires a TLS-terminating reverse proxy. "
+            "Set DP_TRUSTED_PROXIES=<proxy-ip>[,...] to its actual addresses or CIDRs; "
+            "the hub itself does not terminate TLS.")
 
 
 def _mac(payload: str) -> str:

@@ -1,4 +1,4 @@
-"""Shared-mode transport guard: Secure cookies, direct TLS, and trusted proxies (SEC-04 / #108)."""
+"""Shared-mode transport guard: Secure cookies and trusted TLS proxies (SEC-04 / #108)."""
 
 from __future__ import annotations
 
@@ -17,6 +17,10 @@ from hub.routers import workspace
 
 def _kernel_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
+
+def _repo_root() -> str:
+    return os.path.dirname(_kernel_root())
 
 
 def _put_user(user_id: str, password: str) -> None:
@@ -63,7 +67,6 @@ def _set_cookie_header(response) -> str:
 def test_local_mode_is_default_and_allows_insecure_transport(monkeypatch):
     monkeypatch.delenv("DP_DEPLOYMENT_MODE", raising=False)
     monkeypatch.delenv("DP_AUTH_SECURE_COOKIE", raising=False)
-    monkeypatch.delenv("DP_AUTH_DIRECT_TLS", raising=False)
     monkeypatch.delenv("DP_TRUSTED_PROXIES", raising=False)
     monkeypatch.delenv("DP_AUTH_SECRET", raising=False)
 
@@ -76,20 +79,20 @@ def test_shared_mode_rejects_missing_secure_cookie(monkeypatch):
     monkeypatch.setenv("DP_DEPLOYMENT_MODE", "shared")
     monkeypatch.setenv("DP_AUTH_SECRET", "shared-mode-transport-test-secret-0123456789")
     monkeypatch.delenv("DP_AUTH_SECURE_COOKIE", raising=False)
-    monkeypatch.setenv("DP_AUTH_DIRECT_TLS", "1")
+    monkeypatch.setenv("DP_TRUSTED_PROXIES", "10.0.0.1")
 
     with pytest.raises(RuntimeError, match="DP_AUTH_SECURE_COOKIE=1"):
         auth.reject_unsafe_transport()
 
 
-def test_shared_mode_rejects_missing_transport_declaration(monkeypatch):
+def test_shared_mode_rejects_missing_proxy_even_if_direct_tls_is_declared(monkeypatch):
     monkeypatch.setenv("DP_DEPLOYMENT_MODE", "shared")
     monkeypatch.setenv("DP_AUTH_SECRET", "shared-mode-transport-test-secret-0123456789")
     monkeypatch.setenv("DP_AUTH_SECURE_COOKIE", "1")
-    monkeypatch.delenv("DP_AUTH_DIRECT_TLS", raising=False)
+    monkeypatch.setenv("DP_AUTH_DIRECT_TLS", "1")
     monkeypatch.delenv("DP_TRUSTED_PROXIES", raising=False)
 
-    with pytest.raises(RuntimeError, match="DP_AUTH_DIRECT_TLS=1"):
+    with pytest.raises(RuntimeError, match="DP_TRUSTED_PROXIES=<proxy-ip>"):
         auth.reject_unsafe_transport()
 
 
@@ -98,22 +101,16 @@ def test_shared_mode_rejects_wildcard_trusted_proxies(monkeypatch):
     monkeypatch.setenv("DP_AUTH_SECRET", "shared-mode-transport-test-secret-0123456789")
     monkeypatch.setenv("DP_AUTH_SECURE_COOKIE", "1")
     monkeypatch.setenv("DP_TRUSTED_PROXIES", "*")
-    monkeypatch.delenv("DP_AUTH_DIRECT_TLS", raising=False)
 
     with pytest.raises(RuntimeError, match=r"DP_TRUSTED_PROXIES=\*"):
         auth.reject_unsafe_transport()
 
 
-def test_shared_mode_accepts_direct_tls_or_trusted_proxies(monkeypatch):
+def test_shared_mode_accepts_a_declared_tls_terminating_proxy(monkeypatch):
     monkeypatch.setenv("DP_DEPLOYMENT_MODE", "shared")
     monkeypatch.setenv("DP_AUTH_SECRET", "shared-mode-transport-test-secret-0123456789")
     monkeypatch.setenv("DP_AUTH_SECURE_COOKIE", "1")
 
-    monkeypatch.setenv("DP_AUTH_DIRECT_TLS", "1")
-    monkeypatch.delenv("DP_TRUSTED_PROXIES", raising=False)
-    auth.reject_unsafe_transport()
-
-    monkeypatch.delenv("DP_AUTH_DIRECT_TLS", raising=False)
     monkeypatch.setenv("DP_TRUSTED_PROXIES", "10.0.0.1")
     auth.reject_unsafe_transport()
 
@@ -123,7 +120,7 @@ def test_hub_startup_refuses_shared_mode_without_secure_cookie(tmp_path):
     env = dict(os.environ)
     env["DP_DEPLOYMENT_MODE"] = "shared"
     env["DP_AUTH_SECRET"] = "shared-mode-transport-test-secret-0123456789"
-    env["DP_AUTH_DIRECT_TLS"] = "1"
+    env["DP_TRUSTED_PROXIES"] = "10.0.0.1"
     env.pop("DP_AUTH_SECURE_COOKIE", None)
     env["DP_WORKSPACE"] = str(tmp_path)
     env["DP_DATABASE_URL"] = "sqlite:///" + str(tmp_path / "refuse.db")
@@ -144,7 +141,7 @@ def test_cli_refuses_shared_mode_before_binding(tmp_path):
     env = dict(os.environ)
     env["DP_DEPLOYMENT_MODE"] = "shared"
     env["DP_AUTH_SECRET"] = "shared-mode-transport-test-secret-0123456789"
-    env["DP_AUTH_DIRECT_TLS"] = "1"
+    env["DP_TRUSTED_PROXIES"] = "10.0.0.1"
     env.pop("DP_AUTH_SECURE_COOKIE", None)
     env.pop("DP_DATABASE_URL", None)
     result = subprocess.run(
@@ -192,11 +189,11 @@ def test_local_mode_login_cookie_has_no_secure_flag(monkeypatch):
     assert "secure" not in set_cookie.lower()
 
 
-def test_shared_direct_tls_issues_secure_cookie_on_login_and_password_change(monkeypatch):
+def test_shared_proxy_issues_secure_cookie_on_login_and_password_change(monkeypatch):
     monkeypatch.setenv("DP_DEPLOYMENT_MODE", "shared")
-    monkeypatch.setenv("DP_AUTH_SECRET", "shared-direct-tls-cookie-secret-0123456789")
+    monkeypatch.setenv("DP_AUTH_SECRET", "shared-proxy-cookie-secret-0123456789")
     monkeypatch.setenv("DP_AUTH_SECURE_COOKIE", "1")
-    monkeypatch.setenv("DP_AUTH_DIRECT_TLS", "1")
+    monkeypatch.setenv("DP_TRUSTED_PROXIES", "10.0.0.1")
     uid = "shared_secure_cookie"
     _put_user(uid, "password1")
     monkeypatch.setattr(auth_admission, "login_peer_attempts", _limiter())
@@ -221,6 +218,18 @@ def test_shared_direct_tls_issues_secure_cookie_on_login_and_password_change(mon
         )
         assert rotated.status_code == 200
         assert "Secure" in _set_cookie_header(rotated)
+
+
+def test_compose_reference_is_authenticated_local_http():
+    """Keep the checked-in reference runnable at its loopback HTTP URL."""
+    compose = open(os.path.join(_repo_root(), "docker-compose.yml"), encoding="utf-8").read()
+    kernel = compose.split("\n  kernel:\n", 1)[1].split("\n  postgres:\n", 1)[0]
+
+    assert '"127.0.0.1:8471:8471"' in kernel
+    assert "DP_AUTH_SECRET:" in kernel
+    assert "DP_DEPLOYMENT_MODE:" not in kernel
+    assert "DP_AUTH_SECURE_COOKIE:" not in kernel
+    assert "DP_AUTH_DIRECT_TLS:" not in kernel
 
 
 def test_trusted_proxy_headers_affect_login_rate_limit_only_from_declared_peer(monkeypatch):

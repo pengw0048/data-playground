@@ -98,6 +98,15 @@ database path. A non-empty database without a recognized Alembic revision is rej
 guessed or auto-stamped; recover it from a versioned backup (see
 [BACKUP_RESTORE.md](../docs/BACKUP_RESTORE.md)) or do an explicit, audited conversion.
 
+## Shared-service transport
+
+Neither this PodSpawner reference nor the root Compose file provides TLS ingress. The root Compose
+file is an authenticated local HTTP smoke setup bound to `127.0.0.1`; it is not a template for a
+shared service. When adapting this deployment for a trusted team, terminate TLS in a real reverse
+proxy, set `DP_DEPLOYMENT_MODE=shared` and `DP_AUTH_SECURE_COOKIE=1`, and set
+`DP_TRUSTED_PROXIES` to that proxy's actual immediate IP addresses or CIDRs. Do not use `*` or rely on
+the hub to terminate TLS.
+
 ## What the pieces are
 
 `k8s/pod-substrate.yaml` defines the Namespace, Postgres (shared metadata DB), RBAC so the hub
