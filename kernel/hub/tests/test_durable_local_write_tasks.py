@@ -18,11 +18,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from sqlalchemy import func, select
 
-from hub import durable_tasks, local_run_inputs, metadb
+from hub import durable_tasks, local_run_inputs, metadb, workspace_providers
 from hub.deps import Deps
 from hub.local_run_inputs import LOCAL_FILE_INPUT_PROVIDER
 from hub.local_writes import write_managed_local_file
 from hub.models import Graph, RunOutput, RunStatus
+from hub.plugins.adapters import DuckDBAdapter
 from hub.routers import runs
 from hub.routers.runs import (
     _inject_write_intent, _local_run_intent_sha256, _resolve_local_run_manifest,
@@ -325,6 +326,111 @@ def test_restarted_worker_reads_snapshot_after_source_mutation(tmp_path, monkeyp
     source_config = task["graph_doc"]["nodes"][0]["data"]["config"]
     assert "uri" not in source_config and "_inputArtifactUri" not in source_config
     restarted.storage.close()
+
+
+def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_advance(
+        tmp_path, monkeypatch):
+    deps, graph, source, uid = _ordinary_task_context(tmp_path)
+    advanced = source.with_name("provider-head-v2.parquet")
+    _write_ordinary_source(advanced, [99])
+    binding = metadb.workspace_provider_cache_resource(
+        mount_id=f"test-mount-{uuid.uuid4().hex}", provider="test-provider",
+        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID, resource_id="provider-dataset",
+        kind="dataset", name="Provider dataset")
+    logical_uri = workspace_providers.provider_dataset_uri(binding["bindingId"])
+    physical_uri = "test-provider://provider-dataset"
+
+    class ExactProviderAdapter:
+        name = "test-provider-exact"
+
+        def __init__(self):
+            self.head = "v1"
+            self.opened: list[str] = []
+
+        def revision_history(self, _uri, *, limit, cursor=None):
+            del limit, cursor
+            return [], None
+
+        def resolve_revision(self, _uri, *, as_of=None):
+            del as_of
+            return {"revision_id": self.head}
+
+        def scan(self, _uri, **_kwargs):
+            return DuckDBAdapter().scan(str(source))
+
+        def open_revision(self, _uri, revision_id):
+            self.opened.append(revision_id)
+            return DuckDBAdapter().scan({"v1": str(source), "v2": str(advanced)}[revision_id])
+
+        def revision_detail(self, _uri, revision_id, *, preview_limit):
+            relation = self.open_revision(_uri, revision_id)
+            return {
+                "revision_id": revision_id,
+                "columns": [{"name": "value", "type": "int"}],
+                "preview_table": relation.limit(preview_limit).arrow(),
+                "row_count": 2 if revision_id == "v1" else 1,
+            }
+
+    exact_adapter = ExactProviderAdapter()
+    bound_adapter = workspace_providers._BoundProviderDatasetAdapter(
+        logical_uri, physical_uri, exact_adapter)
+    original_resolve = deps.resolve_adapter
+
+    def resolve_adapter(uri):
+        if uri == logical_uri:
+            return bound_adapter
+        if uri == physical_uri:
+            return exact_adapter
+        return original_resolve(uri)
+
+    monkeypatch.setattr(deps, "resolve_adapter", resolve_adapter)
+    source_config = graph.nodes[0].data["config"]
+    source_config["uri"] = logical_uri
+    source_config["datasetRef"] = {
+        "kind": "exact", "datasetId": f"workspace-provider:{binding['bindingId']}",
+        "revisionId": "v1",
+    }
+    source_config["providerReadMode"] = "exact"
+
+    status, _dispatched = _start_without_dispatch(
+        deps, graph, uid, str(uuid.uuid4()), monkeypatch)
+    task = metadb.durable_task(status.run_id)
+    assert task is not None
+    canonical_source = task["graph_doc"]["nodes"][0]["data"]["config"]
+    assert canonical_source["datasetRef"] == source_config["datasetRef"]
+    assert "uri" not in canonical_source
+    assert physical_uri not in json.dumps(task, default=str)
+
+    exact_adapter.head = "v2"
+    durable_tasks._worker(status.run_id, deps)
+
+    completed = metadb.durable_task(status.run_id)
+    assert completed is not None and completed["status"] == "done", completed["status_doc"].get("error")
+    receipt = completed["output_receipt"]
+    assert receipt is not None
+    assert pq.read_table(receipt["publication"]["artifactUri"])["value"].to_pylist() == [1, 2]
+    assert exact_adapter.opened and set(exact_adapter.opened) == {"v1"}
+    deps.storage.close()
+
+
+def test_canonical_workspace_provider_dataset_ref_rejects_malformed_binding_id():
+    graph = Graph.model_validate({
+        "id": "malformed-workspace-provider-binding", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "data": {"config": {
+            "datasetRef": {
+                "kind": "exact", "datasetId": "workspace-provider:not-a-binding",
+                "revisionId": "v1",
+            },
+        }}}], "edges": [],
+    })
+    manifest = [{
+        "node_id": "source", "dataset_id": "workspace-provider:not-a-binding",
+        "revision_id": "v1", "provider": "test-provider-exact",
+        "resolved_at": "2026-07-22T00:00:00+00:00",
+    }]
+
+    with pytest.raises(local_run_inputs.LocalRunInputError, match="does not match the graph"):
+        local_run_inputs.bind_manifest(graph, "source", manifest, lambda _uri: None)
 
 
 def test_task_admission_rollback_leaves_no_task_mapping_or_reference(tmp_path, monkeypatch):
