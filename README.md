@@ -3,25 +3,15 @@
 [![CI](https://github.com/pengw0048/data-playground/actions/workflows/ci.yml/badge.svg)](https://github.com/pengw0048/data-playground/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-**Build data pipelines as typed graphs, and inspect real data as you go.**
+Data Playground is a local-first workspace for ML researchers and data scientists who need to inspect, transform, and publish data without losing track of what ran on which input.
 
-Data Playground is a local-first visual workbench for data. Connect sources and operations on a
-canvas, inspect rows and schemas throughout the graph, then run the same graph over the full
-dataset or from the command line.
+Use a visual Canvas to connect typed data operations, inspect the data that can be represented truthfully at each step, and run the same work over a full dataset. Workspaces keep the resulting datasets, revisions, runs, and outputs together.
 
-The default setup needs no cloud account, hosted service, or model. Point it at Parquet, CSV, JSON,
-Arrow/Feather, Lance, or a directory of files and start working with real data.
+![A seeded Canvas named Purchases per user, with events flowing through filter, aggregate, sort, and Write cards.](docs/screenshot.jpg)
 
-![Data Playground showing an events source connected to a filter, with the filtered rows open beside the node.](docs/screenshot.png)
+## Start locally
 
-> [!NOTE]
-> Data Playground is pre-1.0 and built for a single user or a trusted team. It is not a hardened
-> multi-tenant service. This README describes capabilities available on `main`, not unmerged work.
-
-## Quick start
-
-You need [uv](https://docs.astral.sh/uv/) and [Node.js 20+](https://nodejs.org/). `uv` installs the
-pinned Python version and Python dependencies.
+Install [uv](https://docs.astral.sh/uv/) and [Node.js 20+](https://nodejs.org/), then run:
 
 ```bash
 git clone https://github.com/pengw0048/data-playground.git
@@ -30,288 +20,69 @@ make setup
 make run
 ```
 
-Open <http://127.0.0.1:8471>, then choose **New from example** for a runnable starter canvas or follow
-the [5-minute tour](docs/TUTORIAL.md).
+Open <http://127.0.0.1:8471>. The first run creates a local workspace and seeds `events.parquet`, `movies.csv`, and `images.parquet`; no cloud account or separate service is required.
 
-`make setup` is a one-time step. To launch a different workspace later:
+## Follow one researcher loop
 
-```bash
-cd kernel
-uv run dataplay --workspace /path/to/workspace
-```
+The seeded **Purchases per user** example is a complete first pass through the product:
 
-A workspace contains canvases, metadata, outputs, and drop-in plugins. Its `data/` directory is scanned
-automatically; other allowed paths can be registered from **Workspace**.
+1. **Find the input.** In **Workspace**, open `events` and inspect the dataset. Sources identify the input they use; adapters that expose immutable versions can also expose revision history.
+2. **Make the work visible.** Choose **Open example Purchases per user**. Its Canvas connects `events` through a filter, aggregate, and sort to a **Write** card.
+3. **Inspect before committing.** Preview a source or intermediate step to inspect rows and schema. A preview is bounded only when the operation can still be represented honestly; full-pass operations say so instead of presenting a misleading sample.
+4. **Publish a result.** The example writes `top_users` to **Workspace outputs**. Press **Rerun all** to execute the full graph. A successful managed write records its output and, where the destination supports it, a published dataset revision and receipt.
+5. **Let work finish in the background.** Use **Jobs**, Canvas run history, and **Inbox** to follow durable work and terminal outcomes rather than keeping the Canvas open.
+6. **Reuse the evidence.** Reopen the Canvas, an admitted run input, or a published revision when you want to inspect, extend, or rerun the work.
 
-### Run a saved canvas headlessly
+For the click-by-click version, see the [5-minute tour](docs/TUTORIAL.md). For the data and execution model behind this loop, see [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md).
 
-The graph built in the browser is also a command-line pipeline:
+## What this gives you
 
-```bash
-cd kernel
-uv run dataplay run <canvas-id-or-name> --workspace /path/to/workspace
-uv run dataplay run <canvas-id-or-name> --workspace /path/to/workspace \
-  --param date=2026-07-13 --json
-```
+- **One workspace for data work.** Browse datasets, canvases, folders, and outputs in one place, with catalog search and lineage where the connected provider can supply them.
+- **A typed, inspectable Canvas.** Build filters, joins, aggregates, SQL and Python transforms, validation checks, and writes with validated connections and saved graph state.
+- **Previews that state their limits.** Sampling is useful only when it preserves the operation's meaning. Data Playground distinguishes that from work that needs a full pass.
+- **Evidence for a run.** Runs record their inputs and outcomes; managed writes can publish receipts and dataset revisions. A newer catalog head does not rewrite the identity of a completed run.
+- **Background execution you can return to.** Jobs, Canvas run history, and Inbox retain progress and terminal outcomes across ordinary UI navigation and service recovery.
 
-When pointed at the same workspace, `dataplay run` shares its canvases, metadata, and engine with the
-web app. It exits non-zero on failure, supports repeatable `${NAME}` parameters, and can target one node
-with `--node`. This makes a canvas usable from cron, CI, or an external orchestrator without converting
-it into a second pipeline definition.
+## Extend without coupling the core to your stack
 
-## What it does
+Data Playground's extension boundary is a Python plugin package. Plugins can add typed Canvas nodes, data adapters, catalog/search providers, destinations, execution backends, importers, viewers, and telemetry. The core stays useful with local files and embedded metadata; an integration owns the capabilities it adds and reports unsupported operations explicitly.
 
-| Area | Current capability |
-| --- | --- |
-| **Build** | Typed ports and validated connections on a React Flow canvas; autosave, versions, undo/redo, sections, sharing, and Yjs live collaboration |
-| **Inspect** | Bounded real-row previews, schemas, profiles, media cells, charts, scope-labeled page/sample exports, native full-result streaming, and per-node errors; operations that cannot be sampled truthfully request a full pass |
-| **Transform** | Relational filtering, projection, joins, unions, pivots, aggregates, sorting, deduplication, windows, null filling, unnesting, SQL, and Python transforms fed from Arrow batches in row, pandas, or PyArrow modes |
-| **Validate** | Schema-aware column warnings, row-level assertions that expose violating rows, and named/versioned schema contracts that can fail a run on drift |
-| **Publish** | The default managed-local destination creates or replaces file outputs and appends to managed Lance datasets; successful managed writes publish a revision with catalog and lineage evidence |
-| **Discover** | Server-paginated catalog browse, folders, facets, lexical search, optional semantic search, keys, join suggestions, relationships, and bounded lineage |
-| **Execute** | Local DuckDB execution that streams and spills relational work, warm per-canvas kernels, progress, cancellation, persisted run history, and headless runs |
-| **Extend** | Public Python ports for nodes, datasets, catalogs, search, destinations, importers, viewers, telemetry, kernel substrates, and execution backends |
+Start with [plugin onboarding](docs/PLUGIN_ONBOARDING.md) and the tested packages in [`examples/plugins/`](examples/plugins/). This is also the boundary for a team to connect its own catalog, scheduler, or compute system without adding provider-specific branches to the open-source core.
 
-Preview and full execution intentionally share the same node-building path. A preview bounds source
-reads only when that preserves the operation's meaning; a write, global aggregate, or other full-pass
-operation says so instead of returning a misleading sample.
+## Support boundary
 
-Publication is capability-specific: a different destination, dataset adapter, or execution backend may
-support fewer write modes. Do not infer provider-native write-back from the fact that a source can be
-browsed or run through a canvas.
+Data Playground's supported baseline is a local workstation or a trusted shared team service. It is not a hostile multi-tenant isolation boundary: operators, installed plugins, workers, and people allowed to run arbitrary Python are trusted within a workspace. Optional distributed backends have their own documented support matrices.
 
-## How it works
-
-```mermaid
-flowchart LR
-  UI["Browser canvas"] -->|"HTTP + WebSocket"| HUB["Hub<br/>FastAPI"]
-  MCP["HTTP MCP client"] --> HUB
-  HUB --> DB[("Metadata<br/>SQLite or Postgres")]
-  HUB --> K["Per-canvas kernel"]
-  K --> ENG["DuckDB + Arrow engine"]
-  ENG <--> DATA[("Local or object storage")]
-  K --> EXT["Execution backend<br/>plugin"]
-  EXT <--> DATA
-```
-
-- The **browser** renders built-in and plugin nodes from the same node schemas exposed by the API.
-- The **hub** serves the SPA, REST API, WebSockets, and MCP endpoint; it authenticates requests,
-  persists workspace state, and compiles graphs.
-- A warm **kernel** per canvas owns execution. A detached local kernel can outlive a hub-process
-  restart on the same host. The default engine builds lazy DuckDB relations; custom Python is fed from
-  Arrow batches and can operate in row, pandas, or PyArrow mode.
-- Durable state lives in the **metadata database** and **storage**. SQLite and the local filesystem are
-  the zero-configuration defaults; Postgres and object storage support shared deployments.
-- Collaboration rooms are process-local, so a multi-instance deployment must route one canvas's
-  WebSocket peers to the same hub instance. Authenticated sockets reuse their admitted session and
-  canvas role for at most five seconds; the next active sender or recipient boundary revalidates and
-  fails closed, bounding session revocation and role-downgrade visibility without per-frame DB reads.
-
-Headless runs and stdio MCP initialize the same graph and execution core directly rather than calling
-the HTTP hub.
-
-The architecture and execution details are documented in [`kernel/README.md`](kernel/README.md).
-
-## Extend and integrate
-
-A plugin is a Python package with a `register(reg)` entry point. Drop one into
-`<workspace>/plugins/`, install a package exposing a `dataplay.plugins` entry point, or load a module
-with `DP_PLUGINS`.
-
-| Port | Use it to connect |
-| --- | --- |
-| `NodeSpec` + `NodeBuilder` | A typed operation rendered by the existing frontend |
-| `DatasetAdapter` | A file format, table format, warehouse, or data service |
-| `CatalogProvider` | A replacement for the one application-wide catalog, including its supported write-back, curation, and lineage behavior |
-| `ReadOnlyCatalogProvider` mount | One or more bounded external sources in Workspace browse; the mount cannot modify its source catalog |
-| `ExecutionBackend` / `PlaceableBackend` | A queue, scheduler, cluster, or other compute plane |
-| `KernelSpawner` | Another per-canvas runtime substrate, such as Kubernetes Pods |
-| Registry hooks | Destinations, pipeline importers, embedders, viewers, processors, managed-object providers, and telemetry sinks |
-
-These ports are also the intended boundary for external services: keep catalog/search, scheduling, and
-compute-specific clients in optional adapter packages while the open-source core remains offline-first
-and provider-agnostic. Identity and policy integrations should extend generic contracts instead of adding
-provider-specific branches to core. A typed plugin node is rendered and wired without custom frontend
-code. A read-only Workspace mount leaves managed-local publication in core; use the global
-`CatalogProvider` boundary only when a package is prepared to replace the application catalog and own
-its enabled write-back contract.
-
-Start with the [plugin guide](docs/PLUGINS.md) and the tested reference packages in
-[`examples/plugins/`](examples/plugins/).
-
-## Agents and automation
-
-Data Playground does not require an LLM. Two optional paths operate on the same canvases and execution
-engine:
-
-- **MCP:** connect Claude Code or another MCP client to list data, build and validate graphs, preview
-  steps, start runs, and read results. HTTP MCP updates an open local canvas live; authenticated
-  deployments currently use the stdio transport. See [docs/MCP.md](docs/MCP.md).
-- **Built-in agent:** configure a supported model to let the in-app agent inspect the catalog, edit a
-  graph, write transforms, and preview its work.
-
-With the local app running, an MCP client can connect over HTTP:
-
-```bash
-claude mcp add --transport http dataplay http://127.0.0.1:8471/mcp
-```
-
-> [!IMPORTANT]
-> Agent tools expose catalog metadata and real preview rows. Treat either the built-in agent or an MCP
-> client backed by a hosted model as data egress; use a provider and policy appropriate for the data,
-> or keep those integrations disabled.
-
-## Project status and support boundary
-
-The canonical deployment and trust model is in [docs/SUPPORT.md](docs/SUPPORT.md). In short:
-
-| Deployment profile | Status |
-| --- | --- |
-| **Local, single user or fully trusted collaborators** | Primary path; runs offline with SQLite and local storage |
-| **Trusted-team shared service** | Supported application profile with shared-mode auth/transport checks, Postgres, durable storage, and documented topology; operators still own TLS, secrets, IAM, backups, network policy, quotas, and deployment validation |
-| **Ray execution** | `dp_ray` is tested for the exact shapes in [docs/RAY.md](docs/RAY.md). Whole-graph Ray Jobs persists its binding, reattaches after a hub restart, and publishes terminal state/history with idempotently keyed catalog effects; the multi-region parent remains process-local, and Compose/KubeRay files are validation harnesses rather than production manifests |
-| **Mutually distrusting tenants** | Not supported |
-
-Operators, administrators, installed plugins, per-canvas dependencies, execution workers, and anyone
-allowed to run arbitrary Python or section code are trusted within a workspace. That code executes with
-the kernel or worker's process permissions. `DP_DATASET_ROOTS` constrains supported file access, and user
-SQL has a fail-closed policy, but neither turns arbitrary Python into a security boundary. A kernel also
-holds the data and metadata credentials needed to execute its canvas.
-
-Canvas sharing is not dataset isolation: the catalog and data engine are workspace-wide. Agent and
-object-store credentials are first-class Cred entities; plugin `[[config]]` fields marked `secret` remain
-plugin settings. Both store a **secret reference** — `env:VAR_NAME` or `file:/path/to/secret` — never the
-secret itself. The hub resolves references only in the process that needs the capability (agent call,
-object-store client, plugin registration). A pluggable `SecretResolver` seam (`hub.secrets` /
-`reg.add_secret_resolver`) lets a plugin add schemes such as Vault without importing a vendor client into
-core.
-
-> [!WARNING]
-> The metadata schema was reset to one baseline before the first public release. Databases created
-> by earlier commits are intentionally unsupported: stop every process, preserve any input data or
-> plugins you need, and start with a new workspace/SQLite database or an empty PostgreSQL schema.
-> `dataplay migrate` creates the current schema; it does not convert a pre-reset database.
-
-Create Agent and object-store Creds under **Settings → Credentials**, then select the Agent Cred, the
-default object-store Cred, or a destination-specific Cred. The API exposes the same model at
-`/api/creds`; bindings remain ordinary non-secret settings (`agentCredId`,
-`defaultObjectStoreCredId`, and `destinations[].credId`). Cred and plugin secret fields accept references
-such as:
-
-```text
-Agent Cred.apiKey                    = env:ANTHROPIC_API_KEY
-Object-store Cred.accessKeyId        = env:AWS_ACCESS_KEY_ID
-Object-store Cred.secretAccessKey    = env:AWS_SECRET_ACCESS_KEY
-Object-store Cred.sessionToken       = env:AWS_SESSION_TOKEN   # optional
-plugin.<pack>.<secret-field>         = file:/run/secrets/pack_token
-```
-
-Leave the Agent selection or object-store Cred fields blank to use the configured provider environment
-or ambient SDK / instance-role chain. Metadata backups contain Cred connection metadata and references,
-not resolved credential values.
-
-Run only trusted canvases and plugins. See the [support boundary](docs/SUPPORT.md) for the exact trust
-model and the [security policy](.github/SECURITY.md) for private vulnerability reporting.
-
-### Docker reference setup
-
-The Compose file is an authenticated, Postgres-backed **local HTTP** reference. It binds only
-`127.0.0.1:8471`, deliberately separates the release migration from application startup, and leaves
-the session cookie non-`Secure` so a browser can sign in over that local connection. Export every
-required secret first — Compose fails closed if `DP_AUTH_SECRET` or `DP_POSTGRES_PASSWORD` is unset:
-
-```bash
-export DP_AUTH_SECRET="$(openssl rand -hex 32)"
-export DP_POSTGRES_PASSWORD="$(openssl rand -hex 32)"
-export DP_AUTH_PASSWORD="choose-an-initial-password"
-
-docker compose build
-docker compose up -d postgres
-docker compose run --rm migrate
-unset DP_AUTH_PASSWORD
-docker compose up -d kernel
-```
-
-Sign in at http://127.0.0.1:8471 as `local` with the bootstrap password. Keep `DP_AUTH_SECRET` and
-`DP_POSTGRES_PASSWORD` stable across restarts. Before a later migration, stop every process that
-writes the metadata database. This Compose file is not a shared-service manifest: do not publish its
-HTTP port. The [Kubernetes reference](deploy/README.md) documents the release contract, the
-PodSpawner validation path, and what must be adapted for a real deployment.
-
-### Deployment modes
-
-`DP_DEPLOYMENT_MODE` selects how strict the hub is about transport settings:
-
-| Mode | When to use | Startup behavior |
-| --- | --- | --- |
-| `local` (default) | Laptop / zero-config HTTP on loopback | Unchanged: plain HTTP works; `dp_session` stays `HttpOnly` + `SameSite=Lax` without `Secure` unless you opt in |
-| `shared` | Multi-user service behind a TLS reverse proxy | Fails before binding if auth, Secure cookies, or the proxy allow-list is missing |
-
-Shared mode requires all of:
-
-1. `DP_AUTH_SECRET` — signed session cookies (already required by Compose)
-2. `DP_AUTH_SECURE_COOKIE=1` — browsers will only send `dp_session` over HTTPS
-3. `DP_TRUSTED_PROXIES=<proxy-ip-or-cidr>[,...]` — the actual immediate TLS-terminating reverse
-   proxies; only those peers may supply `X-Forwarded-For` / `X-Forwarded-Proto` used for login rate
-   limiting
-
-The hub does not terminate TLS itself. The checked-in Compose reference intentionally keeps the
-`local` default for its loopback HTTP URL; adapt it with a real TLS reverse proxy, Secure cookies, and
-the proxy's precise addresses or CIDRs before serving a team.
+Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying beyond a local workspace. Report vulnerabilities through the [security policy](.github/SECURITY.md).
 
 ## Documentation
 
-| Guide | Use it for |
-| --- | --- |
-| [5-minute tour](docs/TUTORIAL.md) | Build and run a first pipeline on the seeded data |
-| [Browser and viewport support](docs/BROWSER_SUPPORT.md) | Desktop-first scope, minimum viewport, tested browsers, and input model |
-| [Catalog](docs/CATALOG.md) | Browse, search, curate, and integrate catalog and lineage data |
-| [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md) | Delivered revision/write/task foundations, their current limits, and the roadmap for sparse enrichment and durable data processing |
-| [Project acceptance and roadmap](docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md) | Public scope, deployment profiles, release evidence, and generic extension boundaries |
-| [HTTP API contract](docs/API.md) | OpenAPI snapshot, drift check, and stable error envelope |
-| [Plugins](docs/PLUGINS.md) | Add nodes or connect another data, catalog, destination, or execution system |
-| [MCP](docs/MCP.md) | Connect an external agent over HTTP or stdio |
-| [Supported deployments and trust model](docs/SUPPORT.md) | Supported profiles, trusted components, application guarantees, and operator responsibilities |
-| [Ray](docs/RAY.md) | Exact distributed support matrix, validation evidence, and production gates |
-| [CI and release gates](docs/CI.md) | Fast PR checks, scheduled acceptance, and the release-blocking contract |
-| [Kubernetes reference](deploy/README.md) | Validate and adapt the per-canvas Pod substrate |
-| [Contributing](.github/CONTRIBUTING.md) | Development loop, tests, and plugin contribution guidelines |
-| [Security policy](.github/SECURITY.md) | Vulnerability scope and private reporting |
+### Use
 
-The workbench is desktop-first (minimum **1280×720**, Chromium tested in CI, keyboard + mouse). See
-[browser and viewport support](docs/BROWSER_SUPPORT.md) for the full statement.
+- [5-minute tour](docs/TUTORIAL.md)
+- [Catalog and discovery](docs/CATALOG.md)
+- [Versioned data and durable execution](docs/VERSIONED_DATA_AND_DURABLE_EXECUTION.md)
+- [Browser and viewport support](docs/BROWSER_SUPPORT.md)
+- [MCP integration](docs/MCP.md)
 
-## Development
+### Extend
 
-Run the backend and Vite development server in separate terminals:
+- [Plugin onboarding](docs/PLUGIN_ONBOARDING.md)
+- [Plugin examples](examples/plugins/)
+- [HTTP API contract](docs/API.md)
+- [Kernel and API architecture](kernel/README.md)
 
-```bash
-make dev-kernel   # API on :8471
-make dev-web      # app on :5173, proxying the API
-```
+### Operate
 
-Run the relevant checks before opening a pull request:
+- [Support and deployment boundary](docs/SUPPORT.md)
+- [Backup and restore](docs/BACKUP_RESTORE.md)
+- [CI and test matrix](docs/CI.md)
+- [Observability](docs/OBSERVABILITY.md)
+- [UX acceptance](docs/UX_ACCEPTANCE.md)
+- [Project acceptance and roadmap](docs/PROJECT_ACCEPTANCE_AND_ROADMAP.md)
+- [Ray backend](docs/RAY.md) and [Ray Jobs](docs/RAY_JOBS.md)
+- [Deployment reference](deploy/README.md)
 
-```bash
-make test
-(cd web && npm test && npm run build)
-make e2e-install  # one-time browser install
-make e2e
-```
+## Contribute
 
-Required PR CI also owns the PostgreSQL migration contract and researcher-workflow browser smoke. The
-same lean CI and security gates validate the integrated `main` tree. Ray and Ray Jobs acceptance also
-run on PRs that change their explicitly owned execution or lifecycle paths; full UX, artifacts, and all
-heavy gates run on their scheduled, on-demand, or release policies. None run unconditionally after
-every merge. See [CI and release gates](docs/CI.md) and
-[CONTRIBUTING.md](.github/CONTRIBUTING.md) for the exact contracts and clean-environment commands.
-
-## Contributing
-
-Bug reports, plugin ideas, and focused pull requests are welcome. Keep the core offline-first and put
-provider-specific behavior behind a plugin port. Report security issues privately through the process
-in [SECURITY.md](.github/SECURITY.md).
-
-## License
-
-[Apache License 2.0](LICENSE)
+See [CONTRIBUTING.md](.github/CONTRIBUTING.md). The project is licensed under [Apache 2.0](LICENSE).
