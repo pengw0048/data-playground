@@ -117,6 +117,45 @@ def test_lean_validation_runs_on_pull_requests_and_main() -> None:
         assert events["push"]["branches"] == ["main"]
 
 
+def test_release_reuses_core_checks_at_the_candidate_revision() -> None:
+    expected = {
+        "core-ci": "./.github/workflows/ci.yml",
+        "codeql": "./.github/workflows/codeql.yml",
+        "secret-scan": "./.github/workflows/secret-scan.yml",
+    }
+    for name in ("ci.yml", "codeql.yml", "secret-scan.yml"):
+        workflow_call = _workflow(name)["on"]["workflow_call"]
+        assert workflow_call["inputs"]["expected_sha"] == {
+            "description": {
+                "ci.yml": "Immutable candidate commit to check out for a release gate.",
+                "codeql.yml": "Immutable candidate commit to analyze for a release gate.",
+                "secret-scan.yml": "Immutable candidate commit to scan for a release gate.",
+            }[name],
+            "required": True,
+            "type": "string",
+        }
+
+    jobs = _workflow("release.yml")["jobs"]
+    assert jobs["release-identity"]["outputs"] == {
+        "sha": "${{ steps.commit.outputs.sha }}"
+    }
+    identity_checkout = jobs["release-identity"]["steps"][0]
+    assert identity_checkout["with"]["ref"] == "${{ github.sha }}"
+    for job, called_workflow in expected.items():
+        assert jobs[job]["uses"] == called_workflow
+        assert jobs[job]["needs"] == "release-identity"
+        assert jobs[job]["with"] == {
+            "expected_sha": "${{ needs.release-identity.outputs.sha }}"
+        }
+
+    for name in ("ci.yml", "codeql.yml", "secret-scan.yml"):
+        workflow_jobs = _workflow(name)["jobs"].values()
+        for job in workflow_jobs:
+            for step in job.get("steps", []):
+                if step.get("uses", "").startswith("actions/checkout@"):
+                    assert step["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
+
+
 def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     commands = [step.get("run", "") for step in jobs["e2e"]["steps"]]
@@ -182,7 +221,7 @@ def test_ray_path_ownership_routes_representative_changes() -> None:
         assert not _is_owned(docs_only, jobs)
 
 
-def test_release_publish_waits_for_every_heavy_acceptance_gate() -> None:
+def test_release_publish_waits_for_every_required_gate() -> None:
     jobs = _workflow("release.yml")["jobs"]
     expected = {
         "artifacts": "./.github/workflows/release-artifacts.yml",
@@ -192,4 +231,9 @@ def test_release_publish_waits_for_every_heavy_acceptance_gate() -> None:
     }
     for job, called_workflow in expected.items():
         assert jobs[job]["uses"] == called_workflow
+    expected |= {
+        "core-ci": "./.github/workflows/ci.yml",
+        "codeql": "./.github/workflows/codeql.yml",
+        "secret-scan": "./.github/workflows/secret-scan.yml",
+    }
     assert set(jobs["publish"]["needs"]) == set(expected)

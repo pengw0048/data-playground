@@ -19,31 +19,91 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-identity:
+    name: record exact release candidate commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # `github.sha` is the tag target for a tag push and the selected
+          # immutable revision for a manual dry run.
+          ref: ${{ github.sha }}
+      - name: Record the immutable candidate revision
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          test "$sha" = "$GITHUB_SHA"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Release candidate identity"
+            echo
+            echo "- Event: \`$GITHUB_EVENT_NAME\`"
+            echo "- Ref: \`$GITHUB_REF\`"
+            echo "- Exact tested commit: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Reuse the normal required functional contract and pass it the immutable
+  # candidate SHA rather than inferring a result from the latest main commit.
+  core-ci:
+    needs: release-identity
+    uses: ./.github/workflows/ci.yml
+    with:
+      expected_sha: ${{ needs.release-identity.outputs.sha }}
+    permissions:
+      contents: read
+
+  codeql:
+    needs: release-identity
+    uses: ./.github/workflows/codeql.yml
+    with:
+      expected_sha: ${{ needs.release-identity.outputs.sha }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  secret-scan:
+    needs: release-identity
+    uses: ./.github/workflows/secret-scan.yml
+    with:
+      expected_sha: ${{ needs.release-identity.outputs.sha }}
+    permissions:
+      contents: read
+
   # Re-run the slice-10 contract on the tagged commit (reusable workflow).
   artifacts:
+    needs: release-identity
     uses: ./.github/workflows/release-artifacts.yml
     permissions:
       contents: read
 
   ux-acceptance:
+    needs: release-identity
     uses: ./.github/workflows/ux-acceptance.yml
     permissions:
       contents: read
       issues: read
 
   ray-validation:
+    needs: release-identity
     uses: ./.github/workflows/ray-validation.yml
     permissions:
       contents: read
 
   ray-jobs-acceptance:
+    needs: release-identity
     uses: ./.github/workflows/ray-jobs-acceptance.yml
     permissions:
       contents: read
 
   publish:
     name: publish release + SBOM + attestations
-    needs: [artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
+    needs: [core-ci, codeql, secret-scan, artifacts, ux-acceptance, ray-validation, ray-jobs-acceptance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 40

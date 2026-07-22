@@ -10,6 +10,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Release calls this same functional contract from the immutable candidate
+  # revision. Keep the PR/main event behavior above unchanged.
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Immutable candidate commit to check out for a release gate.
+        required: true
+        type: string
 
 # Least-privilege default for the functional CI suite. Adding this block is the
 # only intentional change to this workflow for #113; jobs and steps are unchanged.
@@ -32,6 +40,8 @@ jobs:
         shard: [kernel, lifecycle, remainder-0, remainder-1, remainder-2]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       # The kernel wheel force-includes ../web/dist as kernel/_web; hatchling errors if that path
       # is missing at install time. The pytest job doesn't serve the SPA, so an empty dir suffices.
@@ -108,6 +118,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       # hatchling force-includes ../web/dist; the quality job never serves the SPA.
       - name: Placeholder web build
@@ -138,6 +150,8 @@ jobs:
       UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: ${{ matrix.python }}
@@ -183,6 +197,8 @@ jobs:
       DP_TEST_DATABASE_URL: postgresql+psycopg://dp:dp-test-only@127.0.0.1:5432/dataplay_test
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Placeholder web build
         run: mkdir -p web/dist
@@ -280,6 +296,8 @@ jobs:
       DP_TEST_DATABASE_URL: postgresql+psycopg://dp:dp-test-only@127.0.0.1:5432/dataplay_test
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: Placeholder web build
         run: mkdir -p web/dist
@@ -299,6 +317,8 @@ jobs:
       CI: "true"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -342,6 +362,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"

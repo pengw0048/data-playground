@@ -13,6 +13,14 @@ on:
     # Mondays 04:27 UTC — offset from Ray validation (05:17) and image-scan.
     - cron: "27 4 * * 1"
   workflow_dispatch:
+  # Release invokes this analysis on the candidate revision; it is not inferred
+  # from a prior default-branch result.
+  workflow_call:
+    inputs:
+      expected_sha:
+        description: Immutable candidate commit to analyze for a release gate.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -39,6 +47,8 @@ jobs:
         language: [javascript-typescript, python]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.expected_sha || github.sha }}
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
