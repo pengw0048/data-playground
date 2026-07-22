@@ -1050,6 +1050,7 @@ def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_dee
     bounded = workspace_providers.bounded_list_children
 
     def deterministic_list_children(_provider, mount, *args, **kwargs):
+        kwargs.pop("timeout", None)
         if mount.id == "a-slow":
             return ProviderPage(state="unavailable", reason="deadline exceeded")
         return bounded(_provider, mount, *args, **kwargs, timeout=0.001)
@@ -1421,7 +1422,7 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             bounded_resolve = workspace_providers.bounded_resolve
             monkeypatch.setattr(
                 workspace_providers, "bounded_resolve",
-                lambda provider_arg, mount, resource_id: bounded_resolve(
+                lambda provider_arg, mount, resource_id, **_kwargs: bounded_resolve(
                     provider_arg, mount, resource_id, timeout=0),
             )
             timed_out = client.get(f"/api/workspace/containers/{remote_container_id}")
@@ -2006,6 +2007,7 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
     bounded = workspace_providers.bounded_search
 
     def search_with_controlled_timeout(provider_arg, mount, *args, **kwargs):
+        kwargs.pop("timeout", None)
         timeout = 0.001 if mount.id == "a-slow" else 1.0
         return bounded(provider_arg, mount, *args, **kwargs, timeout=timeout)
 
@@ -2080,6 +2082,67 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
         })
         assert mismatched.status_code == 422
     time.sleep(0.03)
+
+
+def test_workspace_provider_deadlines_keep_browse_fast_and_explicit_actions_bounded(
+        workspace_scope, monkeypatch):
+    provider = _WorkspaceFixtureProvider()
+    root = metadb.local_workspace_root()
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-provider-deadlines")
+    observed: dict[str, list[float]] = {
+        "list": [], "resolve": [], "ancestors": [], "search": [], "detail": [],
+    }
+
+    def capture(name, bounded):
+        def invoke(*args, **kwargs):
+            observed[name].append(kwargs["timeout"])
+            return bounded(*args, **kwargs)
+        return invoke
+
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setattr(
+        workspace_providers, "bounded_list_children",
+        capture("list", workspace_providers.bounded_list_children))
+    monkeypatch.setattr(
+        workspace_providers, "bounded_resolve",
+        capture("resolve", workspace_providers.bounded_resolve))
+    monkeypatch.setattr(
+        workspace_providers, "bounded_ancestors",
+        capture("ancestors", workspace_providers.bounded_ancestors))
+    monkeypatch.setattr(
+        workspace_providers, "bounded_search",
+        capture("search", workspace_providers.bounded_search))
+    monkeypatch.setattr(
+        workspace_providers, "bounded_dataset_detail",
+        capture("detail", workspace_providers.bounded_dataset_detail))
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {
+            "id": "deadline-fixture",
+            "provider": "fixture",
+            "containerId": folder["id"],
+        },
+    ]))
+
+    page = workspace_providers.browse(folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    resource_ref = next(
+        item["id"] for item in page["items"] if item.get("resourceId") == "dataset-a")
+    assert observed["list"] == [workspace_providers._PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS]
+
+    workspace_providers.search("shared", uid=metadb.DEFAULT_USER_ID)
+    workspace_providers.resolve(resource_ref, uid=metadb.DEFAULT_USER_ID)
+    workspace_providers.provider_dataset_source(
+        resource_ref, uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: object())
+    workspace_providers.relink(
+        resource_ref, uid=metadb.DEFAULT_USER_ID,
+        mount_id="deadline-fixture", resource_id="dataset-a")
+
+    expected = workspace_providers._INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS
+    assert observed["search"] == [expected]
+    assert observed["resolve"] and all(timeout == expected for timeout in observed["resolve"])
+    assert observed["ancestors"] and all(timeout == expected for timeout in observed["ancestors"])
+    assert observed["detail"] == [expected]
 
 
 def test_workspace_search_finds_local_kinds_with_stable_identity_and_bounded_pages(

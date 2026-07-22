@@ -33,6 +33,10 @@ _CURSOR_VERSION = 2
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
 _MAX_CONFIG_BYTES = 1024 * 1024
+# Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
+# actions may wait a little longer, but remain bounded and use the same isolated provider workers.
+_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 1.0
+_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
 }
@@ -257,7 +261,10 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error", error=_activation_error())
         raise ProviderDatasetUnavailable(_activation_error()) from exc
-    result = bounded_dataset_detail(provider, mounted.mount, binding["resourceId"])
+    result = bounded_dataset_detail(
+        provider, mounted.mount, binding["resourceId"],
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
     if result.state != "ready" or result.item is None:
         state = _reference_state(result.failure, result.state)
         metadb.workspace_provider_mark_binding(
@@ -563,7 +570,8 @@ def _prefetch_provider_pages(
             cursor = source_cursor if index == start else None
             future = executor.submit(
                 bounded_list_children, provider, source.mounted.mount, None,
-                limit=limit, cursor=cursor)
+                limit=limit, cursor=cursor,
+                timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
             futures[future] = index
         for future, index in futures.items():
             try:
@@ -730,7 +738,9 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                 public_container = _binding_resource(cached, mounted)
                 statuses[current] = _source_status(source, "unavailable", _activation_error(), "offline")
             else:
-                resolved = bounded_resolve(provider, mounted.mount, resource_id)
+                resolved = bounded_resolve(
+                    provider, mounted.mount, resource_id,
+                    timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
                 if resolved.state != "ready" or resolved.item is None:
                     state = _reference_state(resolved.failure, resolved.state)
                     cached = metadb.workspace_provider_mark_binding(
@@ -740,7 +750,9 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                 elif resolved.item.id != resource_id or resolved.item.kind != "container":
                     raise KeyError(f"Workspace resource 'container:{identity}' is not a container")
                 else:
-                    ancestry = bounded_ancestors(provider, mounted.mount, resource_id)
+                    ancestry = bounded_ancestors(
+                        provider, mounted.mount, resource_id,
+                        timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
                     provider_ancestors = [item for item in ancestry.items if item.kind == "container"]
                     dropped = len(provider_ancestors) != len(ancestry.items)
                     parent_binding_id: str | None = None
@@ -770,7 +782,8 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                         container = {**container, "lastKnown": True}
                     public_container = container
                     page = bounded_list_children(
-                        provider, mounted.mount, resource_id, limit=remaining, cursor=source_cursor)
+                        provider, mounted.mount, resource_id, limit=remaining, cursor=source_cursor,
+                        timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
                     if len(page.items) > remaining:
                         statuses[current] = _source_status(
                             source, "unavailable", "catalog provider exceeded the requested browse limit")
@@ -981,7 +994,9 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
             cached, mounted, source, uid=uid, completeness="unavailable",
             error=_activation_error())
 
-    resolved = bounded_resolve(provider, mounted.mount, resource_id)
+    resolved = bounded_resolve(
+        provider, mounted.mount, resource_id,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS)
     if resolved.state != "ready" or resolved.item is None:
         state = _reference_state(resolved.failure, resolved.state)
         cached = metadb.workspace_provider_mark_binding(
@@ -1003,7 +1018,9 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
     except KeyError:
         return _unavailable_resolution(
             source, "unavailable", "catalog mount container is unavailable")
-    ancestors = bounded_ancestors(provider, mounted.mount, resource_id)
+    ancestors = bounded_ancestors(
+        provider, mounted.mount, resource_id,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS)
     provider_ancestors = [item for item in ancestors.items if item.kind == "container"]
     dropped = len(provider_ancestors) != len(ancestors.items)
     provider_resources: list[dict] = []
@@ -1062,7 +1079,9 @@ def relink(
         provider = _load_provider(mounted.mount.provider)
     except Exception as exc:  # noqa: BLE001 -- activation failure is an unavailable replacement
         raise ProviderRelinkUnavailable(_activation_error()) from exc
-    resolved = bounded_resolve(provider, mounted.mount, resource_id)
+    resolved = bounded_resolve(
+        provider, mounted.mount, resource_id,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS)
     if resolved.state != "ready" or resolved.item is None:
         if resolved.failure == "permission_lost":
             raise PermissionError(resolved.reason or "replacement permission was lost")
@@ -1076,7 +1095,9 @@ def relink(
     if resolved.item.kind != kind:
         raise ValueError("replacement resource kind does not match the detached reference")
 
-    ancestors = bounded_ancestors(provider, mounted.mount, resource_id)
+    ancestors = bounded_ancestors(
+        provider, mounted.mount, resource_id,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS)
     provider_ancestors = [item for item in ancestors.items if item.kind == "container"]
     parent_binding_id: str | None = None
     for item in provider_ancestors:
@@ -1183,6 +1204,7 @@ def _provider_searches(sources: list[_Source], states: list[dict], *,
             future = executor.submit(
                 bounded_search, provider, source.mounted.mount, query,
                 limit=limit, cursor=states[index]["cursor"],
+                timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
             )
             futures[future] = index
         for future, index in futures.items():
