@@ -337,6 +337,9 @@ class ColumnSchema(Wire):
         return self
 
 
+GraphSchema = dict[str, dict[str, list[ColumnSchema] | None]]
+
+
 class SchemaFieldCompatibility(Wire):
     kind: Literal["unchanged", "renamed", "added", "removed", "changed"]
     status: SchemaCompatibilityStatus

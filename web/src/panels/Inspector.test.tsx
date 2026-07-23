@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
 import type { ColumnSchema } from '../types/graph'
 import { register } from '../nodes/registry'
+import { codeHash } from '../nodes/schema'
 import { useStore } from '../store/graph'
 
 const cols: ColumnSchema[] = [
@@ -12,12 +13,12 @@ const cols: ColumnSchema[] = [
 
 describe('canDeclareSchemaKind — which kinds can carry a schema contract', () => {
   it('is true for code ops + any plugin kind', () => {
-    for (const k of ['transform', 'vector-search', 'my_plugin_node']) {
+    for (const k of ['transform', 'vector-search', 'sql', 'my_plugin_node']) {
       expect(canDeclareSchemaKind(k)).toBe(true)
     }
   })
   it('is false for relational / io / annotation built-ins (never a phantom contract editor)', () => {
-    for (const k of ['source', 'filter', 'select', 'sort', 'dedup', 'join', 'sql', 'aggregate',
+    for (const k of ['source', 'filter', 'select', 'sort', 'dedup', 'join', 'aggregate',
       'sample', 'metric', 'chart', 'write', 'note', 'section', 'code']) {
       expect(canDeclareSchemaKind(k)).toBe(false)
     }
@@ -25,6 +26,41 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
   it('allows node-wide contracts only for a single effective output', () => {
     expect(canDeclareNodeSchema('my_plugin_node', 1)).toBe(true)
     expect(canDeclareNodeSchema('my_plugin_node', 2)).toBe(false)
+  })
+
+  it('uses the existing schema hash contract to detect a changed SQL declaration', () => {
+    register({
+      kind: 'sql', title: 'sql', category: 'query',
+      inputs: [{ id: 'in', wire: 'dataset', multi: true }],
+      outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'sql', status: 'draft', history: [], config: {} }),
+    }, () => null)
+    useStore.setState({
+      selectedIds: ['sql'],
+      canvasRole: 'owner',
+      doc: {
+        id: 'sql-contract', name: 'SQL contract', version: 1, requirements: [], edges: [],
+        nodes: [{
+          id: 'sql', type: 'sql', position: { x: 0, y: 0 },
+          data: {
+            title: 'sql', status: 'draft', history: [],
+            config: {
+              sql: 'SELECT owner_id AS actual FROM input',
+              outputSchema: [{ name: 'declared', type: 'string', capabilities: [] }],
+              outputSchemaCodeHash: codeHash('SELECT owner_id FROM input'),
+            },
+          },
+        }],
+      },
+      runs: {},
+      schemas: { sql: { out: [{ name: 'actual', type: 'int', capabilities: [] }] } },
+    } as any)
+
+    render(<Inspector />)
+    expect(screen.getByText(/SQL changed since this contract was pinned/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByTitle('Show columns'))
+    expect(screen.getByText('actual')).toBeInTheDocument()
   })
 })
 

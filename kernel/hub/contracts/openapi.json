@@ -20116,7 +20116,22 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
+                  "additionalProperties": {
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "items": {
+                            "$ref": "#/components/schemas/ColumnSchema"
+                          },
+                          "type": "array"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "type": "object"
+                  },
                   "title": "Response Graph Schema Api Graph Schema Post",
                   "type": "object"
                 }
