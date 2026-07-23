@@ -7,6 +7,7 @@ import type {
   RestoreRevisionTask, SchemaCompatibilityStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
+import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 
 const PAGE_SIZE = 20
 const MAX_RESERVOIR_SEED = 2_147_483_647
@@ -281,7 +282,7 @@ function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
     {!rows.length ? <div className="rounded-md border border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This exact revision returned no preview rows.</div>
       : <div className="max-h-[220px] overflow-auto rounded-md border border-border">
         <table className="dp-mono w-max text-[9.5px]">
-          <thead><tr>{columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead>
+          <thead><tr>{columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold"><FieldEvidenceButton column={column} marker className="dp-mono rounded px-0.5 hover:bg-accent" /></th>)}</tr></thead>
           <tbody>{rows.map((row, index) => <tr key={index}>{columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{cell(row[column.name])}</td>)}</tr>)}</tbody>
         </table>
       </div>}

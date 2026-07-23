@@ -6,6 +6,7 @@ import { Icon } from '../../ui/Icon'
 import { Popover } from '../../ui/Popover'
 import { FileDialog } from '../../ui/FileDialog'
 import { api } from '../../api/client'
+import { FieldEvidenceButton } from '../../components/FieldEvidenceDetail'
 import type { CatalogTable, DatasetRevision, DatasetRevisionDetail } from '../../types/api'
 import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types/graph'
 
@@ -206,6 +207,12 @@ function Source({ id, data }: NodeComponentProps) {
       {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
         Pinned provider revision {providerRevisionLabel}
       </div>}
+      {table && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
+        <summary className="cursor-pointer font-medium text-muted-foreground">Field evidence · {table.columns.length} columns</summary>
+        <div className="mt-1 grid max-h-28 gap-0.5 overflow-y-auto">
+          {table.columns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
+        </div>
+      </details>}
       {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
         disabled={!canEdit} onChange={(event) => updateConfig(id, {
           datasetRef: event.target.value ? { parameterRef: event.target.value } : undefined,

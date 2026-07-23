@@ -22,6 +22,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
+import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 
 export const INSPECTOR_W = 300
 export const INSPECTOR_COLLAPSED_W = 44
@@ -638,7 +639,7 @@ export function PortRow({ dir, name, wire, schema }: {
         <div className="ml-[33px] flex flex-col gap-px rounded border border-border bg-muted/40 p-1">
           {cols!.map((c, i) => (
             <div key={i} className="flex items-baseline justify-between gap-2 text-[10px]">
-              <span className="dp-mono truncate text-foreground">{c.name}</span>
+              <FieldEvidenceButton column={c} marker className="dp-mono truncate rounded px-0.5 text-left text-foreground hover:bg-accent" />
               <span className="dp-mono flex-none text-muted-foreground">{c.type}</span>
             </div>
           ))}
