@@ -690,6 +690,29 @@ class BuildEngine:
                 except Exception as exc:
                     raise NotPreviewable(
                         node, "selected revision is unavailable; choose another revision or follow latest") from exc
+            # An admitted full run is bound to one provider revision.  Schema-only planning is part
+            # of that admission, so it must inspect the same immutable revision instead of asking
+            # the provider for its mutable head.
+            revision_id = cfg.get("_input_revision_id")
+            if self.schema_only and revision_id is not None:
+                exact_artifact = self.graph._input_artifact_uris.get(str(node.id))
+                if (exact_artifact is not None
+                        and cfg.get("_input_artifact_uri") == exact_artifact):
+                    # An isolated child has a parent-attested retained artifact in place of provider
+                    # metadata. Keep that exact sidecar path for schema evidence as well as full runs.
+                    try:
+                        return self.resolve_adapter(exact_artifact).scan(exact_artifact, limit=0)
+                    except Exception as exc:
+                        raise NotPreviewable(
+                            node, "persisted input revision is unavailable") from exc
+                revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
+                open_revision = getattr(revision_adapter, "open_revision", None)
+                if not callable(open_revision):
+                    raise NotPreviewable(node, "persisted input revision is unavailable")
+                try:
+                    return open_revision(uri, str(revision_id)).limit(0)
+                except Exception as exc:  # exact bindings must never fall back to a mutable head
+                    raise NotPreviewable(node, "persisted input revision is unavailable") from exc
             if self.schema_only:
                 try:
                     return adapter.scan(uri, limit=0, **extra)  # metadata only — never materialize
@@ -708,7 +731,6 @@ class BuildEngine:
             # Full-run admission may bind a source to one provider-native revision.  This is an
             # internal execution capability, never a client-configurable source option: opening the
             # exact revision is deliberately preferred to scanning the mutable provider head.
-            revision_id = cfg.get("_input_revision_id")
             if revision_id is not None:
                 exact_artifact = self.graph._input_artifact_uris.get(str(node.id))
                 if (exact_artifact is not None

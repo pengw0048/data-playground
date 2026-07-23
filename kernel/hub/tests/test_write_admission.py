@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from hub import metadb
+from hub import db, metadb
 from hub.api_errors import APIErrorCode
 from hub.models import ColumnSchema, Graph
 from hub.nodespecs import BUILTIN_NODE_SPECS
@@ -154,6 +154,96 @@ def test_preflight_is_metadata_only_and_derives_create_then_replace(contract):
     assert replace.expected_head.revision_id == receipt.revision_id
     assert replace.intent is not None
     assert replace.intent.destination.dataset_id == receipt.dataset_id
+
+
+def test_admitted_exact_source_schema_uses_its_revision_without_mutable_scan(tmp_path):
+    class ExactOnlyAdapter:
+        name = "exact-only"
+
+        def __init__(self):
+            self.opened: list[str] = []
+            self.mutable_scan_calls = 0
+
+        def scan(self, *_args, **_kwargs):
+            self.mutable_scan_calls += 1
+            raise AssertionError("schema-only admitted Source must not scan the mutable provider head")
+
+        def open_revision(self, uri, revision_id):
+            assert uri == source_uri
+            self.opened.append(revision_id)
+            if revision_id == "gone":
+                raise RuntimeError("revision unavailable")
+            return db.conn().from_arrow(pa.table({"value": [1]}))
+
+    source_uri = str(tmp_path / "exact-source")
+    source_adapter = ExactOnlyAdapter()
+    storage = LocalStorage(str(tmp_path / "outputs"))
+    output_adapter = DuckDBAdapter()
+    catalog = InMemoryCatalog(
+        str(tmp_path / "data"),
+        lambda uri: source_adapter if uri == source_uri else output_adapter,
+    )
+    graph = Graph.model_validate({
+        "id": "exact-schema-admission", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "data": {"config": {
+                "uri": source_uri,
+                "_input_provider_uri": source_uri,
+                "_input_revision_id": "revision-1",
+            }}},
+            {"id": "select", "type": "select", "data": {"config": {"select": "value"}}},
+            {"id": "write", "type": "write", "data": {"config": {
+                "filename": "output.parquet", "writeMode": "overwrite",
+            }}},
+        ],
+        "edges": [
+            {"id": "source-select", "source": "source", "target": "select"},
+            {"id": "select-write", "source": "select", "target": "write"},
+        ],
+    })
+    deps = SimpleNamespace(
+        workspace=str(tmp_path), storage=storage, catalog=catalog,
+        resolve_adapter=lambda uri: source_adapter if uri == source_uri else output_adapter,
+        registry=ProcessorRegistry(), node_builders={},
+        node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
+    )
+    try:
+        admitted = _write_admission_for_graph(
+            deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111114")
+        assert [(column.name, column.type) for column in admitted.expected_schema] == [("value", "int")]
+        assert admitted.intent is not None and admitted.blocker is None
+        assert source_adapter.opened == ["revision-1"]
+        assert source_adapter.mutable_scan_calls == 0
+
+        retained_artifact = tmp_path / "retained-exact.parquet"
+        pq.write_table(pa.table({"retained": [1]}), retained_artifact)
+        graph.nodes[0].data["config"].update({
+            "_input_revision_id": "retained-revision",
+            "_input_artifact_uri": str(retained_artifact),
+        })
+        graph.nodes[1].data["config"]["select"] = "retained"
+        graph._input_artifact_uris["source"] = str(retained_artifact)
+        retained = _write_admission_for_graph(
+            deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111116")
+        assert [(column.name, column.type) for column in retained.expected_schema] == [("retained", "int")]
+        assert retained.intent is not None and retained.blocker is None
+        assert source_adapter.opened == ["revision-1"]
+        assert source_adapter.mutable_scan_calls == 0
+
+        graph._input_artifact_uris.clear()
+        graph.nodes[0].data["config"].pop("_input_artifact_uri")
+        graph.nodes[0].data["config"]["_input_revision_id"] = "gone"
+        unavailable = _write_admission_for_graph(
+            deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111115")
+        assert unavailable.intent is None
+        assert unavailable.blocker == (
+            "input schema is not available from bounded metadata; "
+            "declare the upstream output schema before running")
+        assert source_adapter.opened[0] == "revision-1"
+        assert source_adapter.opened[1:] and set(source_adapter.opened[1:]) == {"gone"}
+        assert source_adapter.mutable_scan_calls == 0
+    finally:
+        storage.close()
 
 
 def test_stale_admission_fails_before_artifact_and_preserves_new_head(contract):
