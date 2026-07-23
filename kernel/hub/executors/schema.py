@@ -13,7 +13,13 @@ import uuid
 from collections import deque
 
 from hub import db, graph as g
-from hub.executors.engine import BuildEngine, _bypassed, _disabled, declared_schema
+from hub.executors.engine import (
+    BuildEngine,
+    _bypassed,
+    _disabled,
+    declared_schema,
+    normalize_how,
+)
 from hub.ir import resolve_config
 from hub.models import (
     ColumnSchema,
@@ -211,14 +217,48 @@ def _source_evidence(
         return None
 
 
+def _code_hash(value: str) -> str:
+    """Match the UI's unsigned 32-bit djb2 hash over JavaScript UTF-16 code units."""
+    result = 5381
+    encoded = value.encode("utf-16-le", errors="surrogatepass")
+    for index in range(0, len(encoded), 2):
+        code_unit = int.from_bytes(encoded[index:index + 2], "little")
+        result = (result * 33 + code_unit) & 0xFFFFFFFF
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if result == 0:
+        return "0"
+    out = ""
+    while result:
+        result, digit = divmod(result, 36)
+        out = digits[digit] + out
+    return out
+
+
 def _declared_output(node: GraphNode) -> list[ColumnSchema] | None:
     declaration = declared_schema(node)
     if declaration is None:
         return None
     try:
-        return _columns(declaration)
+        columns = _columns(declaration)
     except ValueError:
         return None
+    raw_config = (
+        node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    )
+    contract_text = raw_config.get("code")
+    if contract_text is None:
+        contract_text = raw_config.get("sql")
+    pinned_hash = raw_config.get("outputSchemaCodeHash")
+    if (
+        contract_text is not None
+        and isinstance(pinned_hash, str)
+        and pinned_hash
+        and pinned_hash != _code_hash(str(contract_text))
+    ):
+        # The declaration still owns names/types and remains enforceable. Only its row-reference
+        # evidence is stale: changed code may now populate the same-shaped field from another target.
+        return _unknown_references(columns)
+    return columns
 
 
 def _same_names(left: list[ColumnSchema], right: list[ColumnSchema]) -> bool:
@@ -270,7 +310,8 @@ def _derive_join(
     left, right = inputs[:2]
     using_keys: set[str] = set()
     raw_on = str(config.get("on") or "").strip()
-    if raw_on:
+    how = normalize_how(str(config.get("how") or "inner"))
+    if raw_on and how != "cross":
         direct = [_direct_projection(part) for part in _split_projection(raw_on)]
         if all(item is not None and item[0] == item[1] for item in direct):
             using_keys = {identifier_key(item[0]) for item in direct if item is not None}
@@ -278,10 +319,28 @@ def _derive_join(
                         if identifier_key(column.name) not in using_keys)]
     if len(origins) != len(output):
         return _unknown_references(output)
-    return [
-        _reference_copy(column, origin)
-        for column, origin in zip(output, origins, strict=True)
-    ]
+    left_by_name = _by_name(left)
+    right_by_name = _by_name(right)
+    derived: list[ColumnSchema] = []
+    for column, origin in zip(output, origins, strict=True):
+        key = identifier_key(origin.name)
+        if key not in using_keys:
+            derived.append(_reference_copy(column, origin))
+            continue
+        left_matches = left_by_name.get(key, [])
+        right_matches = right_by_name.get(key, [])
+        left_key = left_matches[0] if len(left_matches) == 1 else None
+        right_key = right_matches[0] if len(right_matches) == 1 else None
+        if how == "left":
+            reference = left_key.row_reference if left_key is not None else None
+        elif how == "right":
+            reference = right_key.row_reference if right_key is not None else None
+        else:
+            # INNER values are equal and FULL values can originate on either side. In both cases the
+            # merged key has a reference only when complete evidence identifies one compatible target.
+            reference = _compatible_reference([left_key, right_key])
+        derived.append(column.model_copy(update={"row_reference": reference}))
+    return derived
 
 
 def _derive_aggregate(

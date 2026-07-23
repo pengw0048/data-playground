@@ -30,6 +30,18 @@ def _reference(target: str, *, provenance: str = "provider") -> dict:
     }
 
 
+def _code_hash(value: str) -> str:
+    result = 5381
+    for char in value:
+        result = (result * 33 + ord(char)) & 0xFFFFFFFF
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while result:
+        result, digit = divmod(result, 36)
+        out = digits[digit] + out
+    return out or "0"
+
+
 def _column(name: str, *, target: str | None = None,
             provenance: str = "provider") -> ColumnSchema:
     payload = {
@@ -198,6 +210,44 @@ def test_join_keeps_reference_ownership_from_both_source_sides():
     )
 
 
+@pytest.mark.parametrize(
+    ("how", "right_target", "expected_target"),
+    [
+        ("left", "right-owners", "left-owners"),
+        ("right", "right-owners", "right-owners"),
+        ("full", "left-owners", "left-owners"),
+        ("full", "right-owners", None),
+        ("inner", "left-owners", "left-owners"),
+        ("inner", "right-owners", None),
+    ],
+)
+def test_using_join_key_reference_respects_merged_key_ownership(
+    how: str, right_target: str, expected_target: str | None,
+):
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="left-owners"), _column("left_value")],
+        "right": [_column("owner_id", target=right_target), _column("right_value")],
+    })
+    graph = Graph.model_validate({
+        "id": f"{how}-join-key", "version": 1,
+        "nodes": [
+            _node("left", "source", {"uri": "left"}),
+            _node("right", "source", {"uri": "right"}),
+            _node("join", "join", {"on": "owner_id", "how": how}),
+        ],
+        "edges": [
+            _edge("left", "join", handle="a"),
+            _edge("right", "join", handle="b"),
+        ],
+    })
+
+    reference = _row_reference(_schemas(graph, adapter), "join", "owner_id")
+    if expected_target is None:
+        assert reference is None
+    else:
+        assert reference["target"]["datasetId"] == expected_target
+
+
 def test_aggregate_preserves_only_direct_group_key_reference():
     adapter = ReferenceAdapter({
         "left": [
@@ -327,6 +377,92 @@ def test_declared_sql_and_code_references_round_trip_while_opaque_code_is_unknow
     assert preview.columns[0].row_reference is None
 
 
+@pytest.mark.parametrize(
+    ("kind", "contract_field", "contract_text", "expected_type"),
+    [
+        ("sql", "sql", "SELECT owner_id AS copied FROM input", "int"),
+        (
+            "transform",
+            "code",
+            "def fn(row): return {'copied': row['owner_id']}",
+            "int64",
+        ),
+        ("custom-processor", "code", "return input", "int64"),
+    ],
+)
+def test_stale_declared_schema_hash_suppresses_only_row_reference(
+    kind: str, contract_field: str, contract_text: str, expected_type: str,
+):
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="source-owners")],
+    })
+    config = {
+        contract_field: contract_text,
+        "outputSchema": [{
+            "name": "copied",
+            "type": "int64",
+            "rowReference": _reference("declared-owners", provenance="declared"),
+        }],
+        "outputSchemaCodeHash": _code_hash("previous code"),
+        "enforceSchema": True,
+    }
+    graph = Graph.model_validate({
+        "id": f"stale-{kind}", "version": 1,
+        "nodes": [
+            _node("source", "source", {"uri": "left"}),
+            _node("declared", kind, config),
+        ],
+        "edges": [_edge("source", "declared")],
+    })
+    builders = (
+        {"custom-processor": lambda *_args: db.conn().sql(
+            "SELECT 1::BIGINT AS copied")}
+        if kind == "custom-processor" else None
+    )
+
+    schema = schema_for_graph(
+        graph, lambda _uri: adapter, {},
+        node_builders=builders, node_specs=SPECS, storage=None,
+    )["declared"]
+
+    assert schema[0]["name"] == "copied"
+    assert schema[0]["type"] == expected_type
+    assert schema[0]["rowReference"] is None
+
+
+def test_stale_declared_schema_hash_is_unknown_in_runtime_preview():
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="source-owners")],
+    })
+    current_sql = "SELECT owner_id AS copied FROM input"
+    graph = Graph.model_validate({
+        "id": "stale-preview", "version": 1,
+        "nodes": [
+            _node("source", "source", {"uri": "left"}),
+            _node("sql", "sql", {
+                "sql": current_sql,
+                "outputSchema": [{
+                    "name": "copied",
+                    "type": "int64",
+                    "rowReference": _reference(
+                        "declared-owners", provenance="declared"),
+                }],
+                "outputSchemaCodeHash": _code_hash("previous sql"),
+            }),
+        ],
+        "edges": [_edge("source", "sql")],
+    })
+
+    preview = preview_node(
+        graph, "sql", 5, lambda _uri: adapter, {},
+        node_specs=SPECS, storage=None,
+    )
+
+    assert not preview.error
+    assert preview.columns[0].name == "copied"
+    assert preview.columns[0].row_reference is None
+
+
 def test_declared_sql_reuses_existing_runtime_schema_drift_gate():
     adapter = ReferenceAdapter({
         "left": [_column("owner_id", target="source-owners")],
@@ -337,6 +473,8 @@ def test_declared_sql_reuses_existing_runtime_schema_drift_gate():
         "rowReference": _reference("declared-owners", provenance="declared"),
     }]
 
+    pinned_sql = "SELECT owner_id AS copied FROM input"
+
     def graph(sql: str) -> Graph:
         return Graph.model_validate({
             "id": "sql-drift", "version": 1,
@@ -345,6 +483,7 @@ def test_declared_sql_reuses_existing_runtime_schema_drift_gate():
                 _node("sql", "sql", {
                     "sql": sql,
                     "outputSchema": declared,
+                    "outputSchemaCodeHash": _code_hash(pinned_sql),
                     "enforceSchema": True,
                 }),
             ],
@@ -352,7 +491,7 @@ def test_declared_sql_reuses_existing_runtime_schema_drift_gate():
         })
 
     with db.run_scope():
-        current = graph("SELECT owner_id AS copied FROM input")
+        current = graph(pinned_sql)
         engine = BuildEngine(
             current, lambda _uri: adapter, {}, full=True, node_specs=SPECS)
         LocalRunner._check_schema(None, current.nodes[1], engine)
