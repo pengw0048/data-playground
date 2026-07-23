@@ -51,6 +51,7 @@ function Source({ id, data }: NodeComponentProps) {
   const rememberTables = useStore((s) => s.rememberTables)
   const updateConfig = useStore((s) => s.updateConfig)
   const rename = useStore((s) => s.rename)
+  const select = useStore((s) => s.select)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   // show the bound dataset even when the source was configured by tableId or a bare catalog NAME (an
   // agent/example/programmatic source), not only by an exact uri match.
@@ -160,7 +161,7 @@ function Source({ id, data }: NodeComponentProps) {
         <button
           ref={btnRef}
           title={`${table?.name ?? data.title} · ${String(data.config.uri ?? '')}\nClick to change dataset`}
-          onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
+          onClick={(e) => { e.stopPropagation(); select(id); setOpen((v) => !v) }}
           className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
           <Icon name="db" size={13} />
@@ -170,7 +171,7 @@ function Source({ id, data }: NodeComponentProps) {
       ) : (
         <button
           ref={btnRef}
-          onClick={(e) => { e.stopPropagation(); setOpen((v) => !v) }}
+          onClick={(e) => { e.stopPropagation(); select(id); setOpen((v) => !v) }}
           className="flex w-full items-center gap-1.5 rounded-md border border-border bg-card px-2 py-1.5 text-[11.5px] text-muted-foreground"
         >
           <Icon name="db" size={13} />

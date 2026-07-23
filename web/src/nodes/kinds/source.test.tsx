@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ReactFlowProvider } from '@xyflow/react'
+import { TooltipProvider } from '@/components/ui/tooltip'
 
 // importing the store triggers autosave side-effects → stub the api client
 const mocks = vi.hoisted(() => ({
@@ -16,7 +17,7 @@ import { useStore } from '../../store/graph'
 
 const Source = getComponent('source')!
 const render1 = (data: object) =>
-  render(<ReactFlowProvider><Source id="s1" data={data as never} /></ReactFlowProvider>)
+  render(<TooltipProvider><ReactFlowProvider><Source id="s1" data={data as never} /></ReactFlowProvider></TooltipProvider>)
 
 describe('Source card — honest counts + empty/offline (UX-14)', () => {
   beforeEach(() => {
@@ -57,6 +58,14 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ] } as any)
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
     expect(screen.getByText(/\b0\s*rows/)).toBeInTheDocument()
+  })
+
+  it('selects the Source when its dataset control receives the click', () => {
+    render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
+
+    fireEvent.click(screen.getByRole('button', { name: /orders/i }))
+
+    expect(useStore.getState().selectedIds).toEqual(['s1'])
   })
 
   it('uses the selected provider exact schema for field evidence even without a local catalog table', async () => {
