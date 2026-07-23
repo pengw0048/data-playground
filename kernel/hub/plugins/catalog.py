@@ -32,6 +32,8 @@ from hub.models import (
     CatalogTable,
     Facets,
     FacetValue,
+    FieldLineagePage,
+    FieldLineageProjection,
     FolderNode,
     KeyInfo,
     LineageEdge,
@@ -430,6 +432,26 @@ class InMemoryCatalog:
             items=[LineageFact.model_validate({**row, "id": str(row["id"])}) for row in rows],
             next_after_id=str(next_after_id) if next_after_id is not None else None,
             has_more=has_more,
+        )
+
+    def field_lineage_page(
+            self, *, dataset_id: str, revision_id: str, destination_fields: list[str],
+            limit: int, after_id: int) -> FieldLineagePage:
+        rows, next_after_id, has_more, available = metadb.catalog_field_lineage_page(
+            dataset_id=dataset_id,
+            revision_id=revision_id,
+            destination_fields=destination_fields,
+            limit=limit,
+            after_id=after_id,
+        )
+        state = "truncated" if has_more else ("available" if available else "unavailable")
+        return FieldLineagePage(
+            state=state,
+            items=[
+                FieldLineageProjection.model_validate({**row, "id": str(row["id"])})
+                for row in rows
+            ],
+            next_after_id=str(next_after_id) if next_after_id is not None else None,
         )
 
     # -- CatalogProvider: write-back -------------------------------------- #

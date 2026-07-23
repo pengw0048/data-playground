@@ -389,10 +389,18 @@ resolved at that commit, with versions when available; those mutable projections
 matching. An exact replay therefore remains a no-op after a projection changes or is unregistered and
 does not restore deleted facts. Empty-source publications reserve the same complete header. The durable
 reservation remains after unregister as a retry tombstone, so old work cannot recreate removed evidence.
-Because the current `field_mappings` shape (`fieldMappings` on the wire) does not identify a source
-dataset, non-empty
-mappings require exactly one source; multi-source mappings fail closed instead of being inferred or
-duplicated.
+Every new `field_mappings` item (`fieldMappings` on the wire) names the stable source dataset, exact
+source version, source and destination field names, and an optional stable source field ID. A
+multi-source publication succeeds only when every mapping resolves to exactly one admitted source at
+that version. Missing, duplicate, contradictory, unadmitted, or wrong-version ownership rolls back the
+whole publication. The complete canonical mapping contract participates in the reservation fingerprint,
+and each per-source fact receives only its owned mappings.
+
+`CatalogFieldLineageExporter` is the optional bounded read boundary for selected destination fields of
+one exact output dataset/revision. It returns `FieldLineagePage` with an explicit `available`,
+`unsupported`, `unavailable`, or `truncated` state and a monotonic decimal-string cursor. As with graph
+and fact export, the selected provider remains authoritative: the route does not fall back to core
+metadata when this capability is absent.
 
 The built-in local result cache considers a catalog output reusable only when its cached `RunOutput`
 contains an exact `version`, the artifact still exists, and the runner-bound catalog reads back the same

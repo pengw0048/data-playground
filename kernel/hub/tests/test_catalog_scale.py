@@ -482,7 +482,10 @@ def test_lineage_facts_wire_contract_preserves_bigint_ids(monkeypatch):
             "stepId": "write-orders",
             "provenance": "run",
             "fieldMappings": [{
+                "sourceDatasetId": None,
+                "sourceVersion": None,
                 "sourceField": "raw_order_id",
+                "sourceFieldId": None,
                 "destinationField": "order_id",
             }],
             "createdAt": "2026-07-16T08:30:00Z",
@@ -533,6 +536,97 @@ def test_lineage_facts_export_uses_provider_capability_or_fails_explicitly(monke
     }
 
 
+def test_field_lineage_lookup_uses_provider_capability_and_explicit_states(monkeypatch):
+    from hub.models import FieldLineagePage, FieldLineageProjection
+
+    calls = []
+    projection = FieldLineageProjection(
+        id="17",
+        fact_key="fact-17",
+        publication_key="publication-17",
+        source_dataset_id="source-dataset",
+        source_version="source-v1",
+        source_field="raw_id",
+        source_field_id="field-raw-id",
+        destination_dataset_id="destination-dataset",
+        destination_revision_id="destination-v2",
+        destination_field="id",
+        created_at=datetime.datetime.now(datetime.UTC),
+    )
+
+    class Exporter:
+        def field_lineage_page(self, **kwargs):
+            calls.append(kwargs)
+            return FieldLineagePage(state="available", items=[projection])
+
+    deps = get_deps()
+    monkeypatch.setattr(deps, "catalog", Exporter())
+    response = client.get("/api/catalog/lineage/fields", params={
+        "datasetId": "destination-dataset",
+        "revisionId": "destination-v2",
+        "destinationFields": "id",
+        "limit": 7,
+        "afterId": "9",
+    })
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "available",
+        "items": [projection.model_dump(by_alias=True, mode="json")],
+        "nextAfterId": None,
+    }
+    assert calls == [{
+        "dataset_id": "destination-dataset",
+        "revision_id": "destination-v2",
+        "destination_fields": ["id"],
+        "limit": 7,
+        "after_id": 9,
+    }]
+
+    monkeypatch.setattr(deps, "catalog", object())
+    unsupported = client.get("/api/catalog/lineage/fields", params={
+        "datasetId": "destination-dataset",
+        "revisionId": "destination-v2",
+        "destinationFields": "id",
+    })
+    assert unsupported.status_code == 200
+    assert unsupported.json() == {
+        "state": "unsupported", "items": [], "nextAfterId": None,
+    }
+
+
+def test_field_lineage_lookup_rejects_invalid_provider_window(monkeypatch):
+    class Exporter:
+        @staticmethod
+        def field_lineage_page(**_kwargs):
+            return {
+                "state": "available",
+                "items": [{
+                    "id": "11",
+                    "factKey": "fact-11",
+                    "publicationKey": "publication-11",
+                    "sourceDatasetId": "source",
+                    "sourceVersion": "v1",
+                    "sourceField": "raw_id",
+                    "destinationDatasetId": "wrong-destination",
+                    "destinationRevisionId": "v2",
+                    "destinationField": "id",
+                    "createdAt": "2026-07-16T08:30:00Z",
+                }],
+                "nextAfterId": None,
+            }
+
+    monkeypatch.setattr(get_deps(), "catalog", Exporter())
+    response = client.get("/api/catalog/lineage/fields", params={
+        "datasetId": "destination",
+        "revisionId": "v2",
+        "destinationFields": "id",
+        "afterId": "9",
+    })
+    assert response.status_code == 502
+    assert response.json()["detail"] == \
+        "catalog provider returned an invalid field lineage page"
+
+
 def test_lineage_fact_export_rejects_provider_cursor_contract_violations(monkeypatch):
     def fact(fact_id: int) -> dict:
         return {
@@ -577,6 +671,8 @@ def test_lineage_facts_export_uses_real_keyset_pagination():
             for i, uri in enumerate(uris)
         ])
         for i, (source, destination) in enumerate(zip(uris, uris[1:])):
+            source_table = metadb.catalog_get(source)
+            assert source_table is not None
             assert _record_lineage(
                 source,
                 destination,
@@ -589,7 +685,10 @@ def test_lineage_facts_export_uses_real_keyset_pagination():
                     step_id=f"write-{i}",
                     provenance="run",
                     mappings=[{
+                        "source_dataset_id": source_table["registrationId"],
+                        "source_version": source_table["version"],
                         "source_field": "raw_id",
+                        "source_field_id": None,
                         "destination_field": "id",
                     }],
                 ),
@@ -629,7 +728,13 @@ def test_lineage_facts_export_uses_real_keyset_pagination():
             "producerVersion": 7,
             "stepId": "write-0",
             "provenance": "run",
-            "fieldMappings": [{"sourceField": "raw_id", "destinationField": "id"}],
+            "fieldMappings": [{
+                "sourceDatasetId": metadb.catalog_get(uris[0])["registrationId"],
+                "sourceVersion": "10",
+                "sourceField": "raw_id",
+                "sourceFieldId": None,
+                "destinationField": "id",
+            }],
         }
         assert fact_key.startswith("lineage-fact:v1:sha256:")
         assert publication_key.startswith("lineage-publication:v1:sha256:")
@@ -639,6 +744,8 @@ def test_lineage_facts_export_uses_real_keyset_pagination():
         with metadb.session() as session:
             obsolete = session.get(metadb.CatalogLineageFact, ids[0])
             assert obsolete is not None
+            session.execute(delete(metadb.CatalogFieldLineageProjection).where(
+                metadb.CatalogFieldLineageProjection.fact_id == ids[0]))
             session.delete(obsolete)
 
         second = client.get(

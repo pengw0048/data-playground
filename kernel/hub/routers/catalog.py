@@ -27,7 +27,11 @@ from pydantic.alias_generators import to_camel
 
 from hub import db, graph as g, metadb, sandbox
 from hub.api_errors import APIError, APIErrorCode
-from hub.backends import CatalogLineageFactExporter, DatasetRevisionAdapter
+from hub.backends import (
+    CatalogFieldLineageExporter,
+    CatalogLineageFactExporter,
+    DatasetRevisionAdapter,
+)
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
@@ -57,6 +61,7 @@ from hub.models import (
     DatasetRevisionResolution,
     DatasetRevisionSummary,
     Facets,
+    FieldLineagePage,
     ImportRequest,
     JoinSuggestion,
     KernelInfo,
@@ -657,6 +662,61 @@ def lineage_facts(
     )
     if invalid_window:
         raise HTTPException(502, "catalog provider returned an invalid lineage fact page")
+    return page
+
+
+@router.get("/catalog/lineage/fields", response_model=FieldLineagePage)
+def field_lineage(
+        dataset_id: str = Query(..., alias="datasetId", min_length=1, max_length=128),
+        revision_id: str = Query(..., alias="revisionId", min_length=1, max_length=512),
+        destination_fields: list[str] = Query(..., alias="destinationFields"),
+        limit: int = Query(100, ge=1, le=500),
+        after_id: str = Query("0", alias="afterId", pattern=r"^(0|[1-9][0-9]{0,18})$"),
+) -> FieldLineagePage:
+    """Return bounded source-owned evidence for selected fields of one exact output."""
+    cursor = int(after_id)
+    if cursor >= 2**63:
+        raise HTTPException(422, "afterId exceeds the signed BIGINT cursor range")
+    if (not 1 <= len(destination_fields) <= 100
+            or len(destination_fields) != len(set(destination_fields))
+            or any(
+                not field or field != field.strip() or len(field) > 512
+                for field in destination_fields
+            )):
+        raise HTTPException(422, "destinationFields must contain 1 to 100 unique field names")
+    catalog = get_deps().catalog
+    if not isinstance(catalog, CatalogFieldLineageExporter):
+        return FieldLineagePage(state="unsupported")
+    try:
+        page = FieldLineagePage.model_validate(catalog.field_lineage_page(
+            dataset_id=dataset_id,
+            revision_id=revision_id,
+            destination_fields=destination_fields,
+            limit=limit,
+            after_id=cursor,
+        ))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            502, "catalog provider returned an invalid field lineage page"
+        ) from exc
+    ids = [int(item.id) for item in page.items]
+    invalid_window = (
+        len(page.items) > limit
+        or any(projection_id <= cursor for projection_id in ids)
+        or any(left >= right for left, right in zip(ids, ids[1:]))
+        or any(
+            item.destination_dataset_id != dataset_id
+            or item.destination_revision_id != revision_id
+            or item.destination_field not in destination_fields
+            for item in page.items
+        )
+        or (page.state == "truncated" and (
+            not ids or page.next_after_id is None
+            or int(page.next_after_id) != ids[-1]
+        ))
+    )
+    if invalid_window:
+        raise HTTPException(502, "catalog provider returned an invalid field lineage page")
     return page
 
 

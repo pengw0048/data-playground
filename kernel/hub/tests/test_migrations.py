@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0042_field_lineage", "0041_provider_canonical"),
         ("0041_provider_canonical", "0040_managed_sidecar"),
         ("0040_managed_sidecar", "0039_folder_replays"),
         ("0039_folder_replays", "0038_inbox_dataset_scoped"),
@@ -96,8 +97,50 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0041_provider_canonical"]
-    assert metadb.expected_schema_head() == "0041_provider_canonical"
+    assert scripts.get_heads() == ["0042_field_lineage"]
+    assert metadb.expected_schema_head() == "0042_field_lineage"
+
+
+def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
+    db_path = tmp_path / "field-lineage-forward.db"
+    old_mappings = '[{"destination_field":"id","source_field":"raw_id"}]'
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        engine = metadb.engine()
+        with engine.connect() as connection:
+            command.upgrade(
+                metadb._alembic_cfg(connection), "0041_provider_canonical"
+            )
+            connection.execute(sa.text("""
+                INSERT INTO catalog_lineage_facts (
+                    fact_key, publication_key, fingerprint,
+                    source_key, destination_key, source_uri, destination_uri,
+                    source_key_hash, destination_key_hash,
+                    source_uri_hash, destination_uri_hash,
+                    provenance, field_mappings_json, created_at
+                ) VALUES (
+                    'old-fact', 'old-publication', 'old-fingerprint',
+                    'old-source', 'old-destination', 'mem://old-source',
+                    'mem://old-destination', :source_hash, :destination_hash,
+                    :source_hash, :destination_hash,
+                    'manual', :mappings, CURRENT_TIMESTAMP
+                )
+            """), {
+                "source_hash": hashlib.sha256(b"old-source").hexdigest(),
+                "destination_hash": hashlib.sha256(b"old-destination").hexdigest(),
+                "mappings": old_mappings,
+            })
+            connection.commit()
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+
+            assert "catalog_field_lineage_projections" in inspect(
+                connection).get_table_names()
+            assert connection.execute(sa.text(
+                "SELECT field_mappings_json FROM catalog_lineage_facts "
+                "WHERE fact_key = 'old-fact'"
+            )).scalar_one() == old_mappings
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM catalog_field_lineage_projections"
+            )).scalar_one() == 0
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -312,6 +355,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0042_field_lineage_identity.py": (
+            "18aad5bb71ac63841c68501d973825335f51e987e302cdefc4eb94770bb34ad4"
+        ),
         "0041_provider_canonical_state.py": (
             "b1056c4481642dceab97d8fd17b257fe4ddec3755cdbdd04cf01091e1b868b3f"
         ),

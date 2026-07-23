@@ -297,6 +297,61 @@ def test_typed_local_publication_persists_admitted_manifest_on_receipt_and_linea
     assert run_facts[0]["execution_manifest_sha256"] == digest
 
 
+def test_managed_local_field_lineage_uses_exact_retained_revision(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    source_uri = _register_source(catalog, tmp_path)
+    source = metadb.catalog_get(source_uri)
+    assert source is not None and source["version"] is not None
+    logical_uri = str(tmp_path / "published" / "field-lineage.parquet")
+    run_id = f"managed-field-lineage-{uuid.uuid4().hex}"
+    artifact = storage.begin_result(f"managed-file:{logical_uri}", run_id)
+    pq.write_table(pa.table({"value": [1]}), artifact)
+    storage.commit_result(artifact, run_id)
+    lineage = LineagePublication.model_validate({
+        "idempotency_key": f"managed-field-lineage-{uuid.uuid4().hex}",
+        "provenance": "manual",
+        "field_mappings": [{
+            "source_dataset_id": source["registrationId"],
+            "source_version": source["version"],
+            "source_field": "source",
+            "source_field_id": None,
+            "destination_field": "value",
+        }],
+    })
+    try:
+        published = catalog.publish_managed_local_file_output(
+            name="managed_field_lineage",
+            logical_uri=logical_uri,
+            artifact_uri=artifact,
+            parents=[source_uri],
+            lineage=lineage,
+        )
+    finally:
+        assert storage.release_result(artifact, run_id) is True
+
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        published["dataset_id"],
+        published["revision_id"],
+        ["value"],
+    )
+    assert cursor is None and truncated is False and available is True
+    assert len(rows) == 1
+    assert (
+        rows[0]["source_dataset_id"],
+        rows[0]["source_version"],
+        rows[0]["destination_dataset_id"],
+        rows[0]["destination_revision_id"],
+        rows[0]["destination_field"],
+    ) == (
+        source["registrationId"],
+        source["version"],
+        published["dataset_id"],
+        published["revision_id"],
+        "value",
+    )
+
+
 def test_typed_local_write_preconditions_fail_before_artifact_allocation(
         local_catalog, tmp_path, monkeypatch):
     storage, catalog = local_catalog

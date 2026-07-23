@@ -1208,6 +1208,50 @@ class CatalogLineageFact(Base):
     )
 
 
+class CatalogFieldLineageProjection(Base):
+    """One normalized exact-output projection for a source-owned field mapping."""
+
+    __tablename__ = "catalog_field_lineage_projections"
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    projection_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    fact_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        ForeignKey("catalog_lineage_facts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    fact_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    publication_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    source_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_field: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_field_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    destination_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    destination_revision_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    destination_field: Mapped[str] = mapped_column(String(512), nullable=False)
+    destination_dataset_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    destination_revision_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    destination_field_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "projection_key", name="uq_catalog_field_lineage_projection_key"
+        ),
+        Index(
+            "ix_catalog_field_lineage_exact_output",
+            "destination_dataset_hash",
+            "destination_revision_hash",
+            "destination_field_hash",
+            "id",
+        ),
+        Index("ix_catalog_field_lineage_fact_id", "fact_id"),
+        {"sqlite_autoincrement": True},
+    )
+
+
 class CatalogPublicationEvent(Base):
     """One durable catalog effect from an idempotent external-run publication."""
     __tablename__ = "catalog_publication_events"
@@ -16698,9 +16742,8 @@ def _catalog_lineage_canonical(lineage: dict | None, parent_count: int) -> dict 
     )
     if len(mappings_json.encode("utf-8")) > 64 * 1024:
         raise ValueError("catalog lineage field mappings exceed 64 KiB")
-    if parent_count != 1 and canonical["field_mappings"]:
-        raise ValueError(
-            "catalog lineage field mappings require exactly one source per publication")
+    if not parent_count and canonical["field_mappings"]:
+        raise ValueError("catalog lineage field mappings require an admitted source")
     return {**canonical, "field_mappings_json": mappings_json}
 
 
@@ -16724,14 +16767,14 @@ def _catalog_lineage_publication_identity(
         lineage["idempotency_key"].encode("utf-8")
     ).hexdigest()
     semantic = {
-        "schema_version": 2,
+        "schema_version": 3,
         "idempotency_key": lineage["idempotency_key"],
         "parents": parent_tokens,
         "destination_uri": destination_uri,
         "destination_version": destination_version,
         "lineage": _catalog_lineage_publication_semantic(lineage),
     }
-    fingerprint = "lineage-publication:v2:sha256:" + hashlib.sha256(json.dumps(
+    fingerprint = "lineage-publication:v3:sha256:" + hashlib.sha256(json.dumps(
         semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")).hexdigest()
     return publication_key, fingerprint
@@ -16924,6 +16967,7 @@ def _catalog_lineage_source_snapshot(
             "source_uri": snapshot.resolved_source_uri,
             "source_version": snapshot.entry_version,
             "source_registration_id": snapshot.entry_registration_id,
+            "source_dataset_id": snapshot.logical_id or snapshot.entry_registration_id,
         }
     if snapshot.entry_uri is not None:
         return {
@@ -16931,6 +16975,7 @@ def _catalog_lineage_source_snapshot(
             "source_uri": snapshot.entry_uri,
             "source_version": snapshot.entry_version,
             "source_registration_id": snapshot.entry_registration_id,
+            "source_dataset_id": snapshot.entry_registration_id,
         }
     parent_logical = locked_logicals.get(snapshot.logical_id) \
         if snapshot.logical_id is not None else None
@@ -16964,12 +17009,133 @@ def _catalog_lineage_source_snapshot(
         "source_uri": _catalog_lineage_uri(source_uri, field="source URI"),
         "source_version": _catalog_entry_version(entry),
         "source_registration_id": entry.registration_id if entry is not None else None,
+        "source_dataset_id": (
+            snapshot.logical_id
+            or (entry.registration_id if entry is not None else None)
+        ),
     }
+
+
+def _catalog_lineage_destination_identity(
+        s, destination_uri: str, destination_version: str | None) -> tuple[str, str | None]:
+    """Resolve the stable dataset and exact retained revision for one locked destination."""
+    entry = s.get(CatalogEntry, destination_uri)
+    if entry is None:
+        raise RuntimeError("catalog lineage destination is not registered")
+    dataset_id = entry.logical_id or entry.registration_id
+    revision_id = destination_version
+    if entry.logical_id is not None:
+        revision_id = s.scalar(select(ManagedLocalFileRevision.revision_id).where(
+            ManagedLocalFileRevision.logical_id == entry.logical_id,
+            ManagedLocalFileRevision.artifact_uri == destination_uri,
+        ).limit(1)) or revision_id
+    if not dataset_id or len(dataset_id) > 128:
+        raise RuntimeError("catalog lineage destination has no bounded stable dataset identity")
+    if revision_id is not None and (
+            not revision_id or revision_id != revision_id.strip() or len(revision_id) > 512):
+        raise RuntimeError("catalog lineage destination has no bounded exact revision identity")
+    return dataset_id, revision_id
+
+
+def _catalog_lineage_by_source(sources: dict[str, dict], lineage: dict) -> dict[str, dict]:
+    """Bind every mapping to exactly one admitted, stable, exact source."""
+    sources_by_dataset_id: dict[str, tuple[str, dict]] = {}
+    for source_key, source in sources.items():
+        dataset_id = source["source_dataset_id"]
+        prior = sources_by_dataset_id.get(dataset_id) if dataset_id is not None else None
+        if prior is not None and prior[1] != source:
+            raise ValueError(
+                "catalog lineage publication admits one source dataset through multiple identities"
+            )
+        if dataset_id is not None:
+            sources_by_dataset_id[dataset_id] = (source_key, source)
+
+    mappings_by_source = {source_key: [] for source_key in sources}
+    for mapping in lineage["field_mappings"]:
+        admitted = sources_by_dataset_id.get(mapping["source_dataset_id"])
+        if admitted is None:
+            raise ValueError(
+                "catalog lineage field mapping names an unadmitted source dataset"
+            )
+        source_key, source = admitted
+        if mapping["source_version"] != source["source_version"]:
+            raise ValueError(
+                "catalog lineage field mapping names the wrong exact source version"
+            )
+        mappings_by_source[source_key].append(mapping)
+
+    out: dict[str, dict] = {}
+    for source_key, mappings in mappings_by_source.items():
+        source_lineage = {**lineage, "field_mappings": mappings}
+        source_lineage["field_mappings_json"] = json.dumps(
+            mappings, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        out[source_key] = source_lineage
+    return out
+
+
+def _catalog_insert_field_lineage_projection(
+        s, *, fact_id: int, fact_key: str, publication_key: str,
+        source: dict, destination_dataset_id: str, destination_revision_id: str,
+        mapping: dict, created_at: datetime.datetime) -> None:
+    semantic = {
+        "schema_version": 1,
+        "fact_key": fact_key,
+        "publication_key": publication_key,
+        "source_dataset_id": mapping["source_dataset_id"],
+        "source_version": mapping["source_version"],
+        "source_field": mapping["source_field"],
+        "source_field_id": mapping["source_field_id"],
+        "destination_dataset_id": destination_dataset_id,
+        "destination_revision_id": destination_revision_id,
+        "destination_field": mapping["destination_field"],
+    }
+    if semantic["source_dataset_id"] != source["source_dataset_id"]:
+        raise RuntimeError("catalog field lineage source projection is inconsistent")
+    projection_key = "field-lineage:v1:sha256:" + hashlib.sha256(json.dumps(
+        semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")).hexdigest()
+    values = {
+        "projection_key": projection_key,
+        "fact_id": fact_id,
+        **semantic,
+        "destination_dataset_hash": _catalog_lineage_identity_hash(
+            destination_dataset_id),
+        "destination_revision_hash": _catalog_lineage_identity_hash(
+            destination_revision_id),
+        "destination_field_hash": _catalog_lineage_identity_hash(
+            mapping["destination_field"]),
+        "created_at": created_at,
+    }
+    values.pop("schema_version")
+    dialect = s.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover
+        raise RuntimeError(f"unsupported catalog field lineage dialect: {dialect}")
+    s.execute(dialect_insert(CatalogFieldLineageProjection).values(
+        **values,
+    ).on_conflict_do_nothing(
+        index_elements=[CatalogFieldLineageProjection.projection_key],
+    ))
+    winner = s.scalars(select(CatalogFieldLineageProjection).where(
+        CatalogFieldLineageProjection.projection_key == projection_key).limit(1)).first()
+    if winner is None:  # pragma: no cover
+        raise RuntimeError("catalog field lineage projection reservation failed")
+    persisted = {
+        key: getattr(winner, key) for key in values if key != "created_at"
+    }
+    expected = {key: value for key, value in values.items() if key != "created_at"}
+    if persisted != expected:
+        raise RuntimeError("catalog field lineage projection collision")
 
 
 def _catalog_insert_lineage_fact(
         s, *, publication_key: str, source: dict, destination_key: str, destination_uri: str,
-        destination_version: str | None, lineage: dict) -> bool:
+        destination_version: str | None, destination_dataset_id: str,
+        destination_revision_id: str | None, lineage: dict) -> bool:
     public_source = {
         key: source[key] for key in ("source_key", "source_uri", "source_version")
     }
@@ -16981,7 +17147,7 @@ def _catalog_insert_lineage_fact(
         if lineage["run_id"] is not None else None
     )
     semantic = {
-        "schema_version": 1,
+        "schema_version": 2,
         "fact_key": fact_key,
         "publication_key": publication_key,
         **public_source,
@@ -17007,7 +17173,7 @@ def _catalog_insert_lineage_fact(
         **{key: value for key, value in semantic.items() if key != "schema_version"},
         "created_at": created_at,
     })
-    fingerprint = "lineage-fact:v1:sha256:" + hashlib.sha256(json.dumps(
+    fingerprint = "lineage-fact:v2:sha256:" + hashlib.sha256(json.dumps(
         semantic, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")).hexdigest()
     values = {
@@ -17055,6 +17221,23 @@ def _catalog_insert_lineage_fact(
     if persisted != expected:
         raise RuntimeError(
             f"catalog lineage idempotency key collision: {lineage['idempotency_key']}")
+    if lineage["field_mappings"]:
+        if destination_revision_id is None:
+            raise ValueError(
+                "catalog field lineage requires an exact destination revision identity"
+            )
+        for mapping in lineage["field_mappings"]:
+            _catalog_insert_field_lineage_projection(
+                s,
+                fact_id=int(winner.id),
+                fact_key=fact_key,
+                publication_key=publication_key,
+                source=source,
+                destination_dataset_id=destination_dataset_id,
+                destination_revision_id=destination_revision_id,
+                mapping=mapping,
+                created_at=created_at,
+            )
     return inserted_id is not None
 
 
@@ -17079,13 +17262,20 @@ def _catalog_apply_lineage_in_session(
             raise ValueError(
                 "catalog lineage publication names multiple versions of one source identity")
         sources[source["source_key"]] = source
+    destination_dataset_id, destination_revision_id = _catalog_lineage_destination_identity(
+        s, destination_uri, destination_version
+    )
+    lineage_by_source = _catalog_lineage_by_source(sources, lineage)
     inserted = 0
     for source_key in sorted(sources):
         inserted += int(_catalog_insert_lineage_fact(
             s, publication_key=publication_key, source=sources[source_key],
             destination_key=destination_key,
             destination_uri=destination_uri,
-            destination_version=destination_version, lineage=lineage))
+            destination_version=destination_version,
+            destination_dataset_id=destination_dataset_id,
+            destination_revision_id=destination_revision_id,
+            lineage=lineage_by_source[source_key]))
     return inserted
 
 
@@ -19566,6 +19756,14 @@ def catalog_entries() -> list[dict]:
         return [_row_to_doc(r, tag_map.get(r.uri, [])) for r in rows]
 
 
+def _delete_catalog_lineage_facts(s, lineage_predicate) -> None:
+    """Delete normalized projections with their facts on SQLite as well as PostgreSQL."""
+    fact_ids = select(CatalogLineageFact.id).where(lineage_predicate)
+    s.execute(delete(CatalogFieldLineageProjection).where(
+        CatalogFieldLineageProjection.fact_id.in_(fact_ids)))
+    s.execute(delete(CatalogLineageFact).where(lineage_predicate))
+
+
 def _delete_catalog_children(s, uris: list[str]) -> set[str | None]:
     """Remove EVERY row keyed to `uris` alongside the entries themselves — tags/columns/embeddings,
     lineage facts (either endpoint), declared keys, and relationships. Otherwise a deleted table
@@ -19598,7 +19796,7 @@ def _delete_catalog_children(s, uris: list[str]) -> set[str | None]:
         execution_manifest_candidates.update(s.scalars(select(
             CatalogLineageFact.execution_manifest_sha256,
         ).where(lineage_predicate)))
-        s.execute(delete(CatalogLineageFact).where(lineage_predicate))
+        _delete_catalog_lineage_facts(s, lineage_predicate)
     gone = set(uris)
     for r in s.scalars(select(CatalogRelationship)):
         try:
@@ -19630,7 +19828,7 @@ def _delete_catalog_governance(s, catalog_key: str) -> set[str | None]:
     execution_manifest_candidates = set(s.scalars(select(
         CatalogLineageFact.execution_manifest_sha256,
     ).where(lineage_predicate)))
-    s.execute(delete(CatalogLineageFact).where(lineage_predicate))
+    _delete_catalog_lineage_facts(s, lineage_predicate)
     for relationship in s.scalars(select(CatalogRelationship)):
         try:
             doc = json.loads(relationship.doc)
@@ -20059,6 +20257,109 @@ def catalog_lineage_facts_page(
         page = rows[:bounded]
         next_after_id = int(page[-1].id) if has_more and page else None
         return [_catalog_lineage_fact_dict(row) for row in page], next_after_id, has_more
+
+
+def _catalog_field_lineage_projection_dict(
+        row: CatalogFieldLineageProjection) -> dict:
+    created_at = row.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    return {
+        "id": int(row.id),
+        "fact_key": row.fact_key,
+        "publication_key": row.publication_key,
+        "source_dataset_id": row.source_dataset_id,
+        "source_version": row.source_version,
+        "source_field": row.source_field,
+        "source_field_id": row.source_field_id,
+        "destination_dataset_id": row.destination_dataset_id,
+        "destination_revision_id": row.destination_revision_id,
+        "destination_field": row.destination_field,
+        "created_at": created_at,
+    }
+
+
+def _catalog_exact_output_exists_in_session(
+        s, dataset_id: str, revision_id: str,
+        dataset_hash: str, revision_hash: str) -> bool:
+    retained_projection = s.scalar(select(
+        CatalogFieldLineageProjection.id).where(
+            CatalogFieldLineageProjection.destination_dataset_hash == dataset_hash,
+            CatalogFieldLineageProjection.destination_dataset_id == dataset_id,
+            CatalogFieldLineageProjection.destination_revision_hash == revision_hash,
+            CatalogFieldLineageProjection.destination_revision_id == revision_id,
+        ).limit(1))
+    if retained_projection is not None:
+        return True
+    if s.scalar(select(ManagedLocalFileRevision.revision_id).where(
+            ManagedLocalFileRevision.logical_id == dataset_id,
+            ManagedLocalFileRevision.revision_id == revision_id,
+        ).limit(1)) is not None:
+        return True
+    if s.scalar(select(ManagedLocalLanceWriteReceipt.revision_id).where(
+            ManagedLocalLanceWriteReceipt.dataset_id == dataset_id,
+            ManagedLocalLanceWriteReceipt.revision_id == revision_id,
+        ).limit(1)) is not None:
+        return True
+    entries = list(s.scalars(select(CatalogEntry).where(or_(
+        CatalogEntry.registration_id == dataset_id,
+        CatalogEntry.logical_id == dataset_id,
+    ))))
+    return any(_catalog_entry_version(entry) == revision_id for entry in entries)
+
+
+def catalog_field_lineage_page(
+        dataset_id: str, revision_id: str, destination_fields: list[str],
+        limit: int = 100, after_id: int = 0,
+) -> tuple[list[dict], int | None, bool, bool]:
+    """Look up bounded projections for selected fields of one exact output revision."""
+    if (not isinstance(dataset_id, str) or not dataset_id
+            or dataset_id != dataset_id.strip() or len(dataset_id) > 128):
+        raise ValueError("field lineage dataset identity is invalid")
+    if (not isinstance(revision_id, str) or not revision_id
+            or revision_id != revision_id.strip() or len(revision_id) > 512):
+        raise ValueError("field lineage revision identity is invalid")
+    if (not isinstance(destination_fields, list) or not destination_fields
+            or len(destination_fields) > 100):
+        raise ValueError("field lineage requires between 1 and 100 destination fields")
+    fields = sorted(set(destination_fields))
+    if len(fields) != len(destination_fields) or any(
+            not isinstance(field, str) or not field or field != field.strip()
+            or len(field) > 512 for field in fields):
+        raise ValueError("field lineage destination fields are invalid or duplicated")
+    if (isinstance(after_id, bool) or not isinstance(after_id, int)
+            or after_id < 0 or after_id >= 2**63):
+        raise ValueError("field lineage cursor must be a signed non-negative BIGINT")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        raise ValueError("field lineage limit must be between 1 and 500")
+
+    dataset_hash = _catalog_lineage_identity_hash(dataset_id)
+    revision_hash = _catalog_lineage_identity_hash(revision_id)
+    field_hashes = [_catalog_lineage_identity_hash(field) for field in fields]
+    exact_output = (
+        CatalogFieldLineageProjection.destination_dataset_hash == dataset_hash,
+        CatalogFieldLineageProjection.destination_dataset_id == dataset_id,
+        CatalogFieldLineageProjection.destination_revision_hash == revision_hash,
+        CatalogFieldLineageProjection.destination_revision_id == revision_id,
+        CatalogFieldLineageProjection.destination_field_hash.in_(field_hashes),
+        CatalogFieldLineageProjection.destination_field.in_(fields),
+    )
+    with session() as s:
+        rows = list(s.scalars(select(CatalogFieldLineageProjection).where(
+            *exact_output,
+            CatalogFieldLineageProjection.id > after_id,
+        ).order_by(CatalogFieldLineageProjection.id.asc()).limit(limit + 1)))
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        available = _catalog_exact_output_exists_in_session(
+            s, dataset_id, revision_id, dataset_hash, revision_hash)
+        next_after_id = int(page[-1].id) if has_more and page else None
+        return (
+            [_catalog_field_lineage_projection_dict(row) for row in page],
+            next_after_id,
+            has_more,
+            available,
+        )
 
 
 # -- semantic search (opt-in: only populated when an embedder is registered) ----------------------- #

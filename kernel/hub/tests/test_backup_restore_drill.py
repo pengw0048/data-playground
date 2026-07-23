@@ -865,7 +865,10 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     metadb.catalog_upsert_entry(
         parent_uri, "drill-parent",
         {"id": "drill_parent", "name": "drill-parent", "uri": parent_uri,
+         "version": "parent-v1",
          "columns": [{"name": "id", "type": "int64"}]})
+    parent = metadb.catalog_get(parent_uri)
+    assert parent is not None
     lineage_idempotency_key = f"backup-restore-drill-{uuid.uuid4().hex}"
     lineage_publication_key = (
         "lineage-publication:v1:sha256:"
@@ -874,18 +877,27 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     metadb.catalog_upsert_entry(
         child_uri, "drill-child",
         {"id": "drill_child", "name": "drill-child", "uri": child_uri,
+         "version": "child-v1",
          "columns": [{"name": "id", "type": "int64"}]},
         parents=[parent_uri], pipeline="backup-restore-drill",
         lineage=_lineage(
             lineage_idempotency_key,
-            mappings=[{"source_field": "id", "destination_field": "id"}],
+            mappings=[{
+                "source_dataset_id": parent["registrationId"],
+                "source_version": "parent-v1",
+                "source_field": "id",
+                "source_field_id": None,
+                "destination_field": "id",
+            }],
         ))
+    child = metadb.catalog_get(child_uri)
+    assert child is not None
     with metadb.session() as session:
         lineage_receipt = _lineage_receipt_identity(session, lineage_publication_key)
     assert lineage_receipt["effect_type"] == "lineage"
     assert lineage_receipt["uri"] == child_uri
-    assert lineage_receipt["version"] is None
-    assert lineage_receipt["fingerprint"].startswith("lineage-publication:v2:sha256:")
+    assert lineage_receipt["version"] == "child-v1"
+    assert lineage_receipt["fingerprint"].startswith("lineage-publication:v3:sha256:")
 
     revision_catalog = InMemoryCatalog(str(data_dir), lambda _uri: DuckDBAdapter())
     managed_logical_uri = str(data_dir / "managed-recovery.parquet")
@@ -1087,7 +1099,9 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "overlays": overlays,
         "provider_canonical": provider_canonical,
         "parent_uri": parent_uri,
+        "parent_dataset_id": parent["registrationId"],
         "child_uri": child_uri,
+        "child_dataset_id": child["registrationId"],
         "lineage_publication_key": lineage_publication_key,
         "lineage_receipt": lineage_receipt,
         "run_id": run_id,
@@ -1171,8 +1185,25 @@ def _assert_fixture_readable(info: dict, *, outputs_root: Path) -> None:
             metadb.CatalogLineageFact.destination_uri == info["child_uri"]))
         assert fact is not None
         assert json.loads(fact.field_mappings_json) == [
-            {"destination_field": "id", "source_field": "id"},
+            {
+                "destination_field": "id",
+                "source_dataset_id": info["parent_dataset_id"],
+                "source_field": "id",
+                "source_field_id": None,
+                "source_version": "parent-v1",
+            },
         ]
+        projection = session.scalar(select(
+            metadb.CatalogFieldLineageProjection).where(
+                metadb.CatalogFieldLineageProjection.destination_dataset_id
+                == info["child_dataset_id"]))
+        assert projection is not None
+        assert (
+            projection.source_dataset_id,
+            projection.source_version,
+            projection.destination_revision_id,
+            projection.destination_field,
+        ) == (info["parent_dataset_id"], "parent-v1", "child-v1", "id")
         assert _lineage_receipt_identity(
             session, info["lineage_publication_key"]) == info["lineage_receipt"]
     restored_file = outputs_root / info["artifact_rel"]

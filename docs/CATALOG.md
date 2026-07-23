@@ -85,6 +85,8 @@ multi-valued fields:
   source and destination projections resolved on first commit (including versions when available), a
   shared `publication_key` (`publicationKey` on the wire), run/attempt/producer identity, and bounded
   field mappings
+- `catalog_field_lineage_projections` — normalized, source-owned mappings keyed by stable source
+  dataset/version and exact destination dataset/revision, written atomically with each new fact
 - `catalog_publication_events` — durable output, lineage-publication, and usage receipts; lineage
   receipts remain after unregister as retry tombstones
 - `catalog_embeddings` — `(uri, model, dim, vec)` when an embedder is registered
@@ -111,6 +113,10 @@ Key endpoints under `/api`:
   `publicationKey` groups every source fact created by one output publication. The route rejects a
   provider page that exceeds `limit`, returns IDs at or before `afterId`, is not strictly increasing,
   or advertises a continuation that does not advance to the last returned ID.
+- `GET /catalog/lineage/fields?datasetId&revisionId&destinationFields&limit&afterId` — bounded
+  field-to-source evidence for selected fields of one exact output revision. It returns an explicit
+  `available`, `unsupported`, `unavailable`, or `truncated` state; truncated pages carry the last
+  returned decimal-string ID as `nextAfterId`.
 - `GET /catalog/tables/{id}/revisions?limit&cursor` — bounded newest-first native revision history
   for adapters that support it. `datasetId`, `revisionId`, and the cursor are opaque; `retentionOwner`
   distinguishes provider-native history from core-retained managed files.
@@ -200,11 +206,14 @@ original sources. An empty source set is still a complete reserved publication. 
 but retains the receipt as a tombstone, so an old retry cannot attach to or recreate a new registration;
 a genuinely new publication after re-registration needs a new idempotency key.
 
-`LineagePublication.field_mappings` (`fieldMappings` on the wire) currently identifies only source and
-destination column names; it has no source-dataset field. Non-empty mappings are therefore accepted only
-for a publication with exactly one source. A multi-source publication with mappings fails closed instead
-of copying or guessing which source owns a mapping. Multi-source publications without mappings still
-create one fact per distinct source.
+Each new `LineagePublication.field_mappings` item (`fieldMappings` on the wire) identifies a stable
+source dataset, its exact version, the source and destination field names, and an optional stable source
+field ID. Multi-source publications are accepted only when every mapping resolves to exactly one
+admitted source at that version. Missing, duplicate, contradictory, unadmitted, or wrong-version
+ownership fails the complete output transaction. The canonical mapping order and publication
+fingerprint include the full ownership contract, and each source fact contains only that source's
+mappings. Facts committed before this contract remain evidence-poor exports with null source ownership;
+the forward migration does not invent or backfill identity.
 
 `GET /catalog/lineage` aggregates these facts into a compact graph. Its `rootUri` resolves a managed
 logical URI, catalog key, or other provider alias to the same current identity used by the returned
@@ -217,6 +226,11 @@ not CDC and does not promise one transactionally frozen snapshot across a multi-
 deletes touching facts, and the export has no deletion events or tombstones. An external mirror must
 therefore periodically perform a full scan from `afterId=0` and reconcile its complete local view rather
 than treating an ever-increasing cursor as a permanent sync log.
+
+Exact field lookup is a separate optional `CatalogFieldLineageExporter` capability. The route returns
+`state=unsupported` when the selected provider omits it and never consults the built-in metadata store
+behind that provider. Provider pages must remain within the requested exact dataset/revision, selected
+destination fields, limit, and monotonic cursor window.
 
 `CatalogLineageRecorder` is a separate optional capability for attaching the current run's facts to an
 already-published exact catalog output during a cache reuse. A catalog cache candidate is reusable only

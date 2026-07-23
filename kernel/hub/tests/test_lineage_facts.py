@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import json
 import threading
 import uuid
 
@@ -46,8 +47,14 @@ def _register(
 
 def _lineage(
         key: str, *, producer_version: int = 1,
-        mappings: list[tuple[str, str]] | None = None) -> dict:
-    canonical_mappings = sorted(set(mappings or []))
+        mappings: list[dict] | None = None) -> dict:
+    canonical_mappings = sorted(
+        mappings or [],
+        key=lambda mapping: tuple(str(mapping.get(field) or "") for field in (
+            "source_dataset_id", "source_version", "source_field",
+            "source_field_id", "destination_field",
+        )),
+    )
     return {
         "idempotency_key": key,
         "run_id": f"run-{key}",
@@ -56,10 +63,7 @@ def _lineage(
         "producer_version": producer_version,
         "step_id": "write-output",
         "provenance": "run",
-        "field_mappings": [
-            {"source_field": source, "destination_field": destination}
-            for source, destination in canonical_mappings
-        ],
+        "field_mappings": canonical_mappings,
     }
 
 
@@ -76,6 +80,54 @@ def _registration_id(uri: str) -> str:
     return str(registration_id)
 
 
+def _mapping(
+        source_uri: str, source_version: str, source_field: str,
+        destination_field: str, source_field_id: str | None = None) -> dict:
+    return {
+        "source_dataset_id": _registration_id(source_uri),
+        "source_version": source_version,
+        "source_field": source_field,
+        "source_field_id": source_field_id,
+        "destination_field": destination_field,
+    }
+
+
+def test_field_mapping_contract_rejects_missing_duplicate_and_contradictory_ownership():
+    from hub.models import LineagePublication
+
+    base = {
+        "source_dataset_id": "source-dataset",
+        "source_version": "source-v1",
+        "source_field": "raw_id",
+        "source_field_id": "field-id",
+        "destination_field": "id",
+    }
+    with pytest.raises(ValueError, match="exact source dataset identity and version"):
+        LineagePublication(
+            idempotency_key="missing-source-identity",
+            provenance="manual",
+            field_mappings=[{
+                "source_field": "raw_id",
+                "destination_field": "id",
+            }],
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        LineagePublication(
+            idempotency_key="duplicate-field-mapping",
+            provenance="manual",
+            field_mappings=[base, base],
+        )
+    with pytest.raises(ValueError, match="contradictory source ownership"):
+        LineagePublication(
+            idempotency_key="contradictory-field-mapping",
+            provenance="manual",
+            field_mappings=[
+                base,
+                {**base, "source_version": "source-v2", "source_field_id": "other-id"},
+            ],
+        )
+
+
 def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
     source = f"{catalog_scope}source"
     destination = f"{catalog_scope}destination"
@@ -83,7 +135,12 @@ def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
     _register(destination, "destination-v3")
     after_id = _max_fact_id()
     lineage = _lineage(
-        "fact-repeat", mappings=[("raw_b", "feature_b"), ("raw_a", "feature_a")])
+        "fact-repeat",
+        mappings=[
+            _mapping(source, "source-v7", "raw_b", "feature_b"),
+            _mapping(source, "source-v7", "raw_a", "feature_a"),
+        ],
+    )
 
     assert metadb.catalog_record_lineage(destination, "destination-v3", [source], lineage) == 1
     assert metadb.catalog_record_lineage(destination, "destination-v3", [source], lineage) == 0
@@ -121,8 +178,8 @@ def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
         "step_id": "write-output",
         "provenance": "run",
         "field_mappings": [
-            {"source_field": "raw_a", "destination_field": "feature_a"},
-            {"source_field": "raw_b", "destination_field": "feature_b"},
+            _mapping(source, "source-v7", "raw_a", "feature_a"),
+            _mapping(source, "source-v7", "raw_b", "feature_b"),
         ],
     }
     assert fact["created_at"].tzinfo == datetime.timezone.utc
@@ -130,7 +187,11 @@ def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
     with pytest.raises(RuntimeError, match="publication key collision"):
         metadb.catalog_record_lineage(
             destination, "destination-v3", [source],
-            _lineage("fact-repeat", producer_version=2, mappings=[("raw_a", "feature_a")]))
+            _lineage(
+                "fact-repeat",
+                producer_version=2,
+                mappings=[_mapping(source, "source-v7", "raw_a", "feature_a")],
+            ))
 
     assert metadb.catalog_record_lineage(
         destination, "destination-v3", [source], _lineage("fact-distinct")) == 1
@@ -140,15 +201,22 @@ def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
     }]
 
 
-def test_multisource_facts_and_mapping_boundary(catalog_scope):
+def test_multisource_facts_and_exact_field_projections(catalog_scope):
     sources = [f"{catalog_scope}source-{i}" for i in range(3)]
     destination = f"{catalog_scope}destination"
     for i, source in enumerate(sources):
         _register(source, f"source-v{i}")
     _register(destination, "destination-v1")
 
+    mappings = [
+        _mapping(source, f"source-v{i}", f"raw-{i}", f"feature-{i}", f"field-{i}")
+        for i, source in enumerate(sources)
+    ]
+    lineage = _lineage("multi-source", mappings=mappings)
     assert metadb.catalog_record_lineage(
-        destination, "destination-v1", sources, _lineage("multi-source")) == 3
+        destination, "destination-v1", sources, lineage) == 3
+    assert metadb.catalog_record_lineage(
+        destination, "destination-v1", sources, lineage) == 0
     with metadb.session() as s:
         publication_keys = set(s.scalars(select(
             metadb.CatalogLineageFact.publication_key).where(
@@ -161,17 +229,197 @@ def test_multisource_facts_and_mapping_boundary(catalog_scope):
         for source in sources
     ]
 
-    with pytest.raises(ValueError, match="exactly one source"):
+    with metadb.session() as s:
+        facts = list(s.scalars(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.run_id == "run-multi-source"
+        ).order_by(metadb.CatalogLineageFact.source_uri)))
+    assert [row.field_mappings_json for row in facts] == [
+        json.dumps([mapping], sort_keys=True, separators=(",", ":"))
+        for mapping in mappings
+    ]
+
+    destination_dataset_id = _registration_id(destination)
+    first, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id,
+        "destination-v1",
+        ["feature-0", "feature-1", "feature-2"],
+        limit=2,
+    )
+    assert len(first) == 2 and cursor == first[-1]["id"]
+    assert truncated is True and available is True
+    second, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id,
+        "destination-v1",
+        ["feature-0", "feature-1", "feature-2"],
+        limit=2,
+        after_id=first[-1]["id"],
+    )
+    assert len(second) == 1 and cursor is None
+    assert truncated is False and available is True
+    assert {
+        (
+            item["source_dataset_id"],
+            item["source_version"],
+            item["source_field"],
+            item["source_field_id"],
+            item["destination_field"],
+        )
+        for item in [*first, *second]
+    } == {
+        (
+            mapping["source_dataset_id"],
+            mapping["source_version"],
+            mapping["source_field"],
+            mapping["source_field_id"],
+            mapping["destination_field"],
+        )
+        for mapping in mappings
+    }
+    empty, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id,
+        "destination-v1",
+        ["unmapped-field"],
+    )
+    assert empty == [] and cursor is None
+    assert truncated is False and available is True
+    empty, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id,
+        "wrong-destination-v9",
+        ["unmapped-field"],
+    )
+    assert empty == [] and cursor is None
+    assert truncated is False and available is False
+
+    unadmitted = f"{catalog_scope}unadmitted"
+    _register(unadmitted, "unadmitted-v1")
+    with pytest.raises(ValueError, match="unadmitted source dataset"):
         metadb.catalog_record_lineage(
             destination, "destination-v1", sources,
-            _lineage("ambiguous-mapping", mappings=[("left", "out")]))
+            _lineage(
+                "unadmitted-mapping",
+                mappings=[_mapping(unadmitted, "unadmitted-v1", "left", "out")],
+            ))
+    with pytest.raises(ValueError, match="wrong exact source version"):
+        metadb.catalog_record_lineage(
+            destination,
+            "destination-v1",
+            sources,
+            _lineage(
+                "wrong-source-version",
+                mappings=[_mapping(sources[0], "wrong-v9", "left", "out")],
+            ),
+        )
 
-    huge_mappings = [(f"s{i:03d}" + "x" * 508, f"d{i:03d}" + "y" * 508)
-                     for i in range(64)]
+    huge_mappings = [
+        _mapping(
+            sources[0],
+            "source-v0",
+            f"s{i:03d}" + "x" * 508,
+            f"d{i:03d}" + "y" * 508,
+        )
+        for i in range(64)
+    ]
     with pytest.raises(ValueError, match="64 KiB"):
         metadb.catalog_record_lineage(
             destination, "destination-v1", [sources[0]],
             _lineage("oversize-mappings", mappings=huge_mappings))
+
+
+def test_field_mapping_admission_failure_rolls_back_new_output(catalog_scope):
+    admitted = f"{catalog_scope}admitted"
+    unadmitted = f"{catalog_scope}unadmitted"
+    destination = f"{catalog_scope}destination"
+    _register(admitted, "admitted-v1")
+    _register(unadmitted, "unadmitted-v1")
+    lineage = _lineage(
+        "atomic-unadmitted-source",
+        mappings=[_mapping(unadmitted, "unadmitted-v1", "raw_id", "id")],
+    )
+    with metadb.session() as s:
+        before_projections = int(s.scalar(select(func.count()).select_from(
+            metadb.CatalogFieldLineageProjection)) or 0)
+
+    with pytest.raises(ValueError, match="unadmitted source dataset"):
+        metadb.catalog_upsert_entry(
+            destination,
+            "destination",
+            {
+                "id": "tbl_atomic_unadmitted",
+                "name": "destination",
+                "uri": destination,
+                "version": "destination-v1",
+            },
+            parents=[admitted],
+            lineage=lineage,
+        )
+
+    assert metadb.catalog_get(destination) is None
+    with metadb.session() as s:
+        assert not s.scalar(select(metadb.CatalogPublicationEvent.event_key).where(
+            metadb.CatalogPublicationEvent.uri == destination))
+        assert not s.scalar(select(metadb.CatalogLineageFact.id).where(
+            metadb.CatalogLineageFact.destination_uri == destination))
+        assert int(s.scalar(select(func.count()).select_from(
+            metadb.CatalogFieldLineageProjection)) or 0) == before_projections
+
+
+def test_changed_source_ownership_collides_and_registration_cannot_rebind(catalog_scope):
+    sources = [f"{catalog_scope}source-{index}" for index in range(2)]
+    destination = f"{catalog_scope}destination"
+    for source in sources:
+        _register(source, "source-v1")
+    _register(destination, "destination-v1")
+    source_ids = [_registration_id(source) for source in sources]
+    key = "changed-source-ownership"
+    first = _lineage(
+        key, mappings=[_mapping(sources[0], "source-v1", "raw_id", "id")])
+    assert metadb.catalog_record_lineage(
+        destination, "destination-v1", sources, first) == 2
+
+    with pytest.raises(RuntimeError, match="publication key collision"):
+        metadb.catalog_record_lineage(
+            destination,
+            "destination-v1",
+            sources,
+            _lineage(
+                key,
+                mappings=[_mapping(sources[1], "source-v1", "raw_id", "id")],
+            ),
+        )
+
+    destination_dataset_id = _registration_id(destination)
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id, "destination-v1", ["id"])
+    assert cursor is None and truncated is False and available is True
+    assert [row["source_dataset_id"] for row in rows] == [source_ids[0]]
+
+    metadb.catalog_delete_entry(sources[0])
+    _register(sources[0], "source-v1")
+    assert _registration_id(sources[0]) != source_ids[0]
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id, "destination-v1", ["id"])
+    assert rows == [] and cursor is None and truncated is False and available is True
+
+
+def test_known_exact_output_without_mappings_is_available(catalog_scope):
+    source = f"{catalog_scope}source"
+    destination = f"{catalog_scope}destination"
+    _register(source, "source-v1")
+    _register(destination, "destination-v1")
+    assert metadb.catalog_record_lineage(
+        destination,
+        "destination-v1",
+        [source],
+        _lineage("no-field-mappings"),
+    ) == 1
+
+    destination_dataset_id = _registration_id(destination)
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id, "destination-v1", ["id"])
+    assert rows == [] and cursor is None and truncated is False and available is True
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id, "missing-v2", ["id"])
+    assert rows == [] and cursor is None and truncated is False and available is False
 
 
 def test_long_raw_identity_is_indexed_by_hash_without_changing_export(catalog_scope):
@@ -617,7 +865,10 @@ def test_postgres_concurrent_identical_initial_upsert_is_one_publication(catalog
     source = f"{catalog_scope}source"
     destination = f"{catalog_scope}destination"
     _register(source, "source-v1")
-    lineage = _lineage("concurrent-initial-upsert")
+    lineage = _lineage(
+        "concurrent-initial-upsert",
+        mappings=[_mapping(source, "source-v1", "raw_id", "id")],
+    )
     barrier = threading.Barrier(2)
 
     def publish() -> bool:
@@ -634,7 +885,11 @@ def test_postgres_concurrent_identical_initial_upsert_is_one_publication(catalog
     with metadb.session() as s:
         facts = list(s.scalars(select(metadb.CatalogLineageFact).where(
             metadb.CatalogLineageFact.run_id == "run-concurrent-initial-upsert")))
-    assert len(facts) == 1
+        projections = list(s.scalars(select(
+            metadb.CatalogFieldLineageProjection).where(
+                metadb.CatalogFieldLineageProjection.fact_id.in_(
+                    [fact.id for fact in facts]))))
+    assert len(facts) == 1 and len(projections) == 1
 
 
 @pytest.mark.parametrize("retired_target", ["source", "destination"])
