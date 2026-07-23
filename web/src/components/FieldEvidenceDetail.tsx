@@ -66,7 +66,9 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
     setTarget(null); setTargetError(null)
     if (!reference) { setTargetState('idle'); return () => { live = false } }
     setTargetState('loading')
-    void api.table(reference.target.datasetId).then((resolved) => {
+    // A row reference names a retained catalog identity, never a display-name/current-head lookup.
+    // `table()` may resolve a stale logical id to another current registration; keep this strict.
+    void api.tableByRegistration(reference.target.datasetId).then((resolved) => {
       if (!live) return
       setTarget(resolved); setTargetState('idle')
     }).catch((error) => {
@@ -102,7 +104,7 @@ export function FieldEvidenceContent({ column }: { column: ColumnSchema }) {
         {target && <div className="rounded border border-border bg-muted/30 p-1.5">
           <div>Current catalog display: <strong>{target.name}</strong></div>
           <div className="mt-0.5 break-all font-mono text-[9.5px]">catalog:{target.registrationId ?? target.id}</div>
-          <a href={`#/workspace/${encodeURIComponent(target.registrationId ?? target.id)}`} className="mt-1 inline-block font-semibold text-primary underline">Open current catalog entry</a>
+          <a href={`#/workspace/${encodeURIComponent(`dataset:${target.registrationId ?? target.id}`)}`} className="mt-1 inline-block font-semibold text-primary underline">Open current catalog entry</a>
           <div className="mt-1 text-[9.5px] text-muted-foreground">The retained reference above is not replaced by this current display.</div>
         </div>}
       </>}

@@ -59,6 +59,31 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     expect(screen.getByText(/\b0\s*rows/)).toBeInTheDocument()
   })
 
+  it('uses the selected provider exact schema for field evidence even without a local catalog table', async () => {
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'provider-orders', revisionId: 'empty-r7', retentionOwner: 'provider', summary: { rowCount: 0 },
+      preview: {
+        columns: [{ name: 'customer_id', type: 'int64', physicalType: 'INT64', nullable: false, hasDefault: null,
+          fieldId: 'provider.customer_id', provenance: 'provider', capabilities: [],
+          annotations: [{ key: 'provider.note', value: 'selected exact schema', encoding: 'utf8', provenance: 'provider' }] }],
+        rows: [], hasMore: false, rowLimit: 100,
+      },
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
+    render1({ title: 'provider orders', status: 'latest', config: {
+      providerResourceRef: 'dataset:provider-orders', providerName: 'fixture', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
+    } })
+
+    expect(await screen.findByText('Field evidence · 1 columns')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Field evidence · 1 columns'))
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
+    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
+    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
+    expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
+  })
+
   it('cold start: kernel up + no recents fetches a server page, then says the catalog is empty (not "offline")', async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     useStore.setState({ kernelUp: true, catalog: [] } as any)

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup } from '@testing-library/react'
 import type { ColumnSchema } from '../types/graph'
 
-const mocks = vi.hoisted(() => ({ table: vi.fn() }))
+const mocks = vi.hoisted(() => ({ table: vi.fn(), tableByRegistration: vi.fn() }))
 vi.mock('../api/client', () => ({ api: mocks }))
 
 import { FieldEvidenceButton } from './FieldEvidenceDetail'
@@ -23,7 +23,8 @@ describe('FieldEvidenceButton', () => {
   afterEach(() => cleanup())
 
   it('keeps an exact row-reference identity while opening the resolved current catalog entry', async () => {
-    mocks.table.mockResolvedValue({ id: 'customers-registration', registrationId: 'customers-registration', name: 'Customers (renamed)', uri: 'mem://customers', columns: [] })
+    mocks.table.mockResolvedValue({ id: 'stale-collision', registrationId: 'stale-collision', name: 'Wrong current dataset', uri: 'mem://wrong', columns: [] })
+    mocks.tableByRegistration.mockResolvedValue({ id: 'customers-registration', registrationId: 'customers registration/1', name: 'Customers (renamed)', uri: 'mem://customers', columns: [] })
     render(<FieldEvidenceButton column={CUSTOMER} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
@@ -31,12 +32,13 @@ describe('FieldEvidenceButton', () => {
     expect(screen.getByText('owned by the orders provider')).toBeVisible()
     expect(screen.getByText('utf8')).toBeVisible()
     await waitFor(() => expect(screen.getByText('Customers (renamed)')).toBeVisible())
-    expect(screen.getByRole('link', { name: 'Open current catalog entry' })).toHaveAttribute('href', '#/workspace/customers-registration')
-    expect(mocks.table).toHaveBeenCalledWith('customers-logical')
+    expect(screen.getByRole('link', { name: 'Open current catalog entry' })).toHaveAttribute('href', '#/workspace/dataset%3Acustomers%20registration%2F1')
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith('customers-logical')
+    expect(mocks.table).not.toHaveBeenCalled()
   })
 
   it('reports an unavailable target without replacing it with a current dataset', async () => {
-    mocks.table.mockRejectedValue({ status: 410, message: 'compacted' })
+    mocks.tableByRegistration.mockRejectedValue({ status: 410, message: 'compacted' })
     render(<FieldEvidenceButton column={CUSTOMER} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
@@ -54,6 +56,6 @@ describe('FieldEvidenceButton', () => {
     expect(detail).toHaveTextContent('not supplied')
     expect(detail).toHaveTextContent('No row-reference target was supplied.')
     expect(detail).toHaveTextContent('No safe raw annotations were supplied. Values excluded by the adapter redaction contract are not exposed here.')
-    expect(mocks.table).not.toHaveBeenCalled()
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
   })
 })

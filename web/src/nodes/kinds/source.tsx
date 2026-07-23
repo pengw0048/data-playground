@@ -66,6 +66,30 @@ function Source({ id, data }: NodeComponentProps) {
     ? datasetRefIdentity(datasetRef).revisionId : undefined
   const providerRevisionLabel = providerRevision && providerRevision.length > 24
     ? `${providerRevision.slice(0, 12)}…${providerRevision.slice(-8)}` : providerRevision
+  const selectedExact = datasetRef && !isParameterRef(datasetRef) ? datasetRefIdentity(datasetRef) : null
+  const [exactDetail, setExactDetail] = useState<DatasetRevisionDetail | null>(null)
+  const [exactDetailState, setExactDetailState] = useState<ExactRevisionState>('idle')
+  const [exactDetailRequest, setExactDetailRequest] = useState(0)
+
+  // The selected exact revision is authoritative for a Source schema. In particular, a provider
+  // binding may have no local CatalogTable at all, and a cached catalog row may have moved on.
+  useEffect(() => {
+    let live = true
+    setExactDetail(null)
+    if (!selectedExact) { setExactDetailState('idle'); return () => { live = false } }
+    setExactDetailState('checking')
+    api.datasetRevision(selectedExact.datasetId, selectedExact.revisionId).then((next) => {
+      if (!live) return
+      setExactDetail(next); setExactDetailState('available')
+    }).catch((error) => {
+      if (live) setExactDetailState(exactRevisionFailure(error))
+    })
+    return () => { live = false }
+  }, [selectedExact?.datasetId, selectedExact?.revisionId, exactDetailRequest])
+
+  // Never fall back to the current catalog cache after an exact revision has been selected.
+  // An empty revision still supplies its column schema in the exact detail payload.
+  const evidenceColumns = selectedExact ? exactDetail?.preview.columns : table?.columns
 
   useEffect(() => {
     if (!canEdit) { setOpen(false); setDialog(false) }
@@ -207,10 +231,10 @@ function Source({ id, data }: NodeComponentProps) {
       {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
         Pinned provider revision {providerRevisionLabel}
       </div>}
-      {table && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
-        <summary className="cursor-pointer font-medium text-muted-foreground">Field evidence · {table.columns.length} columns</summary>
+      {evidenceColumns && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
+        <summary className="cursor-pointer font-medium text-muted-foreground">Field evidence · {evidenceColumns.length} columns</summary>
         <div className="mt-1 grid max-h-28 gap-0.5 overflow-y-auto">
-          {table.columns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
+          {evidenceColumns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
         </div>
       </details>}
       {datasetParameters.length > 0 && <select aria-label="Dataset run parameter" value={datasetParameter?.parameterRef ?? ''}
@@ -221,6 +245,7 @@ function Source({ id, data }: NodeComponentProps) {
         {datasetParameters.map((item) => <option key={item.name} value={item.name}>Parameter: {item.label || item.name}</option>)}
       </select>}
       {!datasetParameter && !providerDataset && (table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef as DatasetRef | undefined}
+        exactDetail={exactDetail} exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
@@ -229,10 +254,13 @@ function Source({ id, data }: NodeComponentProps) {
   )
 }
 
-function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
+function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDetailState: detailState, onRetryExact, canEdit, onChange }: {
   nodeId: string
   table?: CatalogTable
   selected?: DatasetRef
+  exactDetail: DatasetRevisionDetail | null
+  exactDetailState: ExactRevisionState
+  onRetryExact: () => void
   canEdit: boolean
   onChange: (value: DatasetRef | undefined) => void
 }) {
@@ -246,9 +274,6 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
   const [hasMore, setHasMore] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [historyError, setHistoryError] = useState('')
-  const [detail, setDetail] = useState<DatasetRevisionDetail | null>(null)
-  const [detailState, setDetailState] = useState<ExactRevisionState>('idle')
-  const [detailRequest, setDetailRequest] = useState(0)
   const [capabilitiesChecking, setCapabilitiesChecking] = useState(true)
   const [exactAvailable, setExactAvailable] = useState(false)
   const [asOfAvailable, setAsOfAvailable] = useState(false)
@@ -309,21 +334,6 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
     })
     return () => { live = false }
   }, [table?.id, table?.uri, request])
-
-  useEffect(() => {
-    let live = true
-    setDetail(null)
-    if (!selected) { setDetailState('idle'); return () => { live = false } }
-    const exact = datasetRefIdentity(selected)
-    setDetailState('checking')
-    api.datasetRevision(exact.datasetId, exact.revisionId).then((next) => {
-      if (!live) return
-      setDetail(next); setDetailState('available')
-    }).catch((error) => {
-      if (live) setDetailState(exactRevisionFailure(error))
-    })
-    return () => { live = false }
-  }, [selected, detailRequest])
 
   const resolveAsOf = async () => {
     if (!table) return
@@ -434,19 +444,19 @@ function RevisionControl({ nodeId, table, selected, canEdit, onChange }: {
       {selectedExact && detailState === 'permission' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           Permission to open exact revision {selectedExact.revisionId} was lost. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
-          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry exact revision</button>
+          <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry exact revision</button>
         </div>
       )}
       {selectedExact && detailState === 'offline' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           The provider is offline, so exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
-          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry provider</button>
+          <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry provider</button>
         </div>
       )}
       {selectedExact && detailState === 'error' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           Exact revision {selectedExact.revisionId} could not be verified. Selection preserved; latest was not substituted.{staleLastKnown}{' '}
-          <button type="button" className="font-semibold underline" onClick={() => setDetailRequest((value) => value + 1)}>Retry verification</button>
+          <button type="button" className="font-semibold underline" onClick={onRetryExact}>Retry verification</button>
         </div>
       )}
       {showControl && <Popover anchorRef={anchorRef} open={open} onClose={() => setOpen(false)} width={320} maxHeight={380}>
