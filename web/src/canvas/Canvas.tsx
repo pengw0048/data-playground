@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, MiniMap,
-  applyNodeChanges, applyEdgeChanges, useReactFlow,
+  applyNodeChanges, applyEdgeChanges, useNodesInitialized, useReactFlow,
+  useStore as useReactFlowStore,
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
 } from '@xyflow/react'
 import { allSpecs, buildNodeTypes } from '../nodes'
@@ -26,6 +27,12 @@ import { locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
 
 const edgeTypes = { wire: WireEdge }
+
+function viewportNodeGeometryIdentity(nodes: readonly Node[]): string {
+  return JSON.stringify(nodes.map((node) => [
+    node.id, node.type ?? null, node.parentId ?? null, node.position.x, node.position.y,
+  ]))
+}
 
 // Directional arrowheads for the wires (open chevrons). Defined once; referenced by id from
 // every edge path. `userSpaceOnUse` keeps them a constant size regardless of stroke width.
@@ -117,7 +124,11 @@ export function Canvas() {
   const removeSelected = useStore((s) => s.removeSelected)
   const bypass = useStore((s) => s.bypass)
   const disable = useStore((s) => s.disable)
-  const { screenToFlowPosition, setCenter, getZoom, fitView } = useReactFlow()
+  const { screenToFlowPosition, setCenter, getZoom, fitView, viewportInitialized } = useReactFlow()
+  const internalNodeGeometryIdentity = useReactFlowStore(
+    (state) => viewportNodeGeometryIdentity(state.nodes),
+  )
+  const nodesInitialized = useNodesInitialized()
   const revealedRequestId = useRef<number | null>(null)
   const fittedRequestId = useRef<number | null>(null)
 
@@ -192,27 +203,48 @@ export function Canvas() {
   }, [doc.nodes, selectedIds])
 
   // React Flow's fitView prop applies only at mount (when a first-run Canvas is still empty). A
-  // successful example open therefore carries one explicit, document-bound request. Consume it only
-  // after every card is measured; the request is then gone, so later renders and user pan/zoom remain
-  // entirely presentation-local.
+  // successful example or saved Canvas open therefore carries one explicit, document-bound request.
+  // Consume it only after every card is measured; the request is then gone, so later renders and
+  // user pan/zoom remain entirely presentation-local.
   useEffect(() => {
     if (!viewportFitRequest || viewportFitRequest.canvasId !== doc.id
         || fittedRequestId.current === viewportFitRequest.id) return
+    // A shareable node= route deliberately owns the initial viewport. This also cancels a normal
+    // open's request if the URL changes to a deep link while React Flow is still mounting.
+    if (nodeRevealRequest?.canvasId === doc.id) {
+      acknowledgeViewportFit(viewportFitRequest.id)
+      return
+    }
     if (viewportFitRequest.documentIdentity !== canvasViewportDocumentIdentity(doc)) {
       acknowledgeViewportFit(viewportFitRequest.id)
       return
     }
-    if (rfNodes.length !== doc.nodes.length || rfNodes.length === 0) return
+    // A locally recovered document can arrive synchronously while React Flow is mounting. Its
+    // cards may already report dimensions before the pan/zoom instance exists; fitView queued in
+    // that window cannot move the viewport. Wait for the library's explicit readiness signal.
+    if (!viewportInitialized || !nodesInitialized) return
+    // On a document switch the prior document's measured RF nodes can briefly have the same count.
+    // Never fit that stale geometry while the reconcile effect is replacing it with the new document.
+    const docNodeIds = new Set(doc.nodes.map((node) => node.id))
+    if (rfNodes.length !== doc.nodes.length || rfNodes.length === 0
+        || rfNodes.some((node) => !docNodeIds.has(node.id))) return
+    if (internalNodeGeometryIdentity !== viewportNodeGeometryIdentity(rfNodes)) return
     const measured = rfNodes.every((node) => {
       const width = node.measured?.width ?? node.width
       const height = node.measured?.height ?? node.height
       return typeof width === 'number' && width > 0 && typeof height === 'number' && height > 0
     })
     if (!measured) return
-    fittedRequestId.current = viewportFitRequest.id
-    void fitView({ padding: 0.3, maxZoom: 1 })
-    acknowledgeViewportFit(viewportFitRequest.id)
-  }, [viewportFitRequest, doc, rfNodes, fitView, acknowledgeViewportFit])
+    const requestId = viewportFitRequest.id
+    fittedRequestId.current = requestId
+    void fitView({ padding: 0.3, maxZoom: 1 }).then((fitted) => {
+      if (fitted) acknowledgeViewportFit(requestId)
+      else if (fittedRequestId.current === requestId) fittedRequestId.current = null
+    })
+  }, [
+    viewportFitRequest, nodeRevealRequest, doc, rfNodes, internalNodeGeometryIdentity,
+    viewportInitialized, nodesInitialized, fitView, acknowledgeViewportFit,
+  ])
 
   // A route request is intentionally distinct from normal selection: a click in the Canvas updates
   // the shareable node= URL but must never seize the user's viewport. Wait for React Flow to mount

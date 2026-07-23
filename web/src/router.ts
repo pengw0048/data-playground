@@ -105,7 +105,7 @@ export function canvasLink(id: string): string {
 // The store shape we need — passed in so this module never imports the store (avoids an import cycle).
 interface RouterState { view: DpView; doc: { id: string; nodes: { id: string }[] }; selectedId: string | null; workspaceResourceId: string | null; workspaceSearchQuery: string; workspaceScope: 'all' | 'datasets'; workspaceDatasetQuery: string; jobsQuery: string; inboxQuery: string; transformResourceId: string | null; transformVersion: string | null; transformUpgradeCanvasId: string | null; transformUpgradeNodeId: string | null; transformLibraryQuery: string }
 interface RouterStore {
-  getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken }) => Promise<boolean> }
+  getState: () => RouterState & { applyRoute: (route: Route, navigationToken: NavigationToken) => void; select: (id: string | null) => void; requestNodeReveal: (canvasId: string, nodeId: string) => void; clearNodeReveal: () => void; requestViewportFit: () => void; pushToast: (message: string, kind?: 'info' | 'error') => void; openFile: (id: string, options?: { navigationToken?: NavigationToken; skipViewportFit?: boolean }) => Promise<boolean> }
   subscribe: (fn: (s: RouterState) => void) => () => void
 }
 
@@ -152,7 +152,9 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
       if (r.view !== 'canvas' || !r.nodeId) st.clearNodeReveal()
       if (r.view === 'canvas' && r.canvasId) {
         if (st.doc.id !== r.canvasId) {
-          const ok = await st.openFile(r.canvasId, { navigationToken })  // may be shared; server authorizes
+          // A node deep link has a stronger initial-view contract than a normal Canvas open.
+          // Prevent the ordinary one-shot overview from briefly winning before the target is centered.
+          const ok = await st.openFile(r.canvasId, { navigationToken, skipViewportFit: !!r.nodeId })  // may be shared; server authorizes
           if (!ownsNavigation(navigationToken)) return
           if (!ok) {
             // bad / revoked / unauthorized link: reflect the ACTUAL (unchanged) state and REPLACE the
@@ -160,7 +162,12 @@ export function initRouter(store: RouterStore, bootstrapToken?: NavigationToken)
             history.replaceState(null, '', hashFor(store.getState()))
             return
           }
-        } else if (st.view !== 'canvas') st.applyRoute({ view: 'canvas' }, navigationToken)
+        } else if (st.view !== 'canvas') {
+          st.applyRoute({ view: 'canvas' }, navigationToken)
+          // Jobs/Inbox links may return to the already-loaded document, so no openFile call occurs.
+          // Give a normal Canvas route the same one-shot initial overview as a fresh saved-Canvas open.
+          if (!r.nodeId && st.doc.nodes.length > 0) st.requestViewportFit()
+        }
         if (!ownsNavigation(navigationToken)) return
         const current = store.getState()
         const nodeExists = !!r.nodeId && current.doc.id === r.canvasId
