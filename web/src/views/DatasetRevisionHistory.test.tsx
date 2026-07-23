@@ -184,6 +184,42 @@ describe('DatasetRevisionHistory', () => {
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-stable', 'rev-1')
   })
 
+  it('keeps field evidence inspectable when an exact revision has zero rows', async () => {
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-empty')], nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-empty', {
+      summary: { rowCount: 0, dataFileCount: 0, totalBytes: 0, fragmentCount: 0 },
+      preview: {
+        columns: [{
+          fieldId: 'amount',
+          name: 'amount',
+          type: 'bigint',
+          nullable: false,
+          provenance: 'provider',
+          capabilities: [],
+          annotations: [{
+            key: 'provider.note',
+            value: 'retained empty-revision schema',
+            encoding: 'utf8',
+            provenance: 'provider',
+          }],
+        }],
+        rows: [],
+        hasMore: false,
+        rowLimit: 100,
+      },
+    }))
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-empty' }))
+
+    expect(await screen.findByText(/zero rows|0 rows/i)).toBeInTheDocument()
+    expect(screen.getByText(/retained schema remains inspectable above/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for amount' }))
+    expect(await screen.findByTestId('field-evidence-amount'))
+      .toHaveTextContent('retained empty-revision schema')
+  })
+
   it('never falls back to latest when the selected exact revision was compacted', async () => {
     mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-old')], nextCursor: null, hasMore: false })
     mocks.datasetRevision.mockRejectedValue(new KernelError(410, 'compacted'))
