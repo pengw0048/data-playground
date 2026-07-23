@@ -5758,7 +5758,10 @@ def workspace_provider_source_binding(binding_id: str) -> dict | None:
                 or canonical.uri is None or canonical.columns_doc is None
                 or re.fullmatch(r"[0-9a-f]{32}", canonical.source_binding_id) is None):
             return None
-        return {"sourceBindingId": canonical.source_binding_id}
+        return {
+            "mountId": canonical.mount_id,
+            "sourceBindingId": canonical.source_binding_id,
+        }
 
 
 def workspace_provider_reconcile_children(

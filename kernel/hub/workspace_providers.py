@@ -304,10 +304,11 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
                 metadb.workspace_provider_mark_dataset(
                     mount_id=mounted.mount.id,
                     provider_dataset_id=retained_dataset_id,
-                    state="provider_error",
+                    state="detached",
                     error=result.reason,
                 )
-            raise ProviderDatasetUnavailable("provider dataset detail is unavailable")
+            raise ProviderDatasetGone(
+                "canonical provider dataset was deleted; relink it explicitly")
         state = _reference_state(result.failure, result.state)
         if retained_dataset_id is not None:
             metadb.workspace_provider_mark_dataset(

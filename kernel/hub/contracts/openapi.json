@@ -10792,6 +10792,10 @@
       "WorkspaceCanonicalSourceBinding": {
         "description": "Opaque current Source generation for one canonical mounted-provider dataset.",
         "properties": {
+          "mountId": {
+            "title": "Mountid",
+            "type": "string"
+          },
           "sourceBindingId": {
             "pattern": "^[0-9a-f]{32}$",
             "title": "Sourcebindingid",
@@ -10799,6 +10803,7 @@
           }
         },
         "required": [
+          "mountId",
           "sourceBindingId"
         ],
         "title": "WorkspaceCanonicalSourceBinding",

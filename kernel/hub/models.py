@@ -1127,6 +1127,7 @@ class WorkspaceBrowsePage(Wire):
 
 class WorkspaceCanonicalSourceBinding(Wire):
     """Opaque current Source generation for one canonical mounted-provider dataset."""
+    mount_id: str
     source_binding_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 

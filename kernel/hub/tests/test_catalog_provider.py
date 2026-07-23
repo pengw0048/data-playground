@@ -556,10 +556,11 @@ with TestClient(app) as client:
     source_binding = root_resolution.json()["canonicalSourceBinding"]
     assert source_binding == nested_resolution.json()["canonicalSourceBinding"]
     assert source_binding is not None
+    assert source_binding["mountId"] == "wheel-a"
     assert len(source_binding["sourceBindingId"]) == 32
     serialized_binding = json.dumps(source_binding, sort_keys=True)
     for forbidden in (
-        "wheel-a", "dataset-a", "nested-dataset", "container-a",
+        "dataset-a", "nested-dataset", "container-a",
         "reference.csv", str(Path(os.environ["DP_WORKSPACE"]).parent),
     ):
         assert forbidden not in serialized_binding
@@ -751,6 +752,7 @@ with TestClient(app) as client:
         "input_manifest": inputs, "remote_resource_id": remote["id"],
         "remote_binding_id": remote["bindingId"], "anchor": remote["localPlacement"],
         "canonical_resource_id": resource["id"],
+        "source_binding_mount_id": source_binding["mountId"],
         "source_binding_id": source_binding["sourceBindingId"],
     }))
 print("installed provider placement journey passed")
@@ -810,6 +812,7 @@ with TestClient(app) as client:
     canonical = client.get(f"/api/workspace/resources/{state['canonical_resource_id']}")
     assert canonical.status_code == 200, canonical.text
     assert canonical.json()["canonicalSourceBinding"] == {
+        "mountId": state["source_binding_mount_id"],
         "sourceBindingId": state["source_binding_id"],
     }
 print("installed provider restart evidence passed")

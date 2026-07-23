@@ -1299,8 +1299,12 @@ def _assert_overlay_recovery(info: dict) -> None:
     assert canonical["columns"] == canonical_expected["columns"]
     assert metadb.workspace_provider_source_binding(
         canonical_expected["right_binding_id"]
-    ) == {"sourceBindingId": canonical_expected["source_binding_id"]}
+    ) == {
+        "mountId": canonical_expected["mount_id"],
+        "sourceBindingId": canonical_expected["source_binding_id"],
+    }
     serialized_binding = json.dumps({
+        "mountId": canonical_expected["mount_id"],
         "sourceBindingId": canonical_expected["source_binding_id"],
     })
     assert canonical_expected["provider_dataset_id"] not in serialized_binding
