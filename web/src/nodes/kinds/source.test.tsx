@@ -1,6 +1,7 @@
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ReactFlowProvider } from '@xyflow/react'
+import { TooltipProvider } from '@/components/ui/tooltip'
 
 // importing the store triggers autosave side-effects → stub the api client
 const mocks = vi.hoisted(() => ({
@@ -16,7 +17,7 @@ import { useStore } from '../../store/graph'
 
 const Source = getComponent('source')!
 const render1 = (data: object) =>
-  render(<ReactFlowProvider><Source id="s1" data={data as never} /></ReactFlowProvider>)
+  render(<TooltipProvider><ReactFlowProvider><Source id="s1" data={data as never} /></ReactFlowProvider></TooltipProvider>)
 
 describe('Source card — honest counts + empty/offline (UX-14)', () => {
   beforeEach(() => {
@@ -57,6 +58,39 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     ] } as any)
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
     expect(screen.getByText(/\b0\s*rows/)).toBeInTheDocument()
+  })
+
+  it('selects the Source when its dataset control receives the click', () => {
+    render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
+
+    fireEvent.click(screen.getByRole('button', { name: /orders/i }))
+
+    expect(useStore.getState().selectedIds).toEqual(['s1'])
+  })
+
+  it('uses the selected provider exact schema for field evidence even without a local catalog table', async () => {
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'provider-orders', revisionId: 'empty-r7', retentionOwner: 'provider', summary: { rowCount: 0 },
+      preview: {
+        columns: [{ name: 'customer_id', type: 'int64', physicalType: 'INT64', nullable: false, hasDefault: null,
+          fieldId: 'provider.customer_id', provenance: 'provider', capabilities: [],
+          annotations: [{ key: 'provider.note', value: 'selected exact schema', encoding: 'utf8', provenance: 'provider' }] }],
+        rows: [], hasMore: false, rowLimit: 100,
+      },
+    })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ catalog: [], doc: { id: 'c', name: 'test', version: 1, nodes: [], edges: [] } } as any)
+    render1({ title: 'provider orders', status: 'latest', config: {
+      providerResourceRef: 'dataset:provider-orders', providerName: 'fixture', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
+    } })
+
+    expect(await screen.findByText('Field evidence · 1 columns')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Field evidence · 1 columns'))
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
+    expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
+    expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
+    expect(mocks.datasetRevision).toHaveBeenCalledWith('provider-orders', 'empty-r7')
   })
 
   it('cold start: kernel up + no recents fetches a server page, then says the catalog is empty (not "offline")', async () => {

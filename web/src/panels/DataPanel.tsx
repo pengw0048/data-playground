@@ -11,6 +11,7 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
+import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
@@ -811,7 +812,7 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
               return (
                 <th key={c.name} className={cn('sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[6px] font-semibold text-muted-foreground', num ? 'text-right' : 'text-left')}>
                   <div className={cn('flex items-center', num && 'justify-end')}>
-                    {c.name}
+                    <FieldEvidenceButton column={c} marker className="rounded px-0.5 text-left hover:bg-accent" />
                     {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
                     {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
                   </div>

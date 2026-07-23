@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import type { CatalogTable, Relationship, JoinSuggestion, Cardinality, LineageEdge } from '../types/api'
 import { cn } from '@/lib/utils'
+import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 
 // The relationship graph: entities are catalog datasets, declared joins are solid edges labelled with
 // cardinality. It opens FOCUSED on one table (reached from a table's detail drawer) and shows that
@@ -37,7 +38,7 @@ function EntityNode({ data }: { data: EntityData }) {
           return (
             <div key={c.name} className={cn('flex items-center gap-1.5 px-3 py-0.5 text-left text-[11px]', isPk && 'font-semibold text-foreground')}>
               <span className="w-3 text-center text-[10px]">{isPk ? '🔑' : isKey ? '·' : ''}</span>
-              <span className="dp-mono flex-1 truncate">{c.name}</span>
+              <FieldEvidenceButton column={c} marker className="dp-mono flex-1 truncate rounded px-0.5 text-left hover:bg-accent" />
               <span className="text-[9.5px] text-muted-foreground">{c.type}</span>
             </div>
           )

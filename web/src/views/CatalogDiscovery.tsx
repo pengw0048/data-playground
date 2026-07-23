@@ -6,6 +6,7 @@ import { Icon } from '../ui/Icon'
 import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
+import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import type { CatalogQueryParams, CatalogTable, CatalogUnregisterResult, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
 
 // The Workspace dataset discovery surface is built to browse thousands of datasets. Nothing is loaded up front: a left
@@ -1107,6 +1108,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                       <span className="dp-mono flex-1 truncate text-[11.5px]">{c.name}</span>
                       <span className="text-[10px] text-muted-foreground">{c.type}</span>
                     </button>
+                    <FieldEvidenceButton column={c} label="ⓘ" marker className="shrink-0 rounded px-1 text-[10px] text-muted-foreground hover:bg-accent hover:text-foreground" />
                   </div>
                 )
               })}
