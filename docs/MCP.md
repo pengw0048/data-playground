@@ -75,7 +75,18 @@ and canvas tools reuse the same building blocks as the HTTP API.
 
 Catalog and discovery:
 
-- `list_datasets` — name, uri, columns (name + type), row count, primary-key candidates
+- `search_catalog` — a small, explicit metadata page filtered by text, folder, tags, owner, and
+  required columns. To continue, pass the opaque `nextCursor` back as the only argument; it carries
+  the exact normalized query and next offset. Continue until `hasMore` is false.
+- `get_dataset_context` — a dataset's canonical identity and URI, organization metadata, complete
+  current `ColumnSchema`, declared/candidate keys, a bounded incident-relationship window, and
+  truthful revision-capability state. `relationships.truncated` reports when `relationshipLimit`
+  omitted relationships; there is no continuation because the provider relationship contract
+  cannot resume that window. It returns metadata only.
+- `get_relationship_graph` — declared relationship topology around a dataset or folder, bounded by
+  `maxHops`, `maxNodes`, and `maxEdges`. `truncated: true` means the returned graph is not complete.
+- `get_dataset_lineage` — bounded canonical lineage around one dataset. `state: unavailable` is
+  different from an available-but-empty graph; `truncated: true` means the depth/node bound cut it.
 - `sample_dataset` — a few real rows by catalog name/id or uri
 - `join_hints` — key pairs and cardinality measured on the data (1:1 / 1:N / …)
 - `list_node_kinds` — every built-in and plugin kind with params and ports
@@ -101,8 +112,33 @@ Runs:
 - `cancel_run` — cancel an in-flight run
 - `sample_result` — sample the output dataset a run materialized
 
-Datasets and canvases are also MCP resources (`dataplay://dataset/<id>`, `dataplay://canvas/<id>`) for
-clients that pull context that way.
+Datasets and canvases are also MCP resources
+(`dataplay://dataset/<registration-id>`, `dataplay://canvas/<id>`) for clients that pull context that
+way. A registration id names one exact catalog registration: unregistering and registering the same
+URI again does not rebind the old resource. Dataset resource URIs come from `search_catalog` or
+`get_dataset_context`; they are intentionally not enumerated in `resources/list`, whose MCP response
+has no continuation field.
+
+Catalog metadata reads return `state: available` even when their item/edge list is empty. A failed
+read instead returns `state: unavailable` plus one secret-free `failure` value: `unsupported`,
+`permission_lost`, `offline`, `not_found`, or `provider_error`. Nested relationship and revision
+capability reads use the same states, so their failure does not erase otherwise available context.
+
+## Agent catalog workflow
+
+Use the metadata-only catalog tools before any data sample:
+
+1. Call `search_catalog` with a small `limit` and filters. When `hasMore` is true, call it again with
+   only `{"cursor": "<nextCursor>"}`; do not repeat or change the filters during continuation.
+2. Call `get_dataset_context` for plausible datasets. Read the full schema, keys, organization facts,
+   declared relationships, and revision capability state; unavailable/unknown facts are not positive
+   evidence.
+3. When topology matters, use `get_relationship_graph` and/or `get_dataset_lineage`, respecting their
+   `truncated` flags. These tools expose declared metadata and lineage only, not sample cell values.
+4. Choose two datasets, then call `join_hints` to measure the join cardinality before adding a join.
+
+MCP has no catalog/relationship mutation or automatic Canvas edits in this workflow. It does not expose
+storage credentials, adapter internals, arbitrary provider metadata, or field-reference semantics.
 
 ## Writing transforms, verified
 

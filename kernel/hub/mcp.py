@@ -30,13 +30,15 @@ the UI sees them too.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import sys
 import time
+from collections import deque
 from typing import Any, Callable
 
 from hub import graph_ops
-from hub.models import CatalogQuery
 
 SERVER_NAME = "data-playground"
 SERVER_VERSION = "0.2.3"
@@ -46,16 +48,26 @@ _SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 _LATEST_PROTOCOL = _SUPPORTED_PROTOCOLS[-1]
 
 _RUN_POLL_TIMEOUT_S = 120.0  # a `run_canvas` tool call polls the in-process run to completion up to here
+_CATALOG_CURSOR_VERSION = 1
+_CATALOG_CURSOR_MAX_BYTES = 131_072
+_CATALOG_TEXT_MAX_BYTES = 1_024
+_CATALOG_FOLDER_MAX_BYTES = 1_024
+_CATALOG_OWNER_MAX_BYTES = 512
+_CATALOG_FILTER_ITEM_MAX_BYTES = 128
+_CATALOG_OFFSET_MAX = 2_147_483_647
+_CATALOG_RELATIONSHIP_LIMIT_MAX = 1_000
+_CATALOG_GRAPH_EDGE_LIMIT_MAX = 1_000
 
 _INSTRUCTIONS = (
     "Build and run data pipelines on the Data Playground canvas. A pipeline is a graph of typed "
     "nodes: a `source` reads a dataset, then relational nodes (filter/select/join/aggregate/sql/…) "
     "or a `transform` (arbitrary Python over Arrow batches) shape it, and a `write` materializes it. "
-    "Typical flow: list_datasets → create_canvas → add a `source` (its `uri` is a dataset's uri or "
+    "Typical flow: search_catalog → get_dataset_context → create_canvas → add a `source` (its `uri` is a dataset's uri or "
     "catalog name) → add + connect nodes → preview_node to check real rows at each step → "
     "validate_canvas → give the user the canvas url (or run_canvas). Prefer relational nodes over "
     "Python when they suffice (they push down and run out-of-core); reach for set_transform when the "
-    "logic needs code — then preview_node to confirm it works before moving on. Call join_hints "
+    "logic needs code — then preview_node to confirm it works before moving on. Use "
+    "get_relationship_graph or get_dataset_lineage when topology matters. Call join_hints "
     "before a join (don't guess the key or miss a row-multiplying fan-out). Preview/sample scope "
     "metadata is authoritative: sample/capped/unknown data is not a complete result, and an "
     "each-source limit independently bounds every upstream input rather than the output row order."
@@ -80,6 +92,51 @@ def _jsonable(obj: Any) -> Any:
     """Coerce a result to plain JSON (stringifying Decimals/datetimes from real data rows) so both
     the text content and the structuredContent are always serializable."""
     return json.loads(json.dumps(obj, default=str))
+
+
+def _error_chain(exc: BaseException):
+    """Yield a finite provider error chain without serializing any provider-owned message."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _catalog_failure(exc: BaseException) -> dict:
+    """Map catalog read failures to the small, secret-free MCP recovery taxonomy."""
+    from fastapi import HTTPException
+
+    from hub.plugins.adapters import (
+        RevisionPermissionLost,
+        RevisionProviderOffline,
+        RevisionUnavailable,
+    )
+
+    chain = list(_error_chain(exc))
+    statuses = [error.status_code for error in chain if isinstance(error, HTTPException)]
+    if any(status == 501 for status in statuses):
+        failure = "unsupported"
+    elif any(status == 403 for status in statuses):
+        failure = "permission_lost"
+    elif any(status in (503, 504) for status in statuses):
+        failure = "offline"
+    elif any(status in (404, 410) for status in statuses):
+        failure = "not_found"
+    elif any(isinstance(error, NotImplementedError) for error in chain):
+        failure = "unsupported"
+    elif any(isinstance(error, (PermissionError, RevisionPermissionLost)) for error in chain):
+        failure = "permission_lost"
+    elif any(isinstance(error, (ConnectionError, TimeoutError, RevisionProviderOffline))
+             for error in chain):
+        failure = "offline"
+    elif any(isinstance(error, (KeyError, FileNotFoundError, RevisionUnavailable))
+             for error in chain):
+        failure = "not_found"
+    else:
+        failure = "provider_error"
+    return {"state": "unavailable", "failure": failure}
 
 
 # --------------------------------------------------------------------------- #
@@ -172,6 +229,184 @@ class Playground:
         return self.deps.catalog.resolve_ref(ref)
 
     @staticmethod
+    def _bounded_int(args: dict, key: str, *, default: int, minimum: int, maximum: int) -> int:
+        """Read one MCP bound without silently accepting malformed continuation controls."""
+        value = args.get(key, default)
+        if isinstance(value, bool):
+            raise ToolError(f"'{key}' must be an integer")
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ToolError(f"'{key}' must be an integer") from exc
+        if value < minimum or value > maximum:
+            raise ToolError(f"'{key}' must be between {minimum} and {maximum}")
+        return value
+
+    @staticmethod
+    def _bounded_text(
+            value: object, key: str, *, maximum_bytes: int, optional: bool = True) -> str | None:
+        if value is None and optional:
+            return None
+        if not isinstance(value, str):
+            raise ToolError(f"'{key}' must be a string")
+        normalized = value.strip()
+        if not normalized and optional:
+            return None
+        if not normalized:
+            raise ToolError(f"'{key}' must be non-empty")
+        if len(normalized.encode("utf-8")) > maximum_bytes:
+            raise ToolError(f"'{key}' exceeds the {maximum_bytes}-byte limit")
+        return normalized
+
+    @classmethod
+    def _string_list(cls, args: dict, key: str, *, maximum: int = 50) -> list[str]:
+        value = args.get(key, [])
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ToolError(f"'{key}' must be an array of non-empty strings")
+        if len(value) > maximum:
+            raise ToolError(f"'{key}' may contain at most {maximum} values")
+        out: list[str] = []
+        for item in value:
+            normalized = cls._bounded_text(
+                item, f"{key} item", maximum_bytes=_CATALOG_FILTER_ITEM_MAX_BYTES,
+                optional=False)
+            assert normalized is not None
+            out.append(normalized)
+        return out
+
+    @staticmethod
+    def _dataset_resource_uri(table) -> str | None:
+        registration_id = table.registration_id
+        return f"dataplay://dataset/{registration_id}" if registration_id else None
+
+    @classmethod
+    def _catalog_query_from_args(cls, args: dict, *, offset: int = 0):
+        from hub.models import CatalogQuery
+
+        allowed = {
+            "text", "folder", "tags", "owner", "requiredColumns",
+            "sort", "order", "limit",
+        }
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            raise ToolError(f"unknown search_catalog argument '{unknown[0]}'")
+        sort = args.get("sort", "name")
+        if sort not in ("name", "rows", "updated", "usage", "folder"):
+            raise ToolError("'sort' must be name, rows, updated, usage, or folder")
+        order = args.get("order", "asc")
+        if order not in ("asc", "desc"):
+            raise ToolError("'order' must be asc or desc")
+        limit = cls._bounded_int(args, "limit", default=50, minimum=1, maximum=100)
+        if offset < 0 or offset > _CATALOG_OFFSET_MAX:
+            raise ToolError("catalog continuation offset is out of bounds")
+        return CatalogQuery(
+            q=cls._bounded_text(
+                args.get("text"), "text", maximum_bytes=_CATALOG_TEXT_MAX_BYTES),
+            folder=cls._bounded_text(
+                args.get("folder"), "folder", maximum_bytes=_CATALOG_FOLDER_MAX_BYTES),
+            tags=cls._string_list(args, "tags"),
+            owner=cls._bounded_text(
+                args.get("owner"), "owner", maximum_bytes=_CATALOG_OWNER_MAX_BYTES),
+            has_columns=cls._string_list(args, "requiredColumns"),
+            sort=sort, order=order, limit=limit, offset=offset,
+        )
+
+    @staticmethod
+    def _cursor_query(query) -> dict:
+        return {
+            "text": query.q,
+            "folder": query.folder,
+            "tags": list(query.tags),
+            "owner": query.owner,
+            "requiredColumns": list(query.has_columns),
+            "sort": query.sort,
+            "order": query.order,
+            "limit": query.limit,
+        }
+
+    @classmethod
+    def _encode_catalog_cursor(cls, query, offset: int) -> str:
+        if offset < 0 or offset > _CATALOG_OFFSET_MAX:
+            raise ToolError("catalog continuation offset is out of bounds")
+        raw = json.dumps(
+            {"v": _CATALOG_CURSOR_VERSION, "query": cls._cursor_query(query), "offset": offset},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(raw).rstrip(b"=")
+        if len(encoded) > _CATALOG_CURSOR_MAX_BYTES:
+            raise ToolError("catalog continuation exceeds the server limit")
+        return encoded.decode("ascii")
+
+    @classmethod
+    def _decode_catalog_cursor(cls, cursor: object):
+        value = cls._bounded_text(
+            cursor, "cursor", maximum_bytes=_CATALOG_CURSOR_MAX_BYTES, optional=False)
+        assert value is not None
+        try:
+            padded = value + "=" * (-len(value) % 4)
+            raw = base64.b64decode(padded, altchars=b"-_", validate=True)
+            payload = json.loads(raw)
+        except (UnicodeEncodeError, binascii.Error, json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise ToolError("'cursor' is not a valid search_catalog continuation") from exc
+        if (not isinstance(payload, dict)
+                or set(payload) != {"v", "query", "offset"}
+                or payload.get("v") != _CATALOG_CURSOR_VERSION
+                or not isinstance(payload.get("query"), dict)
+                or isinstance(payload.get("offset"), bool)
+                or not isinstance(payload.get("offset"), int)):
+            raise ToolError("'cursor' is not a valid search_catalog continuation")
+        query_args = payload["query"]
+        if set(query_args) != {
+                "text", "folder", "tags", "owner", "requiredColumns", "sort", "order", "limit"}:
+            raise ToolError("'cursor' is not a valid search_catalog continuation")
+        return cls._catalog_query_from_args(query_args, offset=payload["offset"])
+
+    def _dataset_summary(self, table, *, include_schema: bool = False) -> dict:
+        """The non-sensitive catalog contract shared by search, context, topology, and resources.
+
+        Do not serialize ``CatalogTable.meta`` here: it is an implementation-owned legacy field and
+        could carry arbitrary provider payload. This is intentionally a whitelist of MCP-safe facts.
+        """
+        out = {
+            "id": table.id,
+            "registrationId": table.registration_id,
+            "name": table.name,
+            "uri": table.uri,
+            "resourceUri": self._dataset_resource_uri(table),
+            "rowCount": table.row_count,
+            "version": table.version,
+            "missing": table.missing,
+            "updatedAt": table.updated_at,
+            "organization": {
+                "folder": table.folder,
+                "tags": table.tags,
+                "owner": table.owner,
+                "description": table.description,
+            },
+        }
+        if include_schema:
+            out["columns"] = [column.model_dump(by_alias=True) for column in table.columns]
+            out["keys"] = [key.model_dump(by_alias=True) for key in table.keys]
+        return out
+
+    def _table(self, ref: str):
+        try:
+            return self.deps.catalog.get_table(ref), None
+        except Exception as exc:  # provider errors are values on the metadata-only MCP surface
+            return None, _catalog_failure(exc)
+
+    def _revision_capabilities(self, table) -> dict:
+        """Keep optional revision support explicit without inventing facts for a provider."""
+        from hub.routers.catalog import dataset_revision_capabilities
+        try:
+            capabilities = dataset_revision_capabilities(table.id)
+        except Exception as exc:
+            return _catalog_failure(exc)
+        return {"state": "available", **capabilities.model_dump(by_alias=True)}
+
+    @staticmethod
     def _sample_scope(res) -> dict:
         """The truth-in-preview fields every MCP row sample must preserve.
 
@@ -222,8 +457,170 @@ class Playground:
                 "rows": res.rows, **self._sample_scope(res)}
 
     # -- catalog / discovery ---------------------------------------------- #
-    def list_datasets(self, args: dict) -> dict:
-        return {"datasets": graph_ops.catalog_tables(self.deps)}
+    def search_catalog(self, args: dict) -> dict:
+        """The HTTP table-window contract behind one bounded, query-carrying continuation."""
+        if "cursor" in args:
+            if set(args) != {"cursor"}:
+                raise ToolError("'cursor' must be passed alone; it already carries the exact search query")
+            query = self._decode_catalog_cursor(args["cursor"])
+        else:
+            query = self._catalog_query_from_args(args)
+        try:
+            page = self.deps.catalog.list_page(query)
+            if (page.offset != query.offset or page.limit != query.limit
+                    or len(page.items) > query.limit
+                    or page.total < page.offset + len(page.items)
+                    or (page.has_more and not page.items)):
+                raise RuntimeError("invalid catalog page")
+            next_offset = query.offset + len(page.items)
+            if page.has_more and next_offset > _CATALOG_OFFSET_MAX:
+                raise RuntimeError("catalog continuation offset overflow")
+            next_cursor = self._encode_catalog_cursor(query, next_offset) if page.has_more else None
+            datasets = [self._dataset_summary(table) for table in page.items]
+        except ToolError:
+            raise
+        except Exception as exc:
+            return _catalog_failure(exc)
+        return {
+            "state": "available",
+            "datasets": datasets,
+            "total": page.total,
+            "limit": page.limit,
+            "nextCursor": next_cursor,
+            "hasMore": page.has_more,
+        }
+
+    def get_dataset_context(self, args: dict) -> dict:
+        relationship_limit = self._bounded_int(
+            args, "relationshipLimit", default=100, minimum=1,
+            maximum=_CATALOG_RELATIONSHIP_LIMIT_MAX)
+        dataset = self._bounded_text(
+            self._req(args, "dataset"), "dataset", maximum_bytes=8_192, optional=False)
+        assert dataset is not None
+        table, failure = self._table(dataset)
+        if failure is not None:
+            return failure
+        try:
+            relationships = self.deps.catalog.relationships(table.uri)
+            relationship_result = {
+                "state": "available",
+                "items": [
+                    relationship.model_dump(by_alias=True)
+                    for relationship in relationships[:relationship_limit]
+                ],
+                "limit": relationship_limit,
+                "total": len(relationships),
+                "truncated": len(relationships) > relationship_limit,
+            }
+        except Exception as exc:
+            relationship_result = _catalog_failure(exc)
+        return {
+            "state": "available",
+            "dataset": self._dataset_summary(table, include_schema=True),
+            "relationships": relationship_result,
+            "capabilities": {"revisions": self._revision_capabilities(table)},
+        }
+
+    def _graph_table(self, uri: str, cache: dict[str, Any]):
+        if uri in cache:
+            return cache[uri], None
+        try:
+            table = self.deps.catalog.get_table(uri)
+        except Exception as exc:
+            return None, _catalog_failure(exc)
+        cache[uri] = table
+        return table, None
+
+    def get_relationship_graph(self, args: dict) -> dict:
+        """Bounded BFS over declared catalog relationships; no data reads or measured join inference."""
+        root = self._bounded_text(
+            args.get("dataset"), "dataset", maximum_bytes=8_192)
+        folder = self._bounded_text(
+            args.get("folder"), "folder", maximum_bytes=_CATALOG_FOLDER_MAX_BYTES)
+        if root and folder:
+            raise ToolError("provide either 'dataset' or 'folder', not both")
+        max_hops = self._bounded_int(args, "maxHops", default=2, minimum=0, maximum=6)
+        max_nodes = self._bounded_int(args, "maxNodes", default=100, minimum=1, maximum=500)
+        max_edges = self._bounded_int(
+            args, "maxEdges", default=500, minimum=1, maximum=_CATALOG_GRAPH_EDGE_LIMIT_MAX)
+        cache: dict[str, Any] = {}
+        truncated = False
+        if root:
+            table, failure = self._table(root)
+            if failure is not None:
+                return failure
+            start = [table]
+        else:
+            from hub.models import CatalogQuery
+            try:
+                page = self.deps.catalog.list_page(CatalogQuery(
+                    folder=folder or None, limit=max_nodes, offset=0))
+            except Exception as exc:
+                return _catalog_failure(exc)
+            start = list(page.items)
+            truncated = page.has_more
+        nodes = {table.uri: table for table in start[:max_nodes]}
+        truncated = truncated or len(start) > max_nodes
+        frontier = deque((table.uri, 0) for table in nodes.values())
+        edges: dict[tuple[str, str, tuple[str, ...], tuple[str, ...]], dict] = {}
+        while frontier:
+            uri, hops = frontier.popleft()
+            try:
+                incident = self.deps.catalog.relationships(uri)
+            except Exception as exc:
+                return _catalog_failure(exc)
+            for relationship in incident:
+                if relationship.left_uri == uri:
+                    other = relationship.right_uri
+                elif relationship.right_uri == uri:
+                    other = relationship.left_uri
+                else:
+                    return _catalog_failure(RuntimeError("non-incident relationship"))
+                key = (relationship.left_uri, relationship.right_uri,
+                       tuple(relationship.left_columns), tuple(relationship.right_columns))
+                if other in nodes:
+                    if key not in edges and len(edges) >= max_edges:
+                        truncated = True
+                        continue
+                    edges[key] = relationship.model_dump(by_alias=True)
+                    continue
+                if (hops >= max_hops or len(nodes) >= max_nodes
+                        or (key not in edges and len(edges) >= max_edges)):
+                    truncated = True
+                    continue
+                table, failure = self._graph_table(other, cache)
+                if failure is not None:
+                    return failure
+                nodes[other] = table
+                frontier.append((other, hops + 1))
+                edges[key] = relationship.model_dump(by_alias=True)
+        return {
+            "state": "available",
+            "nodes": [self._dataset_summary(table) for table in nodes.values()],
+            "edges": list(edges.values()),
+            "maxHops": max_hops,
+            "maxNodes": max_nodes,
+            "maxEdges": max_edges,
+            "truncated": truncated,
+        }
+
+    def get_dataset_lineage(self, args: dict) -> dict:
+        dataset = self._bounded_text(
+            self._req(args, "dataset"), "dataset", maximum_bytes=8_192, optional=False)
+        assert dataset is not None
+        table, failure = self._table(dataset)
+        if failure is not None:
+            return failure
+        depth = self._bounded_int(args, "depth", default=3, minimum=1, maximum=20)
+        max_nodes = self._bounded_int(args, "maxNodes", default=100, minimum=1, maximum=500)
+
+        from hub.routers.catalog import lineage
+        try:
+            result = lineage(uri=table.uri, depth=depth, max_nodes=max_nodes)
+        except Exception as exc:
+            return {"dataset": self._dataset_summary(table), **_catalog_failure(exc)}
+        return {"dataset": self._dataset_summary(table), "state": "available",
+                "lineage": result.model_dump(by_alias=True)}
 
     def sample_dataset(self, args: dict) -> dict:
         from fastapi import HTTPException
@@ -608,10 +1005,9 @@ class Playground:
     # -- resources (read-only context the client can pull) ---------------- #
     def list_resources(self) -> list[dict]:
         res: list[dict] = []
-        for t in self.deps.catalog.list_page(CatalogQuery(limit=5000)).items:
-            res.append({"uri": f"dataplay://dataset/{t.id}", "name": t.name,
-                        "description": f"dataset ({t.row_count if t.row_count is not None else '?'} rows) — {t.uri}",
-                        "mimeType": "application/json"})
+        # Dataset resources are addressed from search_catalog/get_dataset_context. Listing every
+        # dataset here would either recreate the old 5,000-row pseudo-limit or hide a truncation
+        # behind an MCP resources/list response that has no continuation field.
         from hub.routers import workspace as ws
         for c in ws.list_canvases(uid=self.user_id):
             res.append({"uri": f"dataplay://canvas/{c['id']}", "name": c.get("name") or c["id"],
@@ -624,15 +1020,12 @@ class Playground:
             raise ToolError(f"unknown resource uri '{uri}'")
         kind, _, ident = uri[len(scheme):].partition("/")
         if kind == "dataset":
-            from hub.routers.catalog import get_table
-            from fastapi import HTTPException
-            try:
-                t = get_table(ident)
-            except HTTPException as e:
-                raise ToolError(str(e.detail))
-            payload = {"name": t.name, "uri": t.uri, "rowCount": t.row_count,
-                       "columns": [{"name": c.name, "type": c.type} for c in t.columns],
-                       "keys": [k.columns for k in t.keys]}
+            payload = self.get_dataset_context({"dataset": ident})
+            if (
+                payload.get("state") != "available"
+                or (payload.get("dataset") or {}).get("registrationId") != ident
+            ):
+                raise ToolError("dataset resource is unavailable")
         elif kind == "canvas":
             payload = self.get_canvas({"canvasId": ident})
         else:
@@ -655,11 +1048,82 @@ _OBJ = {"type": "object"}
 
 def _tool_specs(pg: Playground) -> list[dict]:
     canvas = {"canvasId": {**_STR, "description": "the canvas id (from create_canvas / list_canvases)"}}
+    search_properties = {
+        "text": {**_STR, "maxLength": _CATALOG_TEXT_MAX_BYTES,
+                 "description": "catalog text filter (optional)"},
+        "folder": {**_STR, "maxLength": _CATALOG_FOLDER_MAX_BYTES,
+                   "description": "folder and its subtree (optional)"},
+        "tags": {"type": "array", "maxItems": 50,
+                 "items": {**_STR, "maxLength": _CATALOG_FILTER_ITEM_MAX_BYTES}},
+        "owner": {**_STR, "maxLength": _CATALOG_OWNER_MAX_BYTES},
+        "requiredColumns": {
+            "type": "array", "maxItems": 50,
+            "items": {**_STR, "maxLength": _CATALOG_FILTER_ITEM_MAX_BYTES},
+        },
+        "sort": {"type": "string", "enum": ["name", "rows", "updated", "usage", "folder"]},
+        "order": {"type": "string", "enum": ["asc", "desc"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "cursor": {
+            **_STR, "maxLength": _CATALOG_CURSOR_MAX_BYTES,
+            "description": "opaque continuation from nextCursor; pass it as the only argument",
+        },
+    }
     return [
-        {"name": "list_datasets", "handler": pg.list_datasets,
-         "description": "List the catalog's datasets: name, uri, columns (name+type), row count, and "
-                        "primary-key candidate column(s) — everything to pick a source and join keys.",
-         "inputSchema": _schema({})},
+        {"name": "search_catalog", "handler": pg.search_catalog,
+         "description": "Search or browse one explicit, bounded catalog page. Filter by text, folder, "
+                        "tags, owner, or required columns; then pass nextCursor alone until hasMore is false. "
+                        "Provider failures are structured and no sample cell values are returned.",
+         "inputSchema": {
+             "type": "object",
+             "properties": search_properties,
+             "additionalProperties": False,
+             "oneOf": [
+                 {"required": ["cursor"], "maxProperties": 1},
+                 {"not": {"required": ["cursor"]}},
+             ],
+         }},
+        {"name": "get_dataset_context", "handler": pg.get_dataset_context,
+         "description": "Read a dataset's canonical catalog identity, organization metadata, full current "
+                        "ColumnSchema, key candidates, a bounded incident relationship window, and revision "
+                        "capability state. Metadata only; no sample cells.",
+         "inputSchema": _schema({
+             "dataset": {
+                 **_STR, "maxLength": 8_192,
+                 "description": "catalog name, id, stable registration id, or uri",
+             },
+             "relationshipLimit": {
+                 "type": "integer", "minimum": 1, "maximum": _CATALOG_RELATIONSHIP_LIMIT_MAX,
+             },
+         }, ["dataset"])},
+        {"name": "get_relationship_graph", "handler": pg.get_relationship_graph,
+         "description": "Read declared catalog relationships around one dataset or one folder, bounded by "
+                        "maxHops, maxNodes, and maxEdges. truncated:true means topology was omitted.",
+         "inputSchema": _schema({
+             "dataset": {
+                 **_STR, "maxLength": 8_192,
+                 "description": "optional catalog name, id, stable registration id, or uri",
+             },
+             "folder": {
+                 **_STR, "maxLength": _CATALOG_FOLDER_MAX_BYTES,
+                 "description": "optional folder scope; mutually exclusive with dataset",
+             },
+             "maxHops": {"type": "integer", "minimum": 0, "maximum": 6},
+             "maxNodes": {"type": "integer", "minimum": 1, "maximum": 500},
+             "maxEdges": {
+                 "type": "integer", "minimum": 1, "maximum": _CATALOG_GRAPH_EDGE_LIMIT_MAX,
+             },
+         })},
+        {"name": "get_dataset_lineage", "handler": pg.get_dataset_lineage,
+         "description": "Read bounded canonical lineage around one dataset. truncated:true means the component "
+                        "extends beyond depth/maxNodes; an unavailable state is distinct from an empty graph.",
+         "inputSchema": _schema({
+             "dataset": {
+                 **_STR, "maxLength": 8_192,
+                 "description": "catalog name, id, stable registration id, or uri",
+             },
+             "depth": {"type": "integer", "minimum": 1, "maximum": 20},
+             "maxNodes": {"type": "integer", "minimum": 1, "maximum": 500},
+         }, ["dataset"])},
         {"name": "sample_dataset", "handler": pg.sample_dataset,
          "description": "Return a small sample of real rows from a dataset (by catalog name/id or uri) "
                         "so you can see its actual shape before building on it. Inspect completeness, "

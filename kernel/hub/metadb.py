@@ -19010,8 +19010,11 @@ def catalog_tree(prefix: str = "", table_limit: int = 100
 
 
 def catalog_get(token: str) -> dict | None:
-    """A single entry by uri (PK), then by tbl_id, then by name — all indexed. None if unknown.
-    Replaces the old 'load the whole catalog then look it up' path, so get_table is O(1), not O(n)."""
+    """A single entry by uri, stable registration id, tbl_id, then name — all indexed.
+
+    Registration identity is checked before the reusable display/table identities so an exact MCP
+    resource cannot silently bind to a later registration of the same URI, id, or name.
+    """
     with session() as s:
         catalog_key = _catalog_token_to_key(s, token)
         logical = s.scalars(select(CatalogLogicalDataset).where(
@@ -19020,6 +19023,9 @@ def catalog_get(token: str) -> dict | None:
             if logical is not None and logical.current_uri else None
         if r is None and logical is None:
             r = s.get(CatalogEntry, token)
+        if r is None:
+            r = s.scalars(select(CatalogEntry).where(
+                CatalogEntry.registration_id == token).limit(1)).first()
         if r is None:
             r = s.scalars(select(CatalogEntry).where(CatalogEntry.tbl_id == token).limit(1)).first()
         if r is None:
