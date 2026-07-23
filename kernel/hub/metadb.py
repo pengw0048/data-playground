@@ -601,6 +601,8 @@ class DurableTask(Base):
             "AND dataset_view_id IS NULL AND target_node_id = 'restore-revision') OR "
             "(task_kind = 'keyed_upsert_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'keyed-upsert') OR "
+            "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NULL AND target_node_id = 'managed-sidecar-merge') OR "
             "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NOT NULL AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
@@ -708,7 +710,8 @@ class DurableTaskInboxItem(Base):
             "AND dataset_view_id IS NOT NULL) OR "
             "(task_kind IN ('restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NULL AND dataset_view_id IS NULL) OR "
-            "(task_kind NOT IN "
+            "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NULL) OR (task_kind NOT IN "
             "('distribution_report','restore_revision_write','keyed_upsert_write') "
             "AND canvas_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_inbox_subject"),
@@ -755,7 +758,7 @@ class DistributionReportEnvelope(Base):
 
 
 class MergeColumnsTaskEnvelope(Base):
-    """Immutable #436 admission and SQL-authoritative resume point for one merge Task."""
+    """Immutable sparse or exact-sidecar admission and resume point for one merge Task."""
     __tablename__ = "merge_columns_task_envelopes"
     task_id: Mapped[str] = mapped_column(
         String, ForeignKey("durable_tasks.id"), primary_key=True)
@@ -763,10 +766,14 @@ class MergeColumnsTaskEnvelope(Base):
     intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     merge_doc: Mapped[str] = mapped_column(Text, nullable=False)
     merge_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    sparse_output_id: Mapped[str] = mapped_column(
-        String(128), ForeignKey("sparse_outputs.id"), nullable=False)
+    producer_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="sparse-output", server_default="sparse-output")
+    sparse_output_id: Mapped[str | None] = mapped_column(
+        String(128), ForeignKey("sparse_outputs.id"), nullable=True)
     base_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
     base_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    sidecar_dataset_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sidecar_revision_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     phase: Mapped[str] = mapped_column(
         String(32), nullable=False, default="validating", server_default="validating")
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -774,6 +781,12 @@ class MergeColumnsTaskEnvelope(Base):
     __table_args__ = (
         CheckConstraint("length(intent_sha256) = 64", name="ck_merge_task_intent_sha"),
         CheckConstraint("length(merge_sha256) = 64", name="ck_merge_task_merge_sha"),
+        CheckConstraint(
+            "(producer_kind = 'sparse-output' AND sparse_output_id IS NOT NULL "
+            "AND sidecar_dataset_id IS NULL AND sidecar_revision_id IS NULL) OR "
+            "(producer_kind = 'managed-sidecar' AND sparse_output_id IS NULL "
+            "AND sidecar_dataset_id IS NOT NULL AND sidecar_revision_id IS NOT NULL)",
+            name="ck_merge_task_producer"),
         CheckConstraint(
             "phase IN ('validating','merging','candidate_committed','publishing',"
             "'done','failed','cancelled')", name="ck_merge_task_phase"),
@@ -1464,7 +1477,7 @@ class ManagedLocalLanceWriteReceipt(Base):
 
 
 class MergeColumnsPublication(Base):
-    """Private immutable semantic truth for one SparseOutput merge publication.
+    """Private immutable semantic truth for one certified sidecar merge publication.
 
     This deliberately stores no result-artifact authority.  The normal immutable revision ledger
     owns that; this row only binds the replay key to the evidence that made the merge meaningful.
@@ -5806,17 +5819,17 @@ _INBOX_PRODUCER_KINDS = frozenset({
     "restore_revision_write", "keyed_upsert_write",
 })
 # Canvas-less durable tasks whose Jobs/Inbox subject is a dataset revision history, not a canvas.
-_DATASET_SCOPED_TASK_KINDS = frozenset({"restore_revision_write", "keyed_upsert_write"})
-# Inbox generic write copy is reserved for Canvas-owned publication tasks. Dataset-scoped restore
-# and upsert outcomes deliberately keep their revision-history subject instead of pretending to be
-# a newly named Canvas output.
+_DATASET_SCOPED_TASK_KINDS = frozenset({
+    "restore_revision_write", "keyed_upsert_write", "merge_columns_write",
+})
+# Inbox generic write copy is reserved for Canvas-owned publication tasks. Dataset-scoped outcomes
+# keep their revision-history subject instead of pretending to be a newly named Canvas output.
 _INBOX_COMPLETED_WRITE_SUMMARY_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write",
 })
 # Task kinds that carry their terminal failure code into the Inbox diagnostic allowlist.
-_DIAGNOSTIC_BEARING_TASK_KINDS = frozenset(
-    {"merge_columns_write"} | _DATASET_SCOPED_TASK_KINDS)
+_DIAGNOSTIC_BEARING_TASK_KINDS = _DATASET_SCOPED_TASK_KINDS
 _INBOX_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_TASK_STATUS_TO_OUTCOME = {
     "done": "completed", "failed": "failed", "cancelled": "cancelled",
@@ -6018,6 +6031,7 @@ def _inbox_dataset_contexts(s, task_ids: set[str]) -> dict[str, dict]:
     ).where(
         DurableTask.id.in_(task_ids),
         DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
+        DurableTask.canvas_id.is_(None),
     )).all()
     contexts: dict[str, dict] = {}
     for task_id, task_kind, write_intent in rows:
@@ -6256,6 +6270,12 @@ def keyed_upsert_submission_id(uid: str, submission_id: str) -> str:
         f"keyed-upsert-write-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
 
 
+def managed_sidecar_merge_submission_id(uid: str, submission_id: str) -> str:
+    """Deterministic owner+submission identity for a canvas-less exact-sidecar merge Task."""
+    return "msm_" + hashlib.sha256(
+        f"managed-sidecar-merge-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
+
+
 def _task_status_doc(task_id: str, target_node_id: str | None, status: str = "queued") -> dict:
     from hub.models import RunStatus
     return RunStatus(
@@ -6268,6 +6288,52 @@ def _durable_task_db_now(s) -> datetime.datetime:
     value = _db_now(s)
     return (value.replace(tzinfo=datetime.timezone.utc)
             if value.tzinfo is None else value.astimezone(datetime.timezone.utc))
+
+
+def _managed_sidecar_task_requires_input_refs(task: DurableTask) -> bool:
+    """A completed or permanently terminal task no longer owns its exact input retention."""
+    if task.status in ("queued", "running"):
+        return True
+    return (task.status in ("failed", "cancelled")
+            and task.error != "stale_expected_head"
+            and task.retry_count + 1 < task.max_attempts)
+
+
+def _require_managed_sidecar_task_input_refs(s, task: DurableTask) -> None:
+    """Prove the frozen manifest and its two task-owned exact artifact refs still agree.
+
+    List views may have loaded a queued Task just before a worker terminalized it.  Terminalization
+    updates that Task and removes both retained refs atomically, so refresh the Task before treating
+    an empty ref set as corruption.  Active/retryable states and partial cleanup remain fail-closed.
+    """
+    parsed = _managed_sidecar_task_input_manifest(task.input_manifest)
+    if parsed is None:
+        raise RuntimeError("managed sidecar merge input retention is invalid")
+    _digest, identities = parsed
+    refs = set(s.scalars(select(LocalResultReference.uri).where(
+        LocalResultReference.owner_kind == "durable_task",
+        LocalResultReference.owner_key == task.id,
+    ).with_for_update()))
+    if not refs:
+        refreshed = s.get(DurableTask, task.id, populate_existing=True)
+        if (refreshed is not None and refreshed.status in _TERMINAL_RUN
+                and not _managed_sidecar_task_requires_input_refs(refreshed)):
+            return
+        raise RuntimeError("managed sidecar merge input retention is incomplete")
+    if len(refs) != 2:
+        raise RuntimeError("managed sidecar merge input retention is incomplete")
+    revision_ids = [revision_id for _dataset_id, revision_id in identities]
+    revisions = {row.revision_id: row for row in s.scalars(select(
+        ManagedLocalFileRevision,
+    ).where(ManagedLocalFileRevision.revision_id.in_(revision_ids)).with_for_update())}
+    if len(revisions) != 2 or any(
+            revisions.get(revision_id) is None
+            or revisions[revision_id].logical_id != dataset_id
+            for dataset_id, revision_id in identities):
+        raise RuntimeError("managed sidecar merge input retention is unavailable")
+    expected = {revisions[revision_id].artifact_uri for _dataset_id, revision_id in identities}
+    if len(expected) != 2 or refs != expected:
+        raise RuntimeError("managed sidecar merge input retention is incomplete")
 
 
 def _durable_task_admission(s, task: DurableTask) -> dict:
@@ -6323,18 +6389,35 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
         if envelope is None or task.write_intent is None:
             raise RuntimeError("merge columns durable admission is incomplete")
         try:
-            from hub.merge_columns import MergeColumnsIntentV1, merge_columns_document
             from hub.models import WriteIntent
-            intent = MergeColumnsIntentV1.model_validate_json(envelope.intent_doc)
+            if envelope.producer_kind == "sparse-output":
+                from hub.merge_columns import MergeColumnsIntentV1, merge_columns_document
+                intent = MergeColumnsIntentV1.model_validate_json(envelope.intent_doc)
+                document = merge_columns_document(intent)
+                expected_sidecar = (intent.sparse_output_id, None, None)
+                admission_key = "merge_columns_intent"
+            elif envelope.producer_kind == "managed-sidecar":
+                from hub.managed_sidecar_merge import (
+                    ManagedSidecarMergeIntentV1, managed_sidecar_merge_document,
+                )
+                intent = ManagedSidecarMergeIntentV1.model_validate_json(envelope.intent_doc)
+                document = managed_sidecar_merge_document(intent)
+                expected_sidecar = (None, intent.sidecar.dataset_id, intent.sidecar.revision_id)
+                admission_key = "managed_sidecar_merge_intent"
+                if _managed_sidecar_task_requires_input_refs(task):
+                    _require_managed_sidecar_task_input_refs(s, task)
+            else:
+                raise ValueError
             canonical_intent = json.dumps(
                 intent.model_dump(by_alias=True, mode="json"), sort_keys=True,
                 separators=(",", ":"))
             if (hashlib.sha256(canonical_intent.encode()).hexdigest() != envelope.intent_sha256
                     or envelope.intent_sha256 != task.intent_sha256
-                    or merge_columns_document(intent) != envelope.merge_doc
+                    or document != envelope.merge_doc
                     or hashlib.sha256(envelope.merge_doc.encode()).hexdigest()
                     != envelope.merge_sha256
-                    or intent.sparse_output_id != envelope.sparse_output_id
+                    or expected_sidecar != (envelope.sparse_output_id, envelope.sidecar_dataset_id,
+                                            envelope.sidecar_revision_id)
                     or intent.base.dataset_id != envelope.base_dataset_id
                     or intent.base.revision_id != envelope.base_revision_id):
                 raise ValueError
@@ -6344,7 +6427,8 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
         except (TypeError, ValueError) as exc:
             raise RuntimeError("merge columns durable admission is invalid") from exc
         return {
-            "merge_columns_intent": intent.model_dump(by_alias=True, mode="json"),
+            admission_key: intent.model_dump(by_alias=True, mode="json"),
+            "merge_columns_producer": envelope.producer_kind,
             "merge_columns_phase": envelope.phase,
             "graph_doc": None, "input_manifest": [],
             "write_intent": write.model_dump(by_alias=True, mode="json"),
@@ -6703,6 +6787,125 @@ def submit_merge_columns_task(
         s.flush()
         s.add_all((attempt, checkpoint, envelope))
         s.flush()
+        return _durable_task_doc(s, task), True
+
+
+def submit_managed_sidecar_merge_task(
+        *, uid: str, submission_id: str, intent: object, request_sha256: str,
+        max_attempts: int = 3) -> tuple[dict, bool]:
+    """Atomically own one frozen exact-sidecar merge through the existing merge lifecycle."""
+    from hub.managed_sidecar_merge import (
+        ManagedSidecarMergeIntentV1, managed_sidecar_merge_document,
+    )
+
+    frozen = ManagedSidecarMergeIntentV1.model_validate(intent)
+    request_sha256 = str(request_sha256)
+    if re.fullmatch(r"[0-9a-f]{64}", request_sha256) is None:
+        raise ValueError("managed sidecar merge request digest is invalid")
+    submission = str(submission_id).lower()
+    _linear_checkpoint_identity(submission, "submission", 128)
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 3:
+        raise ValueError("managed sidecar merge task max attempts is invalid")
+    uid = str(uid)
+    intent_doc = json.dumps(
+        frozen.model_dump(by_alias=True, mode="json"), sort_keys=True, separators=(",", ":"))
+    intent_sha = hashlib.sha256(intent_doc.encode()).hexdigest()
+    merge_doc = managed_sidecar_merge_document(frozen)
+    merge_sha = hashlib.sha256(merge_doc.encode()).hexdigest()
+    input_manifest = {
+        "requestSha256": request_sha256,
+        "managedSidecarMergeInputs": [
+            {"kind": "exact", "datasetId": frozen.base.dataset_id,
+             "revisionId": frozen.base.revision_id},
+            {"kind": "exact", "datasetId": frozen.sidecar.dataset_id,
+             "revisionId": frozen.sidecar.revision_id},
+        ],
+    }
+    input_manifest_doc = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
+    input_manifest_sha = hashlib.sha256(input_manifest_doc.encode()).hexdigest()
+    checkpoint_id = hashlib.sha256(
+        f"managed-sidecar-merge-checkpoint-v1\0{uid}\0{submission}\0{intent_sha}".encode()
+    ).hexdigest()[:32]
+    task_id = managed_sidecar_merge_submission_id(uid, submission)
+    with session() as s:
+        user = s.get(User, uid, with_for_update=True)
+        if user is None:
+            raise RuntimeError("managed sidecar merge task owner does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(User).where(User.id == uid).values(created_at=User.created_at))
+        task = s.get(DurableTask, task_id, with_for_update=True)
+        checkpoint = s.get(DurableCheckpoint, task_id, with_for_update=True)
+        envelope = s.get(MergeColumnsTaskEnvelope, task_id, with_for_update=True)
+        if task is not None or checkpoint is not None or envelope is not None:
+            if task is None or checkpoint is None or envelope is None:
+                raise DurableTaskSubmissionConflict("managed sidecar merge durable admission is incomplete")
+            if (task.owner_id != uid or task.task_kind != "merge_columns_write"
+                    or task.canvas_id is not None or task.submission_id != submission
+                    or task.intent_sha256 != intent_sha or task.target_node_id != "managed-sidecar-merge"
+                    or checkpoint.checkpoint_id != checkpoint_id
+                    or checkpoint.task_intent_sha256 != intent_sha
+                    or checkpoint.graph_prefix_sha256 != merge_sha
+                    or envelope.producer_kind != "managed-sidecar"
+                    or envelope.intent_doc != intent_doc or envelope.intent_sha256 != intent_sha
+                    or envelope.merge_doc != merge_doc or envelope.merge_sha256 != merge_sha
+                    or envelope.base_dataset_id != frozen.base.dataset_id
+                    or envelope.base_revision_id != frozen.base.revision_id
+                    or envelope.sidecar_dataset_id != frozen.sidecar.dataset_id
+                    or envelope.sidecar_revision_id != frozen.sidecar.revision_id
+                    or task.input_manifest != input_manifest_doc
+                    or checkpoint.input_manifest_sha256 != input_manifest_sha):
+                raise DurableTaskSubmissionConflict(
+                    "managed sidecar merge submission does not match its frozen admission")
+            if _managed_sidecar_task_requires_input_refs(task):
+                _require_managed_sidecar_task_input_refs(s, task)
+            elif s.scalar(select(LocalResultReference.uri).where(
+                    LocalResultReference.owner_kind == "durable_task",
+                    LocalResultReference.owner_key == task.id).limit(1)) is not None:
+                raise DurableTaskSubmissionConflict(
+                    "managed sidecar merge terminal input retention is incomplete")
+            return _durable_task_doc(s, task), False
+        if (managed_local_file_revision_artifact(frozen.base.dataset_id, frozen.base.revision_id) is None
+                or managed_local_file_revision_artifact(
+                    frozen.sidecar.dataset_id, frozen.sidecar.revision_id) is None):
+            raise DurableTaskSubmissionConflict("managed sidecar merge exact revision is unavailable")
+        try:
+            _validate_managed_local_write_precondition(s, frozen.write_intent, lock=True)
+        except ManagedLocalWriteConflict as exc:
+            raise DurableTaskSubmissionConflict(str(exc)) from exc
+        now = _durable_task_db_now(s)
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
+            submission_id=submission, intent_sha256=intent_sha,
+            target_node_id="managed-sidecar-merge", task_kind="merge_columns_write",
+            execution_manifest_sha256=None, backend_kind="local", graph_doc=None,
+            input_manifest=input_manifest_doc,
+            write_intent=json.dumps(
+                frozen.write_intent.model_dump(by_alias=True, mode="json"),
+                sort_keys=True, separators=(",", ":")),
+            status="queued", status_doc=json.dumps(_task_status_doc(task_id, "managed-sidecar-merge")),
+            max_attempts=max_attempts, created_at=now, updated_at=now)
+        checkpoint = DurableCheckpoint(
+            task_id=task_id, checkpoint_id=checkpoint_id, checkpoint_node_id="merge-columns",
+            output_port_id="out", task_intent_sha256=intent_sha,
+            graph_prefix_sha256=merge_sha, input_manifest_sha256=input_manifest_sha,
+            phase="pending", created_at=now, updated_at=now)
+        envelope = MergeColumnsTaskEnvelope(
+            task_id=task_id, intent_doc=intent_doc, intent_sha256=intent_sha,
+            merge_doc=merge_doc, merge_sha256=merge_sha, producer_kind="managed-sidecar",
+            sparse_output_id=None, base_dataset_id=frozen.base.dataset_id,
+            base_revision_id=frozen.base.revision_id, sidecar_dataset_id=frozen.sidecar.dataset_id,
+            sidecar_revision_id=frozen.sidecar.revision_id, phase="validating",
+            created_at=now, updated_at=now)
+        s.add(task)
+        s.flush()
+        s.add_all((DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            execution_manifest_sha256=None, status="queued", created_at=now), checkpoint, envelope))
+        try:
+            s.flush()
+            sync_local_result_owner(s, "durable_task", task_id, input_manifest)
+        except IntegrityError as exc:
+            raise DurableTaskSubmissionConflict("managed sidecar merge submission conflicts") from exc
         return _durable_task_doc(s, task), True
 
 
@@ -7079,6 +7282,10 @@ def _durable_task_doc(
         s, task: DurableTask, *, include_admission: bool = True,
         include_attempt_updates: bool = False,
         attempts: list[DurableTaskAttempt] | None = None) -> dict:
+    # Admission can refresh a stale managed-sidecar Task after its worker atomically terminalized
+    # it and released both exact input refs.  Do that before copying Task or Attempt fields so one
+    # document never combines the refreshed status with a queued receipt/attempt snapshot.
+    admission = _durable_task_admission(s, task) if include_admission else None
     if attempts is None:
         attempts = list(s.scalars(select(DurableTaskAttempt).where(
             DurableTaskAttempt.task_id == task.id,
@@ -7122,8 +7329,8 @@ def _durable_task_doc(
             "output_receipt": json.loads(item.output_receipt) if item.output_receipt else None,
         } for item in attempts],
     }
-    if include_admission:
-        doc.update(_durable_task_admission(s, task))
+    if admission is not None:
+        doc.update(admission)
     wait = s.get(DurableExternalWait, task.id)
     if wait is not None:
         doc["external_wait"] = {
@@ -7270,6 +7477,9 @@ def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.dateti
             raise RuntimeError("merge columns envelope has no terminal task state")
         envelope.phase = task.status
         envelope.updated_at = now
+        if (envelope.producer_kind == "managed-sidecar"
+                and not _managed_sidecar_task_requires_input_refs(task)):
+            _drop_local_result_owner(s, "durable_task", task.id)
 
 
 def _claim_durable_task_kind(
@@ -9818,11 +10028,12 @@ def _sanitized_merge_columns_jobs_view(
         task: DurableTask, checkpoint: DurableCheckpoint | None,
         envelope: MergeColumnsTaskEnvelope, *, current_attempt_id: str | None,
         can_retry: bool, can_cancel: bool) -> dict:
-    """Return only #436's task identity and committed-candidate facts, never merge authority."""
+    """Return task routing and committed-candidate facts, never merge authority."""
     committed = checkpoint is not None and checkpoint.phase == "committed"
     digest = checkpoint.content_sha256 if committed else None
     diagnostic = task.error if task.error in _MERGE_COLUMNS_JOB_DIAGNOSTICS else None
     return {
+        "producerKind": envelope.producer_kind,
         "phase": envelope.phase,
         "baseDatasetId": envelope.base_dataset_id,
         "baseRevisionId": envelope.base_revision_id,
@@ -9928,23 +10139,36 @@ def retry_keyed_upsert_task(task_id: str, uid: str, retry_request_id: str) -> di
                 if task is not None else None)
 
 
-def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
-    """Return one sanitized merge Task view to a current Canvas collaborator."""
+def merge_columns_task_view(
+        task_id: str, uid: str, *, producer_kind: str | None = None) -> dict | None:
+    """Return a sanitized merge Task view to its Canvas collaborator or headless owner."""
     with session() as s:
         task = s.get(DurableTask, str(task_id))
         if task is None or task.task_kind != "merge_columns_write":
             return None
-        canvas = s.get(Canvas, task.canvas_id)
-        if canvas is None:
-            return None
-        share_role = None
-        if canvas.owner_id != str(uid):
-            share_role = s.scalar(select(CanvasShare.role).where(
-                CanvasShare.canvas_id == task.canvas_id,
-                CanvasShare.user_id == str(uid),
-            ))
-        role = _effective_canvas_role(canvas, str(uid), share_role)
-        if role is None:
+        if task.canvas_id is None:
+            if task.owner_id != str(uid):
+                return None
+            role = "owner"
+        else:
+            canvas = s.get(Canvas, task.canvas_id)
+            if canvas is None:
+                return None
+            share_role = None
+            if canvas.owner_id != str(uid):
+                share_role = s.scalar(select(CanvasShare.role).where(
+                    CanvasShare.canvas_id == task.canvas_id,
+                    CanvasShare.user_id == str(uid),
+                ))
+            role = _effective_canvas_role(canvas, str(uid), share_role)
+            if role is None:
+                return None
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id)
+        if envelope is None:
+            raise RuntimeError("merge columns task envelope is unavailable")
+        # Keep producer mismatches indistinguishable from absent tasks without attempting
+        # durable admission (which may deliberately require retained managed-sidecar inputs).
+        if producer_kind is not None and envelope.producer_kind != producer_kind:
             return None
         task_doc = _durable_task_doc(s, task, include_attempt_updates=True)
         attempts = task_doc["attempts"]
@@ -9960,14 +10184,16 @@ def merge_columns_task_view(task_id: str, uid: str) -> dict | None:
                      and task.error != "stale_expected_head")
         can_cancel = can_mutate and task.status in ("queued", "running")
         checkpoint = s.get(DurableCheckpoint, task.id)
-        envelope = s.get(MergeColumnsTaskEnvelope, task.id)
-        if envelope is None:
-            raise RuntimeError("merge columns task envelope is unavailable")
         return {
             "taskId": task.id,
             "status": task.status,
             "canRetry": can_retry,
             "canCancel": can_cancel,
+            # Private router hand-off: the managed-sidecar response uses this same durable
+            # projection for frozen intent, receipt, and diagnostic state.
+            "managed_sidecar_merge_intent": task_doc.get("managed_sidecar_merge_intent"),
+            "output_receipt": task_doc["output_receipt"],
+            "error": task_doc["error"],
             "mergeColumns": _sanitized_merge_columns_jobs_view(
                 task, checkpoint, envelope, current_attempt_id=latest["id"],
                 can_retry=can_retry, can_cancel=can_cancel),
@@ -9987,19 +10213,28 @@ def merge_columns_task_request_sha256(task_id: str) -> str | None:
 
 
 def _lock_merge_columns_task_action(
-        s, task_id: str, uid: str) -> DurableTask | None:
+        s, task_id: str, uid: str, *, producer_kind: str | None = None) -> DurableTask | None:
     """Lock a merge Task only after its current Canvas role is made authoritative.
 
     The first Task read supplies an immutable subject for the Canvas/CanvasShare lock
     order.  Re-reading the Task under its row lock then prevents a stale subject or
     a revoked collaborator from changing the task state.
     """
-    subject = s.execute(select(DurableTask.canvas_id).where(
+    subject = s.execute(select(DurableTask.canvas_id, DurableTask.owner_id).where(
         DurableTask.id == str(task_id),
-    )).scalar_one_or_none()
+    )).one_or_none()
     if subject is None:
         return None
-    canvas_id = str(subject)
+    canvas_id, owner_id = subject
+    if canvas_id is None:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        if (task is None or task.task_kind != "merge_columns_write"
+                or task.owner_id != str(uid) or owner_id != str(uid)):
+            return None
+        envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+        return task if envelope is not None and (
+            producer_kind is None or envelope.producer_kind == producer_kind) else None
+    canvas_id = str(canvas_id)
     canvas = s.get(Canvas, canvas_id, with_for_update=True)
     if canvas is None:
         return None
@@ -10020,21 +10255,26 @@ def _lock_merge_columns_task_action(
     if (task is None or task.task_kind != "merge_columns_write"
             or task.owner_id != str(uid) or task.canvas_id != canvas_id):
         return None
+    envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
+    if envelope is None or (producer_kind is not None and envelope.producer_kind != producer_kind):
+        return None
     return task
 
 
-def cancel_merge_columns_task(task_id: str, uid: str) -> dict | None:
+def cancel_merge_columns_task(
+        task_id: str, uid: str, *, producer_kind: str | None = None) -> dict | None:
     """Cancel one merge Task after atomically confirming its current editor role."""
     with session() as s:
-        task = _lock_merge_columns_task_action(s, task_id, uid)
+        task = _lock_merge_columns_task_action(s, task_id, uid, producer_kind=producer_kind)
         return _request_durable_task_cancel_in_session(s, task) if task is not None else None
 
 
 def retry_merge_columns_task(
-        task_id: str, uid: str, retry_request_id: str) -> dict | None:
+        task_id: str, uid: str, retry_request_id: str,
+        *, producer_kind: str | None = None) -> dict | None:
     """Retry one merge Task after atomically confirming its current editor role."""
     with session() as s:
-        task = _lock_merge_columns_task_action(s, task_id, uid)
+        task = _lock_merge_columns_task_action(s, task_id, uid, producer_kind=producer_kind)
         return (_retry_durable_task_in_session(s, task, retry_request_id)
                 if task is not None else None)
 
@@ -10562,14 +10802,15 @@ def list_workspace_runs(
                     },
                 }))
 
-        # Restore-revision and keyed-upsert Tasks are canvas-less and owner-scoped: their subject is a
-        # dataset's revision history, not a canvas. Project them through their own owner-scoped query so
-        # the Canvas authorization join never fabricates a canvas for them.
+        # Dataset-scoped Tasks are canvas-less and owner-scoped: their subject is a dataset's revision
+        # history, not a canvas. Project them through their own owner-scoped query so the Canvas
+        # authorization join never fabricates a canvas for them.
         if not canvas_id and not node_id and (backend is None or backend == "local"):
             dataset_task_identity = literal("t:") + DurableTask.id
             dataset_task_predicates = [
                 DurableTask.owner_id == str(uid),
                 DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
+                DurableTask.canvas_id.is_(None),
             ]
             if run_id:
                 dataset_task_predicates.append(DurableTask.id == run_id)
@@ -10618,13 +10859,23 @@ def list_workspace_runs(
                 can_cancel = task.status in ("queued", "running")
                 dataset_context = _dataset_context_from_write_intent(
                     task.task_kind, task.write_intent)
+                merge_view = None
+                if task.task_kind == "merge_columns_write":
+                    checkpoint = s.get(DurableCheckpoint, task.id)
+                    envelope = s.get(MergeColumnsTaskEnvelope, task.id)
+                    if envelope is None:
+                        raise RuntimeError("managed sidecar merge Jobs envelope is unavailable")
+                    merge_view = _sanitized_merge_columns_jobs_view(
+                        task, checkpoint, envelope, current_attempt_id=latest["id"],
+                        can_retry=can_retry, can_cancel=can_cancel)
                 candidates.append(((created_at, f"t:{task.id}"), {
                     "id": f"t:{task.id}", "runId": task.id, "requestId": None,
                     "jobType": "run", "status": task.status,
                     "targetNodeId": task.target_node_id, "targetPortId": None,
                     "rows": status_doc.get("total_rows"), "ms": status_doc.get("ms"),
                     "progress": _workspace_progress(task.progress),
-                    "error": task.error, "inputManifest": task_doc["input_manifest"],
+                    "error": task.error, "inputManifest": ([] if merge_view is not None
+                                                               else task_doc["input_manifest"]),
                     "executionManifestSha256": None,
                     "executionManifestReconstructable": False,
                     "outputs": [], "profile": None, "perNode": None,
@@ -10649,10 +10900,11 @@ def list_workspace_runs(
                     } for item in attempts],
                     "cancelRequested": task.cancel_requested,
                     "canRetry": can_retry, "canCancel": can_cancel,
-                    "writeIntent": task_doc["write_intent"],
+                    "writeIntent": None if merge_view is not None else task_doc["write_intent"],
                     "outputReceipt": task_doc["output_receipt"],
                     "externalWait": None,
                     "datasetContext": dataset_context,
+                    **({"mergeColumns": merge_view} if merge_view is not None else {}),
                 }))
     candidates.sort(key=lambda item: item[0], reverse=True)
     page = candidates[:limit]
@@ -13075,6 +13327,33 @@ def _sparse_output_revision_identities(value: object) -> set[tuple[str, str]]:
     return set()
 
 
+def _managed_sidecar_task_input_manifest(
+        value: object) -> tuple[str, list[tuple[str, str]]] | None:
+    """Parse the one explicit durable merge input surface, never generic task metadata."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or set(value) != {"requestSha256", "managedSidecarMergeInputs"}:
+        return None
+    digest, inputs = value.get("requestSha256"), value.get("managedSidecarMergeInputs")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        return None
+    if not isinstance(inputs, list) or len(inputs) != 2:
+        return None
+    identities: list[tuple[str, str]] = []
+    for item in inputs:
+        if (not isinstance(item, dict) or set(item) != {"kind", "datasetId", "revisionId"}
+                or item.get("kind") != "exact"):
+            return None
+        dataset_id, revision_id = item.get("datasetId"), item.get("revisionId")
+        if not isinstance(dataset_id, str) or not dataset_id or not isinstance(revision_id, str) or not revision_id:
+            return None
+        identities.append((dataset_id, revision_id))
+    return (digest, identities) if len(set(identities)) == 2 else None
+
+
 def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if owner_kind in ("canvas", "canvas_version"):
@@ -13086,6 +13365,11 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
     elif owner_kind == "sparse_output":
         for value in values:
             identities.update(_sparse_output_revision_identities(value))
+    elif owner_kind == "durable_task":
+        for value in values:
+            parsed = _managed_sidecar_task_input_manifest(value)
+            if parsed is not None:
+                identities.update(parsed[1])
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))
@@ -13769,6 +14053,8 @@ def release_linear_checkpoint(task_id: str) -> dict | None:
             envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
             if envelope is None:
                 raise RuntimeError("merge columns release envelope is unavailable")
+            if envelope.producer_kind == "managed-sidecar":
+                _drop_local_result_owner_locked(s, "durable_task", task.id)
             s.delete(envelope)
             s.flush()
         s.delete(task)

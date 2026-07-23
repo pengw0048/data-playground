@@ -1621,6 +1621,7 @@ class DurableBoundedFanoutView(Wire):
 class DurableMergeColumnsView(Wire):
     """Sanitized exact-candidate merge projection for Workspace Jobs."""
 
+    producer_kind: Literal["sparse-output", "managed-sidecar"]
     phase: Literal[
         "validating", "merging", "candidate_committed", "publishing",
         "done", "failed", "cancelled",
@@ -1683,7 +1684,9 @@ class RestoreRevisionTaskV1(Wire):
 class DurableTaskDatasetContextView(Wire):
     """Dataset revision-history subject for a canvas-less durable Task in Jobs / Inbox."""
 
-    task_kind: Literal["restore_revision_write", "keyed_upsert_write"]
+    task_kind: Literal[
+        "restore_revision_write", "keyed_upsert_write", "merge_columns_write",
+    ]
     dataset_id: str = Field(min_length=1, max_length=128)
     name: str | None = None
 

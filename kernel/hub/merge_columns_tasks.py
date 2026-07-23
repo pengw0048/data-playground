@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import threading
 import uuid
@@ -15,6 +16,10 @@ from hub.local_writes import write_managed_local_file
 from hub.merge_columns import (
     MergeColumnsIntentV1, merge_columns_publication_context,
     merge_sparse_output_candidate,
+)
+from hub.managed_sidecar_merge import (
+    ManagedSidecarMergeIntentV1, managed_sidecar_merge_document,
+    merge_managed_sidecar_candidate,
 )
 from hub.models import RunOutput, RunStatus, WriteIntent, WriteReceipt
 
@@ -67,10 +72,23 @@ def _heartbeat(task_id: str, attempt_id: str, owner_token: str) -> None:
         raise RuntimeError("cancelled")
 
 
-def _receipt(intent: WriteIntent, frozen: MergeColumnsIntentV1) -> WriteReceipt | None:
+def _publication_context(
+        frozen: MergeColumnsIntentV1 | ManagedSidecarMergeIntentV1, *, task_id: str | None = None,
+        attempt_id: str | None = None, owner_token: str | None = None):
+    if isinstance(frozen, MergeColumnsIntentV1):
+        return merge_columns_publication_context(
+            frozen, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token)
+    document = managed_sidecar_merge_document(frozen)
+    return metadb.MergeColumnsPublicationContext(
+        merge_doc=document, merge_sha256=hashlib.sha256(document.encode()).hexdigest(),
+        task_id=task_id, attempt_id=attempt_id, owner_token=owner_token)
+
+
+def _receipt(
+        intent: WriteIntent, frozen: MergeColumnsIntentV1 | ManagedSidecarMergeIntentV1) -> WriteReceipt | None:
     prior = metadb.catalog_managed_local_write_receipt(
         intent.model_dump(by_alias=True, mode="json"),
-        merge_publication=merge_columns_publication_context(frozen))
+        merge_publication=_publication_context(frozen))
     return WriteReceipt.model_validate(prior) if prior is not None else None
 
 
@@ -82,7 +100,7 @@ def _candidate_bytes(table: pa.Table) -> bytes:
 
 def _publish_candidate(
         deps, *, task_id: str, attempt_id: str, owner_token: str,
-        target_node_id: str, frozen: MergeColumnsIntentV1,
+        target_node_id: str, frozen: MergeColumnsIntentV1 | ManagedSidecarMergeIntentV1,
         intent: WriteIntent) -> RunStatus:
     prior = _receipt(intent, frozen)
     if prior is not None:
@@ -118,7 +136,7 @@ def _publish_candidate(
             storage=deps.storage, catalog=deps.catalog, intent=intent,
             write_artifact=write_artifact, before_publish=lambda: (_heartbeat(
                 task_id, attempt_id, owner_token), guard.check()),
-            merge_publication=merge_columns_publication_context(
+            merge_publication=_publication_context(
                 frozen, task_id=task_id, attempt_id=attempt_id, owner_token=owner_token))
         guard.check()
         return _done(task_id, target_node_id, intent, receipt)
@@ -140,7 +158,11 @@ def _worker(task_id: str, deps) -> None:
             return
         attempt_id = str(claimed["attempts"][-1]["id"])
         target_node_id = str(claimed["target_node_id"])
-        frozen = MergeColumnsIntentV1.model_validate(claimed["merge_columns_intent"])
+        if claimed.get("merge_columns_producer") == "managed-sidecar":
+            frozen = ManagedSidecarMergeIntentV1.model_validate(
+                claimed["managed_sidecar_merge_intent"])
+        else:
+            frozen = MergeColumnsIntentV1.model_validate(claimed["merge_columns_intent"])
         intent = WriteIntent.model_validate(claimed["write_intent"])
         try:
             _heartbeat(task_id, attempt_id, owner_token)
@@ -173,7 +195,9 @@ def _worker(task_id: str, deps) -> None:
                             status_doc=_status(
                                 task_id, target_node_id, phase="merging", progress=0.35)):
                         return
-                    table = merge_sparse_output_candidate(storage=deps.storage, intent=frozen)
+                    table = (merge_managed_sidecar_candidate(storage=deps.storage, intent=frozen)
+                             if isinstance(frozen, ManagedSidecarMergeIntentV1)
+                             else merge_sparse_output_candidate(storage=deps.storage, intent=frozen))
                     _heartbeat(task_id, attempt_id, owner_token)
                     candidate = metadb.reserve_linear_checkpoint_candidate(
                         task_id=task_id, attempt_id=attempt_id, owner_token=owner_token,

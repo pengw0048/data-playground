@@ -4176,12 +4176,21 @@
             "title": "Phase",
             "type": "string"
           },
+          "producerKind": {
+            "enum": [
+              "sparse-output",
+              "managed-sidecar"
+            ],
+            "title": "Producerkind",
+            "type": "string"
+          },
           "reused": {
             "title": "Reused",
             "type": "boolean"
           }
         },
         "required": [
+          "producerKind",
           "phase",
           "baseDatasetId",
           "baseRevisionId",
@@ -4318,7 +4327,8 @@
           "taskKind": {
             "enum": [
               "restore_revision_write",
-              "keyed_upsert_write"
+              "keyed_upsert_write",
+              "merge_columns_write"
             ],
             "title": "Taskkind",
             "type": "string"
@@ -5828,6 +5838,263 @@
           "password"
         ],
         "title": "LoginBody",
+        "type": "object"
+      },
+      "ManagedSidecarMergePreflightV1": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "baseSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Baseschema",
+            "type": "array"
+          },
+          "coverage": {
+            "additionalProperties": true,
+            "title": "Coverage",
+            "type": "object"
+          },
+          "eligible": {
+            "title": "Eligible",
+            "type": "boolean"
+          },
+          "expectedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "identityColumns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Identitycolumns",
+            "type": "array"
+          },
+          "outputSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Outputschema",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MergeColumnRuleV1"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "sidecar": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "sidecarSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Sidecarschema",
+            "type": "array"
+          }
+        },
+        "required": [
+          "base",
+          "sidecar",
+          "expectedHead",
+          "identityColumns",
+          "coverage",
+          "rules",
+          "baseSchema",
+          "sidecarSchema",
+          "outputSchema",
+          "eligible"
+        ],
+        "title": "ManagedSidecarMergePreflightV1",
+        "type": "object"
+      },
+      "ManagedSidecarMergeTaskRequestV1": {
+        "additionalProperties": false,
+        "description": "Headless exact-sidecar variant: no graph, storage path, or plugin authority.",
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "expectedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "identityColumns": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Identitycolumns",
+            "type": "array"
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MergeColumnRuleV1"
+            },
+            "maxItems": 128,
+            "minItems": 1,
+            "title": "Rules",
+            "type": "array"
+          },
+          "sidecar": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "submissionId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Submissionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "submissionId",
+          "base",
+          "sidecar",
+          "expectedHead",
+          "identityColumns",
+          "rules"
+        ],
+        "title": "ManagedSidecarMergeTaskRequestV1",
+        "type": "object"
+      },
+      "ManagedSidecarMergeTaskV1": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "baseSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Baseschema",
+            "type": "array"
+          },
+          "canCancel": {
+            "title": "Cancancel",
+            "type": "boolean"
+          },
+          "canRetry": {
+            "title": "Canretry",
+            "type": "boolean"
+          },
+          "childRevisionId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Childrevisionid"
+          },
+          "coverage": {
+            "additionalProperties": true,
+            "title": "Coverage",
+            "type": "object"
+          },
+          "diagnosticCode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diagnosticcode"
+          },
+          "expectedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "identityColumns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Identitycolumns",
+            "type": "array"
+          },
+          "mergeColumns": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DurableMergeColumnsView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outputSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Outputschema",
+            "type": "array"
+          },
+          "receipt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/MergeColumnRuleV1"
+            },
+            "title": "Rules",
+            "type": "array"
+          },
+          "sidecar": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "sidecarSchema": {
+            "items": {
+              "$ref": "#/components/schemas/ColumnSchema"
+            },
+            "title": "Sidecarschema",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "taskId": {
+            "title": "Taskid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId",
+          "status",
+          "base",
+          "sidecar",
+          "expectedHead",
+          "identityColumns",
+          "coverage",
+          "rules",
+          "baseSchema",
+          "sidecarSchema",
+          "outputSchema",
+          "canRetry",
+          "canCancel"
+        ],
+        "title": "ManagedSidecarMergeTaskV1",
         "type": "object"
       },
       "MergeColumnRuleV1": {
@@ -20273,6 +20540,423 @@
           }
         },
         "summary": "Livez"
+      }
+    },
+    "/api/managed-sidecar-merge": {
+      "post": {
+        "operationId": "submit_managed_sidecar_merge_api_managed_sidecar_merge_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManagedSidecarMergeTaskRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedSidecarMergeTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Submit Managed Sidecar Merge"
+      }
+    },
+    "/api/managed-sidecar-merge/preflight": {
+      "post": {
+        "operationId": "managed_sidecar_preflight_api_managed_sidecar_merge_preflight_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManagedSidecarMergeTaskRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedSidecarMergePreflightV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Managed Sidecar Preflight"
+      }
+    },
+    "/api/managed-sidecar-merge/{task_id}": {
+      "get": {
+        "operationId": "managed_sidecar_status_api_managed_sidecar_merge__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedSidecarMergeTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Managed Sidecar Status"
+      }
+    },
+    "/api/managed-sidecar-merge/{task_id}/cancel": {
+      "post": {
+        "operationId": "cancel_managed_sidecar_merge_api_managed_sidecar_merge__task_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedSidecarMergeTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Cancel Managed Sidecar Merge"
+      }
+    },
+    "/api/managed-sidecar-merge/{task_id}/retry": {
+      "post": {
+        "operationId": "retry_managed_sidecar_merge_api_managed_sidecar_merge__task_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_RetryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedSidecarMergeTaskV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Retry Managed Sidecar Merge"
       }
     },
     "/api/me": {

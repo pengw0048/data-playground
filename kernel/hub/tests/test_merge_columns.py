@@ -732,6 +732,7 @@ def test_durable_merge_reuses_only_committed_candidate_and_redacts_jobs(local_ca
     assert sorted(outcomes) == ["cancelled", "completed"]
     jobs = metadb.list_workspace_runs(case.admission["ownerId"])
     job = next(item for item in jobs["items"] if item["taskId"] == task["id"])
+    assert job["mergeColumns"]["producerKind"] == "sparse-output"
     assert job["mergeColumns"]["phase"] == "done"
     assert job["mergeColumns"]["candidate"] == "committed"
     assert job["writeIntent"] is None and job["inputManifest"] == []
