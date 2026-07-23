@@ -6,16 +6,19 @@ canvas an MCP client builds is the SAME persisted canvas the HTTP API serves to 
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import uuid
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from hub.deps import get_deps
 from hub.main import app
-from hub.mcp import build_server, serve_stdio
+from hub.mcp import _catalog_failure, build_server, serve_stdio
+from hub.models import CatalogPage, CatalogQuery, CatalogTable, ColumnSchema, Relationship
 
 client = TestClient(app)
 server = build_server(base_url="http://test.local")
@@ -85,7 +88,8 @@ def test_positional_params_are_invalid_params():
 def test_tools_list_every_tool_has_a_schema():
     tools = rpc("tools/list")["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert {"list_datasets", "create_canvas", "add_node", "connect", "set_transform",
+    assert {"search_catalog", "get_dataset_context", "get_relationship_graph",
+            "get_dataset_lineage", "create_canvas", "add_node", "connect", "set_transform",
             "preview_node", "run_canvas"} <= names
     for t in tools:
         assert t["description"] and t["inputSchema"]["type"] == "object"
@@ -94,12 +98,197 @@ def test_tools_list_every_tool_has_a_schema():
 # --------------------------------------------------------------------------- #
 # Catalog / discovery
 # --------------------------------------------------------------------------- #
-def test_list_datasets_surfaces_seeded_tables_with_types_and_keys():
-    ds = data("list_datasets", {})["datasets"]
-    events = next(d for d in ds if d["name"] == "events")
-    assert {"id", "user_id", "event", "amount"} <= {c["name"] for c in events["columns"]}
-    assert all("type" in c for c in events["columns"])
-    assert any(d["keys"] for d in ds)  # at least one dataset exposes a primary-key candidate
+def test_search_catalog_is_bounded_and_continuable(monkeypatch):
+    first = CatalogTable(id="one", name="one", uri="memory://one", columns=[ColumnSchema(name="id", type="int")])
+    second = CatalogTable(id="two", name="two", uri="memory://two", columns=[ColumnSchema(name="id", type="int")])
+    seen: list[CatalogQuery] = []
+
+    def page(query):
+        seen.append(query)
+        return CatalogPage(items=[first] if query.offset == 0 else [second], total=2,
+                           offset=query.offset, limit=query.limit, has_more=query.offset == 0)
+
+    monkeypatch.setattr(get_deps().catalog, "list_page", page)
+    one = data("search_catalog", {"text": "sales", "tags": ["curated"],
+                                   "requiredColumns": ["id"], "limit": 1})
+    two = data("search_catalog", {"cursor": one["nextCursor"]})
+    assert one["state"] == "available" and one["hasMore"] is True
+    assert one["nextCursor"] != "1"
+    assert two["hasMore"] is False and two["datasets"][0]["id"] == "two"
+    assert seen[0].q == "sales" and seen[0].tags == ["curated"]
+    assert seen[0].has_columns == ["id"] and seen[0].limit == 1
+    assert seen[1].model_copy(update={"offset": 0}) == seen[0] and seen[1].offset == 1
+    ambiguous = call("search_catalog", {"cursor": one["nextCursor"], "text": "different"})
+    assert ambiguous["isError"] is True
+
+
+@pytest.mark.parametrize("arguments", [
+    {"text": "é" * 513},
+    {"folder": "f" * 1_025},
+    {"owner": "o" * 513},
+    {"tags": ["t" * 129]},
+    {"requiredColumns": ["c" * 129]},
+    {"cursor": "a" * 131_073},
+])
+def test_search_catalog_bounds_every_caller_controlled_string(arguments):
+    assert call("search_catalog", arguments)["isError"] is True
+
+
+def test_search_catalog_rejects_an_out_of_range_cursor_offset():
+    payload = {
+        "v": 1,
+        "query": {
+            "text": None, "folder": None, "tags": [], "owner": None,
+            "requiredColumns": [], "sort": "name", "order": "asc", "limit": 1,
+        },
+        "offset": 2_147_483_648,
+    }
+    cursor = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    assert call("search_catalog", {"cursor": cursor})["isError"] is True
+
+
+@pytest.mark.parametrize(("error", "failure"), [
+    (NotImplementedError("provider secret"), "unsupported"),
+    (PermissionError("provider secret"), "permission_lost"),
+    (ConnectionError("provider secret"), "offline"),
+    (KeyError("provider secret"), "not_found"),
+    (RuntimeError("provider secret"), "provider_error"),
+    (HTTPException(501, "provider secret"), "unsupported"),
+    (HTTPException(403, "provider secret"), "permission_lost"),
+    (HTTPException(503, "provider secret"), "offline"),
+    (HTTPException(404, "provider secret"), "not_found"),
+    (HTTPException(502, "provider secret"), "provider_error"),
+])
+def test_catalog_failure_classifier_is_structured_and_secret_free(error, failure):
+    result = _catalog_failure(error)
+    assert result == {"state": "unavailable", "failure": failure}
+    assert "secret" not in json.dumps(result)
+
+
+def test_catalog_read_surfaces_keep_failures_distinct_from_available_empty(monkeypatch):
+    catalog = get_deps().catalog
+    original_page = catalog.list_page
+    monkeypatch.setattr(catalog, "list_page", lambda _query: (_ for _ in ()).throw(
+        RuntimeError("provider secret")))
+    assert data("search_catalog", {}) == {"state": "unavailable", "failure": "provider_error"}
+    monkeypatch.setattr(catalog, "list_page", original_page)
+
+    missing = data("get_dataset_context", {"dataset": "definitely-not-a-dataset"})
+    assert missing == {"state": "unavailable", "failure": "not_found"}
+    empty = data("search_catalog", {"text": "definitely-no-catalog-match"})
+    assert empty["state"] == "available" and empty["datasets"] == [] and empty["hasMore"] is False
+
+
+def test_context_classifies_relationship_and_revision_failures(monkeypatch):
+    from hub.routers import catalog as catalog_router
+
+    catalog = get_deps().catalog
+    monkeypatch.setattr(
+        catalog, "relationships",
+        lambda _uri=None: (_ for _ in ()).throw(PermissionError("provider secret")),
+    )
+    monkeypatch.setattr(
+        catalog_router, "dataset_revision_capabilities",
+        lambda _table_id: (_ for _ in ()).throw(ConnectionError("provider secret")),
+    )
+    context = data("get_dataset_context", {"dataset": "events"})
+    assert context["state"] == "available"
+    assert context["relationships"] == {
+        "state": "unavailable", "failure": "permission_lost",
+    }
+    assert context["capabilities"]["revisions"] == {
+        "state": "unavailable", "failure": "offline",
+    }
+
+
+def test_context_relationship_window_is_independently_bounded(monkeypatch):
+    events, images = _uri("events"), _uri("images")
+    relationships = [
+        Relationship(
+            left_uri=events, left_columns=[f"left_{index}"],
+            right_uri=images, right_columns=[f"right_{index}"],
+        )
+        for index in range(1_001)
+    ]
+    monkeypatch.setattr(get_deps().catalog, "relationships", lambda _uri=None: relationships)
+    context = data("get_dataset_context", {"dataset": "events", "relationshipLimit": 10})
+    assert context["relationships"]["state"] == "available"
+    assert len(context["relationships"]["items"]) == 10
+    assert context["relationships"] | {"items": []} == {
+        "state": "available", "items": [], "limit": 10, "total": 1_001, "truncated": True,
+    }
+
+
+def test_dataset_context_uses_canonical_alias_and_redacts_legacy_meta():
+    table = get_deps().catalog.get_table("tbl_events")
+    context = data("get_dataset_context", {"dataset": table.uri})
+    assert context["state"] == "available"
+    assert context["dataset"]["id"] == table.id and context["dataset"]["uri"] == table.uri
+    assert context["dataset"]["resourceUri"] == f"dataplay://dataset/{table.registration_id}"
+    assert {"id", "user_id", "event", "amount"} <= {c["name"] for c in context["dataset"]["columns"]}
+    assert "meta" not in context["dataset"] and context["capabilities"]["revisions"]["state"] in {"available", "unavailable"}
+
+
+def test_relationship_graph_is_declared_only_and_truthfully_bounded():
+    catalog = get_deps().catalog
+    events, images = _uri("events"), _uri("images")
+    relationship = Relationship(left_uri=events, left_columns=["id"], right_uri=images,
+                                right_columns=["id"], cardinality="1:1")
+    catalog.add_relationship(relationship)
+    try:
+        graph = data("get_relationship_graph", {"dataset": "events", "maxHops": 1, "maxNodes": 2})
+        bounded = data("get_relationship_graph", {"dataset": "events", "maxHops": 0, "maxNodes": 1})
+    finally:
+        catalog.remove_relationship(relationship)
+    assert relationship.model_dump(by_alias=True) in graph["edges"]
+    assert graph["truncated"] is False and {node["uri"] for node in graph["nodes"]} >= {events, images}
+    assert bounded["truncated"] is True and bounded["nodes"] == [graph["nodes"][0]] and not bounded["edges"]
+
+
+def test_relationship_graph_caps_one_thousand_edges_truthfully(monkeypatch):
+    events, images = _uri("events"), _uri("images")
+    relationships = [
+        Relationship(
+            left_uri=events, left_columns=[f"left_{index}"],
+            right_uri=images, right_columns=[f"right_{index}"],
+        )
+        for index in range(1_001)
+    ]
+    monkeypatch.setattr(get_deps().catalog, "relationships", lambda _uri=None: relationships)
+    graph = data("get_relationship_graph", {
+        "dataset": "events", "maxHops": 1, "maxNodes": 2, "maxEdges": 1_000,
+    })
+    assert graph["state"] == "available" and len(graph["edges"]) == 1_000
+    assert graph["maxEdges"] == 1_000 and graph["truncated"] is True
+
+
+def test_relationship_graph_and_lineage_classify_provider_failures(monkeypatch):
+    catalog = get_deps().catalog
+    original_relationships = catalog.relationships
+    monkeypatch.setattr(
+        catalog, "relationships",
+        lambda _uri=None: (_ for _ in ()).throw(ConnectionError("provider secret")),
+    )
+    assert data("get_relationship_graph", {"dataset": "events"}) == {
+        "state": "unavailable", "failure": "offline",
+    }
+    monkeypatch.setattr(catalog, "relationships", original_relationships)
+    monkeypatch.setattr(
+        catalog, "lineage",
+        lambda _uri, depth=6, max_nodes=500: (_ for _ in ()).throw(
+            NotImplementedError("provider secret")),
+    )
+    lineage = data("get_dataset_lineage", {"dataset": "events"})
+    assert lineage["state"] == "unavailable" and lineage["failure"] == "unsupported"
+    assert "secret" not in json.dumps(lineage)
+
+
+def test_dataset_lineage_is_bounded_and_empty_is_not_unavailable():
+    result = data("get_dataset_lineage", {"dataset": "events", "depth": 1, "maxNodes": 1})
+    assert result["state"] == "available"
+    assert result["lineage"]["rootUri"] == _uri("events")
+    assert isinstance(result["lineage"]["truncated"], bool)
 
 
 def test_sample_dataset_by_name_returns_real_rows():
@@ -544,12 +733,53 @@ def test_run_status_and_cancel_are_listed_tools():
 # --------------------------------------------------------------------------- #
 def test_resources_list_and_read():
     res = rpc("resources/list")["result"]["resources"]
-    uris = [r["uri"] for r in res]
-    assert any(u.startswith("dataplay://dataset/") for u in uris)
-    ds_uri = next(u for u in uris if u.startswith("dataplay://dataset/"))
+    # Dataset discovery is deliberately absent here: MCP resources/list has no continuation field.
+    # search_catalog returns the bounded resource URI for an exact dataset instead.
+    assert not any(r["uri"].startswith("dataplay://dataset/") for r in res)
+    ds_uri = data("search_catalog", {"text": "events", "limit": 1})["datasets"][0]["resourceUri"]
     content = rpc("resources/read", {"uri": ds_uri})["result"]["contents"][0]
     assert content["mimeType"] == "application/json"
-    assert "columns" in json.loads(content["text"])
+    payload = json.loads(content["text"])
+    assert "columns" in payload["dataset"] and "meta" not in payload["dataset"]
+
+
+def test_dataset_resource_registration_identity_does_not_rebind_after_reregister(tmp_path):
+    path = tmp_path / f"mcp-aba-{uuid.uuid4().hex}.csv"
+    path.write_text("id,value\n1,old\n")
+    catalog = get_deps().catalog
+    replacement = None
+    try:
+        created = client.post("/api/catalog/register", json={
+            "uri": str(path), "name": f"mcp_aba_{uuid.uuid4().hex}",
+        }).json()
+        old_registration = created["registrationId"]
+        old_resource = f"dataplay://dataset/{old_registration}"
+
+        # The current catalog resolver accepts the same stable identity used by the resource URI.
+        context = data("get_dataset_context", {"dataset": old_registration})
+        assert context["dataset"]["resourceUri"] == old_resource
+        assert "result" in rpc("resources/read", {"uri": old_resource})
+
+        removed = client.delete(f"/api/catalog/tables/{created['id']}", params={
+            "expected_registration_id": old_registration,
+            "expected_revision": created["metadataRevision"],
+        })
+        assert removed.status_code == 200
+        replacement = client.post("/api/catalog/register", json={
+            # Deliberately collide with the stale registration token's generic name namespace.
+            # resources/read must still resolve that token as one exact registration or fail closed.
+            "uri": str(path), "name": old_registration,
+        }).json()
+        assert replacement["registrationId"] != old_registration
+
+        stale = rpc("resources/read", {"uri": old_resource})
+        assert stale["error"]["code"] == -32002
+        new_resource = f"dataplay://dataset/{replacement['registrationId']}"
+        fresh = rpc("resources/read", {"uri": new_resource})["result"]["contents"][0]
+        assert json.loads(fresh["text"])["dataset"]["registrationId"] == replacement["registrationId"]
+    finally:
+        # This test owns the unique path and removes whichever generation is current.
+        catalog.unregister(str(path))
 
 
 def test_resources_read_unknown_uri_errors():

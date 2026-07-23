@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from hub.deps import get_deps
 from hub.main import app
+from hub.mcp import build_server
 
 client = TestClient(app)
 
@@ -38,7 +39,33 @@ def test_http_initialize_and_tools_list():
     r = rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})["result"]
     assert r["serverInfo"]["name"] == "data-playground"
     names = {t["name"] for t in rpc("tools/list")["result"]["tools"]}
-    assert {"create_canvas", "add_node", "run_canvas", "sample_result"} <= names
+    assert {"search_catalog", "get_dataset_context", "get_relationship_graph",
+            "get_dataset_lineage", "create_canvas", "add_node", "run_canvas", "sample_result"} <= names
+
+
+def test_http_and_stdio_catalog_schemas_and_results_match():
+    stdio = build_server(base_url="http://test.local")
+    http_tools = rpc("tools/list")["result"]["tools"]
+    stdio_tools = stdio.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+    })["result"]["tools"]
+    assert http_tools == stdio_tools
+
+    arguments = {"text": "events", "limit": 1}
+    http_page = tool("search_catalog", arguments)
+    stdio_page = stdio.handle({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "search_catalog", "arguments": arguments},
+    })["result"]["structuredContent"]
+    assert http_page == stdio_page
+
+    dataset = http_page["datasets"][0]["registrationId"]
+    http_context = tool("get_dataset_context", {"dataset": dataset})
+    stdio_context = stdio.handle({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "get_dataset_context", "arguments": {"dataset": dataset}},
+    })["result"]["structuredContent"]
+    assert http_context == stdio_context
 
 
 def test_http_notification_yields_202_no_body():

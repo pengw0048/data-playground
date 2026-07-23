@@ -945,10 +945,7 @@ class InMemoryCatalog:
         return table
 
     def relationships(self, uri: str | None = None) -> list[Relationship]:
-        try:
-            raw = metadb.catalog_relationships()
-        except Exception:  # noqa: BLE001
-            raw = []
+        raw = metadb.catalog_relationships()
         rels: list[Relationship] = []
         for r in raw:
             try:
