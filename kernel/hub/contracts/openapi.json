@@ -10789,6 +10789,26 @@
         "title": "WorkspaceBrowsePage",
         "type": "object"
       },
+      "WorkspaceCanonicalSourceBinding": {
+        "description": "Opaque current Source generation for one canonical mounted-provider dataset.",
+        "properties": {
+          "mountId": {
+            "title": "Mountid",
+            "type": "string"
+          },
+          "sourceBindingId": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Sourcebindingid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mountId",
+          "sourceBindingId"
+        ],
+        "title": "WorkspaceCanonicalSourceBinding",
+        "type": "object"
+      },
       "WorkspaceCreateCanvasBody": {
         "additionalProperties": false,
         "properties": {
@@ -11353,6 +11373,16 @@
             },
             "title": "Ancestors",
             "type": "array"
+          },
+          "canonicalSourceBinding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceCanonicalSourceBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "resource": {
             "anyOf": [

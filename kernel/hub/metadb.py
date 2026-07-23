@@ -318,6 +318,8 @@ class WorkspaceProviderDataset(Base):
     mount_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     provider_dataset_id: Mapped[str] = mapped_column(String(512), primary_key=True)
     provider: Mapped[str] = mapped_column(String(256), nullable=False)
+    source_binding_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=lambda: secrets.token_hex(16))
     uri: Mapped[str | None] = mapped_column(Text, nullable=True)
     columns_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="current")
@@ -336,6 +338,14 @@ class WorkspaceProviderDataset(Base):
             "(uri IS NULL AND columns_doc IS NULL) OR "
             "(uri IS NOT NULL AND columns_doc IS NOT NULL)",
             name="ck_workspace_provider_dataset_detail_pair",
+        ),
+        CheckConstraint(
+            "length(source_binding_id) = 32",
+            name="ck_workspace_provider_dataset_source_binding",
+        ),
+        UniqueConstraint(
+            "mount_id", "source_binding_id",
+            name="uq_workspace_provider_dataset_source_binding",
         ),
     )
 
@@ -5289,6 +5299,7 @@ def _workspace_provider_dataset_doc(row: WorkspaceProviderDataset) -> dict:
         "mountId": row.mount_id,
         "providerDatasetId": row.provider_dataset_id,
         "provider": row.provider,
+        "sourceBindingId": row.source_binding_id,
         "uri": row.uri,
         "columns": (
             json.loads(row.columns_doc) if row.columns_doc is not None else None),
@@ -5453,7 +5464,7 @@ def _workspace_provider_upsert_dataset(
     )
     now = _now()
     if row is None:
-        row = WorkspaceProviderDataset(
+        candidate = WorkspaceProviderDataset(
             mount_id=mount_id,
             provider_dataset_id=provider_dataset_id,
             provider=provider,
@@ -5462,9 +5473,25 @@ def _workspace_provider_upsert_dataset(
             state="current",
             last_resolved_at=now,
         )
-        s.add(row)
-        s.flush()
-        return row, False
+        try:
+            # Two independent placements may discover one canonical dataset concurrently. The
+            # composite primary key arbitrates the mint; a savepoint keeps the losing transaction
+            # usable so it can join the winner instead of forking Source identity.
+            with s.begin_nested():
+                s.add(candidate)
+                s.flush()
+        except IntegrityError:
+            row = s.get(
+                WorkspaceProviderDataset,
+                (mount_id, provider_dataset_id),
+                with_for_update=True,
+            )
+            if row is None:
+                # A scoped source-token collision or unrelated integrity failure has no safe
+                # recovery path and must not be treated as the requested canonical dataset.
+                raise
+        else:
+            return candidate, False
     conflict = (
         row.provider != provider
         or row.uri is not None and row.uri != uri
@@ -5706,6 +5733,35 @@ def workspace_provider_dataset(
     with session() as s:
         row = s.get(WorkspaceProviderDataset, (mount_id, provider_dataset_id))
         return _workspace_provider_dataset_doc(row) if row is not None else None
+
+
+def workspace_provider_source_binding(binding_id: str) -> dict | None:
+    """Resolve one selected placement to its current opaque canonical Source generation.
+
+    This is the only placement-to-Source identity boundary. It deliberately joins through the
+    retained canonical key and never falls back by URI, display name, provider placement, another
+    occurrence, or a current provider observation.
+    """
+    if re.fullmatch(r"[0-9a-f]{32}", str(binding_id)) is None:
+        return None
+    with session() as s:
+        placement = s.get(WorkspaceProviderBinding, binding_id)
+        if (placement is None or placement.kind != "dataset" or not placement.active
+                or placement.state != "current" or placement.provider_dataset_id is None):
+            return None
+        canonical = s.get(
+            WorkspaceProviderDataset,
+            (placement.mount_id, placement.provider_dataset_id),
+        )
+        if (canonical is None or canonical.provider != placement.provider
+                or canonical.state != "current"
+                or canonical.uri is None or canonical.columns_doc is None
+                or re.fullmatch(r"[0-9a-f]{32}", canonical.source_binding_id) is None):
+            return None
+        return {
+            "mountId": canonical.mount_id,
+            "sourceBindingId": canonical.source_binding_id,
+        }
 
 
 def workspace_provider_reconcile_children(

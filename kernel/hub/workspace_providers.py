@@ -304,10 +304,11 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
                 metadb.workspace_provider_mark_dataset(
                     mount_id=mounted.mount.id,
                     provider_dataset_id=retained_dataset_id,
-                    state="provider_error",
+                    state="detached",
                     error=result.reason,
                 )
-            raise ProviderDatasetUnavailable("provider dataset detail is unavailable")
+            raise ProviderDatasetGone(
+                "canonical provider dataset was deleted; relink it explicitly")
         state = _reference_state(result.failure, result.state)
         if retained_dataset_id is not None:
             metadb.workspace_provider_mark_dataset(
@@ -1158,6 +1159,8 @@ def _cached_resolution(
         "ancestors": [*local_ancestors, *cached_ancestors],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
+        "canonicalSourceBinding": metadb.workspace_provider_source_binding(
+            binding["bindingId"]),
     }
 
 
@@ -1329,6 +1332,8 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         "resource": current,
         "ancestors": combined,
         "source": _source_status(source, completeness, error, current["referenceState"]),
+        "canonicalSourceBinding": metadb.workspace_provider_source_binding(
+            current["bindingId"]),
     }
 
 

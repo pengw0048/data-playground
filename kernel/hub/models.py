@@ -1125,11 +1125,18 @@ class WorkspaceBrowsePage(Wire):
         return self
 
 
+class WorkspaceCanonicalSourceBinding(Wire):
+    """Opaque current Source generation for one canonical mounted-provider dataset."""
+    mount_id: str
+    source_binding_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class WorkspaceResourceResolution(Wire):
     resource: WorkspaceResource | None
     ancestors: list[WorkspaceResource] = []
     source: WorkspaceSourceStatus = WorkspaceSourceStatus(
         id="local", kind="local", completeness="complete")
+    canonical_source_binding: WorkspaceCanonicalSourceBinding | None = None
 
 
 class WorkspaceProviderRelinkRequest(Wire):

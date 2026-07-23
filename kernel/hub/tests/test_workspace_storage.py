@@ -565,6 +565,7 @@ class _MultiPlacementWorkspaceProvider:
 
     def __init__(self):
         self.partial_parents: set[str] = set()
+        self.dataset_ids = {"canonical-dataset"}
         self.ancestor_calls = 0
         self.search_calls = 0
         self.resources = {
@@ -616,7 +617,7 @@ class _MultiPlacementWorkspaceProvider:
         return ProviderAncestors(items=[parent] if parent is not None else [])
 
     def dataset_detail(self, _mount, dataset_id):
-        if dataset_id != "canonical-dataset":
+        if dataset_id not in self.dataset_ids:
             return ProviderDatasetDetailResult(
                 state="unavailable", reason="dataset not found", failure="not_found")
         return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
@@ -908,6 +909,18 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert left["bindingId"] != right["bindingId"]
     assert left["providerDatasetId"] == right["providerDatasetId"] == "canonical-dataset"
     assert left["parentId"] != right["parentId"]
+    left_resolution = workspace_providers.resolve(
+        left["id"], uid=metadb.DEFAULT_USER_ID)
+    right_resolution = workspace_providers.resolve(
+        right["id"], uid=metadb.DEFAULT_USER_ID)
+    source_binding = left_resolution["canonicalSourceBinding"]
+    assert source_binding == right_resolution["canonicalSourceBinding"]
+    assert source_binding is not None
+    assert len(source_binding["sourceBindingId"]) == 32
+    assert "left-occurrence" not in json.dumps(source_binding)
+    assert "right-occurrence" not in json.dumps(source_binding)
+    assert "canonical-dataset" not in json.dumps(source_binding)
+    assert "canonical-dataset.parquet" not in json.dumps(source_binding)
     with metadb.session() as session:
         canonical_rows = list(session.scalars(select(metadb.WorkspaceProviderDataset).where(
             metadb.WorkspaceProviderDataset.mount_id == mount_id)))
@@ -963,6 +976,9 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         if item.get("providerPlacementId") == "left-occurrence")
     assert moved_resource["bindingId"] == left["bindingId"]
     assert moved_resource["name"] == "Shared moved"
+    assert workspace_providers.resolve(
+        moved_resource["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] == source_binding
 
     # A complete parent snapshot plus not-found resolve detaches only the deleted occurrence.
     del provider.resources["left-occurrence"]
@@ -980,6 +996,12 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert deleted is not None and deleted["referenceState"] == "detached"
     assert survivor is not None and survivor["referenceState"] == "current"
     assert canonical is not None and canonical["referenceState"] == "current"
+    assert workspace_providers.resolve(
+        left["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] is None
+    assert workspace_providers.resolve(
+        right["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] == source_binding
 
     # Canonical outage/recovery is shared state and does not detach the surviving placement.
     dataset_detail = provider.dataset_detail
@@ -1003,6 +1025,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         mount_id=mount_id,
         provider_dataset_id="canonical-dataset",
     )["referenceState"] == "current"
+    assert metadb.workspace_provider_source_binding(
+        right["bindingId"]) == source_binding
 
     # Reopening the metadata engine preserves both the tombstone and shared canonical state.
     assert metadb._engine is not None
@@ -1015,6 +1039,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         mount_id=mount_id,
         provider_dataset_id="canonical-dataset",
     )["referenceState"] == "current"
+    assert metadb.workspace_provider_source_binding(
+        right["bindingId"]) == source_binding
 
     # Conflicting canonical facts fail closed without replacing the retained URI/schema evidence.
     provider.resources["right-occurrence"] = CatalogResource(
@@ -1034,6 +1060,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert conflicted is not None
     assert conflicted["referenceState"] == "provider_error"
     assert conflicted["uri"] == "file:///canonical-dataset.parquet"
+    assert conflicted["sourceBindingId"] == source_binding["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(right["bindingId"]) is None
 
     # The mount-scoped placement key does not fork when operator configuration changes provider.
     provider_changed = metadb.workspace_provider_cache_resource(
@@ -1054,6 +1082,147 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
             metadb.WorkspaceProviderBinding.active.is_(True),
         )))
         assert len(occurrences) == 1
+
+
+def test_provider_source_binding_is_mount_scoped_and_canonical_tombstone_is_aba_fenced(
+        workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    common = {
+        "provider": "fixture",
+        "container_id": root["id"],
+        "kind": "dataset",
+        "provider_dataset_id": f"dataset-{token}",
+        "uri": f"secret://credentials@host/{token}/physical.parquet",
+        "columns": [{"name": "sensitive_display_column", "type": "int64"}],
+    }
+    first = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-left-{token}",
+        name=f"Display left {token}",
+    )
+    second = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-right-{token}",
+        name=f"Display right {token}",
+    )
+    other_mount = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-b-{token}",
+        provider_placement_id=f"placement-left-{token}",
+        name=f"Display left {token}",
+    )
+
+    first_source = metadb.workspace_provider_source_binding(first["bindingId"])
+    assert first_source == metadb.workspace_provider_source_binding(second["bindingId"])
+    assert first_source is not None
+    with metadb.session() as session:
+        other_canonical = session.get(
+            metadb.WorkspaceProviderDataset,
+            (f"mount-b-{token}", f"dataset-{token}"),
+        )
+        assert other_canonical is not None
+        # The database uniqueness boundary is mount-scoped, so equal opaque tokens across mounts
+        # remain representable and the public evidence must retain its mount discriminator.
+        other_canonical.source_binding_id = first_source["sourceBindingId"]
+    other_source = metadb.workspace_provider_source_binding(other_mount["bindingId"])
+    assert other_source is not None
+    assert first_source["mountId"] != other_source["mountId"]
+    assert first_source["sourceBindingId"] == other_source["sourceBindingId"]
+    assert first_source != other_source
+    assert first_source["mountId"] == f"mount-a-{token}"
+    encoded = json.dumps(first_source, sort_keys=True)
+    for forbidden in (
+        "secret", "credentials", "physical", "sensitive_display_column",
+        "placement-left", "placement-right", "Display",
+    ):
+        assert forbidden not in encoded
+
+    canonical_before = metadb.workspace_provider_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+    )
+    assert canonical_before is not None
+    metadb.workspace_provider_mark_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+        state="detached",
+        error="provider reused canonical identity",
+    )
+    reused = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-reused-{token}",
+        name=f"Reused display {token}",
+    )
+    canonical_after = metadb.workspace_provider_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+    )
+    assert canonical_after is not None
+    assert canonical_after["referenceState"] == "detached"
+    assert canonical_after["sourceBindingId"] == canonical_before["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(first["bindingId"]) is None
+    assert metadb.workspace_provider_source_binding(second["bindingId"]) is None
+    assert metadb.workspace_provider_source_binding(reused["bindingId"]) is None
+
+
+def test_postgres_concurrent_placements_join_one_provider_source_binding(workspace_scope):
+    if metadb._is_sqlite_database():
+        pytest.skip("PostgreSQL canonical Source mint concurrency regression")
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    common = {
+        "mount_id": f"concurrent-source-{token}",
+        "provider": "fixture",
+        "container_id": metadb.LOCAL_WORKSPACE_ROOT_ID,
+        "kind": "dataset",
+        "provider_dataset_id": f"canonical-{token}",
+        "uri": f"fixture://canonical-{token}",
+        "columns": [{"name": "value", "type": "int64"}],
+    }
+    start = threading.Barrier(3)
+    results: list[dict | Exception] = []
+
+    def cache(placement: str) -> None:
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_provider_cache_resource(
+                **common,
+                provider_placement_id=placement,
+                name=placement,
+            ))
+        except Exception as exc:  # noqa: BLE001 - concurrent failures are asserted below
+            results.append(exc)
+
+    threads = [
+        threading.Thread(target=cache, args=(f"left-{token}",)),
+        threading.Thread(target=cache, args=(f"right-{token}",)),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert len(results) == 2
+    assert all(isinstance(result, dict) for result in results), results
+    bindings = [
+        metadb.workspace_provider_source_binding(result["bindingId"])
+        for result in results if isinstance(result, dict)
+    ]
+    assert bindings[0] is not None
+    assert bindings[0] == bindings[1]
+    with metadb.session() as session:
+        canonical_rows = list(session.scalars(select(
+            metadb.WorkspaceProviderDataset).where(
+                metadb.WorkspaceProviderDataset.mount_id == common["mount_id"],
+                metadb.WorkspaceProviderDataset.provider_dataset_id
+                == common["provider_dataset_id"],
+            )))
+    assert len(canonical_rows) == 1
 
 
 @pytest.mark.parametrize("conflicting_fact", ["uri", "columns"])
@@ -1094,44 +1263,68 @@ def test_provider_dataset_binding_rejects_conflicting_occurrence_and_detail_fact
     assert binding["active"] is True
 
 
-def test_provider_dataset_detail_not_found_keeps_the_same_binding_retryable(
+def test_provider_dataset_detail_not_found_tombstones_canonical_source_generation(
         workspace_scope, monkeypatch):
-    provider = _WorkspaceFixtureProvider()
-    mount_id, binding_id, uri = _workspace_provider_dataset_binding(
-        workspace_scope, monkeypatch, provider)
-    normal_detail = provider.dataset_detail
-    monkeypatch.setattr(
-        provider, "dataset_detail",
-        lambda *_args, **_kwargs: ProviderDatasetDetailResult(
-            state="unavailable", reason="canonical detail is not ready", failure="not_found"),
-    )
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-canonical-detail-tombstone")
+    mount_id = f"canonical-detail-tombstone-{token}"
+    provider = _MultiPlacementWorkspaceProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    root_page = workspace_providers.browse(
+        folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    left_parent = next(
+        item for item in root_page["items"]
+        if item.get("providerPlacementId") == "left-parent")
+    left_page = workspace_providers.browse(
+        left_parent["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID, limit=100)
+    resource = next(
+        item for item in left_page["items"]
+        if item.get("providerPlacementId") == "left-occurrence")
+    binding_id = resource["bindingId"]
+    uri = workspace_providers.provider_dataset_uri(binding_id)
+    before = workspace_providers.resolve(resource["id"], uid=metadb.DEFAULT_USER_ID)
+    source_binding = before["canonicalSourceBinding"]
+    assert source_binding is not None
+
+    # The real fake provider loses its canonical dataset while its stale placement remains visible.
+    provider.dataset_ids.remove("canonical-dataset")
     physical_calls: list[str] = []
 
     with pytest.raises(
-            workspace_providers.ProviderDatasetUnavailable,
-            match="provider dataset detail is unavailable"):
+            workspace_providers.ProviderDatasetGone,
+            match="canonical provider dataset was deleted"):
         workspace_providers.provider_dataset_adapter(
             uri, lambda physical_uri: physical_calls.append(physical_uri) or object())
 
     degraded = metadb.workspace_provider_binding(binding_id)
     assert degraded is not None
     assert degraded["referenceState"] == "current"
-    assert degraded["canonicalReferenceState"] == "provider_error"
+    assert degraded["canonicalReferenceState"] == "detached"
     assert degraded["active"] is True
     assert physical_calls == []
 
-    monkeypatch.setattr(provider, "dataset_detail", normal_detail)
-    adapter = workspace_providers.provider_dataset_adapter(
-        uri, lambda physical_uri: physical_calls.append(physical_uri) or object())
-
-    assert adapter.matches(uri)
-    assert physical_calls == [f"file:///{mount_id}.parquet"]
-    recovered = metadb.workspace_provider_binding(binding_id)
-    assert recovered is not None
-    assert recovered["bindingId"] == binding_id
-    assert recovered["referenceState"] == "current"
-    assert recovered["canonicalReferenceState"] == "current"
-    assert recovered["active"] is True
+    # A later passive resolve can observe the same provider dataset ID again, but it must not
+    # revive the terminal canonical generation or make its old Source token available.
+    provider.dataset_ids.add("canonical-dataset")
+    reappeared = workspace_providers.resolve(
+        resource["id"], uid=metadb.DEFAULT_USER_ID)
+    assert reappeared["resource"]["bindingId"] == binding_id
+    assert reappeared["resource"]["referenceState"] == "current"
+    assert reappeared["resource"]["canonicalReferenceState"] == "detached"
+    assert reappeared["resource"]["lastKnown"] is True
+    assert reappeared["canonicalSourceBinding"] is None
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert canonical is not None
+    assert canonical["referenceState"] == "detached"
+    assert canonical["sourceBindingId"] == source_binding["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(binding_id) is None
 
 
 class _ExactFixtureAdapter:

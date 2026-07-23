@@ -837,9 +837,12 @@ def _seed_provider_canonical_recovery_fixture() -> dict:
         provider_dataset_id=common["provider_dataset_id"],
     )
     assert canonical is not None
+    source_binding = metadb.workspace_provider_source_binding(right["bindingId"])
+    assert source_binding is not None
     return {
         "mount_id": common["mount_id"],
         "provider_dataset_id": common["provider_dataset_id"],
+        "source_binding_id": source_binding["sourceBindingId"],
         "uri": common["uri"],
         "columns": canonical["columns"],
         "left_binding_id": left["bindingId"],
@@ -1291,8 +1294,23 @@ def _assert_overlay_recovery(info: dict) -> None:
         canonical_expected["provider_dataset_id"])
     assert canonical is not None
     assert canonical["referenceState"] == "current"
+    assert canonical["sourceBindingId"] == canonical_expected["source_binding_id"]
     assert canonical["uri"] == canonical_expected["uri"]
     assert canonical["columns"] == canonical_expected["columns"]
+    assert metadb.workspace_provider_source_binding(
+        canonical_expected["right_binding_id"]
+    ) == {
+        "mountId": canonical_expected["mount_id"],
+        "sourceBindingId": canonical_expected["source_binding_id"],
+    }
+    serialized_binding = json.dumps({
+        "mountId": canonical_expected["mount_id"],
+        "sourceBindingId": canonical_expected["source_binding_id"],
+    })
+    assert canonical_expected["provider_dataset_id"] not in serialized_binding
+    assert canonical_expected["uri"] not in serialized_binding
+    assert canonical_expected["left_binding_id"] not in serialized_binding
+    assert canonical_expected["right_binding_id"] not in serialized_binding
     info["overlay_recovery_evidence"] = observed_states
 
 

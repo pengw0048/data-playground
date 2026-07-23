@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -54,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0043_provider_source_binding", "0042_field_lineage"),
         ("0042_field_lineage", "0041_provider_canonical"),
         ("0041_provider_canonical", "0040_managed_sidecar"),
         ("0040_managed_sidecar", "0039_folder_replays"),
@@ -97,8 +99,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0042_field_lineage"]
-    assert metadb.expected_schema_head() == "0042_field_lineage"
+    assert scripts.get_heads() == ["0043_provider_source_binding"]
+    assert metadb.expected_schema_head() == "0043_provider_source_binding"
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -141,6 +143,48 @@ def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path)
             assert connection.execute(sa.text(
                 "SELECT count(*) FROM catalog_field_lineage_projections"
             )).scalar_one() == 0
+
+
+def test_provider_source_binding_forward_migration_mints_opaque_generations(tmp_path):
+    db_path = tmp_path / "provider-source-binding-forward.db"
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        engine = metadb.engine()
+        with engine.connect() as connection:
+            command.upgrade(
+                metadb._alembic_cfg(connection), "0042_field_lineage"
+            )
+            connection.execute(sa.text("""
+                INSERT INTO workspace_provider_datasets (
+                    mount_id, provider_dataset_id, provider, uri, columns_doc,
+                    state, last_error, last_resolved_at, created_at, updated_at
+                ) VALUES (
+                    'mount-a', 'dataset-a', 'fixture',
+                    'secret://physical-a', '[]', 'current', NULL,
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                ), (
+                    'mount-a', 'dataset-b', 'fixture',
+                    'secret://physical-b', '[]', 'detached', 'resource is detached',
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+            """))
+            connection.commit()
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+
+            rows = connection.execute(sa.text(
+                "SELECT mount_id, provider_dataset_id, source_binding_id, state "
+                "FROM workspace_provider_datasets ORDER BY provider_dataset_id"
+            )).mappings().all()
+            assert [row["provider_dataset_id"] for row in rows] == [
+                "dataset-a", "dataset-b"]
+            assert all(
+                len(row["source_binding_id"]) == 32
+                and set(row["source_binding_id"]) <= set("0123456789abcdef")
+                for row in rows
+            )
+            assert rows[0]["source_binding_id"] != rows[1]["source_binding_id"]
+            assert rows[1]["state"] == "detached"
+            assert "secret" not in json.dumps(
+                [row["source_binding_id"] for row in rows])
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -355,6 +399,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0043_provider_source_binding.py": (
+            "bb830c82e83793683157ab4e5cb7660f6991013d2c9a92ab30cc6b50c451cd31"
+        ),
         "0042_field_lineage_identity.py": (
             "18aad5bb71ac63841c68501d973825335f51e987e302cdefc4eb94770bb34ad4"
         ),
