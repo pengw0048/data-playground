@@ -151,6 +151,10 @@ def test_intent_reload_is_complete_canonical_and_tamper_proof(local_catalog, tmp
     inconsistent["write_intent"]["expected_schema"] = []
     with pytest.raises(ValueError):
         ManagedSidecarMergeIntentV1.model_validate(inconsistent)
+    self_merge = intent.model_dump()
+    self_merge["sidecar"] = self_merge["base"]
+    with pytest.raises(ValueError, match="revisions must be distinct"):
+        ManagedSidecarMergeIntentV1.model_validate(self_merge)
 
 
 @pytest.mark.parametrize(("ids", "expected_status", "field", "value"), [
@@ -198,6 +202,8 @@ def test_request_canonicalizes_last_known_and_rejects_arbitrary_parents(local_ca
         base=noisy_base, sidecar=sidecar, expected_head=noisy_base, **common)
     assert admit_managed_sidecar_merge(storage=storage, request=clean) == (
         admit_managed_sidecar_merge(storage=storage, request=noisy))
+    with pytest.raises(ValueError, match="revisions must be distinct"):
+        ManagedSidecarMergeRequestV1(base=base, sidecar=base, expected_head=base, **common)
     with pytest.raises(ValueError):
         ManagedSidecarMergeRequestV1.model_validate({**clean.model_dump(), "provenance": {}})
 

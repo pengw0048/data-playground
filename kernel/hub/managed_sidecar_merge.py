@@ -55,6 +55,8 @@ class ManagedSidecarMergeRequestV1(Wire):
         self.base = _canonical_exact(self.base)
         self.sidecar = _canonical_exact(self.sidecar)
         self.expected_head = _canonical_exact(self.expected_head)
+        if _same_exact(self.base, self.sidecar):
+            raise ValueError("managed sidecar merge revisions must be distinct")
         return self
 
 
@@ -83,6 +85,8 @@ class ManagedSidecarMergeIntentV1(Wire):
         self.write_intent.expected_head = (
             _canonical_exact(self.write_intent.expected_head)
             if self.write_intent.expected_head is not None else None)
+        if _same_exact(self.base, self.sidecar):
+            raise ValueError("managed sidecar merge revisions must be distinct")
         try:
             # Reopenable intents must prove their serialized certificate remains bound to exactly
             # this base and spec digest; a digest over arbitrary JSON is not that proof.
