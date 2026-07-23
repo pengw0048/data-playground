@@ -6968,7 +6968,14 @@ def test_kernel_backend_runs_check_named_outputs_end_to_end(monkeypatch, isolate
         assert durable is not None
         assert RunStatus.model_validate(durable).model_dump(
             by_alias=True)["outputs"] == final["outputs"]
-        history = {record["runId"]: record for record in metadb.list_runs(canvas_id)}
+        history = {}
+        history_deadline = time.monotonic() + 5
+        while time.monotonic() < history_deadline:
+            history = {record["runId"]: record for record in metadb.list_runs(canvas_id)}
+            if run_id in history:
+                break
+            time.sleep(0.05)
+        assert run_id in history, "terminal run was not projected into Canvas history"
         assert [RunOutput.model_validate(output).model_dump(by_alias=True)
                 for output in history[run_id]["outputs"]] == final["outputs"]
 
