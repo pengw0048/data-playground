@@ -10919,6 +10919,24 @@
             "title": "Canrenamefolder",
             "type": "boolean"
           },
+          "canonicalReferenceState": {
+            "anyOf": [
+              {
+                "enum": [
+                  "current",
+                  "offline",
+                  "permission_lost",
+                  "detached",
+                  "provider_error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canonicalreferencestate"
+          },
           "catalogFolderId": {
             "anyOf": [
               {
@@ -11040,6 +11058,17 @@
             ],
             "title": "Parentid"
           },
+          "parentProviderPlacementId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parentproviderplacementid"
+          },
           "placementId": {
             "anyOf": [
               {
@@ -11062,10 +11091,32 @@
             ],
             "title": "Provider"
           },
+          "providerDatasetId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Providerdatasetid"
+          },
           "providerMutation": {
             "default": false,
             "title": "Providermutation",
             "type": "boolean"
+          },
+          "providerPlacementId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Providerplacementid"
           },
           "referenceState": {
             "default": "current",

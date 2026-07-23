@@ -748,7 +748,7 @@ def _seed_overlay_recovery_fixture() -> dict:
             mount_id="backup-drill-overlay",
             provider="backup-drill-provider",
             container_id=root["id"],
-            resource_id=f"overlay-{label}",
+            provider_placement_id=f"overlay-{label}",
             kind="container",
             name=f"Backup {label} overlay",
         )
@@ -786,6 +786,45 @@ def _seed_overlay_recovery_fixture() -> dict:
     return overlays
 
 
+def _seed_provider_canonical_recovery_fixture() -> dict:
+    """Seed one shared canonical dataset and two independently recoverable occurrences."""
+    root = metadb.local_workspace_root()
+    common = {
+        "mount_id": "backup-drill-canonical",
+        "provider": "backup-drill-provider",
+        "container_id": root["id"],
+        "kind": "dataset",
+        "provider_dataset_id": "shared-dataset",
+        "uri": "s3://provider-owned/shared-dataset.parquet",
+        "columns": [{"name": "value", "type": "int64"}],
+    }
+    left = metadb.workspace_provider_cache_resource(
+        **common,
+        provider_placement_id="shared-dataset-left",
+        name="Shared dataset left",
+    )
+    right = metadb.workspace_provider_cache_resource(
+        **common,
+        provider_placement_id="shared-dataset-right",
+        name="Shared dataset right",
+    )
+    left = metadb.workspace_provider_mark_binding(
+        left["bindingId"], state="detached", error="fixture occurrence removed")
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=common["mount_id"],
+        provider_dataset_id=common["provider_dataset_id"],
+    )
+    assert canonical is not None
+    return {
+        "mount_id": common["mount_id"],
+        "provider_dataset_id": common["provider_dataset_id"],
+        "uri": common["uri"],
+        "columns": canonical["columns"],
+        "left_binding_id": left["bindingId"],
+        "right_binding_id": right["bindingId"],
+    }
+
+
 def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
                   provider: _ClaimProvider) -> dict:
     metadb.init_db()
@@ -821,6 +860,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         workspace_container["id"], target_kind="canvas", target_id=canvas_id,
         name="backup-restore-drill")
     overlays = _seed_overlay_recovery_fixture()
+    provider_canonical = _seed_provider_canonical_recovery_fixture()
 
     metadb.catalog_upsert_entry(
         parent_uri, "drill-parent",
@@ -1045,6 +1085,7 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
         "workspace_container_id": workspace_container["id"],
         "workspace_placement_id": workspace_placement["id"],
         "overlays": overlays,
+        "provider_canonical": provider_canonical,
         "parent_uri": parent_uri,
         "child_uri": child_uri,
         "lineage_publication_key": lineage_publication_key,
@@ -1184,6 +1225,21 @@ def _assert_overlay_recovery(info: dict) -> None:
             "restored_state": binding["referenceState"],
             "post_reopen_state": reopened_binding["referenceState"],
         }
+    canonical_expected = info["provider_canonical"]
+    left = metadb.workspace_provider_binding(canonical_expected["left_binding_id"])
+    right = metadb.workspace_provider_binding(canonical_expected["right_binding_id"])
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=canonical_expected["mount_id"],
+        provider_dataset_id=canonical_expected["provider_dataset_id"],
+    )
+    assert left is not None and left["referenceState"] == "detached"
+    assert right is not None and right["referenceState"] == "current"
+    assert left["providerDatasetId"] == right["providerDatasetId"] == (
+        canonical_expected["provider_dataset_id"])
+    assert canonical is not None
+    assert canonical["referenceState"] == "current"
+    assert canonical["uri"] == canonical_expected["uri"]
+    assert canonical["columns"] == canonical_expected["columns"]
     info["overlay_recovery_evidence"] = observed_states
 
 

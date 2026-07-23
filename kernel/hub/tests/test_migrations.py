@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0041_provider_canonical", "0040_managed_sidecar"),
         ("0040_managed_sidecar", "0039_folder_replays"),
         ("0039_folder_replays", "0038_inbox_dataset_scoped"),
         ("0038_inbox_dataset_scoped", "0037_keyed_upsert"),
@@ -95,8 +96,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0040_managed_sidecar"]
-    assert metadb.expected_schema_head() == "0040_managed_sidecar"
+    assert scripts.get_heads() == ["0041_provider_canonical"]
+    assert metadb.expected_schema_head() == "0041_provider_canonical"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -106,6 +107,96 @@ def test_migration_revision_ids_fit_alembic_version_num():
         assert len(revision.revision) <= 32, (
             f"revision id {revision.revision!r} exceeds alembic_version.version_num "
             f"varchar(32) and cannot apply on PostgreSQL")
+
+
+def test_provider_canonical_state_migration_preserves_placement_snapshots(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'provider-canonical.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0040_managed_sidecar")
+        with metadb.engine().begin() as connection:
+            connection.execute(sa.text(
+                "INSERT INTO workspace_provider_bindings "
+                "(id, mount_id, provider, container_id, resource_id, kind, name, "
+                "parent_binding_id, state, active, last_error, relinked_from_id, "
+                "last_resolved_at, created_at, updated_at) VALUES "
+                "('provider-parent', 'migration-mount', 'fixture', :root, "
+                "'provider-parent-placement', 'container', 'Parent snapshot', NULL, "
+                "'current', 1, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+                "CURRENT_TIMESTAMP), "
+                "('provider-child', 'migration-mount', 'fixture', :root, "
+                "'provider-child-placement', 'dataset', 'Child snapshot', "
+                "'provider-parent', 'offline', 1, 'safe old error', NULL, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            ), {"root": metadb.LOCAL_WORKSPACE_ROOT_ID})
+            connection.execute(sa.text(
+                "INSERT INTO workspace_external_overlay_anchors "
+                "(binding_id, container_id, mount_id, resource_id, created_at) VALUES "
+                "('provider-parent', :root, 'migration-mount', "
+                "'provider-parent-placement', CURRENT_TIMESTAMP)"
+            ), {"root": metadb.LOCAL_WORKSPACE_ROOT_ID})
+
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            rows = connection.execute(sa.text(
+                "SELECT id, provider_placement_id, parent_provider_placement_id, "
+                "provider_dataset_id, kind, name, state, active, last_error "
+                "FROM workspace_provider_bindings ORDER BY id"
+            )).mappings().all()
+            assert rows == [
+                {
+                    "id": "provider-child",
+                    "provider_placement_id": "provider-child-placement",
+                    "parent_provider_placement_id": "provider-parent-placement",
+                    "provider_dataset_id": None,
+                    "kind": "dataset",
+                    "name": "Child snapshot",
+                    "state": "offline",
+                    "active": 1,
+                    "last_error": "safe old error",
+                },
+                {
+                    "id": "provider-parent",
+                    "provider_placement_id": "provider-parent-placement",
+                    "parent_provider_placement_id": None,
+                    "provider_dataset_id": None,
+                    "kind": "container",
+                    "name": "Parent snapshot",
+                    "state": "current",
+                    "active": 1,
+                    "last_error": None,
+                },
+            ]
+            anchor = connection.execute(sa.text(
+                "SELECT binding_id, mount_id, provider_placement_id "
+                "FROM workspace_external_overlay_anchors"
+            )).mappings().one()
+            assert anchor == {
+                "binding_id": "provider-parent",
+                "mount_id": "migration-mount",
+                "provider_placement_id": "provider-parent-placement",
+            }
+            assert connection.execute(sa.text(
+                "SELECT count(*) FROM workspace_provider_datasets"
+            )).scalar_one() == 0
+        recovered = metadb.workspace_provider_cache_resource(
+            mount_id="migration-mount",
+            provider="fixture",
+            container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+            provider_placement_id="provider-child-placement",
+            kind="dataset",
+            name="Child snapshot",
+            parent_provider_placement_id="provider-parent-placement",
+            parent_binding_id="provider-parent",
+            provider_dataset_id="canonical-child",
+            uri="file:///canonical-child.parquet",
+        )
+        assert recovered["bindingId"] == "provider-child"
+        assert recovered["providerDatasetId"] == "canonical-child"
+        assert recovered["canonicalReferenceState"] == "current"
+        assert metadb.workspace_provider_dataset(
+            mount_id="migration-mount",
+            provider_dataset_id="canonical-child",
+        )["uri"] == "file:///canonical-child.parquet"
 
 
 def test_temporal_parent_blocks_downgrade_without_partial_schema_loss(tmp_path):
@@ -221,6 +312,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0041_provider_canonical_state.py": (
+            "b1056c4481642dceab97d8fd17b257fe4ddec3755cdbdd04cf01091e1b868b3f"
+        ),
         "0040_managed_sidecar_merge_task.py": (
             "d3c7ef82fe53d06e235c92b641e7190f4d2803d52fbea88de6babccf83ad27e7"
         ),
