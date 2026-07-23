@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import ConfigDict, Field, field_validator
@@ -17,9 +18,13 @@ from hub.merge_columns import (
     sparse_output_merge_evidence,
 )
 from hub.merge_columns_tasks import dispatch
+from hub.managed_sidecar_merge import (
+    ManagedSidecarMergeError, ManagedSidecarMergeIntentV1, ManagedSidecarMergeRequestV1,
+    admit_managed_sidecar_merge, prepare_managed_sidecar_merge,
+)
 from hub.models import (
     ColumnSchema, DurableMergeColumnsView, ExactDatasetRef, Graph, LineagePublication,
-    Wire, WriteDestination, WriteIntent, WriteProvenance,
+    Wire, WriteDestination, WriteIntent, WriteProvenance, WriteReceipt,
 )
 from hub.plugins.catalog import InMemoryCatalog
 from hub.security import current_user
@@ -94,6 +99,63 @@ class MergeColumnsTaskV1(Wire):
 
     task_id: str
     status: str
+    can_retry: bool
+    can_cancel: bool
+    merge_columns: DurableMergeColumnsView | None = None
+
+
+class ManagedSidecarMergeTaskRequestV1(Wire):
+    """Headless exact-sidecar variant: no graph, storage path, or plugin authority."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    submission_id: str = Field(min_length=1, max_length=128)
+    base: ExactDatasetRef
+    sidecar: ExactDatasetRef
+    expected_head: ExactDatasetRef
+    identity_columns: list[str] = Field(min_length=1, max_length=16)
+    rules: list[MergeColumnRuleV1] = Field(min_length=1, max_length=128)
+
+    @field_validator("submission_id")
+    @classmethod
+    def _managed_submission_id(cls, value: str) -> str:
+        if value != value.strip() or "\x00" in value:
+            raise ValueError("submissionId must be trimmed and NUL-free")
+        return value.lower()
+
+
+class ManagedSidecarMergePreflightV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    base: ExactDatasetRef
+    sidecar: ExactDatasetRef
+    expected_head: ExactDatasetRef
+    identity_columns: list[str]
+    coverage: dict
+    rules: list[MergeColumnRuleV1]
+    base_schema: list[ColumnSchema]
+    sidecar_schema: list[ColumnSchema]
+    output_schema: list[ColumnSchema]
+    eligible: bool
+
+
+class ManagedSidecarMergeTaskV1(Wire):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    task_id: str
+    status: Literal["queued", "running", "done", "failed", "cancelled"]
+    base: ExactDatasetRef
+    sidecar: ExactDatasetRef
+    expected_head: ExactDatasetRef
+    identity_columns: list[str]
+    coverage: dict
+    rules: list[MergeColumnRuleV1]
+    base_schema: list[ColumnSchema]
+    sidecar_schema: list[ColumnSchema]
+    output_schema: list[ColumnSchema]
+    child_revision_id: str | None = None
+    receipt: WriteReceipt | None = None
+    diagnostic_code: str | None = None
     can_retry: bool
     can_cancel: bool
     merge_columns: DurableMergeColumnsView | None = None
@@ -258,7 +320,7 @@ def _preflight_response(preparation, base, head, output_schema, rules, identity_
 
 
 def _task_view(task_id: str, uid: str) -> MergeColumnsTaskV1:
-    value = metadb.merge_columns_task_view(task_id, uid)
+    value = metadb.merge_columns_task_view(task_id, uid, producer_kind="sparse-output")
     if value is None:
         raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
     raw = value.get("mergeColumns")
@@ -266,6 +328,72 @@ def _task_view(task_id: str, uid: str) -> MergeColumnsTaskV1:
         task_id=str(value["taskId"]), status=str(value["status"]),
         can_retry=bool(value["canRetry"]), can_cancel=bool(value["canCancel"]),
         merge_columns=DurableMergeColumnsView.model_validate(raw) if raw is not None else None)
+
+
+def _managed_sidecar_intent(request: ManagedSidecarMergeTaskRequestV1, uid: str):
+    key = f"managed-sidecar-merge:{uid}:{request.submission_id}"
+    return ManagedSidecarMergeRequestV1(
+        base=request.base, sidecar=request.sidecar, expected_head=request.expected_head,
+        identity_columns=request.identity_columns, rules=request.rules, idempotency_key=key,
+        publication=LineagePublication(
+            idempotency_key=key, provenance="manual", producer="merge-columns",
+            producer_version=1, step_id="managed-sidecar-merge"))
+
+
+def _managed_sidecar_request_sha256(
+        request: ManagedSidecarMergeTaskRequestV1, uid: str) -> str:
+    """Digest the caller-owned durable meaning without reopening mutable catalog state."""
+    frozen = _managed_sidecar_intent(request, uid)
+    def exact(ref: ExactDatasetRef) -> dict[str, str]:
+        return {"kind": "exact", "datasetId": ref.dataset_id, "revisionId": ref.revision_id}
+    payload = {
+        "base": exact(request.base), "sidecar": exact(request.sidecar),
+        "expectedHead": exact(request.expected_head),
+        "identityColumns": request.identity_columns,
+        "rules": [rule.model_dump(by_alias=True, mode="json") for rule in request.rules],
+        "publication": frozen.publication.model_dump(by_alias=True, mode="json"),
+        "idempotencyKey": frozen.idempotency_key,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _managed_sidecar_error(exc: Exception) -> APIError:
+    message = str(exc)
+    if "head moved" in message or "expected head" in message:
+        return APIError(409, "managed sidecar merge destination head moved",
+                        code=APIErrorCode.CONFLICT, retryable=False)
+    if "unavailable" in message:
+        return APIError(410, "managed sidecar merge revision is unavailable",
+                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return APIError(422, "managed sidecar merge admission is invalid",
+                    code=APIErrorCode.VALIDATION_ERROR, retryable=False)
+
+
+def _managed_sidecar_task_view(task_id: str, uid: str) -> ManagedSidecarMergeTaskV1:
+    view = metadb.merge_columns_task_view(task_id, uid, producer_kind="managed-sidecar")
+    if view is None:
+        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+                       retryable=False)
+    try:
+        intent = ManagedSidecarMergeIntentV1.model_validate(view["managed_sidecar_merge_intent"])
+    except (KeyError, ValueError) as exc:
+        raise APIError(409, "managed sidecar merge task admission is invalid",
+                       code=APIErrorCode.CONFLICT, retryable=False) from exc
+    receipt = view.get("output_receipt")
+    return ManagedSidecarMergeTaskV1(
+        task_id=str(view["taskId"]), status=str(view["status"]), base=intent.base,
+        sidecar=intent.sidecar, expected_head=intent.expected_head,
+        identity_columns=[field["name"] for field in intent.coverage.get("spec", {}).get("fields", [])
+                          if isinstance(field, dict) and isinstance(field.get("name"), str)],
+        child_revision_id=(str(receipt["revisionId"]) if isinstance(receipt, dict)
+                           and isinstance(receipt.get("revisionId"), str) else None),
+        receipt=WriteReceipt.model_validate(receipt) if isinstance(receipt, dict) else None,
+        coverage=intent.coverage, rules=intent.rules, base_schema=intent.base_schema,
+        sidecar_schema=intent.sidecar_schema, output_schema=intent.output_schema,
+        diagnostic_code=(str(view["error"]) if isinstance(view.get("error"), str) else None),
+        can_retry=bool(view["canRetry"]), can_cancel=bool(view["canCancel"]),
+        merge_columns=(DurableMergeColumnsView.model_validate(view["mergeColumns"])
+                       if view.get("mergeColumns") is not None else None))
 
 
 @router.post("/merge-columns/preflight", response_model=MergeColumnsPreflightV1)
@@ -350,16 +478,87 @@ def submit(request: MergeColumnsRequestV1, uid: str = Depends(current_user)) -> 
     return _task_view(task["id"], uid)
 
 
+@router.post("/managed-sidecar-merge/preflight", response_model=ManagedSidecarMergePreflightV1)
+def managed_sidecar_preflight(
+        request: ManagedSidecarMergeTaskRequestV1,
+        uid: str = Depends(current_user)) -> ManagedSidecarMergePreflightV1:
+    try:
+        prepared = prepare_managed_sidecar_merge(
+            storage=get_deps().storage, request=_managed_sidecar_intent(request, uid))
+        coverage = prepared.coverage
+        from hub.row_identity import serialize_row_identity_coverage
+        coverage_doc = serialize_row_identity_coverage(
+            coverage, prepared.request.base, coverage.spec.digest)
+    except (ManagedSidecarMergeError, ValueError) as exc:
+        raise _managed_sidecar_error(exc) from exc
+    return ManagedSidecarMergePreflightV1(
+        base=prepared.request.base, sidecar=prepared.request.sidecar,
+        expected_head=prepared.request.expected_head,
+        identity_columns=list(prepared.request.identity_columns), coverage=coverage_doc,
+        rules=prepared.request.rules, base_schema=prepared.base_schema,
+        sidecar_schema=prepared.sidecar_schema, output_schema=prepared.output_schema,
+        eligible=coverage.status == "complete")
+
+
+@router.post("/managed-sidecar-merge", response_model=ManagedSidecarMergeTaskV1)
+def submit_managed_sidecar_merge(
+        request: ManagedSidecarMergeTaskRequestV1,
+        uid: str = Depends(current_user)) -> ManagedSidecarMergeTaskV1:
+    task_id = metadb.managed_sidecar_merge_submission_id(uid, request.submission_id)
+    request_sha256 = _managed_sidecar_request_sha256(request, uid)
+    existing = metadb.durable_task(task_id, include_admission=False)
+    if existing is not None:
+        view = _managed_sidecar_task_view(task_id, uid)
+        if metadb.merge_columns_task_request_sha256(task_id) != request_sha256:
+            raise APIError(409, "managed sidecar merge submission id is already used for another intent",
+                           code=APIErrorCode.CONFLICT, retryable=False)
+        dispatch(task_id, get_deps())
+        return view
+    deps = get_deps()
+    try:
+        intent = admit_managed_sidecar_merge(
+            storage=deps.storage, request=_managed_sidecar_intent(request, uid))
+        task, _created = metadb.submit_managed_sidecar_merge_task(
+            uid=uid, submission_id=request.submission_id,
+            intent=intent.model_dump(by_alias=True, mode="json"), request_sha256=request_sha256)
+    except metadb.DurableTaskSubmissionConflict as exc:
+        existing = metadb.durable_task(task_id, include_admission=False)
+        if (existing is not None
+                and metadb.merge_columns_task_request_sha256(task_id) == request_sha256):
+            dispatch(task_id, deps)
+            return _managed_sidecar_task_view(task_id, uid)
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
+    except (ManagedSidecarMergeError, ValueError) as exc:
+        raise _managed_sidecar_error(exc) from exc
+    dispatch(task["id"], deps)
+    return _managed_sidecar_task_view(task["id"], uid)
+
+
 @router.get("/merge-columns/{task_id}", response_model=MergeColumnsTaskV1)
 def status(task_id: str, uid: str = Depends(current_user)) -> MergeColumnsTaskV1:
     return _task_view(task_id, uid)
 
 
+@router.get("/managed-sidecar-merge/{task_id}", response_model=ManagedSidecarMergeTaskV1)
+def managed_sidecar_status(
+        task_id: str, uid: str = Depends(current_user)) -> ManagedSidecarMergeTaskV1:
+    return _managed_sidecar_task_view(task_id, uid)
+
+
 @router.post("/merge-columns/{task_id}/cancel", response_model=MergeColumnsTaskV1)
 def cancel(task_id: str, uid: str = Depends(current_user)) -> MergeColumnsTaskV1:
-    if metadb.cancel_merge_columns_task(task_id, uid) is None:
+    if metadb.cancel_merge_columns_task(task_id, uid, producer_kind="sparse-output") is None:
         raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
     return _task_view(task_id, uid)
+
+
+@router.post("/managed-sidecar-merge/{task_id}/cancel", response_model=ManagedSidecarMergeTaskV1)
+def cancel_managed_sidecar_merge(
+        task_id: str, uid: str = Depends(current_user)) -> ManagedSidecarMergeTaskV1:
+    if metadb.cancel_merge_columns_task(task_id, uid, producer_kind="managed-sidecar") is None:
+        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+                       retryable=False)
+    return _managed_sidecar_task_view(task_id, uid)
 
 
 class _RetryRequest(Wire):
@@ -370,10 +569,27 @@ class _RetryRequest(Wire):
 @router.post("/merge-columns/{task_id}/retry", response_model=MergeColumnsTaskV1)
 def retry(task_id: str, request: _RetryRequest, uid: str = Depends(current_user)) -> MergeColumnsTaskV1:
     try:
-        retried = metadb.retry_merge_columns_task(task_id, uid, request.retry_request_id)
+        retried = metadb.retry_merge_columns_task(
+            task_id, uid, request.retry_request_id, producer_kind="sparse-output")
     except ValueError as exc:
         raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
     if retried is None:
         raise APIError(404, "merge-columns task not found", code=APIErrorCode.NOT_FOUND, retryable=False)
     dispatch(task_id, get_deps())
     return _task_view(task_id, uid)
+
+
+@router.post("/managed-sidecar-merge/{task_id}/retry", response_model=ManagedSidecarMergeTaskV1)
+def retry_managed_sidecar_merge(
+        task_id: str, request: _RetryRequest,
+        uid: str = Depends(current_user)) -> ManagedSidecarMergeTaskV1:
+    try:
+        retried = metadb.retry_merge_columns_task(
+            task_id, uid, request.retry_request_id, producer_kind="managed-sidecar")
+    except ValueError as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from None
+    if retried is None:
+        raise APIError(404, "managed sidecar merge task not found", code=APIErrorCode.NOT_FOUND,
+                       retryable=False)
+    dispatch(task_id, get_deps())
+    return _managed_sidecar_task_view(task_id, uid)

@@ -14,7 +14,8 @@ from pydantic.alias_generators import to_camel
 
 from hub import db, metadb
 from hub.merge_columns import (
-    MergeColumnRuleV1, MergeColumnsError, merge_output_columns, schema_columns,
+    MergeColumnRuleV1, MergeColumnsError, _canonical as _merge_canonical,
+    merge_complete_sidecar_table, merge_output_columns, schema_columns,
 )
 from hub.models import (
     ColumnSchema, ExactDatasetRef, LineagePublication, PlanDigest, Wire, WriteDestination,
@@ -251,3 +252,49 @@ def admit_managed_sidecar_merge(
         rules=prepared.request.rules, base_schema=prepared.base_schema,
         sidecar_schema=prepared.sidecar_schema, output_schema=prepared.output_schema,
         write_intent=write)
+
+
+def managed_sidecar_merge_document(intent: ManagedSidecarMergeIntentV1) -> str:
+    """Private semantic companion for the ordinary managed-local write receipt."""
+    frozen = ManagedSidecarMergeIntentV1.model_validate(intent)
+    return _merge_canonical({
+        "version": 1,
+        "producer": "managed-sidecar",
+        "intent": _semantic_payload(frozen),
+        "mergeSha256": frozen.merge_sha256,
+    })
+
+
+def merge_managed_sidecar_candidate(*, storage, intent: ManagedSidecarMergeIntentV1):
+    """Reopen both retained exact revisions and build a candidate without publication."""
+    frozen = ManagedSidecarMergeIntentV1.model_validate(intent)
+    base_uri = metadb.managed_local_file_revision_artifact(
+        frozen.base.dataset_id, frozen.base.revision_id)
+    sidecar_uri = metadb.managed_local_file_revision_artifact(
+        frozen.sidecar.dataset_id, frozen.sidecar.revision_id)
+    if base_uri is None or sidecar_uri is None:
+        raise ManagedSidecarMergeError("managed sidecar merge exact revision is unavailable")
+    try:
+        coverage = decode_row_identity_coverage(
+            frozen.coverage, frozen.base, frozen.row_identity_spec_sha256)
+        identities = [field.name for field in coverage.spec.fields]
+        with db.base_guard(), source_read_scope(
+                storage, [base_uri, sidecar_uri], owner="managed-sidecar-merge"):
+            base = DuckDBAdapter().scan(base_uri).to_arrow_table()
+            sidecar = DuckDBAdapter().scan(sidecar_uri).to_arrow_table()
+            if (schema_columns(base.schema) != frozen.base_schema
+                    or schema_columns(sidecar.schema) != frozen.sidecar_schema):
+                raise ManagedSidecarMergeError("managed sidecar merge frozen schema changed")
+            relation = db.conn().from_arrow(sidecar)
+            current = certify_row_identity_coverage(
+                storage, frozen.base, identities, relation, owner="managed-sidecar-merge",
+                frozen_spec=coverage.spec)
+        if current.status != "complete" or serialize_row_identity_coverage(
+                current, frozen.base, coverage.spec.digest) != frozen.coverage:
+            raise ManagedSidecarMergeError("managed sidecar merge frozen evidence changed")
+        return merge_complete_sidecar_table(
+            base=base, sidecar=sidecar, identity_columns=identities, rules=frozen.rules)
+    except ManagedSidecarMergeError:
+        raise
+    except Exception as exc:
+        raise ManagedSidecarMergeError("managed sidecar merge exact revision is unavailable") from exc

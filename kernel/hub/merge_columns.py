@@ -136,6 +136,39 @@ def side_fields_name(schema: pa.Schema, requested: str) -> str:
     return matches[0]
 
 
+def merge_complete_sidecar_table(
+        *, base: pa.Table, sidecar: pa.Table, identity_columns: list[str],
+        rules: list[MergeColumnRuleV1]) -> pa.Table:
+    """Join one already-certified sidecar onto a full-width base by logical identity.
+
+    Callers own reopening and coverage certification.  Keeping the actual row construction here
+    makes SparseOutput and exact managed-sidecar producers share the one merge interpretation.
+    """
+    source_index = {
+        tuple(sidecar[column][row].as_py() for column in identity_columns): row
+        for row in range(sidecar.num_rows)
+    }
+    arrays: list[pa.Array] = []
+    rule_by_target = {identifier_key(rule.target): rule for rule in rules}
+    for field, column in zip(base.schema, base.columns, strict=True):
+        rule = rule_by_target.get(identifier_key(field.name))
+        if rule is None:
+            arrays.append(column)
+            continue
+        source = sidecar[side_fields_name(sidecar.schema, rule.source)]
+        arrays.append(pa.array([
+            source[source_index[tuple(base[key][row].as_py() for key in identity_columns)]].as_py()
+            for row in range(base.num_rows)], type=field.type))
+    for rule in rules:
+        if rule.mode == "add":
+            source = sidecar[side_fields_name(sidecar.schema, rule.source)]
+            arrays.append(pa.array([
+                source[source_index[tuple(base[key][row].as_py() for key in identity_columns)]].as_py()
+                for row in range(base.num_rows)], type=source.type))
+    return pa.Table.from_arrays(arrays, names=[field.name for field in base.schema] + [
+        rule.target for rule in rules if rule.mode == "add"])
+
+
 def merge_output_schema(
         base_schema: pa.Schema, sidecar_schema: pa.Schema, identity_columns: list[str],
         rules: list[MergeColumnRuleV1]) -> list[ColumnSchema]:
@@ -298,27 +331,8 @@ def merge_sparse_output_candidate(*, storage, intent: MergeColumnsIntentV1) -> p
                         admission["rowIdentitySpecSha256"]).spec)
             if coverage.status != "complete":
                 raise MergeColumnsError("merge requires complete logical identity coverage")
-            # Build by immutable logical keys, never positions.  Coverage has already ruled out null
-            # and duplicates, so this map is a total one-to-one correspondence.
-            source_index = {tuple(sidecar[column][row].as_py() for column in identities): row
-                            for row in range(sidecar.num_rows)}
-            arrays: list[pa.Array] = []
-            rule_by_target = {identifier_key(rule.target): rule for rule in frozen.rules}
-            for field, column in zip(base.schema, base.columns, strict=True):
-                rule = rule_by_target.get(identifier_key(field.name))
-                if rule is None:
-                    arrays.append(column)
-                    continue
-                source = sidecar[side_fields_name(sidecar.schema, rule.source)]
-                arrays.append(pa.array([source[source_index[tuple(base[key][row].as_py() for key in identities)]].as_py()
-                                        for row in range(base.num_rows)], type=field.type))
-            for rule in frozen.rules:
-                if rule.mode == "add":
-                    source = sidecar[side_fields_name(sidecar.schema, rule.source)]
-                    arrays.append(pa.array([source[source_index[tuple(base[key][row].as_py() for key in identities)]].as_py()
-                                            for row in range(base.num_rows)], type=source.type))
-            output = pa.Table.from_arrays(arrays, names=[field.name for field in base.schema] + [
-                rule.target for rule in frozen.rules if rule.mode == "add"])
+            output = merge_complete_sidecar_table(
+                base=base, sidecar=sidecar, identity_columns=identities, rules=frozen.rules)
     return output
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 import uuid
@@ -10,12 +11,17 @@ from concurrent.futures import ThreadPoolExecutor
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from hub import metadb
+from hub import linear_checkpoint as lc, merge_columns_tasks, metadb
 from hub.api_errors import APIError
 from hub.deps import Deps
-from hub.models import Graph
+from hub.models import (
+    DatasetRevision, Graph, LineagePublication, WritePublicationIdentity,
+    WriteProvenance, WriteReceipt,
+)
+from hub.main import app
 from hub.routers import catalog as catalog_api, merge_columns as api
 
 
@@ -80,6 +86,362 @@ def _request(
         submission_id=submission_id, identity_columns=["id"],
         rules=[{"source": "replacement", "target": "value", "mode": "replace"}],
     )
+
+
+def _managed_sidecar_request(tmp_path, monkeypatch, *, submission_id: str | None = None):
+    deps = Deps(str(tmp_path / "workspace"), str(tmp_path / "data"), maintain_storage=False)
+    monkeypatch.setattr(api, "get_deps", lambda: deps)
+
+    def publish(logical: str, name: str, table: pa.Table):
+        artifact = deps.storage.begin_result(logical, f"managed-sidecar:{name}")
+        pq.write_table(table, artifact)
+        deps.storage.commit_result(artifact, f"managed-sidecar:{name}")
+        row = deps.catalog.publish_managed_local_file_output(
+            name=name, logical_uri=logical, artifact_uri=artifact)
+        assert deps.storage.release_result(artifact, f"managed-sidecar:{name}")
+        return {"kind": "exact", "datasetId": row["dataset_id"], "revisionId": row["revision_id"]}
+
+    base = publish(deps.storage.output_uri("base", ".parquet"), "base", pa.table({
+        "id": pa.array([1, 2], type=pa.int32()), "value": [10, 20], "keep": ["a", "b"],
+    }))
+    sidecar = publish(deps.storage.output_uri("sidecar", ".parquet"), "sidecar", pa.table({
+        "id": pa.array([2, 1], type=pa.int32()), "replacement": [200, 100], "added": [2, 1],
+    }))
+    with metadb.session() as session:
+        if session.get(metadb.User, "owner") is None:
+            session.add(metadb.User(id="owner", name="Owner"))
+    return api.ManagedSidecarMergeTaskRequestV1(
+        submission_id=submission_id or f"managed-sidecar-{uuid.uuid4().hex}",
+        base=base, sidecar=sidecar, expected_head=base,
+        identity_columns=["id"], rules=[
+            {"source": "replacement", "target": "value", "mode": "replace"},
+            {"source": "added", "target": "derived", "mode": "add"},
+        ])
+
+
+def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
+        tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch)
+    preflight = api.managed_sidecar_preflight(request, "owner")
+    assert preflight.eligible is True
+    assert [column.name for column in preflight.output_schema] == ["id", "value", "keep", "derived"]
+    assert "uri" not in preflight.model_dump_json().lower()
+
+    task = api.submit_managed_sidecar_merge(request, "owner")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        current = api.managed_sidecar_status(task.task_id, "owner")
+        if current.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.02)
+    assert current.status == "done" and current.receipt is not None
+    assert current.child_revision_id == current.receipt.revision_id
+    assert current.coverage["status"] == "complete"
+    assert current.identity_columns == ["id"]
+    assert api.submit_managed_sidecar_merge(request, "owner").task_id == task.task_id
+    with metadb.session() as session:
+        assert not list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "durable_task",
+            metadb.LocalResultReference.owner_key == task.task_id,
+        )))
+
+    jobs = metadb.list_workspace_runs("owner", run_id=task.task_id)["items"]
+    assert len(jobs) == 1 and jobs[0]["mergeColumns"]["baseDatasetId"] == request.base.dataset_id
+    inbox = metadb.list_durable_task_inbox_items("owner")["items"]
+    assert any(item["task_id"] == task.task_id and item["completed_write"] for item in inbox)
+
+    with TestClient(app) as client:
+        jobs_response = client.get("/api/jobs", params={"run_id": task.task_id},
+                                   headers={"x-dp-user": "owner"})
+        inbox_response = client.get("/api/inbox", headers={"x-dp-user": "owner"})
+    assert jobs_response.status_code == inbox_response.status_code == 200
+    job = jobs_response.json()["items"][0]
+    assert job["datasetContext"]["taskKind"] == "merge_columns_write"
+    assert any(item["taskId"] == task.task_id for item in inbox_response.json()["items"])
+
+    changed = request.model_copy(deep=True)
+    changed.rules[0].target = "keep"
+    with pytest.raises(APIError) as conflict:
+        api.submit_managed_sidecar_merge(changed, "owner")
+    assert conflict.value.status_code == 409
+    changed_identity = request.model_copy(deep=True)
+    changed_identity.identity_columns = ["value"]
+    with pytest.raises(APIError) as identity_conflict:
+        api.submit_managed_sidecar_merge(changed_identity, "owner")
+    assert identity_conflict.value.status_code == 409
+
+
+def test_managed_sidecar_invalid_or_moved_head_creates_no_task(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch)
+    invalid = request.model_copy(deep=True)
+    invalid.identity_columns = ["missing"]
+    with pytest.raises(APIError) as invalid_error:
+        api.submit_managed_sidecar_merge(invalid, "owner")
+    assert invalid_error.value.status_code in (410, 422)
+
+    deps = api.get_deps()
+    artifact = deps.storage.begin_result("moved-base", "moved-base")
+    pq.write_table(pa.table({"id": pa.array([1, 2], type=pa.int32()), "value": [30, 40],
+                             "keep": ["c", "d"]}), artifact)
+    deps.storage.commit_result(artifact, "moved-base")
+    deps.catalog.publish_managed_local_file_output(
+        name="base", logical_uri=deps.storage.output_uri("base", ".parquet"), artifact_uri=artifact)
+    assert deps.storage.release_result(artifact, "moved-base")
+    with pytest.raises(APIError) as moved_error:
+        api.submit_managed_sidecar_merge(request, "owner")
+    assert moved_error.value.status_code == 409
+    with metadb.session() as session:
+        assert session.get(metadb.DurableTask, metadb.managed_sidecar_merge_submission_id(
+            "owner", request.submission_id)) is None
+
+
+def test_managed_sidecar_task_retains_exact_inputs_until_terminal_cleanup(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="retained-inputs")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    task = api.submit_managed_sidecar_merge(request, "owner")
+    with metadb.session() as session:
+        refs = list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "durable_task",
+            metadb.LocalResultReference.owner_key == task.task_id,
+        )))
+    assert len(refs) == 2
+
+    deps = api.get_deps()
+    for name, table in (("base", pa.table({"id": pa.array([1, 2], type=pa.int32()),
+                                             "value": [30, 40], "keep": ["c", "d"]})),
+                        ("sidecar", pa.table({"id": pa.array([1, 2], type=pa.int32()),
+                                                "replacement": [300, 400], "added": [3, 4]}))):
+        artifact = deps.storage.begin_result(f"moved-{name}", f"moved-{name}")
+        pq.write_table(table, artifact)
+        deps.storage.commit_result(artifact, f"moved-{name}")
+        deps.catalog.publish_managed_local_file_output(
+            name=name, logical_uri=deps.storage.output_uri(name, ".parquet"), artifact_uri=artifact)
+        assert deps.storage.release_result(artifact, f"moved-{name}")
+    metadb.managed_local_file_revision_gc_batch(0)
+    assert metadb.managed_local_file_revision_artifact(
+        request.base.dataset_id, request.base.revision_id) is not None
+    assert metadb.managed_local_file_revision_artifact(
+        request.sidecar.dataset_id, request.sidecar.revision_id) is not None
+
+
+def test_managed_sidecar_missing_input_ref_fails_closed(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="missing-input-ref")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    task = api.submit_managed_sidecar_merge(request, "owner")
+    with metadb.session() as session:
+        ref = session.scalar(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "durable_task",
+            metadb.LocalResultReference.owner_key == task.task_id,
+        ))
+        assert ref is not None
+        session.delete(ref)
+    with pytest.raises(RuntimeError, match="input retention"):
+        metadb.claim_merge_columns_task(task.task_id, "missing-ref-owner")
+
+
+def test_managed_sidecar_admission_race_rejects_changed_request_digest(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="digest-race")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    api.submit_managed_sidecar_merge(request, "owner")
+    intent = api.admit_managed_sidecar_merge(
+        storage=api.get_deps().storage, request=api._managed_sidecar_intent(request, "owner"))
+    with pytest.raises(metadb.DurableTaskSubmissionConflict, match="frozen admission"):
+        metadb.submit_managed_sidecar_merge_task(
+            uid="owner", submission_id=request.submission_id,
+            intent=intent.model_dump(by_alias=True, mode="json"), request_sha256="0" * 64)
+
+
+def test_managed_sidecar_router_race_fallback_rejects_changed_digest(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="router-digest-race")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    original = api.submit_managed_sidecar_merge(request, "owner")
+    changed = request.model_copy(deep=True)
+    changed.rules[0] = api.MergeColumnRuleV1(
+        source="replacement", target="replacement_copy", mode="add")
+
+    real_durable_task = metadb.durable_task
+    hidden = False
+
+    def hide_existing_once(task_id, **kwargs):
+        nonlocal hidden
+        if str(task_id) == original.task_id and not hidden:
+            hidden = True
+            return None
+        return real_durable_task(task_id, **kwargs)
+
+    monkeypatch.setattr(api.metadb, "durable_task", hide_existing_once)
+    with pytest.raises(APIError) as conflict:
+        api.submit_managed_sidecar_merge(changed, "owner")
+    assert conflict.value.status_code == 409
+
+
+def test_merge_producer_routes_cannot_observe_or_mutate_each_other(tmp_path, monkeypatch):
+    sparse_request = _request(tmp_path, monkeypatch)
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    sparse_task = api.submit(sparse_request, "editor")
+    sidecar_request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="producer-isolation")
+    sidecar_task = api.submit_managed_sidecar_merge(sidecar_request, "owner")
+
+    for call in (
+            lambda: api.status(sidecar_task.task_id, "owner"),
+            lambda: api.managed_sidecar_status(sparse_task.task_id, "editor"),
+            lambda: api.cancel(sidecar_task.task_id, "owner"),
+            lambda: api.cancel_managed_sidecar_merge(sparse_task.task_id, "editor")):
+        with pytest.raises(APIError) as error:
+            call()
+        assert error.value.status_code == 404
+    with metadb.session() as session:
+        sparse = session.get(metadb.DurableTask, sparse_task.task_id)
+        sidecar = session.get(metadb.DurableTask, sidecar_task.task_id)
+        assert sparse is not None and sidecar is not None
+        sparse_attempt = session.scalar(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == sparse_task.task_id))
+        sidecar_attempt = session.scalar(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == sidecar_task.task_id))
+        assert sparse.cancel_requested is sidecar.cancel_requested is False
+        assert sparse_attempt is not None and sparse_attempt.cancel_requested_at is None
+        assert sidecar_attempt is not None and sidecar_attempt.cancel_requested_at is None
+        sparse.status = sidecar.status = "cancelled"
+        sparse.cancel_requested = sidecar.cancel_requested = False
+    for call in (
+            lambda: api.retry(sidecar_task.task_id, api._RetryRequest(retry_request_id="wrong-side"), "owner"),
+            lambda: api.retry_managed_sidecar_merge(
+                sparse_task.task_id, api._RetryRequest(retry_request_id="wrong-sparse"), "editor")):
+        with pytest.raises(APIError) as error:
+            call()
+        assert error.value.status_code == 404
+    with metadb.session() as session:
+        assert session.get(metadb.DurableTask, sparse_task.task_id).retry_count == 0
+        assert session.get(metadb.DurableTask, sidecar_task.task_id).retry_count == 0
+
+
+def test_managed_sidecar_cancel_retry_retains_inputs_and_can_claim(tmp_path, monkeypatch):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id="cancel-retry")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    task = api.submit_managed_sidecar_merge(request, "owner")
+    assert api.cancel_managed_sidecar_merge(task.task_id, "owner").can_cancel is True
+    with metadb.session() as session:
+        durable = session.get(metadb.DurableTask, task.task_id)
+        assert durable is not None
+        durable.status, durable.cancel_requested = "cancelled", False
+    first = api.retry_managed_sidecar_merge(
+        task.task_id, api._RetryRequest(retry_request_id="retry-once"), "owner")
+    second = api.retry_managed_sidecar_merge(
+        task.task_id, api._RetryRequest(retry_request_id="retry-once"), "owner")
+    assert first.task_id == second.task_id == task.task_id
+    with metadb.session() as session:
+        refs = list(session.scalars(select(metadb.LocalResultReference).where(
+            metadb.LocalResultReference.owner_kind == "durable_task",
+            metadb.LocalResultReference.owner_key == task.task_id,
+        )))
+    assert len(refs) == 2
+    assert metadb.claim_merge_columns_task(task.task_id, "retry-owner") is not None
+
+
+def test_managed_sidecar_terminal_cleanup_race_refreshes_status_and_jobs(tmp_path, monkeypatch):
+    """A stale queued read must accept the worker's atomic terminal ref cleanup."""
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+
+    def terminalize(task_id: str) -> None:
+        with metadb.session() as session:
+            durable = metadb._lock_durable_task_for_write(session, task_id)
+            assert durable is not None
+            attempt = session.scalar(select(metadb.DurableTaskAttempt).where(
+                metadb.DurableTaskAttempt.task_id == task_id,
+            ).order_by(metadb.DurableTaskAttempt.attempt_number.desc()).with_for_update())
+            assert attempt is not None
+            now = metadb._durable_task_db_now(session)
+            receipt = WriteReceipt(
+                dataset_id="terminal-race", revision_id=f"revision-{task_id}",
+                head=DatasetRevision(
+                    dataset_id="terminal-race", revision_id=f"revision-{task_id}"),
+                rows=3, bytes=30, schema=[],
+                publication=WritePublicationIdentity(
+                    logical_uri=f"/terminal-race/{task_id}.parquet",
+                    artifact_uri=f"/terminal-race/{task_id}.parquet",
+                    publish_sequence=1, idempotency_key=f"terminal-race-{task_id}"),
+                provenance=WriteProvenance(publication=LineagePublication(
+                    idempotency_key=f"terminal-race-{task_id}", provenance="manual")),
+            )
+            receipt_json = json.dumps(receipt.model_dump(by_alias=True, mode="json"), sort_keys=True)
+            durable.status = attempt.status = "done"
+            durable.error = attempt.error = None
+            status_doc = {
+                "run_id": durable.id, "status": "done",
+                "target_node_id": durable.target_node_id, "outputs": [],
+                "total_rows": receipt.rows,
+            }
+            durable.status_doc = json.dumps(status_doc)
+            durable.output_receipt = attempt.output_receipt = receipt_json
+            durable.completed_at = attempt.completed_at = durable.updated_at = now
+            metadb._terminalize_hidden_task_envelope(session, durable, now)
+
+    status_task = api.submit_managed_sidecar_merge(_managed_sidecar_request(
+        tmp_path, monkeypatch, submission_id="status-terminal-race"), "owner")
+    original_admission = metadb._durable_task_admission
+    raced_status = False
+
+    def terminalize_before_stale_admission(session, durable):
+        nonlocal raced_status
+        if durable.id == status_task.task_id and not raced_status:
+            raced_status = True
+            terminalize(durable.id)
+        return original_admission(session, durable)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(metadb, "_durable_task_admission", terminalize_before_stale_admission)
+        status = api.managed_sidecar_status(status_task.task_id, "owner")
+    assert raced_status and status.status == "done" and status.receipt is not None
+    assert status.receipt.rows == 3 and status.child_revision_id == status.receipt.revision_id
+
+    jobs_task = api.submit_managed_sidecar_merge(_managed_sidecar_request(
+        tmp_path, monkeypatch, submission_id="jobs-terminal-race"), "owner")
+    raced_jobs = False
+
+    def terminalize_before_jobs_admission(session, durable):
+        nonlocal raced_jobs
+        if durable.id == jobs_task.task_id and not raced_jobs:
+            raced_jobs = True
+            terminalize(durable.id)
+        return original_admission(session, durable)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(metadb, "_durable_task_admission", terminalize_before_jobs_admission)
+        jobs = metadb.list_workspace_runs("owner", run_id=jobs_task.task_id)["items"]
+    assert raced_jobs and len(jobs) == 1 and jobs[0]["status"] == "done"
+    assert jobs[0]["rows"] == 3 and jobs[0]["outputReceipt"]["rows"] == 3
+    assert jobs[0]["taskAttempts"][-1]["status"] == "done"
+
+
+@pytest.mark.parametrize("loss", ["candidate", "publication"])
+def test_managed_sidecar_reconciles_candidate_and_publication_response_loss(
+        tmp_path, monkeypatch, loss):
+    request = _managed_sidecar_request(tmp_path, monkeypatch, submission_id=f"loss-{loss}")
+    if loss == "candidate":
+        real_commit = lc.materialize_and_commit_checkpoint
+
+        def committed_then_lost(*args, **kwargs):
+            real_commit(*args, **kwargs)
+            raise RuntimeError("candidate commit response lost")
+
+        monkeypatch.setattr(merge_columns_tasks.lc, "materialize_and_commit_checkpoint", committed_then_lost)
+    else:
+        real_write = merge_columns_tasks.write_managed_local_file
+
+        def published_then_lost(*args, **kwargs):
+            real_write(*args, **kwargs)
+            raise RuntimeError("publication response lost")
+
+        monkeypatch.setattr(merge_columns_tasks, "write_managed_local_file", published_then_lost)
+    task = api.submit_managed_sidecar_merge(request, "owner")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        current = api.managed_sidecar_status(task.task_id, "owner")
+        if current.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.02)
+    assert current.status == "done" and current.receipt is not None
+    assert api.submit_managed_sidecar_merge(request, "owner").task_id == task.task_id
 
 
 def test_editor_preflights_without_side_effect_then_submits_and_replays(tmp_path, monkeypatch):

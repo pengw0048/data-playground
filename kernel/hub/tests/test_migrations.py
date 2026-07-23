@@ -54,6 +54,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0040_managed_sidecar", "0039_folder_replays"),
         ("0039_folder_replays", "0038_inbox_dataset_scoped"),
         ("0038_inbox_dataset_scoped", "0037_keyed_upsert"),
         ("0037_keyed_upsert", "0036_restore_revision"),
@@ -94,8 +95,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0039_folder_replays"]
-    assert metadb.expected_schema_head() == "0039_folder_replays"
+    assert scripts.get_heads() == ["0040_managed_sidecar"]
+    assert metadb.expected_schema_head() == "0040_managed_sidecar"
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -220,6 +221,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0040_managed_sidecar_merge_task.py": (
+            "d3c7ef82fe53d06e235c92b641e7190f4d2803d52fbea88de6babccf83ad27e7"
+        ),
         "0039_workspace_folder_replays.py": (
             "58553bae37f35f47639c93ec080795ea48cce29fcdd78c5211d9de740ba7fb63"
         ),
