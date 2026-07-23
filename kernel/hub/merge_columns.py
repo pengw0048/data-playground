@@ -119,12 +119,11 @@ def _as_exact(value: ExactDatasetRef) -> ExactDatasetRef:
     return value
 
 
-def _schema_columns(schema: pa.Schema) -> list[ColumnSchema]:
+def schema_columns(schema: pa.Schema) -> list[ColumnSchema]:
     with db.base_guard():
         empty = pa.Table.from_batches([], schema=schema)
         columns = relation_columns(db.conn().from_arrow(empty))
     return [ColumnSchema(name=column.name, type=column.type) for column in columns]
-
 
 def side_fields_name(schema: pa.Schema, requested: str) -> str:
     """Resolve a V1 identifier through the same collision semantics as validation."""
@@ -144,10 +143,22 @@ def merge_output_schema(
     additionally proves frozen sidecar/base evidence; this function deliberately has no I/O or
     publication authority.
     """
+    return merge_output_columns(
+        schema_columns(base_schema), schema_columns(sidecar_schema), identity_columns, rules)
+
+
+def merge_output_columns(
+        base_columns: list[ColumnSchema], sidecar_columns: list[ColumnSchema],
+        identity_columns: list[str], rules: list[MergeColumnRuleV1]) -> list[ColumnSchema]:
+    """Validate V1 merge semantics over canonical logical schema columns.
+
+    This is the sole schema/rule interpretation shared by live Parquet preflight and frozen intent
+    reload.  It deliberately returns canonical output columns rather than Arrow fields.
+    """
     identity_keys = {identifier_key(name) for name in identity_columns}
-    base_fields = {identifier_key(field.name): field for field in base_schema}
-    side_fields = {identifier_key(field.name): field for field in sidecar_schema}
-    if (len(base_fields) != len(base_schema) or len(side_fields) != len(sidecar_schema)
+    base_fields = {identifier_key(column.name): column for column in base_columns}
+    side_fields = {identifier_key(column.name): column for column in sidecar_columns}
+    if (len(base_fields) != len(base_columns) or len(side_fields) != len(sidecar_columns)
             or len(identity_keys) != len(identity_columns)):
         raise MergeColumnsError("merge schema is ambiguous")
     if (not rules or len(rules) != len({identifier_key(rule.target) for rule in rules})
@@ -164,12 +175,12 @@ def merge_output_schema(
                 raise MergeColumnsError("merge add target already exists")
         elif target is None or target.type != side_fields[source_key].type:
             raise MergeColumnsError("merge replace type is invalid")
-    payload = [field.name for field in sidecar_schema if identifier_key(field.name) not in identity_keys]
+    payload = [column.name for column in sidecar_columns
+               if identifier_key(column.name) not in identity_keys]
     if {identifier_key(rule.source) for rule in rules} != {identifier_key(name) for name in payload}:
         raise MergeColumnsError("merge rules do not consume the certified sidecar payload")
-    return _schema_columns(base_schema) + [
-        ColumnSchema(name=rule.target, type=_schema_columns(
-            pa.schema([side_fields[identifier_key(rule.source)]]))[0].type)
+    return list(base_columns) + [
+        ColumnSchema(name=rule.target, type=side_fields[identifier_key(rule.source)].type)
         for rule in rules if rule.mode == "add"
     ]
 

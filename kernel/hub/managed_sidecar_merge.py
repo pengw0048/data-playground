@@ -13,7 +13,9 @@ from pydantic import ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
 
 from hub import db, metadb
-from hub.merge_columns import MergeColumnRuleV1, MergeColumnsError, merge_output_schema
+from hub.merge_columns import (
+    MergeColumnRuleV1, MergeColumnsError, merge_output_columns, schema_columns,
+)
 from hub.models import (
     ColumnSchema, ExactDatasetRef, LineagePublication, PlanDigest, Wire, WriteDestination,
     WriteIntent, WriteProvenance,
@@ -67,6 +69,8 @@ class ManagedSidecarMergeIntentV1(Wire):
     row_identity_spec_sha256: PlanDigest
     coverage: dict
     rules: list[MergeColumnRuleV1]
+    base_schema: list[ColumnSchema]
+    sidecar_schema: list[ColumnSchema]
     output_schema: list[ColumnSchema]
     write_intent: WriteIntent
     merge_sha256: PlanDigest
@@ -95,13 +99,17 @@ class ManagedSidecarMergeIntentV1(Wire):
                 or write.destination.dataset_id != self.base.dataset_id
                 or write.expected_head is None
                 or not _same_exact(write.expected_head, self.expected_head)
-                or write.expected_schema != self.output_schema):
+                or write.expected_schema != self.output_schema
+                or write.provenance.parents != []):
             raise ValueError("managed sidecar merge write intent is invalid")
-        identities = {field.name for field in coverage.spec.fields}
-        outputs = {column.name for column in self.output_schema}
-        if any(rule.target not in outputs or rule.source in identities or rule.target in identities
-               for rule in self.rules):
-            raise ValueError("managed sidecar merge rules are invalid")
+        try:
+            output = merge_output_columns(
+                self.base_schema, self.sidecar_schema,
+                [field.name for field in coverage.spec.fields], self.rules)
+        except MergeColumnsError as exc:
+            raise ValueError("managed sidecar merge rules are invalid") from exc
+        if output != self.output_schema:
+            raise ValueError("managed sidecar merge output schema is invalid")
         expected = hashlib.sha256(_canonical(_semantic_payload(self)).encode()).hexdigest()
         if self.merge_sha256 != expected:
             raise ValueError("managed sidecar merge intent digest is invalid")
@@ -113,9 +121,9 @@ class PreparedManagedSidecarMerge:
     """Read-only preflight facts; non-complete coverage is deliberately representable."""
 
     request: ManagedSidecarMergeRequestV1
-    head: dict
-    base_schema: object
-    sidecar_schema: object
+    destination: WriteDestination
+    base_schema: list[ColumnSchema]
+    sidecar_schema: list[ColumnSchema]
     coverage: object
     output_schema: list[ColumnSchema]
 
@@ -132,6 +140,10 @@ def _semantic_payload(intent: ManagedSidecarMergeIntentV1) -> dict:
         "rowIdentitySpecSha256": intent.row_identity_spec_sha256,
         "coverage": intent.coverage,
         "rules": [rule.model_dump(by_alias=True, mode="json") for rule in intent.rules],
+        "baseSchema": [column.model_dump(by_alias=True, mode="json")
+                       for column in intent.base_schema],
+        "sidecarSchema": [column.model_dump(by_alias=True, mode="json")
+                          for column in intent.sidecar_schema],
         "outputSchema": [column.model_dump(by_alias=True, mode="json")
                          for column in intent.output_schema],
         "writeIntent": intent.write_intent.model_dump(by_alias=True, mode="json"),
@@ -194,12 +206,17 @@ def prepare_managed_sidecar_merge(
     except Exception as exc:
         raise ManagedSidecarMergeError("managed sidecar merge revision is unavailable") from exc
     try:
-        output_schema = merge_output_schema(
-            base_schema, sidecar_schema, request.identity_columns, request.rules)
+        base_columns, sidecar_columns = schema_columns(base_schema), schema_columns(sidecar_schema)
+        output_schema = merge_output_columns(
+            base_columns, sidecar_columns, request.identity_columns, request.rules)
     except MergeColumnsError as exc:
         raise ManagedSidecarMergeError(str(exc)) from exc
     return PreparedManagedSidecarMerge(
-        request=request, head=head, base_schema=base_schema, sidecar_schema=sidecar_schema,
+        request=request,
+        destination=WriteDestination(
+            logical_uri=str(head["logical_uri"]), name=str(head["name"]),
+            dataset_id=base.dataset_id),
+        base_schema=base_columns, sidecar_schema=sidecar_columns,
         coverage=coverage, output_schema=output_schema)
 
 
@@ -218,9 +235,7 @@ def admit_managed_sidecar_merge(
         raise ManagedSidecarMergeError("managed sidecar merge requires complete identity coverage")
     base = prepared.request.base
     write = WriteIntent(
-        destination=WriteDestination(
-            logical_uri=str(prepared.head["logical_uri"]), name=str(prepared.head["name"]),
-            dataset_id=base.dataset_id),
+        destination=prepared.destination,
         mode="replace", expected_schema=prepared.output_schema, expected_head=base,
         idempotency_key=prepared.request.idempotency_key,
         provenance=WriteProvenance(publication=prepared.request.publication, parents=[]))
@@ -229,4 +244,6 @@ def admit_managed_sidecar_merge(
     return _build_intent(
         base=base, sidecar=prepared.request.sidecar, expected_head=base,
         row_identity_spec_sha256=prepared.coverage.spec.digest, coverage=coverage_doc,
-        rules=prepared.request.rules, output_schema=prepared.output_schema, write_intent=write)
+        rules=prepared.request.rules, base_schema=prepared.base_schema,
+        sidecar_schema=prepared.sidecar_schema, output_schema=prepared.output_schema,
+        write_intent=write)

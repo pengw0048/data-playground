@@ -1,13 +1,14 @@
 """Acceptance tests for pure exact managed-sidecar merge admission (#767)."""
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from hub import metadb
+from hub import managed_sidecar_merge as managed_sidecar_merge_module, metadb
 from hub.managed_sidecar_merge import (
     ManagedSidecarMergeError, ManagedSidecarMergeIntentV1, ManagedSidecarMergeRequestV1,
     admit_managed_sidecar_merge, prepare_managed_sidecar_merge,
@@ -218,3 +219,49 @@ def test_prepare_rejects_identity_rule_and_schema_collision(local_catalog, tmp_p
     )
     with pytest.raises(ManagedSidecarMergeError, match="merge rules"):
         prepare_managed_sidecar_merge(storage=storage, request=request)
+
+
+def test_reload_reuses_shared_schema_rules_and_rejects_write_parents(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": [1], "old": [1],
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": [1], "replacement": [2],
+    }))
+    key = "issue-767-reload-rules"
+    intent = admit_managed_sidecar_merge(storage=storage, request=ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    ))
+    prepared = prepare_managed_sidecar_merge(storage=storage, request=ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    ))
+    assert not hasattr(prepared, "head")
+    assert prepared.destination.dataset_id == base.dataset_id
+    assert isinstance(prepared.base_schema, list) and isinstance(prepared.sidecar_schema, list)
+
+    tampered = intent.model_dump()
+    tampered["rules"] = [{"source": "replacement", "target": "old", "mode": "add"}]
+    draft = intent.model_copy(deep=True)
+    draft.rules = [MergeColumnRuleV1(source="replacement", target="old", mode="add")]
+    tampered["merge_sha256"] = hashlib.sha256(
+        managed_sidecar_merge_module._canonical(
+            managed_sidecar_merge_module._semantic_payload(draft)).encode()).hexdigest()
+    with pytest.raises(ValueError, match="rules"):
+        ManagedSidecarMergeIntentV1.model_validate(tampered)
+
+    parents = intent.model_dump()
+    parents["write_intent"]["provenance"]["parents"] = ["file:///not-an-allowed-parent"]
+    draft = intent.model_copy(deep=True)
+    draft.write_intent.provenance.parents = ["file:///not-an-allowed-parent"]
+    parents["merge_sha256"] = hashlib.sha256(
+        managed_sidecar_merge_module._canonical(
+            managed_sidecar_merge_module._semantic_payload(draft)).encode()).hexdigest()
+    with pytest.raises(ValueError, match="write intent"):
+        ManagedSidecarMergeIntentV1.model_validate(parents)
