@@ -21,6 +21,15 @@ from hub.plugins.adapters import (
 )
 
 _MANIFEST_FIELDS = {"node_id", "dataset_id", "revision_id", "provider", "resolved_at"}
+_DISPATCH_CONFIG_FIELDS = {
+    "_input_artifact_uri",
+    "_input_dataset_id",
+    "_input_preview_limit",
+    "_input_provider",
+    "_input_provider_preview_uri",
+    "_input_provider_uri",
+    "_input_revision_id",
+}
 LOCAL_FILE_INPUT_PROVIDER = "local-file-snapshot"
 _LOCAL_FILE_INPUT_EXTENSIONS = (
     ".parquet", ".pq", ".csv", ".tsv", ".json", ".ndjson",
@@ -318,6 +327,12 @@ def bind_manifest(
                 and config.get("_input_revision_id") == item["revision_id"])
             else ""
         )
+        if isinstance(config, dict):
+            # A saved/imported graph may contain fields from an older dispatch copy. Keep only the
+            # validated prebound URI above; every field on this new private copy must be rebuilt
+            # from the current admitted manifest so stale state cannot retarget Source execution.
+            for field in _DISPATCH_CONFIG_FIELDS:
+                config.pop(field, None)
         provider_dataset_id = (
             item["dataset_id"] if prebound_provider_uri
             else workspace_providers.provider_dataset_identity(source_uri) if source_uri else None)
