@@ -155,6 +155,89 @@ def test_manifest_binding_replaces_untrusted_preview_limit_and_keeps_full_run_ex
     ]
 
 
+def test_manifest_binding_rebuilds_dispatch_fields_before_opening_source(tmp_path):
+    lance = pytest.importorskip("lance")
+    admitted_uri = str(tmp_path / "admitted.lance")
+    stale_uri = str(tmp_path / "stale.lance")
+    lance.write_dataset(pa.table({"value": [1]}), admitted_uri)
+    lance.write_dataset(pa.table({"value": [2]}), stale_uri)
+    adapter = LanceAdapter()
+    InMemoryCatalog(str(tmp_path / "data"), lambda _uri: adapter)._add(
+        name="admitted", uri=admitted_uri, strict_probe=True)
+    deps = SimpleNamespace(resolve_adapter=lambda _uri: adapter)
+    graph = _source_graph(admitted_uri)
+    config = graph.nodes[0].data["config"]
+    config.update({
+        "_input_artifact_uri": stale_uri,
+        "_input_dataset_id": "stale-dataset",
+        "_input_preview_limit": 1,
+        "_input_provider": "stale-provider",
+        "_input_provider_preview_uri": stale_uri,
+        "_input_provider_uri": stale_uri,
+        "_input_revision_id": "999",
+    })
+    manifest = runs._resolve_local_run_manifest(graph, "source", deps)
+
+    bound = bind_manifest(graph, "source", manifest, deps.resolve_adapter)
+    bound_config = bound.nodes[0].data["config"]
+
+    assert graph.nodes[0].data["config"]["_input_provider_uri"] == stale_uri
+    assert "_input_provider_uri" not in bound_config
+    assert "_input_provider_preview_uri" not in bound_config
+    assert "_input_preview_limit" not in bound_config
+    assert "_input_artifact_uri" not in bound_config
+    assert bound_config["_input_dataset_id"] == manifest[0]["dataset_id"]
+    assert bound_config["_input_provider"] == manifest[0]["provider"]
+    assert bound_config["_input_revision_id"] == manifest[0]["revision_id"]
+    with db.run_scope():
+        assert BuildEngine(
+            bound, deps.resolve_adapter, {}, full=True,
+        ).relation("source").fetchall() == [(1,)]
+
+
+def test_kernel_rebinding_preserves_only_a_matching_prebound_provider_uri(tmp_path):
+    lance = pytest.importorskip("lance")
+    physical_uri = str(tmp_path / "provider.lance")
+    lance.write_dataset(pa.table({"value": [7]}), physical_uri)
+    adapter = LanceAdapter()
+    binding_id = "a" * 32
+    graph = _source_graph(f"workspace-provider://{binding_id}")
+    revision_id = str(lance.dataset(physical_uri).version)
+    manifest = [{
+        "node_id": "source",
+        "dataset_id": f"workspace-provider:{binding_id}",
+        "revision_id": revision_id,
+        "provider": adapter.name,
+        "resolved_at": "2026-07-23T00:00:00Z",
+    }]
+    graph.nodes[0].data["config"].update({
+        "_input_provider_uri": physical_uri,
+        "_input_dataset_id": manifest[0]["dataset_id"],
+        "_input_provider": manifest[0]["provider"],
+        "_input_revision_id": revision_id,
+        "_input_preview_limit": 1,
+    })
+
+    rebound = bind_manifest(
+        graph,
+        "source",
+        manifest,
+        lambda _uri: adapter,
+        allow_prebound_provider=True,
+    )
+    config = rebound.nodes[0].data["config"]
+
+    assert config["_input_provider_uri"] == physical_uri
+    assert config["_input_dataset_id"] == manifest[0]["dataset_id"]
+    assert config["_input_provider"] == manifest[0]["provider"]
+    assert config["_input_revision_id"] == revision_id
+    assert "_input_preview_limit" not in config
+    with db.run_scope():
+        assert BuildEngine(
+            rebound, lambda _uri: adapter, {}, full=True,
+        ).relation("source").fetchall() == [(7,)]
+
+
 def test_kernel_transport_rejects_stale_and_secret_bearing_manifests():
     valid = [{
         "node_id": "source", "dataset_id": "dataset", "revision_id": "1",
