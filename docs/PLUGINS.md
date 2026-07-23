@@ -146,6 +146,40 @@ must not scan rows or perform an unbounded namespace listing. Preflight and reco
 `fingerprint(uri)`; keep it bounded and metadata-only, and return the best available revision token rather
 than promising a content hash. Missing capabilities or uncertain metadata are handled as unknown cost.
 
+### Field metadata and typed row references
+
+`schema(uri)` returns the current `ColumnSchema` wire model. An adapter may attach up to 32
+`annotations` to a field. Each annotation has a non-empty key of at most 128 UTF-8 bytes with no control
+characters, an explicit `utf8` or canonical `base64` value encoding, and `provider` or `declared`
+provenance. A decoded value is limited to 4 KiB, decoded annotations are limited to 16 KiB per field and
+256 KiB per schema, keys are unique, and core serializes them in UTF-8 byte order. Native Arrow/Lance
+metadata that is malformed, excessive, or unsafe is dropped as a whole entry; an explicit plugin/wire DTO
+with the same defect is rejected. Core never emits a redaction placeholder.
+
+The safety policy is finite and reviewable. Dot, colon, and slash delimit paths; spaces and hyphens inside
+one segment normalize to underscores. Core rejects only these exact normalized segments (or an adjacent
+pair that joins to one of them, such as `storage.options` -> `storage_options`):
+`access_key`, `access_key_id`, `access_token`, `api_key`, `api_token`, `auth_token`, `authorization`,
+`authorization_envelope`, `bearer_token`, `client_secret`, `credential`, `credential_envelope`,
+`credentials`, `aws_access_key_id`, `aws_secret_access_key`, `aws_session_token`,
+`google_application_credentials`, `id_token`, `password`, `private_key`, `refresh_token`, `secret`,
+`secret_access_key`, `secret_key`, `security_token`, `session_token`, `storage_options`, and `token`. It
+does not use substring or entropy matching: keys such as `tokenized.algorithm`, `token_count`, and
+`tokenizer` are ordinary
+metadata. Decoded UTF-8 values are also rejected when they contain an Authorization Basic/Bearer envelope,
+a private-key PEM header, a JSON object with one of those exact credential/storage key segments, or a URI
+with userinfo or a credential query key. Credential URI queries additionally reject exact normalized
+`sig`, `signature`, `x_amz_credential`, `x_amz_security_token`, `x_amz_signature`,
+`x_goog_credential`, and `x_goog_signature` keys. Non-UTF-8 safe values use bounded canonical base64.
+
+A field may carry one `rowReference` with `provider`, `declared`, or `lineage` evidence. Its `target` is
+either an exact dataset/revision identity or a canonical catalog `datasetId`; `keyFields` is an ordered,
+unique tuple of 1-16 non-empty names (at most 256 UTF-8 bytes each), and `semanticType` is optional and at
+most 128 UTF-8 bytes. Do not infer this contract from a column name. An Arrow/Lance adapter may optionally
+define `normalize_field_reference(column)`: core calls it only after annotations are sanitized, and it
+must return only the generic `TypedRowReference` DTO (or `None`). Core validates the result again; the hook
+must not add organization-specific decoding to public core or mutate field identity/type facts.
+
 `reg.add_runner(runner)` adds an execution backend. Implement `ExecutionBackend`: `name`, `can_run`,
 `estimate`, `run`, `status`, `cancel`. A backend that can honor a destination-specific or configured
 default Cred must also implement `supports_selected_destination_credentials() -> True`. Core treats a

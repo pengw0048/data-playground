@@ -72,6 +72,7 @@ from hub.models import (
     SchemaCompatibility,
     SampleRequest,
     SampleResult,
+    normalize_column_schemas,
 )
 from hub.security import current_user
 
@@ -812,9 +813,9 @@ def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
                 deps.storage, [left_uri, right_uri],
                 owner=f"catalog-join:{uuid.uuid4().hex}"):
             left_cols = (left_cols if left_cols is not None
-                         else deps.resolve_adapter(left_uri).schema(left_uri))
+                         else normalize_column_schemas(deps.resolve_adapter(left_uri).schema(left_uri)))
             right_cols = (right_cols if right_cols is not None
-                          else deps.resolve_adapter(right_uri).schema(right_uri))
+                          else normalize_column_schemas(deps.resolve_adapter(right_uri).schema(right_uri)))
             return rel.suggest_joins(left_cols, right_cols,
                                      rel.measured_unique(left_uri, deps.resolve_adapter),
                                      rel.measured_unique(right_uri, deps.resolve_adapter))

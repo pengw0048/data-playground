@@ -165,4 +165,25 @@ export interface ColumnSchema {
   hasDefault?: boolean | null
   provenance?: 'inferred' | 'declared' | 'provider'
   capabilities: string[]
+  annotations?: FieldAnnotation[]
+  rowReference?: TypedRowReference
+}
+
+export interface FieldAnnotation {
+  key: string
+  value: string
+  encoding: 'utf8' | 'base64'
+  provenance: 'declared' | 'provider'
+}
+
+export interface CanonicalDatasetRef {
+  kind: 'canonical'
+  datasetId: string
+}
+
+export interface TypedRowReference {
+  target: ExactDatasetRef | CanonicalDatasetRef
+  keyFields: string[]
+  semanticType?: string | null
+  provenance: 'declared' | 'provider' | 'lineage'
 }

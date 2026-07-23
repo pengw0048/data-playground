@@ -98,7 +98,19 @@ def test_saved_contract_round_trips_current_field_model_without_loss():
     name = f"schema-roundtrip-{uuid.uuid4().hex}"
     fields = [_field(
         "customer_id", "bigint", fieldId="warehouse.customer_id", physicalType="INT64",
-        nullable=False, hasDefault=False, provenance="provider", capabilities=["key"])]
+        nullable=False, hasDefault=False, provenance="provider", capabilities=["key"],
+        annotations=[{
+            "key": "semantic.type",
+            "value": "customer",
+            "encoding": "utf8",
+            "provenance": "declared",
+        }],
+        rowReference={
+            "target": {"kind": "canonical", "datasetId": "customers"},
+            "keyFields": ["customer_id"],
+            "semanticType": "customer",
+            "provenance": "declared",
+        })]
 
     metadb.save_schema_contract(name, fields)
     stored = metadb.get_schema_contract(name)

@@ -21,7 +21,7 @@ import uuid
 from typing import Any
 
 from hub import graph as graph_mod
-from hub.models import CatalogQuery, GraphNode
+from hub.models import CatalogQuery, GraphNode, normalize_column_schemas
 
 
 class GraphOpError(ValueError):
@@ -260,8 +260,8 @@ def join_hints(deps, left: str, right: str) -> dict:
         _resolve_uri_and_cols(deps, left), _resolve_uri_and_cols(deps, right))
     with source_read_scope(
             deps.storage, [luri, ruri], owner=f"join-hints:{uuid.uuid4().hex}"):
-        lcols = lcols if lcols is not None else deps.resolve_adapter(luri).schema(luri)
-        rcols = rcols if rcols is not None else deps.resolve_adapter(ruri).schema(ruri)
+        lcols = lcols if lcols is not None else normalize_column_schemas(deps.resolve_adapter(luri).schema(luri))
+        rcols = rcols if rcols is not None else normalize_column_schemas(deps.resolve_adapter(ruri).schema(ruri))
         sugg = rel.suggest_joins(lcols, rcols,
                                  rel.measured_unique(luri, deps.resolve_adapter),
                                  rel.measured_unique(ruri, deps.resolve_adapter))

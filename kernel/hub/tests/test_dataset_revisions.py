@@ -290,17 +290,33 @@ def test_lance_exact_revision_detail_preserves_schema_for_empty_revision(tmp_pat
     lance = pytest.importorskip("lance")
     name = f"empty-revision-{uuid.uuid4().hex}"
     uri = str(tmp_path / f"{name}.lance")
-    lance.write_dataset(pa.table({"value": pa.array([], type=pa.int64())}), uri)
+    schema = pa.schema([pa.field("value", pa.int64(), metadata={
+        b"source.note": b"retained",
+    })])
+    lance.write_dataset(pa.Table.from_arrays([pa.array([], type=pa.int64())], schema=schema), uri)
     registered = client.post("/api/catalog/register", json={"uri": uri, "name": name})
     assert registered.status_code == 200, registered.text
     history = client.get(f"/api/catalog/tables/{registered.json()['id']}/revisions")
     revision = history.json()["items"][0]
+
+    head_schema = pa.schema([pa.field("value", pa.int64(), metadata={
+        b"source.note": b"current-head",
+    })])
+    lance.write_dataset(
+        pa.Table.from_arrays([pa.array([1], type=pa.int64())], schema=head_schema),
+        uri,
+        mode="overwrite",
+    )
+    assert LanceAdapter().schema(uri)[0].annotations[0].value == "current-head"
 
     response = client.get(f"/api/catalog/revisions/{revision['datasetId']}/{revision['revisionId']}")
     assert response.status_code == 200, response.text
     detail = response.json()
     assert detail["summary"]["rowCount"] == 0
     assert detail["preview"]["columns"][0]["name"] == "value"
+    assert detail["preview"]["columns"][0]["annotations"] == [
+        {"key": "source.note", "value": "retained", "encoding": "utf8", "provenance": "provider"},
+    ]
     assert detail["preview"]["rows"] == []
     assert detail["preview"]["hasMore"] is False
 

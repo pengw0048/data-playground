@@ -114,6 +114,29 @@
         "title": "BrowseRequest",
         "type": "object"
       },
+      "CanonicalDatasetRef": {
+        "additionalProperties": false,
+        "description": "One stable catalog identity, never a URI, name, or transient table id.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "kind": {
+            "const": "canonical",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "datasetId"
+        ],
+        "title": "CanonicalDatasetRef",
+        "type": "object"
+      },
       "CanvasCopyCreateBody": {
         "additionalProperties": false,
         "properties": {
@@ -872,6 +895,14 @@
       "ColumnSchema": {
         "description": "One current schema-field model.\n\n``type`` is the logical type used by execution and the UI.  Adapters may also\nreport their source physical type, but must leave facts they cannot prove as\n``None`` rather than guessing.",
         "properties": {
+          "annotations": {
+            "items": {
+              "$ref": "#/components/schemas/FieldAnnotation"
+            },
+            "maxItems": 32,
+            "title": "Annotations",
+            "type": "array"
+          },
           "capabilities": {
             "default": [],
             "items": {
@@ -942,6 +973,16 @@
             ],
             "title": "Provenance",
             "type": "string"
+          },
+          "rowReference": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TypedRowReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "type": {
             "description": "Logical field type.",
@@ -4743,6 +4784,44 @@
           }
         },
         "title": "Facets",
+        "type": "object"
+      },
+      "FieldAnnotation": {
+        "additionalProperties": false,
+        "description": "One bounded, opaque field metadata entry supplied by a source or producer.",
+        "properties": {
+          "encoding": {
+            "enum": [
+              "utf8",
+              "base64"
+            ],
+            "title": "Encoding",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "provenance": {
+            "enum": [
+              "declared",
+              "provider"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value",
+          "encoding",
+          "provenance"
+        ],
+        "title": "FieldAnnotation",
         "type": "object"
       },
       "FolderCreateRequest": {
@@ -9864,6 +9943,57 @@
           }
         },
         "title": "TransformRetention",
+        "type": "object"
+      },
+      "TypedRowReference": {
+        "additionalProperties": false,
+        "description": "Producer evidence that this field stores a key in another dataset.",
+        "properties": {
+          "keyFields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Keyfields",
+            "type": "array"
+          },
+          "provenance": {
+            "enum": [
+              "declared",
+              "provider",
+              "lineage"
+            ],
+            "title": "Provenance",
+            "type": "string"
+          },
+          "semanticType": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Semantictype"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "$ref": "#/components/schemas/CanonicalDatasetRef"
+              }
+            ],
+            "title": "Target"
+          }
+        },
+        "required": [
+          "target",
+          "keyFields",
+          "provenance"
+        ],
+        "title": "TypedRowReference",
         "type": "object"
       },
       "UnregisterItemResult": {

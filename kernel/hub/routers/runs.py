@@ -31,7 +31,7 @@ from hub.backends import (
     backend_supports_admitted_input_manifests, backend_supports_named_multi_output_runs,
 )
 from hub.deps import get_deps
-from hub.executors.engine import declared_schema
+from hub.executors.engine import canonical_type, declared_schema
 from hub.executors.preview import PREVIEW_SCAN, preview_node
 from hub.executors.profile import profile_node
 from hub.executors.schema import schema_for_graph, schema_for_graph_ports
@@ -103,6 +103,26 @@ _EXPORT_MEDIA_TYPES = {
     ".tsv": "text/tab-separated-values; charset=utf-8",
     ".json": "application/json",
 }
+
+
+def _schemas_are_write_compatible(
+        incoming: list[ColumnSchema], destination: list[ColumnSchema]) -> bool:
+    """Compare data-bearing schema facts without conflating them with field metadata.
+
+    Provider and execution adapters use different spellings for the same physical
+    type (for example Arrow ``int64`` and DuckDB ``BIGINT``).  Field provenance,
+    annotations, row references, and nullable evidence describe a field but do not
+    change whether the incoming values can be appended to that field.
+    """
+    if len(incoming) != len(destination):
+        return False
+    return all(
+        left.name == right.name
+        and left.type == right.type
+        and canonical_type(left.physical_type or left.type)
+        == canonical_type(right.physical_type or right.type)
+        for left, right in zip(incoming, destination)
+    )
 
 
 def _resolve_parameters(
@@ -799,7 +819,7 @@ def _write_admission_for_graph(
                     or expected.dataset_id != str(lance_binding["dataset_id"])):
                 raise HTTPException(
                     409, "write admission is stale; re-admit the current destination head and retry")
-        if destination_schema != normalized_schema:
+        if not _schemas_are_write_compatible(normalized_schema, destination_schema):
             return WriteAdmission(
                 node_id=node_id, managed=True, destination=logical_uri,
                 mode="append", provider="managed-local-lance",

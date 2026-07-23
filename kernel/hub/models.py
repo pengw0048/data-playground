@@ -6,9 +6,13 @@ snake_case in Python. These shapes ARE the contract.
 
 from __future__ import annotations
 
+import base64
 import datetime
+import json
 import math
+import re
 from typing import Annotated, Any, Literal
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import (
     UUID4, AfterValidator, BaseModel, ConfigDict, Field, PrivateAttr, TypeAdapter,
@@ -77,6 +81,232 @@ class CredUpsert(Wire):
 # --------------------------------------------------------------------------- #
 SchemaProvenance = Literal["inferred", "declared", "provider"]
 SchemaCompatibilityStatus = Literal["compatible", "breaking", "unknown"]
+FieldAnnotationEncoding = Literal["utf8", "base64"]
+FieldAnnotationProvenance = Literal["declared", "provider"]
+RowReferenceProvenance = Literal["declared", "provider", "lineage"]
+
+_DISALLOWED_METADATA_KEY_SEGMENTS = frozenset({
+    "access_key", "access_key_id", "access_token", "api_key", "api_token",
+    "auth_token", "authorization", "authorization_envelope", "bearer_token",
+    "aws_access_key_id", "aws_secret_access_key", "aws_session_token", "client_secret",
+    "credential", "credential_envelope", "credentials", "google_application_credentials",
+    "id_token", "password", "private_key", "refresh_token", "secret", "secret_access_key",
+    "secret_key", "security_token", "session_token", "storage_options", "token",
+})
+_DISALLOWED_CREDENTIAL_QUERY_KEYS = frozenset({
+    "sig", "signature", "x_amz_credential", "x_amz_security_token", "x_amz_signature",
+    "x_goog_credential", "x_goog_signature",
+})
+_METADATA_KEY_PATH_SEPARATOR = re.compile(r"[.:/]+")
+_METADATA_KEY_WORD_SEPARATOR = re.compile(r"[\s-]+")
+_AUTHORIZATION_ENVELOPE = re.compile(
+    r"\bauthorization\b\s*[\"']?\s*[:=]\s*[\"']?\s*(?:bearer|basic)\s+[^\s\"']+",
+    re.IGNORECASE,
+)
+_PRIVATE_KEY_PEM = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
+_URI_CANDIDATE = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
+
+
+def _metadata_key_is_disallowed(key: str) -> bool:
+    """Match a finite set of exact path segments, never substrings or entropy."""
+    segments = tuple(
+        _METADATA_KEY_WORD_SEPARATOR.sub("_", segment.casefold()).strip("_")
+        for segment in _METADATA_KEY_PATH_SEPARATOR.split(key)
+        if segment
+    )
+    return (any(segment in _DISALLOWED_METADATA_KEY_SEGMENTS for segment in segments)
+            or any(f"{left}_{right}" in _DISALLOWED_METADATA_KEY_SEGMENTS
+                   for left, right in zip(segments, segments[1:])))
+
+
+def _credential_query_key_is_disallowed(key: str) -> bool:
+    normalized = _METADATA_KEY_WORD_SEPARATOR.sub("_", key.casefold()).strip("_")
+    return (_metadata_key_is_disallowed(key)
+            or normalized in _DISALLOWED_CREDENTIAL_QUERY_KEYS)
+
+
+def _json_has_disallowed_metadata_key(value: object) -> bool:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                if isinstance(key, str) and _metadata_key_is_disallowed(key):
+                    return True
+                pending.append(nested)
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
+def _text_has_credential_uri(text: str) -> bool:
+    for match in _URI_CANDIDATE.finditer(text):
+        candidate = match.group(0).rstrip(",;.)]}")
+        try:
+            parsed = urlsplit(candidate)
+            if parsed.username is not None or parsed.password is not None:
+                return True
+            if any(_credential_query_key_is_disallowed(key)
+                   for key, _value in parse_qsl(parsed.query, keep_blank_values=True)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def field_metadata_is_disallowed(key: str, value: bytes) -> bool:
+    """Return whether raw field metadata could disclose a credential or auth envelope.
+
+    This intentionally matches only documented key/URI forms.  It is not an entropy
+    heuristic: unknown metadata remains useful, reviewable schema evidence.
+    """
+    if _metadata_key_is_disallowed(key):
+        return True
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if (_AUTHORIZATION_ENVELOPE.search(text) is not None
+            or _PRIVATE_KEY_PEM.search(text) is not None
+            or _text_has_credential_uri(text)):
+        return True
+    try:
+        document = json.loads(text)
+    except (json.JSONDecodeError, RecursionError):
+        return False
+    return _json_has_disallowed_metadata_key(document)
+
+
+def _bounded_text(value: str, *, label: str, maximum: int, controls: bool = False) -> str:
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+        raise ValueError(f"{label} must be non-empty and at most {maximum} UTF-8 bytes")
+    if controls and any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+        raise ValueError(f"{label} must not contain control characters")
+    return value
+
+
+class FieldAnnotation(Wire):
+    """One bounded, opaque field metadata entry supplied by a source or producer."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    key: str
+    value: str
+    encoding: FieldAnnotationEncoding
+    provenance: FieldAnnotationProvenance
+
+    @model_validator(mode="after")
+    def _validate_annotation(self) -> "FieldAnnotation":
+        self.key = _bounded_text(self.key, label="annotation key", maximum=128, controls=True)
+        if self.encoding == "utf8":
+            raw = self.value.encode("utf-8")
+        else:
+            try:
+                raw = base64.b64decode(self.value.encode("ascii"), validate=True)
+            except (UnicodeEncodeError, ValueError) as exc:
+                raise ValueError("base64 annotation value is invalid") from exc
+            if base64.b64encode(raw).decode("ascii") != self.value:
+                raise ValueError("base64 annotation value is not canonical")
+        if len(raw) > 4096:
+            raise ValueError("annotation value exceeds 4096 decoded bytes")
+        if field_metadata_is_disallowed(self.key, raw):
+            raise ValueError("annotation contains disallowed credential metadata")
+        return self
+
+    def decoded_value(self) -> bytes:
+        return (self.value.encode("utf-8") if self.encoding == "utf8"
+                else base64.b64decode(self.value.encode("ascii"), validate=True))
+
+
+class CanonicalDatasetRef(Wire):
+    """One stable catalog identity, never a URI, name, or transient table id."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["canonical"]
+    dataset_id: str = Field(min_length=1, max_length=128)
+
+
+class TypedRowReference(Wire):
+    """Producer evidence that this field stores a key in another dataset."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    target: ExactDatasetRef | CanonicalDatasetRef
+    key_fields: list[str]
+    semantic_type: str | None = None
+    provenance: RowReferenceProvenance
+
+    @model_validator(mode="after")
+    def _validate_reference(self) -> "TypedRowReference":
+        if not 1 <= len(self.key_fields) <= 16:
+            raise ValueError("row reference must have 1-16 key fields")
+        self.key_fields = [
+            _bounded_text(key, label="row reference key field", maximum=256)
+            for key in self.key_fields
+        ]
+        if len(set(self.key_fields)) != len(self.key_fields):
+            raise ValueError("row reference key fields must be unique")
+        if self.semantic_type is not None:
+            self.semantic_type = _bounded_text(
+                self.semantic_type, label="row reference semantic type", maximum=128)
+        return self
+
+
+def safe_field_annotations(metadata: dict[bytes, bytes] | None, *,
+                           provenance: FieldAnnotationProvenance = "provider") -> list[FieldAnnotation]:
+    """Convert native Arrow/Lance metadata to bounded annotations, dropping unsafe raw entries."""
+    annotations: list[FieldAnnotation] = []
+    decoded_bytes = 0
+    entries = sorted((metadata or {}).items(), key=lambda item: item[0] if isinstance(item[0], bytes) else b"")
+    for raw_key, raw_value in entries:
+        if len(annotations) == 32:
+            break
+        if not isinstance(raw_key, bytes) or not isinstance(raw_value, bytes):
+            continue
+        if len(raw_value) > 4096:
+            continue
+        try:
+            key = raw_key.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if field_metadata_is_disallowed(key, raw_value):
+            continue
+        try:
+            value = raw_value.decode("utf-8")
+            encoding: FieldAnnotationEncoding = "utf8"
+        except UnicodeDecodeError:
+            value = base64.b64encode(raw_value).decode("ascii")
+            encoding = "base64"
+        try:
+            annotation = FieldAnnotation(key=key, value=value, encoding=encoding, provenance=provenance)
+        except ValueError:
+            # Native metadata is evidence, never a reason to make an otherwise readable source unusable.
+            continue
+        size = len(annotation.decoded_value())
+        if decoded_bytes + size > 16 * 1024:
+            continue
+        annotations.append(annotation)
+        decoded_bytes += size
+    return annotations
+
+
+def normalize_column_schemas(columns: list["ColumnSchema | dict"]) -> list["ColumnSchema"]:
+    """Validate one adapter/provider schema before it reaches durable or public boundaries."""
+    def plain_wire_value(value):
+        if isinstance(value, BaseModel):
+            return plain_wire_value(value.model_dump(by_alias=True, mode="python"))
+        if isinstance(value, dict):
+            return {key: plain_wire_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [plain_wire_value(item) for item in value]
+        return value
+
+    normalized = [ColumnSchema.model_validate(plain_wire_value(column)) for column in columns]
+    if sum(sum(len(annotation.decoded_value()) for annotation in column.annotations)
+           for column in normalized) > 256 * 1024:
+        raise ValueError("schema annotations exceed 256 KiB decoded bytes")
+    return normalized
 
 
 class ColumnSchema(Wire):
@@ -94,6 +324,17 @@ class ColumnSchema(Wire):
     has_default: bool | None = Field(default=None, description="Whether a non-null field has a source default; null means unknown.")
     provenance: SchemaProvenance = Field(default="inferred", description="Evidence source for this field metadata.")
     capabilities: list[str] = []
+    annotations: list[FieldAnnotation] = Field(default_factory=list, max_length=32)
+    row_reference: TypedRowReference | None = None
+
+    @model_validator(mode="after")
+    def _validate_field_metadata(self) -> "ColumnSchema":
+        if len({annotation.key for annotation in self.annotations}) != len(self.annotations):
+            raise ValueError("field annotation keys must be unique")
+        if sum(len(annotation.decoded_value()) for annotation in self.annotations) > 16 * 1024:
+            raise ValueError("field annotations exceed 16 KiB decoded bytes")
+        self.annotations = sorted(self.annotations, key=lambda annotation: annotation.key.encode("utf-8"))
+        return self
 
 
 class SchemaFieldCompatibility(Wire):
