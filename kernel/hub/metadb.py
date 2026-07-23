@@ -164,7 +164,7 @@ class WorkspaceExternalOverlayAnchor(Base):
     # Mount/resource are immutable identity evidence retained beside the binding generation.  They
     # must never become a pair-unique adoption key because providers are allowed to recycle IDs.
     mount_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    resource_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    provider_placement_id: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
     __table_args__ = (
         UniqueConstraint("container_id", name="uq_workspace_external_overlay_container"),
@@ -311,24 +311,54 @@ class SparseOutputMaterialization(Base):
     )
 
 
-class WorkspaceProviderBinding(Base):
-    """Durable, non-sensitive display snapshot for one explicit external resource binding.
+class WorkspaceProviderDataset(Base):
+    """Mount-scoped canonical provider dataset facts shared by every placement occurrence."""
 
-    The binding ID is part of the Workspace reference.  A provider resource that was observed as
-    deleted therefore stays detached even if the provider later reuses the same resource ID; only an
-    explicit relink can mint a new binding.  We deliberately retain no URI, columns, provider config,
-    credentials, or other provider-owned metadata here.
+    __tablename__ = "workspace_provider_datasets"
+    mount_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    provider_dataset_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(256), nullable=False)
+    uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    columns_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="current")
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    last_resolved_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now, index=True)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('current', 'offline', 'permission_lost', 'detached', 'provider_error')",
+            name="ck_workspace_provider_dataset_state",
+        ),
+        CheckConstraint(
+            "(uri IS NULL AND columns_doc IS NULL) OR "
+            "(uri IS NOT NULL AND columns_doc IS NOT NULL)",
+            name="ck_workspace_provider_dataset_detail_pair",
+        ),
+    )
+
+
+class WorkspaceProviderBinding(Base):
+    """Durable display/path snapshot for one provider placement binding generation.
+
+    The binding ID is part of the Workspace reference. A placement observed as deleted stays
+    detached even if the provider later reuses its placement ID. Dataset URI/schema facts live only
+    in :class:`WorkspaceProviderDataset`, keyed by ``(mount_id, provider_dataset_id)``.
     """
     __tablename__ = "workspace_provider_bindings"
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     mount_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     provider: Mapped[str] = mapped_column(String(256), nullable=False)
     container_id: Mapped[str] = mapped_column(String, nullable=False)
-    resource_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    provider_placement_id: Mapped[str] = mapped_column(String(512), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     name: Mapped[str] = mapped_column(String(512), nullable=False)
+    parent_provider_placement_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     parent_binding_id: Mapped[str | None] = mapped_column(
         String(32), ForeignKey("workspace_provider_bindings.id"), nullable=True)
+    provider_dataset_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="current")
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -345,9 +375,19 @@ class WorkspaceProviderBinding(Base):
             "state IN ('current', 'offline', 'permission_lost', 'detached', 'provider_error')",
             name="ck_workspace_provider_binding_state",
         ),
+        ForeignKeyConstraint(
+            ["mount_id", "provider_dataset_id"],
+            ["workspace_provider_datasets.mount_id",
+             "workspace_provider_datasets.provider_dataset_id"],
+            name="fk_workspace_provider_binding_dataset",
+        ),
         Index(
-            "ix_workspace_provider_binding_resource",
-            "mount_id", "provider", "resource_id", "active",
+            "ix_workspace_provider_binding_placement",
+            "mount_id", "provider_placement_id", "active",
+        ),
+        Index(
+            "ix_workspace_provider_binding_dataset",
+            "mount_id", "provider_dataset_id", "active",
         ),
     )
 
@@ -5128,7 +5168,7 @@ def _workspace_placement_resource(row: WorkspacePlacement, *, detached: bool) ->
 
 def _workspace_external_identity(binding: WorkspaceProviderBinding) -> str:
     payload = json.dumps(
-        [binding.mount_id, binding.resource_id, binding.id], separators=(",", ":"),
+        [binding.mount_id, binding.provider_placement_id, binding.id], separators=(",", ":"),
     ).encode()
     return "external." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
@@ -5138,17 +5178,26 @@ def _workspace_provider_container_resource(
     """Project cached provider facts only; action responses must never consult a live provider."""
     parent = (s.get(WorkspaceProviderBinding, binding.parent_binding_id)
               if binding.parent_binding_id is not None else None)
+    parent_unresolved = (
+        parent is None and binding.parent_provider_placement_id is not None)
     parent_id = (
         f"container:{_workspace_external_identity(parent)}"
-        if parent is not None else _workspace_ref("container", binding.container_id)
+        if parent is not None
+        else None if parent_unresolved
+        else _workspace_ref("container", binding.container_id)
     )
     return {
         "id": f"container:{_workspace_external_identity(binding)}",
         "kind": "container", "name": binding.name, "parentId": parent_id,
         "detached": binding.state == "detached", "source": "provider",
         "mountId": binding.mount_id, "provider": binding.provider,
-        "resourceId": binding.resource_id, "bindingId": binding.id,
-        "referenceState": binding.state, "lastKnown": binding.state != "current",
+        "resourceId": binding.provider_placement_id,
+        "providerPlacementId": binding.provider_placement_id,
+        "parentProviderPlacementId": binding.parent_provider_placement_id,
+        "providerDatasetId": binding.provider_dataset_id,
+        "bindingId": binding.id,
+        "referenceState": binding.state,
+        "lastKnown": binding.state != "current" or parent_unresolved,
         "lastResolvedAt": binding.last_resolved_at,
         "localPlacement": local_placement,
         "providerMutation": False,
@@ -5191,13 +5240,44 @@ _WORKSPACE_PROVIDER_STATES = {
 }
 
 
-def _workspace_provider_binding_doc(row: WorkspaceProviderBinding) -> dict:
+def _workspace_provider_dataset_doc(row: WorkspaceProviderDataset) -> dict:
     return {
+        "mountId": row.mount_id,
+        "providerDatasetId": row.provider_dataset_id,
+        "provider": row.provider,
+        "uri": row.uri,
+        "columns": (
+            json.loads(row.columns_doc) if row.columns_doc is not None else None),
+        "referenceState": row.state,
+        "lastError": row.last_error,
+        "lastResolvedAt": row.last_resolved_at,
+    }
+
+
+def _workspace_provider_dataset_for_binding(
+        s, row: WorkspaceProviderBinding) -> WorkspaceProviderDataset | None:
+    if row.provider_dataset_id is None:
+        return None
+    return s.get(
+        WorkspaceProviderDataset,
+        (row.mount_id, row.provider_dataset_id),
+    )
+
+
+def _workspace_provider_binding_doc(
+        row: WorkspaceProviderBinding,
+        canonical: WorkspaceProviderDataset | None = None) -> dict:
+    doc = {
         "bindingId": row.id,
         "mountId": row.mount_id,
         "provider": row.provider,
         "containerId": row.container_id,
-        "resourceId": row.resource_id,
+        # ``resourceId`` remains the generic Workspace provider field consumed by the current web
+        # client. The two provider identity layers below are authoritative and unambiguous.
+        "resourceId": row.provider_placement_id,
+        "providerPlacementId": row.provider_placement_id,
+        "parentProviderPlacementId": row.parent_provider_placement_id,
+        "providerDatasetId": row.provider_dataset_id,
         "kind": row.kind,
         "name": row.name,
         "parentBindingId": row.parent_binding_id,
@@ -5207,6 +5287,19 @@ def _workspace_provider_binding_doc(row: WorkspaceProviderBinding) -> dict:
         "relinkedFromId": row.relinked_from_id,
         "lastResolvedAt": row.last_resolved_at,
     }
+    if canonical is not None:
+        doc.update({
+            "canonicalReferenceState": canonical.state,
+            "canonicalLastError": canonical.last_error,
+            "canonicalLastResolvedAt": canonical.last_resolved_at,
+        })
+    else:
+        doc.update({
+            "canonicalReferenceState": None,
+            "canonicalLastError": None,
+            "canonicalLastResolvedAt": None,
+        })
+    return doc
 
 
 def _workspace_external_overlay_anchor_doc(
@@ -5216,7 +5309,8 @@ def _workspace_external_overlay_anchor_doc(
         "containerId": container.id,
         "containerVersion": container.version,
         "mountId": anchor.mount_id,
-        "resourceId": anchor.resource_id,
+        "resourceId": anchor.provider_placement_id,
+        "providerPlacementId": anchor.provider_placement_id,
         "recoveryState": "ready",
     }
 
@@ -5256,90 +5350,224 @@ def workspace_provider_ensure_overlay_anchor(binding_id: str) -> dict:
             s.flush()
             anchor = WorkspaceExternalOverlayAnchor(
                 binding_id=binding.id, container_id=container.id,
-                mount_id=binding.mount_id, resource_id=binding.resource_id,
+                mount_id=binding.mount_id,
+                provider_placement_id=binding.provider_placement_id,
             )
             s.add(anchor)
             s.flush()
         else:
             container = _workspace_container_locked(s, anchor.container_id)
-            if (anchor.mount_id != binding.mount_id or anchor.resource_id != binding.resource_id):
+            if (anchor.mount_id != binding.mount_id
+                    or anchor.provider_placement_id != binding.provider_placement_id):
                 raise RuntimeError("external Workspace overlay anchor identity no longer matches its binding")
         return _workspace_external_overlay_anchor_doc(anchor, container)
 
 
 def _workspace_provider_initial_binding_id(
-    mount_id: str, provider: str, resource_id: str,
+    mount_id: str, provider_placement_id: str,
 ) -> str:
     payload = json.dumps(
-        [mount_id, provider, resource_id], separators=(",", ":"), ensure_ascii=False,
+        [mount_id, provider_placement_id],
+        separators=(",", ":"), ensure_ascii=False,
     ).encode()
     return hashlib.sha256(payload).hexdigest()[:32]
 
 
-def workspace_provider_cache_resource(
-    *, mount_id: str, provider: str, container_id: str, resource_id: str, kind: str, name: str,
-    parent_binding_id: str | None = None, parent_is_known: bool = True,
-) -> dict:
-    """Persist only the bounded display facts needed to explain a broken external reference.
+def _workspace_provider_columns_doc(columns: list[ColumnSchema] | list[dict]) -> str:
+    canonical = [
+        ColumnSchema.model_validate(column).model_dump(
+            by_alias=True, mode="json", exclude_none=True)
+        for column in columns
+    ]
+    return json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
-    A terminal detached binding is never revived by a provider read.  This is the ABA fence that
-    prevents delete/recreate with a reused provider ID from silently rebinding an old Workspace URL.
+
+def _workspace_provider_safe_error(state: str) -> str:
+    return {
+        "offline": "provider is offline",
+        "permission_lost": "provider permission was lost",
+        "detached": "resource is detached",
+        "provider_error": "provider read failed",
+    }[state]
+
+
+def _workspace_provider_upsert_dataset(
+    s, *, mount_id: str, provider: str, provider_dataset_id: str,
+    uri: str, columns: list[ColumnSchema] | list[dict],
+) -> tuple[WorkspaceProviderDataset, bool]:
+    """Upsert one canonical dataset without ever merging incompatible provider facts."""
+    if not provider_dataset_id or len(provider_dataset_id) > 512:
+        raise ValueError("invalid canonical provider dataset identity")
+    if not uri or len(uri) > 8192:
+        raise ValueError("invalid canonical provider dataset URI")
+    columns_doc = _workspace_provider_columns_doc(columns)
+    row = s.get(
+        WorkspaceProviderDataset,
+        (mount_id, provider_dataset_id),
+        with_for_update=True,
+    )
+    now = _now()
+    if row is None:
+        row = WorkspaceProviderDataset(
+            mount_id=mount_id,
+            provider_dataset_id=provider_dataset_id,
+            provider=provider,
+            uri=uri,
+            columns_doc=columns_doc,
+            state="current",
+            last_resolved_at=now,
+        )
+        s.add(row)
+        s.flush()
+        return row, False
+    conflict = (
+        row.provider != provider
+        or row.uri is not None and row.uri != uri
+        or row.columns_doc is not None and row.columns_doc != columns_doc
+    )
+    if conflict:
+        row.state = "provider_error"
+        row.last_error = "provider returned conflicting canonical dataset facts"
+        row.last_resolved_at = now
+        return row, True
+    # A terminal canonical tombstone is not revived by a passive provider observation.
+    if row.state != "detached":
+        row.provider = provider
+        row.uri = uri
+        row.columns_doc = columns_doc
+        row.state = "current"
+        row.last_error = None
+        row.last_resolved_at = now
+    return row, False
+
+
+def workspace_provider_cache_resource(
+    *, mount_id: str, provider: str, container_id: str,
+    provider_placement_id: str, kind: str, name: str,
+    parent_provider_placement_id: str | None = None,
+    parent_binding_id: str | None = None, parent_is_known: bool = True,
+    provider_dataset_id: str | None = None, uri: str | None = None,
+    columns: list[ColumnSchema] | list[dict] | None = None,
+) -> dict:
+    """Persist a placement occurrence and its independently keyed canonical dataset evidence.
+
+    A terminal detached placement is never revived by a provider read. A placement may move or
+    rename, but it cannot silently change kind or canonical dataset target. Canonical facts are
+    shared by every placement and incompatible observations fail closed without overwriting them.
     """
     if kind not in {"container", "dataset"}:
         raise ValueError("invalid provider resource kind")
+    if not provider_placement_id or len(provider_placement_id) > 512:
+        raise ValueError("invalid provider placement identity")
+    if kind == "dataset":
+        if provider_dataset_id is None or uri is None:
+            raise ValueError("provider dataset placement requires canonical detail")
+        canonical_columns = columns or []
+    else:
+        if provider_dataset_id is not None or uri is not None or columns:
+            raise ValueError("provider container cannot carry canonical dataset detail")
+        canonical_columns = []
+
     with session() as s:
+        canonical: WorkspaceProviderDataset | None = None
+        canonical_conflict = False
+        if provider_dataset_id is not None and uri is not None:
+            canonical, canonical_conflict = _workspace_provider_upsert_dataset(
+                s,
+                mount_id=mount_id,
+                provider=provider,
+                provider_dataset_id=provider_dataset_id,
+                uri=uri,
+                columns=canonical_columns,
+            )
+
         row = s.scalar(select(WorkspaceProviderBinding).where(
             WorkspaceProviderBinding.mount_id == mount_id,
-            WorkspaceProviderBinding.provider == provider,
-            WorkspaceProviderBinding.resource_id == resource_id,
+            WorkspaceProviderBinding.provider_placement_id == provider_placement_id,
             WorkspaceProviderBinding.active.is_(True),
         ).order_by(WorkspaceProviderBinding.updated_at.desc()))
         if row is None:
             row = s.scalar(select(WorkspaceProviderBinding).where(
                 WorkspaceProviderBinding.mount_id == mount_id,
-                WorkspaceProviderBinding.provider == provider,
-                WorkspaceProviderBinding.resource_id == resource_id,
+                WorkspaceProviderBinding.provider_placement_id == provider_placement_id,
             ).order_by(WorkspaceProviderBinding.updated_at.desc()))
         if row is None:
             row = WorkspaceProviderBinding(
-                id=_workspace_provider_initial_binding_id(mount_id, provider, resource_id),
+                id=_workspace_provider_initial_binding_id(
+                    mount_id, provider_placement_id),
                 mount_id=mount_id,
                 provider=provider,
                 container_id=container_id,
-                resource_id=resource_id,
+                provider_placement_id=provider_placement_id,
                 kind=kind,
                 name=name,
+                parent_provider_placement_id=parent_provider_placement_id,
                 parent_binding_id=parent_binding_id,
-                state="current",
+                provider_dataset_id=provider_dataset_id,
+                state="provider_error" if canonical_conflict else "current",
                 active=True,
+                last_error=(
+                    "provider returned conflicting canonical dataset facts"
+                    if canonical_conflict else None),
                 last_resolved_at=_now(),
             )
             s.add(row)
             try:
                 s.flush()
             except IntegrityError:
-                # Concurrent request-time reads mint the same deterministic first binding.  Adopt
-                # the winner rather than failing a healthy provider read.
+                # Concurrent reads mint the same deterministic first placement generation.
                 s.rollback()
                 row = s.get(WorkspaceProviderBinding, _workspace_provider_initial_binding_id(
-                    mount_id, provider, resource_id))
+                    mount_id, provider_placement_id))
                 if row is None:
                     raise
+                canonical = _workspace_provider_dataset_for_binding(s, row)
         elif row.state != "detached":
-            row.kind = kind
-            row.name = name
-            row.container_id = container_id
-            if parent_is_known:
-                row.parent_binding_id = parent_binding_id
-            row.state = "current"
-            row.last_error = None
+            placement_conflict = (
+                row.provider != provider
+                or row.kind != kind
+                or (row.provider_dataset_id is not None
+                    and row.provider_dataset_id != provider_dataset_id)
+            )
+            if placement_conflict or canonical_conflict:
+                row.state = "provider_error"
+                row.last_error = (
+                    "provider mount changed its provider binding"
+                    if row.provider != provider else
+                    "provider placement changed its canonical target"
+                    if placement_conflict
+                    else "provider returned conflicting canonical dataset facts")
+            else:
+                row.kind = kind
+                row.name = name
+                row.container_id = container_id
+                parent_changed = (
+                    row.parent_provider_placement_id
+                    != parent_provider_placement_id
+                )
+                row.parent_provider_placement_id = parent_provider_placement_id
+                if parent_is_known:
+                    row.parent_binding_id = parent_binding_id
+                elif parent_changed:
+                    # A move to an uncached provider parent invalidates the old path binding.
+                    # Keep the new provider parent identity, but project its local path unresolved
+                    # until a bounded ancestor read hydrates that parent.
+                    row.parent_binding_id = None
+                if row.provider_dataset_id is None:
+                    # Forward-migrated placements learn their explicit current canonical identity
+                    # only from the current provider DTO.
+                    row.provider_dataset_id = provider_dataset_id
+                row.state = "current"
+                row.last_error = None
             row.last_resolved_at = _now()
-        return _workspace_provider_binding_doc(row)
+        canonical = canonical or _workspace_provider_dataset_for_binding(s, row)
+        return _workspace_provider_binding_doc(row, canonical)
 
 
 def workspace_provider_binding(
     binding_id: str, *, mount_id: str | None = None, provider: str | None = None,
-    resource_id: str | None = None,
+    provider_placement_id: str | None = None,
 ) -> dict | None:
     with session() as s:
         row = s.get(WorkspaceProviderBinding, binding_id)
@@ -5347,24 +5575,29 @@ def workspace_provider_binding(
             return None
         if (mount_id is not None and row.mount_id != mount_id
                 or provider is not None and row.provider != provider
-                or resource_id is not None and row.resource_id != resource_id):
+                or provider_placement_id is not None
+                and row.provider_placement_id != provider_placement_id):
             return None
-        return _workspace_provider_binding_doc(row)
+        return _workspace_provider_binding_doc(
+            row, _workspace_provider_dataset_for_binding(s, row))
 
 
-def workspace_provider_binding_for_resource(
-    *, mount_id: str, provider: str, resource_id: str,
+def workspace_provider_binding_for_placement(
+    *, mount_id: str, provider: str, provider_placement_id: str,
 ) -> dict | None:
     with session() as s:
         row = s.scalar(select(WorkspaceProviderBinding).where(
             WorkspaceProviderBinding.mount_id == mount_id,
-            WorkspaceProviderBinding.provider == provider,
-            WorkspaceProviderBinding.resource_id == resource_id,
+            WorkspaceProviderBinding.provider_placement_id == provider_placement_id,
         ).order_by(
             WorkspaceProviderBinding.active.desc(),
             WorkspaceProviderBinding.updated_at.desc(),
         ))
-        return _workspace_provider_binding_doc(row) if row is not None else None
+        if row is not None and row.provider != provider:
+            return None
+        return (_workspace_provider_binding_doc(
+            row, _workspace_provider_dataset_for_binding(s, row))
+            if row is not None else None)
 
 
 def workspace_provider_binding_ancestors(binding_id: str) -> list[dict]:
@@ -5382,7 +5615,8 @@ def workspace_provider_binding_ancestors(binding_id: str) -> list[dict]:
             current = s.get(WorkspaceProviderBinding, current_id)
             if current is None:
                 break
-            ancestors.append(_workspace_provider_binding_doc(current))
+            ancestors.append(_workspace_provider_binding_doc(
+                current, _workspace_provider_dataset_for_binding(s, current)))
             current_id = current.parent_binding_id
         return list(reversed(ancestors))
 
@@ -5391,15 +5625,7 @@ def workspace_provider_mark_binding(binding_id: str, *, state: str, error: str |
     if state not in _WORKSPACE_PROVIDER_STATES or state == "current":
         raise ValueError("invalid degraded provider reference state")
     del error
-    # Provider reasons are useful on the live response but are not trusted persistence input: they
-    # may contain a URI, object name, or credential-shaped diagnostic.  Persist only a fixed safe
-    # explanation of the classified state.
-    safe_error = {
-        "offline": "provider is offline",
-        "permission_lost": "provider permission was lost",
-        "detached": "resource is detached",
-        "provider_error": "provider read failed",
-    }[state]
+    safe_error = _workspace_provider_safe_error(state)
     with session() as s:
         row = s.get(WorkspaceProviderBinding, binding_id, with_for_update=True)
         if row is None:
@@ -5407,12 +5633,67 @@ def workspace_provider_mark_binding(binding_id: str, *, state: str, error: str |
         if row.state != "detached":
             row.state = state
             row.last_error = safe_error
-        return _workspace_provider_binding_doc(row)
+        return _workspace_provider_binding_doc(
+            row, _workspace_provider_dataset_for_binding(s, row))
+
+
+def workspace_provider_mark_dataset(
+    *, mount_id: str, provider_dataset_id: str, state: str, error: str | None,
+) -> dict:
+    if state not in _WORKSPACE_PROVIDER_STATES or state == "current":
+        raise ValueError("invalid degraded provider dataset state")
+    del error
+    with session() as s:
+        row = s.get(
+            WorkspaceProviderDataset,
+            (mount_id, provider_dataset_id),
+            with_for_update=True,
+        )
+        if row is None:
+            raise KeyError("Workspace provider dataset not found")
+        if row.state != "detached":
+            row.state = state
+            row.last_error = _workspace_provider_safe_error(state)
+        return _workspace_provider_dataset_doc(row)
+
+
+def workspace_provider_dataset(
+        *, mount_id: str, provider_dataset_id: str) -> dict | None:
+    with session() as s:
+        row = s.get(WorkspaceProviderDataset, (mount_id, provider_dataset_id))
+        return _workspace_provider_dataset_doc(row) if row is not None else None
+
+
+def workspace_provider_reconcile_children(
+    *, mount_id: str, parent_provider_placement_id: str | None,
+    seen_provider_placement_ids: set[str],
+) -> list[dict]:
+    """Fence missing occurrences pending bounded resolve; never infer delete from a possible move."""
+    with session() as s:
+        rows = list(s.scalars(select(WorkspaceProviderBinding).where(
+            WorkspaceProviderBinding.mount_id == mount_id,
+            WorkspaceProviderBinding.active.is_(True),
+            WorkspaceProviderBinding.parent_provider_placement_id
+            == parent_provider_placement_id,
+            WorkspaceProviderBinding.state != "detached",
+        ).with_for_update()))
+        missing: list[dict] = []
+        for row in rows:
+            if row.provider_placement_id in seen_provider_placement_ids:
+                continue
+            row.state = "provider_error"
+            row.last_error = "placement is missing from its last parent"
+            missing.append(_workspace_provider_binding_doc(
+                row, _workspace_provider_dataset_for_binding(s, row)))
+        return missing
 
 
 def workspace_provider_relink_binding(
-    old_binding_id: str, *, mount_id: str, provider: str, container_id: str, resource_id: str,
-    kind: str, name: str, parent_binding_id: str | None,
+    old_binding_id: str, *, mount_id: str, provider: str, container_id: str,
+    provider_placement_id: str, kind: str, name: str,
+    parent_provider_placement_id: str | None, parent_binding_id: str | None,
+    provider_dataset_id: str | None = None, uri: str | None = None,
+    columns: list[ColumnSchema] | list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """Mint a new binding and retain the old binding as an auditable detached reference."""
     if kind not in {"container", "dataset"}:
@@ -5425,6 +5706,18 @@ def workspace_provider_relink_binding(
             raise ValueError("Workspace provider binding was already relinked")
         if old.kind != kind:
             raise ValueError("replacement resource kind does not match the detached reference")
+        canonical: WorkspaceProviderDataset | None = None
+        if kind == "dataset":
+            if provider_dataset_id is None or uri is None:
+                raise ValueError("replacement dataset requires canonical detail")
+            canonical, conflict = _workspace_provider_upsert_dataset(
+                s, mount_id=mount_id, provider=provider,
+                provider_dataset_id=provider_dataset_id, uri=uri,
+                columns=columns or [])
+            if conflict or canonical.state != "current":
+                raise ValueError("replacement canonical dataset is unavailable")
+        elif provider_dataset_id is not None or uri is not None or columns:
+            raise ValueError("replacement container cannot carry canonical detail")
         old.active = False
         old.state = "detached"
         old.last_error = "relinked explicitly"
@@ -5433,10 +5726,12 @@ def workspace_provider_relink_binding(
             mount_id=mount_id,
             provider=provider,
             container_id=container_id,
-            resource_id=resource_id,
+            provider_placement_id=provider_placement_id,
             kind=kind,
             name=name,
+            parent_provider_placement_id=parent_provider_placement_id,
             parent_binding_id=parent_binding_id,
+            provider_dataset_id=provider_dataset_id,
             state="current",
             active=True,
             relinked_from_id=old.id,
@@ -5444,7 +5739,11 @@ def workspace_provider_relink_binding(
         )
         s.add(fresh)
         s.flush()
-        return _workspace_provider_binding_doc(old), _workspace_provider_binding_doc(fresh)
+        return (
+            _workspace_provider_binding_doc(
+                old, _workspace_provider_dataset_for_binding(s, old)),
+            _workspace_provider_binding_doc(fresh, canonical),
+        )
 
 
 def _workspace_canvas_visible_clause(uid: str):
@@ -5645,7 +5944,8 @@ def workspace_provider_overlay_resolve(resource_id: str, *, uid: str) -> dict:
         return {
             "resource": _workspace_public_placement_resource(
                 s, placement, detached=s.get(Canvas, identity) is None),
-            "binding": _workspace_provider_binding_doc(binding),
+            "binding": _workspace_provider_binding_doc(
+                binding, _workspace_provider_dataset_for_binding(s, binding)),
         }
 
 

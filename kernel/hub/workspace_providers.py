@@ -29,9 +29,11 @@ from hub.catalog_provider import (
 
 _EXTERNAL_PREFIX = "external."
 _PROVIDER_DATASET_URI_PREFIX = "workspace-provider://"
-_CURSOR_VERSION = 2
+_CURSOR_VERSION = 3
 _SEARCH_CURSOR_VERSION = 1
 _MAX_MOUNTS = 8
+_MAX_MISSING_PLACEMENT_PROBES = 8
+_MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
 # Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
 # actions may wait a little longer, but remain bounded and use the same isolated provider workers.
@@ -249,6 +251,8 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
     assert binding is not None
     if binding["referenceState"] == "detached":
         raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
+    if binding.get("canonicalReferenceState") == "detached":
+        raise ProviderDatasetGone("canonical provider dataset is detached")
     mounts, _invalid = _configured_mounts()
     mounted = next((item for item in mounts if item.mount.id == binding["mountId"]), None)
     if mounted is None or mounted.mount.provider != binding["provider"]:
@@ -261,8 +265,9 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error", error=_activation_error())
         raise ProviderDatasetUnavailable(_activation_error()) from exc
+    placement_id = binding["providerPlacementId"]
     resolved = bounded_resolve(
-        provider, mounted.mount, binding["resourceId"],
+        provider, mounted.mount, placement_id,
         timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
     )
     if resolved.state != "ready" or resolved.item is None:
@@ -277,24 +282,40 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
             raise ProviderDatasetOffline("provider dataset is offline")
         raise ProviderDatasetUnavailable("provider dataset detail is invalid")
     occurrence = resolved.item
-    if (occurrence.placement_id != binding["resourceId"] or occurrence.kind != "dataset"
+    if (occurrence.placement_id != placement_id or occurrence.kind != "dataset"
             or occurrence.dataset_id is None):
         metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error",
             error="catalog provider returned a mismatched dataset binding")
         raise ProviderDatasetUnavailable("provider returned a mismatched dataset binding")
+    retained_dataset_id = binding.get("providerDatasetId")
+    if retained_dataset_id is not None and occurrence.dataset_id != retained_dataset_id:
+        metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error",
+            error="catalog provider changed the placement canonical target")
+        raise ProviderDatasetUnavailable("provider placement changed its canonical target")
     result = bounded_dataset_detail(
         provider, mounted.mount, occurrence.dataset_id,
         timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
     )
     if result.state != "ready" or result.item is None:
         if result.failure == "not_found":
-            metadb.workspace_provider_mark_binding(
-                binding_id, state="provider_error", error=result.reason)
+            if retained_dataset_id is not None:
+                metadb.workspace_provider_mark_dataset(
+                    mount_id=mounted.mount.id,
+                    provider_dataset_id=retained_dataset_id,
+                    state="provider_error",
+                    error=result.reason,
+                )
             raise ProviderDatasetUnavailable("provider dataset detail is unavailable")
         state = _reference_state(result.failure, result.state)
-        metadb.workspace_provider_mark_binding(
-            binding_id, state=state, error=result.reason)
+        if retained_dataset_id is not None:
+            metadb.workspace_provider_mark_dataset(
+                mount_id=mounted.mount.id,
+                provider_dataset_id=retained_dataset_id,
+                state=state,
+                error=result.reason,
+            )
         if state == "permission_lost":
             raise PermissionError("permission to read provider dataset was lost")
         if state == "detached":
@@ -304,17 +325,27 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         raise ProviderDatasetUnavailable("provider dataset detail is invalid")
     detail = result.item
     if detail.uri != occurrence.uri or detail.columns != occurrence.columns:
-        metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error",
-            error="catalog provider returned conflicting canonical dataset facts")
+        if retained_dataset_id is not None:
+            metadb.workspace_provider_mark_dataset(
+                mount_id=mounted.mount.id,
+                provider_dataset_id=retained_dataset_id,
+                state="provider_error",
+                error="catalog provider returned conflicting canonical dataset facts",
+            )
         raise ProviderDatasetUnavailable("provider returned conflicting canonical dataset facts")
     cached = metadb.workspace_provider_cache_resource(
         mount_id=mounted.mount.id, provider=mounted.mount.provider,
-        container_id=mounted.container_id, resource_id=occurrence.placement_id,
+        container_id=mounted.container_id,
+        provider_placement_id=occurrence.placement_id,
         kind=occurrence.kind, name=occurrence.name,
+        parent_provider_placement_id=occurrence.parent_placement_id,
         parent_binding_id=binding.get("parentBindingId"),
+        provider_dataset_id=detail.dataset_id,
+        uri=detail.uri,
+        columns=detail.columns,
     )
-    if cached["bindingId"] != binding_id or cached["referenceState"] != "current":
+    if (cached["bindingId"] != binding_id or cached["referenceState"] != "current"
+            or cached.get("canonicalReferenceState") != "current"):
         raise ProviderDatasetUnavailable("provider dataset binding is no longer current")
     try:
         adapter = resolve_physical(detail.uri)
@@ -435,11 +466,16 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         metadb.workspace_provider_binding(binding["parentBindingId"])
         if binding.get("parentBindingId") else None
     )
+    parent_unresolved = (
+        parent is None and binding.get("parentProviderPlacementId") is not None)
     parent_id = (
         f"container:{_external_identity(parent['mountId'], parent['resourceId'], parent['bindingId'])}"
-        if parent is not None else f"container:{binding['containerId']}"
+        if parent is not None
+        else None if parent_unresolved
+        else f"container:{binding['containerId']}"
     )
     state = binding["referenceState"]
+    canonical_state = binding.get("canonicalReferenceState")
     anchor = (metadb.workspace_provider_overlay_anchor(binding["bindingId"])
               if binding["kind"] == "container" else None)
     if anchor is None and binding["kind"] == "container":
@@ -467,9 +503,17 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         "mountId": binding["mountId"],
         "provider": binding["provider"],
         "resourceId": binding["resourceId"],
+        "providerPlacementId": binding["providerPlacementId"],
+        "parentProviderPlacementId": binding.get("parentProviderPlacementId"),
+        "providerDatasetId": binding.get("providerDatasetId"),
         "bindingId": binding["bindingId"],
         "referenceState": state,
-        "lastKnown": state != "current",
+        "canonicalReferenceState": canonical_state,
+        "lastKnown": (
+            state != "current"
+            or canonical_state not in {None, "current"}
+            or parent_unresolved
+        ),
         "lastResolvedAt": binding["lastResolvedAt"],
         "localPlacement": local_placement,
         "providerMutation": False,
@@ -485,10 +529,10 @@ def _workspace_resource(
 ) -> dict:
     parent_is_known = item.parent_placement_id is None or parent_binding_id is not None
     if parent_binding_id is None and item.parent_placement_id is not None:
-        parent = metadb.workspace_provider_binding_for_resource(
+        parent = metadb.workspace_provider_binding_for_placement(
             mount_id=mounted.mount.id,
             provider=mounted.mount.provider,
-            resource_id=item.parent_placement_id,
+            provider_placement_id=item.parent_placement_id,
         )
         parent_binding_id = parent["bindingId"] if parent is not None else None
         parent_is_known = parent is not None
@@ -496,11 +540,15 @@ def _workspace_resource(
         mount_id=mounted.mount.id,
         provider=mounted.mount.provider,
         container_id=mounted.container_id,
-        resource_id=item.placement_id,
+        provider_placement_id=item.placement_id,
         kind=item.kind,
         name=item.name,
+        parent_provider_placement_id=item.parent_placement_id,
         parent_binding_id=parent_binding_id,
         parent_is_known=parent_is_known,
+        provider_dataset_id=item.dataset_id,
+        uri=item.uri,
+        columns=item.columns,
     )
     return _binding_resource(binding, mounted)
 
@@ -529,23 +577,31 @@ def _source_status(
 
 
 def _cursor_encode(layout: str, container_id: str, fingerprint: str, source_index: int,
-                   source_cursor: str | None, history: list[tuple[str, str | None]]) -> str:
+                   source_cursor: str | None, history: list[tuple[str, str | None]],
+                   reconciliation_placement_ids: list[str] | None = None) -> str:
     raw = json.dumps(
-        [_CURSOR_VERSION, layout, container_id, fingerprint, source_index, source_cursor, history],
+        [
+            _CURSOR_VERSION, layout, container_id, fingerprint, source_index,
+            source_cursor, history, reconciliation_placement_ids,
+        ],
         separators=(",", ":"),
     ).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def _cursor_decode(cursor: str | None, *, layout: str, container_id: str, fingerprint: str,
-                   source_count: int) -> tuple[int, str | None, list[tuple[str, str | None]]]:
+                   source_count: int) -> tuple[
+                       int, str | None, list[tuple[str, str | None]], list[str] | None]:
     if cursor is None:
-        return 0, None, []
+        return 0, None, [], []
     if len(cursor) > 16_384:
         raise ValueError("invalid Workspace cursor")
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        version, bound_layout, bound_container, bound_fingerprint, source_index, source_cursor, history = json.loads(raw)
+        (
+            version, bound_layout, bound_container, bound_fingerprint,
+            source_index, source_cursor, history, reconciliation_placement_ids,
+        ) = json.loads(raw)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
         raise ValueError("invalid Workspace cursor") from exc
     valid_history = (
@@ -555,15 +611,51 @@ def _cursor_decode(cursor: str | None, *, layout: str, container_id: str, finger
                 and (item[1] is None or isinstance(item[1], str) and len(item[1]) <= 512)
                 for item in history)
     )
+    valid_reconciliation = (
+        reconciliation_placement_ids is None
+        or isinstance(reconciliation_placement_ids, list)
+        and all(
+            isinstance(item, str) and item and len(item) <= 512
+            for item in reconciliation_placement_ids
+        )
+        and len(reconciliation_placement_ids) == len(set(reconciliation_placement_ids))
+        and len(json.dumps(
+            reconciliation_placement_ids, separators=(",", ":")).encode()
+        ) <= _MAX_RECONCILIATION_CURSOR_BYTES
+    )
     if (version != _CURSOR_VERSION or bound_layout != layout or bound_container != container_id
             or bound_fingerprint != fingerprint
             or isinstance(source_index, bool) or not isinstance(source_index, int)
             or source_index < 0 or source_index >= source_count
             or source_cursor is not None and (
                 not isinstance(source_cursor, str) or len(source_cursor) > 512)
-            or not valid_history or len(history) != source_index):
+            or not valid_history or len(history) != source_index
+            or not valid_reconciliation):
         raise ValueError("invalid Workspace cursor")
-    return source_index, source_cursor, [(item[0], item[1]) for item in history]
+    return (
+        source_index,
+        source_cursor,
+        [(item[0], item[1]) for item in history],
+        reconciliation_placement_ids,
+    )
+
+
+def _extend_reconciliation_placements(
+    seen: list[str] | None,
+    items: list[CatalogResource],
+) -> list[str] | None:
+    """Carry one bounded, duplicate-free occurrence traversal across provider pages."""
+    if seen is None:
+        return None
+    item_ids = [item.placement_id for item in items]
+    if set(seen).intersection(item_ids):
+        # Cross-page duplicates mean this cursor traversal cannot prove a complete occurrence set.
+        return None
+    combined = [*seen, *item_ids]
+    if len(json.dumps(combined, separators=(",", ":")).encode()) > (
+            _MAX_RECONCILIATION_CURSOR_BYTES):
+        return None
+    return combined
 
 
 def _configured_source_error() -> str:
@@ -608,6 +700,93 @@ def _prefetch_provider_pages(
     return reads
 
 
+def _reconcile_complete_children(
+    provider: ReadOnlyCatalogProvider,
+    mounted: _MountedProvider,
+    *,
+    parent_provider_placement_id: str | None,
+    seen_provider_placement_ids: set[str],
+) -> bool:
+    """Classify a bounded set of missing occurrences without confusing moves with deletes.
+
+    A complete child page proves only that an occurrence left this parent. Resolve tells whether the
+    same placement moved elsewhere or became a tombstone. Probes fan out under the same global
+    provider deadline/concurrency boundary. Returns ``True`` when more missing placements remain
+    explicitly unresolved.
+    """
+    missing = metadb.workspace_provider_reconcile_children(
+        mount_id=mounted.mount.id,
+        parent_provider_placement_id=parent_provider_placement_id,
+        seen_provider_placement_ids=seen_provider_placement_ids,
+    )
+    probed = missing[:_MAX_MISSING_PLACEMENT_PROBES]
+    incomplete = len(missing) > len(probed)
+    futures: dict[concurrent.futures.Future, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(probed)),
+            thread_name_prefix="dp-workspace-placement-refresh") as executor:
+        for binding in probed:
+            future = executor.submit(
+                bounded_resolve,
+                provider,
+                mounted.mount,
+                binding["providerPlacementId"],
+                timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+            )
+            futures[future] = binding
+        for future, binding in futures.items():
+            try:
+                resolved = future.result()
+            except Exception:  # noqa: BLE001 -- bounded wrapper should not leak provider failures
+                resolved = None
+            if resolved is None or resolved.state != "ready" or resolved.item is None:
+                state = _reference_state(
+                    resolved.failure if resolved is not None else "provider_error",
+                    resolved.state if resolved is not None else "unavailable",
+                )
+                metadb.workspace_provider_mark_binding(
+                    binding["bindingId"], state=state,
+                    error=resolved.reason if resolved is not None else None,
+                )
+                incomplete = incomplete or state != "detached"
+                continue
+            occurrence = resolved.item
+            if occurrence.placement_id != binding["providerPlacementId"]:
+                metadb.workspace_provider_mark_binding(
+                    binding["bindingId"], state="provider_error",
+                    error="provider returned a mismatched placement identity",
+                )
+                incomplete = True
+                continue
+            if occurrence.parent_placement_id == parent_provider_placement_id:
+                # Resolve and list disagree about membership. Retain the prior snapshot as unavailable.
+                metadb.workspace_provider_mark_binding(
+                    binding["bindingId"], state="provider_error",
+                    error="provider returned conflicting placement topology",
+                )
+                incomplete = True
+                continue
+            parent_known = (
+                occurrence.parent_placement_id is None
+                or metadb.workspace_provider_binding_for_placement(
+                    mount_id=mounted.mount.id,
+                    provider=mounted.mount.provider,
+                    provider_placement_id=occurrence.parent_placement_id,
+                ) is not None
+            )
+            refreshed = _workspace_resource(occurrence, mounted)
+            if not parent_known:
+                metadb.workspace_provider_mark_binding(
+                    refreshed["bindingId"],
+                    state="provider_error",
+                    error="moved placement parent is not cached",
+                )
+                incomplete = True
+            elif refreshed["lastKnown"]:
+                incomplete = True
+    return incomplete
+
+
 def _mixed_page(container_id: str, *, uid: str, limit: int,
                 cursor: str | None, mounts: list[_MountedProvider], invalid: bool) -> dict:
     local_mounts = [item for item in mounts if item.container_id == container_id]
@@ -615,7 +794,7 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
     if invalid:
         sources.append(_Source("configuration"))
     fingerprint = _mount_fingerprint(local_mounts, invalid)
-    source_index, source_cursor, history = _cursor_decode(
+    source_index, source_cursor, history, reconciliation_placement_ids = _cursor_decode(
         cursor, layout="local-mounted", container_id=container_id, fingerprint=fingerprint,
         source_count=len(sources))
     statuses = [
@@ -625,7 +804,9 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
     items: list[dict] = []
     container = metadb.workspace_resolve(
         f"container:{container_id}", uid=uid)["resource"]
-    next_state: tuple[int, str | None, list[tuple[str, str | None]]] | None = None
+    next_state: tuple[
+        int, str | None, list[tuple[str, str | None]], list[str] | None,
+    ] | None = None
     current = source_index
     provider_pages: dict[int, ProviderPage | str] | None = None
 
@@ -639,7 +820,10 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
             items.extend(page["items"])
             if page["nextCursor"] is not None:
                 statuses[current] = _source_status(source, "page")
-                next_state = (current, page["nextCursor"], history)
+                next_state = (
+                    current, page["nextCursor"], history,
+                    reconciliation_placement_ids,
+                )
                 break
             statuses[current] = _source_status(source, "complete")
         elif source.kind == "configuration":
@@ -658,30 +842,63 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
                 # The prefetched page used the capacity available before earlier sources contributed.
                 # Defer it intact and retry from the same opaque cursor; never drop a provider item.
                 statuses[current] = _source_status(source, "pending")
-                next_state = (current, source_cursor, history)
+                next_state = (
+                    current, source_cursor, history,
+                    reconciliation_placement_ids,
+                )
                 break
             else:
                 page = provider_page
                 if page.items:
                     items.extend(_workspace_resource(item, source.mounted) for item in page.items)
+                reconciliation_placement_ids = _extend_reconciliation_placements(
+                    reconciliation_placement_ids, page.items)
+                reconciliation_incomplete = False
+                if page.state == "ready" and page.next_cursor is None:
+                    if reconciliation_placement_ids is None:
+                        reconciliation_incomplete = True
+                    else:
+                        try:
+                            reconciliation_provider = _load_provider(
+                                source.mounted.mount.provider)
+                        except Exception:  # noqa: BLE001 -- cached occurrences stay explicit
+                            reconciliation_incomplete = True
+                        else:
+                            reconciliation_incomplete = _reconcile_complete_children(
+                                reconciliation_provider,
+                                source.mounted,
+                                parent_provider_placement_id=None,
+                                seen_provider_placement_ids=set(
+                                    reconciliation_placement_ids),
+                            )
                 if page.state == "ready" and page.next_cursor is not None:
                     if not page.items:
                         statuses[current] = _source_status(
                             source, "unavailable", "catalog provider returned a non-advancing page")
                     else:
                         statuses[current] = _source_status(source, "page")
-                        next_state = (current, page.next_cursor, history)
+                        next_state = (
+                            current, page.next_cursor, history,
+                            reconciliation_placement_ids,
+                        )
                         break
                 else:
                     completeness = "complete" if page.state == "ready" else page.state
-                    statuses[current] = _source_status(source, completeness, page.reason)
+                    statuses[current] = _source_status(
+                        source,
+                        "partial" if completeness == "complete"
+                        and reconciliation_incomplete else completeness,
+                        ("some missing placements could not be refreshed"
+                         if reconciliation_incomplete else page.reason),
+                    )
 
         current += 1
         source_cursor = None
+        reconciliation_placement_ids = []
         history = [(status["completeness"], status.get("error"))
                    for status in statuses[:current]]
         if len(items) >= limit and current < len(sources):
-            next_state = (current, None, history)
+            next_state = (current, None, history, reconciliation_placement_ids)
             break
 
     next_cursor = (
@@ -703,7 +920,7 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                  mounts: list[_MountedProvider], invalid: bool) -> dict:
     mount_id, resource_id, binding_id = _decode_external_identity(identity)
     cached = metadb.workspace_provider_binding(
-        binding_id, mount_id=mount_id, resource_id=resource_id)
+        binding_id, mount_id=mount_id, provider_placement_id=resource_id)
     if cached is None:
         raise KeyError("Workspace provider binding not found")
     # A pre-0034 cached container has no anchor until it is first exposed.  Direct external
@@ -717,7 +934,7 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     provider_source = _Source("provider", mounted) if mounted is not None else _Source("configuration")
     sources = [_Source("local"), provider_source]
     fingerprint = _mount_fingerprint([mounted], invalid) if mounted is not None else _mount_fingerprint([], invalid)
-    source_index, source_cursor, history = _cursor_decode(
+    source_index, source_cursor, history, reconciliation_placement_ids = _cursor_decode(
         cursor, layout="external-overlay", container_id=identity, fingerprint=fingerprint,
         source_count=len(sources))
     statuses = [
@@ -726,7 +943,9 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
     ]
     items: list[dict] = []
     public_container = _binding_resource(cached, cached_mount)
-    next_state: tuple[int, str | None, list[tuple[str, str | None]]] | None = None
+    next_state: tuple[
+        int, str | None, list[tuple[str, str | None]], list[str] | None,
+    ] | None = None
     current = source_index
 
     while current < len(sources) and len(items) < limit:
@@ -738,7 +957,10 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
             items.extend(overlay["items"])
             if overlay["nextCursor"] is not None:
                 statuses[current] = _source_status(source, "page")
-                next_state = (current, overlay["nextCursor"], history)
+                next_state = (
+                    current, overlay["nextCursor"], history,
+                    reconciliation_placement_ids,
+                )
                 break
             statuses[current] = _source_status(source, "complete")
         elif mounted is None:
@@ -799,8 +1021,12 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                         binding = metadb.workspace_provider_cache_resource(
                             mount_id=mounted.mount.id, provider=mounted.mount.provider,
                             container_id=mounted.container_id,
-                            resource_id=resolved.item.placement_id,
+                            provider_placement_id=resolved.item.placement_id,
                             kind=resolved.item.kind, name=resolved.item.name,
+                            parent_provider_placement_id=resolved.item.parent_placement_id,
+                            provider_dataset_id=resolved.item.dataset_id,
+                            uri=resolved.item.uri,
+                            columns=resolved.item.columns,
                             parent_is_known=False)
                         container = _binding_resource(binding, mounted)
                         ancestry_completeness = (
@@ -820,6 +1046,20 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                         items.extend(
                             _workspace_resource(item, mounted, parent_binding_id=container["bindingId"])
                             for item in page.items)
+                        reconciliation_placement_ids = _extend_reconciliation_placements(
+                            reconciliation_placement_ids, page.items)
+                        reconciliation_incomplete = False
+                        if page.state == "ready" and page.next_cursor is None:
+                            reconciliation_incomplete = (
+                                reconciliation_placement_ids is None
+                                or _reconcile_complete_children(
+                                    provider,
+                                    mounted,
+                                    parent_provider_placement_id=resource_id,
+                                    seen_provider_placement_ids=set(
+                                        reconciliation_placement_ids or []),
+                                )
+                            )
                         if page.state == "ready" and page.next_cursor is not None:
                             if not page.items:
                                 statuses[current] = _source_status(
@@ -831,22 +1071,30 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                                     else ancestry_completeness,
                                     ancestry_error,
                                 )
-                                next_state = (current, page.next_cursor, history)
+                                next_state = (
+                                    current, page.next_cursor, history,
+                                    reconciliation_placement_ids,
+                                )
                                 break
                         else:
                             completeness = "complete" if page.state == "ready" else page.state
                             statuses[current] = _source_status(
                                 source,
+                                "partial" if completeness == "complete"
+                                and reconciliation_incomplete else
                                 ancestry_completeness if completeness == "complete"
                                 else completeness,
-                                ancestry_error if completeness == "complete" else page.reason,
+                                ("some missing placements could not be refreshed"
+                                 if reconciliation_incomplete else
+                                 ancestry_error if completeness == "complete" else page.reason),
                             )
 
         current += 1
         source_cursor = None
+        reconciliation_placement_ids = []
         history = [(status["completeness"], status.get("error")) for status in statuses[:current]]
         if len(items) >= limit and current < len(sources):
-            next_state = (current, None, history)
+            next_state = (current, None, history, reconciliation_placement_ids)
             break
 
     next_cursor = (
@@ -988,7 +1236,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
 
     mount_id, resource_id, binding_id = _decode_external_identity(identity)
     cached = metadb.workspace_provider_binding(
-        binding_id, mount_id=mount_id, resource_id=resource_id)
+        binding_id, mount_id=mount_id, provider_placement_id=resource_id)
     if cached is None or cached["kind"] != kind:
         raise KeyError("Workspace provider binding not found")
     mounts, _invalid = _configured_mounts()
@@ -1096,7 +1344,8 @@ def relink(
         raise ValueError("only external Workspace resources can be relinked")
     old_mount_id, old_resource_id, old_binding_id = _decode_external_identity(identity)
     old = metadb.workspace_provider_binding(
-        old_binding_id, mount_id=old_mount_id, resource_id=old_resource_id)
+        old_binding_id, mount_id=old_mount_id,
+        provider_placement_id=old_resource_id)
     if old is None or old["kind"] != kind:
         raise KeyError("Workspace provider binding not found")
 
@@ -1138,10 +1387,14 @@ def relink(
         mount_id=mounted.mount.id,
         provider=mounted.mount.provider,
         container_id=mounted.container_id,
-        resource_id=resolved.item.placement_id,
+        provider_placement_id=resolved.item.placement_id,
         kind=resolved.item.kind,
         name=resolved.item.name,
+        parent_provider_placement_id=resolved.item.parent_placement_id,
         parent_binding_id=parent_binding_id,
+        provider_dataset_id=resolved.item.dataset_id,
+        uri=resolved.item.uri,
+        columns=resolved.item.columns,
     )
     return {
         "ok": True,

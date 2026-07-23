@@ -560,6 +560,301 @@ class _WorkspaceFixtureProvider:
         return ProviderSearchPage(items=items, next_cursor=next_cursor)
 
 
+class _MultiPlacementWorkspaceProvider:
+    """Mutable provider fixture with two occurrences of one canonical dataset."""
+
+    def __init__(self):
+        self.partial_parents: set[str] = set()
+        self.ancestor_calls = 0
+        self.search_calls = 0
+        self.resources = {
+            "left-parent": CatalogResource(
+                placement_id="left-parent", kind="container", name="Left"),
+            "right-parent": CatalogResource(
+                placement_id="right-parent", kind="container", name="Right"),
+            "left-occurrence": CatalogResource(
+                placement_id="left-occurrence", dataset_id="canonical-dataset",
+                kind="dataset", name="Shared left",
+                parent_placement_id="left-parent",
+                uri="file:///canonical-dataset.parquet",
+                columns=[{"name": "value", "type": "int64"}],
+            ),
+            "right-occurrence": CatalogResource(
+                placement_id="right-occurrence", dataset_id="canonical-dataset",
+                kind="dataset", name="Shared right",
+                parent_placement_id="right-parent",
+                uri="file:///canonical-dataset.parquet",
+                columns=[{"name": "value", "type": "int64"}],
+            ),
+        }
+
+    def list_children(self, _mount, parent_placement_id, *, limit, cursor=None):
+        resources = sorted(
+            (item for item in self.resources.values()
+             if item.parent_placement_id == parent_placement_id),
+            key=lambda item: (item.name, item.placement_id),
+        )
+        if parent_placement_id in self.partial_parents:
+            return ProviderPage(
+                state="partial", items=[], reason="provider returned a partial snapshot")
+        start = int(cursor or 0)
+        items = resources[start:start + limit]
+        next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
+        return ProviderPage(items=items, next_cursor=next_cursor)
+
+    def resolve(self, _mount, placement_id):
+        item = self.resources.get(placement_id)
+        return ProviderResourceResult(item=item) if item is not None else ProviderResourceResult(
+            state="unavailable", reason="resource not found", failure="not_found")
+
+    def ancestors(self, _mount, placement_id):
+        self.ancestor_calls += 1
+        item = self.resources.get(placement_id)
+        if item is None or item.parent_placement_id is None:
+            return ProviderAncestors()
+        parent = self.resources.get(item.parent_placement_id)
+        return ProviderAncestors(items=[parent] if parent is not None else [])
+
+    def dataset_detail(self, _mount, dataset_id):
+        if dataset_id != "canonical-dataset":
+            return ProviderDatasetDetailResult(
+                state="unavailable", reason="dataset not found", failure="not_found")
+        return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
+            dataset_id=dataset_id,
+            uri="file:///canonical-dataset.parquet",
+            columns=[{"name": "value", "type": "int64"}],
+        ))
+
+    def capabilities(self, _mount):
+        return ProviderCapabilities(search=True)
+
+    def search(self, _mount, query, *, limit, cursor=None):
+        self.search_calls += 1
+        resources = sorted(
+            (item for item in self.resources.values()
+             if item.kind == "dataset" and query.casefold() in item.name.casefold()),
+            key=lambda item: item.placement_id,
+        )
+        start = int(cursor or 0)
+        items = resources[start:start + limit]
+        next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
+        return ProviderSearchPage(items=items, next_cursor=next_cursor)
+
+
+@pytest.mark.parametrize("mutation", ["deleted", "moved"])
+def test_complete_provider_traversal_reconciles_all_paginated_occurrences(
+        workspace_scope, monkeypatch, mutation):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-paged-reconciliation")
+    mount_id = f"paged-reconciliation-{token}"
+    provider = _WorkspaceFixtureProvider()
+    resources = [
+        CatalogResource(placement_id="a", kind="container", name="a"),
+        CatalogResource(placement_id="b", kind="container", name="b"),
+        CatalogResource(placement_id="c", kind="container", name="c"),
+    ]
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    initial = workspace_providers.browse(
+        folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    bindings = {
+        item["providerPlacementId"]: item["bindingId"]
+        for item in initial["items"] if item.get("mountId") == mount_id
+    }
+    assert set(bindings) == {"a", "b", "c"}
+
+    if mutation == "deleted":
+        resources[:] = [item for item in resources if item.placement_id != "b"]
+    else:
+        resources[1] = CatalogResource(
+            placement_id="b", kind="container", name="b moved",
+            parent_placement_id="a")
+
+    seen: list[str] = []
+    cursor = None
+    while True:
+        page = workspace_providers.browse(
+            folder["id"], uid=metadb.DEFAULT_USER_ID, limit=1, cursor=cursor)
+        seen.extend(
+            item["providerPlacementId"] for item in page["items"]
+            if item.get("mountId") == mount_id
+        )
+        cursor = page["nextCursor"]
+        if cursor is None:
+            assert page["completeness"] == "complete"
+            assert page["sources"][-1]["completeness"] == "complete"
+            break
+
+    assert seen == ["a", "c"]
+    unchanged = {
+        placement_id: metadb.workspace_provider_binding(binding_id)
+        for placement_id, binding_id in bindings.items()
+        if placement_id != "b"
+    }
+    assert all(binding is not None and binding["referenceState"] == "current"
+               and binding["parentProviderPlacementId"] is None
+               for binding in unchanged.values())
+    missing = metadb.workspace_provider_binding(bindings["b"])
+    assert missing is not None
+    if mutation == "deleted":
+        assert missing["referenceState"] == "detached"
+        assert missing["parentProviderPlacementId"] is None
+    else:
+        assert missing["referenceState"] == "current"
+        assert missing["name"] == "b moved"
+        assert missing["parentProviderPlacementId"] == "a"
+
+
+def test_cold_provider_search_keeps_parent_path_unresolved_until_bounded_resolve(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-cold-search")
+    mount_id = f"cold-search-{token}"
+    provider = _MultiPlacementWorkspaceProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    cold = workspace_providers.search(
+        "Shared", uid=metadb.DEFAULT_USER_ID, limit=100)
+    matches = [
+        item for group in cold["groups"] for item in group["items"]
+        if item.get("mountId") == mount_id
+    ]
+    assert provider.search_calls == 1
+    assert provider.ancestor_calls == 0
+    assert {item["providerPlacementId"] for item in matches} == {
+        "left-occurrence", "right-occurrence"}
+    assert {item["parentProviderPlacementId"] for item in matches} == {
+        "left-parent", "right-parent"}
+    assert all(item["parentId"] is None and item["lastKnown"] is True for item in matches)
+    with metadb.session() as session:
+        cached = list(session.scalars(select(metadb.WorkspaceProviderBinding).where(
+            metadb.WorkspaceProviderBinding.mount_id == mount_id)))
+        assert {item.provider_placement_id for item in cached} == {
+            "left-occurrence", "right-occurrence"}
+        assert all(item.parent_binding_id is None for item in cached)
+
+    assert metadb._engine is not None
+    metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
+    assert metadb.require_schema_at_head() == metadb.expected_schema_head()
+    restarted = [
+        metadb.workspace_provider_binding(item["bindingId"]) for item in matches
+    ]
+    assert {
+        item["parentProviderPlacementId"] for item in restarted if item is not None
+    } == {"left-parent", "right-parent"}
+    assert all(item is not None and item["parentBindingId"] is None for item in restarted)
+
+    resolved = [
+        workspace_providers.resolve(item["id"], uid=metadb.DEFAULT_USER_ID)
+        for item in matches
+    ]
+    assert provider.search_calls == 1
+    assert provider.ancestor_calls == 2
+    assert len({item["resource"]["parentId"] for item in resolved}) == 2
+    assert {
+        item["ancestors"][-1]["providerPlacementId"] for item in resolved
+    } == {"left-parent", "right-parent"}
+
+
+def test_provider_search_move_clears_stale_parent_until_resolve_hydrates_path(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-search-parent-move")
+    mount_id = f"search-parent-move-{token}"
+    provider = _MultiPlacementWorkspaceProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    root_page = workspace_providers.browse(
+        folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    left_parent = next(
+        item for item in root_page["items"]
+        if item.get("providerPlacementId") == "left-parent")
+    left_page = workspace_providers.browse(
+        left_parent["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    original = next(
+        item for item in left_page["items"]
+        if item.get("providerPlacementId") == "left-occurrence")
+    assert original["parentId"] == left_parent["id"]
+
+    provider.resources["cold-parent"] = CatalogResource(
+        placement_id="cold-parent", kind="container", name="Cold")
+    provider.resources["left-occurrence"] = CatalogResource(
+        placement_id="left-occurrence", dataset_id="canonical-dataset",
+        kind="dataset", name="Shared moved cold",
+        parent_placement_id="cold-parent",
+        uri="file:///canonical-dataset.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    ancestor_calls = provider.ancestor_calls
+    search = workspace_providers.search(
+        "Shared moved cold", uid=metadb.DEFAULT_USER_ID, limit=100)
+    moved = next(
+        item for group in search["groups"] for item in group["items"]
+        if item.get("mountId") == mount_id)
+    assert provider.ancestor_calls == ancestor_calls
+    assert moved["bindingId"] == original["bindingId"]
+    assert moved["parentProviderPlacementId"] == "cold-parent"
+    assert moved["parentId"] is None
+    assert moved["lastKnown"] is True
+    cached = metadb.workspace_provider_binding(original["bindingId"])
+    assert cached is not None
+    assert cached["parentProviderPlacementId"] == "cold-parent"
+    assert cached["parentBindingId"] is None
+
+    resolution = workspace_providers.resolve(
+        moved["id"], uid=metadb.DEFAULT_USER_ID)
+    assert provider.ancestor_calls == ancestor_calls + 1
+    assert resolution["resource"]["parentId"] is not None
+    assert resolution["resource"]["parentId"] != left_parent["id"]
+    assert resolution["resource"]["lastKnown"] is False
+    assert resolution["ancestors"][-1]["providerPlacementId"] == "cold-parent"
+    hydrated = metadb.workspace_provider_binding(original["bindingId"])
+    assert hydrated is not None
+    cold_parent = metadb.workspace_provider_binding_for_placement(
+        mount_id=mount_id, provider="fixture",
+        provider_placement_id="cold-parent")
+    assert cold_parent is not None
+    assert hydrated["parentBindingId"] == cold_parent["bindingId"]
+
+    provider.resources["left-occurrence"] = CatalogResource(
+        placement_id="left-occurrence", dataset_id="canonical-dataset",
+        kind="dataset", name="Shared moved root",
+        uri="file:///canonical-dataset.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    rooted_search = workspace_providers.search(
+        "Shared moved root", uid=metadb.DEFAULT_USER_ID, limit=100)
+    rooted = next(
+        item for group in rooted_search["groups"] for item in group["items"]
+        if item.get("mountId") == mount_id)
+    assert rooted["parentProviderPlacementId"] is None
+    assert rooted["parentId"] == f"container:{folder['id']}"
+    assert rooted["lastKnown"] is False
+    rooted_cached = metadb.workspace_provider_binding(original["bindingId"])
+    assert rooted_cached is not None
+    assert rooted_cached["parentBindingId"] is None
+
+
 def _workspace_provider_dataset_binding(workspace_scope, monkeypatch, provider):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
@@ -576,6 +871,189 @@ def _workspace_provider_dataset_binding(workspace_scope, monkeypatch, provider):
         item for item in page["items"] if item.get("resourceId") == "dataset-a")
     binding_id = resource["bindingId"]
     return mount_id, binding_id, workspace_providers.provider_dataset_uri(binding_id)
+
+
+def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-occurrences")
+    mount_id = f"occurrences-{token}"
+    provider = _MultiPlacementWorkspaceProvider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+
+    root_page = workspace_providers.browse(
+        folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    containers = {
+        item["providerPlacementId"]: item for item in root_page["items"]
+        if item["kind"] == "container" and item.get("mountId") == mount_id
+    }
+    left_page = workspace_providers.browse(
+        containers["left-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    right_page = workspace_providers.browse(
+        containers["right-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    left = next(item for item in left_page["items"]
+                if item.get("providerPlacementId") == "left-occurrence")
+    right = next(item for item in right_page["items"]
+                 if item.get("providerPlacementId") == "right-occurrence")
+    assert left["bindingId"] != right["bindingId"]
+    assert left["providerDatasetId"] == right["providerDatasetId"] == "canonical-dataset"
+    assert left["parentId"] != right["parentId"]
+    with metadb.session() as session:
+        canonical_rows = list(session.scalars(select(metadb.WorkspaceProviderDataset).where(
+            metadb.WorkspaceProviderDataset.mount_id == mount_id)))
+        assert len(canonical_rows) == 1
+
+    search = workspace_providers.search(
+        "Shared", uid=metadb.DEFAULT_USER_ID, limit=100)
+    matches = [
+        item for group in search["groups"] for item in group["items"]
+        if item.get("mountId") == mount_id
+    ]
+    assert {item["providerPlacementId"] for item in matches} == {
+        "left-occurrence", "right-occurrence"}
+    assert len({item["id"] for item in matches}) == 2
+    assert len({item["parentId"] for item in matches}) == 2
+
+    # An incomplete page cannot prove that an unseen occurrence moved or was deleted.
+    provider.partial_parents.add("left-parent")
+    partial = workspace_providers.browse(
+        containers["left-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    assert partial["sources"][1]["completeness"] == "partial"
+    assert metadb.workspace_provider_binding(left["bindingId"])["referenceState"] == "current"
+    provider.partial_parents.clear()
+
+    # A complete old-parent snapshot plus resolve proves a move and updates only placement facts.
+    provider.resources["left-occurrence"] = CatalogResource(
+        placement_id="left-occurrence", dataset_id="canonical-dataset",
+        kind="dataset", name="Shared moved",
+        parent_placement_id="right-parent",
+        uri="file:///canonical-dataset.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    workspace_providers.browse(
+        containers["left-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    moved = metadb.workspace_provider_binding(left["bindingId"])
+    assert moved is not None
+    assert moved["referenceState"] == "current"
+    assert moved["parentProviderPlacementId"] == "right-parent"
+    assert moved["providerDatasetId"] == "canonical-dataset"
+    moved_page = workspace_providers.browse(
+        containers["right-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    moved_resource = next(
+        item for item in moved_page["items"]
+        if item.get("providerPlacementId") == "left-occurrence")
+    assert moved_resource["bindingId"] == left["bindingId"]
+    assert moved_resource["name"] == "Shared moved"
+
+    # A complete parent snapshot plus not-found resolve detaches only the deleted occurrence.
+    del provider.resources["left-occurrence"]
+    surviving_page = workspace_providers.browse(
+        containers["right-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    assert {item["providerPlacementId"] for item in surviving_page["items"]
+            if item["kind"] == "dataset"} == {"right-occurrence"}
+    deleted = metadb.workspace_provider_binding(left["bindingId"])
+    survivor = metadb.workspace_provider_binding(right["bindingId"])
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert deleted is not None and deleted["referenceState"] == "detached"
+    assert survivor is not None and survivor["referenceState"] == "current"
+    assert canonical is not None and canonical["referenceState"] == "current"
+
+    # Canonical outage/recovery is shared state and does not detach the surviving placement.
+    dataset_detail = provider.dataset_detail
+    monkeypatch.setattr(
+        provider,
+        "dataset_detail",
+        lambda *_args, **_kwargs: ProviderDatasetDetailResult(
+            state="unavailable", reason="provider offline", failure="offline"),
+    )
+    survivor_uri = workspace_providers.provider_dataset_uri(right["bindingId"])
+    with pytest.raises(workspace_providers.ProviderDatasetOffline):
+        workspace_providers.provider_dataset_adapter(survivor_uri, lambda _uri: object())
+    assert metadb.workspace_provider_binding(right["bindingId"])["referenceState"] == "current"
+    assert metadb.workspace_provider_dataset(
+        mount_id=mount_id,
+        provider_dataset_id="canonical-dataset",
+    )["referenceState"] == "offline"
+    monkeypatch.setattr(provider, "dataset_detail", dataset_detail)
+    workspace_providers.provider_dataset_adapter(survivor_uri, lambda _uri: object())
+    assert metadb.workspace_provider_dataset(
+        mount_id=mount_id,
+        provider_dataset_id="canonical-dataset",
+    )["referenceState"] == "current"
+
+    # Reopening the metadata engine preserves both the tombstone and shared canonical state.
+    assert metadb._engine is not None
+    metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
+    assert metadb.require_schema_at_head() == metadb.expected_schema_head()
+    assert metadb.workspace_provider_binding(left["bindingId"])["referenceState"] == "detached"
+    assert metadb.workspace_provider_binding(right["bindingId"])["referenceState"] == "current"
+    assert metadb.workspace_provider_dataset(
+        mount_id=mount_id,
+        provider_dataset_id="canonical-dataset",
+    )["referenceState"] == "current"
+
+    # Conflicting canonical facts fail closed without replacing the retained URI/schema evidence.
+    provider.resources["right-occurrence"] = CatalogResource(
+        placement_id="right-occurrence", dataset_id="canonical-dataset",
+        kind="dataset", name="Shared right",
+        parent_placement_id="right-parent",
+        uri="file:///conflicting.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    workspace_providers.browse(
+        containers["right-parent"]["id"].removeprefix("container:"),
+        uid=metadb.DEFAULT_USER_ID,
+        limit=100,
+    )
+    conflicted = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert conflicted is not None
+    assert conflicted["referenceState"] == "provider_error"
+    assert conflicted["uri"] == "file:///canonical-dataset.parquet"
+
+    # The mount-scoped placement key does not fork when operator configuration changes provider.
+    provider_changed = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="different-provider",
+        container_id=folder["id"],
+        provider_placement_id="left-parent",
+        kind="container",
+        name="Left",
+    )
+    assert provider_changed["bindingId"] == containers["left-parent"]["bindingId"]
+    assert provider_changed["referenceState"] == "provider_error"
+    assert provider_changed["provider"] == "fixture"
+    with metadb.session() as session:
+        occurrences = list(session.scalars(select(metadb.WorkspaceProviderBinding).where(
+            metadb.WorkspaceProviderBinding.mount_id == mount_id,
+            metadb.WorkspaceProviderBinding.provider_placement_id == "left-parent",
+            metadb.WorkspaceProviderBinding.active.is_(True),
+        )))
+        assert len(occurrences) == 1
 
 
 @pytest.mark.parametrize("conflicting_fact", ["uri", "columns"])
@@ -611,7 +1089,8 @@ def test_provider_dataset_binding_rejects_conflicting_occurrence_and_detail_fact
     assert physical_calls == []
     binding = metadb.workspace_provider_binding(binding_id)
     assert binding is not None
-    assert binding["referenceState"] == "provider_error"
+    assert binding["referenceState"] == "current"
+    assert binding["canonicalReferenceState"] == "provider_error"
     assert binding["active"] is True
 
 
@@ -636,7 +1115,8 @@ def test_provider_dataset_detail_not_found_keeps_the_same_binding_retryable(
 
     degraded = metadb.workspace_provider_binding(binding_id)
     assert degraded is not None
-    assert degraded["referenceState"] == "provider_error"
+    assert degraded["referenceState"] == "current"
+    assert degraded["canonicalReferenceState"] == "provider_error"
     assert degraded["active"] is True
     assert physical_calls == []
 
@@ -650,6 +1130,7 @@ def test_provider_dataset_detail_not_found_keeps_the_same_binding_retryable(
     assert recovered is not None
     assert recovered["bindingId"] == binding_id
     assert recovered["referenceState"] == "current"
+    assert recovered["canonicalReferenceState"] == "current"
     assert recovered["active"] is True
 
 
@@ -1746,7 +2227,8 @@ def test_workspace_degraded_container_binding_lazily_installs_anchor(workspace_s
     root = metadb.local_workspace_root()
     mount_id = f"overlay-degraded-{uuid.uuid4().hex}"
     binding = metadb.workspace_provider_cache_resource(
-        mount_id=mount_id, provider="fixture", container_id=root["id"], resource_id="container-a",
+        mount_id=mount_id, provider="fixture", container_id=root["id"],
+        provider_placement_id="container-a",
         kind="container", name="Cached container")
     assert metadb.workspace_provider_overlay_anchor(binding["bindingId"]) is None
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{

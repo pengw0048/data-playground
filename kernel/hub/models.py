@@ -944,11 +944,19 @@ class WorkspaceResource(Wire):
     source: Literal["local", "provider"] = "local"
     mount_id: str | None = None
     provider: str | None = None
+    # Generic current-client field for the provider occurrence. The provider-specific fields retain
+    # both identity layers explicitly so placement navigation cannot become canonical data identity.
     resource_id: str | None = None
+    provider_placement_id: str | None = None
+    parent_provider_placement_id: str | None = None
+    provider_dataset_id: str | None = None
     binding_id: str | None = None
     reference_state: Literal[
         "current", "offline", "permission_lost", "detached", "provider_error"
     ] = "current"
+    canonical_reference_state: Literal[
+        "current", "offline", "permission_lost", "detached", "provider_error"
+    ] | None = None
     last_known: bool = False
     last_resolved_at: datetime.datetime | None = None
     local_placement: WorkspaceLocalPlacementCapability | None = None

@@ -335,7 +335,9 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
     _write_ordinary_source(advanced, [99])
     binding = metadb.workspace_provider_cache_resource(
         mount_id=f"test-mount-{uuid.uuid4().hex}", provider="test-provider",
-        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID, resource_id="provider-dataset",
+        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+        provider_placement_id="provider-dataset",
+        provider_dataset_id="provider-dataset", uri="test-provider://provider-dataset",
         kind="dataset", name="Provider dataset")
     logical_uri = workspace_providers.provider_dataset_uri(binding["bindingId"])
     physical_uri = "test-provider://provider-dataset"
