@@ -246,6 +246,76 @@ def test_admitted_exact_source_schema_uses_its_revision_without_mutable_scan(tmp
         storage.close()
 
 
+def test_direct_local_admission_uses_write_predecessor_regardless_of_node_order(contract):
+    deps, graph = contract
+    source, write = graph.nodes
+    source.data["config"]["outputSchema"] = [{"name": "wrong_source", "type": "string"}]
+    select = {
+        "id": "select", "type": "select", "data": {"config": {
+            "outputSchema": [{"name": "selected_value", "type": "int"}],
+        }},
+    }
+    graph = Graph.model_validate({
+        **graph.model_dump(by_alias=True),
+        "nodes": [source.model_dump(by_alias=True), select, write.model_dump(by_alias=True)],
+        "edges": [
+            {"id": "source-select", "source": "source", "target": "select"},
+            {"id": "select-write", "source": "select", "target": "write"},
+        ],
+    })
+
+    reversed_graph = graph.model_copy(deep=True)
+    reversed_graph.nodes.reverse()
+    admissions = [
+        _write_admission_for_graph(
+            deps, candidate, "write", "researcher", f"direct-local-{index}", direct_local=True)
+        for index, candidate in enumerate((graph, reversed_graph))
+    ]
+
+    assert all(admission.intent is not None for admission in admissions)
+    assert [
+        [(column.name, column.type) for column in admission.expected_schema]
+        for admission in admissions
+    ] == [[("selected_value", "int")], [("selected_value", "int")]]
+
+
+def test_direct_local_admission_blocks_ambiguous_predecessors_regardless_of_edge_order(contract):
+    deps, graph = contract
+    source, write = graph.nodes
+    other_source = source.model_copy(deep=True)
+    other_source.id = "other-source"
+    source.data["config"]["outputSchema"] = [{"name": "left_value", "type": "int"}]
+    other_source.data["config"]["outputSchema"] = [{"name": "right_value", "type": "string"}]
+    graph = Graph.model_validate({
+        **graph.model_dump(by_alias=True),
+        "nodes": [
+            source.model_dump(by_alias=True),
+            other_source.model_dump(by_alias=True),
+            write.model_dump(by_alias=True),
+        ],
+        "edges": [
+            {"id": "source-write", "source": "source", "target": "write"},
+            {"id": "other-write", "source": "other-source", "target": "write"},
+        ],
+    })
+
+    reversed_edges = graph.model_copy(deep=True)
+    reversed_edges.edges.reverse()
+    admissions = [
+        _write_admission_for_graph(
+            deps, candidate, "write", "researcher", f"ambiguous-{index}", direct_local=True)
+        for index, candidate in enumerate((graph, reversed_edges))
+    ]
+
+    assert all(admission.intent is None for admission in admissions)
+    assert all(
+        admission.blocker
+        == "input schema is not available from bounded metadata; "
+        "declare the upstream output schema before running"
+        for admission in admissions
+    )
+
+
 def test_stale_admission_fails_before_artifact_and_preserves_new_head(contract):
     deps, graph = contract
     create = _write_admission_for_graph(
