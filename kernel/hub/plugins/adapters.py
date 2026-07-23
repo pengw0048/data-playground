@@ -23,7 +23,12 @@ from collections.abc import Callable
 import duckdb
 
 from hub import db, paths
-from hub.models import ColumnSchema
+from hub.models import (
+    ColumnSchema,
+    TypedRowReference,
+    normalize_column_schemas,
+    safe_field_annotations,
+)
 from hub.plugins.capabilities import tag_columns
 from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
@@ -108,6 +113,11 @@ _TYPE_MAP = {
     "SMALLINT": "int", "TINYINT": "int", "DOUBLE": "float", "FLOAT": "float", "REAL": "float",
     "BOOLEAN": "bool", "DATE": "date", "TIME": "time", "TIMESTAMP": "timestamp",
     "TIMESTAMP WITH TIME ZONE": "timestamp", "BLOB": "bytes", "UUID": "string", "JSON": "json",
+    "INT8": "int", "INT16": "int", "INT32": "int", "INT64": "int",
+    "UINT8": "int", "UINT16": "int", "UINT32": "int", "UINT64": "int",
+    "FLOAT16": "float", "FLOAT32": "float", "FLOAT64": "float",
+    "STRING": "string", "LARGE_STRING": "string", "BINARY": "bytes", "LARGE_BINARY": "bytes",
+    "DATE32": "date", "DATE64": "date",
 }
 
 
@@ -276,6 +286,55 @@ def relation_columns(rel: Relation) -> list[ColumnSchema]:
     cols = [ColumnSchema(name=n, type=display_type(str(t)), physical_type=str(t), provenance="inferred")
             for n, t in zip(rel.columns, rel.types)]
     return tag_columns(cols)
+
+
+def arrow_schema_columns(schema, *, reference_normalizer: Callable[[ColumnSchema], TypedRowReference | dict | None] | None = None) -> list[ColumnSchema]:
+    """Return safe source schema facts without routing native metadata through DuckDB.
+
+    A plugin may provide ``reference_normalizer`` to map its already-sanitized annotations
+    to the generic row-reference DTO.  Core deliberately does not interpret producer keys.
+    """
+    columns: list[ColumnSchema] = []
+    for field in schema:
+        column = ColumnSchema(
+            name=field.name,
+            type=display_type(str(field.type)),
+            physical_type=str(field.type),
+            nullable=field.nullable,
+            provenance="provider",
+            annotations=safe_field_annotations(field.metadata),
+        )
+        if reference_normalizer is not None:
+            reference = reference_normalizer(column)
+            if reference is not None:
+                payload = column.model_dump(by_alias=True, mode="json")
+                payload["rowReference"] = reference
+                column = normalize_column_schemas([payload])[0]
+        columns.append(column)
+    remaining = 256 * 1024
+    bounded: list[ColumnSchema] = []
+    for column in columns:
+        annotations = []
+        for annotation in column.annotations:
+            size = len(annotation.decoded_value())
+            if size <= remaining:
+                annotations.append(annotation)
+                remaining -= size
+        if annotations == column.annotations:
+            bounded.append(column)
+            continue
+        payload = column.model_dump(by_alias=True, mode="json")
+        payload["annotations"] = annotations
+        bounded.append(ColumnSchema.model_validate(payload))
+    return normalize_column_schemas(bounded)
+
+
+def adapter_arrow_schema_columns(adapter, schema) -> list[ColumnSchema]:
+    """Feature-detect a plugin's generic row-reference normalizer without decoding its keys in core."""
+    normalizer = getattr(adapter, "normalize_field_reference", None)
+    if normalizer is not None and not callable(normalizer):
+        raise TypeError("normalize_field_reference must be callable")
+    return arrow_schema_columns(schema, reference_normalizer=normalizer)
 
 
 def _fingerprint_path(p: str) -> str:
@@ -551,6 +610,14 @@ class DuckDBAdapter:
         shutil.rmtree(old_dir, ignore_errors=True)                   # the originals, now safely superseded
 
     def schema(self, uri: str) -> list[ColumnSchema]:
+        if _read_uri(uri).lower().split("?", 1)[0].endswith((".arrow", ".feather", ".ipc")):
+            import pyarrow.dataset as pds
+
+            normalized = _read_uri(uri)
+            local = paths.checked_local_path(normalized)
+            filesystem, source = ((None, local) if local is not None else object_fs(normalized))
+            return adapter_arrow_schema_columns(
+                self, pds.dataset(source, format="ipc", filesystem=filesystem).schema)
         with db.base_guard():  # executes on the base connection when off a run_scope (catalog probe)
             return relation_columns(self.scan(uri, limit=0))
 
@@ -1075,8 +1142,7 @@ class LanceAdapter:
         return rel.project("* EXCLUDE (_distance), (1 - _distance) AS _score")  # Lance ranks by distance asc
 
     def schema(self, uri: str) -> list[ColumnSchema]:
-        with db.base_guard():  # scan() feeds a Lance reader into the base DuckDB connection off-scope
-            return relation_columns(self.scan(uri, limit=0))
+        return adapter_arrow_schema_columns(self, self._dataset(uri).schema)
 
     def count(self, uri: str) -> int | None:
         try:
@@ -1202,7 +1268,7 @@ class LanceAdapter:
                 "parent_revision_id": parent,
                 # Lance's version metadata does not identify the producing job/operation.
                 "producer_operation": None,
-                "columns": relation_columns(db.conn().from_arrow(empty)),
+                "columns": adapter_arrow_schema_columns(self, empty.schema),
                 "row_count": int(dataset.count_rows()),
                 "data_file_count": metadata_int("total_data_files"),
                 "total_bytes": metadata_int("total_files_size"),

@@ -206,7 +206,7 @@ def canonical_type(t: object) -> tuple:
         if not inner:
             return ("struct", None)
         return ("struct", tuple((n, canonical_type(ft)) for n, ft in (_split_field(f) for f in _split_top(inner))))
-    if head in ("decimal", "numeric"):
+    if head in ("decimal", "numeric", "decimal128", "decimal256"):
         args = _split_top(inner) if inner else []
         if args and args[0]:
             try:

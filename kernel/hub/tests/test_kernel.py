@@ -2317,6 +2317,8 @@ def test_schema_contract_type_model_is_specificity_faithful():
 
     # a PRECISE contract is now enforced faithfully — real drift no longer passes
     assert S(C("decimal(38,9)"), C("DECIMAL(38,9)"))
+    assert S(C("decimal(38,9)"), C("decimal128(38, 9)"))
+    assert S(C("decimal(50,9)"), C("decimal256(50, 9)"))
     assert not S(C("decimal(38,9)"), C("DECIMAL(10,2)"))
     assert not S(C("decimal(38,9)"), C("DOUBLE"))
     assert S(C("list<int>"), C("INTEGER[]")) and not S(C("list<int>"), C("VARCHAR[]"))

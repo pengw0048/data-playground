@@ -39,6 +39,7 @@ from hub.models import (
     LineageFactsPage,
     LineageNode,
     LineagePublication,
+    normalize_column_schemas,
     LineageResult,
     Relationship,
     WriteIntent,
@@ -175,12 +176,22 @@ class InMemoryCatalog:
         # concurrent catalog reads; only the version/collision compute + upsert below is serialized.
         try:
             adapter = self.resolve(uri)
-            columns = adapter.schema(uri)
-            count = adapter.count(uri)
+            raw_columns = adapter.schema(uri)
         except Exception as exc:  # noqa: BLE001 — unmanaged registrations may describe offline data
             if strict_probe:
                 raise RuntimeError("output schema/count probe failed") from exc
             adapter, columns, count = None, [], None
+        else:
+            try:
+                columns = normalize_column_schemas(raw_columns)
+            except Exception:  # noqa: BLE001 — never expose a provider's invalid payload in the error
+                raise ValueError("adapter returned invalid schema metadata") from None
+            try:
+                count = adapter.count(uri)
+            except Exception as exc:  # noqa: BLE001 — count is optional evidence for unmanaged data
+                if strict_probe:
+                    raise RuntimeError("output schema/count probe failed") from exc
+                count = None
         fp = "unknown"
         try:
             fp = (adapter.fingerprint(uri) if adapter else "unknown") + self._object_stat_sig(uri)
@@ -189,7 +200,8 @@ class InMemoryCatalog:
         from hub.relationships import key_candidates
         keys = key_candidates(columns)
         if version is None:
-            sig = "|".join(f"{c.name}:{c.type}" for c in columns) + f"|rows={count}|fp={fp}"
+            schema_doc = [column.model_dump(by_alias=True, mode="json") for column in columns]
+            sig = json.dumps(schema_doc, sort_keys=True, separators=(",", ":")) + f"|rows={count}|fp={fp}"
             version = "v" + _h.sha256(sig.encode()).hexdigest()[:10]
         tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         applied = True

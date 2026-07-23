@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -675,6 +676,46 @@ def test_lance_append_admission_blocks_incompatible_schema_before_publication(
     assert admission.expected_head is not None
     assert admission.blocker == "input schema is incompatible with the existing Lance destination"
     assert set(os.listdir(os.path.join(table.uri, "data"))) == before
+
+
+def test_lance_append_admission_preserves_physical_integer_width(lance_contract):
+    _lance, deps, graph, table = lance_contract
+    source = next(node for node in graph.nodes if node.id == "source")
+    narrow = os.path.join(deps.workspace, "narrow.parquet")
+    pq.write_table(pa.table({"value": pa.array([2], type=pa.int32())}), narrow)
+    source.data["config"]["uri"] = narrow
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "82333333-3333-4233-8233-333333333333")
+
+    assert admission.intent is None
+    assert admission.expected_head is not None
+    assert admission.blocker == "input schema is incompatible with the existing Lance destination"
+    assert LanceAdapter().resolve_revision(table.uri)["revision_id"] == "1"
+
+
+def test_lance_append_admission_accepts_equivalent_arrow_decimal_spelling(
+        lance_contract):
+    lance, deps, graph, table = lance_contract
+    decimal_type = pa.decimal128(21, 1)
+    source = next(node for node in graph.nodes if node.id == "source")
+    pq.write_table(
+        pa.table({"amount": pa.array([Decimal("1.0"), Decimal("2.0")], type=decimal_type)}),
+        source.data["config"]["uri"],
+    )
+    lance.write_dataset(
+        pa.table({"amount": pa.array([Decimal("3.0")], type=decimal_type)}),
+        table.uri,
+        mode="overwrite",
+    )
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "82444444-4444-4244-8244-444444444444")
+
+    assert admission.blocker is None
+    assert admission.intent is not None
+    assert admission.expected_head is not None
+    assert admission.expected_schema[0].physical_type == "DECIMAL(21,1)"
 
 
 def test_lance_append_unknown_schema_keeps_truthful_mode(lance_contract, monkeypatch):
