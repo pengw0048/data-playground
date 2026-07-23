@@ -155,7 +155,9 @@ def test_lance_append_publishes_two_source_field_lineage_and_replays_exactly(
     assert sorted(len(fact["field_mappings"]) for fact in selected) == [1, 1]
 
     changed_doc = intent.model_dump(by_alias=True, mode="json")
-    changed_mapping = changed_doc["provenance"]["publication"]["fieldMappings"][0]
+    changed_mapping = next(
+        mapping for mapping in changed_doc["provenance"]["publication"]["fieldMappings"]
+        if mapping["sourceDatasetId"] != right_binding["dataset_id"])
     changed_mapping["sourceDatasetId"] = right_binding["dataset_id"]
     changed_mapping["sourceVersion"] = right.version
     changed = WriteIntent.model_validate(changed_doc)
@@ -198,20 +200,34 @@ def test_lance_field_lineage_admission_fails_before_provider_commit(
         return create(*args, **kwargs)
 
     monkeypatch.setattr(LanceFragment, "create", track_create)
+    intent = _intent(
+        table, binding, f"lance-{failure}",
+        parents=[source.uri], mappings=[mapping])
     with pytest.raises(ValueError, match=match):
         write_managed_local_lance_append(
-            intent=_intent(
-                table, binding, f"lance-{failure}",
-                parents=[source.uri], mappings=[mapping]),
+            intent=intent,
             data=pa.table({"value": [2]}),
         )
 
     assert allocations == 0
     assert lance.LanceDataset(table.uri).version == 1
+    destination_revision_id = str(int(intent.expected_head.revision_id) + 1)
     with metadb.session() as session:
-        assert session.scalar(select(metadb.ManagedLocalLanceWriteReceipt)) is None
-        assert session.scalar(select(metadb.CatalogLineageFact)) is None
-        assert session.scalar(select(metadb.CatalogFieldLineageProjection)) is None
+        assert session.get(metadb.ManagedLocalLanceWriteReceipt, intent.idempotency_key) is None
+        assert session.scalar(select(metadb.CatalogLineageFact.id).where(
+            metadb.CatalogLineageFact.destination_uri == table.uri,
+            metadb.CatalogLineageFact.destination_version == destination_revision_id,
+        )) is None
+        assert session.scalar(select(metadb.CatalogFieldLineageProjection.id).where(
+            metadb.CatalogFieldLineageProjection.destination_dataset_id == binding["dataset_id"],
+            metadb.CatalogFieldLineageProjection.destination_revision_id
+            == destination_revision_id,
+        )) is None
+        assert session.scalar(select(metadb.CatalogPublicationEvent.event_key).where(
+            metadb.CatalogPublicationEvent.effect_type == "lineage",
+            metadb.CatalogPublicationEvent.uri == table.uri,
+            metadb.CatalogPublicationEvent.version == destination_revision_id,
+        )) is None
 
 
 def test_lance_append_receipt_reopens_exact_version_after_head_move_and_restart(
