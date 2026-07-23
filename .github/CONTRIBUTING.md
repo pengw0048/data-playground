@@ -16,6 +16,8 @@ make e2e       # browser end-to-end tests (Playwright on the real UI)
 ```
 
 For a focused web change, run from `web/`: `npm run typecheck`, `npm test`, and `npm run build`.
+After that build, a focused `npm run e2e -- --project=... path/to/spec.ts` serves that exact built SPA;
+the Playwright server builds a disposable packaged-kernel wheel from it, so no manual uv cache cleanup is needed.
 For a focused kernel test, use `cd kernel && uv run pytest -q path/to/test.py::test_name`.
 
 To reproduce the kernel dependency environment without changing the lockfile, use
