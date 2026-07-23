@@ -280,14 +280,25 @@ source still publishes through the separately configured managed destination and
 Workspace persistence and mixed Workspace browse are consumers of this contract, not responsibilities
 of a provider wheel.
 
-Import only these public types: `CatalogMount`, `CatalogResource`, `ProviderCapabilities`, `ProviderPage`,
-`ProviderSearchPage`, `ProviderResourceResult`, `ProviderAncestors`, `ReadOnlyCatalogProvider`,
-`bounded_list_children`, `bounded_search`, `bounded_resolve`, and `bounded_ancestors`.
+Import only these public types: `CatalogMount`, `CatalogResource`, `CatalogDatasetDetail`,
+`ProviderCapabilities`, `ProviderCapabilitiesResult`, `ProviderPage`, `ProviderSearchPage`,
+`ProviderResourceResult`, `ProviderDatasetDetailResult`, `ProviderAncestors`,
+`ReadOnlyCatalogProvider`, `bounded_capabilities`, `bounded_list_children`, `bounded_search`,
+`bounded_resolve`, `bounded_dataset_detail`, and `bounded_ancestors`.
 A `CatalogMount(id, provider, config)` identifies a local placement; `id` is not a provider resource
-ID. A provider resource has an opaque stable `id`; display names and parent paths are never identity.
+ID. Every browse or search occurrence has an opaque provider-scoped `placementId`, with an optional
+`parentPlacementId`; display names and presentation paths are never identity. A dataset occurrence also
+has a required opaque provider-scoped `datasetId`. The same canonical dataset may appear under several
+containers through different placement IDs, but every occurrence must agree on its canonical binding URI
+and schema facts. A container has no `datasetId`, URI, or columns. A single-placement provider still
+returns one explicit placement.
 
-Implement `capabilities`, `list_children`, `resolve`, `ancestors`, and `dataset_detail`. Children take
-a finite `limit` (1–500) and an opaque cursor; order must be deterministic. A provider returns
+Implement `capabilities`, `list_children`, `resolve`, `ancestors`, and `dataset_detail` using the
+identity the provider owns: `list_children(parentPlacementId)`, `resolve(placementId)`, and
+`ancestors(placementId)` operate on occurrences, while `dataset_detail(datasetId)` returns a
+`CatalogDatasetDetail` containing only canonical dataset facts. Search returns occurrences, including
+their placement and parent-placement identities as path evidence. Children take a finite `limit`
+(1–500) and an opaque cursor; order must be deterministic. A provider returns
 `ready`, `partial`, `unavailable`, or `unsupported` rather than pretending an offline or unsupported
 read succeeded. Use the matching `bounded_*` helper at a consumer boundary when a synchronous provider
 must not delay local work: deadline, cancellation, and availability failures are normalized to an
@@ -302,7 +313,8 @@ five-second deadline. Both are bounded by the same isolated provider workers; th
 or a provider-specific setting, so providers should still enforce suitable bounds on their own I/O.
 
 Lexical search is optional and must be declared with `ProviderCapabilities(search=True)`. A declared
-provider implements `search(mount, query, limit=, cursor=)` and returns `ProviderSearchPage`, including
+provider implements `search(mount, query, limit=, cursor=)` and returns `ProviderSearchPage` of
+placement occurrences, including
 `freshness` as `current`, `stale`, or `unknown`. Workspace search never probes an undeclared method: a
 mount without this capability is labeled unsupported, while a declared search uses the bounded explicit
 interaction deadline and keeps its errors and continuation separate from every other source.
@@ -316,8 +328,9 @@ python -m hub.catalog_provider_conformance your-provider \
   --mount-id local-provider-a --config root=/path/to/catalog
 ```
 
-The command verifies capability discovery, bounded pagination, opaque resolve, ancestors, dataset
-detail, and stable identities after a provider restart. The reference
+The command verifies capability discovery, bounded pagination, placement-specific resolve and
+ancestors, two placements of one canonical dataset, canonical dataset detail, and stable identities
+after a provider restart. The reference
 [`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) reads a `catalog.json`
 document from its `root` mount config and never writes it.
 
@@ -337,9 +350,27 @@ installed provider and is never returned by the API; changing mount identity or 
 invalidates outstanding mixed-browse cursors. A malformed entry or failed provider activation is
 reported as an unavailable source while local and other healthy sources remain browseable.
 
-Use a conformance fixture whose first two deterministic root resources share a display name but have
-distinct IDs, and whose first root container has a dataset child with schema. This makes the command
-exercise duplicate-name identity, nested ancestors, and dataset detail instead of accepting a no-op.
+Use a conformance fixture whose first two deterministic root containers share a display name but have
+distinct placement IDs, and give each a dataset occurrence with the same dataset ID, canonical URI, and
+schema. This makes the command exercise duplicate-name identity, placement-specific ancestors, and
+canonical dataset detail instead of accepting a no-op.
+
+The minimal JSON shape consumed by the reference provider is:
+
+```json
+{
+  "resources": [
+    {"placementId": "north", "kind": "container", "name": "Shared"},
+    {"placementId": "south", "kind": "container", "name": "Shared"},
+    {"placementId": "north-sales", "parentPlacementId": "north", "kind": "dataset",
+     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet",
+     "columns": [{"name": "id", "type": "int64"}]},
+    {"placementId": "south-sales", "parentPlacementId": "south", "kind": "dataset",
+     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet",
+     "columns": [{"name": "id", "type": "int64"}]}
+  ]
+}
+```
 
 All lineage methods exposed by a catalog plugin must agree on authority. An `InMemoryCatalog` subclass
 may serve discovery rows externally while deliberately retaining its inherited core-metadata lineage

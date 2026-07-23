@@ -261,11 +261,37 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error", error=_activation_error())
         raise ProviderDatasetUnavailable(_activation_error()) from exc
-    result = bounded_dataset_detail(
+    resolved = bounded_resolve(
         provider, mounted.mount, binding["resourceId"],
         timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
     )
+    if resolved.state != "ready" or resolved.item is None:
+        state = _reference_state(resolved.failure, resolved.state)
+        metadb.workspace_provider_mark_binding(
+            binding_id, state=state, error=resolved.reason)
+        if state == "permission_lost":
+            raise PermissionError("permission to read provider dataset was lost")
+        if state == "detached":
+            raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
+        if state == "offline":
+            raise ProviderDatasetOffline("provider dataset is offline")
+        raise ProviderDatasetUnavailable("provider dataset detail is invalid")
+    occurrence = resolved.item
+    if (occurrence.placement_id != binding["resourceId"] or occurrence.kind != "dataset"
+            or occurrence.dataset_id is None):
+        metadb.workspace_provider_mark_binding(
+            binding_id, state="provider_error",
+            error="catalog provider returned a mismatched dataset binding")
+        raise ProviderDatasetUnavailable("provider returned a mismatched dataset binding")
+    result = bounded_dataset_detail(
+        provider, mounted.mount, occurrence.dataset_id,
+        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
+    )
     if result.state != "ready" or result.item is None:
+        if result.failure == "not_found":
+            metadb.workspace_provider_mark_binding(
+                binding_id, state="provider_error", error=result.reason)
+            raise ProviderDatasetUnavailable("provider dataset detail is unavailable")
         state = _reference_state(result.failure, result.state)
         metadb.workspace_provider_mark_binding(
             binding_id, state=state, error=result.reason)
@@ -276,24 +302,25 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
         if state == "offline":
             raise ProviderDatasetOffline("provider dataset is offline")
         raise ProviderDatasetUnavailable("provider dataset detail is invalid")
-    item = result.item
-    if item.id != binding["resourceId"] or item.kind != "dataset" or not item.uri:
+    detail = result.item
+    if detail.uri != occurrence.uri or detail.columns != occurrence.columns:
         metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error",
-            error="catalog provider returned a mismatched dataset binding")
-        raise ProviderDatasetUnavailable("provider returned a mismatched dataset binding")
+            error="catalog provider returned conflicting canonical dataset facts")
+        raise ProviderDatasetUnavailable("provider returned conflicting canonical dataset facts")
     cached = metadb.workspace_provider_cache_resource(
         mount_id=mounted.mount.id, provider=mounted.mount.provider,
-        container_id=mounted.container_id, resource_id=item.id, kind=item.kind,
-        name=item.name, parent_binding_id=binding.get("parentBindingId"),
+        container_id=mounted.container_id, resource_id=occurrence.placement_id,
+        kind=occurrence.kind, name=occurrence.name,
+        parent_binding_id=binding.get("parentBindingId"),
     )
     if cached["bindingId"] != binding_id or cached["referenceState"] != "current":
         raise ProviderDatasetUnavailable("provider dataset binding is no longer current")
     try:
-        adapter = resolve_physical(item.uri)
+        adapter = resolve_physical(detail.uri)
     except Exception as exc:
         raise ProviderDatasetUnavailable("provider dataset adapter is unavailable") from exc
-    return _BoundProviderDatasetAdapter(uri, item.uri, adapter)
+    return _BoundProviderDatasetAdapter(uri, detail.uri, adapter)
 
 
 def provider_dataset_supports_exact(adapter: object) -> bool:
@@ -456,12 +483,12 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
 def _workspace_resource(
     item: CatalogResource, mounted: _MountedProvider, *, parent_binding_id: str | None = None,
 ) -> dict:
-    parent_is_known = item.parent_id is None or parent_binding_id is not None
-    if parent_binding_id is None and item.parent_id is not None:
+    parent_is_known = item.parent_placement_id is None or parent_binding_id is not None
+    if parent_binding_id is None and item.parent_placement_id is not None:
         parent = metadb.workspace_provider_binding_for_resource(
             mount_id=mounted.mount.id,
             provider=mounted.mount.provider,
-            resource_id=item.parent_id,
+            resource_id=item.parent_placement_id,
         )
         parent_binding_id = parent["bindingId"] if parent is not None else None
         parent_is_known = parent is not None
@@ -469,7 +496,7 @@ def _workspace_resource(
         mount_id=mounted.mount.id,
         provider=mounted.mount.provider,
         container_id=mounted.container_id,
-        resource_id=item.id,
+        resource_id=item.placement_id,
         kind=item.kind,
         name=item.name,
         parent_binding_id=parent_binding_id,
@@ -747,7 +774,8 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                         binding_id, state=state, error=resolved.reason)
                     public_container = _binding_resource(cached, mounted)
                     statuses[current] = _source_status(source, resolved.state, resolved.reason, state)
-                elif resolved.item.id != resource_id or resolved.item.kind != "container":
+                elif (resolved.item.placement_id != resource_id
+                      or resolved.item.kind != "container"):
                     raise KeyError(f"Workspace resource 'container:{identity}' is not a container")
                 else:
                     ancestry = bounded_ancestors(
@@ -770,7 +798,8 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                         # Refresh the target display facts only and preserve its cached ancestry.
                         binding = metadb.workspace_provider_cache_resource(
                             mount_id=mounted.mount.id, provider=mounted.mount.provider,
-                            container_id=mounted.container_id, resource_id=resolved.item.id,
+                            container_id=mounted.container_id,
+                            resource_id=resolved.item.placement_id,
                             kind=resolved.item.kind, name=resolved.item.name,
                             parent_is_known=False)
                         container = _binding_resource(binding, mounted)
@@ -1004,7 +1033,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         return _cached_resolution(
             cached, mounted, source, uid=uid, completeness=resolved.state,
             error=resolved.reason)
-    if resolved.item.id != resource_id or resolved.item.kind != kind:
+    if resolved.item.placement_id != resource_id or resolved.item.kind != kind:
         cached = metadb.workspace_provider_mark_binding(
             binding_id, state="provider_error",
             error="catalog provider returned a mismatched resource identity")
@@ -1089,7 +1118,7 @@ def relink(
             raise KeyError(resolved.reason or "replacement resource was not found")
         raise ProviderRelinkUnavailable(
             resolved.reason or "replacement provider is unavailable")
-    if resolved.item.id != resource_id:
+    if resolved.item.placement_id != resource_id:
         raise ProviderRelinkUnavailable(
             "catalog provider returned a mismatched replacement identity")
     if resolved.item.kind != kind:
@@ -1109,7 +1138,7 @@ def relink(
         mount_id=mounted.mount.id,
         provider=mounted.mount.provider,
         container_id=mounted.container_id,
-        resource_id=resolved.item.id,
+        resource_id=resolved.item.placement_id,
         kind=resolved.item.kind,
         name=resolved.item.name,
         parent_binding_id=parent_binding_id,

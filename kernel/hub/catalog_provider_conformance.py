@@ -9,7 +9,8 @@ import sys
 from importlib.metadata import entry_points
 
 from hub.catalog_provider import (
-    CatalogMount, ReadOnlyCatalogProvider, bounded_list_children, bounded_search,
+    CatalogMount, ReadOnlyCatalogProvider, bounded_ancestors, bounded_capabilities,
+    bounded_dataset_detail, bounded_list_children, bounded_resolve, bounded_search,
 )
 
 
@@ -62,7 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         return _failure("activation", "entry point did not provide a read-only catalog provider")
     mount = CatalogMount(id=args.mount_id, provider=args.provider, config=config)
     try:
-        capabilities = provider.capabilities(mount)
+        capability_result = bounded_capabilities(provider, mount)
+        if capability_result.state != "ready" or capability_result.item is None:
+            return _failure("capability", "provider capability discovery was unavailable")
+        capabilities = capability_result.item
         if not all((capabilities.list_children, capabilities.resolve, capabilities.ancestors,
                     capabilities.dataset_detail)):
             return _failure("capability", "provider omitted a required read capability")
@@ -70,29 +74,49 @@ def main(argv: list[str] | None = None) -> int:
         if first.state != "ready" or len(first.items) != 1 or first.next_cursor is None:
             return _failure("capability", "provider did not return a bounded root page")
         second = bounded_list_children(provider, mount, None, limit=1, cursor=first.next_cursor)
-        if second.state != "ready" or len(second.items) != 1 or second.items[0].id == first.items[0].id:
+        if (second.state != "ready" or len(second.items) != 1
+                or second.items[0].placement_id == first.items[0].placement_id):
             return _failure("capability", "provider pagination was not stable")
         if first.items[0].name != second.items[0].name:
             return _failure("capability", "provider did not preserve duplicate display names")
         if capabilities.search:
             searched = bounded_search(provider, mount, first.items[0].name, limit=1)
-            if (searched.state != "ready" or len(searched.items) != 1
-                    or searched.items[0].name != first.items[0].name):
+            if searched.state != "ready" or len(searched.items) != 1:
                 return _failure("capability", "provider search was not bounded and stable")
-        resolved = provider.resolve(mount, first.items[0].id)
-        if resolved.state != "ready" or resolved.item is None or resolved.item.id != first.items[0].id:
-            return _failure("capability", "provider could not resolve its opaque resource ID")
-        child = bounded_list_children(provider, mount, first.items[0].id, limit=1)
+        resolved = bounded_resolve(provider, mount, first.items[0].placement_id)
+        if (resolved.state != "ready" or resolved.item is None
+                or resolved.item.placement_id != first.items[0].placement_id):
+            return _failure("capability", "provider could not resolve its opaque placement ID")
+        child = bounded_list_children(provider, mount, first.items[0].placement_id, limit=1)
         if child.state != "ready" or len(child.items) != 1 or child.items[0].kind != "dataset":
             return _failure("capability", "provider did not expose the conformance dataset child")
-        detail = provider.dataset_detail(mount, child.items[0].id)
+        first_dataset = child.items[0]
+        assert first_dataset.dataset_id is not None
+        detail = bounded_dataset_detail(provider, mount, first_dataset.dataset_id)
         if (detail.state != "ready" or detail.item is None or
-                detail.item.id != child.items[0].id or not detail.item.columns):
+                detail.item.dataset_id != first_dataset.dataset_id or not detail.item.columns
+                or detail.item.uri != first_dataset.uri
+                or detail.item.columns != first_dataset.columns):
             return _failure("capability", "provider could not return dataset detail and schema")
-        ancestors = provider.ancestors(mount, child.items[0].id)
+        second_child = bounded_list_children(provider, mount, second.items[0].placement_id, limit=1)
+        if (second_child.state != "ready" or len(second_child.items) != 1
+                or second_child.items[0].kind != "dataset"
+                or second_child.items[0].dataset_id != first_dataset.dataset_id
+                or second_child.items[0].placement_id == first_dataset.placement_id
+                or second_child.items[0].uri != first_dataset.uri
+                or second_child.items[0].columns != first_dataset.columns):
+            return _failure("capability", "provider did not preserve canonical dataset identity")
+        second_detail = bounded_dataset_detail(provider, mount, second_child.items[0].dataset_id or "")
+        if second_detail.state != "ready" or second_detail.item != detail.item:
+            return _failure("capability", "provider returned conflicting canonical dataset facts")
+        ancestors = bounded_ancestors(provider, mount, first_dataset.placement_id)
         if (ancestors.state != "ready" or not ancestors.items or
-                ancestors.items[-1].id != first.items[0].id):
-            return _failure("capability", "provider could not return resource ancestors")
+                ancestors.items[-1].placement_id != first.items[0].placement_id):
+            return _failure("capability", "provider could not return placement-specific ancestors")
+        second_ancestors = bounded_ancestors(provider, mount, second_child.items[0].placement_id)
+        if (second_ancestors.state != "ready" or not second_ancestors.items
+                or second_ancestors.items[-1].placement_id != second.items[0].placement_id):
+            return _failure("capability", "provider did not preserve moved presentation paths")
         restarted = _provider(args.provider)
         repeated = bounded_list_children(restarted, mount, None, limit=1)
         if repeated.state != "ready" or repeated.items != first.items:
