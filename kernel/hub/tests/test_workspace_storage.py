@@ -21,10 +21,12 @@ from sqlalchemy import delete, event, select, update
 
 from hub import db, main as hub_main, metadb, workspace_providers
 from hub.catalog_provider import (
+    CatalogDatasetDetail,
     CatalogMount,
     CatalogResource,
     ProviderAncestors,
     ProviderCapabilities,
+    ProviderDatasetDetailResult,
     ProviderPage,
     ProviderResourceResult,
     ProviderSearchPage,
@@ -484,22 +486,24 @@ class _WorkspaceFixtureProvider:
     @staticmethod
     def _resources(mount_id: str) -> list[CatalogResource]:
         return [
-            CatalogResource(id="container-a", kind="container", name="shared"),
+            CatalogResource(placement_id="container-a", kind="container", name="shared"),
             CatalogResource(
-                id="dataset-a", kind="dataset", name="shared",
+                placement_id="dataset-a", dataset_id="dataset-a", kind="dataset", name="shared",
                 uri=f"file:///{mount_id}.parquet"),
             CatalogResource(
-                id="nested-dataset", kind="dataset", name="nested",
-                parent_id="container-a", uri=f"file:///{mount_id}-nested.parquet"),
+                placement_id="nested-dataset", dataset_id="nested-dataset", kind="dataset",
+                name="nested", parent_placement_id="container-a",
+                uri=f"file:///{mount_id}-nested.parquet"),
         ]
 
-    def list_children(self, mount, parent_id, *, limit, cursor=None):
+    def list_children(self, mount, parent_placement_id, *, limit, cursor=None):
         self.list_calls += 1
         if mount.id == "a-slow":
             time.sleep(0.02)
         resources = sorted(
-            (item for item in self._resources(mount.id) if item.parent_id == parent_id),
-            key=lambda item: (item.name, item.id),
+            (item for item in self._resources(mount.id)
+             if item.parent_placement_id == parent_placement_id),
+            key=lambda item: (item.name, item.placement_id),
         )
         start = int(cursor or 0)
         items = resources[start:start + limit]
@@ -509,18 +513,26 @@ class _WorkspaceFixtureProvider:
         next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
         return ProviderPage(items=items, next_cursor=next_cursor)
 
-    def resolve(self, mount, resource_id):
-        item = next((item for item in self._resources(mount.id) if item.id == resource_id), None)
+    def resolve(self, mount, placement_id):
+        item = next(
+            (item for item in self._resources(mount.id) if item.placement_id == placement_id), None)
         return ProviderResourceResult(item=item) if item else ProviderResourceResult(
             state="unavailable", reason="resource not found", failure="not_found")
 
-    def ancestors(self, mount, resource_id):
-        if resource_id == "nested-dataset":
+    def ancestors(self, mount, placement_id):
+        if placement_id == "nested-dataset":
             return ProviderAncestors(items=[self._resources(mount.id)[0]])
         return ProviderAncestors()
 
-    def dataset_detail(self, mount, resource_id):
-        return self.resolve(mount, resource_id)
+    def dataset_detail(self, mount, dataset_id):
+        item = next(
+            (item for item in self._resources(mount.id) if item.dataset_id == dataset_id), None)
+        if item is None:
+            return ProviderDatasetDetailResult(
+                state="unavailable", reason="dataset not found", failure="not_found")
+        assert item.uri is not None and item.dataset_id is not None
+        return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
+            dataset_id=item.dataset_id, uri=item.uri, columns=item.columns))
 
     def capabilities(self, _mount):
         return ProviderCapabilities(search=_mount.id != "e-unsupported")
@@ -532,7 +544,7 @@ class _WorkspaceFixtureProvider:
         resources = sorted(
             (item for item in self._resources(mount.id)
              if all(token in item.name.casefold() for token in tokens)),
-            key=lambda item: (item.name.casefold(), item.kind, item.id),
+            key=lambda item: (item.name.casefold(), item.kind, item.placement_id),
         )
         if mount.id == "f-overlimit":
             return ProviderSearchPage(items=resources[:limit + 1])
@@ -546,6 +558,99 @@ class _WorkspaceFixtureProvider:
                 freshness="stale")
         next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
         return ProviderSearchPage(items=items, next_cursor=next_cursor)
+
+
+def _workspace_provider_dataset_binding(workspace_scope, monkeypatch, provider):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"workspace-{token}-canonical-provider")
+    mount_id = f"canonical-{token}"
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    page = workspace_providers.browse(
+        folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
+    resource = next(
+        item for item in page["items"] if item.get("resourceId") == "dataset-a")
+    binding_id = resource["bindingId"]
+    return mount_id, binding_id, workspace_providers.provider_dataset_uri(binding_id)
+
+
+@pytest.mark.parametrize("conflicting_fact", ["uri", "columns"])
+def test_provider_dataset_binding_rejects_conflicting_occurrence_and_detail_facts(
+        workspace_scope, monkeypatch, conflicting_fact):
+    provider = _WorkspaceFixtureProvider()
+    mount_id, binding_id, uri = _workspace_provider_dataset_binding(
+        workspace_scope, monkeypatch, provider)
+    occurrence = next(
+        item for item in provider._resources(mount_id) if item.placement_id == "dataset-a")
+    assert occurrence.dataset_id is not None and occurrence.uri is not None
+    detail = CatalogDatasetDetail(
+        dataset_id=occurrence.dataset_id,
+        uri=("file:///conflicting.parquet"
+             if conflicting_fact == "uri" else occurrence.uri),
+        columns=(
+            [{"name": "conflicting", "type": "string"}]
+            if conflicting_fact == "columns" else occurrence.columns
+        ),
+    )
+    monkeypatch.setattr(
+        provider, "dataset_detail",
+        lambda *_args, **_kwargs: ProviderDatasetDetailResult(item=detail),
+    )
+    physical_calls: list[str] = []
+
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="conflicting canonical dataset facts"):
+        workspace_providers.provider_dataset_adapter(
+            uri, lambda physical_uri: physical_calls.append(physical_uri) or object())
+
+    assert physical_calls == []
+    binding = metadb.workspace_provider_binding(binding_id)
+    assert binding is not None
+    assert binding["referenceState"] == "provider_error"
+    assert binding["active"] is True
+
+
+def test_provider_dataset_detail_not_found_keeps_the_same_binding_retryable(
+        workspace_scope, monkeypatch):
+    provider = _WorkspaceFixtureProvider()
+    mount_id, binding_id, uri = _workspace_provider_dataset_binding(
+        workspace_scope, monkeypatch, provider)
+    normal_detail = provider.dataset_detail
+    monkeypatch.setattr(
+        provider, "dataset_detail",
+        lambda *_args, **_kwargs: ProviderDatasetDetailResult(
+            state="unavailable", reason="canonical detail is not ready", failure="not_found"),
+    )
+    physical_calls: list[str] = []
+
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="provider dataset detail is unavailable"):
+        workspace_providers.provider_dataset_adapter(
+            uri, lambda physical_uri: physical_calls.append(physical_uri) or object())
+
+    degraded = metadb.workspace_provider_binding(binding_id)
+    assert degraded is not None
+    assert degraded["referenceState"] == "provider_error"
+    assert degraded["active"] is True
+    assert physical_calls == []
+
+    monkeypatch.setattr(provider, "dataset_detail", normal_detail)
+    adapter = workspace_providers.provider_dataset_adapter(
+        uri, lambda physical_uri: physical_calls.append(physical_uri) or object())
+
+    assert adapter.matches(uri)
+    assert physical_calls == [f"file:///{mount_id}.parquet"]
+    recovered = metadb.workspace_provider_binding(binding_id)
+    assert recovered is not None
+    assert recovered["bindingId"] == binding_id
+    assert recovered["referenceState"] == "current"
+    assert recovered["active"] is True
 
 
 class _ExactFixtureAdapter:
@@ -629,7 +734,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
     path.write_text("value\n1\n2\n")
     provider = _WorkspaceFixtureProvider()
     resource = CatalogResource(
-        id="dataset-a", kind="dataset", name="Provider observations", uri=str(path))
+        placement_id="dataset-a", dataset_id="dataset-a", kind="dataset",
+        name="Provider observations", uri=str(path))
     monkeypatch.setattr(provider, "_resources", lambda _mount_id: [resource])
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
@@ -1231,9 +1337,10 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
     provider = _WorkspaceFixtureProvider()
     mount_id = f"overlay-{uuid.uuid4().hex}"
     resources = [
-        CatalogResource(id="container-a", kind="container", name="Provider folder"),
+        CatalogResource(placement_id="container-a", kind="container", name="Provider folder"),
         CatalogResource(
-            id="provider-child", kind="dataset", name="Provider child", parent_id="container-a",
+            placement_id="provider-child", dataset_id="provider-child", kind="dataset",
+            name="Provider child", parent_placement_id="container-a",
             uri="file:///provider-child.parquet"),
     ]
     monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
@@ -1534,11 +1641,13 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
 
             # Provider display rename/move only refreshes binding snapshots; the local placement
             # stays on this binding generation's anchor.
-            parent = CatalogResource(id="parent-a", kind="container", name="New provider parent")
+            parent = CatalogResource(
+                placement_id="parent-a", kind="container", name="New provider parent")
             resources[:] = [
                 parent,
                 CatalogResource(
-                    id="container-a", kind="container", name="Renamed folder", parent_id="parent-a"),
+                    placement_id="container-a", kind="container", name="Renamed folder",
+                    parent_placement_id="parent-a"),
             ]
             monkeypatch.setattr(
                 provider, "ancestors",
@@ -1586,7 +1695,8 @@ def test_external_container_overlay_anchor_is_fenced_hidden_and_replay_safe(
             assert detached_deep_link.status_code == 200, detached_deep_link.text
             assert detached_deep_link.json()["resource"]["parentId"] == remote["id"]
             assert detached_deep_link.json()["source"]["referenceState"] == "detached"
-            resources[:] = [CatalogResource(id="container-a", kind="container", name="Recreated folder")]
+            resources[:] = [CatalogResource(
+                placement_id="container-a", kind="container", name="Recreated folder")]
             still_detached = client.get(f"/api/workspace/resources/{remote['id']}")
             assert still_detached.json()["resource"]["referenceState"] == "detached"
             assert still_detached.json()["resource"]["localPlacement"]["containerId"] == anchor_id
@@ -1823,9 +1933,11 @@ def test_external_overlay_browse_rejects_legacy_and_cross_layout_cursors(
     mount_id = f"overlay-cursor-{uuid.uuid4().hex}"
     provider = _WorkspaceFixtureProvider()
     resources = [
-        CatalogResource(id="container-a", kind="container", name="External folder"),
-        CatalogResource(id="one", kind="dataset", name="one", parent_id="container-a", uri="file:///one"),
-        CatalogResource(id="two", kind="dataset", name="two", parent_id="container-a", uri="file:///two"),
+        CatalogResource(placement_id="container-a", kind="container", name="External folder"),
+        CatalogResource(placement_id="one", dataset_id="one", kind="dataset", name="one",
+                        parent_placement_id="container-a", uri="file:///one"),
+        CatalogResource(placement_id="two", dataset_id="two", kind="dataset", name="two",
+                        parent_placement_id="container-a", uri="file:///two"),
     ]
     monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
@@ -1884,8 +1996,9 @@ def test_external_overlay_canvas_deep_link_refreshes_live_container_and_falls_ba
     root = metadb.local_workspace_root()
     mount_id = f"overlay-deep-link-{uuid.uuid4().hex}"
     provider = _WorkspaceFixtureProvider()
-    resources = [CatalogResource(id="container-a", kind="container", name="Original folder")]
-    parent = CatalogResource(id="parent-a", kind="container", name="Original parent")
+    resources = [CatalogResource(
+        placement_id="container-a", kind="container", name="Original folder")]
+    parent = CatalogResource(placement_id="parent-a", kind="container", name="Original parent")
     monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
@@ -1948,7 +2061,8 @@ def test_external_overlay_canvas_deep_link_refreshes_live_container_and_falls_ba
         resources[:] = [
             parent,
             CatalogResource(
-                id="container-a", kind="container", name="Renamed folder", parent_id="parent-a"),
+                placement_id="container-a", kind="container", name="Renamed folder",
+                parent_placement_id="parent-a"),
         ]
         renamed = client.get(f"/api/workspace/resources/{canvas_ref}")
         assert renamed.status_code == 200, renamed.text
@@ -2050,8 +2164,7 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
         assert groups["mount:e-unsupported"]["source"]["searchMode"] == "unsupported"
         assert groups["mount:e-unsupported"]["source"]["completeness"] == "unsupported"
         assert groups["mount:f-overlimit"]["source"]["completeness"] == "unavailable"
-        assert groups["mount:f-overlimit"]["source"]["error"] == (
-            "catalog provider exceeded the requested search limit")
+        assert groups["mount:f-overlimit"]["source"]["error"] == "provider search result is invalid"
 
         found: list[dict] = [
             item for group in page["groups"] for item in group["items"]
@@ -2074,8 +2187,7 @@ def test_workspace_search_groups_sources_preserves_duplicates_and_reports_partia
         assert len({item["id"] for item in duplicates}) == len(duplicates)
         final_groups = {group["source"]["id"]: group for group in document["groups"]}
         assert final_groups["mount:g-stuck"]["source"]["completeness"] == "unavailable"
-        assert final_groups["mount:g-stuck"]["source"]["error"] == (
-            "catalog provider returned a non-advancing search page")
+        assert final_groups["mount:g-stuck"]["source"]["error"] == "provider search result is invalid"
 
         mismatched = client.get("/api/workspace/search", params={
             "q": "different", "limit": 1, "cursor": page["nextCursor"],

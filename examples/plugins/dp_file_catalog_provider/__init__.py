@@ -1,10 +1,11 @@
 """Reference read-only provider backed by a JSON catalog document.
 
 The mount configuration must contain ``root`` pointing at a directory with ``catalog.json``.  The
-document has ``resources`` entries with opaque ``id``, ``kind``, ``name``, optional ``parentId``, and
-for datasets a ``uri`` plus optional ``columns``. An optional provider-owned immutable ``revisionId``
-enables exact reads only when upstream guarantees the bytes for that token; absent means mutable
-preview-only. The provider never creates, edits, or deletes files.
+document has ``resources`` entries with opaque ``placementId``, ``kind``, ``name``, optional
+``parentPlacementId``, and, for datasets, a canonical ``datasetId`` plus a ``uri`` and optional
+``columns``. An optional provider-owned immutable ``revisionId`` enables exact reads only when upstream
+guarantees the bytes for that token; absent means mutable preview-only. The provider never creates,
+edits, or deletes files.
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ import hashlib
 from pathlib import Path
 
 from hub.catalog_provider import (
-    CatalogMount, CatalogResource, ProviderAncestors, ProviderCapabilities, ProviderPage,
-    ProviderResourceResult, ProviderSearchPage,
+    CatalogDatasetDetail, CatalogMount, CatalogResource, ProviderAncestors, ProviderCapabilities,
+    ProviderDatasetDetailResult, ProviderPage, ProviderResourceResult, ProviderSearchPage,
 )
 from hub.plugins.adapters import DuckDBAdapter, RevisionUnavailable, relation_columns
 
@@ -26,9 +27,9 @@ _MUTABLE_DATASET_SCHEME = "dp-file-catalog-mutable://"
 
 
 def _dataset_uri(
-    root: Path, resource_id: str, physical_uri: str, revision_id: str | None,
+    root: Path, dataset_id: str, physical_uri: str, revision_id: str | None,
 ) -> str:
-    values = [str(root.resolve()), resource_id, physical_uri]
+    values = [str(root.resolve()), dataset_id, physical_uri]
     if revision_id is not None:
         values.append(revision_id)
     document = json.dumps(
@@ -167,7 +168,9 @@ class FileCatalogProvider:
         document = json.loads((root / "catalog.json").read_text())
         resources = []
         for raw in document.get("resources", []):
-            item = CatalogResource.model_validate(raw)
+            item = CatalogResource.model_validate({
+                key: value for key, value in raw.items() if key != "revisionId"
+            })
             if item.kind == "dataset":
                 raw_revision = raw.get("revisionId")
                 if raw_revision is not None and (
@@ -179,20 +182,32 @@ class FileCatalogProvider:
                 # revision adapter. Ordinary file entries remain mutable and preview-only.
                 revision_id = raw_revision if isinstance(raw_revision, str) else None
                 item = item.model_copy(update={
-                    "uri": _dataset_uri(root, item.id, str(item.uri), revision_id),
+                    "uri": _dataset_uri(root, item.dataset_id or "", str(item.uri), revision_id),
                 })
             resources.append(item)
-        if len({item.id for item in resources}) != len(resources):
-            raise ValueError("resource IDs must be unique")
+        if len({item.placement_id for item in resources}) != len(resources):
+            raise ValueError("placement IDs must be unique")
+        canonical: dict[str, tuple[str, list]] = {}
+        for item in resources:
+            if item.kind != "dataset":
+                continue
+            assert item.dataset_id is not None and item.uri is not None
+            facts = (item.uri, item.columns)
+            previous = canonical.setdefault(item.dataset_id, facts)
+            if previous != facts:
+                raise ValueError("dataset IDs must have consistent canonical facts")
         return resources
 
     def capabilities(self, mount: CatalogMount) -> ProviderCapabilities:
         return ProviderCapabilities(search=True)
 
-    def list_children(self, mount: CatalogMount, parent_id: str | None, *, limit: int,
+    def list_children(self, mount: CatalogMount, parent_placement_id: str | None, *, limit: int,
                       cursor: str | None = None) -> ProviderPage:
-        resources = sorted((item for item in self._resources(mount) if item.parent_id == parent_id),
-                           key=lambda item: (item.name.casefold(), item.id))
+        resources = sorted(
+            (item for item in self._resources(mount)
+             if item.parent_placement_id == parent_placement_id),
+            key=lambda item: (item.name.casefold(), item.placement_id),
+        )
         start = int(cursor) if cursor is not None else 0
         if start < 0 or start > len(resources):
             raise ValueError("cursor is outside this collection")
@@ -200,38 +215,43 @@ class FileCatalogProvider:
         next_cursor = str(start + len(items)) if start + len(items) < len(resources) else None
         return ProviderPage(items=items, next_cursor=next_cursor)
 
-    def resolve(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult:
-        item = next((item for item in self._resources(mount) if item.id == resource_id), None)
+    def resolve(self, mount: CatalogMount, placement_id: str) -> ProviderResourceResult:
+        item = next(
+            (item for item in self._resources(mount) if item.placement_id == placement_id), None)
         return ProviderResourceResult(item=item) if item else ProviderResourceResult(
             state="unavailable", reason="resource not found", failure="not_found")
 
-    def ancestors(self, mount: CatalogMount, resource_id: str) -> ProviderAncestors:
-        by_id = {item.id: item for item in self._resources(mount)}
-        current = by_id.get(resource_id)
+    def ancestors(self, mount: CatalogMount, placement_id: str) -> ProviderAncestors:
+        by_id = {item.placement_id: item for item in self._resources(mount)}
+        current = by_id.get(placement_id)
         if current is None:
             return ProviderAncestors(state="unavailable", reason="resource not found")
         items: list[CatalogResource] = []
-        seen = {resource_id}
-        while current.parent_id is not None:
-            parent_id = current.parent_id
-            if parent_id in seen:
+        seen = {placement_id}
+        while current.parent_placement_id is not None:
+            parent_placement_id = current.parent_placement_id
+            if parent_placement_id in seen:
                 return ProviderAncestors(
                     state="partial", items=list(reversed(items)), reason="ancestor cycle detected")
-            current = by_id.get(parent_id)
+            current = by_id.get(parent_placement_id)
             if current is None:
                 return ProviderAncestors(
                     state="partial", items=list(reversed(items)), reason="ancestor is unavailable")
             items.append(current)
-            seen.add(parent_id)
+            seen.add(parent_placement_id)
         return ProviderAncestors(items=list(reversed(items)))
 
-    def dataset_detail(self, mount: CatalogMount, resource_id: str) -> ProviderResourceResult:
-        result = self.resolve(mount, resource_id)
-        if result.item is not None and result.item.kind != "dataset":
-            return ProviderResourceResult(
-                state="unsupported", reason="resource is not a dataset",
-                failure="provider_error")
-        return result
+    def dataset_detail(self, mount: CatalogMount, dataset_id: str) -> ProviderDatasetDetailResult:
+        item = next(
+            (item for item in self._resources(mount)
+             if item.kind == "dataset" and item.dataset_id == dataset_id), None)
+        if item is None:
+            return ProviderDatasetDetailResult(
+                state="unavailable", reason="dataset not found", failure="not_found")
+        assert item.uri is not None and item.dataset_id is not None
+        return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
+            dataset_id=item.dataset_id, uri=item.uri, columns=item.columns,
+        ))
 
     def search(self, mount: CatalogMount, query: str, *, limit: int,
                cursor: str | None = None) -> ProviderSearchPage:
@@ -239,7 +259,7 @@ class FileCatalogProvider:
         resources = sorted(
             (item for item in self._resources(mount)
              if all(token in item.name.casefold() for token in tokens)),
-            key=lambda item: (item.name.casefold(), item.kind, item.id),
+            key=lambda item: (item.name.casefold(), item.kind, item.placement_id),
         )
         start = int(cursor) if cursor is not None else 0
         if start < 0 or start > len(resources):
