@@ -265,3 +265,37 @@ def test_reload_reuses_shared_schema_rules_and_rejects_write_parents(local_catal
             managed_sidecar_merge_module._semantic_payload(draft)).encode()).hexdigest()
     with pytest.raises(ValueError, match="write intent"):
         ManagedSidecarMergeIntentV1.model_validate(parents)
+
+
+def test_preflight_and_reload_reject_integer_width_drift(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": pa.array([1], type=pa.int64()), "old": pa.array([1], type=pa.int32()),
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": pa.array([1], type=pa.int64()), "replacement": pa.array([2], type=pa.int64()),
+    }))
+    key = "issue-767-width"
+    request = ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    )
+    with pytest.raises(ManagedSidecarMergeError, match="replace type"):
+        prepare_managed_sidecar_merge(storage=storage, request=request)
+
+    compatible_sidecar = _publish(storage, catalog, str(tmp_path / "compatible.parquet"), "compatible", pa.table({
+        "id": pa.array([1], type=pa.int64()), "replacement": pa.array([2], type=pa.int32()),
+    }))
+    intent = admit_managed_sidecar_merge(
+        storage=storage, request=request.model_copy(update={"sidecar": compatible_sidecar}))
+    tampered = intent.model_dump()
+    tampered["base_schema"][0]["physical_type"] = "int32"
+    draft = intent.model_copy(deep=True)
+    draft.base_schema[0].physical_type = "int32"
+    tampered["merge_sha256"] = hashlib.sha256(
+        managed_sidecar_merge_module._canonical(
+            managed_sidecar_merge_module._semantic_payload(draft)).encode()).hexdigest()
+    with pytest.raises(ValueError, match="rules"):
+        ManagedSidecarMergeIntentV1.model_validate(tampered)

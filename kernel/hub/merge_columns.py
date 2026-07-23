@@ -120,10 +120,12 @@ def _as_exact(value: ExactDatasetRef) -> ExactDatasetRef:
 
 
 def schema_columns(schema: pa.Schema) -> list[ColumnSchema]:
+    """Return canonical columns with the exact Arrow type needed for merge validation."""
     with db.base_guard():
         empty = pa.Table.from_batches([], schema=schema)
         columns = relation_columns(db.conn().from_arrow(empty))
-    return [ColumnSchema(name=column.name, type=column.type) for column in columns]
+    return [ColumnSchema(name=column.name, type=column.type, physical_type=str(field.type))
+            for column, field in zip(columns, schema, strict=True)]
 
 def side_fields_name(schema: pa.Schema, requested: str) -> str:
     """Resolve a V1 identifier through the same collision semantics as validation."""
@@ -170,16 +172,27 @@ def merge_output_columns(
                 or source_key in identity_keys or not rule.source or not rule.target):
             raise MergeColumnsError("merge rules are invalid")
         target = base_fields.get(target_key)
+        if (side_fields[source_key].physical_type is None
+                or (target is not None and target.physical_type is None)):
+            raise MergeColumnsError("merge exact type evidence is unavailable")
         if rule.mode == "add":
             if target is not None:
                 raise MergeColumnsError("merge add target already exists")
-        elif target is None or target.type != side_fields[source_key].type:
+        elif target is None or target.physical_type != side_fields[source_key].physical_type:
             raise MergeColumnsError("merge replace type is invalid")
+    for identity_key in identity_keys:
+        base = base_fields.get(identity_key)
+        sidecar = side_fields.get(identity_key)
+        if (base is None or sidecar is None or base.physical_type is None
+                or sidecar.physical_type is None or base.physical_type != sidecar.physical_type):
+            raise MergeColumnsError("merge identity type is invalid")
     payload = [column.name for column in sidecar_columns
                if identifier_key(column.name) not in identity_keys]
     if {identifier_key(rule.source) for rule in rules} != {identifier_key(name) for name in payload}:
         raise MergeColumnsError("merge rules do not consume the certified sidecar payload")
-    return list(base_columns) + [
+    # Frozen schemas retain physical evidence; the public write schema deliberately remains the
+    # original logical ColumnSchema shape.
+    return [ColumnSchema(name=column.name, type=column.type) for column in base_columns] + [
         ColumnSchema(name=rule.target, type=side_fields[identifier_key(rule.source)].type)
         for rule in rules if rule.mode == "add"
     ]

@@ -24,6 +24,7 @@ from hub.merge_columns import (
     MergeColumnRuleV1,
     MergeColumnsError,
     MergeColumnsIntentV1,
+    merge_output_schema,
     merge_sparse_output_candidate,
     merge_sparse_output_columns,
     sparse_output_merge_evidence,
@@ -215,6 +216,14 @@ def _fixture_checksum(table: pa.Table) -> str:
     """Stable, value-only fixture fingerprint; never includes an artifact location."""
     document = json.dumps(table.to_pydict(), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(document.encode()).hexdigest()
+
+
+def test_merge_output_schema_rejects_distinct_integer_widths():
+    base = pa.schema([pa.field("id", pa.int32()), pa.field("value", pa.int32())])
+    sidecar = pa.schema([pa.field("id", pa.int32()), pa.field("replacement", pa.int64())])
+    with pytest.raises(MergeColumnsError, match="replace type"):
+        merge_output_schema(base, sidecar, ["id"], [
+            MergeColumnRuleV1(source="replacement", target="value", mode="replace")])
 
 
 def _full_width_golden() -> tuple[pa.Table, pa.Table, pa.Table]:
