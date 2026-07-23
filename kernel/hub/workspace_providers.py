@@ -1158,6 +1158,8 @@ def _cached_resolution(
         "ancestors": [*local_ancestors, *cached_ancestors],
         "source": _source_status(
             source, completeness, error, binding["referenceState"]),
+        "canonicalSourceBinding": metadb.workspace_provider_source_binding(
+            binding["bindingId"]),
     }
 
 
@@ -1329,6 +1331,8 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         "resource": current,
         "ancestors": combined,
         "source": _source_status(source, completeness, error, current["referenceState"]),
+        "canonicalSourceBinding": metadb.workspace_provider_source_binding(
+            current["bindingId"]),
     }
 
 

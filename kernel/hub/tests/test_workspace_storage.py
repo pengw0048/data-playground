@@ -908,6 +908,18 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert left["bindingId"] != right["bindingId"]
     assert left["providerDatasetId"] == right["providerDatasetId"] == "canonical-dataset"
     assert left["parentId"] != right["parentId"]
+    left_resolution = workspace_providers.resolve(
+        left["id"], uid=metadb.DEFAULT_USER_ID)
+    right_resolution = workspace_providers.resolve(
+        right["id"], uid=metadb.DEFAULT_USER_ID)
+    source_binding = left_resolution["canonicalSourceBinding"]
+    assert source_binding == right_resolution["canonicalSourceBinding"]
+    assert source_binding is not None
+    assert len(source_binding["sourceBindingId"]) == 32
+    assert "left-occurrence" not in json.dumps(source_binding)
+    assert "right-occurrence" not in json.dumps(source_binding)
+    assert "canonical-dataset" not in json.dumps(source_binding)
+    assert "canonical-dataset.parquet" not in json.dumps(source_binding)
     with metadb.session() as session:
         canonical_rows = list(session.scalars(select(metadb.WorkspaceProviderDataset).where(
             metadb.WorkspaceProviderDataset.mount_id == mount_id)))
@@ -963,6 +975,9 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         if item.get("providerPlacementId") == "left-occurrence")
     assert moved_resource["bindingId"] == left["bindingId"]
     assert moved_resource["name"] == "Shared moved"
+    assert workspace_providers.resolve(
+        moved_resource["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] == source_binding
 
     # A complete parent snapshot plus not-found resolve detaches only the deleted occurrence.
     del provider.resources["left-occurrence"]
@@ -980,6 +995,12 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert deleted is not None and deleted["referenceState"] == "detached"
     assert survivor is not None and survivor["referenceState"] == "current"
     assert canonical is not None and canonical["referenceState"] == "current"
+    assert workspace_providers.resolve(
+        left["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] is None
+    assert workspace_providers.resolve(
+        right["id"], uid=metadb.DEFAULT_USER_ID
+    )["canonicalSourceBinding"] == source_binding
 
     # Canonical outage/recovery is shared state and does not detach the surviving placement.
     dataset_detail = provider.dataset_detail
@@ -1003,6 +1024,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         mount_id=mount_id,
         provider_dataset_id="canonical-dataset",
     )["referenceState"] == "current"
+    assert metadb.workspace_provider_source_binding(
+        right["bindingId"]) == source_binding
 
     # Reopening the metadata engine preserves both the tombstone and shared canonical state.
     assert metadb._engine is not None
@@ -1015,6 +1038,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         mount_id=mount_id,
         provider_dataset_id="canonical-dataset",
     )["referenceState"] == "current"
+    assert metadb.workspace_provider_source_binding(
+        right["bindingId"]) == source_binding
 
     # Conflicting canonical facts fail closed without replacing the retained URI/schema evidence.
     provider.resources["right-occurrence"] = CatalogResource(
@@ -1034,6 +1059,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert conflicted is not None
     assert conflicted["referenceState"] == "provider_error"
     assert conflicted["uri"] == "file:///canonical-dataset.parquet"
+    assert conflicted["sourceBindingId"] == source_binding["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(right["bindingId"]) is None
 
     # The mount-scoped placement key does not fork when operator configuration changes provider.
     provider_changed = metadb.workspace_provider_cache_resource(
@@ -1054,6 +1081,134 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
             metadb.WorkspaceProviderBinding.active.is_(True),
         )))
         assert len(occurrences) == 1
+
+
+def test_provider_source_binding_is_mount_scoped_and_canonical_tombstone_is_aba_fenced(
+        workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    root = metadb.local_workspace_root()
+    common = {
+        "provider": "fixture",
+        "container_id": root["id"],
+        "kind": "dataset",
+        "provider_dataset_id": f"dataset-{token}",
+        "uri": f"secret://credentials@host/{token}/physical.parquet",
+        "columns": [{"name": "sensitive_display_column", "type": "int64"}],
+    }
+    first = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-left-{token}",
+        name=f"Display left {token}",
+    )
+    second = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-right-{token}",
+        name=f"Display right {token}",
+    )
+    other_mount = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-b-{token}",
+        provider_placement_id=f"placement-left-{token}",
+        name=f"Display left {token}",
+    )
+
+    first_source = metadb.workspace_provider_source_binding(first["bindingId"])
+    assert first_source == metadb.workspace_provider_source_binding(second["bindingId"])
+    assert first_source is not None
+    assert first_source != metadb.workspace_provider_source_binding(
+        other_mount["bindingId"])
+    encoded = json.dumps(first_source, sort_keys=True)
+    for forbidden in (
+        token, "secret", "credentials", "physical", "sensitive_display_column",
+        "placement-left", "placement-right", "Display",
+    ):
+        assert forbidden not in encoded
+
+    canonical_before = metadb.workspace_provider_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+    )
+    assert canonical_before is not None
+    metadb.workspace_provider_mark_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+        state="detached",
+        error="provider reused canonical identity",
+    )
+    reused = metadb.workspace_provider_cache_resource(
+        **common,
+        mount_id=f"mount-a-{token}",
+        provider_placement_id=f"placement-reused-{token}",
+        name=f"Reused display {token}",
+    )
+    canonical_after = metadb.workspace_provider_dataset(
+        mount_id=f"mount-a-{token}",
+        provider_dataset_id=f"dataset-{token}",
+    )
+    assert canonical_after is not None
+    assert canonical_after["referenceState"] == "detached"
+    assert canonical_after["sourceBindingId"] == canonical_before["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(first["bindingId"]) is None
+    assert metadb.workspace_provider_source_binding(second["bindingId"]) is None
+    assert metadb.workspace_provider_source_binding(reused["bindingId"]) is None
+
+
+def test_postgres_concurrent_placements_join_one_provider_source_binding(workspace_scope):
+    if metadb._is_sqlite_database():
+        pytest.skip("PostgreSQL canonical Source mint concurrency regression")
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    common = {
+        "mount_id": f"concurrent-source-{token}",
+        "provider": "fixture",
+        "container_id": metadb.LOCAL_WORKSPACE_ROOT_ID,
+        "kind": "dataset",
+        "provider_dataset_id": f"canonical-{token}",
+        "uri": f"fixture://canonical-{token}",
+        "columns": [{"name": "value", "type": "int64"}],
+    }
+    start = threading.Barrier(3)
+    results: list[dict | Exception] = []
+
+    def cache(placement: str) -> None:
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_provider_cache_resource(
+                **common,
+                provider_placement_id=placement,
+                name=placement,
+            ))
+        except Exception as exc:  # noqa: BLE001 - concurrent failures are asserted below
+            results.append(exc)
+
+    threads = [
+        threading.Thread(target=cache, args=(f"left-{token}",)),
+        threading.Thread(target=cache, args=(f"right-{token}",)),
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    assert len(results) == 2
+    assert all(isinstance(result, dict) for result in results), results
+    bindings = [
+        metadb.workspace_provider_source_binding(result["bindingId"])
+        for result in results if isinstance(result, dict)
+    ]
+    assert bindings[0] is not None
+    assert bindings[0] == bindings[1]
+    with metadb.session() as session:
+        canonical_rows = list(session.scalars(select(
+            metadb.WorkspaceProviderDataset).where(
+                metadb.WorkspaceProviderDataset.mount_id == common["mount_id"],
+                metadb.WorkspaceProviderDataset.provider_dataset_id
+                == common["provider_dataset_id"],
+            )))
+    assert len(canonical_rows) == 1
 
 
 @pytest.mark.parametrize("conflicting_fact", ["uri", "columns"])
