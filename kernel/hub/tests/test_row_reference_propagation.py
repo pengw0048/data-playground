@@ -302,6 +302,31 @@ def test_union_requires_complete_compatible_reference_evidence():
     assert _row_reference(union("missing"), "union", "owner_id") is None
 
 
+def test_relational_declaration_cannot_override_conflicting_union_references():
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="left-owners")],
+        "right": [_column("owner_id", target="right-owners")],
+    })
+    graph = Graph.model_validate({
+        "id": "forged-union-declaration", "version": 1,
+        "nodes": [
+            _node("left", "source", {"uri": "left"}),
+            _node("right", "source", {"uri": "right"}),
+            _node("union", "union", {"outputSchema": [{
+                "name": "owner_id",
+                "type": "int64",
+                "rowReference": _reference("forged-owners", provenance="declared"),
+            }]}),
+        ],
+        "edges": [_edge("left", "union"), _edge("right", "union")],
+    })
+
+    schema = _schemas(graph, adapter)
+    assert schema["union"][0]["name"] == "owner_id"
+    assert schema["union"][0]["type"] == "int"
+    assert _row_reference(schema, "union", "owner_id") is None
+
+
 def test_declared_sql_and_code_references_round_trip_while_opaque_code_is_unknown():
     adapter = ReferenceAdapter({
         "left": [_column("owner_id", target="source-owners")],
@@ -427,6 +452,67 @@ def test_stale_declared_schema_hash_suppresses_only_row_reference(
 
     assert schema[0]["name"] == "copied"
     assert schema[0]["type"] == expected_type
+    assert schema[0]["rowReference"] is None
+
+
+def test_sql_staleness_uses_sql_not_an_unrelated_code_field():
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="source-owners")],
+    })
+    pinned_sql = "SELECT owner_id AS copied FROM input"
+    graph = Graph.model_validate({
+        "id": "sql-code-field-staleness", "version": 1,
+        "nodes": [
+            _node("source", "source", {"uri": "left"}),
+            _node("sql", "sql", {
+                "code": pinned_sql,
+                "sql": "SELECT owner_id AS actual FROM input",
+                "outputSchema": [{
+                    "name": "actual",
+                    "type": "string",
+                    "rowReference": _reference("declared-owners", provenance="declared"),
+                }],
+                "outputSchemaCodeHash": _code_hash(pinned_sql),
+            }),
+        ],
+        "edges": [_edge("source", "sql")],
+    })
+
+    schema = _schemas(graph, adapter)["sql"]
+    assert schema[0]["name"] == "actual"
+    assert schema[0]["type"] == "int"
+    assert schema[0]["rowReference"] is None
+
+
+@pytest.mark.parametrize("code", [None, "previous section script"])
+def test_section_staleness_uses_script_not_code(code: str | None):
+    adapter = ReferenceAdapter({
+        "left": [_column("owner_id", target="source-owners")],
+    })
+    pinned_script = "emit(inputs['in'])"
+    config = {
+        "script": "emit(inputs['in'].project('owner_id AS actual'))",
+        "outputSchema": [{
+            "name": "copied",
+            "type": "int64",
+            "rowReference": _reference("declared-owners", provenance="declared"),
+        }],
+        "outputSchemaCodeHash": _code_hash(pinned_script),
+    }
+    if code is not None:
+        config["code"] = code
+    graph = Graph.model_validate({
+        "id": "section-script-staleness", "version": 1,
+        "nodes": [
+            _node("source", "source", {"uri": "left"}),
+            _node("section", "section", config),
+        ],
+        "edges": [_edge("source", "section")],
+    })
+
+    schema = _schemas(graph, adapter)["section"]
+    assert schema[0]["name"] == "copied"
+    assert schema[0]["type"] == "int64"
     assert schema[0]["rowReference"] is None
 
 

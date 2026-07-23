@@ -27,24 +27,24 @@ import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 export const INSPECTOR_W = 300
 export const INSPECTOR_COLLAPSED_W = 44
 
-// Built-in node kinds with a hand-built card — everything else the app renders is a PLUGIN node.
-const BUILTIN_KINDS = new Set([
-  'source', 'filter', 'select', 'sort', 'dedup', 'join', 'sql', 'aggregate', 'sample',
-  'metric', 'chart', 'write', 'note', 'section', 'code', 'transform', 'vector-search',
-])
 // Opaque code outputs and SQL projections can carry an explicit output contract. SQL remains
 // physically typeable without one, but its row-reference provenance is unknown unless declared.
-// Plugin kinds execute too, so any non-built-in kind is contract-capable as well.
+// Other contract-capable kinds must be backend-registered plugins, not merely unknown node names.
 const CONTRACT_KINDS = new Set(['transform', 'vector-search', 'sql'])
-export const canDeclareSchemaKind = (kind: string) => CONTRACT_KINDS.has(kind) || !BUILTIN_KINDS.has(kind)
+export const canDeclareSchemaKind = (kind: string) => (
+  CONTRACT_KINDS.has(kind) || getSpec(kind)?.source?.startsWith('plugin:') === true
+)
 export const canDeclareNodeSchema = (kind: string, outputCount: number) => (
   canDeclareSchemaKind(kind)
-  && !['source', 'write', 'note', 'section'].includes(kind)
   && outputCount === 1
 )
 
-const schemaContractStale = (cfg: Record<string, unknown>): boolean => {
-  const contractText = cfg.code ?? cfg.sql
+const schemaContractText = (kind: string, cfg: Record<string, unknown>): unknown => (
+  kind === 'sql' ? cfg.sql : cfg.code
+)
+
+const schemaContractStale = (kind: string, cfg: Record<string, unknown>): boolean => {
+  const contractText = schemaContractText(kind, cfg)
   const pinnedHash = cfg.outputSchemaCodeHash
   return Array.isArray(cfg.outputSchema) && cfg.outputSchema.length > 0
     && contractText != null && typeof pinnedHash === 'string' && pinnedHash.length > 0
@@ -142,9 +142,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
 
-  // a code op / plugin kind can carry a declared/inferred schema contract; relational ops are always
-  // statically typed, and source/write/note/section are handled elsewhere.
-  const schemaCapableKind = canDeclareSchemaKind(kind) && !['source', 'write', 'note', 'section'].includes(kind)
+  // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
+  const schemaCapableKind = canDeclareSchemaKind(kind)
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
   const perPortSchemaDeferred = schemaCapableKind && outputPorts.length > 1
   // OUTPUT port schema: prefer the node's own declared contract (exact user types, instant) over the
@@ -153,7 +152,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
   const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
-    kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(cfg)
+    kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(kind, cfg)
       && !node.data.bypassed && outputPorts.length === 1
       ? declaredOut
       : allSchemas[nodeId]?.[portId]
@@ -674,10 +673,10 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
   const refName = os && !Array.isArray(os) && typeof os === 'object' ? os.ref : undefined
   const enforce = !!cfg.enforceSchema
   const source = cfg.outputSchemaSource as string | undefined
-  const contractText = cfg.code ?? cfg.sql
+  const contractText = schemaContractText(node?.type ?? '', cfg)
   const code = contractText == null ? null : String(contractText)
   // the contract may be stale if the code/SQL changed since it was pinned
-  const stale = schemaContractStale(cfg)
+  const stale = schemaContractStale(node?.type ?? '', cfg)
   const [names, setNames] = useState<string[]>([])       // named contracts available to reference
   const [refCols, setRefCols] = useState<ColumnSchema[]>([])
   const inferRequestGeneration = useRef(0)

@@ -15,6 +15,7 @@ from collections import deque
 from hub import db, graph as g
 from hub.executors.engine import (
     BuildEngine,
+    _CODE_KINDS,
     _bypassed,
     _disabled,
     declared_schema,
@@ -234,7 +235,25 @@ def _code_hash(value: str) -> str:
     return out
 
 
-def _declared_output(node: GraphNode) -> list[ColumnSchema] | None:
+def _contract_text(node: GraphNode, config: dict) -> object:
+    if node.type == "sql":
+        return config.get("sql")
+    if node.type == "section":
+        return config.get("script")
+    return config.get("code")
+
+
+def _declared_output(
+        node: GraphNode, node_builders: dict | None = None,
+) -> list[ColumnSchema] | None:
+    """Return a declaration only for node kinds whose output contract is authoritative.
+
+    Relational nodes derive their references from their inputs.  The engine already reserves
+    ``outputSchema`` for code kinds and registered plugin builders; SQL additionally uses it as
+    a reference contract while retaining its observed names and physical types.
+    """
+    if node.type != "sql" and node.type not in _CODE_KINDS and node.type not in (node_builders or {}):
+        return None
     declaration = declared_schema(node)
     if declaration is None:
         return None
@@ -245,9 +264,7 @@ def _declared_output(node: GraphNode) -> list[ColumnSchema] | None:
     raw_config = (
         node.data.get("config", {}) if isinstance(node.data, dict) else {}
     )
-    contract_text = raw_config.get("code")
-    if contract_text is None:
-        contract_text = raw_config.get("sql")
+    contract_text = _contract_text(node, raw_config)
     pinned_hash = raw_config.get("outputSchemaCodeHash")
     if (
         contract_text is not None
@@ -389,6 +406,7 @@ def derive_reference_schema(
         inputs: list[list[ColumnSchema] | None],
         *,
         source_evidence: list[ColumnSchema] | None = None,
+        node_builders: dict | None = None,
 ) -> list[ColumnSchema]:
     """Apply the one provider-neutral reference-propagation contract for a Canvas node."""
     if _disabled(node):
@@ -408,7 +426,7 @@ def derive_reference_schema(
             and _same_names(observed, source_evidence)
             else _unknown_references(observed)
         )
-    declaration = _declared_output(node)
+    declaration = _declared_output(node, node_builders)
     if declaration is not None:
         return _matching_reference_columns(observed, declaration)
     if node.type in _UNTYPED or node.type == "sql":
@@ -451,6 +469,7 @@ def _derive_graph_schemas(
         observed: dict[str, list[ColumnSchema] | None],
         source_evidence: dict[str, list[ColumnSchema] | None],
         node_ids: set[str] | None = None,
+        node_builders: dict | None = None,
 ) -> dict[str, list[ColumnSchema] | None]:
     selected = (
         graph.nodes
@@ -474,7 +493,8 @@ def _derive_graph_schemas(
         inputs = [derived.get(edge.source) for edge in incoming[node_id]]
         derived[node_id] = (
             derive_reference_schema(
-                node, raw, inputs, source_evidence=source_evidence.get(node_id))
+                node, raw, inputs, source_evidence=source_evidence.get(node_id),
+                node_builders=node_builders)
             if raw is not None else None
         )
         for child in children[node_id]:
@@ -557,7 +577,7 @@ def derived_schemas_for_engine(
         except Exception:  # noqa: BLE001 - unavailable nodes are explicit unknowns
             observed[node.id] = None
     return _derive_graph_schemas(
-        graph, observed, evidence, {node.id for node in nodes})
+        graph, observed, evidence, {node.id for node in nodes}, node_builders)
 
 
 def schema_for_graph(

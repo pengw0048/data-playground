@@ -11,15 +11,28 @@ const cols: ColumnSchema[] = [
   { name: 'amount', type: 'double', capabilities: [] },
 ]
 
+function registerSpec(kind: string, source?: string) {
+  register({
+    kind, title: kind, category: 'compute', inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+    canBypass: false, blurb: '', source,
+    defaultData: () => ({ title: kind, status: 'draft', history: [], config: {} }),
+  }, () => null)
+}
+
 describe('canDeclareSchemaKind — which kinds can carry a schema contract', () => {
-  it('is true for code ops + any plugin kind', () => {
+  it('is true for code ops + backend-owned plugin kinds', () => {
+    registerSpec('my_plugin_node', 'plugin:test')
     for (const k of ['transform', 'vector-search', 'sql', 'my_plugin_node']) {
       expect(canDeclareSchemaKind(k)).toBe(true)
     }
   })
-  it('is false for relational / io / annotation built-ins (never a phantom contract editor)', () => {
-    for (const k of ['source', 'filter', 'select', 'sort', 'dedup', 'join', 'aggregate',
-      'sample', 'metric', 'chart', 'write', 'note', 'section', 'code']) {
+  it('is false for generic built-ins, whether source is builtin or omitted', () => {
+    for (const k of ['union', 'window', 'fill', 'unnest', 'unpivot', 'assert']) {
+      registerSpec(k, 'builtin')
+      expect(canDeclareSchemaKind(k)).toBe(false)
+    }
+    registerSpec('pivot')
+    for (const k of ['pivot', 'unknown_node']) {
       expect(canDeclareSchemaKind(k)).toBe(false)
     }
   })
@@ -46,9 +59,17 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
           data: {
             title: 'sql', status: 'draft', history: [],
             config: {
+              code: 'SELECT owner_id AS copied FROM input',
               sql: 'SELECT owner_id AS actual FROM input',
-              outputSchema: [{ name: 'declared', type: 'string', capabilities: [] }],
-              outputSchemaCodeHash: codeHash('SELECT owner_id FROM input'),
+              outputSchema: [{
+                name: 'actual', type: 'string', capabilities: [],
+                rowReference: {
+                  target: { kind: 'canonical', datasetId: 'stale-target' },
+                  keyFields: ['id'],
+                  provenance: 'declared',
+                },
+              }],
+              outputSchemaCodeHash: codeHash('SELECT owner_id AS copied FROM input'),
             },
           },
         }],
@@ -61,13 +82,16 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     expect(screen.getByText(/SQL changed since this contract was pinned/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for actual' }))
+    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
 
   it('uses the server-derived reference fact for a stale plugin contract', () => {
     register({
       kind: 'stale-contract-plugin', title: 'plugin', category: 'compute',
       inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
-      canBypass: false, blurb: '',
+      canBypass: false, blurb: '', source: 'plugin:test',
       defaultData: () => ({ title: 'plugin', status: 'draft', history: [], config: {} }),
     }, () => null)
     useStore.setState({
@@ -105,6 +129,53 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
     expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
   })
+
+  it('uses the server schema instead of a forged contract on a conflicting Union', () => {
+    register({
+      kind: 'union', title: 'union', category: 'compute', source: 'builtin',
+      inputs: [{ id: 'in', wire: 'dataset', multi: true }],
+      outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'union', status: 'draft', history: [], config: {} }),
+    }, () => null)
+    useStore.setState({
+      selectedIds: ['union'],
+      canvasRole: 'owner',
+      doc: {
+        id: 'conflicting-union', name: 'Conflicting Union', version: 1, requirements: [],
+        edges: [
+          { id: 'left-union', source: 'left', target: 'union', data: { wire: 'dataset' } },
+          { id: 'right-union', source: 'right', target: 'union', data: { wire: 'dataset' } },
+        ],
+        nodes: [
+          { id: 'left', type: 'source', position: { x: 0, y: 0 }, data: { title: 'left', status: 'draft', history: [], config: {} } },
+          { id: 'right', type: 'source', position: { x: 0, y: 0 }, data: { title: 'right', status: 'draft', history: [], config: {} } },
+          {
+            id: 'union', type: 'union', position: { x: 0, y: 0 },
+            data: {
+              title: 'union', status: 'draft', history: [],
+              config: {
+                outputSchema: [{
+                  name: 'owner_id', type: 'string', capabilities: [],
+                  rowReference: {
+                    target: { kind: 'canonical', datasetId: 'forged-target' },
+                    keyFields: ['id'], provenance: 'declared',
+                  },
+                }],
+              },
+            },
+          },
+        ],
+      },
+      runs: {},
+      schemas: { union: { out: [{ name: 'owner_id', type: 'int', capabilities: [] }] } },
+    } as any)
+
+    render(<Inspector />)
+    fireEvent.click(screen.getByTitle('Show columns'))
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for owner_id' }))
+    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.queryByText(/forged-target/i)).not.toBeInTheDocument()
+  })
 })
 
 describe('Inspector — effective named outputs', () => {
@@ -140,7 +211,7 @@ describe('Inspector — effective named outputs', () => {
     register({
       kind: 'inspector-multi-plugin', title: 'multi', category: 'compute', inputs: [],
       outputs: [{ id: 'left', wire: 'dataset' }, { id: 'right', wire: 'dataset' }],
-      canBypass: false, blurb: '',
+      canBypass: false, blurb: '', source: 'plugin:test',
       defaultData: () => ({ title: 'multi', status: 'draft', history: [], config: {} }),
     }, () => null)
     selectNode('inspector-multi-plugin', undefined)
