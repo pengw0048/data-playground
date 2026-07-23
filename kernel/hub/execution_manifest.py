@@ -167,6 +167,11 @@ def _canonical_graph(
             config.pop("_input_artifact_uri", None)
             config.pop("_input_provider_uri", None)
             config.pop("_input_provider_preview_uri", None)
+            # A provider placement is display/navigation context only. The admitted exact ref is
+            # the canonical execution identity and must not retain its originating occurrence.
+            config.pop("providerResourceRef", None)
+            config.pop("providerMountId", None)
+            config.pop("providerName", None)
             config["datasetRef"] = {
                 "kind": "exact",
                 "datasetId": input_ref["dataset_id"],

@@ -339,7 +339,10 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
         provider_placement_id="provider-dataset",
         provider_dataset_id="provider-dataset", uri="test-provider://provider-dataset",
         kind="dataset", name="Provider dataset")
-    logical_uri = workspace_providers.provider_dataset_uri(binding["bindingId"])
+    source_binding = metadb.workspace_provider_source_binding(binding["bindingId"])
+    assert source_binding is not None
+    logical_uri = workspace_providers.provider_dataset_uri(
+        source_binding["mountId"], source_binding["sourceBindingId"])
     physical_uri = "test-provider://provider-dataset"
 
     class ExactProviderAdapter:
@@ -389,7 +392,7 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
     source_config = graph.nodes[0].data["config"]
     source_config["uri"] = logical_uri
     source_config["datasetRef"] = {
-        "kind": "exact", "datasetId": f"workspace-provider:{binding['bindingId']}",
+        "kind": "exact", "datasetId": workspace_providers.provider_dataset_identity(logical_uri),
         "revisionId": "v1",
     }
     source_config["providerReadMode"] = "exact"

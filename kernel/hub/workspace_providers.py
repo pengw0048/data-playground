@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import concurrent.futures
 import functools
 import hashlib
@@ -168,7 +169,7 @@ def _decode_external_identity(identity: str) -> tuple[str, str, str]:
         encoded = identity.removeprefix(_EXTERNAL_PREFIX)
         raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
         mount_id, resource_id, binding_id = json.loads(raw)
-    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
         raise KeyError("invalid external Workspace resource reference") from exc
     if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
             or not isinstance(resource_id, str) or not resource_id or len(resource_id) > 512):
@@ -179,12 +180,29 @@ def _decode_external_identity(identity: str) -> tuple[str, str, str]:
     return mount_id, resource_id, binding_id
 
 
-def provider_dataset_uri(binding_id: str) -> str:
-    """Return the only provider Source identity persisted in a Canvas document."""
-    if (len(binding_id) != 32
-            or any(char not in "0123456789abcdef" for char in binding_id)):
+def _source_identity_token(mount_id: str, source_binding_id: str) -> str:
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or len(source_binding_id) != 32
+            or any(char not in "0123456789abcdef" for char in source_binding_id)):
         raise ValueError("invalid Workspace provider dataset binding")
-    return f"{_PROVIDER_DATASET_URI_PREFIX}{binding_id}"
+    return base64.urlsafe_b64encode(json.dumps(
+        [mount_id, source_binding_id], separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def _decode_source_identity_token(token: str) -> tuple[str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        mount_id, source_binding_id = json.loads(raw)
+        if _source_identity_token(mount_id, source_binding_id) != token:
+            raise ValueError("non-canonical Workspace provider dataset binding")
+    except (TypeError, ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise ProviderDatasetUnavailable("provider dataset binding is invalid") from exc
+    return mount_id, source_binding_id
+
+
+def provider_dataset_uri(mount_id: str, source_binding_id: str) -> str:
+    """Return the placement-independent provider Source URI persisted in a Canvas."""
+    return f"{_PROVIDER_DATASET_URI_PREFIX}{_source_identity_token(mount_id, source_binding_id)}"
 
 
 def is_provider_dataset_uri(uri: str) -> bool:
@@ -195,14 +213,22 @@ def provider_dataset_identity(uri: str) -> str | None:
     """Map one synthetic Source URI to its ABA-fenced Workspace dataset identity."""
     if not is_provider_dataset_uri(uri):
         return None
-    binding_id = uri.removeprefix(_PROVIDER_DATASET_URI_PREFIX)
-    if (len(binding_id) != 32
-            or any(char not in "0123456789abcdef" for char in binding_id)):
-        raise ProviderDatasetUnavailable("provider dataset binding is invalid")
-    binding = metadb.workspace_provider_binding(binding_id)
-    if binding is None or binding["kind"] != "dataset":
+    mount_id, source_binding_id = _decode_source_identity_token(
+        uri.removeprefix(_PROVIDER_DATASET_URI_PREFIX))
+    binding = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if binding is None:
         raise ProviderDatasetGone("provider dataset binding is unavailable")
-    return f"workspace-provider:{binding_id}"
+    return f"workspace-provider:{_source_identity_token(mount_id, source_binding_id)}"
+
+
+def provider_dataset_uri_for_identity(dataset_id: str) -> str | None:
+    """Restore the logical URI from one canonical DatasetRef identity, if provider-owned."""
+    prefix = "workspace-provider:"
+    if not dataset_id.startswith(prefix):
+        return None
+    _decode_source_identity_token(dataset_id.removeprefix(prefix))
+    return f"{_PROVIDER_DATASET_URI_PREFIX}{dataset_id.removeprefix(prefix)}"
 
 
 class _BoundProviderDatasetAdapter:
@@ -214,7 +240,8 @@ class _BoundProviderDatasetAdapter:
 
     _URI_METHODS = {
         "scan", "preview_scan", "schema", "count", "metadata_count", "fingerprint",
-        "resolve_revision", "open_revision", "preview_revision",
+        "resolve_revision", "open_revision", "preview_revision", "revision_history",
+        "revision_detail",
     }
 
     def __init__(self, source_uri: str, physical_uri: str, adapter: object):
@@ -227,7 +254,7 @@ class _BoundProviderDatasetAdapter:
         return uri == self.source_uri
 
     def __getattr__(self, name: str):
-        if name in {"write", "revision_history", "revision_detail", "nearest"}:
+        if name in {"write", "nearest"}:
             raise AttributeError(f"read-only provider dataset adapter does not expose {name}")
         value = getattr(self.adapter, name)
         if name not in self._URI_METHODS or not callable(value):
@@ -246,77 +273,39 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
     dataset_id = provider_dataset_identity(uri)
     if dataset_id is None:
         raise LookupError("not a Workspace provider dataset URI")
-    binding_id = dataset_id.removeprefix("workspace-provider:")
-    binding = metadb.workspace_provider_binding(binding_id)
-    assert binding is not None
-    if binding["referenceState"] == "detached":
-        raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
-    if binding.get("canonicalReferenceState") == "detached":
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_id.removeprefix("workspace-provider:"))
+    binding = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if binding is None:
         raise ProviderDatasetGone("canonical provider dataset is detached")
+    if binding["referenceState"] != "current":
+        if binding["referenceState"] not in {"offline", "permission_lost"}:
+            raise ProviderDatasetUnavailable("provider dataset metadata is invalid")
     mounts, _invalid = _configured_mounts()
     mounted = next((item for item in mounts if item.mount.id == binding["mountId"]), None)
     if mounted is None or mounted.mount.provider != binding["provider"]:
-        metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error", error="catalog mount is not configured")
         raise ProviderDatasetUnavailable("provider dataset mount is unavailable")
     try:
         provider = _load_provider(mounted.mount.provider)
     except Exception as exc:  # noqa: BLE001 -- activation details/configuration stay sanitized
-        metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error", error=_activation_error())
         raise ProviderDatasetUnavailable(_activation_error()) from exc
-    placement_id = binding["providerPlacementId"]
-    resolved = bounded_resolve(
-        provider, mounted.mount, placement_id,
-        timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
-    )
-    if resolved.state != "ready" or resolved.item is None:
-        state = _reference_state(resolved.failure, resolved.state)
-        metadb.workspace_provider_mark_binding(
-            binding_id, state=state, error=resolved.reason)
-        if state == "permission_lost":
-            raise PermissionError("permission to read provider dataset was lost")
-        if state == "detached":
-            raise ProviderDatasetGone("provider dataset was deleted; relink it explicitly")
-        if state == "offline":
-            raise ProviderDatasetOffline("provider dataset is offline")
-        raise ProviderDatasetUnavailable("provider dataset detail is invalid")
-    occurrence = resolved.item
-    if (occurrence.placement_id != placement_id or occurrence.kind != "dataset"
-            or occurrence.dataset_id is None):
-        metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error",
-            error="catalog provider returned a mismatched dataset binding")
-        raise ProviderDatasetUnavailable("provider returned a mismatched dataset binding")
-    retained_dataset_id = binding.get("providerDatasetId")
-    if retained_dataset_id is not None and occurrence.dataset_id != retained_dataset_id:
-        metadb.workspace_provider_mark_binding(
-            binding_id, state="provider_error",
-            error="catalog provider changed the placement canonical target")
-        raise ProviderDatasetUnavailable("provider placement changed its canonical target")
     result = bounded_dataset_detail(
-        provider, mounted.mount, occurrence.dataset_id,
+        provider, mounted.mount, binding["providerDatasetId"],
         timeout=_INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS,
     )
     if result.state != "ready" or result.item is None:
         if result.failure == "not_found":
-            if retained_dataset_id is not None:
-                metadb.workspace_provider_mark_dataset(
-                    mount_id=mounted.mount.id,
-                    provider_dataset_id=retained_dataset_id,
-                    state="detached",
-                    error=result.reason,
-                )
+            metadb.workspace_provider_mark_dataset(
+                mount_id=mounted.mount.id,
+                provider_dataset_id=binding["providerDatasetId"],
+                state="detached", error=result.reason)
             raise ProviderDatasetGone(
                 "canonical provider dataset was deleted; relink it explicitly")
         state = _reference_state(result.failure, result.state)
-        if retained_dataset_id is not None:
-            metadb.workspace_provider_mark_dataset(
-                mount_id=mounted.mount.id,
-                provider_dataset_id=retained_dataset_id,
-                state=state,
-                error=result.reason,
-            )
+        metadb.workspace_provider_mark_dataset(
+            mount_id=mounted.mount.id, provider_dataset_id=binding["providerDatasetId"],
+            state=state, error=result.reason)
         if state == "permission_lost":
             raise PermissionError("permission to read provider dataset was lost")
         if state == "detached":
@@ -325,29 +314,20 @@ def provider_dataset_adapter(uri: str, resolve_physical: Callable[[str], object]
             raise ProviderDatasetOffline("provider dataset is offline")
         raise ProviderDatasetUnavailable("provider dataset detail is invalid")
     detail = result.item
-    if detail.uri != occurrence.uri or detail.columns != occurrence.columns:
-        if retained_dataset_id is not None:
-            metadb.workspace_provider_mark_dataset(
-                mount_id=mounted.mount.id,
-                provider_dataset_id=retained_dataset_id,
-                state="provider_error",
-                error="catalog provider returned conflicting canonical dataset facts",
-            )
+    if (detail.dataset_id != binding["providerDatasetId"] or detail.uri != binding["uri"]
+            or metadb._workspace_provider_columns_doc(detail.columns)
+            != metadb._workspace_provider_columns_doc(binding["columns"])):
+        metadb.workspace_provider_mark_dataset(
+            mount_id=mounted.mount.id, provider_dataset_id=binding["providerDatasetId"],
+            state="provider_error", error="catalog provider returned conflicting canonical dataset facts")
         raise ProviderDatasetUnavailable("provider returned conflicting canonical dataset facts")
-    cached = metadb.workspace_provider_cache_resource(
-        mount_id=mounted.mount.id, provider=mounted.mount.provider,
-        container_id=mounted.container_id,
-        provider_placement_id=occurrence.placement_id,
-        kind=occurrence.kind, name=occurrence.name,
-        parent_provider_placement_id=occurrence.parent_placement_id,
-        parent_binding_id=binding.get("parentBindingId"),
-        provider_dataset_id=detail.dataset_id,
-        uri=detail.uri,
-        columns=detail.columns,
-    )
-    if (cached["bindingId"] != binding_id or cached["referenceState"] != "current"
-            or cached.get("canonicalReferenceState") != "current"):
-        raise ProviderDatasetUnavailable("provider dataset binding is no longer current")
+    current = metadb.workspace_provider_mark_dataset(
+        mount_id=mounted.mount.id, provider_dataset_id=binding["providerDatasetId"],
+        state="current", error=None)
+    if current["referenceState"] != "current":
+        if current["referenceState"] == "detached":
+            raise ProviderDatasetGone("canonical provider dataset is detached")
+        raise ProviderDatasetUnavailable("provider dataset is no longer current")
     try:
         adapter = resolve_physical(detail.uri)
     except Exception as exc:
@@ -418,13 +398,22 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
         if state == "provider_error":
             raise ProviderDatasetUnavailable("provider dataset metadata is invalid")
         raise ProviderDatasetOffline("provider dataset is offline")
-    binding_id = str(resource.get("bindingId") or "")
-    uri = provider_dataset_uri(binding_id)
+    source_binding = resolution.get("canonicalSourceBinding")
+    if not isinstance(source_binding, dict):
+        source_binding = metadb.workspace_provider_source_binding(
+            str(resource.get("bindingId") or ""))
+    if not isinstance(source_binding, dict):
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    uri = provider_dataset_uri(
+        str(source_binding.get("mountId") or ""),
+        str(source_binding.get("sourceBindingId") or ""))
     adapter = provider_dataset_adapter(uri, resolve_physical)
     dataset_id = provider_dataset_identity(uri)
     assert dataset_id is not None
     config: dict[str, object] = {
         "uri": uri,
+        # Bounded navigation/display context only. The canonical URI/DatasetRef above are the
+        # admission and execution identity; plan/manifest canonicalization strips these fields.
         "providerResourceRef": resource_ref,
         "providerMountId": resource.get("mountId"),
         "providerName": resource.get("provider"),

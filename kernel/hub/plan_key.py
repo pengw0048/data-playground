@@ -57,11 +57,22 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
     def _fold(n, prefix=""):
         data = n.data if isinstance(n.data, dict) else {}
         cfg = data.get("config", {})
+        if n.type == "source" and isinstance(cfg, dict):
+            # Placement is navigation-only for admitted provider Sources.  Do not let a retained
+            # legacy placement hint fork cache identity from the canonical URI/DatasetRef.
+            cfg = {key: value for key, value in cfg.items() if key not in {
+                "providerResourceRef", "providerMountId", "providerName",
+            }}
         # bypassed/disabled/title are SIBLINGS of config on data, and the engine changes the lowered
         # relation based on them (engine.py reads node.data.bypassed / .disabled; a metric node emits its
         # title as the output value) — so they must be in the key, else a toggle or a metric rename serves
         # a stale cached preview/result. Folding title over-invalidates a plain rename (safe: just recompute).
-        flags = f"b{int(bool(data.get('bypassed')))}d{int(bool(data.get('disabled')))}t{data.get('title', '')}"
+        canonical_provider_source = (
+            n.type == "source" and n.parent_id is None
+            and str(cfg.get("uri") or "").startswith("workspace-provider://")
+        )
+        title = "" if canonical_provider_source else data.get("title", "")
+        flags = f"b{int(bool(data.get('bypassed')))}d{int(bool(data.get('disabled')))}t{title}"
         parts.append(f"{prefix}{n.id}:{n.type}:{flags}:{json.dumps(cfg, sort_keys=True, default=str)}")
         if n.type == "source":
             uri = cfg.get("uri")

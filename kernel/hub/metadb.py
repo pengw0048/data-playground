@@ -4204,6 +4204,13 @@ def _dataset_view_source_placement_in_session(s, dataset_id: str):
 
 def dataset_view_source_workspace(dataset_id: str) -> dict:
     """Resolve the current Catalog-overlay container used for server-owned placement."""
+    if str(dataset_id).startswith("workspace-provider:"):
+        # Provider Sources have no locally mutable dataset placement.  Their immutable views live
+        # at the local root; the canonical DatasetRef is the source authority, never an occurrence.
+        return {
+            "sourceRegistrationId": str(dataset_id), "sourcePlacementId": None,
+            "containerId": LOCAL_WORKSPACE_ROOT_ID, "ordinal": 0,
+        }
     with session() as s:
         entry, placement = _dataset_view_source_placement_in_session(s, dataset_id)
         return {
@@ -4223,11 +4230,18 @@ def dataset_view_create(
     if len(definition_doc.encode("utf-8")) > 1_048_576:
         raise ValueError("DatasetView definition exceeds the persisted size limit")
     with _workspace_write_session() as s:
-        entry, source = _dataset_view_source_placement_in_session(s, source_dataset_id)
-        if (entry.registration_id != source_registration_id
-                or source.container_id != expected_container_id):
-            raise WorkspaceVersionConflict("DatasetView source placement changed; retry the request")
-        _workspace_writable_destination_locked(s, source.container_id)
+        provider_source = str(source_dataset_id).startswith("workspace-provider:")
+        if provider_source:
+            if (source_registration_id != str(source_dataset_id)
+                    or expected_container_id != LOCAL_WORKSPACE_ROOT_ID):
+                raise WorkspaceVersionConflict("DatasetView source placement changed; retry the request")
+            _workspace_writable_destination_locked(s, LOCAL_WORKSPACE_ROOT_ID)
+        else:
+            entry, source = _dataset_view_source_placement_in_session(s, source_dataset_id)
+            if (entry.registration_id != source_registration_id
+                    or source.container_id != expected_container_id):
+                raise WorkspaceVersionConflict("DatasetView source placement changed; retry the request")
+            _workspace_writable_destination_locked(s, source.container_id)
 
         dialect = s.get_bind().dialect.name
         if dialect == "postgresql":
@@ -4262,11 +4276,11 @@ def dataset_view_create(
         document = json.loads(definition_doc)
         placement = WorkspacePlacement(
             id=placement_id,
-            container_id=source.container_id,
+            container_id=(LOCAL_WORKSPACE_ROOT_ID if provider_source else source.container_id),
             target_kind="dataset_view",
             target_id=view_id,
             name=_workspace_name(document["name"]),
-            ordinal=source.ordinal,
+            ordinal=0 if provider_source else source.ordinal,
             version=1,
         )
         s.add(placement)
@@ -5711,9 +5725,8 @@ def workspace_provider_mark_binding(binding_id: str, *, state: str, error: str |
 def workspace_provider_mark_dataset(
     *, mount_id: str, provider_dataset_id: str, state: str, error: str | None,
 ) -> dict:
-    if state not in _WORKSPACE_PROVIDER_STATES or state == "current":
+    if state not in _WORKSPACE_PROVIDER_STATES:
         raise ValueError("invalid degraded provider dataset state")
-    del error
     with session() as s:
         row = s.get(
             WorkspaceProviderDataset,
@@ -5724,7 +5737,8 @@ def workspace_provider_mark_dataset(
             raise KeyError("Workspace provider dataset not found")
         if row.state != "detached":
             row.state = state
-            row.last_error = _workspace_provider_safe_error(state)
+            row.last_error = None if state == "current" else _workspace_provider_safe_error(state)
+            row.last_resolved_at = _now()
         return _workspace_provider_dataset_doc(row)
 
 
@@ -5733,6 +5747,28 @@ def workspace_provider_dataset(
     with session() as s:
         row = s.get(WorkspaceProviderDataset, (mount_id, provider_dataset_id))
         return _workspace_provider_dataset_doc(row) if row is not None else None
+
+
+def workspace_provider_dataset_for_source_binding(
+        *, mount_id: str, source_binding_id: str) -> dict | None:
+    """Resolve one current canonical Source generation within its configured mount.
+
+    This is intentionally the reverse of ``workspace_provider_source_binding``.  A source
+    binding is only meaningful with its mount: it must never be searched globally, nor be
+    reconstructed from a placement, URI, display name, or a fresh provider observation.
+    """
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or re.fullmatch(r"[0-9a-f]{32}", str(source_binding_id)) is None):
+        return None
+    with session() as s:
+        row = s.scalar(select(WorkspaceProviderDataset).where(
+            WorkspaceProviderDataset.mount_id == mount_id,
+            WorkspaceProviderDataset.source_binding_id == source_binding_id,
+        ))
+        if (row is None or row.state == "detached" or row.uri is None
+                or row.columns_doc is None):
+            return None
+        return _workspace_provider_dataset_doc(row)
 
 
 def workspace_provider_source_binding(binding_id: str) -> dict | None:

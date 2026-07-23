@@ -871,11 +871,15 @@ def _workspace_provider_dataset_binding(workspace_scope, monkeypatch, provider):
     resource = next(
         item for item in page["items"] if item.get("resourceId") == "dataset-a")
     binding_id = resource["bindingId"]
-    return mount_id, binding_id, workspace_providers.provider_dataset_uri(binding_id)
+    source = workspace_providers.resolve(resource["id"], uid=metadb.DEFAULT_USER_ID)[
+        "canonicalSourceBinding"]
+    assert source is not None
+    return mount_id, binding_id, workspace_providers.provider_dataset_uri(
+        source["mountId"], source["sourceBindingId"])
 
 
 def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
-        workspace_scope, monkeypatch):
+        workspace_scope, tmp_path, monkeypatch):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
     folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-occurrences")
@@ -921,6 +925,53 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert "right-occurrence" not in json.dumps(source_binding)
     assert "canonical-dataset" not in json.dumps(source_binding)
     assert "canonical-dataset.parquet" not in json.dumps(source_binding)
+    path = tmp_path / "canonical.csv"
+    path.write_text("value\n1\n")
+    exact = _ExactFixtureAdapter(str(path))
+    left_source = workspace_providers.provider_dataset_source(
+        left["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
+    right_source = workspace_providers.provider_dataset_source(
+        right["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
+    left_config, right_config = left_source["data"]["config"], right_source["data"]["config"]
+    assert left_config["uri"] == right_config["uri"]
+    assert left_config["datasetRef"] == right_config["datasetRef"]
+    assert left_config["providerResourceRef"] != right_config["providerResourceRef"]
+    from hub.execution_manifest import _canonical_graph
+    from hub.models import Graph
+    from hub.plan_key import plan_hash
+    left_graph = Graph.model_validate({
+        "id": "canonical-provider", "version": 1,
+        "nodes": [{**left_source, "id": "source", "data": {
+            **left_source["data"], "title": "Left placement",
+        }}], "edges": [],
+    })
+    right_graph = left_graph.model_copy(deep=True)
+    right_graph.nodes[0].data["title"] = "Right placement"
+    right_graph.nodes[0].data["config"] = right_config
+    admitted = [{
+        "node_id": "source", "dataset_id": left_config["datasetRef"]["datasetId"],
+        "revision_id": left_config["datasetRef"]["revisionId"], "provider": exact.name,
+        "resolved_at": "2026-07-23T00:00:00Z",
+    }]
+    assert plan_hash(left_graph, "source", lambda _uri: None) == plan_hash(
+        right_graph, "source", lambda _uri: None)
+    contained = left_graph.model_copy(deep=True)
+    contained.nodes[0].parent_id = "section"
+    renamed_contained = contained.model_copy(deep=True)
+    renamed_contained.nodes[0].data["title"] = "Renamed callable input"
+    assert plan_hash(contained, "source", lambda _uri: None) != plan_hash(
+        renamed_contained, "source", lambda _uri: None)
+    local_source = left_graph.model_copy(deep=True)
+    local_source.nodes[0].data["config"]["uri"] = "file:///local.csv"
+    renamed_local = local_source.model_copy(deep=True)
+    renamed_local.nodes[0].data["title"] = "Renamed local input"
+    assert plan_hash(local_source, "source", lambda _uri: None) != plan_hash(
+        renamed_local, "source", lambda _uri: None)
+    canonical = _canonical_graph(left_graph, admitted)
+    assert canonical == _canonical_graph(right_graph, admitted)
+    assert "title" not in canonical["nodes"][0]["data"]
+    assert not {"providerResourceRef", "providerMountId", "providerName"} & set(
+        canonical["nodes"][0]["data"]["config"])
     with metadb.session() as session:
         canonical_rows = list(session.scalars(select(metadb.WorkspaceProviderDataset).where(
             metadb.WorkspaceProviderDataset.mount_id == mount_id)))
@@ -1002,6 +1053,11 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
     assert workspace_providers.resolve(
         right["id"], uid=metadb.DEFAULT_USER_ID
     )["canonicalSourceBinding"] == source_binding
+    # The canonical Source never re-resolves its admission placement. A deleted occurrence cannot
+    # disturb the URI admitted through it while another occurrence still proves the dataset.
+    assert workspace_providers.provider_dataset_adapter(
+        left_source["data"]["config"]["uri"], lambda _uri: object()).source_uri == (
+            right_source["data"]["config"]["uri"])
 
     # Canonical outage/recovery is shared state and does not detach the surviving placement.
     dataset_detail = provider.dataset_detail
@@ -1011,7 +1067,8 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         lambda *_args, **_kwargs: ProviderDatasetDetailResult(
             state="unavailable", reason="provider offline", failure="offline"),
     )
-    survivor_uri = workspace_providers.provider_dataset_uri(right["bindingId"])
+    survivor_uri = workspace_providers.provider_dataset_uri(
+        source_binding["mountId"], source_binding["sourceBindingId"])
     with pytest.raises(workspace_providers.ProviderDatasetOffline):
         workspace_providers.provider_dataset_adapter(survivor_uri, lambda _uri: object())
     assert metadb.workspace_provider_binding(right["bindingId"])["referenceState"] == "current"
@@ -1286,11 +1343,12 @@ def test_provider_dataset_detail_not_found_tombstones_canonical_source_generatio
     resource = next(
         item for item in left_page["items"]
         if item.get("providerPlacementId") == "left-occurrence")
-    binding_id = resource["bindingId"]
-    uri = workspace_providers.provider_dataset_uri(binding_id)
     before = workspace_providers.resolve(resource["id"], uid=metadb.DEFAULT_USER_ID)
     source_binding = before["canonicalSourceBinding"]
     assert source_binding is not None
+    binding_id = resource["bindingId"]
+    uri = workspace_providers.provider_dataset_uri(
+        source_binding["mountId"], source_binding["sourceBindingId"])
 
     # The real fake provider loses its canonical dataset while its stale placement remains visible.
     provider.dataset_ids.remove("canonical-dataset")
@@ -1329,6 +1387,8 @@ def test_provider_dataset_detail_not_found_tombstones_canonical_source_generatio
 
 class _ExactFixtureAdapter:
     name = "fixture-exact"
+    retention_owner = "provider"
+    revision_selectors = frozenset({"exact", "latest"})
 
     def __init__(self, path: str):
         self.path = path
@@ -1410,7 +1470,8 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
     resource = CatalogResource(
         placement_id="dataset-a", dataset_id="dataset-a", kind="dataset",
         name="Provider observations", uri=str(path))
-    monkeypatch.setattr(provider, "_resources", lambda _mount_id: [resource])
+    resources = [resource]
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
         {"id": "provider-use", "provider": "fixture"},
@@ -1455,6 +1516,30 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         assert str(path) not in json.dumps(graph)
         assert config["providerReadMode"] == "exact"
         assert config["datasetRef"]["revisionId"] == "fixture-revision-1"
+        dataset_id = config["datasetRef"]["datasetId"]
+        capabilities = client.get(f"/api/catalog/tables/{dataset_id}/revisions/capabilities")
+        assert capabilities.status_code == 200 and capabilities.json()["datasetViewSave"] is True
+        history = client.get(f"/api/catalog/tables/{dataset_id}/revisions")
+        assert history.status_code == 200 and history.json()["items"][0]["datasetId"] == dataset_id
+        detail = client.get(f"/api/catalog/revisions/{dataset_id}/fixture-revision-1")
+        assert detail.status_code == 200, detail.text
+        missing_detail = client.get(f"/api/catalog/revisions/{dataset_id}/missing-revision")
+        assert missing_detail.status_code == 410, missing_detail.text
+        view = client.post("/api/dataset-views", json={
+            "submissionId": uuid.uuid4().hex, "name": "Provider exact view",
+            "datasetRef": config["datasetRef"], "selectedColumns": ["value"],
+            "predicate": None, "sampling": {"kind": "all"},
+        })
+        assert view.status_code == 201, view.text
+        # Erasing the source placement is deliberately irrelevant to canonical preview/revision/view
+        # reopening; only canonical dataset disappearance may make these unavailable.
+        original_resolve = provider.resolve
+        monkeypatch.setattr(provider, "resolve", lambda *_args, **_kwargs: ProviderResourceResult(
+            state="unavailable", reason="placement deleted", failure="not_found"))
+        assert client.get(f"/api/catalog/tables/{dataset_id}/revisions").status_code == 200
+        assert client.post(f"/api/dataset-views/{view.json()['id']}/preview").status_code == 200
+        monkeypatch.setattr(provider, "resolve", original_resolve)
+        exact_adapter.open_calls.clear()
         exact_adapter.head = "fixture-revision-2"
 
         preview = client.post("/api/run/preview", json={
@@ -1738,7 +1823,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
 
         missing_binding_graph = json.loads(json.dumps(mutable_graph))
         missing_binding_graph["nodes"][0]["data"]["config"]["uri"] = (
-            "workspace-provider://00000000000000000000000000000000")
+            workspace_providers.provider_dataset_uri("provider-use", "0" * 32))
         missing_binding = client.post("/api/run", json={
             "graph": missing_binding_graph, "targetNodeId": mutable_source["id"],
         })
@@ -1799,11 +1884,130 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
         gone = client.post("/api/run", json={
             "graph": graph, "targetNodeId": source["id"],
         })
-        assert gone.status_code == 410, gone.text
-        assert gone.json()["detail"] == "local_run_input_revision_unavailable"
+        # The admission occurrence is detached, but the canonical dataset remains current. This
+        # run now reaches normal exact-capability admission instead of substituting a 410.
+        assert gone.status_code == 409, gone.text
+        assert "mutable-only" in gone.json()["detail"]
         assert "secret" not in gone.text
         assert dispatched is False
         assert set(deps.run_index) == run_index_before
+
+
+def test_canonical_provider_tombstone_closes_source_revision_and_dataset_view(
+        workspace_scope, tmp_path, monkeypatch):
+    path = tmp_path / "tombstone.csv"
+    path.write_text("value\n1\n")
+    root = metadb.local_workspace_root()
+    folder = metadb.workspace_create_container(
+        root["id"], f"canonical-tombstone-{workspace_scope['canvas_id'][-12:]}")
+    provider = _WorkspaceFixtureProvider()
+    resource = CatalogResource(
+        placement_id="dataset-a", dataset_id="dataset-a", kind="dataset",
+        name="Tombstone source", uri=str(path))
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: [resource])
+    mount_id = "m" * 128
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": folder["id"],
+    }]))
+    deps = get_deps()
+    adapter = _ExactFixtureAdapter(str(path))
+    monkeypatch.setattr(deps, "resolve_physical_adapter", lambda _uri: adapter)
+
+    with TestClient(app) as client:
+        page = client.get(f"/api/workspace/containers/{folder['id']}").json()
+        resource_ref = next(
+            item["id"] for item in page["items"] if item.get("mountId") == mount_id)
+        created = client.post("/api/workspace/canvases", json={
+            "containerId": folder["id"],
+            "expectedContainerVersion": page["container"]["version"],
+            "name": "Canonical tombstone", "providerDatasetRefs": [resource_ref],
+        })
+        assert created.status_code == 200, created.text
+        graph = client.get(f"/api/canvas/{created.json()['id']}").json()
+        config = graph["nodes"][0]["data"]["config"]
+        dataset_id = config["datasetRef"]["datasetId"]
+        assert len(dataset_id) > 128
+        view = client.post("/api/dataset-views", json={
+            "submissionId": uuid.uuid4().hex, "name": "Tombstone view",
+            "datasetRef": config["datasetRef"], "selectedColumns": ["value"],
+            "predicate": None, "sampling": {"kind": "all"},
+        })
+        assert view.status_code == 201, view.text
+
+        monkeypatch.setattr(provider, "dataset_detail", lambda *_args, **_kwargs:
+                            ProviderDatasetDetailResult(
+                                state="unavailable", reason="deleted", failure="not_found"))
+        with pytest.raises(workspace_providers.ProviderDatasetGone):
+            deps.resolve_adapter(config["uri"])
+        assert client.get(f"/api/catalog/tables/{dataset_id}/revisions").status_code == 410
+        assert client.get(
+            f"/api/catalog/revisions/{dataset_id}/fixture-revision-1").status_code == 410
+        assert client.post(f"/api/dataset-views/{view.json()['id']}/preview").status_code == 410
+
+
+def test_canonical_provider_token_recovery_and_detach_race(workspace_scope, monkeypatch):
+    mount_id = f"token-{workspace_scope['canvas_id'][-12:]}"
+    calls: list[str] = []
+
+    class Provider:
+        def dataset_detail(self, _mount, dataset_id):
+            calls.append(dataset_id)
+            return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
+                dataset_id=dataset_id, uri=f"fixture://{dataset_id}", columns=[]))
+
+    provider = Provider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+        {"id": mount_id, "provider": "fixture"},
+    ]))
+
+    def cached(dataset_id: str):
+        return metadb.workspace_provider_cache_resource(
+            mount_id=mount_id, provider="fixture", container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+            provider_placement_id=f"placement-{dataset_id}", provider_dataset_id=dataset_id,
+            uri=f"fixture://{dataset_id}", columns=[], kind="dataset", name=dataset_id)
+
+    first = cached("permission")
+    source = metadb.workspace_provider_source_binding(first["bindingId"])
+    assert source is not None
+    uri = workspace_providers.provider_dataset_uri(source["mountId"], source["sourceBindingId"])
+    token = uri.removeprefix("workspace-provider://")
+    assert workspace_providers._decode_source_identity_token(token) == (
+        source["mountId"], source["sourceBindingId"])
+    with pytest.raises(workspace_providers.ProviderDatasetUnavailable):
+        workspace_providers._decode_source_identity_token(token + "=")
+    alias_token = workspace_providers.provider_dataset_uri(
+        "m", source["sourceBindingId"]).removeprefix("workspace-provider://")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    unused_bits = 4 if len(alias_token) % 4 == 2 else 2
+    index = alphabet.index(alias_token[-1])
+    alias = alias_token[:-1] + alphabet[(index & ~((1 << unused_bits) - 1)) | 1]
+    with pytest.raises(workspace_providers.ProviderDatasetUnavailable):
+        workspace_providers._decode_source_identity_token(alias)
+
+    metadb.workspace_provider_mark_dataset(
+        mount_id=mount_id, provider_dataset_id="permission", state="permission_lost", error=None)
+    assert workspace_providers.provider_dataset_adapter(uri, lambda _uri: object()).source_uri == uri
+    assert calls == ["permission"]
+    assert metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="permission")["referenceState"] == "current"
+
+    raced = cached("race")
+    race_source = metadb.workspace_provider_source_binding(raced["bindingId"])
+    assert race_source is not None
+    race_uri = workspace_providers.provider_dataset_uri(
+        race_source["mountId"], race_source["sourceBindingId"])
+    original_mark = metadb.workspace_provider_mark_dataset
+
+    def detach_before_current(**kwargs):
+        if kwargs["state"] == "current":
+            original_mark(**{**kwargs, "state": "detached"})
+        return original_mark(**kwargs)
+
+    monkeypatch.setattr(metadb, "workspace_provider_mark_dataset", detach_before_current)
+    with pytest.raises(workspace_providers.ProviderDatasetGone):
+        workspace_providers.provider_dataset_adapter(race_uri, lambda _uri: object())
 
 
 @pytest.mark.parametrize("config", [[], "", 0, False])

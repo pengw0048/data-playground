@@ -357,9 +357,11 @@ def bind_manifest(
                 # identity embeds the durable binding id, which is sufficient to restore the
                 # synthetic logical URI and re-run the existing binding/adapter exact checks below.
                 try:
-                    source_uri = workspace_providers.provider_dataset_uri(
-                        item["dataset_id"].removeprefix("workspace-provider:"))
-                except ValueError as exc:
+                    source_uri = workspace_providers.provider_dataset_uri_for_identity(
+                        item["dataset_id"])
+                    if source_uri is None:
+                        raise ValueError("not a provider dataset")
+                except (ValueError, workspace_providers.ProviderDatasetUnavailable) as exc:
                     raise LocalRunInputError(
                         "local run input manifest does not match the graph") from exc
                 provider_dataset_id = workspace_providers.provider_dataset_identity(source_uri)
