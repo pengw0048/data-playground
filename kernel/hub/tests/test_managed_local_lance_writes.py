@@ -61,7 +61,10 @@ def lance_destination(tmp_path):
     return lance, catalog, table, binding
 
 
-def _intent(table, binding: dict, key: str, *, revision_id: str | None = None) -> WriteIntent:
+def _intent(
+        table, binding: dict, key: str, *, revision_id: str | None = None,
+        parents: list[str] | None = None, mappings: list[dict] | None = None,
+) -> WriteIntent:
     head = revision_id or LanceAdapter().resolve_revision(table.uri)["revision_id"]
     return WriteIntent(
         destination=WriteDestination(
@@ -77,8 +80,138 @@ def _intent(table, binding: dict, key: str, *, revision_id: str | None = None) -
             kind="exact", dataset_id=binding["dataset_id"], revision_id=head),
         idempotency_key=key,
         provenance=WriteProvenance(publication=LineagePublication(
-            idempotency_key=key, provenance="manual")),
+            idempotency_key=key,
+            provenance="manual",
+            field_mappings=mappings or [],
+        ), parents=parents or []),
     )
+
+
+def _register_source(catalog, tmp_path, name: str, column: str) -> tuple[object, dict]:
+    uri = str(tmp_path / f"{name}.parquet")
+    pq.write_table(pa.table({column: [1]}), uri)
+    table = catalog._add(name=name, uri=uri, strict_probe=True)
+    binding = metadb.catalog_revision_binding_for_uri(uri)
+    assert binding is not None and table.version is not None
+    return table, binding
+
+
+def _mapping(source, binding: dict, source_field: str) -> dict:
+    return {
+        "source_dataset_id": binding["dataset_id"],
+        "source_version": source.version,
+        "source_field": source_field,
+        "source_field_id": None,
+        "destination_field": "value",
+    }
+
+
+def test_lance_append_publishes_two_source_field_lineage_and_replays_exactly(
+        lance_destination, tmp_path):
+    _lance, catalog, table, binding = lance_destination
+    left, left_binding = _register_source(catalog, tmp_path, "left-source", "left_id")
+    right, right_binding = _register_source(catalog, tmp_path, "right-source", "right_id")
+    parents = [left.uri, right.uri]
+    mappings = [
+        _mapping(left, left_binding, "left_id"),
+        _mapping(right, right_binding, "right_id"),
+    ]
+    intent = _intent(
+        table, binding, "lance-field-lineage",
+        parents=parents, mappings=mappings)
+
+    receipt = write_managed_local_lance_append(
+        intent=intent, data=pa.table({"value": [2]}))
+    replayed = write_managed_local_lance_append(
+        intent=intent, data=pa.table({"value": [999]}))
+
+    assert replayed == receipt
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        receipt.dataset_id, receipt.revision_id, ["value"])
+    assert cursor is None and truncated is False and available is True
+    assert {
+        (
+            row["source_dataset_id"],
+            row["source_version"],
+            row["source_field"],
+            row["destination_dataset_id"],
+            row["destination_revision_id"],
+        )
+        for row in rows
+    } == {
+        (
+            left_binding["dataset_id"], left.version, "left_id",
+            receipt.dataset_id, receipt.revision_id,
+        ),
+        (
+            right_binding["dataset_id"], right.version, "right_id",
+            receipt.dataset_id, receipt.revision_id,
+        ),
+    }
+    facts, _after, has_more = metadb.catalog_lineage_facts_page(limit=10)
+    selected = [fact for fact in facts if fact["destination_version"] == receipt.revision_id]
+    assert has_more is False
+    assert len(selected) == 2
+    assert sorted(len(fact["field_mappings"]) for fact in selected) == [1, 1]
+
+    changed_doc = intent.model_dump(by_alias=True, mode="json")
+    changed_mapping = changed_doc["provenance"]["publication"]["fieldMappings"][0]
+    changed_mapping["sourceDatasetId"] = right_binding["dataset_id"]
+    changed_mapping["sourceVersion"] = right.version
+    changed = WriteIntent.model_validate(changed_doc)
+    with pytest.raises(
+            metadb.ManagedLocalWriteConflict, match="idempotency key collision"):
+        write_managed_local_lance_append(
+            intent=changed, data=pa.table({"value": [3]}))
+
+    unmapped = _intent(
+        table, binding, "lance-unmapped",
+        revision_id=receipt.revision_id, parents=[left.uri])
+    unmapped_receipt = write_managed_local_lance_append(
+        intent=unmapped, data=pa.table({"value": [3]}))
+    rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+        unmapped_receipt.dataset_id, unmapped_receipt.revision_id, ["value"])
+    assert rows == [] and cursor is None and truncated is False and available is True
+
+
+@pytest.mark.parametrize("failure", ["wrong-version", "unadmitted"])
+def test_lance_field_lineage_admission_fails_before_provider_commit(
+        lance_destination, tmp_path, monkeypatch, failure):
+    lance, catalog, table, binding = lance_destination
+    source, source_binding = _register_source(
+        catalog, tmp_path, "admitted-source", "source_id")
+    mapping = _mapping(source, source_binding, "source_id")
+    if failure == "wrong-version":
+        mapping["source_version"] = f"{source.version}-wrong"
+        match = "wrong exact source version"
+    else:
+        mapping["source_dataset_id"] = "unadmitted-source"
+        match = "unadmitted source dataset"
+    from lance.fragment import LanceFragment
+
+    allocations = 0
+    create = LanceFragment.create
+
+    def track_create(*args, **kwargs):
+        nonlocal allocations
+        allocations += 1
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(LanceFragment, "create", track_create)
+    with pytest.raises(ValueError, match=match):
+        write_managed_local_lance_append(
+            intent=_intent(
+                table, binding, f"lance-{failure}",
+                parents=[source.uri], mappings=[mapping]),
+            data=pa.table({"value": [2]}),
+        )
+
+    assert allocations == 0
+    assert lance.LanceDataset(table.uri).version == 1
+    with metadb.session() as session:
+        assert session.scalar(select(metadb.ManagedLocalLanceWriteReceipt)) is None
+        assert session.scalar(select(metadb.CatalogLineageFact)) is None
+        assert session.scalar(select(metadb.CatalogFieldLineageProjection)) is None
 
 
 def test_lance_append_receipt_reopens_exact_version_after_head_move_and_restart(

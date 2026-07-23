@@ -32,6 +32,7 @@ from hub.main import app
 from hub.models import (
     CatalogTable,
     Graph,
+    LineagePublication,
     RunOutput,
     RunStatus,
     WriteIntent,
@@ -242,14 +243,35 @@ def _attempt_inventory(handle: dict) -> list[dict]:
 
 
 def _publish_core_revision(
-        storage: LocalStorage, catalog: InMemoryCatalog, logical_uri: str, value: int) -> dict:
+        storage: LocalStorage, catalog: InMemoryCatalog, logical_uri: str, value: int,
+        *, source: dict | None = None,
+) -> dict:
     run_id = f"backup-revision-{uuid.uuid4().hex}"
     artifact = storage.begin_result(f"backup-revision:{logical_uri}", run_id)
     pq.write_table(pa.table({"value": [value]}), artifact)
     storage.commit_result(artifact, run_id)
     try:
+        lineage = None
+        parents = None
+        if source is not None:
+            parents = [source["uri"]]
+            lineage = LineagePublication.model_validate(_lineage(
+                f"backup-revision-lineage-{value}-{uuid.uuid4().hex}",
+                mappings=[{
+                    "source_dataset_id": source["registrationId"],
+                    "source_version": source["version"],
+                    "source_field": "id",
+                    "source_field_id": None,
+                    "destination_field": "value",
+                }],
+            ))
         published = catalog.publish_managed_local_file_output(
-            name="backup_revision", logical_uri=logical_uri, artifact_uri=artifact)
+            name="backup_revision",
+            logical_uri=logical_uri,
+            artifact_uri=artifact,
+            parents=parents,
+            lineage=lineage,
+        )
     except Exception:
         storage.abort_result(artifact, run_id)
         raise
@@ -902,9 +924,9 @@ def _seed_fixture(workspace: Path, storage: LocalStorage, *, claim_uri: str,
     revision_catalog = InMemoryCatalog(str(data_dir), lambda _uri: DuckDBAdapter())
     managed_logical_uri = str(data_dir / "managed-recovery.parquet")
     core_original = _publish_core_revision(
-        storage, revision_catalog, managed_logical_uri, 101)
+        storage, revision_catalog, managed_logical_uri, 101, source=parent)
     core_head = _publish_core_revision(
-        storage, revision_catalog, managed_logical_uri, 202)
+        storage, revision_catalog, managed_logical_uri, 202, source=parent)
     assert core_original["dataset_id"] == core_head["dataset_id"]
 
     ordinary_path = data_dir / "ordinary-input.parquet"
@@ -1332,6 +1354,36 @@ def _assert_revision_recovery(
             if core_logical is not None else None,
             (info["core_original"]["dataset_id"], info["core_head"]["artifact_uri"], "active"),
         )
+        for label, revision in (
+                ("managed original field lineage", info["core_original"]),
+                ("managed head field lineage", info["core_head"])):
+            rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+                revision["dataset_id"], revision["revision_id"], ["value"])
+            check(
+                label,
+                {
+                    "available": available,
+                    "cursor": cursor,
+                    "truncated": truncated,
+                    "mappings": [(
+                        row["source_dataset_id"],
+                        row["source_version"],
+                        row["destination_revision_id"],
+                        row["destination_field"],
+                    ) for row in rows],
+                },
+                {
+                    "available": True,
+                    "cursor": None,
+                    "truncated": False,
+                    "mappings": [(
+                        info["parent_dataset_id"],
+                        "parent-v1",
+                        revision["revision_id"],
+                        "value",
+                    )],
+                },
+            )
 
         tombstone_logical = session.get(
             metadb.CatalogLogicalDataset, info["tombstone"]["dataset_id"])

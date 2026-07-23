@@ -352,6 +352,75 @@ def test_managed_local_field_lineage_uses_exact_retained_revision(
     )
 
 
+def test_managed_local_field_lineage_survives_head_advance_and_restart(
+        local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    source_uri = _register_source(catalog, tmp_path)
+    source = metadb.catalog_get(source_uri)
+    assert source is not None and source["version"] is not None
+    logical_uri = str(tmp_path / "published" / "retained-field-lineage.parquet")
+
+    def publish(value: int) -> dict:
+        run_id = f"retained-field-lineage-{value}-{uuid.uuid4().hex}"
+        artifact = storage.begin_result(f"managed-file:{logical_uri}", run_id)
+        pq.write_table(pa.table({"value": [value]}), artifact)
+        storage.commit_result(artifact, run_id)
+        lineage = LineagePublication.model_validate({
+            "idempotency_key": f"retained-field-lineage-{value}-{uuid.uuid4().hex}",
+            "provenance": "manual",
+            "field_mappings": [{
+                "source_dataset_id": source["registrationId"],
+                "source_version": source["version"],
+                "source_field": "source",
+                "source_field_id": None,
+                "destination_field": "value",
+            }],
+        })
+        try:
+            return catalog.publish_managed_local_file_output(
+                name="retained_field_lineage",
+                logical_uri=logical_uri,
+                artifact_uri=artifact,
+                parents=[source_uri],
+                lineage=lineage,
+            )
+        finally:
+            assert storage.release_result(artifact, run_id) is True
+
+    first = publish(1)
+    second = publish(2)
+    assert first["dataset_id"] == second["dataset_id"]
+
+    def assert_exact_lineage(publication: dict) -> None:
+        rows, cursor, truncated, available = metadb.catalog_field_lineage_page(
+            publication["dataset_id"],
+            publication["revision_id"],
+            ["value"],
+        )
+        assert cursor is None and truncated is False and available is True
+        assert len(rows) == 1
+        assert rows[0]["source_dataset_id"] == source["registrationId"]
+        assert rows[0]["source_version"] == source["version"]
+        assert rows[0]["destination_revision_id"] == publication["revision_id"]
+
+    assert_exact_lineage(first)
+    assert_exact_lineage(second)
+    with metadb.session() as session:
+        assert session.scalar(select(metadb.CatalogColumn).where(
+            metadb.CatalogColumn.uri == first["table"].uri)) is None
+        assert len(list(session.scalars(select(
+            metadb.CatalogFieldLineageProjection).where(
+                metadb.CatalogFieldLineageProjection.destination_dataset_id
+                == first["dataset_id"])))) == 2
+
+    if metadb._engine is not None:
+        metadb._engine.dispose()
+    metadb._engine = metadb._Session = None
+    metadb.init_db()
+    assert_exact_lineage(first)
+    assert_exact_lineage(second)
+
+
 def test_typed_local_write_preconditions_fail_before_artifact_allocation(
         local_catalog, tmp_path, monkeypatch):
     storage, catalog = local_catalog
