@@ -17,6 +17,25 @@ capabilities available to it. Install packages only from parties trusted with th
 canonical [supported deployments and trust model](SUPPORT.md) before exposing a plugin to a shared
 service.
 
+The neutral [`dp_sidecar_fixture`](../examples/plugins/dp_sidecar_fixture/) is the public
+conformance example for a sidecar-producing node. It retains an explicit logical identity and
+emits one derived payload column. It has no merge or destination authority: publish its ordinary
+output, then use the Write inspector's managed-sidecar merge to select an exact core-owned base,
+explicit mappings, and a server-certified preflight.
+
+Install and run the fixture as an entry-point plugin:
+
+```bash
+cd kernel
+uv run --with ../examples/plugins/dp_sidecar_fixture dataplay --workspace /absolute/path/to/workspace
+```
+
+Add a **derive sidecar column** node, set `identity`, `value`, and `output`, then run it to an
+ordinary managed-local Write. The fixture fails if any of those fields is absent; it never passes a
+wide input through as a deceptive sidecar. Its output is only a candidate. Core validates the exact
+sidecar/base identities, coverage, schema, current head, and final receipt when the researcher
+separately configures the managed-sidecar merge.
+
 ## The shape of a plugin
 
 A plugin is a Python package with a `register(reg)` function. Each process that loads the plugin calls

@@ -723,6 +723,17 @@ function WorkspaceDatasets() {
   const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
   const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
   const query = useMemo(() => parseWorkspaceDatasetQuery(encodedQuery), [encodedQuery])
+  // An exact revision deep link is navigation state, not a Catalog filter. Keep it opaque here;
+  // DatasetRevisionHistory verifies/read-opens the revision instead of substituting the current head.
+  const exactRevision = useMemo(() => {
+    const params = new URLSearchParams(encodedQuery)
+    const revisionId = params.get('revision') || undefined
+    const datasetId = params.get('revisionDataset') || undefined
+    return revisionId && datasetId ? { revisionId, datasetId } : undefined
+  }, [encodedQuery])
+  const initialRevisionId = exactRevision?.revisionId
+  const initialRevisionDatasetId = exactRevision?.datasetId
+  const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
   const selectedRegistrationId = requestedResourceId?.startsWith('dataset:')
     ? requestedResourceId.slice('dataset:'.length) : null
   const [datasetAction, setDatasetAction] = useState<{ tables: CatalogTable[] } | null>(null)
@@ -871,12 +882,34 @@ function WorkspaceDatasets() {
     <div className="min-h-0 flex-1">
       <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
         title="Datasets" queryState={query}
-        onQueryStateChange={(next) => setEncodedQuery(serializeWorkspaceDatasetQuery(next))}
+        initialRevisionId={initialRevisionId}
+        initialRevisionDatasetId={initialRevisionDatasetId}
+        onQueryStateChange={(next) => {
+          const params = new URLSearchParams(serializeWorkspaceDatasetQuery(next))
+          if (hasExactRevision) {
+            params.set('revision', initialRevisionId)
+            params.set('revisionDataset', initialRevisionDatasetId)
+          }
+          setEncodedQuery(params.toString())
+        }}
         selectedRegistrationId={selectedRegistrationId}
-        onSelectedTableChange={(table) => {
+        onSelectedTableChange={(table, origin = 'user') => {
           setSelectedWorkspaceTable(table)
+          // Exact revision navigation belongs to the selected route as an atomic pair. A user
+          // close or user-selected replacement leaves that route, while route resolution itself
+          // (including a transient null) must preserve it.
+          if (hasExactRevision && origin === 'user') {
+            const params = new URLSearchParams(serializeWorkspaceDatasetQuery(query))
+            params.delete('revision')
+            params.delete('revisionDataset')
+            setEncodedQuery(params.toString())
+          }
           if (!table) setWorkspaceResource(null)
-          else if (table.registrationId) setWorkspaceResource(`dataset:${table.registrationId}`)
+          else if (table.registrationId) {
+            // A route may canonicalize an old registration or receipt logical id to the current
+            // registration. Only an explicit user selection starts a different dataset journey.
+            setWorkspaceResource(`dataset:${table.registrationId}`)
+          }
           else pushToast('This dataset has no stable Workspace identity', 'error')
         }}
         onUseTables={useTables} onUploadDataset={uploadDataset}

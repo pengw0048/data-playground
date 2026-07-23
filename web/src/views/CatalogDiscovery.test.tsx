@@ -12,7 +12,10 @@ const mocks = vi.hoisted(() => ({
 }))
 vi.mock('../api/client', () => ({
   api: mocks,
-  KernelError: class KernelError extends Error { status = 0 },
+  KernelError: class KernelError extends Error {
+    status: number
+    constructor(status = 0, message = '') { super(message); this.status = status }
+  },
 }))
 
 const store = vi.hoisted(() => ({
@@ -88,6 +91,89 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.renameFolder.mockResolvedValue({ ok: true })
     mocks.deleteFolder.mockResolvedValue({ ok: true })
     store.uploadDataset.mockResolvedValue(null)
+  })
+
+  it('uses the selected registration normally when no complete exact revision pair is present', async () => {
+    mocks.tableByRegistration.mockResolvedValue({ ...TABLE, id: 'tbl_orders', registrationId: 'registration-path' })
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-path" onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+    await screen.findByRole('dialog', { name: 'orders' })
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith('registration-path')
+    expect(mocks.table).not.toHaveBeenCalled()
+  })
+
+  it('uses the exact receipt identity rather than a mismatched path registration and canonicalizes the path', async () => {
+    const onSelectedTableChange = vi.fn()
+    mocks.tableByRegistration.mockResolvedValue({ ...TABLE, id: 'tbl_orders', registrationId: 'registration-current' })
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id"
+      onSelectedTableChange={onSelectedTableChange} onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+    await screen.findByRole('dialog', { name: 'orders' })
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith('logical-receipt-id')
+    expect(mocks.tableByRegistration).not.toHaveBeenCalledWith('registration-other')
+    expect(onSelectedTableChange).toHaveBeenCalledWith(
+      expect.objectContaining({ registrationId: 'registration-current' }), 'route',
+    )
+  })
+
+  it('re-resolves an already selected path when a same-page exact receipt pair names another dataset', async () => {
+    mocks.tableByRegistration.mockImplementation(async (registrationId: string) => registrationId === 'registration-path'
+      ? TABLE_2
+      : { ...TABLE, id: 'tbl_orders', registrationId: 'registration-current' })
+    const props = { sourceIdentity: store.kernelInfo, foldersMutable: true,
+      selectedRegistrationId: 'registration-path', onUseTables: vi.fn(), onUploadDataset: store.uploadDataset }
+    const { rerender } = render(<CatalogDiscovery {...props} />)
+    await screen.findByRole('dialog', { name: 'customers' })
+    expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('registration-path')
+
+    rerender(<CatalogDiscovery {...props} initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id" />)
+    await screen.findByRole('dialog', { name: 'orders' })
+    expect(mocks.tableByRegistration).toHaveBeenLastCalledWith('logical-receipt-id')
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([403, 404])('keeps exact receipt lookup failures (%i) visible without trying the path registration', async (status) => {
+    mocks.tableByRegistration.mockRejectedValue(Object.assign(new Error(`receipt ${status} unavailable`), { status }))
+    render(<CatalogDiscovery sourceIdentity={store.kernelInfo} foldersMutable
+      selectedRegistrationId="registration-other" initialRevisionId="rev-receipt" initialRevisionDatasetId="logical-receipt-id"
+      onUseTables={vi.fn()} onUploadDataset={store.uploadDataset} />)
+    expect(await screen.findByRole('alert')).toHaveTextContent(`receipt ${status} unavailable`)
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
+    expect(mocks.tableByRegistration).toHaveBeenCalledWith('logical-receipt-id')
+    expect(mocks.tableByRegistration).not.toHaveBeenCalledWith('registration-other')
+  })
+
+  it('re-resolves a later exact receipt link after its earlier route was canonicalized', async () => {
+    const logical = 'logical-receipt-id'
+    const onSelectedTableChange = vi.fn()
+    mocks.tableByRegistration.mockImplementation(async (registrationId: string) => registrationId === 'registration-customers'
+      ? TABLE_2
+      : { ...TABLE, id: 'tbl_orders', registrationId: 'registration-current' })
+    const props = {
+      sourceIdentity: store.kernelInfo, foldersMutable: true,
+      onUseTables: vi.fn(), onUploadDataset: store.uploadDataset, onSelectedTableChange,
+    }
+    const exact = { initialRevisionId: 'rev-receipt', initialRevisionDatasetId: logical }
+    const { rerender } = render(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
+    await screen.findByRole('dialog', { name: 'orders' })
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
+
+    // Workspace writes the canonical registration after the exact logical lookup succeeds.
+    rerender(<CatalogDiscovery {...props} {...exact} selectedRegistrationId="registration-current" />)
+    await waitFor(() => expect(onSelectedTableChange).toHaveBeenCalledWith(
+      expect.objectContaining({ registrationId: 'registration-current' }), 'route',
+    ))
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(1)
+
+    rerender(<CatalogDiscovery {...props} selectedRegistrationId="registration-customers" />)
+    await screen.findByRole('dialog', { name: 'customers' })
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(2)
+
+    rerender(<CatalogDiscovery {...props} {...exact} selectedRegistrationId={logical} />)
+    await screen.findByRole('dialog', { name: 'orders' })
+    expect(mocks.tableByRegistration).toHaveBeenCalledTimes(3)
+    expect(mocks.tableByRegistration).toHaveBeenLastCalledWith(logical)
   })
   afterEach(() => cleanup())
 

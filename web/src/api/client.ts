@@ -7,6 +7,7 @@ import type {
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceFolderActionResult, WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
+  ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
@@ -498,6 +499,17 @@ export const api = {
   retryMergeColumnsTask: (taskId: string, retryRequestId: string) =>
     req<MergeColumnsTask>(`/merge-columns/${encodeURIComponent(taskId)}/retry`, { method: 'POST', body: JSON.stringify({ retryRequestId }) }),
 
+  managedSidecarMergePreflight: (body: ManagedSidecarMergeRequest) =>
+    req<ManagedSidecarMergePreflight>('/managed-sidecar-merge/preflight', { method: 'POST', body: JSON.stringify(body) }),
+  submitManagedSidecarMerge: (body: ManagedSidecarMergeRequest) =>
+    req<ManagedSidecarMergeTask>('/managed-sidecar-merge', { method: 'POST', body: JSON.stringify(body) }),
+  managedSidecarMergeTask: (taskId: string) =>
+    req<ManagedSidecarMergeTask>(`/managed-sidecar-merge/${encodeURIComponent(taskId)}`),
+  cancelManagedSidecarMergeTask: (taskId: string) =>
+    req<ManagedSidecarMergeTask>(`/managed-sidecar-merge/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
+  retryManagedSidecarMergeTask: (taskId: string, retryRequestId: string) =>
+    req<ManagedSidecarMergeTask>(`/managed-sidecar-merge/${encodeURIComponent(taskId)}/retry`, { method: 'POST', body: JSON.stringify({ retryRequestId }) }),
+
   upsertPreflight: (body: UpsertRequest) =>
     req<UpsertPreflight>('/catalog/upsert/preflight', { method: 'POST', body: JSON.stringify(body) }),
   submitUpsert: (body: UpsertRequest) =>
@@ -713,7 +725,7 @@ export interface BoundedFanoutJobDto {
 }
 export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
-export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write'
+export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write'
 export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; name?: string | null }
 export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }

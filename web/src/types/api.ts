@@ -734,6 +734,7 @@ export interface MergeColumnsPreflight {
   eligible: boolean
 }
 export interface MergeColumnsTaskProjection {
+  producerKind: 'sparse-output' | 'managed-sidecar'
   phase: 'validating' | 'merging' | 'candidate_committed' | 'publishing' | 'done' | 'failed' | 'cancelled'
   baseDatasetId: string
   baseRevisionId: string
@@ -749,6 +750,40 @@ export interface MergeColumnsTaskProjection {
 export interface MergeColumnsTask {
   taskId: string
   status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  canRetry: boolean
+  canCancel: boolean
+  mergeColumns?: MergeColumnsTaskProjection | null
+}
+
+// A headless, exact managed-local sidecar merge.  Unlike the Source → Select merge above, the
+// sidecar was already published by an upstream run; this request never carries a graph, URI, or
+// plugin-provided authority.
+export interface ManagedSidecarMergeRequest {
+  submissionId: string
+  base: { kind: 'exact'; datasetId: string; revisionId: string }
+  sidecar: { kind: 'exact'; datasetId: string; revisionId: string }
+  expectedHead: { kind: 'exact'; datasetId: string; revisionId: string }
+  identityColumns: string[]
+  rules: MergeColumnRule[]
+}
+export interface ManagedSidecarMergePreflight {
+  base: { kind: 'exact'; datasetId: string; revisionId: string }
+  sidecar: { kind: 'exact'; datasetId: string; revisionId: string }
+  expectedHead: { kind: 'exact'; datasetId: string; revisionId: string }
+  identityColumns: string[]
+  coverage: MergeColumnsPreflight['coverage']
+  rules: MergeColumnRule[]
+  baseSchema: ColumnSchema[]
+  sidecarSchema: ColumnSchema[]
+  outputSchema: ColumnSchema[]
+  eligible: boolean
+}
+export interface ManagedSidecarMergeTask extends ManagedSidecarMergePreflight {
+  taskId: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  childRevisionId?: string | null
+  receipt?: WriteReceipt | null
+  diagnosticCode?: string | null
   canRetry: boolean
   canCancel: boolean
   mergeColumns?: MergeColumnsTaskProjection | null

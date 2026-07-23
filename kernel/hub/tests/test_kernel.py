@@ -11210,6 +11210,51 @@ def test_example_plugin_loads_and_runs(tmp_path):
     assert rows == [("a****",), ("b**",)]  # 'alice'→'a'+4× *, 'bob'→'b'+2× *
 
 
+def test_sidecar_fixture_plugin_retains_only_identity_and_declared_payload(tmp_path):
+    """The public fixture demonstrates a plugin seam, never merge authority or passthrough width."""
+    import shutil
+    from pathlib import Path
+
+    import duckdb
+
+    from hub import db
+    from hub.deps import Deps
+    from hub.executors.engine import BuildEngine
+    from hub.models import Graph
+
+    src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_sidecar_fixture"
+    ws = tmp_path / "ws"
+    (ws / "plugins").mkdir(parents=True)
+    shutil.copytree(src, ws / "plugins" / "dp_sidecar_fixture")
+    deps = Deps(str(ws), str(tmp_path / "data"))
+    assert "derive_sidecar_column" in deps.node_specs
+
+    path = str(tmp_path / "wide.parquet")
+    duckdb.connect().execute(
+        f"COPY (SELECT 1 AS id, 4 AS signal, 'keep' AS untouched) TO '{path}' (FORMAT PARQUET)")
+    graph = Graph(**{"id": "sidecar-fixture", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": path}}},
+        {"id": "derive", "type": "derive_sidecar_column", "position": {"x": 1, "y": 0},
+         "data": {"config": {"identity": "id", "value": "signal", "output": "derived"}}},
+    ], "edges": [{"id": "edge", "source": "src", "target": "derive", "data": {"wire": "dataset"}}]})
+    with db.run_scope():
+        engine = BuildEngine(graph, deps.resolve_adapter, deps.registry, full=True,
+                             node_builders=deps.node_builders, node_specs=deps.node_specs)
+        relation = engine.relation("derive")
+        assert relation.columns == ["id", "derived"]
+        assert relation.fetchall() == [(1, 8.0)]
+
+    missing_output = Graph(**{"id": "sidecar-fixture-missing-output", "version": 1, "nodes": [
+        {"id": "src", "type": "source", "position": {"x": 0, "y": 0}, "data": {"config": {"uri": path}}},
+        {"id": "derive", "type": "derive_sidecar_column", "position": {"x": 1, "y": 0},
+         "data": {"config": {"identity": "id", "value": "signal"}}},
+    ], "edges": [{"id": "edge", "source": "src", "target": "derive", "data": {"wire": "dataset"}}]})
+    with db.run_scope(), pytest.raises(ValueError, match="identity, value, and output"):
+        engine = BuildEngine(missing_output, deps.resolve_adapter, deps.registry, full=True,
+                             node_builders=deps.node_builders, node_specs=deps.node_specs)
+        engine.relation("derive")
+
+
 def test_source_pushdown_into_scan(tmp_path):
     # A single-consumer source→filter / source→select chain hands the predicate / projection to
     # adapter.scan() on a full run, so an adapter that can prune at the source does — while the

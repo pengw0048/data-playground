@@ -16,7 +16,7 @@ import { getSpec, nodeOutputs, type NodeSpec } from './registry'
 import { nodeInvalidReason } from './generic'
 import { useInputColumns, useSchemaWarnings } from './fields'
 import {
-  useStore, nodeRunnable, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredUpsertWrite, type PanelKind,
+  useStore, nodeRunnable, isDisabled, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite, type PanelKind,
 } from '../store/graph'
 import { exportNode } from '../lib/exporters'
 import type { NodeData } from '../types/graph'
@@ -48,6 +48,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const runState = useStore((s) => s.runs[id]?.phase)
   const runnable = useStore((s) => nodeRunnable(s.doc, id))
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, id))
+  const configuredManagedSidecarMerge = useStore((s) => hasConfiguredManagedSidecarMerge(s.doc, id))
   const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, id))
   // hover drives the action shelf. The shelf is a DOM descendant of this wrapper (just positioned
   // below it), so the wrapper's own enter/leave already covers card↔shelf travel — moving between
@@ -215,7 +216,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
+              label={busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
               disabled={!canEdit || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}

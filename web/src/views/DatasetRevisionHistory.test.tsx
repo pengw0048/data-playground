@@ -23,7 +23,7 @@ import { KernelError } from '../api/client'
 import { parseHash, routeHash } from '../router'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 
-const TABLE: CatalogTable = { id: 'table-1', name: 'orders', uri: 'lance:///orders', columns: [] }
+const TABLE: CatalogTable = { id: 'table-1', registrationId: 'registration-current', name: 'orders', uri: 'lance:///orders', columns: [] }
 const revision = (revisionId: string) => ({
   datasetId: 'dataset-stable', revisionId, committedAt: '2026-07-16T12:00:00Z', retentionOwner: 'provider' as const,
 })
@@ -83,6 +83,22 @@ describe('DatasetRevisionHistory', () => {
     mocks.datasetRevisions.mockRejectedValue(new KernelError(501, 'history unavailable'))
     render(<DatasetRevisionHistory table={TABLE} />)
     await waitFor(() => expect(screen.queryByTestId('dataset-revision-history')).toBeNull())
+  })
+
+  it('opens the requested historical revision directly and never substitutes the current head', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-current')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-historical'))
+    render(<DatasetRevisionHistory table={TABLE} initialRevisionId="rev-historical" initialRevisionDatasetId="logical-receipt-id" />)
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith('logical-receipt-id', 'rev-historical'))
+    expect(await screen.findByText('Exact revision rev-historical')).toBeInTheDocument()
+    expect(mocks.datasetRevision).not.toHaveBeenCalledWith('logical-receipt-id', 'rev-current')
+  })
+
+  it('does not treat a revision without its logical dataset identity as an exact deep link', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-current')], nextCursor: null, hasMore: false })
+    render(<DatasetRevisionHistory table={TABLE} initialRevisionId="rev-historical" />)
+    await screen.findByText('rev-current')
+    expect(mocks.datasetRevision).not.toHaveBeenCalled()
   })
 
   it('distinguishes empty, unavailable, and provider-error history states', async () => {

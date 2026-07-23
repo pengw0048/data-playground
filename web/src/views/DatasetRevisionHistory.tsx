@@ -37,7 +37,7 @@ function delta(current?: number | null, parent?: number | null) {
   return change === 0 ? 'no change' : `${change > 0 ? '+' : ''}${change.toLocaleString()}`
 }
 
-export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
+export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisionDatasetId }: { table: CatalogTable; initialRevisionId?: string; initialRevisionDatasetId?: string }) {
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
   const [items, setItems] = useState<DatasetRevision[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
@@ -89,6 +89,15 @@ export function DatasetRevisionHistory({ table }: { table: CatalogTable }) {
       detailRequest.current += 1
     }
   }, [loadFirst])
+
+  useEffect(() => {
+    if (!initialRevisionId || !initialRevisionDatasetId) return
+    // The route supplies only a stable dataset/revision identity. Opening it goes through the
+    // same exact-revision reader as a click in history; a missing/compacted revision stays honest.
+    void openRevision({ datasetId: initialRevisionDatasetId, revisionId: initialRevisionId, retentionOwner: 'core' })
+  // openRevision is defined below as a stable callback; the requested identity is the fence.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [table.id, table.registrationId, initialRevisionId, initialRevisionDatasetId])
 
   const loadMore = async () => {
     if (!cursor || loadingMore) return

@@ -37,6 +37,16 @@ describe('Workspace routes', () => {
     expect(window.location.hash).not.toContain('q=must-not-leak')
   })
 
+  it('preserves an exact receipt dataset identity alongside its revision', () => {
+    const datasetQuery = new URLSearchParams({ revision: 'rev-9', revisionDataset: 'logical-receipt-id' }).toString()
+    window.location.hash = routeHash('workspace', undefined, 'dataset:registration-current', undefined,
+      undefined, undefined, undefined, 'datasets', datasetQuery)
+    expect(parseHash()).toEqual({
+      view: 'workspace', workspaceResourceId: 'dataset:registration-current', workspaceScope: 'datasets',
+      workspaceDatasetQuery: datasetQuery,
+    })
+  })
+
   it('deliberately redirects former Recents and Tables URLs to Workspace', () => {
     window.location.hash = '#/files'
     expect(parseHash()).toEqual({ view: 'workspace' })

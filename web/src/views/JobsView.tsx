@@ -73,6 +73,7 @@ function selectedQuickView(params: URLSearchParams): QuickView | null {
 const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
+  merge_columns_write: 'Column merge',
 }
 
 function jobPhase(item: WorkspaceJobDto): string | null {
@@ -241,11 +242,16 @@ export function JobsView() {
     setActing(`${runId}:${action}`); setActionError('')
     try {
       if (item.mergeColumns && item.taskId) {
-        if (action === 'cancel') await api.cancelMergeColumnsTask(item.taskId)
+        const managed = item.mergeColumns.producerKind === 'managed-sidecar'
+        if (action === 'cancel') {
+          if (managed) await api.cancelManagedSidecarMergeTask(item.taskId)
+          else await api.cancelMergeColumnsTask(item.taskId)
+        }
         else {
           const actionId = retryActions.current.get(runId) ?? globalThis.crypto.randomUUID()
           retryActions.current.set(runId, actionId)
-          await api.retryMergeColumnsTask(item.taskId, actionId)
+          if (managed) await api.retryManagedSidecarMergeTask(item.taskId, actionId)
+          else await api.retryMergeColumnsTask(item.taskId, actionId)
           retryActions.current.delete(runId)
         }
       } else if (action === 'cancel') await api.cancelRun(runId)
