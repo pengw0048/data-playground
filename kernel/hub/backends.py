@@ -18,8 +18,8 @@ import duckdb
 
 from hub.models import (
     CatalogBrowse, CatalogPage, CatalogPublicationReceipt, CatalogQuery, CatalogTable, ColumnSchema,
-    CompilePlan, Facets, Graph, GraphNode, LineageFactsPage, LineagePublication, LineageResult,
-    Placement, Relationship, RunEstimate, RunStatus,
+    CompilePlan, Facets, FieldLineagePage, Graph, GraphNode, LineageFactsPage, LineagePublication,
+    LineageResult, Placement, Relationship, RunEstimate, RunStatus,
 )
 
 # The `dataset` wire is a lazy DuckDB relation — the currency a node's build produces/consumes.
@@ -407,6 +407,16 @@ class CatalogLineageFactExporter(Protocol):
     """
 
     def lineage_facts_page(self, *, limit: int, after_id: int) -> LineageFactsPage: ...
+
+
+@runtime_checkable
+class CatalogFieldLineageExporter(Protocol):
+    """Optional exact-output field-lineage capability owned by the selected catalog provider."""
+
+    def field_lineage_page(
+        self, *, dataset_id: str, revision_id: str, destination_fields: list[str],
+        limit: int, after_id: int,
+    ) -> FieldLineagePage: ...
 
 
 @runtime_checkable

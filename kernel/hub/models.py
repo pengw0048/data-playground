@@ -572,8 +572,35 @@ class LineageEdge(Wire):
 
 
 class LineageFieldMapping(Wire):
+    """One source-owned field projection.
+
+    ``source_dataset_id`` is the stable catalog identity (managed logical id or ordinary
+    registration id), never a URI/name/table id.  It is optional only when exporting evidence
+    committed before this identity became part of the contract; new publications require both it
+    and ``source_version``.
+    """
+
+    source_dataset_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_version: str | None = Field(default=None, min_length=1, max_length=512)
     source_field: str = Field(min_length=1, max_length=512)
+    source_field_id: str | None = Field(default=None, min_length=1, max_length=512)
     destination_field: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "LineageFieldMapping":
+        for field_name in (
+            "source_dataset_id",
+            "source_version",
+            "source_field",
+            "source_field_id",
+            "destination_field",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value != value.strip():
+                raise ValueError(
+                    f"lineage field mapping {field_name} cannot contain surrounding whitespace"
+                )
+        return self
 
 
 class LineagePublication(Wire):
@@ -614,12 +641,49 @@ class LineagePublication(Wire):
         if self.provenance == "run" and not (
                 self.run_id and self.producer and self.step_id):
             raise ValueError("run lineage requires run, producer, and step identities")
+        canonical = [
+            (
+                mapping.source_dataset_id,
+                mapping.source_version,
+                mapping.source_field,
+                mapping.source_field_id,
+                mapping.destination_field,
+            )
+            for mapping in self.field_mappings
+        ]
+        if any(
+            source_dataset_id is None or source_version is None
+            for source_dataset_id, source_version, *_rest in canonical
+        ):
+            raise ValueError(
+                "new lineage field mappings require an exact source dataset identity and version"
+            )
+        if len(canonical) != len(set(canonical)):
+            raise ValueError("lineage field mappings contain a duplicate")
+        ownership_keys: set[tuple[str | None, str, str]] = set()
+        for (
+            source_dataset_id,
+            _source_version,
+            source_field,
+            _source_field_id,
+            destination,
+        ) in canonical:
+            ownership_key = (source_dataset_id, source_field, destination)
+            if ownership_key in ownership_keys:
+                raise ValueError("lineage field mappings contain contradictory source ownership")
+            ownership_keys.add(ownership_key)
         self.field_mappings = [
-            LineageFieldMapping(source_field=source, destination_field=destination)
-            for source, destination in sorted({
-                (mapping.source_field, mapping.destination_field)
-                for mapping in self.field_mappings
-            })
+            LineageFieldMapping(
+                source_dataset_id=source_dataset_id,
+                source_version=source_version,
+                source_field=source_field,
+                source_field_id=source_field_id,
+                destination_field=destination,
+            )
+            for (
+                source_dataset_id, source_version, source_field,
+                source_field_id, destination,
+            ) in sorted(canonical, key=lambda item: tuple(value or "" for value in item))
         ]
         return self
 
@@ -841,6 +905,63 @@ class LineageFactsPage(Wire):
     def validate_cursor_state(self) -> "LineageFactsPage":
         if self.has_more != (self.next_after_id is not None):
             raise ValueError("lineage fact page continuation state is inconsistent")
+        return self
+
+
+class FieldLineageProjection(Wire):
+    """One exact, source-owned field projection retained with a lineage publication."""
+
+    id: LineageFactCursor
+    fact_key: str = Field(min_length=1, max_length=512)
+    publication_key: str = Field(min_length=1, max_length=96)
+    source_dataset_id: str = Field(min_length=1, max_length=128)
+    source_version: str = Field(min_length=1, max_length=512)
+    source_field: str = Field(min_length=1, max_length=512)
+    source_field_id: str | None = Field(default=None, min_length=1, max_length=512)
+    destination_dataset_id: str = Field(min_length=1, max_length=128)
+    destination_revision_id: str = Field(min_length=1, max_length=512)
+    destination_field: str = Field(min_length=1, max_length=512)
+    created_at: datetime.datetime
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "FieldLineageProjection":
+        for field_name in (
+            "fact_key",
+            "publication_key",
+            "source_dataset_id",
+            "source_version",
+            "source_field",
+            "source_field_id",
+            "destination_dataset_id",
+            "destination_revision_id",
+            "destination_field",
+        ):
+            value = getattr(self, field_name)
+            if value is not None and value != value.strip():
+                raise ValueError(
+                    f"field lineage projection {field_name} cannot contain surrounding whitespace"
+                )
+        if self.created_at.utcoffset() is None:
+            raise ValueError("field lineage projection creation time must include a timezone")
+        return self
+
+
+class FieldLineagePage(Wire):
+    """Bounded evidence for selected fields of one exact output revision."""
+
+    state: Literal["available", "unsupported", "unavailable", "truncated"]
+    items: list[FieldLineageProjection] = Field(default_factory=list, max_length=500)
+    next_after_id: LineageFactCursor | None = None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "FieldLineagePage":
+        if self.state == "truncated":
+            if not self.items or self.next_after_id is None:
+                raise ValueError("truncated field lineage requires a continuation cursor")
+        elif self.next_after_id is not None:
+            raise ValueError("complete field lineage cannot expose a continuation cursor")
+        if self.state in {"unsupported", "unavailable"} and self.items:
+            raise ValueError(f"{self.state} field lineage cannot expose items")
         return self
 
 
