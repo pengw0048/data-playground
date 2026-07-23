@@ -698,10 +698,16 @@ def _write_admission_for_graph(
         if direct_local:
             # Prefer an explicit declared upstream schema (external-wait fixtures). Fall back to the
             # graph schema so Source -> Select(checkpoint) -> Write can still admit create/replace.
-            upstream = next(
-                (candidate for candidate in graph.nodes if candidate.id != node_id), None)
-            schema = declared_schema(upstream) if upstream is not None else None
-            if schema is None:
+            inbound = graph_mod.incoming(graph, node_id)
+            if len(inbound) > 1:
+                schema = None
+            else:
+                upstream = (
+                    graph_mod.node_map(graph).get(inbound[0].source)
+                    if inbound else None
+                )
+                schema = declared_schema(upstream) if upstream is not None else None
+            if schema is None and len(inbound) <= 1:
                 schemas = schema_for_graph(
                     graph, deps.resolve_adapter, deps.registry,
                     getattr(deps, "node_builders", {}), getattr(deps, "node_specs", {}),
