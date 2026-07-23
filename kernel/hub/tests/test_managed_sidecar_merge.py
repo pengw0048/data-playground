@@ -9,10 +9,11 @@ import pytest
 
 from hub import metadb
 from hub.managed_sidecar_merge import (
-    ManagedSidecarMergeError, ManagedSidecarMergeRequestV1, admit_managed_sidecar_merge,
+    ManagedSidecarMergeError, ManagedSidecarMergeIntentV1, ManagedSidecarMergeRequestV1,
+    admit_managed_sidecar_merge, prepare_managed_sidecar_merge,
 )
 from hub.merge_columns import MergeColumnRuleV1
-from hub.models import ExactDatasetRef, LineagePublication, WriteProvenance
+from hub.models import ExactDatasetRef, LineagePublication
 from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
@@ -75,8 +76,8 @@ def test_admit_real_parquet_add_replace_reordered_composite(local_catalog, tmp_p
         base=base, sidecar=sidecar, expected_head=base, identity_columns=["account", "day"],
         rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace"),
                MergeColumnRuleV1(source="addition", target="new", mode="add")],
-        idempotency_key=key, provenance=WriteProvenance(
-            publication=LineagePublication(idempotency_key=key, provenance="manual"), parents=[]),
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
     )
 
     intent = admit_managed_sidecar_merge(storage=storage, request=request)
@@ -103,8 +104,8 @@ def test_admission_rejects_moved_head_and_incomplete_identity_coverage(local_cat
     request = ManagedSidecarMergeRequestV1(
         base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
         rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
-        idempotency_key=key, provenance=WriteProvenance(
-            publication=LineagePublication(idempotency_key=key, provenance="manual"), parents=[]),
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
     )
     with pytest.raises(ManagedSidecarMergeError, match="complete identity coverage"):
         admit_managed_sidecar_merge(storage=storage, request=request)
@@ -116,3 +117,104 @@ def test_admission_rejects_moved_head_and_incomplete_identity_coverage(local_cat
     _publish(storage, catalog, base_uri, "base", pa.table({"id": [1, 2], "old": [3, 4]}))
     with pytest.raises(ManagedSidecarMergeError, match="base head moved"):
         admit_managed_sidecar_merge(storage=storage, request=complete)
+
+
+def test_intent_reload_is_complete_canonical_and_tamper_proof(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": [1, 2], "old": [1, 2],
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": [1, 2], "replacement": [10, 20],
+    }))
+    key = "issue-767-reload"
+    request = ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    )
+    intent = admit_managed_sidecar_merge(storage=storage, request=request)
+    assert ManagedSidecarMergeIntentV1.model_validate_json(intent.model_dump_json()) == intent
+    assert intent.write_intent.provenance.parents == []
+
+    missing = intent.model_dump()
+    missing.pop("merge_sha256")
+    with pytest.raises(ValueError):
+        ManagedSidecarMergeIntentV1.model_validate(missing)
+    tampered = intent.model_dump()
+    tampered["coverage"]["status"] = "partial"
+    with pytest.raises(ValueError):
+        ManagedSidecarMergeIntentV1.model_validate(tampered)
+    inconsistent = intent.model_dump()
+    inconsistent["write_intent"]["expected_schema"] = []
+    with pytest.raises(ValueError):
+        ManagedSidecarMergeIntentV1.model_validate(inconsistent)
+
+
+@pytest.mark.parametrize(("ids", "expected_status", "field", "value"), [
+    ([None, 2], "invalid", "null_rows", 1),
+    ([1, 1], "invalid", "duplicate_groups", 1),
+    ([1], "partial", "missing_identities", 1),
+    ([1, 2, 3], "partial", "extra_identities", 1),
+])
+def test_prepare_preserves_distinguishable_identity_blockers(
+        local_catalog, tmp_path, ids, expected_status, field, value):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": pa.array([1, 2], type=pa.int64()), "old": [1, 2],
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": pa.array(ids, type=pa.int64()), "replacement": list(range(len(ids))),
+    }))
+    key = f"issue-767-{field}"
+    prepared = prepare_managed_sidecar_merge(storage=storage, request=ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    ))
+    assert prepared.coverage.status == expected_status
+    evidence = prepared.coverage.candidate if field in {"null_rows", "duplicate_groups"} else prepared.coverage
+    assert getattr(evidence, field) == value
+
+
+def test_request_canonicalizes_last_known_and_rejects_arbitrary_parents(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": [1], "old": [1],
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": [1], "replacement": [2],
+    }))
+    key = "issue-767-canonical"
+    common = dict(identity_columns=["id"], rules=[
+        MergeColumnRuleV1(source="replacement", target="old", mode="replace")],
+        idempotency_key=key, publication=LineagePublication(idempotency_key=key, provenance="manual"))
+    clean = ManagedSidecarMergeRequestV1(base=base, sidecar=sidecar, expected_head=base, **common)
+    noisy_base = base.model_copy(update={"last_known": {"committedAt": "2026-01-01T00:00:00Z"}})
+    noisy = ManagedSidecarMergeRequestV1(
+        base=noisy_base, sidecar=sidecar, expected_head=noisy_base, **common)
+    assert admit_managed_sidecar_merge(storage=storage, request=clean) == (
+        admit_managed_sidecar_merge(storage=storage, request=noisy))
+    with pytest.raises(ValueError):
+        ManagedSidecarMergeRequestV1.model_validate({**clean.model_dump(), "provenance": {}})
+
+
+def test_prepare_rejects_identity_rule_and_schema_collision(local_catalog, tmp_path):
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": [1], "old": [1],
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": [1], "replacement": [2],
+    }))
+    key = "issue-767-rules"
+    request = ManagedSidecarMergeRequestV1(
+        base=base, sidecar=sidecar, expected_head=base, identity_columns=["id"],
+        rules=[MergeColumnRuleV1(source="id", target="old", mode="replace")],
+        idempotency_key=key,
+        publication=LineagePublication(idempotency_key=key, provenance="manual"),
+    )
+    with pytest.raises(ManagedSidecarMergeError, match="merge rules"):
+        prepare_managed_sidecar_merge(storage=storage, request=request)
