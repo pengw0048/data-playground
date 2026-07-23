@@ -10028,11 +10028,12 @@ def _sanitized_merge_columns_jobs_view(
         task: DurableTask, checkpoint: DurableCheckpoint | None,
         envelope: MergeColumnsTaskEnvelope, *, current_attempt_id: str | None,
         can_retry: bool, can_cancel: bool) -> dict:
-    """Return only #436's task identity and committed-candidate facts, never merge authority."""
+    """Return task routing and committed-candidate facts, never merge authority."""
     committed = checkpoint is not None and checkpoint.phase == "committed"
     digest = checkpoint.content_sha256 if committed else None
     diagnostic = task.error if task.error in _MERGE_COLUMNS_JOB_DIAGNOSTICS else None
     return {
+        "producerKind": envelope.producer_kind,
         "phase": envelope.phase,
         "baseDatasetId": envelope.base_dataset_id,
         "baseRevisionId": envelope.base_revision_id,

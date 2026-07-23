@@ -147,6 +147,7 @@ def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
 
     jobs = metadb.list_workspace_runs("owner", run_id=task.task_id)["items"]
     assert len(jobs) == 1 and jobs[0]["mergeColumns"]["baseDatasetId"] == request.base.dataset_id
+    assert jobs[0]["mergeColumns"]["producerKind"] == "managed-sidecar"
     inbox = metadb.list_durable_task_inbox_items("owner")["items"]
     assert any(item["task_id"] == task.task_id and item["completed_write"] for item in inbox)
 
@@ -157,6 +158,7 @@ def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
     assert jobs_response.status_code == inbox_response.status_code == 200
     job = jobs_response.json()["items"][0]
     assert job["datasetContext"]["taskKind"] == "merge_columns_write"
+    assert job["mergeColumns"]["producerKind"] == "managed-sidecar"
     assert any(item["taskId"] == task.task_id for item in inbox_response.json()["items"])
 
     changed = request.model_copy(deep=True)
@@ -779,6 +781,7 @@ def test_merge_task_observation_is_shared_but_actions_remain_with_original_owner
                    if item["taskId"] == task.task_id)
         assert job["targetNodeId"] == "write"
         assert job["canCancel"] is expected and job["canRetry"] is False
+        assert job["mergeColumns"]["producerKind"] == "sparse-output"
         assert job["mergeColumns"]["canCancel"] is expected
         assert job["mergeColumns"]["canRetry"] is False
 

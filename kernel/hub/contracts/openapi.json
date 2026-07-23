@@ -4176,12 +4176,21 @@
             "title": "Phase",
             "type": "string"
           },
+          "producerKind": {
+            "enum": [
+              "sparse-output",
+              "managed-sidecar"
+            ],
+            "title": "Producerkind",
+            "type": "string"
+          },
           "reused": {
             "title": "Reused",
             "type": "boolean"
           }
         },
         "required": [
+          "producerKind",
           "phase",
           "baseDatasetId",
           "baseRevisionId",

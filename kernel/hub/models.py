@@ -1621,6 +1621,7 @@ class DurableBoundedFanoutView(Wire):
 class DurableMergeColumnsView(Wire):
     """Sanitized exact-candidate merge projection for Workspace Jobs."""
 
+    producer_kind: Literal["sparse-output", "managed-sidecar"]
     phase: Literal[
         "validating", "merging", "candidate_committed", "publishing",
         "done", "failed", "cancelled",
