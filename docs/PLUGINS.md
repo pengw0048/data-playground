@@ -27,7 +27,7 @@ Install and run the fixture as an entry-point plugin:
 
 ```bash
 cd kernel
-uv run --with ../examples/plugins/dp_sidecar_fixture dataplay --workspace /absolute/path/to/workspace
+uv run --with ../examples/plugins/dp_sidecar_fixture/ dataplay --workspace /absolute/path/to/workspace
 ```
 
 Add a **derive sidecar column** node, set `identity`, `value`, and `output`, then run it to an
