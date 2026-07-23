@@ -1,9 +1,10 @@
 import { useEffect } from 'react'
-import { roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
+import { hasConfiguredManagedSidecarMerge, roleCanEdit, targetParameterDeclarations, useStore } from '../store/graph'
 import { color, status as statusTok } from '../theme/tokens'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
+import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
 import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
@@ -25,6 +26,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const isConfiguredMerge = !!mergeRules && typeof mergeRules === 'object' && !Array.isArray(mergeRules)
     && Array.isArray((mergeRules as { rules?: unknown }).rules)
     && (mergeRules as { rules: unknown[] }).rules.length > 0
+  const isConfiguredManagedSidecarMerge = hasConfiguredManagedSidecarMerge(doc, nodeId)
   const upsertKeys = target?.data.config.keyedUpsert
   const isConfiguredUpsert = !!upsertKeys && typeof upsertKeys === 'object' && !Array.isArray(upsertKeys)
     && Array.isArray((upsertKeys as { keys?: unknown }).keys)
@@ -36,9 +38,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const setJobsQuery = useStore((s) => s.setJobsQuery)
 
   useEffect(() => {
-    if (!isConfiguredMerge && !isConfiguredUpsert && (!run || run.phase === 'idle')) estimate(nodeId)
+    if (!isConfiguredManagedSidecarMerge && !isConfiguredMerge && !isConfiguredUpsert && (!run || run.phase === 'idle')) estimate(nodeId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isConfiguredMerge, isConfiguredUpsert, nodeId])
+  }, [isConfiguredManagedSidecarMerge, isConfiguredMerge, isConfiguredUpsert, nodeId])
 
   const phase = run?.phase ?? 'estimating'
   const est = run?.estimate
@@ -63,6 +65,14 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const outputName = String(writeConfig.filename ?? writeConfig.name ?? target?.data.title ?? 'output')
   const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
   const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
+
+  if (isConfiguredManagedSidecarMerge) return (
+    <div className="p-3.5">
+      <Label>MANAGED SIDECAR MERGE</Label>
+      <div className="mt-1 text-[11px] text-muted-foreground">This Write merges an already-published exact sidecar into a selected current base head. The server certifies every coverage and publication fact.</div>
+      <ManagedSidecarMergeControl nodeId={nodeId} />
+    </div>
+  )
 
   if (isConfiguredMerge) return (
     <div className="p-3.5">

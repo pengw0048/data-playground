@@ -1,4 +1,4 @@
-"""One fenced durable SparseOutput merge that publishes only a committed full candidate."""
+"""Fenced durable column-merge tasks that publish only committed full candidates."""
 
 from __future__ import annotations
 

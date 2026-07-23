@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredUpsertWrite,
+  previewPlanIdentity, useStore, nodeRunnable, roleCanEdit, hasConfiguredMergeColumnsWrite, hasConfiguredManagedSidecarMerge, hasConfiguredUpsertWrite,
 } from '../store/graph'
 import { getSpec, nodeOutputs } from '../nodes/registry'
 import { getBackendSpec, NodeParamFields, nodeInvalidReason } from '../nodes/generic'
@@ -12,6 +12,7 @@ import { FileDialog } from '../ui/FileDialog'
 import { miniInputClass } from '../ui/controls'
 import { api } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
+import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
 import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
@@ -110,6 +111,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const runnable = useStore((s) => nodeRunnable(s.doc, nodeId))
   const runState = useStore((s) => s.runs[nodeId]?.phase)
   const configuredMerge = useStore((s) => hasConfiguredMergeColumnsWrite(s.doc, nodeId))
+  const configuredManagedSidecarMerge = useStore((s) => hasConfiguredManagedSidecarMerge(s.doc, nodeId))
   const configuredUpsert = useStore((s) => hasConfiguredUpsertWrite(s.doc, nodeId))
   const allSchemas = useStore((s) => s.schemas)
   const edges = useStore((s) => s.doc.edges)
@@ -200,10 +202,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {/* Observation and exact navigation remain available to viewers. MergeColumnsControl owns
             its own edit/action guards; wrapping it in the destination fieldset would also disable
             the read-only Jobs and receipt links. */}
-        {configuredMerge ? <MergeColumnsControl nodeId={nodeId} />
+        {configuredManagedSidecarMerge ? <ManagedSidecarMergeControl nodeId={nodeId} />
+          : configuredMerge ? <MergeColumnsControl nodeId={nodeId} />
           : configuredUpsert ? <UpsertControl nodeId={nodeId} />
             : <details className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
               <summary className="cursor-pointer font-semibold text-foreground">Advanced write operations</summary>
+              <ManagedSidecarMergeControl nodeId={nodeId} />
               <MergeColumnsControl nodeId={nodeId} />
               <UpsertControl nodeId={nodeId} />
             </details>}
@@ -281,7 +285,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
             <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-            <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
+          <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />

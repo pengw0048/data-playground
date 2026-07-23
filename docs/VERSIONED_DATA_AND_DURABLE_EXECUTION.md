@@ -133,6 +133,10 @@ operation.
   lost a response.
 - A sparse enrichment joins a frozen, complete sidecar to one exact base revision. It does not
   silently fill gaps or rebase onto a new head.
+- A managed-sidecar merge is the same bounded publication shape without rerunning the upstream
+  transform: the Canvas carries exact base and sidecar identities plus explicit column rules; the
+  service alone certifies coverage, schemas, the current destination head, and the receipt. The
+  UI may suggest matching fields, but a suggestion is never merge authority.
 - Workspace placement is presentation. Dataset, revision, run, artifact, and provider identities stay
   stable when an item is moved or renamed.
 - An optional backend or provider can claim only the capabilities it implements and tests.
@@ -144,6 +148,7 @@ These are executable contracts as well as product descriptions. The core coverag
 [admitted local inputs](../kernel/hub/tests/test_local_run_input_admission.py),
 [write admission](../kernel/hub/tests/test_write_admission.py),
 [sparse merge publication](../kernel/hub/tests/test_merge_columns.py),
+[managed-sidecar task admission](../kernel/hub/tests/test_merge_columns_api.py),
 [keyed upsert](../kernel/hub/tests/test_keyed_upsert_api.py),
 [durable recovery](../kernel/hub/tests/test_durable_local_write_tasks.py), and
 [Workspace storage](../kernel/hub/tests/test_workspace_storage.py). The cross-surface browser journey

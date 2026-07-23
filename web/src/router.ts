@@ -6,7 +6,7 @@ import { ownsNavigation, startNavigation, type NavigationToken } from './navigat
 
 export interface Route { view: DpView; canvasId?: string; nodeId?: string; workspaceResourceId?: string; workspaceQuery?: string; workspaceScope?: 'all' | 'datasets'; workspaceDatasetQuery?: string; jobsQuery?: string; inboxQuery?: string; transformId?: string; transformVersion?: string; transformCanvasId?: string; transformNodeId?: string; transformQuery?: string }
 
-const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match'] as const
+const DATASET_QUERY_KEYS = ['dq', 'folder', 'tags', 'owner', 'columns', 'sort', 'order', 'match', 'revision', 'revisionDataset'] as const
 
 export function parseHash(): Route {
   const h = location.hash.replace(/^#\/?/, '')

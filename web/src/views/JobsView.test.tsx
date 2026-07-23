@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   workspaceJobs: vi.fn(), executionManifest: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
-  cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(), datasetRevision: vi.fn(),
+  cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(),
+  cancelManagedSidecarMergeTask: vi.fn(), retryManagedSidecarMergeTask: vi.fn(), datasetRevision: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
@@ -31,6 +32,8 @@ describe('JobsView', () => {
     mocks.retryRun.mockResolvedValue(undefined)
     mocks.cancelMergeColumnsTask.mockResolvedValue(undefined)
     mocks.retryMergeColumnsTask.mockResolvedValue(undefined)
+    mocks.cancelManagedSidecarMergeTask.mockResolvedValue(undefined)
+    mocks.retryManagedSidecarMergeTask.mockResolvedValue(undefined)
     mocks.datasetRevision.mockResolvedValue({})
     mocks.listCanvases.mockResolvedValue([])
     useStore.setState({ view: 'jobs', jobsQuery: '', files: [], toasts: [] } as never)
@@ -338,7 +341,7 @@ describe('JobsView', () => {
   it('uses only the dedicated merge task actions and never falls back from an exact receipt', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'merge-1', taskId: 'merge-1', status: 'running', error: null, canCancel: true,
-      mergeColumns: { phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
+      mergeColumns: { producerKind: 'sparse-output', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-1 in Alpha research', expanded: false }))
@@ -349,11 +352,35 @@ describe('JobsView', () => {
     expect(mocks.cancelRun).not.toHaveBeenCalledWith('merge-1')
   })
 
+  it('uses the server-projected producer kind for managed-sidecar task actions', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'sidecar-1', taskId: 'sidecar-1', status: 'running', error: null, canCancel: true,
+      mergeColumns: { producerKind: 'managed-sidecar', phase: 'merging', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: false, canCancel: true },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-1 in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
+    await waitFor(() => expect(mocks.cancelManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-1'))
+    expect(mocks.cancelMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-1')
+  })
+
+  it('uses the managed-sidecar retry endpoint for a failed managed task', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      runId: 'sidecar-retry', taskId: 'sidecar-retry', status: 'failed', error: 'worker lost', canRetry: true,
+      mergeColumns: { producerKind: 'managed-sidecar', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'pending', reused: false, canRetry: true, canCancel: false },
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run sidecar-retry in Alpha research', expanded: false }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry task' }))
+    await waitFor(() => expect(mocks.retryManagedSidecarMergeTask).toHaveBeenCalledWith('sidecar-retry', expect.any(String)))
+    expect(mocks.retryMergeColumnsTask).not.toHaveBeenCalledWith('sidecar-retry')
+  })
+
   it('routes a stale merge Task back to its real Write node for explicit re-admission', async () => {
     mocks.workspaceJobs.mockResolvedValue({ items: [job({
       runId: 'merge-stale', taskId: 'merge-stale', targetNodeId: 'write-merge', status: 'failed',
       error: 'stale_expected_head', canCancel: false, canRetry: false,
-      mergeColumns: { phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: false, canRetry: false, canCancel: false, diagnosticCode: 'stale_expected_head' },
+      mergeColumns: { producerKind: 'sparse-output', phase: 'failed', baseDatasetId: 'dataset-1', baseRevisionId: 'rev-1', candidate: 'committed', reused: false, canRetry: false, canCancel: false, diagnosticCode: 'stale_expected_head' },
     })], hasMore: false, nextCursor: null })
     render(<JobsView />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open run merge-stale in Alpha research', expanded: false }))

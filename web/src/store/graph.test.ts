@@ -1004,6 +1004,42 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().toasts.some((toast) => toast.msg === 'Column merge uses its certified admission flow.')).toBe(true)
   })
 
+  it('routes even an empty managed-sidecar merge draft to its certified panel instead of ordinary Write execution', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/source.parquet' }
+    const write = NODE('write', 'write')
+    // An empty draft is still an explicit choice to use the certified sidecar flow. It must not
+    // quietly fall through to ordinary Write admission while the researcher completes it.
+    write.data.config = { filename: 'output.parquet', managedSidecarMerge: {} }
+    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }] } })
+
+    await useStore.getState().requestRun('write')
+    await useStore.getState().run('write')
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
+    expect(useStore.getState().openPanels).toEqual({ write: 'run' })
+    expect(useStore.getState().toasts.some((toast) => toast.msg === 'Managed sidecar merge uses its certified admission flow.')).toBe(true)
+  })
+
+  it('fails closed to the managed-sidecar panel when an imported draft is malformed', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/source.parquet' }
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', managedSidecarMerge: ['corrupt-draft'] }
+    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }] } })
+
+    await useStore.getState().requestRun('write')
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(apiMocks.writeAdmission).not.toHaveBeenCalled()
+    expect(useStore.getState().openPanels).toEqual({ write: 'run' })
+  })
+
   it('routes configured keyed-upsert Writes to their certified panel instead of the ordinary runner', async () => {
     const source = NODE('source')
     source.data.config = { uri: '/data/source.parquet' }

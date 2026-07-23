@@ -130,6 +130,18 @@ export function hasConfiguredMergeColumnsWrite(doc: CanvasDoc, id: string): bool
   return Array.isArray(rules) && rules.length > 0
 }
 
+/** Empty sidecar drafts are still intentional configuration: never send them through ordinary
+ * Write execution while a researcher is selecting the exact base and mappings. */
+export function hasConfiguredManagedSidecarMerge(doc: CanvasDoc, id: string): boolean {
+  const node = doc.nodes.find((item) => item.id === id)
+  if (node?.type !== 'write') return false
+  const value = node.data.config.managedSidecarMerge
+  // This reserved advanced-write field is a run boundary, not merely a valid UI draft. Imported
+  // or stale documents may carry malformed values; fail closed into the certified panel rather
+  // than silently submitting them through ordinary Write admission.
+  return value !== undefined
+}
+
 export function hasConfiguredUpsertWrite(doc: CanvasDoc, id: string): boolean {
   const node = doc.nodes.find((item) => item.id === id)
   if (node?.type !== 'write') return false
@@ -2053,6 +2065,11 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
+      return
+    }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Column merge uses its certified admission flow.', 'info')
@@ -2264,6 +2281,11 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
+      set(() => ({ openPanels: { [id]: 'run' } }))
+      get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
+      return
+    }
     if (hasConfiguredMergeColumnsWrite(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Column merge uses its certified admission flow.', 'info')

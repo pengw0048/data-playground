@@ -33,7 +33,7 @@ export interface CatalogDiscoveryProps {
   queryState?: CatalogDiscoveryQueryState
   onQueryStateChange?: (state: CatalogDiscoveryQueryState) => void
   selectedRegistrationId?: string | null
-  onSelectedTableChange?: (table: CatalogTable | null) => void
+  onSelectedTableChange?: (table: CatalogTable | null, origin?: 'user' | 'route') => void
   /** Optional Workspace bridge; Catalog remains independently reusable without it. */
   onOpenInWorkspace?: (table: CatalogTable) => void
   workspaceLocation?: {
@@ -42,6 +42,10 @@ export interface CatalogDiscoveryProps {
     retryable?: boolean
   }
   onRetryWorkspaceLocation?: () => void
+  /** Exact revision requested by a Catalog deep link; it is not a moving-head selection. */
+  initialRevisionId?: string
+  /** Authoritative logical dataset identity paired with the requested revision. */
+  initialRevisionDatasetId?: string
 }
 
 export interface CatalogDiscoveryQueryState {
@@ -63,6 +67,7 @@ export function CatalogDiscovery({
   sourceIdentity: catalogSource, foldersMutable, onUseTables, onUploadDataset, title = 'Datasets',
   queryState, onQueryStateChange, selectedRegistrationId, onSelectedTableChange, onOpenInWorkspace,
   workspaceLocation, onRetryWorkspaceLocation,
+  initialRevisionId, initialRevisionDatasetId,
 }: CatalogDiscoveryProps) {
   const pushToast = useStore((s) => s.pushToast)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -116,6 +121,13 @@ export function CatalogDiscovery({
   const seq = useRef(0)
   const loadingMore = useRef(false)
   const selectionSeq = useRef(0)
+  // The displayed table and the identity used to resolve it are distinct during exact-revision
+  // navigation: a receipt logical id can resolve to a current registration id.
+  const selectedLookupId = useRef<string | null>(null)
+  // A route may temporarily retain a retired registration while Workspace canonicalizes it after
+  // resolution. Remembering that route selection avoids immediately clearing the resolved table
+  // and issuing the same failed lookup again during that hand-off.
+  const resolvedRouteSelection = useRef<string | null>(null)
 
   // debounce the search box into the query
   useEffect(() => {
@@ -169,30 +181,50 @@ export function CatalogDiscovery({
   useEffect(() => { void loadFirst() }, [loadFirst])
 
   const selectTable = useCallback((table: CatalogTable | null) => {
+    selectedLookupId.current = table?.registrationId ?? null
     setSelected(table)
-    onSelectedTableChange?.(table)
+    onSelectedTableChange?.(table, 'user')
   }, [onSelectedTableChange])
   useEffect(() => {
     if (selectedRegistrationId === undefined) return
     const requestId = ++selectionSeq.current
     setSelectionError(null)
-    if (!selectedRegistrationId) {
+    const hasExactRevision = !!initialRevisionId && !!initialRevisionDatasetId
+    // A complete exact revision pair names its authoritative logical dataset. The path resource
+    // is only a stale/canonicalizable Workspace projection and must never select a different
+    // table before the revision view opens.
+    const lookupId = hasExactRevision ? initialRevisionDatasetId : selectedRegistrationId
+    const routeProjection = selectedRegistrationId ?? lookupId
+    const routeLookupKey = `${routeProjection}\u0000${lookupId}`
+    if (!lookupId) {
+      resolvedRouteSelection.current = null
+      selectedLookupId.current = null
       setSelected(null)
-      selectedTableChangeRef.current?.(null)
+      selectedTableChangeRef.current?.(null, 'route')
       return
     }
-    if (selected?.registrationId === selectedRegistrationId) return
+    if (selected?.registrationId === selectedRegistrationId
+        && selectedLookupId.current === lookupId) {
+      // The parent has consumed the transient route selection and canonicalized its URL. Clear
+      // only the transient hand-off guard; retain selectedLookupId as evidence that this table
+      // was resolved from the current authoritative lookup identity.
+      resolvedRouteSelection.current = null
+      return
+    }
+    if (resolvedRouteSelection.current === routeLookupKey) return
     setSelected(null)
-    api.tableByRegistration(selectedRegistrationId).then((table) => {
+    void api.tableByRegistration(lookupId).then((table) => {
       if (requestId === selectionSeq.current) {
+        resolvedRouteSelection.current = routeLookupKey
+        selectedLookupId.current = lookupId
         setSelected(table)
-        selectedTableChangeRef.current?.(table)
+        selectedTableChangeRef.current?.(table, 'route')
       }
     }).catch((caught) => {
       if (requestId === selectionSeq.current) setSelectionError(errorMessage(caught))
     })
     return () => { selectionSeq.current += 1 }
-  }, [selectedRegistrationId, selected?.registrationId, selectionRevision])
+  }, [selectedRegistrationId, initialRevisionId, initialRevisionDatasetId, selectionRevision])
 
   const loadMore = useCallback(async () => {
     if (!hasMore || loading || loadingMore.current) return
@@ -470,6 +502,8 @@ export function CatalogDiscovery({
 
       {selected && (
         <CatalogDetail key={selected.id} table={selected} onClose={() => selectTable(null)} onUse={use}
+          initialRevisionId={initialRevisionId}
+          initialRevisionDatasetId={initialRevisionDatasetId}
           onChanged={(t) => { selectTable(t); setCatalogRevision((v) => v + 1); void loadFirst() }}
           onFolder={(folder) => {
             if (onOpenInWorkspace) void onOpenInWorkspace(selected)
@@ -861,7 +895,7 @@ function FolderBranch({ node, depth, selected, onSelect, onRenamed, onDeleted, m
 // ---- detail drawer: columns + metadata editor + lineage ---------------------
 export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDeleted, onOpenTable, onColumn,
   folderActionLabel = 'Browse folder', folderActionVisible = !!table.folder,
-  folderActionDisabled = false, folderActionTitle, onFolderRetry,
+  folderActionDisabled = false, folderActionTitle, onFolderRetry, initialRevisionId, initialRevisionDatasetId,
 }: {
   table: CatalogTable; onClose: () => void; onUse: (t: CatalogTable) => void
   onChanged: (t: CatalogTable) => void; onFolder: (f: string) => void
@@ -869,6 +903,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   folderActionLabel?: string; folderActionVisible?: boolean
   folderActionDisabled?: boolean; folderActionTitle?: string
   onFolderRetry?: () => void
+  initialRevisionId?: string
+  initialRevisionDatasetId?: string
 }) {
   const pushToast = useStore((s) => s.pushToast)
   const openRelationships = useStore((s) => s.openRelationships)
@@ -1034,7 +1070,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             {table.usage ? <span>· used {table.usage}×</span> : null}
           </div>
 
-          <DatasetRevisionHistory key={table.id} table={table} />
+          <DatasetRevisionHistory key={`${table.id}:${initialRevisionId ?? ''}:${initialRevisionDatasetId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
 
           {/* organization editor */}
           <section className="flex flex-col gap-2 rounded-lg border border-border p-3">

@@ -27,22 +27,28 @@ vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
   CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
+    initialRevisionId, initialRevisionDatasetId,
     onOpenInWorkspace, workspaceLocation, onRetryWorkspaceLocation }: {
     onUseTables: (tables: { id: string; registrationId: string; name: string; uri: string; columns: never[] }[]) => void
     onQueryStateChange: (query: object) => void
-    onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] } | null) => void
+    onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] } | null, origin?: 'user' | 'route') => void
     selectedRegistrationId?: string | null
+    initialRevisionId?: string
+    initialRevisionDatasetId?: string
     onOpenInWorkspace?: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] }) => void
     workspaceLocation?: { state: 'resolving' | 'available' | 'unavailable'; reason?: string; retryable?: boolean }
     onRetryWorkspaceLocation?: () => void
   }) => <div data-testid="catalog-discovery">
     <span>Selected registration: {selectedRegistrationId ?? 'none'}</span>
+    <span>Exact deep link: {initialRevisionDatasetId ?? 'none'}@{initialRevisionId ?? 'none'}</span>
     <button onClick={() => onUseTables([
       { id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] },
       { id: 't2', registrationId: 'dataset-2', name: 'actions', uri: 'file:///actions.parquet', columns: [] },
     ])}>Use selected datasets</button>
     <button onClick={() => onQueryStateChange({ q: 'robot hands', folder: 'robotics', tags: ['gold'], owner: '', hasColumns: ['frame_id'], sort: 'updated', order: 'desc', match: 'meaning' })}>Change dataset query</button>
     <button onClick={() => onSelectedTableChange({ id: 't1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] })}>Open dataset</button>
+    <button onClick={() => onSelectedTableChange(null)}>Close dataset</button>
+    <button onClick={() => onSelectedTableChange({ id: 'tbl-receipt', registrationId: 'registration-current', name: 'receipt dataset', uri: 'file:///receipt.parquet', folder: 'robotics', columns: [] }, 'route')}>Open receipt dataset</button>
     <button onClick={() => onSelectedTableChange({ id: 'root-table', registrationId: 'root-dataset', name: 'root observations', uri: 'file:///root.parquet', columns: [] })}>Open root dataset</button>
     {onOpenInWorkspace && <button
       disabled={workspaceLocation?.state !== 'available'}
@@ -131,6 +137,39 @@ describe('WorkspaceExplorer', () => {
       .toHaveTextContent('DatasetView · Local exact view')
     expect(mocks.datasetView).toHaveBeenCalledWith('view-1')
     await waitFor(() => expect(mocks.previewDatasetView).toHaveBeenCalledWith('view-1'))
+  })
+
+  it('preserves a receipt logical revision identity while canonicalizing its Workspace registration', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:logical-receipt'
+    store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
+    render(<WorkspaceExplorer />)
+
+    expect(screen.getByText('Exact deep link: logical-receipt@rev-receipt')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Open receipt dataset' }))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith('dataset:registration-current')
+    expect(store.setWorkspaceDatasetQuery).not.toHaveBeenCalledWith(expect.not.stringContaining('revision=rev-receipt'))
+  })
+
+  it('clears both exact revision fields when the user selects another dataset', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open dataset' }))
+    await waitFor(() => expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(''))
+  })
+
+  it('clears both exact revision fields when the user closes the exact dataset', async () => {
+    store.workspaceScope = 'datasets'
+    store.workspaceResourceId = 'dataset:registration-current'
+    store.workspaceDatasetQuery = 'revision=rev-receipt&revisionDataset=logical-receipt'
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close dataset' }))
+    await waitFor(() => expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(''))
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(null)
   })
 
   it('continues a bounded page only when the user requests more', async () => {

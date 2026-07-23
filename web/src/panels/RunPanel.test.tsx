@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('../store/graph', () => ({
+  hasConfiguredManagedSidecarMerge: () => false,
   roleCanEdit: () => true,
   targetParameterDeclarations: (doc: any) => doc.parameters ?? [],
   useStore: (selector: (state: any) => unknown) => selector(mocks.state),
