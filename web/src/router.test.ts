@@ -121,6 +121,7 @@ describe('Workspace routes', () => {
           state.nodeRevealRequest = { canvasId, nodeId }
         },
         clearNodeReveal: () => { state.nodeRevealRequest = null },
+        requestViewportFit: vi.fn(),
         pushToast: vi.fn(), setWorkspaceResource: vi.fn(), setWorkspaceSearchQuery: vi.fn(),
         setWorkspaceScope: vi.fn(), setWorkspaceDatasetQuery: vi.fn(), setJobsQuery: vi.fn(),
         setInboxQuery: vi.fn(), setTransformResource: vi.fn(), setTransformLibraryQuery: vi.fn(),
@@ -140,7 +141,7 @@ describe('Workspace routes', () => {
     history.replaceState(null, '', '#/canvas/canvas-old?node=missing')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
     await vi.waitFor(() => expect(openFile).toHaveBeenCalledWith('canvas-old', {
-      navigationToken: expect.any(Number),
+      navigationToken: expect.any(Number), skipViewportFit: true,
     }))
 
     history.replaceState(null, '', '#/inbox')
@@ -200,7 +201,7 @@ describe('Workspace routes', () => {
         ...state,
         applyRoute: (route: { view: DpView }) => { state.view = route.view; publish() },
         select: (id: string | null) => { state.selectedId = id; publish() },
-        requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(), pushToast: vi.fn(), openFile,
+        requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(), requestViewportFit: vi.fn(), pushToast: vi.fn(), openFile,
       }),
       subscribe: (subscriber: (snapshot: typeof state) => void) => {
         subscribers.add(subscriber)
@@ -232,6 +233,36 @@ describe('Workspace routes', () => {
     expect(openFile).toHaveBeenCalledTimes(4)
   })
 
+  it('requests a one-shot overview when a normal Canvas route returns from Jobs to the loaded document', async () => {
+    const state = {
+      view: 'jobs' as DpView,
+      doc: { id: 'canvas-current', nodes: [{ id: 'step-1' }] }, selectedId: null as string | null,
+      workspaceResourceId: null, workspaceSearchQuery: '', workspaceScope: 'all' as const,
+      workspaceDatasetQuery: '', jobsQuery: '', inboxQuery: '', transformResourceId: null,
+      transformVersion: null, transformUpgradeCanvasId: null, transformUpgradeNodeId: null,
+      transformLibraryQuery: '',
+    }
+    const requestViewportFit = vi.fn()
+    const store = {
+      getState: () => ({
+        ...state,
+        applyRoute: (route: { view: DpView }) => { state.view = route.view },
+        select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(), requestViewportFit,
+        pushToast: vi.fn(), openFile: vi.fn(async () => false),
+      }),
+      subscribe: vi.fn(() => () => {}),
+    }
+    const bootstrapToken = startNavigation()
+    const router = initRouter(store, bootstrapToken)
+    router.settleBootstrap(bootstrapToken)
+
+    history.replaceState(null, '', '#/canvas/canvas-current')
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+
+    await vi.waitFor(() => expect(state.view).toBe('canvas'))
+    expect(requestViewportFit).toHaveBeenCalledOnce()
+  })
+
   it('coalesces one history traversal and removes both listeners plus the store subscription', async () => {
     const state = {
       view: 'canvas' as DpView,
@@ -246,7 +277,7 @@ describe('Workspace routes', () => {
     const store = {
       getState: () => ({
         ...state,
-        applyRoute: vi.fn(), select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(),
+        applyRoute: vi.fn(), select: vi.fn(), requestNodeReveal: vi.fn(), clearNodeReveal: vi.fn(), requestViewportFit: vi.fn(),
         pushToast: vi.fn(), openFile,
       }),
       subscribe: vi.fn(() => unsubscribe),

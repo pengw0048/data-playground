@@ -152,6 +152,90 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('a saved Canvas fits on Workspace reopen and reload without taking later viewport control @canvas-viewport', async ({ page }) => {
+    const canvasId = `saved-overview-${Date.now()}`
+    const canvasName = 'Saved graph overview'
+    const otherCanvasId = `${canvasId}-other`
+    const otherCanvasName = 'Saved graph overview other'
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: canvasName, version: 1,
+      nodes: Array.from({ length: 5 }, (_, index) => ({
+        id: `step-${index}`, type: 'filter', position: { x: 120 + index * 400, y: 160 },
+        data: { title: `Step ${index + 1}`, status: 'idle', config: {} },
+      })),
+      edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    const otherCreated = await page.request.post('/api/canvas', { data: {
+      id: otherCanvasId, name: otherCanvasName, version: 1,
+      nodes: Array.from({ length: 5 }, (_, index) => ({
+        id: `other-step-${index}`, type: 'filter', position: { x: 220, y: 120 + index * 600 },
+        data: { title: `Other step ${index + 1}`, status: 'idle', config: {} },
+      })),
+      edges: [],
+    } })
+    expect(otherCreated.ok()).toBe(true)
+    await page.setViewportSize({ width: 1280, height: 720 })
+
+    const nodes = page.locator('.react-flow__node')
+    const allNodesInsideFlow = async () => {
+      const flow = await page.locator('.react-flow').boundingBox()
+      const nodeBoxes = await nodes.evaluateAll((elements) => elements.map((element) => {
+        const box = element.getBoundingClientRect()
+        return { x: box.x, y: box.y, width: box.width, height: box.height }
+      }))
+      return !!flow && nodeBoxes.length === 5 && nodeBoxes.every((node) => (
+        node.x >= flow.x && node.y >= flow.y
+        && node.x + node.width <= flow.x + flow.width
+        && node.y + node.height <= flow.y + flow.height
+      ))
+    }
+
+    try {
+      await goToWorkspace(page)
+      await (await workspaceResource(page, 'canvas', canvasName)).click()
+      await expect(nodes).toHaveCount(5)
+      await expect.poll(allNodesInsideFlow).toBe(true)
+
+      const viewport = page.locator('.react-flow__viewport')
+      await page.getByRole('button', { name: 'Zoom in', exact: true }).click()
+      const manualViewport = await viewport.getAttribute('style')
+      await nodes.first().click()
+      await page.waitForTimeout(500)
+      expect(await viewport.getAttribute('style')).toBe(manualViewport)
+
+      // Jobs' ordinary Open canvas link returns to the document still held in the client store;
+      // this is not a fetch/reopen path, but it needs the same useful initial overview.
+      await page.evaluate(() => { location.hash = '#/jobs' })
+      await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
+      await page.evaluate((hash) => { location.hash = hash }, `#/canvas/${canvasId}`)
+      await expect(nodes).toHaveCount(5)
+      await expect.poll(allNodesInsideFlow).toBe(true)
+
+      await page.reload()
+      await expect(nodes).toHaveCount(5)
+      await expect.poll(allNodesInsideFlow).toBe(true)
+
+      // The fit uses React Flow's actual canvas region, not the browser window. Switch to a graph
+      // with deliberately different geometry while the Inspector is collapsed, then back again.
+      // That proves a same-count stale RF node set cannot consume the next document's request.
+      await page.getByRole('button', { name: 'Hide Inspector', exact: true }).click()
+      await backToWorkspace(page)
+      await (await workspaceResource(page, 'canvas', otherCanvasName)).click()
+      await expect(nodes).toHaveCount(5)
+      await expect(nodes.first()).toHaveAttribute('data-id', 'other-step-0')
+      await expect.poll(allNodesInsideFlow).toBe(true)
+      await backToWorkspace(page)
+      await (await workspaceResource(page, 'canvas', canvasName)).click()
+      await expect(nodes).toHaveCount(5)
+      await expect(nodes.first()).toHaveAttribute('data-id', 'step-0')
+      await expect.poll(allNodesInsideFlow).toBe(true)
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(otherCanvasId)}`)
+    }
+  })
+
   test('first-run choice preserves work, respects run-history safety, and never resets a manual viewport @first-run', async ({ page }) => {
     await page.goto('/')
     expect(await canvasesFor(page)).toEqual([])
@@ -531,8 +615,19 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('an online Canvas edit inside the autosave debounce survives tab reload as a local draft', async ({ page }) => {
-    await fresh(page)
-    const canvasId = decodeURIComponent(new URL(page.url()).hash.split('/').pop()!)
+    const canvasId = `local-draft-overview-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'untitled', version: 1,
+      nodes: Array.from({ length: 5 }, (_, index) => ({
+        id: `draft-step-${index}`, type: 'filter', position: { x: 120 + index * 400, y: 160 },
+        data: { title: `Draft step ${index + 1}`, status: 'idle', config: {} },
+      })),
+      edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
+    const nodes = page.locator('.react-flow__node')
+    await expect(nodes).toHaveCount(5)
     await expect(page.getByTestId('autosave')).toHaveText(/saved/, { timeout: 8_000 })
     await waitForCollabRoom(page, canvasId)
     const name = `Close recovery ${Date.now()}`
@@ -554,6 +649,18 @@ test.describe('Data Playground canvas', () => {
     await expect(page).toHaveURL(new RegExp(`#\/canvas\/${canvasId}$`))
     await expect(page.getByTestId('file-menu')).toContainText(name)
     await expect(page.getByTestId('autosave')).toHaveText(/saved locally/)
+    await expect.poll(async () => {
+      const flow = await page.locator('.react-flow').boundingBox()
+      const nodeBoxes = await nodes.evaluateAll((elements) => elements.map((element) => {
+        const box = element.getBoundingClientRect()
+        return { x: box.x, y: box.y, width: box.width, height: box.height }
+      }))
+      return !!flow && nodeBoxes.length === 5 && nodeBoxes.every((node) => (
+        node.x >= flow.x && node.y >= flow.y
+        && node.x + node.width <= flow.x + flow.width
+        && node.y + node.height <= flow.y + flow.height
+      ))
+    }).toBe(true)
     expect(unloadPuts).toBe(0)
 
     await page.unroute(canvasUrl)

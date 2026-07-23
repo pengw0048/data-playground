@@ -64,7 +64,7 @@ vi.mock('../api/client', () => ({
 }))
 
 import {
-  currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
+  canvasViewportDocumentIdentity, currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
@@ -2542,6 +2542,58 @@ describe('graph store — core authority ops', () => {
     expect(await useStore.getState().openFile('shared')).toBe(true)
 
     expect(useStore.getState().selectedId).toBe('a')
+  })
+
+  it('requests one initial viewport fit for a non-empty saved Canvas unless a node deep link owns the view', async () => {
+    const doc = { id: 'saved', version: 2, name: 'saved', nodes: [NODE('a')], edges: [] }
+    apiMocks.getCanvas.mockResolvedValue(doc)
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: 'saved', name: 'saved', version: 2, role: 'owner' },
+    ])
+
+    expect(await useStore.getState().openFile('saved')).toBe(true)
+    const fit = useStore.getState().viewportFitRequest
+    expect(fit).toMatchObject({ canvasId: 'saved' })
+    expect(fit?.documentIdentity).toBe(canvasViewportDocumentIdentity(doc))
+
+    useStore.getState().acknowledgeViewportFit(fit!.id)
+    expect(await useStore.getState().openFile('saved', { skipViewportFit: true })).toBe(true)
+    expect(useStore.getState().viewportFitRequest).toBeNull()
+
+    const empty = { id: 'empty', version: 1, name: 'empty', nodes: [], edges: [] }
+    apiMocks.getCanvas.mockResolvedValue(empty)
+    apiMocks.listCanvases.mockResolvedValue([
+      { id: 'empty', name: 'empty', version: 1, role: 'owner' },
+    ])
+    expect(await useStore.getState().openFile('empty')).toBe(true)
+    expect(useStore.getState().viewportFitRequest).toBeNull()
+  })
+
+  it('fits a recovered non-empty local draft unless a node deep link owns the view', async () => {
+    const doc = { id: 'local-saved', version: 3, name: 'local saved', nodes: [NODE('a'), NODE('b')], edges: [] }
+    expect(writeCanvasDraft({
+      draftId: doc.id,
+      principalId: 'alice',
+      canvasId: doc.id,
+      baseCanvasId: doc.id,
+      baseVersion: doc.version,
+      name: doc.name,
+      doc,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-23T15:00:00.000Z',
+    }).ok).toBe(true)
+    useStore.getState().refreshLocalDrafts()
+
+    expect(useStore.getState().openLocalDraft(doc.id)).toBe(true)
+    const fit = useStore.getState().viewportFitRequest
+    expect(fit).toMatchObject({ canvasId: doc.id })
+    expect(fit?.documentIdentity).toBe(canvasViewportDocumentIdentity(doc))
+
+    useStore.getState().acknowledgeViewportFit(fit!.id)
+    expect(await useStore.getState().openFile(doc.id, { skipViewportFit: true })).toBe(true)
+    expect(useStore.getState().viewportFitRequest).toBeNull()
+    expect(apiMocks.getCanvas).not.toHaveBeenCalled()
   })
 
   it('lets only the latest overlapping file-open navigation install a document', async () => {

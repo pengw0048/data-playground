@@ -40,7 +40,8 @@ export type CanvasCreationResult =
   | { ok: false }
 
 type NavigationOptions = { navigationToken?: NavigationToken }
-type OpenFileOptions = NavigationOptions & { serverCopy?: boolean }
+type CanvasNavigationOptions = NavigationOptions & { skipViewportFit?: boolean }
+type OpenFileOptions = CanvasNavigationOptions & { serverCopy?: boolean }
 
 const OPEN_KEY = (uid: string) => `dp-open-${uid}`  // last-opened file per user
 const ROLE_KEY = (userId: string, canvasId: string) => `dp-canvas-role-${encodeURIComponent(userId)}-${encodeURIComponent(canvasId)}`
@@ -1053,7 +1054,7 @@ interface Store {
   requestNodeReveal: (canvasId: string, nodeId: string) => void
   acknowledgeNodeReveal: (requestId: number) => void
   clearNodeReveal: () => void
-  requestViewportFit: (doc: CanvasDoc) => void
+  requestViewportFit: (doc?: CanvasDoc) => void
   acknowledgeViewportFit: (requestId: number) => void
   setSelection: (ids: string[]) => void
   selectAll: () => void
@@ -1188,7 +1189,7 @@ interface Store {
   setParameters: (parameters: CanvasParameterDeclaration[]) => string | null
   deleteFile: (id: string) => Promise<void>
   refreshLocalDrafts: () => void
-  openLocalDraft: (draftId: string, options?: NavigationOptions) => boolean
+  openLocalDraft: (draftId: string, options?: CanvasNavigationOptions) => boolean
   retryLocalDraft: (draftId: string) => Promise<void>
   forkLocalDraft: (draftId: string) => Promise<void>
   discardLocalDraft: (draftId: string) => Promise<void>
@@ -1776,7 +1777,7 @@ export const useStore = create<Store>((set, get) => ({
 
   clearNodeReveal: () => set({ nodeRevealRequest: null }),
 
-  requestViewportFit: (doc) => set({
+  requestViewportFit: (doc = get().doc) => set({
     viewportFitRequest: {
       id: ++_viewportFitGeneration,
       canvasId: doc.id,
@@ -2886,8 +2887,14 @@ export const useStore = create<Store>((set, get) => ({
         ? get().localDrafts.find((draft) => draft.canvasId === route.canvasId)
         : undefined
       if (ownsNavigation(navigationToken)) {
-        const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId, { navigationToken })
-          : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId, { navigationToken }) : false
+        const opened = routeDraft ? get().openLocalDraft(routeDraft.draftId, {
+          navigationToken,
+          skipViewportFit: !!route.nodeId,
+        })
+          : (route.view === 'canvas' && route.canvasId) ? await get().openFile(route.canvasId, {
+            navigationToken,
+            skipViewportFit: !!route.nodeId,
+          }) : false
         if (ownsNavigation(navigationToken)) {
           if (opened && route.view === 'canvas' && route.canvasId && route.nodeId
               && get().doc.id === route.canvasId) {
@@ -2971,7 +2978,10 @@ export const useStore = create<Store>((set, get) => ({
       return false
     }
     const localDraft = get().localDrafts.find((draft) => draft.canvasId === id && draft.principalId === userId)
-    if (localDraft && !options?.serverCopy) return get().openLocalDraft(localDraft.draftId, { navigationToken })
+    if (localDraft && !options?.serverCopy) return get().openLocalDraft(localDraft.draftId, {
+      navigationToken,
+      skipViewportFit: options?.skipViewportFit,
+    })
     const isCurrent = () => ownsNavigation(navigationToken)
       && generation === _fileNavigationGeneration && get().currentUser?.id === userId
     try {
@@ -3001,6 +3011,11 @@ export const useStore = create<Store>((set, get) => ({
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
       set({ view: 'canvas' })  // opening a file navigates to the editor
+      // A saved graph is otherwise mounted at React Flow's default viewport. Request one fit for
+      // this freshly opened, non-empty document; Canvas consumes it after card measurement, so
+      // later saves, collaboration updates, and ordinary rerenders stay out of the user's way.
+      // A node deep link owns its initial viewport instead.
+      if (!options?.skipViewportFit && get().doc.nodes.length > 0) get().requestViewportFit(get().doc)
       if (inspectConflict) get().pushToast('Opened the server copy read-only. Resolve or fork the local draft before editing this Canvas.', 'info')
       else if (accessRemoved) get().pushToast('This canvas is no longer in your accessible files. Opened the fetched snapshot read-only.', 'error')
       else if (!roleRefreshed || !role) get().pushToast('Opened read-only because your current access could not be confirmed', 'error')
@@ -3314,6 +3329,7 @@ export const useStore = create<Store>((set, get) => ({
       saved: true,
       view: 'canvas',
     })
+    if (!options?.skipViewportFit && draft.doc.nodes.length > 0) get().requestViewportFit(get().doc)
     try { localStorage.setItem(OPEN_KEY(principalId), draft.canvasId) } catch { /* visible writes happen through the draft store */ }
     if (!roleCanEdit(role)) get().pushToast('Opened the local draft read-only because current edit access is not confirmed', 'error')
     return true
