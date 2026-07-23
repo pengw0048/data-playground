@@ -62,6 +62,49 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
   })
+
+  it('uses the server-derived reference fact for a stale plugin contract', () => {
+    register({
+      kind: 'stale-contract-plugin', title: 'plugin', category: 'compute',
+      inputs: [], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'plugin', status: 'draft', history: [], config: {} }),
+    }, () => null)
+    useStore.setState({
+      selectedIds: ['plugin'],
+      canvasRole: 'owner',
+      doc: {
+        id: 'plugin-contract', name: 'Plugin contract', version: 1, requirements: [], edges: [],
+        nodes: [{
+          id: 'plugin', type: 'stale-contract-plugin', position: { x: 0, y: 0 },
+          data: {
+            title: 'plugin', status: 'draft', history: [],
+            config: {
+              code: 'return current_input',
+              outputSchema: [{
+                name: 'copied', type: 'int64', capabilities: [],
+                rowReference: {
+                  target: { kind: 'canonical', datasetId: 'stale-target' },
+                  keyFields: ['id'],
+                  provenance: 'declared',
+                },
+              }],
+              outputSchemaCodeHash: codeHash('return previous_input'),
+            },
+          },
+        }],
+      },
+      runs: {},
+      schemas: { plugin: { out: [{ name: 'copied', type: 'int64', capabilities: [] }] } },
+    } as any)
+
+    render(<Inspector />)
+    expect(screen.getByText(/changed since this contract was pinned/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByTitle('Show columns'))
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for copied' }))
+    expect(screen.getByText('No row-reference target was supplied.')).toBeInTheDocument()
+    expect(screen.queryByText(/stale-target/i)).not.toBeInTheDocument()
+  })
 })
 
 describe('Inspector — effective named outputs', () => {

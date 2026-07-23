@@ -43,6 +43,14 @@ export const canDeclareNodeSchema = (kind: string, outputCount: number) => (
   && outputCount === 1
 )
 
+const schemaContractStale = (cfg: Record<string, unknown>): boolean => {
+  const contractText = cfg.code ?? cfg.sql
+  const pinnedHash = cfg.outputSchemaCodeHash
+  return Array.isArray(cfg.outputSchema) && cfg.outputSchema.length > 0
+    && contractText != null && typeof pinnedHash === 'string' && pinnedHash.length > 0
+    && pinnedHash !== codeHash(String(contractText))
+}
+
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
 // generic editor), a code snippet with "open editor", its ports, and actions. When nothing (or a
 // multi-selection) is selected it shows a hint. The canvas cards still work; this is the persistent
@@ -145,7 +153,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const declaredOut = Array.isArray(cfg.outputSchema) && (cfg.outputSchema as ColumnSchema[]).length
     ? (cfg.outputSchema as ColumnSchema[]) : null
   const outSchemaFor = (portId: string): ColumnSchema[] | null | undefined => (
-    kind !== 'sql' && canDeclareSchema && declaredOut
+    kind !== 'sql' && canDeclareSchema && declaredOut && !schemaContractStale(cfg)
       && !node.data.bypassed && outputPorts.length === 1
       ? declaredOut
       : allSchemas[nodeId]?.[portId]
@@ -669,8 +677,7 @@ function SchemaContract({ nodeId, runnable }: { nodeId: string; runnable: boolea
   const contractText = cfg.code ?? cfg.sql
   const code = contractText == null ? null : String(contractText)
   // the contract may be stale if the code/SQL changed since it was pinned
-  const stale = declared.length > 0 && code != null && !!cfg.outputSchemaCodeHash
-    && cfg.outputSchemaCodeHash !== codeHash(code)
+  const stale = schemaContractStale(cfg)
   const [names, setNames] = useState<string[]>([])       // named contracts available to reference
   const [refCols, setRefCols] = useState<ColumnSchema[]>([])
   const inferRequestGeneration = useRef(0)
