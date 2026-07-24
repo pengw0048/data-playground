@@ -3434,6 +3434,7 @@ def test_postgres_concurrent_workspace_dataset_adds_fence_same_canvas_version(wo
         with metadb.session() as session:
             session.execute(delete(metadb.WorkspaceCanvasDatasetAddReplay).where(
                 metadb.WorkspaceCanvasDatasetAddReplay.request_id.in_(request_ids)))
+        metadb.delete_canvas_cascade(canvas_id)
 
 
 def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, monkeypatch):
