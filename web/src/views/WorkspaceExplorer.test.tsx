@@ -555,9 +555,9 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(screen.getByLabelText('Target canvas')).toHaveValue('target-canvas'))
     expect(screen.queryByRole('option', { name: /Read only/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
-    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
-      datasetIds: ['dataset-1'], expectedCanvasVersion: 9,
-    }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', expect.objectContaining({
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 9, requestId: expect.any(String),
+    })))
     expect(store.openFile).toHaveBeenCalledWith('target-canvas')
   })
 
@@ -581,9 +581,9 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
-    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-canvas', {
-      datasetIds: ['dataset-1'], expectedCanvasVersion: 12,
-    }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-canvas', expect.objectContaining({
+      datasetIds: ['dataset-1'], expectedCanvasVersion: 12, requestId: expect.any(String),
+    })))
   })
 
   it('fails closed instead of offering stale Canvas targets when the list refresh fails', async () => {
@@ -1039,9 +1039,9 @@ describe('WorkspaceExplorer', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Choose a Canvas/ }))
     await waitFor(() => expect(screen.getByRole('button', { name: 'Add and open' })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
-    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', {
-      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
-    }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('target-canvas', expect.objectContaining({
+      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9, requestId: expect.any(String),
+    })))
     expect(store.openFile).toHaveBeenCalledWith('target-canvas')
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
@@ -1061,13 +1061,54 @@ describe('WorkspaceExplorer', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
     fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
     fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
-    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-provider-canvas', {
-      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9,
-    }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledWith('current-provider-canvas', expect.objectContaining({
+      providerDatasetRefs: [EXTERNAL_DATASET.id], expectedCanvasVersion: 9, requestId: expect.any(String),
+    })))
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
   })
+
+  it('reuses the provider add request ID on retry and reports an already-present Source', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    store.doc = { id: 'current-provider-canvas', version: 9 }
+    store.files = [{ id: 'current-provider-canvas', name: 'Current provider analysis', version: 9, role: 'owner' }]
+    mocks.workspaceAddDatasets
+      .mockRejectedValueOnce(new Error('provider temporarily unavailable'))
+      .mockResolvedValueOnce({
+        ok: true, id: 'current-provider-canvas', version: 9,
+        changed: false, alreadyPresent: true, addedCount: 0,
+      })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Use in canvas' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Add to this Canvas/ })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /^Add to this Canvas/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    expect(await screen.findByText('provider temporarily unavailable')).toBeVisible()
+    const firstPayload = mocks.workspaceAddDatasets.mock.calls[0]?.[1] as {
+      requestId: string
+    }
+    expect(firstPayload.requestId).toEqual(expect.any(String))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add and open' }))
+    await waitFor(() => expect(mocks.workspaceAddDatasets).toHaveBeenCalledTimes(2))
+    const secondPayload = mocks.workspaceAddDatasets.mock.calls[1]?.[1] as {
+      requestId: string
+    }
+    expect(secondPayload.requestId).toBe(firstPayload.requestId)
+    expect(store.pushToast).toHaveBeenCalledWith(
+      'This provider dataset is already present in the selected Canvas.',
+      'info',
+    )
+    expect(store.openFile).toHaveBeenCalledWith('current-provider-canvas')
+    expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
+    expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+    expect(mocks.tableByRegistration).not.toHaveBeenCalled()
+  })
+
 
   it('explores a provider dataset in the surrounding external local overlay without mutating the provider', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
