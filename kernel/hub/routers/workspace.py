@@ -36,6 +36,7 @@ from hub.models import (
     WorkspaceAddDatasetResult,
     WorkspaceRunPage,
     WorkspaceBrowsePage,
+    WorkspaceCanonicalDatasetContext,
     WorkspaceResourceResolution,
     WorkspaceProviderRelinkRequest,
     WorkspaceProviderRelinkResult,
@@ -742,6 +743,25 @@ def resolve_workspace_resource(resource_id: str, uid: str = Depends(current_user
         return workspace_providers.resolve(resource_id, uid=uid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@router.get(
+    "/workspace/resources/{resource_id}/canonical-dataset",
+    response_model=WorkspaceCanonicalDatasetContext,
+)
+def canonical_workspace_provider_dataset(
+    resource_id: str,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Resolve placement-independent provider detail through the existing Source admission path."""
+    try:
+        return workspace_providers.provider_dataset_context(
+            resource_id, uid=uid,
+            resolve_physical=get_deps().resolve_physical_adapter,
+        )
+    except Exception as exc:  # noqa: BLE001 -- normalized to the existing provider action contract
+        _provider_dataset_action_error(exc)
+        raise AssertionError("provider dataset error mapping returned")  # pragma: no cover
 
 
 @router.post(

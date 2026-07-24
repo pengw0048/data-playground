@@ -449,6 +449,45 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     }
 
 
+def provider_dataset_context(resource_ref: str, *, uid: str,
+                             resolve_physical: Callable[[str], object]) -> dict:
+    """Return only non-sensitive canonical facts proven by the exact Source admission path."""
+    source = provider_dataset_source(
+        resource_ref, uid=uid, resolve_physical=resolve_physical)
+    config = source["data"]["config"]
+    uri = str(config["uri"])
+    dataset_identity = provider_dataset_identity(uri)
+    if dataset_identity is None:  # pragma: no cover - provider_dataset_source constructs this URI
+        raise ProviderDatasetUnavailable("canonical provider dataset identity is unavailable")
+    mount_id, source_binding_id = _decode_source_identity_token(
+        dataset_identity.removeprefix("workspace-provider:"))
+    canonical = metadb.workspace_provider_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if canonical is None:
+        raise ProviderDatasetGone("canonical provider dataset is detached")
+    dataset_ref = config.get("datasetRef")
+    exact = dataset_ref if isinstance(dataset_ref, dict) else None
+    provider_read_mode = config.get("providerReadMode")
+    if provider_read_mode not in {"exact", "mutable"}:
+        raise ProviderDatasetUnavailable("canonical provider dataset read mode is unavailable")
+    if provider_read_mode == "exact" and exact is None:
+        raise ProviderDatasetUnavailable("canonical provider dataset revision is unavailable")
+    read_mode = "exact" if provider_read_mode == "exact" else "current"
+    return {
+        "mountId": canonical["mountId"],
+        "sourceBindingId": canonical["sourceBindingId"],
+        "providerDatasetId": canonical["providerDatasetId"],
+        "datasetIdentity": dataset_identity,
+        "readMode": read_mode,
+        "revisionId": exact.get("revisionId") if exact is not None else None,
+        "committedAt": (
+            (exact.get("lastKnown") or {}).get("committedAt")
+            if exact is not None and isinstance(exact.get("lastKnown"), dict) else None
+        ),
+        "columns": canonical["columns"],
+    }
+
+
 def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
     identity = _external_identity(
         binding["mountId"], binding["resourceId"], binding["bindingId"])

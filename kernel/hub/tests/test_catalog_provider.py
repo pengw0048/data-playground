@@ -564,6 +564,25 @@ with TestClient(app) as client:
         "reference.csv", str(Path(os.environ["DP_WORKSPACE"]).parent),
     ):
         assert forbidden not in serialized_binding
+    root_context_response = client.get(
+        f"/api/workspace/resources/{resource['id']}/canonical-dataset")
+    nested_context_response = client.get(
+        f"/api/workspace/resources/{nested_resource['id']}/canonical-dataset")
+    assert root_context_response.status_code == nested_context_response.status_code == 200
+    canonical_context = root_context_response.json()
+    assert canonical_context == nested_context_response.json()
+    assert canonical_context["mountId"] == source_binding["mountId"]
+    assert canonical_context["sourceBindingId"] == source_binding["sourceBindingId"]
+    assert canonical_context["providerDatasetId"] == "dataset-a"
+    assert canonical_context["datasetIdentity"].startswith("workspace-provider:")
+    assert canonical_context["readMode"] == "exact"
+    assert canonical_context["revisionId"] == "provider-dataset-a-v1"
+    assert isinstance(canonical_context["committedAt"], str)
+    assert [(column["name"], column["type"])
+            for column in canonical_context["columns"]] == [("id", "int64")]
+    serialized_context = json.dumps(canonical_context, sort_keys=True)
+    for forbidden in ("reference.csv", str(Path(os.environ["DP_WORKSPACE"]).parent)):
+        assert forbidden not in serialized_context
     body = {
         "requestId": "00000000-0000-4000-8000-000000000791",
         "containerId": remote["localPlacement"]["containerId"],
@@ -596,7 +615,12 @@ with TestClient(app) as client:
     source = graph["nodes"][0]
     config = source["data"]["config"]
     assert config["uri"].startswith("workspace-provider://")
+    from hub import workspace_providers
+    assert workspace_providers.provider_dataset_identity(config["uri"]) == (
+        canonical_context["datasetIdentity"])
     assert config["datasetRef"]["revisionId"] == "provider-dataset-a-v1"
+    assert config["datasetRef"]["revisionId"] == canonical_context["revisionId"]
+    assert config["datasetRef"]["lastKnown"]["committedAt"] == canonical_context["committedAt"]
     assert os.environ["DP_CATALOG_MOUNTS"] not in json.dumps(graph)
     assert str(Path(os.environ["DP_WORKSPACE"]).parent / "catalog") not in json.dumps(graph)
 

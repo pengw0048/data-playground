@@ -5,7 +5,8 @@ import type {
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
-  WorkspaceFolderActionResult, WorkspaceMoveCanvasResult, WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
+  WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
+  WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
@@ -247,8 +248,15 @@ export const api = {
     if (params?.limit) query.set('limit', String(params.limit))
     return req<WorkspaceBrowsePage>(`/workspace/containers/${encodeURIComponent(containerId)}${query.size ? `?${query}` : ''}`)
   },
-  workspaceResource: (resourceId: string) =>
-    req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`),
+  workspaceResource: (resourceId: string, options?: { signal?: AbortSignal }) =>
+    req<WorkspaceResourceResolution>(`/workspace/resources/${encodeURIComponent(resourceId)}`, {
+      signal: options?.signal,
+    }),
+  workspaceCanonicalDataset: (resourceId: string, options?: { signal?: AbortSignal }) =>
+    req<WorkspaceCanonicalDatasetContext>(
+      `/workspace/resources/${encodeURIComponent(resourceId)}/canonical-dataset`,
+      { signal: options?.signal },
+    ),
   workspaceRelink: (resourceId: string, body: { mountId: string; resourceId: string }) =>
     req<WorkspaceProviderRelinkResult>(
       `/workspace/resources/${encodeURIComponent(resourceId)}/relink`,

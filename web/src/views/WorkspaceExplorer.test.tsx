@@ -4,6 +4,7 @@ import type { DatasetViewDefinition } from '../types/api'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
+  workspaceCanonicalDataset: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
@@ -80,9 +81,19 @@ const VIEW_DEFINITION: DatasetViewDefinition = {
   retentionOwner: 'provider', createdAt: '2026-07-18T12:00:00Z', semanticSha256: 'a'.repeat(64), definitionSha256: 'b'.repeat(64),
 }
 const EXTERNAL_LOCAL_PLACEMENT = { writable: true, canCreateCanvas: true, canMoveCanvas: true, containerId: 'local-overlay-anchor', containerVersion: 7, recoveryState: 'ready' as const }
-const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder', localPlacement: EXTERNAL_LOCAL_PLACEMENT, providerMutation: false }
-const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset' }
+const EXTERNAL_FOLDER = { id: 'container:external.mount-folder', kind: 'container' as const, name: 'Remote', parentId: ROOT.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-folder', providerPlacementId: 'remote-folder', localPlacement: EXTERNAL_LOCAL_PLACEMENT, providerMutation: false }
+const EXTERNAL_DATASET = { id: 'dataset:external.mount-dataset', kind: 'dataset' as const, name: 'observations', parentId: EXTERNAL_FOLDER.id, detached: false, source: 'provider' as const, mountId: 'warehouse', provider: 'fixture', resourceId: 'remote-dataset', providerPlacementId: 'remote-dataset', parentProviderPlacementId: 'remote-folder', providerDatasetId: 'canonical-observations', referenceState: 'current' as const, canonicalReferenceState: 'current' as const }
 const PROVIDER_COMPLETE = { id: 'mount:warehouse', kind: 'provider' as const, mountId: 'warehouse', provider: 'fixture', completeness: 'complete' as const, error: null }
+const CANONICAL_SOURCE_BINDING = { mountId: 'warehouse', sourceBindingId: 'a'.repeat(32) }
+const CANONICAL_DATASET_CONTEXT = {
+  ...CANONICAL_SOURCE_BINDING,
+  providerDatasetId: 'canonical-observations',
+  datasetIdentity: 'workspace-provider:canonical-source',
+  readMode: 'exact' as const,
+  revisionId: 'revision-7',
+  committedAt: '2026-07-23T12:00:00Z',
+  columns: [{ name: 'value', type: 'int64', provenance: 'provider' as const, capabilities: [], annotations: [] }],
+}
 
 describe('WorkspaceExplorer', () => {
   beforeEach(() => {
@@ -98,6 +109,7 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceBrowse.mockResolvedValue({ container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'complete', sources: [{ id: 'local', kind: 'local', completeness: 'complete' }] })
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
+    mocks.workspaceCanonicalDataset.mockResolvedValue(CANONICAL_DATASET_CONTEXT)
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
@@ -1023,7 +1035,7 @@ describe('WorkspaceExplorer', () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     store.files = [{ id: 'target-canvas', name: 'Exact target', version: 9, role: 'editor' }]
     mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'target-canvas', version: 10 })
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
@@ -1053,7 +1065,7 @@ describe('WorkspaceExplorer', () => {
     store.doc = { id: 'current-provider-canvas', version: 9 }
     store.files = [{ id: 'current-provider-canvas', name: 'Current provider analysis', version: 9, role: 'owner' }]
     mocks.workspaceAddDatasets.mockResolvedValue({ ok: true, id: 'current-provider-canvas', version: 10 })
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
@@ -1079,7 +1091,7 @@ describe('WorkspaceExplorer', () => {
         ok: true, id: 'current-provider-canvas', version: 9,
         changed: false, alreadyPresent: true, addedCount: 0,
       })
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
@@ -1112,7 +1124,7 @@ describe('WorkspaceExplorer', () => {
 
   it('explores a provider dataset in the surrounding external local overlay without mutating the provider', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     mocks.workspaceCreateCanvas.mockResolvedValue({ ok: true, id: 'provider-explore', created: true, resource: CANVAS })
     render(<WorkspaceExplorer />)
@@ -1131,7 +1143,7 @@ describe('WorkspaceExplorer', () => {
   it('disables provider dataset exploration when its external local overlay is unavailable', async () => {
     const unavailable = { ...EXTERNAL_FOLDER, localPlacement: { ...EXTERNAL_LOCAL_PLACEMENT, recoveryState: 'unavailable' as const } }
     store.workspaceResourceId = EXTERNAL_DATASET.id
-    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, unavailable], source: PROVIDER_COMPLETE })
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, unavailable], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: unavailable, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
@@ -1143,11 +1155,505 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
   })
 
+  it('keeps a placement deep link distinct from its canonical dataset and shows only observed aliases', async () => {
+    const alternateFolder = {
+      ...EXTERNAL_FOLDER, id: 'container:external.remote-b', name: 'Remote B',
+      resourceId: 'remote-folder-b', providerPlacementId: 'remote-folder-b',
+    }
+    const alternate = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.mount-dataset-b', parentId: alternateFolder.id,
+      resourceId: 'remote-dataset-b', providerPlacementId: 'remote-dataset-b',
+      parentProviderPlacementId: 'remote-folder-b',
+    }
+    store.workspaceResourceId = alternate.id
+    mocks.workspaceResource.mockResolvedValue({ resource: alternate, ancestors: [ROOT, alternateFolder], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
+    mocks.workspaceBrowse.mockResolvedValue({ container: alternateFolder, items: [alternate], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    const view = render(<WorkspaceExplorer />)
+    await screen.findByRole('dialog', { name: 'observations' })
+
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    view.rerender(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Workspace placementremote-dataset')
+    expect(detail).toHaveTextContent('Canonical datasetMountwarehouseDataset IDcanonical-observations')
+    expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
+      'Source dataset identityworkspace-provider:canonical-source',
+    )
+    expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
+      'Read modeExact revision · revision-7',
+    )
+    expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
+      'Canonical columnsvalue · int64',
+    )
+    expect(detail).toHaveTextContent('Also observed atRemote B / observations')
+    expect(detail).toHaveTextContent('Only placements already loaded in this Workspace session are shown.')
+    expect(mocks.workspaceResource).toHaveBeenLastCalledWith(EXTERNAL_DATASET.id)
+    expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledWith(
+      alternate.id, { signal: expect.any(AbortSignal) },
+    )
+    expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledWith(
+      EXTERNAL_DATASET.id, { signal: expect.any(AbortSignal) },
+    )
+  })
+
+  it('keeps the full named ancestor chain for a nested provider placement', async () => {
+    const top = {
+      ...EXTERNAL_FOLDER, id: 'container:external.top', name: 'Top collection',
+      resourceId: 'top', providerPlacementId: 'top',
+    }
+    const nested = {
+      ...EXTERNAL_FOLDER, id: 'container:external.nested', name: 'Nested collection', parentId: top.id,
+      resourceId: 'nested', providerPlacementId: 'nested', parentProviderPlacementId: 'top',
+    }
+    const dataset = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.nested-dataset', parentId: nested.id,
+      resourceId: 'nested-dataset', providerPlacementId: 'nested-dataset', parentProviderPlacementId: 'nested',
+    }
+    store.workspaceResourceId = dataset.id
+    mocks.workspaceResource.mockResolvedValue({ resource: dataset, ancestors: [ROOT, top, nested], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
+    mocks.workspaceBrowse.mockResolvedValue({ container: nested, items: [dataset], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Top collection / Nested collection / observations')
+  })
+
+  it('uses a top-level provider dataset name as its truthful placement path', async () => {
+    const topLevel = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.top-level', parentId: ROOT.id,
+      resourceId: 'top-level', providerPlacementId: 'top-level',
+      parentProviderPlacementId: undefined,
+    }
+    store.workspaceResourceId = topLevel.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: topLevel, ancestors: [ROOT], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [topLevel], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Workspace placementtop-levelobservations')
+    expect(detail).not.toHaveTextContent('remote-folder')
+  })
+
+  it('labels mutable canonical provider detail as current instead of implying an exact revision', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({
+      ...CANONICAL_DATASET_CONTEXT,
+      readMode: 'current',
+      revisionId: null,
+      committedAt: null,
+    })
+    render(<WorkspaceExplorer />)
+
+    const context = await screen.findByTestId('canonical-provider-dataset-context')
+    expect(context).toHaveTextContent('Current/latest provider state · not an exact revision')
+    expect(context).not.toHaveTextContent('Exact revision')
+  })
+
+  it('bounds canonical column rendering while retaining the reported total', async () => {
+    const columns = Array.from({ length: 27 }, (_, index) => ({
+      name: `column-${index}`, type: 'string', provenance: 'provider' as const,
+      capabilities: [], annotations: [],
+    }))
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset.mockResolvedValue({ ...CANONICAL_DATASET_CONTEXT, columns })
+    render(<WorkspaceExplorer />)
+
+    const context = await screen.findByTestId('canonical-provider-dataset-context')
+    expect(within(context).getByText('column-0')).toBeVisible()
+    expect(within(context).getByText('column-24')).toBeVisible()
+    expect(within(context).queryByText('column-25')).not.toBeInTheDocument()
+    expect(context).toHaveTextContent('2 more columns')
+  })
+
+  it('retries canonical provider detail without changing the placement', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    mocks.workspaceCanonicalDataset
+      .mockRejectedValueOnce(new Error('canonical detail timed out'))
+      .mockResolvedValueOnce(CANONICAL_DATASET_CONTEXT)
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText(/Canonical dataset context is unavailable/)).toHaveTextContent(
+      'canonical detail timed out',
+    )
+    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry canonical detail' }))
+    expect(await screen.findByTestId('canonical-provider-dataset-context')).toHaveTextContent(
+      'Exact revision · revision-7',
+    )
+    expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledTimes(2)
+    expect(store.workspaceResourceId).toBe(EXTERNAL_DATASET.id)
+  })
+
+  it('bounded-resolves fresh same-named provider search occurrences into truthful paths', async () => {
+    const alternateFolder = {
+      ...EXTERNAL_FOLDER, id: 'container:external.other-folder', name: 'Other Remote',
+      resourceId: 'other-folder', providerPlacementId: 'other-folder',
+    }
+    const alternate = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.search-alias', resourceId: 'search-alias',
+      providerPlacementId: 'search-alias', parentProviderPlacementId: 'other-folder',
+    }
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{ source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' }, items: [EXTERNAL_DATASET, alternate] }],
+    })
+    mocks.workspaceResource.mockImplementation((resourceId: string) => Promise.resolve(
+      resourceId === EXTERNAL_DATASET.id
+        ? { resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING }
+        : { resource: alternate, ancestors: [ROOT, alternateFolder], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING },
+    ))
+    render(<WorkspaceExplorer />)
+
+    const results = await screen.findByTestId('workspace-search-results')
+    expect(within(results).getAllByText('observations', { exact: true })).toHaveLength(2)
+    expect(results).toHaveTextContent('Placement path · Remote / observations')
+    expect(results).toHaveTextContent('Placement path · Other Remote / observations')
+    expect(mocks.workspaceResource).toHaveBeenCalledTimes(2)
+    expect(mocks.workspaceResource.mock.calls.every(([, options]) => options.signal instanceof AbortSignal)).toBe(true)
+  })
+
+  it('detects same-named provider occurrences across loaded search pages', async () => {
+    const alternateFolder = {
+      ...EXTERNAL_FOLDER, id: 'container:external.page-two-folder', name: 'Page Two',
+      resourceId: 'page-two-folder', providerPlacementId: 'page-two-folder',
+    }
+    const alternate = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.page-two-dataset',
+      resourceId: 'page-two-dataset', providerPlacementId: 'page-two-dataset',
+      parentProviderPlacementId: 'page-two-folder',
+    }
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'page', hasMore: true, nextCursor: 'provider-page-2',
+        groups: [{
+          source: { ...PROVIDER_COMPLETE, completeness: 'page', freshness: 'current', searchMode: 'native' },
+          items: [EXTERNAL_DATASET],
+        }],
+      })
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [{
+          source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' },
+          items: [alternate],
+        }],
+      })
+    mocks.workspaceResource.mockImplementation((resourceId: string) => Promise.resolve(
+      resourceId === EXTERNAL_DATASET.id
+        ? {
+            resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER],
+            source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+          }
+        : {
+            resource: alternate, ancestors: [ROOT, alternateFolder],
+            source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+          },
+    ))
+    render(<WorkspaceExplorer />)
+
+    const initial = await screen.findByTestId('workspace-search-results')
+    expect(within(initial).getAllByText('observations', { exact: true })).toHaveLength(1)
+    expect(mocks.workspaceResource).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
+    const merged = screen.getByTestId('workspace-search-results')
+    expect(within(merged).getAllByText('observations', { exact: true })).toHaveLength(2)
+    expect(merged).toHaveTextContent('Placement path · Remote / observations')
+    expect(merged).toHaveTextContent('Placement path · Page Two / observations')
+  })
+
+  it('caps automatic provider search enrichment at 25 placements per query', async () => {
+    const datasets = Array.from({ length: 30 }, (_, index) => ({
+      ...EXTERNAL_DATASET,
+      id: `dataset:external.search-cap-${index}`,
+      resourceId: `search-cap-${index}`,
+      providerPlacementId: `search-cap-${index}`,
+      parentProviderPlacementId: `search-cap-folder-${index}`,
+    }))
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'page', hasMore: true, nextCursor: 'cap-page-2',
+        groups: [{
+          source: { ...PROVIDER_COMPLETE, completeness: 'page', freshness: 'current', searchMode: 'native' },
+          items: datasets.slice(0, 20),
+        }],
+      })
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [{
+          source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' },
+          items: datasets.slice(20),
+        }],
+      })
+    mocks.workspaceResource.mockImplementation((resourceId: string) => {
+      const index = datasets.findIndex((resource) => resource.id === resourceId)
+      const folder = {
+        ...EXTERNAL_FOLDER,
+        id: `container:external.search-cap-folder-${index}`,
+        name: `Search folder ${index}`,
+        resourceId: `search-cap-folder-${index}`,
+        providerPlacementId: `search-cap-folder-${index}`,
+      }
+      return Promise.resolve({
+        resource: datasets[index], ancestors: [ROOT, folder],
+        source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+      })
+    })
+    render(<WorkspaceExplorer />)
+
+    await screen.findByTestId('workspace-search-results')
+    expect(mocks.workspaceResource).toHaveBeenCalledTimes(20)
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+    await waitFor(() => expect(mocks.workspaceSearch).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(25))
+  })
+
+  it('aborts superseded search enrichment without polluting later placement observations', async () => {
+    const alternateFolder = {
+      ...EXTERNAL_FOLDER, id: 'container:external.superseded-folder', name: 'Superseded Remote',
+      resourceId: 'superseded-folder', providerPlacementId: 'superseded-folder',
+    }
+    const alternate = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.superseded-dataset',
+      resourceId: 'superseded-dataset', providerPlacementId: 'superseded-dataset',
+      parentProviderPlacementId: 'superseded-folder',
+    }
+    const pending: Array<(value: unknown) => void> = []
+    store.workspaceSearchQuery = 'first'
+    mocks.workspaceSearch
+      .mockResolvedValueOnce({
+        query: 'first', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [{
+          source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' },
+          items: [EXTERNAL_DATASET, alternate],
+        }],
+      })
+      .mockResolvedValueOnce({
+        query: 'second', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [],
+      })
+    mocks.workspaceResource.mockImplementation(() => new Promise((resolve) => pending.push(resolve)))
+    const view = render(<WorkspaceExplorer />)
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
+
+    store.workspaceSearchQuery = 'second'
+    view.rerender(<WorkspaceExplorer />)
+    expect(await screen.findByTestId('workspace-search-results')).toHaveTextContent('for “second”')
+
+    await act(async () => {
+      pending[0]?.({
+        resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER],
+        source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+      })
+      pending[1]?.({
+        resource: alternate, ancestors: [ROOT, alternateFolder],
+        source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+      })
+    })
+
+    store.workspaceSearchQuery = ''
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    view.rerender(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).not.toHaveTextContent('Also observed at')
+    expect(detail).not.toHaveTextContent('Superseded Remote / observations')
+  })
+
+  it('does not invent a search path from opaque provider identities', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{ source: { ...PROVIDER_COMPLETE, freshness: 'current', searchMode: 'native' }, items: [EXTERNAL_DATASET] }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const results = await screen.findByTestId('workspace-search-results')
+    expect(results).not.toHaveTextContent('Placement path ·')
+    expect(results).not.toHaveTextContent('remote-folder')
+    expect(mocks.workspaceResource).not.toHaveBeenCalled()
+  })
+
+  it('keeps stale search paths visible but excludes them from current alternate placements', async () => {
+    const alternateFolder = {
+      ...EXTERNAL_FOLDER, id: 'container:external.stale-folder', name: 'Stale Remote',
+      resourceId: 'stale-folder', providerPlacementId: 'stale-folder',
+    }
+    const alternate = {
+      ...EXTERNAL_DATASET, id: 'dataset:external.stale-alternate',
+      resourceId: 'stale-alternate', providerPlacementId: 'stale-alternate',
+      parentProviderPlacementId: 'stale-folder',
+    }
+    store.workspaceResourceId = alternate.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: alternate, ancestors: [ROOT, alternateFolder], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: alternateFolder, items: [alternate], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    const view = render(<WorkspaceExplorer />)
+    await screen.findByRole('dialog', { name: 'observations' })
+
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'complete', sources: [PROVIDER_COMPLETE],
+    })
+    view.rerender(<WorkspaceExplorer />)
+    expect(await screen.findByRole('dialog', { name: 'observations' })).toHaveTextContent(
+      'Also observed atStale Remote / observations',
+    )
+
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch.mockResolvedValue({
+      query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+      groups: [{
+        source: { ...PROVIDER_COMPLETE, freshness: 'stale', searchMode: 'native' },
+        items: [alternate],
+      }],
+    })
+    view.rerender(<WorkspaceExplorer />)
+    const results = await screen.findByTestId('workspace-search-results')
+    expect(results).toHaveTextContent('Placement path · Stale Remote / observations')
+
+    store.workspaceSearchQuery = ''
+    view.rerender(<WorkspaceExplorer />)
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).not.toHaveTextContent('Also observed at')
+  })
+
+  it('bounds observed alternate placements within one Workspace session', async () => {
+    const entries = Array.from({ length: 7 }, (_, index) => {
+      const folder = {
+        ...EXTERNAL_FOLDER, id: `container:external.folder-${index}`, name: `Remote ${index}`,
+        resourceId: `folder-${index}`, providerPlacementId: `folder-${index}`,
+      }
+      const dataset = {
+        ...EXTERNAL_DATASET, id: `dataset:external.dataset-${index}`, parentId: folder.id,
+        resourceId: `dataset-${index}`, providerPlacementId: `dataset-${index}`,
+        parentProviderPlacementId: `folder-${index}`,
+      }
+      return { folder, dataset }
+    })
+    const byResource = new Map(entries.map(({ folder, dataset }) => [dataset.id, { resource: dataset, ancestors: [ROOT, folder], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING }]))
+    mocks.workspaceResource.mockImplementation((resourceId: string) => Promise.resolve(byResource.get(resourceId)))
+    mocks.workspaceBrowse.mockImplementation((containerId: string) => {
+      const entry = entries.find(({ folder }) => folder.id === `container:${containerId}`)
+      return Promise.resolve(entry && { container: entry.folder, items: [entry.dataset], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    })
+
+    store.workspaceResourceId = entries[0].dataset.id
+    const view = render(<WorkspaceExplorer />)
+    for (const entry of entries) {
+      store.workspaceResourceId = entry.dataset.id
+      view.rerender(<WorkspaceExplorer />)
+      await waitFor(() => expect(mocks.workspaceResource).toHaveBeenLastCalledWith(entry.dataset.id))
+    }
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail.querySelectorAll('[title^="Remote "]')).toHaveLength(5)
+    expect(detail).not.toHaveTextContent('Remote 0 / observations')
+    expect(detail).toHaveTextContent('Remote 1 / observations')
+  })
+
+  it('separates a detached placement from canonical dataset unavailability', async () => {
+    const detachedPlacement = { ...EXTERNAL_DATASET, detached: true, referenceState: 'detached' as const, lastKnown: true }
+    store.workspaceResourceId = detachedPlacement.id
+    mocks.workspaceResource.mockResolvedValue({ resource: detachedPlacement, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [detachedPlacement], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    const first = render(<WorkspaceExplorer />)
+    expect(await screen.findByRole('dialog', { name: 'observations' })).toHaveTextContent('Placement state · detached · canonical dataset is current')
+    first.unmount()
+    mocks.workspaceResource.mockClear()
+
+    const unavailableCanonical = { ...EXTERNAL_DATASET, canonicalReferenceState: 'offline' as const, lastKnown: true }
+    mocks.workspaceResource.mockResolvedValue({ resource: unavailableCanonical, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
+    mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [unavailableCanonical], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
+    const second = render(<WorkspaceExplorer />)
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detail).toHaveTextContent('Canonical dataset state · offline')
+    expect(detail).toHaveTextContent('Placement state · current')
+    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Retry canonical dataset' }))
+    await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
+    second.unmount()
+    mocks.workspaceResource.mockClear()
+
+    const bothUnavailable = {
+      ...EXTERNAL_DATASET, referenceState: 'offline' as const,
+      canonicalReferenceState: 'offline' as const, lastKnown: true,
+    }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: bothUnavailable, ancestors: [ROOT, EXTERNAL_FOLDER],
+      source: { ...PROVIDER_COMPLETE, completeness: 'unavailable', referenceState: 'offline' },
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [bothUnavailable], nextCursor: null, hasMore: false,
+      completeness: 'partial',
+      sources: [{ ...PROVIDER_COMPLETE, completeness: 'unavailable', referenceState: 'offline' }],
+    })
+    render(<WorkspaceExplorer />)
+    const both = await screen.findByRole('dialog', { name: 'observations' })
+    expect(both).toHaveTextContent('Placement state · offline')
+    expect(both).toHaveTextContent('Canonical dataset state · offline')
+    expect(screen.getByRole('button', { name: 'Use in canvas' })).toBeDisabled()
+  })
+
   it('preserves an external selection and ancestors when its refresh becomes unavailable', async () => {
     store.workspaceResourceId = EXTERNAL_DATASET.id
     mocks.workspaceResource
-      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
-      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT], source: { ...PROVIDER_COMPLETE, completeness: 'partial', error: 'ancestor read interrupted' } })
+      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
+      .mockResolvedValueOnce({ resource: EXTERNAL_DATASET, ancestors: [ROOT], source: { ...PROVIDER_COMPLETE, completeness: 'partial', error: 'ancestor read interrupted' }, canonicalSourceBinding: CANONICAL_SOURCE_BINDING })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     render(<WorkspaceExplorer />)
 
@@ -1190,7 +1696,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
-    expect(detail).toHaveTextContent('Last-known metadata · offline')
+    expect(detail).toHaveTextContent('Placement state · offline')
     fireEvent.click(screen.getAllByRole('button', { name: 'Relink' })[0])
     const dialog = screen.getByRole('dialog', { name: 'Relink observations' })
     expect(dialog).toHaveTextContent('Names are never used to repair a binding')
