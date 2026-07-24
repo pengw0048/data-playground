@@ -4912,7 +4912,7 @@
             "type": "string"
           },
           "sourceDatasetId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "title": "Sourcedatasetid",
             "type": "string"
@@ -5861,7 +5861,7 @@
           "sourceDatasetId": {
             "anyOf": [
               {
-                "maxLength": 128,
+                "maxLength": 512,
                 "minLength": 1,
                 "type": "string"
               },

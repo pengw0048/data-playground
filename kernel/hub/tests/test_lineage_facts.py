@@ -92,6 +92,109 @@ def _mapping(
     }
 
 
+def _provider_lineage_admission(*, run_id: str, mount_id: str | None = None,
+                                revision_id: str = "provider-revision-v1",
+                                duplicate: str | None = None,
+                                admitted_dataset_id: str | None = None) -> tuple[str, str, str]:
+    """Persist one canonical provider binding and exact execution-manifest admission."""
+    from types import SimpleNamespace
+
+    from hub.execution_manifest import build_execution_manifest
+    from hub.models import Graph
+    from hub.nodespecs import BUILTIN_NODE_SPECS
+    from hub import workspace_providers
+
+    mount_id = mount_id or f"provider-mount-{uuid.uuid4().hex}"
+    source_binding_id = uuid.uuid4().hex
+    parent = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    dataset_id = f"workspace-provider:{parent.removeprefix('workspace-provider://')}"
+    admitted_dataset_id = admitted_dataset_id or dataset_id
+    graph = Graph.model_validate({
+        "id": f"provider-lineage-{uuid.uuid4().hex}", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0},
+             "data": {"config": {"uri": parent}}},
+            *([{"id": "source-duplicate", "type": "source",
+                "position": {"x": 0, "y": 1},
+                "data": {"config": {"uri": parent}}}] if duplicate else []),
+            {"id": "write", "type": "write", "position": {"x": 1, "y": 0},
+             "data": {"config": {"name": "derived"}}},
+        ],
+        "edges": [
+            {"id": "source-write", "source": "source", "target": "write"},
+            *([{"id": "source-duplicate-write", "source": "source-duplicate",
+                "target": "write"}] if duplicate else []),
+        ],
+    })
+    inputs = [{
+        "node_id": "source", "dataset_id": admitted_dataset_id,
+        "revision_id": revision_id, "provider": "fixture-exact",
+        "resolved_at": "2026-07-23T00:00:00+00:00",
+    }]
+    if duplicate:
+        inputs.append({
+            **inputs[0], "node_id": "source-duplicate",
+            "revision_id": (
+                "provider-revision-conflict" if duplicate == "conflict" else revision_id),
+            "provider": (
+                "other-fixture-exact" if duplicate == "provider-conflict"
+                else inputs[0]["provider"]),
+        })
+    digest, document = build_execution_manifest(
+        graph, target_node_id="write", target_port_id=None, input_manifest=inputs,
+        write_intent=None,
+        deps=SimpleNamespace(
+            node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS}, plugins=[]),
+    )
+    provider_dataset_id = f"physical-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.WorkspaceProviderDataset(
+            mount_id=mount_id, provider_dataset_id=provider_dataset_id,
+            provider="fixture", source_binding_id=source_binding_id,
+            uri="fixture://physical/secret-placement", columns_doc="[]", state="current",
+        ))
+        session.flush()
+        # Two display placements intentionally share this canonical source binding. Neither belongs
+        # to the retained manifest or to a lineage fact.
+        for index in range(2):
+            session.add(metadb.WorkspaceProviderBinding(
+                id=uuid.uuid4().hex, mount_id=mount_id, provider="fixture",
+                container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+                provider_placement_id=f"placement-{index}-{uuid.uuid4().hex}",
+                kind="dataset", name=f"Placement {index}",
+                provider_dataset_id=provider_dataset_id,
+            ))
+        metadb._persist_execution_manifest(session, digest, document)
+        session.add(metadb.RunState(
+            run_id=run_id, canvas_id=None, status="done", doc="{}",
+            execution_manifest_sha256=digest,
+        ))
+    return parent, dataset_id, digest
+
+
+def _provider_lineage(
+        key: str, *, run_id: str, dataset_id: str, revision_id: str,
+        mapping: bool = True) -> dict:
+    return _lineage(key, mappings=[{
+        "source_dataset_id": dataset_id,
+        "source_version": revision_id,
+        "source_field": "raw_id",
+        "source_field_id": None,
+        "destination_field": "id",
+    }] if mapping else []) | {"run_id": run_id}
+
+
+def _provider_binding_for_parent(session, parent: str):
+    from hub import workspace_providers
+
+    mount_id, source_binding_id = workspace_providers._decode_source_identity_token(
+        parent.removeprefix("workspace-provider://"))
+    return session.scalar(select(metadb.WorkspaceProviderDataset).where(
+        metadb.WorkspaceProviderDataset.mount_id == mount_id,
+        metadb.WorkspaceProviderDataset.source_binding_id == source_binding_id,
+    ))
+
+
 def test_field_mapping_contract_rejects_missing_duplicate_and_contradictory_ownership():
     from hub.models import LineagePublication
 
@@ -126,6 +229,121 @@ def test_field_mapping_contract_rejects_missing_duplicate_and_contradictory_owne
                 {**base, "source_version": "source-v2", "source_field_id": "other-id"},
             ],
         )
+
+
+def test_provider_lineage_uses_admitted_canonical_identity_and_exact_revision(catalog_scope):
+    run_id = f"provider-lineage-run-{uuid.uuid4().hex}"
+    # A legal token with a 126-character mount produces a stable dataset identity beyond 128.
+    parent, dataset_id, manifest_sha256 = _provider_lineage_admission(
+        run_id=run_id, mount_id="mount-" + "m" * 120,
+        revision_id="provider-revision-exact",
+    )
+    assert len(dataset_id) > 128
+    destination = f"{catalog_scope}provider-destination"
+    _register(destination, "destination-v1")
+    lineage = _provider_lineage(
+        "provider-canonical-success", run_id=run_id, dataset_id=dataset_id,
+        revision_id="provider-revision-exact")
+
+    # Publication derives only from the retained manifest, so temporary provider availability does
+    # not prevent facts for an already admitted exact revision.
+    with metadb.session() as session:
+        binding = _provider_binding_for_parent(session, parent)
+        assert binding is not None
+        binding.state = "offline"
+    assert metadb.catalog_record_lineage(
+        destination, "destination-v1", [parent], lineage) == 1
+    # A completed publication remains replayable even after the binding later becomes unavailable.
+    with metadb.session() as session:
+        binding = _provider_binding_for_parent(session, parent)
+        assert binding is not None
+        binding.state = "detached"
+    assert metadb.catalog_record_lineage(
+        destination, "destination-v1", [parent], lineage) == 0
+
+    with metadb.session() as session:
+        fact = session.scalar(select(metadb.CatalogLineageFact).where(
+            metadb.CatalogLineageFact.run_id == run_id))
+        assert fact is not None
+        assert (fact.source_key, fact.source_uri, fact.source_version) == (
+            dataset_id, parent, "provider-revision-exact")
+        assert fact.execution_manifest_sha256 == manifest_sha256
+        assert "physical-" not in json.dumps({
+            "sourceKey": fact.source_key, "sourceUri": fact.source_uri,
+            "sourceVersion": fact.source_version,
+        }, sort_keys=True)
+    destination_dataset_id = _registration_id(destination)
+    projections, _cursor, _truncated, available = metadb.catalog_field_lineage_page(
+        destination_dataset_id, "destination-v1", ["id"])
+    assert available is True
+    assert [(item["source_dataset_id"], item["source_version"])
+            for item in projections] == [(dataset_id, "provider-revision-exact")]
+
+
+def test_provider_lineage_allows_repeated_nodes_with_one_exact_admitted_identity(catalog_scope):
+    run_id = f"provider-lineage-repeat-{uuid.uuid4().hex}"
+    parent, dataset_id, _manifest_sha256 = _provider_lineage_admission(
+        run_id=run_id, duplicate="same")
+    destination = f"{catalog_scope}provider-repeat-destination"
+    _register(destination, "destination-v1")
+
+    assert metadb.catalog_record_lineage(
+        destination, "destination-v1", [parent], _provider_lineage(
+            "provider-repeat", run_id=run_id, dataset_id=dataset_id,
+            revision_id="provider-revision-v1", mapping=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing", "mismatched", "revision-conflict", "provider-conflict", "detached",
+     "provider_error", "corrupt", "malformed"],
+)
+def test_provider_lineage_rejects_untrusted_admission_before_output_or_fact(
+        catalog_scope, failure):
+    run_id = f"provider-lineage-reject-{failure}-{uuid.uuid4().hex}"
+    parent, dataset_id, _manifest_sha256 = _provider_lineage_admission(
+        run_id=run_id,
+        duplicate=("conflict" if failure == "revision-conflict"
+                   else "provider-conflict" if failure == "provider-conflict" else None),
+        admitted_dataset_id=("workspace-provider:unrelated" if failure == "mismatched" else None),
+    )
+    if failure == "missing":
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            assert state is not None
+            state.execution_manifest_sha256 = None
+    elif failure in {"detached", "provider_error"}:
+        with metadb.session() as session:
+            binding = _provider_binding_for_parent(session, parent)
+            assert binding is not None
+            binding.state = failure
+    elif failure == "corrupt":
+        with metadb.session() as session:
+            state = session.get(metadb.RunState, run_id)
+            assert state is not None and state.execution_manifest_sha256 is not None
+            manifest = session.get(metadb.ExecutionManifest, state.execution_manifest_sha256)
+            assert manifest is not None
+            manifest.semantic_doc = "{}"
+    elif failure == "malformed":
+        parent = "workspace-provider://not-a-canonical-binding"
+
+    destination = f"{catalog_scope}provider-rejected-{failure}"
+    lineage = _provider_lineage(
+        f"provider-rejected-{failure}", run_id=run_id, dataset_id=dataset_id,
+        revision_id="provider-revision-v1")
+    with pytest.raises(RuntimeError, match="provider source"):
+        metadb.catalog_upsert_entry(
+            destination, "destination", {
+                "id": f"tbl_provider_rejected_{failure}", "name": "destination",
+                "uri": destination, "version": "destination-v1",
+            }, parents=[parent], lineage=lineage)
+
+    assert metadb.catalog_get(destination) is None
+    with metadb.session() as session:
+        assert not session.scalar(select(metadb.CatalogPublicationEvent.event_key).where(
+            metadb.CatalogPublicationEvent.uri == destination))
+        assert not session.scalar(select(metadb.CatalogLineageFact.id).where(
+            metadb.CatalogLineageFact.destination_uri == destination))
 
 
 def test_fact_identity_versions_mappings_and_pair_history(catalog_scope):
@@ -623,7 +841,8 @@ def test_stale_exact_upsert_replay_never_rolls_back_newer_projection(catalog_sco
     assert metadb.catalog_get(destination)["version"] == "destination-v2"
     with metadb.session() as s:
         facts = list(s.scalars(select(metadb.CatalogLineageFact).where(
-            metadb.CatalogLineageFact.destination_uri == destination)))
+            metadb.CatalogLineageFact.destination_uri == destination
+        ).order_by(metadb.CatalogLineageFact.id)))
     assert [fact.destination_version for fact in facts] == [
         "destination-v1", "destination-v2"]
 
