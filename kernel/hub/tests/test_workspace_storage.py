@@ -1639,6 +1639,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             json={
                 "expectedCanvasVersion": graph["version"],
                 "providerDatasetRefs": [provider_resource["id"]],
+                "requestId": "provider-add-check",
             },
         )
         assert incompatible_add.status_code == 409, incompatible_add.text
@@ -1876,6 +1877,7 @@ def test_provider_dataset_use_exact_preview_and_mutable_run_rejection(
             json={
                 "expectedCanvasVersion": graph["version"],
                 "providerDatasetRefs": [provider_resource["id"]],
+                "requestId": "provider-add-check",
             },
         )
         assert gone_add.status_code == 410, gone_add.text
@@ -3233,6 +3235,207 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                    and "catalog_" in statement for statement in statements)
 
 
+def test_workspace_add_deduplicates_provider_canonical_uri_without_binding_lookup(
+        workspace_scope, monkeypatch):
+    canvas_id = workspace_scope["canvas_id"]
+    mount_id = f"dedup-{canvas_id.removeprefix('workspace-canvas-')}"
+    binding_id = "a" * 32
+    uri = workspace_providers.provider_dataset_uri(mount_id, binding_id)
+    identity = f"workspace-provider:{uri.removeprefix('workspace-provider://')}"
+
+    def provider_source(node_id: str, title: str, revision: str, placement: str) -> dict:
+        return {
+            "id": node_id, "type": "source", "position": {"x": 0, "y": 0},
+            "data": {"title": title, "status": "latest", "config": {
+                "uri": uri,
+                "datasetRef": {"kind": "exact", "datasetId": identity, "revisionId": revision},
+                "providerResourceRef": placement,
+            }},
+        }
+
+    left = provider_source("left", "Left placement", "revision-1", "left-occurrence")
+    right = provider_source("right", "Right placement", "revision-2", "right-occurrence")
+    intent = {"canvasId": canvas_id, "expectedCanvasVersion": 7,
+              "datasetIds": [], "providerDatasetRefs": ["left-occurrence"]}
+    with metadb.session() as session:
+        session.add(metadb.WorkspaceProviderDataset(
+            mount_id=mount_id, provider_dataset_id="canonical-dataset", provider="fixture",
+            source_binding_id=binding_id))
+    request_ids = ["canonical-left", "canonical-right", "canonical-mixed"]
+    try:
+        first = metadb.workspace_add_datasets_action(
+            uid=metadb.DEFAULT_USER_ID, canvas_id=canvas_id, expected_canvas_version=7,
+            dataset_ids=[], provider_sources=[left], request_id="canonical-left", request_intent=intent)
+        assert first["changed"] is True
+        assert first["addedCount"] == 1
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceProviderDataset).where(
+                metadb.WorkspaceProviderDataset.mount_id == mount_id))
+            canvas = session.get(metadb.Canvas, canvas_id)
+            assert canvas is not None
+            before_doc = canvas.doc
+            before_version = canvas.version
+            snapshot_ids_before = list(session.scalars(select(metadb.CanvasVersion.id).where(
+                metadb.CanvasVersion.canvas_id == canvas_id)))
+
+        broadcasts: list[str] = []
+
+        async def record_external_edit(changed_canvas_id: str) -> None:
+            broadcasts.append(changed_canvas_id)
+
+        monkeypatch.setattr("hub.main._broadcast_external_edit", record_external_edit)
+        admission_calls: list[list[str]] = []
+
+        def unavailable_provider_admission(refs: list[str], uid: str) -> list[dict]:
+            del uid
+            admission_calls.append(refs)
+            raise workspace_providers.ProviderDatasetOffline("provider is unavailable")
+
+        monkeypatch.setattr(
+            "hub.routers.workspace._provider_dataset_sources", unavailable_provider_admission)
+        with TestClient(app) as client:
+            replay = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+                "providerDatasetRefs": ["left-occurrence"], "expectedCanvasVersion": 7,
+                "requestId": "canonical-left",
+            })
+            assert replay.status_code == 200, replay.text
+            assert replay.json() == first
+
+            changed_intent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+                "providerDatasetRefs": ["right-occurrence"], "expectedCanvasVersion": 7,
+                "requestId": "canonical-left",
+            })
+            assert changed_intent.status_code == 422, changed_intent.text
+            assert admission_calls == []
+
+            def resolved_provider_source(refs: list[str], uid: str) -> list[dict]:
+                assert refs == ["right-occurrence"]
+                assert uid == metadb.DEFAULT_USER_ID
+                return [right]
+
+            monkeypatch.setattr(
+                "hub.routers.workspace._provider_dataset_sources", resolved_provider_source)
+            duplicate = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+                "providerDatasetRefs": ["right-occurrence"], "expectedCanvasVersion": 8,
+                "requestId": "canonical-right",
+            })
+            assert duplicate.status_code == 200, duplicate.text
+            assert duplicate.json() == {
+                "ok": True, "id": canvas_id, "version": 8, "changed": False,
+                "alreadyPresent": True, "addedCount": 0,
+            }
+
+            with metadb.session() as session:
+                canvas = session.get(metadb.Canvas, canvas_id)
+                assert canvas is not None
+                assert canvas.version == before_version
+                assert canvas.doc == before_doc
+                assert set(session.scalars(select(metadb.CanvasVersion.id).where(
+                    metadb.CanvasVersion.canvas_id == canvas_id))) == set(snapshot_ids_before)
+            assert broadcasts == []
+
+            mixed = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+                "datasetIds": [workspace_scope["dataset_id"]],
+                "providerDatasetRefs": ["right-occurrence"], "expectedCanvasVersion": 8,
+                "requestId": "canonical-mixed",
+            })
+            assert mixed.status_code == 200, mixed.text
+            assert mixed.json() == {
+                "ok": True, "id": canvas_id, "version": 9, "changed": True,
+                "alreadyPresent": True, "addedCount": 1,
+            }
+
+        with metadb.session() as session:
+            canvas = session.get(metadb.Canvas, canvas_id)
+            assert canvas is not None
+            doc = json.loads(canvas.doc)
+            assert canvas.version == doc["version"] == 9
+            assert len(doc["nodes"]) == 2
+            provider_nodes = [node for node in doc["nodes"]
+                              if node["data"]["config"]["uri"] == uri]
+            assert len(provider_nodes) == 1
+            assert provider_nodes[0]["data"]["config"] == left["data"]["config"]
+            assert any(node["data"]["config"]["uri"] == workspace_scope["uri"]
+                       for node in doc["nodes"])
+            snapshot_ids_after = list(session.scalars(select(metadb.CanvasVersion.id).where(
+                metadb.CanvasVersion.canvas_id == canvas_id)))
+            assert len(snapshot_ids_after) == len(snapshot_ids_before) + 1
+        assert broadcasts == [canvas_id]
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceCanvasDatasetAddReplay).where(
+                metadb.WorkspaceCanvasDatasetAddReplay.request_id.in_(request_ids)))
+            session.execute(delete(metadb.WorkspaceProviderDataset).where(
+                metadb.WorkspaceProviderDataset.mount_id == mount_id))
+        metadb.delete_canvas_cascade(canvas_id)
+
+
+def test_postgres_concurrent_workspace_dataset_adds_fence_same_canvas_version(workspace_scope):
+    if metadb._is_sqlite_database():
+        pytest.skip("PostgreSQL Canvas dataset-add CAS concurrency regression")
+    canvas_id = workspace_scope["canvas_id"]
+    token = canvas_id.removeprefix("workspace-canvas-")
+    request_ids = [
+        f"concurrent-workspace-add-left-{token}",
+        f"concurrent-workspace-add-right-{token}"]
+    start = threading.Barrier(3)
+    results: list[dict | Exception] = []
+
+    def add_dataset(request_id: str) -> None:
+        intent = {
+            "canvasId": canvas_id,
+            "expectedCanvasVersion": 7,
+            "datasetIds": [workspace_scope["dataset_id"]],
+            "providerDatasetRefs": [],
+        }
+        start.wait(timeout=5)
+        try:
+            results.append(metadb.workspace_add_datasets_action(
+                uid=metadb.DEFAULT_USER_ID,
+                canvas_id=canvas_id,
+                expected_canvas_version=7,
+                dataset_ids=[workspace_scope["dataset_id"]],
+                request_id=request_id,
+                request_intent=intent,
+            ))
+        except Exception as exc:  # noqa: BLE001 - concurrent failures are asserted below
+            results.append(exc)
+
+    threads = [
+        threading.Thread(target=add_dataset, args=(request_id,))
+        for request_id in request_ids
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        winners = [result for result in results if isinstance(result, dict)]
+        conflicts = [
+            result for result in results
+            if isinstance(result, metadb.WorkspaceVersionConflict)
+        ]
+        assert len(winners) == len(conflicts) == 1, results
+        assert winners[0] == {
+            "ok": True, "id": canvas_id, "version": 8, "changed": True,
+            "alreadyPresent": False, "addedCount": 1,
+        }
+        assert "changed from expected version 7" in str(conflicts[0])
+        with metadb.session() as session:
+            canvas = session.get(metadb.Canvas, canvas_id)
+            assert canvas is not None
+            doc = json.loads(canvas.doc)
+            assert canvas.version == doc["version"] == 8
+            assert len(doc["nodes"]) == 1
+    finally:
+        with metadb.session() as session:
+            session.execute(delete(metadb.WorkspaceCanvasDatasetAddReplay).where(
+                metadb.WorkspaceCanvasDatasetAddReplay.request_id.in_(request_ids)))
+
+
 def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, monkeypatch):
     canvas_id = workspace_scope["canvas_id"]
     token = canvas_id.removeprefix("workspace-canvas-")
@@ -3268,37 +3471,63 @@ def test_workspace_add_uses_exact_canvas_and_dataset_versions(workspace_scope, m
         try:
             concurrent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
                 "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
+                "requestId": "open-canvas-check",
             })
             assert concurrent.status_code == 409
             assert "currently open" in concurrent.json()["detail"]
         finally:
             hub_main._collab_rooms.pop(canvas_id, None)
 
-        added = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+        missing_request_id = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
         })
+        assert missing_request_id.status_code == 422
+        assert "requestId" in missing_request_id.text
+
+        added = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
+            "requestId": "workspace-add-replay",
+        })
         assert added.status_code == 200, added.text
-        assert added.json()["version"] == 8
+        assert added.json() == {
+            "ok": True, "id": canvas_id, "version": 8, "changed": True,
+            "alreadyPresent": False, "addedCount": 2,
+        }
+
+        replay = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
+            "requestId": "workspace-add-replay",
+        })
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == added.json()
+
+        changed_intent = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
+            "datasetIds": [workspace_scope["dataset_id"]], "expectedCanvasVersion": 7,
+            "requestId": "workspace-add-replay",
+        })
+        assert changed_intent.status_code == 422
 
         stale = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetIds": selected_dataset_ids, "expectedCanvasVersion": 7,
+            "requestId": "stale-add-check",
         })
         assert stale.status_code == 409
 
         missing = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetIds": [workspace_scope["dataset_id"], "missing-stable-dataset"],
-            "expectedCanvasVersion": 8,
+            "expectedCanvasVersion": 8, "requestId": "missing-add-check",
         })
         assert missing.status_code == 404
 
         duplicate = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetIds": [second_dataset_id, second_dataset_id], "expectedCanvasVersion": 8,
+            "requestId": "duplicate-add-check",
         })
         assert duplicate.status_code == 422
 
         oversized = client.post(f"/api/workspace/canvases/{canvas_id}/datasets", json={
             "datasetIds": [f"dataset-{index}" for index in range(51)],
-            "expectedCanvasVersion": 8,
+            "expectedCanvasVersion": 8, "requestId": "oversized-add-check",
         })
         assert oversized.status_code == 422
 

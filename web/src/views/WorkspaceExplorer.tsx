@@ -1255,6 +1255,8 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const pushToast = useStore((state) => state.pushToast)
+  const addReplay = useRef<{ intent: string; requestId: string } | null>(null)
   const currentCanvas = editable.find((file) => file.id === currentCanvasId)
   useEffect(() => {
     if (!editable.some((file) => file.id === canvasId)) setCanvasId(editable[0]?.id ?? '')
@@ -1278,9 +1280,12 @@ function DatasetActionDialog({ action, container, destinationError, files, curre
       } else {
         const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) { setError('Choose an editable target canvas'); return }
-        await api.workspaceAddDatasets(target.id, {
-          datasetIds, expectedCanvasVersion: target.version,
+        const intent = JSON.stringify({ canvasId: target.id, expectedCanvasVersion: target.version, datasetIds })
+        if (addReplay.current?.intent !== intent) addReplay.current = { intent, requestId: newRequestId() }
+        const result = await api.workspaceAddDatasets(target.id, {
+          datasetIds, expectedCanvasVersion: target.version, requestId: addReplay.current.requestId,
         })
+        if (result.alreadyPresent) pushToast('This dataset is already present in the selected Canvas.', 'info')
         onOpened(target.id)
       }
     } catch (caught) { setError(errorMessage(caught)) }
@@ -1487,7 +1492,9 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
   const [canvasId, setCanvasId] = useState(editable[0]?.id ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const pushToast = useStore((state) => state.pushToast)
   const replay = useRef<{ intent: string; requestId: string } | null>(null)
+  const addReplay = useRef<{ intent: string; requestId: string } | null>(null)
   const destination = canvasDestination(container, 'create')
   const currentCanvas = editable.find((file) => file.id === currentCanvasId)
   useEffect(() => {
@@ -1514,9 +1521,14 @@ function ProviderDatasetActionDialog({ resource, container, files, currentCanvas
       } else {
         const target = mode === 'current' ? currentCanvas : editable.find((file) => file.id === canvasId)
         if (!target) throw new Error('Choose an editable target canvas')
-        await api.workspaceAddDatasets(target.id, {
+        const intent = JSON.stringify({ canvasId: target.id,
+          expectedCanvasVersion: target.version, providerDatasetRefs: [resource.id] })
+        if (addReplay.current?.intent !== intent) addReplay.current = { intent, requestId: newRequestId() }
+        const result = await api.workspaceAddDatasets(target.id, {
           providerDatasetRefs: [resource.id], expectedCanvasVersion: target.version,
+          requestId: addReplay.current.requestId,
         })
+        if (result.alreadyPresent) pushToast('This provider dataset is already present in the selected Canvas.', 'info')
         onOpened(target.id)
       }
     } catch (caught) { setError(errorMessage(caught)) }

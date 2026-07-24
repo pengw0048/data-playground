@@ -184,6 +184,19 @@ class WorkspaceCanvasCreateReplay(Base):
     )
 
 
+class WorkspaceCanvasDatasetAddReplay(Base):
+    """Durable compact outcome for a retried Workspace Canvas dataset append."""
+    __tablename__ = "workspace_canvas_dataset_add_replays"
+    owner_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    intent_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    __table_args__ = (
+        CheckConstraint("length(intent_sha256) = 64", name="ck_workspace_canvas_dataset_add_replay_sha"),
+    )
+
+
 class WorkspaceFolderCreateReplay(Base):
     """Durable one-intent/one-result record for client-retried local Folder creation."""
     __tablename__ = "workspace_folder_create_replays"
@@ -3817,6 +3830,31 @@ def _workspace_canvas_create_request_id(request_id: str) -> str:
     return normalized
 
 
+def _workspace_canvas_dataset_add_replay_in_session(
+        s, *, uid: str, request_id: str, intent_sha256: str) -> dict | None:
+    replay = s.get(WorkspaceCanvasDatasetAddReplay, (uid, request_id), with_for_update=True)
+    if replay is None:
+        return None
+    if replay.intent_sha256 != intent_sha256:
+        raise ValueError("Canvas dataset add request id was reused for a different semantic request")
+    try:
+        result = json.loads(replay.result_doc)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - committed server record
+        raise RuntimeError("Canvas dataset add replay record is corrupt") from exc
+    if not isinstance(result, dict):  # pragma: no cover - committed server record
+        raise RuntimeError("Canvas dataset add replay record is corrupt")
+    return result
+
+
+def workspace_canvas_dataset_add_replay(*, uid: str, request_id: str, intent: dict) -> dict | None:
+    """Return a committed append outcome before retrying provider admission."""
+    normalized = _workspace_canvas_create_request_id(request_id)
+    intent_sha256 = _workspace_canvas_create_intent_sha256(intent)
+    with session() as s:
+        return _workspace_canvas_dataset_add_replay_in_session(
+            s, uid=uid, request_id=normalized, intent_sha256=intent_sha256)
+
+
 def _workspace_canvas_create_replay_in_session(
         s, *, uid: str, request_id: str, intent_sha256: str) -> dict | None:
     replay = s.get(WorkspaceCanvasCreateReplay, (uid, request_id), with_for_update=True)
@@ -3977,21 +4015,57 @@ def workspace_create_canvas_action(*, uid: str, container_id: str,
         return result
 
 
+def _workspace_provider_source_identity(source: object) -> str | None:
+    """Return a validated canonical provider identity, never a display or placement reference."""
+    if not isinstance(source, dict) or source.get("type") != "source":
+        return None
+    data = source.get("data")
+    config = data.get("config") if isinstance(data, dict) else None
+    uri = config.get("uri") if isinstance(config, dict) else None
+    if not isinstance(uri, str):
+        return None
+    from hub import workspace_providers
+    prefix = "workspace-provider://"
+    if not uri.startswith(prefix):
+        return None
+    identity = f"workspace-provider:{uri.removeprefix(prefix)}"
+    try:
+        # This public round trip validates the canonical base64url token without looking up mutable
+        # provider state. Existing malformed Sources stay untouched and do not become a dedup key.
+        return identity if workspace_providers.provider_dataset_uri_for_identity(identity) == uri else None
+    except (KeyError, TypeError, ValueError, workspace_providers.ProviderDatasetUnavailable):
+        return None
+
+
 def workspace_add_datasets_action(*, uid: str, canvas_id: str,
                                   expected_canvas_version: int, dataset_ids: list[str],
-                                  provider_sources: list[dict] | None = None) -> dict:
-    """Atomically append bounded sources resolved from exact registration identities."""
+                                  provider_sources: list[dict] | None = None,
+                                  request_id: str | None = None,
+                                  request_intent: dict | None = None) -> dict:
+    """Atomically append local sources and canonically deduplicate provider Sources per Canvas."""
+    if (request_id is None) != (request_intent is None):
+        raise ValueError("Canvas dataset add replay requires both a request id and request intent")
+    normalized_request_id = (
+        _workspace_canvas_create_request_id(request_id) if request_id is not None else None)
+    intent_sha256 = (
+        _workspace_canvas_create_intent_sha256(request_intent)
+        if request_intent is not None else None)
     with _workspace_write_session() as s:
         canvas = s.get(Canvas, canvas_id, with_for_update=True)
         if canvas is None:
             raise KeyError(f"canvas '{canvas_id}' not found")
         if _workspace_canvas_role_in_session(s, canvas, uid) not in ("owner", "editor"):
             raise PermissionError("you don't have edit access to this canvas")
+        # The router's precheck enables lost-response replay without provider availability, but two
+        # requests can both miss it. Recheck under the Canvas write lock before the version CAS.
+        if normalized_request_id is not None and intent_sha256 is not None:
+            replay = _workspace_canvas_dataset_add_replay_in_session(
+                s, uid=uid, request_id=normalized_request_id, intent_sha256=intent_sha256)
+            if replay is not None:
+                return replay
         if canvas.version != expected_canvas_version:
             raise WorkspaceVersionConflict(
                 f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
-        sources = [*_workspace_dataset_sources_in_session(s, dataset_ids),
-                   *(provider_sources or [])]
         try:
             doc = json.loads(canvas.doc)
         except (TypeError, ValueError) as exc:
@@ -3999,16 +4073,45 @@ def workspace_add_datasets_action(*, uid: str, canvas_id: str,
         nodes = doc.get("nodes")
         if not isinstance(nodes, list):
             raise ValueError(f"canvas '{canvas_id}' has invalid content")
-        _snapshot_canvas_in_session(
-            s, canvas, canvas.doc, canvas.version, author_id=uid,
-            label="before Workspace dataset add")
-        _workspace_place_sources(nodes, sources)
-        canvas.version += 1
-        doc["version"] = canvas.version
-        canvas.doc = json.dumps(doc)
-        sync_local_result_owner(s, "canvas", canvas_id, doc)
-        _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
-        return {"ok": True, "id": canvas_id, "version": canvas.version, "doc": doc}
+        existing_provider_identities = {
+            identity for identity in (_workspace_provider_source_identity(node) for node in nodes)
+            if identity is not None
+        }
+        provider_candidates = list(provider_sources or [])
+        provider_identities = [_workspace_provider_source_identity(source) for source in provider_candidates]
+        if any(identity is None for identity in provider_identities):
+            raise ValueError("provider Source has no validated canonical dataset identity")
+        already_present = any(
+            identity in existing_provider_identities for identity in provider_identities)
+        provider_to_add = [
+            source for source, identity in zip(provider_candidates, provider_identities, strict=True)
+            if identity not in existing_provider_identities
+        ]
+        sources = [*_workspace_dataset_sources_in_session(s, dataset_ids), *provider_to_add]
+        changed = bool(sources)
+        if changed:
+            _snapshot_canvas_in_session(
+                s, canvas, canvas.doc, canvas.version, author_id=uid,
+                label="before Workspace dataset add")
+            _workspace_place_sources(nodes, sources)
+            canvas.version += 1
+            doc["version"] = canvas.version
+            canvas.doc = json.dumps(doc)
+            sync_local_result_owner(s, "canvas", canvas_id, doc)
+            _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
+        result = {
+            "ok": True, "id": canvas_id, "version": canvas.version,
+            "changed": changed, "alreadyPresent": already_present,
+            "addedCount": len(sources),
+        }
+        if normalized_request_id is not None and intent_sha256 is not None:
+            s.add(WorkspaceCanvasDatasetAddReplay(
+                owner_id=uid, request_id=normalized_request_id,
+                intent_sha256=intent_sha256,
+                result_doc=json.dumps(result, separators=(",", ":")),
+            ))
+            s.flush()
+        return result
 
 
 def workspace_add_transform_action(
