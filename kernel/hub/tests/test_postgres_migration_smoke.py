@@ -78,6 +78,13 @@ def test_postgres_cli_migration_and_service_startup_contract(tmp_path):
             opts={"compare_type": True, "target_metadata": metadb.Base.metadata},
         )
         assert compare_metadata(context, metadb.Base.metadata) == []
+        columns = {
+            column["name"]: column["type"]
+            for column in connection.dialect.get_columns(
+                connection, "catalog_field_lineage_projections")
+        }
+        assert columns["source_dataset_id"].length == 512
+        assert columns["destination_dataset_id"].length == 128
     with metadb.session() as session:
         admin = session.get(metadb.User, metadb.DEFAULT_USER_ID)
         assert admin is not None and admin.is_admin and admin.password_hash

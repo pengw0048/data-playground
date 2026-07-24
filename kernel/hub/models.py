@@ -580,7 +580,7 @@ class LineageFieldMapping(Wire):
     and ``source_version``.
     """
 
-    source_dataset_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_dataset_id: str | None = Field(default=None, min_length=1, max_length=512)
     source_version: str | None = Field(default=None, min_length=1, max_length=512)
     source_field: str = Field(min_length=1, max_length=512)
     source_field_id: str | None = Field(default=None, min_length=1, max_length=512)
@@ -914,7 +914,7 @@ class FieldLineageProjection(Wire):
     id: LineageFactCursor
     fact_key: str = Field(min_length=1, max_length=512)
     publication_key: str = Field(min_length=1, max_length=96)
-    source_dataset_id: str = Field(min_length=1, max_length=128)
+    source_dataset_id: str = Field(min_length=1, max_length=512)
     source_version: str = Field(min_length=1, max_length=512)
     source_field: str = Field(min_length=1, max_length=512)
     source_field_id: str | None = Field(default=None, min_length=1, max_length=512)

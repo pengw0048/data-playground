@@ -1233,7 +1233,7 @@ class CatalogFieldLineageProjection(Base):
     )
     fact_key: Mapped[str] = mapped_column(String(512), nullable=False)
     publication_key: Mapped[str] = mapped_column(String(96), nullable=False)
-    source_dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_dataset_id: Mapped[str] = mapped_column(String(512), nullable=False)
     source_version: Mapped[str] = mapped_column(String(512), nullable=False)
     source_field: Mapped[str] = mapped_column(String(512), nullable=False)
     source_field_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -17050,9 +17050,11 @@ def _catalog_validate_lineage_parent_logicals(
 def _catalog_lineage_source_snapshot(
         s, snapshot: _CatalogLineageParentSnapshot,
         locked_logicals: dict[str, CatalogLogicalDataset],
-        locked_entries: dict[str, CatalogEntry]) -> dict:
+        locked_entries: dict[str, CatalogEntry], lineage: dict | None = None) -> dict:
     """Freeze the source identity and exact physical generation used by this publication."""
     parent = snapshot.token
+    if parent.startswith("workspace-provider://"):
+        return _catalog_provider_lineage_source_snapshot(s, parent, lineage)
     if snapshot.resolved_source_uri is not None:
         return {
             "source_key": snapshot.resolved_source_key,
@@ -17105,6 +17107,66 @@ def _catalog_lineage_source_snapshot(
             snapshot.logical_id
             or (entry.registration_id if entry is not None else None)
         ),
+    }
+
+
+def _catalog_provider_lineage_source_snapshot(s, parent: str, lineage: dict | None) -> dict:
+    """Resolve one canonical provider parent from its retained exact run admission.
+
+    Provider Sources deliberately have no catalog entry and their synthetic URI is not a physical
+    location.  The transaction therefore locks only the durable binding and the already-retained
+    execution manifest; it never activates a provider or resolves a mutable head while publishing.
+    """
+    from hub.execution_manifest import ExecutionManifestError, execution_manifest_admission
+    from hub import workspace_providers
+
+    try:
+        token = parent.removeprefix("workspace-provider://")
+        mount_id, source_binding_id = workspace_providers._decode_source_identity_token(token)
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise RuntimeError("catalog lineage provider source binding is invalid") from exc
+    dataset_id = f"workspace-provider:{token}"
+    binding = s.scalar(select(WorkspaceProviderDataset).where(
+        WorkspaceProviderDataset.mount_id == mount_id,
+        WorkspaceProviderDataset.source_binding_id == source_binding_id,
+    ).with_for_update())
+    if binding is None:
+        raise RuntimeError("catalog lineage provider source binding is unavailable")
+    if binding.state in {"detached", "provider_error"}:
+        raise RuntimeError("catalog lineage provider source binding is unavailable")
+    if binding.state not in {"current", "offline", "permission_lost"}:
+        raise RuntimeError("catalog lineage provider source binding is invalid")
+    run_id = lineage.get("run_id") if isinstance(lineage, dict) else None
+    if not isinstance(run_id, str) or not run_id:
+        raise RuntimeError("catalog lineage provider source has no retained run admission")
+    sha256 = _retain_execution_manifest_for_run_in_session(s, run_id)
+    if sha256 is None:
+        raise RuntimeError("catalog lineage provider source has no retained run admission")
+    manifest = s.get(ExecutionManifest, sha256, with_for_update=True)
+    if manifest is None:  # pragma: no cover - retention helper locks this invariant
+        raise RuntimeError("catalog lineage provider source manifest is unavailable")
+    try:
+        admission = execution_manifest_admission(manifest.sha256, manifest.semantic_doc)
+    except (ExecutionManifestError, ValueError) as exc:
+        raise RuntimeError("catalog lineage provider source manifest is invalid") from exc
+    admitted = [
+        item for item in admission["input_manifest"]
+        if item["dataset_id"] == dataset_id
+    ]
+    exact_identities = {
+        (item["dataset_id"], item["revision_id"], item["provider"])
+        for item in admitted
+    }
+    if len(exact_identities) != 1:
+        raise RuntimeError(
+            "catalog lineage provider source does not match one admitted exact identity")
+    _dataset_id, revision_id, _provider = next(iter(exact_identities))
+    return {
+        "source_key": dataset_id,
+        "source_uri": parent,
+        "source_version": revision_id,
+        "source_registration_id": None,
+        "source_dataset_id": dataset_id,
     }
 
 
@@ -17348,7 +17410,7 @@ def _catalog_apply_lineage_in_session(
     sources: dict[str, dict] = {}
     for snapshot in parent_snapshots:
         source = _catalog_lineage_source_snapshot(
-            s, snapshot, locked_logicals, locked_entries)
+            s, snapshot, locked_logicals, locked_entries, lineage)
         prior = sources.get(source["source_key"])
         if prior is not None and prior != source:
             raise ValueError(
@@ -17407,7 +17469,7 @@ def _catalog_lock_lineage_publication_targets(
     sources: dict[str, dict] = {}
     for snapshot in target_snapshots[1:]:
         source = _catalog_lineage_source_snapshot(
-            s, snapshot, locked_logicals, locked_entries)
+            s, snapshot, locked_logicals, locked_entries, lineage)
         prior = sources.get(source["source_key"])
         if prior is not None and prior != source:
             raise ValueError(

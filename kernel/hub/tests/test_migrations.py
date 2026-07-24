@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0044_provider_lineage_identity", "0043_provider_source_binding"),
         ("0043_provider_source_binding", "0042_field_lineage"),
         ("0042_field_lineage", "0041_provider_canonical"),
         ("0041_provider_canonical", "0040_managed_sidecar"),
@@ -99,8 +100,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0043_provider_source_binding"]
-    assert metadb.expected_schema_head() == "0043_provider_source_binding"
+    assert scripts.get_heads() == ["0044_provider_lineage_identity"]
+    assert metadb.expected_schema_head() == "0044_provider_lineage_identity"
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -185,6 +186,27 @@ def test_provider_source_binding_forward_migration_mints_opaque_generations(tmp_
             assert rows[1]["state"] == "detached"
             assert "secret" not in json.dumps(
                 [row["source_binding_id"] for row in rows])
+
+
+def test_provider_lineage_identity_forward_migration_widens_only_source_projection(tmp_path):
+    with _isolated_metadata(f"sqlite:///{tmp_path / 'provider-lineage-identity.db'}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0043_provider_source_binding")
+            before = {
+                column["name"]: column["type"]
+                for column in inspect(connection).get_columns(
+                    "catalog_field_lineage_projections")
+            }
+            assert before["source_dataset_id"].length == 128
+            assert before["destination_dataset_id"].length == 128
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            after = {
+                column["name"]: column["type"]
+                for column in inspect(connection).get_columns(
+                    "catalog_field_lineage_projections")
+            }
+            assert after["source_dataset_id"].length == 512
+            assert after["destination_dataset_id"].length == 128
 
 
 def test_migration_revision_ids_fit_alembic_version_num():
@@ -399,6 +421,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0044_provider_lineage_identity.py": (
+            "41cb6d835a6647674264fa7db1c871c0fff0cbd1ae83c1fa1055e27a8e7a84b9"
+        ),
         "0043_provider_source_binding.py": (
             "bb830c82e83793683157ab4e5cb7660f6991013d2c9a92ab30cc6b50c451cd31"
         ),
