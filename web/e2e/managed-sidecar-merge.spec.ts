@@ -65,7 +65,7 @@ test('uses the installed sidecar fixture through the Write inspector and reopens
     sidecar = await publish(page, { id: sidecarCanvas, name: 'installed sidecar fixture', version: 1, requirements: [],
       nodes: [
         { id: 'source', type: 'source', position: { x: 0, y: 0 }, data: { title: 'exact base', config: { uri: base.uri, datasetRef: { kind: 'exact', datasetId: base.datasetId, revisionId: base.revisionId } } } },
-        { id: 'derive', type: 'derive_sidecar_column', position: { x: 200, y: 0 }, data: { title: 'derive sidecar column', config: { identity: 'id', value: 'replace_me', output: 'replacement', outputSchema: [{ name: 'id', type: 'int' }, { name: 'replacement', type: 'float' }] } } },
+        { id: 'derive', type: 'derive_sidecar_column', position: { x: 200, y: 0 }, data: { title: 'derive sidecar column', config: { identity: 'id', value: 'replace_me', output: 'replacement', outputSchema: [{ name: 'id', type: 'int', rowReference: { target: { kind: 'exact', datasetId: base.datasetId, revisionId: base.revisionId }, keyFields: ['id'], semanticType: 'row', provenance: 'declared' } }, { name: 'replacement', type: 'float' }] } } },
         { id: 'write', type: 'write', position: { x: 400, y: 0 }, data: { title: 'sidecar', config: { filename: `issue-769-sidecar-${stamp}.parquet`, writeMode: 'overwrite' } } },
       ], edges: [{ id: 'a', source: 'source', target: 'derive' }, { id: 'b', source: 'derive', target: 'write' }],
     }, `issue-769-sidecar-${stamp}.parquet`)

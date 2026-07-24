@@ -24,6 +24,9 @@ class APIErrorCode(StrEnum):
 
     INVALID_REQUEST = "invalid_request"
     INVALID_GRAPH = "invalid_graph"
+    ROW_REFERENCE_TARGET_MISMATCH = "row_reference_target_mismatch"
+    IDENTITY_REFERENCE_REQUIRED = "identity_reference_required"
+    IDENTITY_REFERENCE_UNAVAILABLE = "identity_reference_unavailable"
     OUTPUT_PORT_REQUIRED = "output_port_required"
     OUTPUT_PORT_NOT_FOUND = "output_port_not_found"
     MULTI_OUTPUT_UNSUPPORTED = "multi_output_unsupported"

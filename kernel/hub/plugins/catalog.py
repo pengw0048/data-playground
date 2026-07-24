@@ -63,7 +63,8 @@ def canonical_lineage_parent_tokens(parents: list[str] | None) -> list[str]:
 
 def lineage_for_output(graph, backend_run_id: str, step_id: str, *,
                        attempt_id: str | None = None,
-                       idempotency_key: str | None = None) -> LineagePublication:
+                       idempotency_key: str | None = None,
+                       field_mappings: list[dict] | None = None) -> LineagePublication:
     """Resolve the catalog-only identity for one execution sink.
 
     A placed final region keeps its own backend run for status/cancellation, while the graph's private
@@ -94,6 +95,7 @@ def lineage_for_output(graph, backend_run_id: str, step_id: str, *,
         producer_version=producer_version,
         step_id=str(step_id),
         provenance="run",
+        field_mappings=field_mappings or [],
     )
 
 

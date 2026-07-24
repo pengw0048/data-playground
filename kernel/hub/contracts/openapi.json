@@ -6,6 +6,9 @@
         "enum": [
           "invalid_request",
           "invalid_graph",
+          "row_reference_target_mismatch",
+          "identity_reference_required",
+          "identity_reference_unavailable",
           "output_port_required",
           "output_port_not_found",
           "multi_output_unsupported",
@@ -5380,6 +5383,25 @@
       "JoinAnalysis": {
         "description": "Everything the join node's inspector needs: ranked key suggestions for its two inputs, and a\nfan-out warning when the join isn't 1:1 (the result lands at the finer grain — a later\nparent-grain metric would double-count unless you aggregate).",
         "properties": {
+          "blockingCode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blockingcode"
+          },
+          "configuredRowReference": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RowReferenceDiagnosis"
+            },
+            "title": "Configuredrowreference",
+            "type": "array"
+          },
           "note": {
             "anyOf": [
               {
@@ -5474,6 +5496,14 @@
               "type": "string"
             },
             "title": "Rightcolumns",
+            "type": "array"
+          },
+          "rowReference": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RowReferenceDiagnosis"
+            },
+            "title": "Rowreference",
             "type": "array"
           },
           "score": {
@@ -8449,6 +8479,153 @@
           "expectedHeadRevisionId"
         ],
         "title": "RestoreRevisionTaskV1",
+        "type": "object"
+      },
+      "RowReferenceDiagnosis": {
+        "additionalProperties": false,
+        "description": "Conservative target-compatibility fact for one join key pair.",
+        "properties": {
+          "evidenceSource": {
+            "default": "none",
+            "enum": [
+              "row_reference",
+              "none"
+            ],
+            "title": "Evidencesource",
+            "type": "string"
+          },
+          "leftField": {
+            "title": "Leftfield",
+            "type": "string"
+          },
+          "leftInput": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RowReferenceInputIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "leftKeyFields": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Leftkeyfields",
+            "type": "array"
+          },
+          "leftTarget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "$ref": "#/components/schemas/CanonicalDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lefttarget"
+          },
+          "reason": {
+            "default": "no_row_reference_evidence",
+            "title": "Reason",
+            "type": "string"
+          },
+          "rightField": {
+            "title": "Rightfield",
+            "type": "string"
+          },
+          "rightInput": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RowReferenceInputIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rightKeyFields": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Rightkeyfields",
+            "type": "array"
+          },
+          "rightTarget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "$ref": "#/components/schemas/CanonicalDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Righttarget"
+          },
+          "status": {
+            "default": "unknown",
+            "enum": [
+              "compatible",
+              "conflict",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "leftField",
+          "rightField"
+        ],
+        "title": "RowReferenceDiagnosis",
+        "type": "object"
+      },
+      "RowReferenceInputIdentity": {
+        "additionalProperties": false,
+        "description": "A bounded join-input identity, deliberately never a URI or display name.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "exact",
+              "canonical"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "revisionId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revisionid"
+          }
+        },
+        "required": [
+          "kind",
+          "datasetId"
+        ],
+        "title": "RowReferenceInputIdentity",
         "type": "object"
       },
       "RunBackendRef": {

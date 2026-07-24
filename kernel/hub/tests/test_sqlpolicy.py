@@ -23,6 +23,7 @@ from hub.sqlpolicy import (
     bind_input_ctes,
     identifier,
     identifier_list,
+    join_equality_columns,
     quote_identifier,
     validate_fragment,
     validate_query,
@@ -233,6 +234,28 @@ def test_function_policy_rejects_existing_mixed_case_shadow_without_mutating_cat
 )
 def test_fragment_policy_allows_expected_shapes(kind, fragment):
     assert validate_fragment(kind, fragment).sql == fragment
+
+
+def test_join_key_extraction_uses_validated_ast_for_quoted_identifiers():
+    assert join_equality_columns(
+        'A."customer id" = B."id" AND b."tenant-id" = a."tenant""key"'
+    ) == (["customer id", 'tenant"key'], ["id", "tenant-id"])
+    assert join_equality_columns(
+        "a.id = b.id AND TRUE AND lower(a.label) = lower(b.label)"
+    ) == (["id"], ["id"])
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "a.id = b.id OR a.tenant_id = b.tenant_id",
+        "lower(a.id) = b.id",
+        "a.id + 1 = b.id",
+        "a.id <> b.id",
+    ],
+)
+def test_join_key_extraction_declines_non_simple_conditions(condition):
+    assert join_equality_columns(condition) is None
 
 
 @pytest.mark.parametrize(

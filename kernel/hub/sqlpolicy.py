@@ -519,6 +519,78 @@ def validate_fragment(kind: FragmentKind, fragment: object, *, con=None) -> Vali
     return ValidatedSQL(text, refs)
 
 
+def join_equality_columns(fragment: object, *, con=None) -> tuple[list[str], list[str]] | None:
+    """Extract a pure ``a.field = b.field [AND ...]`` JOIN_ON key sequence.
+
+    The validated DuckDB AST is authoritative for identifier parsing, including quoted and escaped
+    names.  Any other boolean or value expression is deliberately not interpreted as a key.
+    """
+    validated = validate_fragment(FragmentKind.JOIN_ON, fragment, con=con)
+    ast, _normalized = _parse_select(_wrapper(FragmentKind.JOIN_ON, validated.sql))
+    condition = (_top_select(ast).get("from_table") or {}).get("condition")
+    if not isinstance(condition, dict) or condition.get("type") != "CONJUNCTION_AND":
+        return None
+    children = condition.get("children")
+    if not isinstance(children, list) or len(children) < 2:
+        return None
+
+    def is_true(item: object) -> bool:
+        child = item.get("child") if isinstance(item, dict) else None
+        value = child.get("value") if isinstance(child, dict) else None
+        return bool(
+            isinstance(item, dict)
+            and item.get("class") == "CAST"
+            and (item.get("cast_type") or {}).get("id") == "BOOLEAN"
+            and isinstance(child, dict)
+            and child.get("class") == "CONSTANT"
+            and isinstance(value, dict)
+            and value.get("value") == "t"
+        )
+
+    # The wrapper contributes one TRUE fence; user-authored TRUE conjuncts are semantically identical
+    # and cannot be allowed to hide an otherwise explicit cross-side equality.
+    if not is_true(children[-1]):
+        return None
+
+    left_fields: list[str] = []
+    right_fields: list[str] = []
+    for item in children:
+        if is_true(item):
+            continue
+        if not isinstance(item, dict) or item.get("type") != "COMPARE_EQUAL":
+            continue
+        left, right = item.get("left"), item.get("right")
+        if not (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.get("class") == right.get("class") == "COLUMN_REF"
+        ):
+            continue
+        left_names, right_names = left.get("column_names"), right.get("column_names")
+        aliases = (
+            {_ascii_fold(left_names[0]), _ascii_fold(right_names[0])}
+            if (isinstance(left_names, list) and isinstance(right_names, list)
+                and left_names and right_names
+                and isinstance(left_names[0], str) and isinstance(right_names[0], str))
+            else set()
+        )
+        if not (
+            isinstance(left_names, list)
+            and isinstance(right_names, list)
+            and len(left_names) == len(right_names) == 2
+            and all(isinstance(value, str) for value in [*left_names, *right_names])
+            and aliases == {"a", "b"}
+        ):
+            continue
+        if _ascii_fold(left_names[0]) == "a":
+            left_fields.append(left_names[1])
+            right_fields.append(right_names[1])
+        else:
+            left_fields.append(right_names[1])
+            right_fields.append(left_names[1])
+    return (left_fields, right_fields) if left_fields else None
+
+
 def quote_identifier(name: object) -> str:
     value = str(name)
     if "\x00" in value:
@@ -625,13 +697,20 @@ def _decode_identifier(token: str) -> str:
     return token
 
 
-def identifier_list(value: object, columns: Iterable[object], *, label: str = "column") -> list[str]:
+def parse_identifier_list(value: object, *, label: str = "column") -> list[str]:
     text = _bounded(value, f"{label} list").strip()
     if not text:
         return []
     # Keep parsing deliberately small: these fields are identifiers, not SQL expressions.
     tokens = _split_identifiers(text)
-    return [identifier(_decode_identifier(t), columns, label=label) for t in tokens]
+    return [_decode_identifier(token) for token in tokens]
+
+
+def identifier_list(value: object, columns: Iterable[object], *, label: str = "column") -> list[str]:
+    return [
+        identifier(name, columns, label=label)
+        for name in parse_identifier_list(value, label=label)
+    ]
 
 
 def validate_identifier_alias(value: object, *, label: str = "alias") -> str:

@@ -516,6 +516,11 @@ function JoinHints({ nodeId }: { nodeId: string }) {
           ⚠ {analysis.warning}
         </div>
       )}
+      {analysis?.blockingCode && (
+        <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[10.5px] leading-relaxed text-destructive">
+          {analysis.blockingCode}: this configured key targets a different retained dataset. Cardinality cannot make it safe.
+        </div>
+      )}
       {suggestions.length === 0 ? (
         <div className="text-[10.5px] leading-relaxed text-muted-foreground">
           {loading ? 'Analyzing keys…' : (analysis?.note ?? 'No matching key columns between the two inputs.')}
@@ -529,6 +534,8 @@ function JoinHints({ nodeId }: { nodeId: string }) {
                 {s.leftColumns.join('+')} = {s.rightColumns.join('+')}
               </span>
               <span className={cn('rounded px-1.5 py-px text-[9.5px] font-semibold', CARD_TONE[s.cardinality] ?? CARD_TONE.unknown)}>{s.cardinality}</span>
+              {(s.rowReference ?? []).some((diagnosis) => diagnosis.status === 'compatible') && <span className="rounded bg-green-100 px-1.5 py-px text-[9.5px] font-semibold text-green-700 dark:bg-green-500/15 dark:text-green-300">reference match</span>}
+              {(s.rowReference ?? []).some((diagnosis) => diagnosis.status === 'unknown') && <span className="rounded bg-muted px-1.5 py-px text-[9.5px] text-muted-foreground">reference unknown</span>}
             </button>
           ))}
           <div className="text-[9.5px] leading-relaxed text-muted-foreground">Cardinality measured from the data · click to fill the join key.</div>

@@ -912,12 +912,14 @@ def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
     def resolve(uri: str):
         try:
             table = deps.catalog.get_table(uri)
-            return table.uri, table.columns
-        except KeyError:
-            return uri, None
+            identity = rel.input_identity(
+                dataset_id=table.registration_id, revision_id=table.version)
+            return table.uri, table.columns, identity
+        except (KeyError, ValueError):
+            return uri, None, None
     try:
-        left_uri, left_cols = resolve(req.left_uri)
-        right_uri, right_cols = resolve(req.right_uri)
+        left_uri, left_cols, left_identity = resolve(req.left_uri)
+        right_uri, right_cols, right_identity = resolve(req.right_uri)
         from hub import paths
         paths.ensure_local_uri_allowed(left_uri)
         paths.ensure_local_uri_allowed(right_uri)
@@ -930,7 +932,9 @@ def join_suggestions(req: JoinSuggestRequest) -> list[JoinSuggestion]:
                           else normalize_column_schemas(deps.resolve_adapter(right_uri).schema(right_uri)))
             return rel.suggest_joins(left_cols, right_cols,
                                      rel.measured_unique(left_uri, deps.resolve_adapter),
-                                     rel.measured_unique(right_uri, deps.resolve_adapter))
+                                     rel.measured_unique(right_uri, deps.resolve_adapter),
+                                     left_identity=left_identity,
+                                     right_identity=right_identity)
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except ManagedSourceReadError as e:

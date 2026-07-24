@@ -359,6 +359,15 @@ def _managed_sidecar_request_sha256(
 
 def _managed_sidecar_error(exc: Exception) -> APIError:
     message = str(exc)
+    if message == "row_reference_target_mismatch":
+        return APIError(422, message, code=APIErrorCode.ROW_REFERENCE_TARGET_MISMATCH,
+                        retryable=False)
+    if message == "identity_reference_required":
+        return APIError(422, message, code=APIErrorCode.IDENTITY_REFERENCE_REQUIRED,
+                        retryable=False)
+    if message == "identity_reference_unavailable":
+        return APIError(422, message, code=APIErrorCode.IDENTITY_REFERENCE_UNAVAILABLE,
+                        retryable=False)
     if "head moved" in message or "expected head" in message:
         return APIError(409, "managed sidecar merge destination head moved",
                         code=APIErrorCode.CONFLICT, retryable=False)

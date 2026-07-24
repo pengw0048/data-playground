@@ -17159,10 +17159,20 @@ def _catalog_lineage_source_snapshot(
     if parent.startswith("workspace-provider://"):
         return _catalog_provider_lineage_source_snapshot(s, parent, lineage)
     if snapshot.resolved_source_uri is not None:
+        # A managed-local source's durable exact identity is its revision ledger id, not the
+        # replaceable CatalogEntry version. Field projections must retain that same identity because
+        # managed-sidecar admission compares them to an ExactDatasetRef.
+        managed_revision = (
+            s.scalar(select(ManagedLocalFileRevision.revision_id).where(
+                ManagedLocalFileRevision.logical_id == snapshot.logical_id,
+                ManagedLocalFileRevision.artifact_uri == snapshot.resolved_source_uri,
+            ).limit(1))
+            if snapshot.logical_id is not None else None
+        )
         return {
             "source_key": snapshot.resolved_source_key,
             "source_uri": snapshot.resolved_source_uri,
-            "source_version": snapshot.entry_version,
+            "source_version": managed_revision or snapshot.entry_version,
             "source_registration_id": snapshot.entry_registration_id,
             "source_dataset_id": snapshot.logical_id or snapshot.entry_registration_id,
         }
@@ -19935,6 +19945,13 @@ def catalog_revision_binding_for_uri(uri: str) -> dict | None:
         ).limit(1)) is not None:
             return {"dataset_id": entry.logical_id, "uri": entry.uri}
         return {"dataset_id": entry.registration_id, "uri": entry.uri}
+
+
+def catalog_managed_logical_id_for_uri(uri: str) -> str | None:
+    """Return a catalog entry's managed logical owner without consulting its revision ledger."""
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        return entry.logical_id if entry is not None and entry.logical_id else None
 
 
 def managed_local_file_revision_history(
