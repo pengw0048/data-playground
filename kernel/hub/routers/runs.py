@@ -1233,6 +1233,25 @@ def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
         )
 
 
+def _reject_row_reference_target_mismatch(graph: Graph, deps, target_node_id: str | None) -> None:
+    """Reject a configured known target contradiction before any run/task allocation."""
+    from hub import relationships
+
+    scoped = _target_execution_graph(graph, target_node_id)
+    columns = schema_for_graph(
+        scoped, deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
+        storage=deps.storage)
+    for node in scoped.nodes:
+        if node.type != "join":
+            continue
+        analysis = relationships.analyze_join(
+            scoped, node.id, columns, deps.catalog, deps.resolve_adapter, storage=deps.storage)
+        if analysis.blocking_code:
+            raise APIError(
+                422, analysis.blocking_code,
+                code=APIErrorCode.ROW_REFERENCE_TARGET_MISMATCH, retryable=False)
+
+
 def _inspection_port(graph, node_id: str, port_id: str | None, deps) -> str:
     """Validate a single-relation request before it can acquire a source or compute resource."""
     try:
@@ -2344,6 +2363,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if write_intent is None and retained_local_manifest.get("write_intent") is not None:
             write_intent = WriteIntent.model_validate(
                 retained_local_manifest["write_intent"])
+    fresh_local_admission = retained_local_manifest is None
 
     # Capture caller intent before catalog references are resolved or private exact-revision bindings are
     # attached. Kernel and isolated-local transports mint an id when a non-browser caller has none; the
@@ -2395,22 +2415,29 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
     # Every provider Source must cross exact admission before any backend/controller may allocate.
     # This guard is backend-wide and independent of a caller-supplied submissionId: mutable-only
     # providers can still serve bounded previews, but they never reach a runner.
-    try:
-        source_nodes = _local_run_source_nodes(graph, target_node_id)
-    except (KeyError, graph_mod.CycleError):
+    if fresh_local_admission:
+        try:
+            source_nodes = _local_run_source_nodes(graph, target_node_id)
+        except (KeyError, graph_mod.CycleError):
+            _reject_invalid(graph, deps, target_node_id)
+            raise
+        provider_sources = [
+            node for node in source_nodes
+            if workspace_providers.is_provider_dataset_uri(str(
+                node.data.get("config", {}).get("uri") or ""))
+        ]
+        if provider_sources:
+            _reject_invalid(graph, deps, target_node_id)
+            if input_manifest is None:
+                input_manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
+            else:
+                _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
+
+        # Retained-manifest and legacy durable response-loss adoption above remain dependency-free.
+        # Only fresh work consults current catalog/schema facts before any allocation.
+        graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
         _reject_invalid(graph, deps, target_node_id)
-        raise
-    provider_sources = [
-        node for node in source_nodes
-        if workspace_providers.is_provider_dataset_uri(str(
-            node.data.get("config", {}).get("uri") or ""))
-    ]
-    if provider_sources:
-        _reject_invalid(graph, deps, target_node_id)
-        if input_manifest is None:
-            input_manifest = _resolve_local_run_manifest(graph, target_node_id, deps)
-        else:
-            _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
+        _reject_row_reference_target_mismatch(graph, deps, target_node_id)
 
     external_request = _external_wait_request(deps, graph, target_node_id)
     if external_request is not None:
@@ -2566,7 +2593,10 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         status = metadb.durable_task(task["task_id"], include_admission=False)
         assert status is not None
         return RunStatus.model_validate(status["status_doc"]), None
-    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)  # source may name a catalog table (F50)
+    if fresh_local_admission:
+        # A retained exact admission already validated and canonicalized this logical graph before
+        # the response was lost; replay must not regain a dependency on the mutable catalog alias.
+        graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
     _reject_invalid(graph, deps, target_node_id)
     # Keep the durable graph on logical Source URIs. A supplied exact manifest binds private
     # _input_* execution fields below; those belong only on the schema/plan/worker copy and must never

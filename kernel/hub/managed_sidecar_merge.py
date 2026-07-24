@@ -18,7 +18,7 @@ from hub.merge_columns import (
     merge_complete_sidecar_table, merge_output_columns, schema_columns,
 )
 from hub.models import (
-    ColumnSchema, ExactDatasetRef, LineagePublication, PlanDigest, Wire, WriteDestination,
+    ColumnSchema, ExactDatasetRef, LineagePublication, PlanDigest, RowReferenceInputIdentity, Wire, WriteDestination,
     WriteIntent, WriteProvenance,
 )
 from hub.plugins.adapters import DuckDBAdapter
@@ -27,6 +27,9 @@ from hub.row_identity import (
     serialize_row_identity_coverage,
 )
 from hub.storage import source_read_scope
+from hub.row_reference_diagnosis import (
+    ROW_REFERENCE_TARGET_MISMATCH, diagnose_durable_field_projections, has_target_conflict,
+)
 
 
 class ManagedSidecarMergeError(RuntimeError):
@@ -175,6 +178,27 @@ def _schema(relation):
     return relation.limit(0).to_arrow_table().schema
 
 
+def _require_durable_identity_reference(
+        *, base: ExactDatasetRef, sidecar: ExactDatasetRef, identity_columns: list[str]) -> None:
+    """Require a complete exact durable projection from every sidecar identity field to base."""
+    rows, _cursor, truncated, available = metadb.catalog_field_lineage_page(
+        dataset_id=sidecar.dataset_id, revision_id=sidecar.revision_id,
+        destination_fields=identity_columns, limit=100)
+    state = "available" if available and not truncated else "unavailable"
+    diagnoses = diagnose_durable_field_projections(
+        sidecar=RowReferenceInputIdentity(
+            kind="exact", dataset_id=sidecar.dataset_id, revision_id=sidecar.revision_id),
+        base=RowReferenceInputIdentity(
+            kind="exact", dataset_id=base.dataset_id, revision_id=base.revision_id),
+        fields=identity_columns, projections=rows, state=state)
+    if has_target_conflict(diagnoses):
+        raise ManagedSidecarMergeError(ROW_REFERENCE_TARGET_MISMATCH)
+    if state != "available":
+        raise ManagedSidecarMergeError("identity_reference_unavailable")
+    if any(diagnosis.status != "compatible" for diagnosis in diagnoses):
+        raise ManagedSidecarMergeError("identity_reference_required")
+
+
 def prepare_managed_sidecar_merge(
         *, storage, request: ManagedSidecarMergeRequestV1) -> PreparedManagedSidecarMerge:
     """Read exact revisions and return coverage facts without admitting incomplete coverage."""
@@ -193,6 +217,10 @@ def prepare_managed_sidecar_merge(
         sidecar.dataset_id, sidecar.revision_id)
     if base_uri is None or sidecar_uri is None:
         raise ManagedSidecarMergeError("managed sidecar merge exact revision is unavailable")
+    # This is pure durable ledger evidence and must precede protected scans, coverage work, task
+    # submission, receipt reservation, or child-revision allocation.
+    _require_durable_identity_reference(
+        base=base, sidecar=sidecar, identity_columns=request.identity_columns)
     try:
         # The sidecar stays within this lifecycle scope while its lazy relation is inspected and
         # certified. ``certify_row_identity_coverage`` independently fences the exact base. The

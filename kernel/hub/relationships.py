@@ -13,16 +13,24 @@ measured over the tuple. Matching pairs single- and multi-column key sets betwee
 
 from __future__ import annotations
 
-import re
 import uuid
 from itertools import combinations
 
 from hub import db
 from hub import graph as g
 from hub.grain import grain_of
-from hub.models import ColumnSchema, Graph, JoinAnalysis, JoinSuggestion, KeyInfo
+from hub.models import (
+    ColumnSchema, Graph, JoinAnalysis, JoinSuggestion, KeyInfo, RowReferenceInputIdentity,
+    dataset_ref_identity,
+)
 from hub.plugins.capabilities import display_base_type, is_key_column
-from hub.sqlpolicy import identifier, quote_identifier
+from hub.row_reference_diagnosis import (
+    ROW_REFERENCE_TARGET_MISMATCH, diagnose_key_pairs, has_target_conflict, input_identity,
+)
+from hub.sqlpolicy import (
+    SQLPolicyError, identifier, identifier_key, join_equality_columns, parse_identifier_list,
+    quote_identifier,
+)
 
 # a join key column set is at most this wide — a wider composite is almost never a real join key and
 # the combinatorics (C(n,k)) would explode.
@@ -186,15 +194,77 @@ def _candidate_keysets(left_cols: list[ColumnSchema],
     return out
 
 
+def _reference_candidate_keysets(
+        left_cols: list[ColumnSchema],
+        right_cols: list[ColumnSchema],
+) -> list[list[tuple[str, str]]]:
+    """Synthesize bounded renamed-key candidates from retained row-reference facts.
+
+    One scalar reference gives a complete mapping only for a single target key field.  Composite
+    references do not carry the corresponding local-field sequence, so they remain available to
+    configured/declared joins but are never guessed here.
+    """
+    out: list[list[tuple[str, str]]] = []
+
+    def append(source: list[ColumnSchema], peer: list[ColumnSchema], *, flipped: bool) -> None:
+        for source_column in source:
+            reference = source_column.row_reference
+            if reference is None or len(reference.key_fields) != 1:
+                continue
+            key = identifier_key(reference.key_fields[0])
+            matches = [column for column in peer if identifier_key(column.name) == key]
+            if len(matches) != 1:
+                continue
+            peer_column = matches[0]
+            if display_base_type(source_column.type) != display_base_type(peer_column.type):
+                continue
+            pair = ((peer_column.name, source_column.name) if flipped
+                    else (source_column.name, peer_column.name))
+            out.append([pair])
+
+    append(left_cols, right_cols, flipped=False)
+    append(right_cols, left_cols, flipped=True)
+    deduped: list[list[tuple[str, str]]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for candidate in out:
+        key = tuple(candidate)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(candidate)
+    return deduped
+
+
 def suggest_joins(left_cols: list[ColumnSchema], right_cols: list[ColumnSchema],
-                  left_unique, right_unique) -> list[JoinSuggestion]:
+                  left_unique, right_unique,
+                  left_identity: RowReferenceInputIdentity | None = None,
+                  right_identity: RowReferenceInputIdentity | None = None) -> list[JoinSuggestion]:
     """Ranked ways to join, given a uniqueness oracle for each side (`fn(cols) -> bool | None`).
     left_unique/right_unique either MEASURE on a dataset (measured_unique) or decide from a
     canvas node's grain. Cardinality + a 'verified' confidence come from those oracles."""
     left_unique, right_unique = _memoize(left_unique), _memoize(right_unique)  # each key set measured once
     out: list[JoinSuggestion] = []
-    for cand in _candidate_keysets(left_cols, right_cols):
+    named = _candidate_keysets(left_cols, right_cols)
+    reference = _reference_candidate_keysets(left_cols, right_cols)
+    reference_keys = {tuple(candidate) for candidate in reference}
+    named_keys = {tuple(candidate) for candidate in named}
+    candidates = reference + [
+        candidate for candidate in named if tuple(candidate) not in reference_keys]
+    for cand in candidates:
         lc, rc = [p[0] for p in cand], [p[1] for p in cand]
+        references = diagnose_key_pairs(
+            left_input=left_identity, right_input=right_identity,
+            left_columns=left_cols, right_columns=right_cols,
+            left_fields=lc, right_fields=rc,
+        )
+        # A target contradiction is stronger than a name/type/cardinality heuristic. Unknown keeps
+        # legacy behavior; it is never promoted to compatible.
+        if has_target_conflict(references):
+            continue
+        # A renamed reference creates a new candidate only after its target is positively comparable.
+        # Unknown evidence cannot manufacture a join hint from the target key's name.
+        if (tuple(cand) not in named_keys
+                and not any(diagnosis.status == "compatible" for diagnosis in references)):
+            continue
         lu, ru = left_unique(lc), right_unique(rc)
         card = cardinality(lu, ru)
         conf = "verified" if (lu is not None and ru is not None) else "inferred"
@@ -206,9 +276,13 @@ def suggest_joins(left_cols: list[ColumnSchema], right_cols: list[ColumnSchema],
             reason = f"neither key is unique ({card}) — a many-to-many bridge"
         exact = all(a == b for a, b in cand)
         # rank: a determinate 1:x/x:1 (has a parent side) beats a bridge; exact name beats FK-style; narrow beats wide
-        score = (2.0 if card in ("1:1", "1:N", "N:1") else 0.0) + (1.0 if exact else 0.0) - 0.1 * (len(cand) - 1)
+        score = ((2.0 if card in ("1:1", "1:N", "N:1") else 0.0)
+                 + (1.0 if exact else 0.0)
+                 + (3.0 if any(d.status == "compatible" for d in references) else 0.0)
+                 - 0.1 * (len(cand) - 1))
         out.append(JoinSuggestion(left_columns=lc, right_columns=rc, cardinality=card,
-                                  confidence=conf, score=round(score, 3), reason=reason))
+                                  confidence=conf, score=round(score, 3), reason=reason,
+                                  row_reference=references))
     out.sort(key=lambda s: s.score, reverse=True)
     return out
 
@@ -273,18 +347,50 @@ def _configured_join_key(node) -> tuple[list[str], list[str]] | None:
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
     on = str(cfg.get("on") or "").strip()
     if on:
-        cols = [c.strip().strip('"') for c in on.split(",") if c.strip()]
+        try:
+            cols = parse_identifier_list(on, label="join key")
+        except SQLPolicyError:
+            return None
         return (cols, cols) if cols else None
     cond = str(cfg.get("condition") or "").strip()
     if cond:
-        left, right = [], []
-        for s1, c1, s2, c2 in re.findall(r'([ab])\.("?\w+"?)\s*=\s*([ab])\.("?\w+"?)', cond):
-            c1, c2 = c1.strip('"'), c2.strip('"')
-            if {s1, s2} == {"a", "b"}:
-                (left, right) = (left + [c1], right + [c2]) if s1 == "a" else (left + [c2], right + [c1])
-        if left:
-            return (left, right)
+        try:
+            return join_equality_columns(cond)
+        except SQLPolicyError:
+            return None
     return None
+
+
+def _input_identity(graph: Graph, node_id: str, catalog) -> RowReferenceInputIdentity | None:
+    """Resolve only the bounded durable identity carried by one single-source join input."""
+    source_uri = _lone_source_uri(graph, node_id)
+    source = next((node for node in g.upstream_chain(graph, node_id)
+                   if node.type == "source" and (node.data.get("config", {}) if isinstance(node.data, dict) else {}).get("uri") == source_uri), None)
+    if not source_uri:
+        return None
+    from hub import workspace_providers
+    if workspace_providers.is_provider_dataset_uri(source_uri):
+        if source is None:
+            return None
+        config = source.data.get("config", {}) if isinstance(source.data, dict) else {}
+        try:
+            dataset_id, revision_id = dataset_ref_identity(config.get("datasetRef"))
+            token = source_uri.removeprefix("workspace-provider://")
+            canonical_id = f"workspace-provider:{token}"
+            if workspace_providers.provider_dataset_uri_for_identity(canonical_id) != source_uri:
+                return None
+        except (TypeError, ValueError, workspace_providers.ProviderDatasetUnavailable):
+            return None
+        if canonical_id != dataset_id:
+            return None
+        return input_identity(dataset_id=dataset_id, revision_id=revision_id)
+    try:
+        table = catalog.get_table(source_uri)
+    except (KeyError, ValueError):
+        return None
+    # Ordinary catalog Sources execute the current URI registration.  A client-carried DatasetRef
+    # cannot rebind that URI, and transient table ids/names/URIs are not durable identities.
+    return input_identity(dataset_id=table.registration_id, revision_id=table.version)
 
 
 def analyze_join(graph: Graph, node_id: str, columns_by_node: dict[str, list | None],
@@ -315,39 +421,65 @@ def _analyze_join_unfenced(graph: Graph, node_id: str, columns_by_node: dict[str
         return JoinAnalysis(note="input columns aren't known yet (run an upstream code op to type them)")
     lcols = [ColumnSchema.model_validate(c) for c in lcols_raw]
     rcols = [ColumnSchema.model_validate(c) for c in rcols_raw]
+    left_identity, right_identity = (
+        _input_identity(graph, left, catalog), _input_identity(graph, right, catalog))
     lo = _grain_unique_oracle(graph, left, catalog, resolve_adapter)
     ro = _grain_unique_oracle(graph, right, catalog, resolve_adapter)
-    suggestions = suggest_joins(lcols, rcols, lo, ro)
+    suggestions = suggest_joins(
+        lcols, rcols, lo, ro, left_identity=left_identity, right_identity=right_identity)
     # DECLARED relationships between the two inputs' source datasets lead (owner-asserted, trusted).
     # A declared edge with cardinality 'unknown' borrows the MEASURED cardinality for the same columns
     # so the fan-out warning still fires (declaring a join shouldn't hide that it multiplies rows).
     declared = _declared_suggestions(graph, left, right, catalog)
     cols_key = lambda s: (tuple(s.left_columns), tuple(s.right_columns))  # noqa: E731
     measured_by_cols = {cols_key(s): s.cardinality for s in suggestions}
+    compatible_declared = []
     for d in declared:
+        d.row_reference = diagnose_key_pairs(
+            left_input=left_identity, right_input=right_identity,
+            left_columns=lcols, right_columns=rcols,
+            left_fields=d.left_columns, right_fields=d.right_columns,
+        )
+        if has_target_conflict(d.row_reference):
+            continue
         if d.cardinality == "unknown":
             d.cardinality = measured_by_cols.get(cols_key(d), "unknown")
+        compatible_declared.append(d)
+    declared = compatible_declared
     declared_cols = {cols_key(d) for d in declared}
     suggestions = declared + [s for s in suggestions if cols_key(s) not in declared_cols]
     # If the join is already CONFIGURED (on / condition), the warning must reflect the key it ACTUALLY
     # uses — not the top-ranked candidate. Surface that key's cardinality first (measuring it if it
     # isn't among the suggestions), so `validate`'s all-clear can't be a different key's cardinality.
     configured = _configured_join_key(g.node_map(graph).get(node_id))
+    configured_references = []
     if configured:
         cl, cr = configured
+        configured_references = diagnose_key_pairs(
+            left_input=left_identity, right_input=right_identity,
+            left_columns=lcols, right_columns=rcols, left_fields=cl, right_fields=cr,
+        )
+        if has_target_conflict(configured_references):
+            return JoinAnalysis(
+                suggestions=suggestions, configured_row_reference=configured_references,
+                blocking_code=ROW_REFERENCE_TARGET_MISMATCH,
+                note="configured join key has a known row-reference target mismatch",
+            )
         active = next((s for s in suggestions if s.left_columns == cl and s.right_columns == cr), None)
         if active is None:
             card = cardinality(lo(cl), ro(cr))
             active = JoinSuggestion(left_columns=cl, right_columns=cr, cardinality=card,
                                     confidence="verified" if card != "unknown" else "inferred",
-                                    reason="configured join key")
+                                    reason="configured join key", row_reference=configured_references)
         suggestions = [active] + [s for s in suggestions if s is not active]
     if not suggestions:
-        return JoinAnalysis(note="no matching key columns between the two inputs")
+        return JoinAnalysis(note="no matching key columns between the two inputs",
+                            configured_row_reference=configured_references)
     warning = None
     top = suggestions[0]
     if top.cardinality in ("1:N", "N:1", "N:M"):
         many = "both sides" if top.cardinality == "N:M" else ("right" if top.cardinality == "1:N" else "left")
         warning = (f"this join is {top.cardinality}: {many} fans out, so the result is at the finer "
                    "grain — rows multiply. Aggregate downstream if you meant the parent grain.")
-    return JoinAnalysis(suggestions=suggestions, warning=warning)
+    return JoinAnalysis(suggestions=suggestions, warning=warning,
+                        configured_row_reference=configured_references)

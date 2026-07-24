@@ -1,10 +1,11 @@
-import { render, screen, fireEvent } from '@testing-library/react'
-import { describe, it, expect } from 'vitest'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { describe, it, expect, vi } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
 import type { ColumnSchema } from '../types/graph'
 import { register } from '../nodes/registry'
 import { codeHash } from '../nodes/schema'
 import { useStore } from '../store/graph'
+import { api } from '../api/client'
 
 const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
@@ -392,6 +393,36 @@ describe('Inspector — effective named outputs', () => {
     fireEvent.click(screen.getByText('Advanced write operations'))
     expect(advanced).toHaveAttribute('open')
     expect(screen.getByLabelText('Certified column merge')).toBeInTheDocument()
+  })
+})
+
+describe('Inspector — row-reference join diagnosis', () => {
+  it('renders a configured blocking code and never describes unknown evidence as safe', async () => {
+    const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({
+      suggestions: [
+        { leftColumns: ['account_id'], rightColumns: ['id'], cardinality: '1:1', confidence: 'verified', score: 4, reason: 'reference', rowReference: [{ leftField: 'account_id', rightField: 'id', status: 'compatible', reason: 'exact_target_matches_peer' }] },
+        { leftColumns: ['legacy_id'], rightColumns: ['id'], cardinality: 'unknown', confidence: 'inferred', score: 1, reason: 'unknown', rowReference: [{ leftField: 'legacy_id', rightField: 'id', status: 'unknown', reason: 'peer_identity_unavailable' }] },
+      ], warning: null, note: null, configuredRowReference: [], blockingCode: 'row_reference_target_mismatch',
+    } as any)
+    useStore.setState({
+      selectedIds: ['join'], canvasRole: 'owner', runs: {},
+      doc: { id: 'join-diagnosis', name: 'Join', version: 1, requirements: [],
+        nodes: [
+          { id: 'left', type: 'source', position: { x: 0, y: 0 }, data: { title: 'left', status: 'draft', history: [], config: { uri: 'left.parquet' } } },
+          { id: 'right', type: 'source', position: { x: 0, y: 1 }, data: { title: 'right', status: 'draft', history: [], config: { uri: 'right.parquet' } } },
+          { id: 'join', type: 'join', position: { x: 1, y: 0 }, data: { title: 'join', status: 'draft', history: [], config: { on: 'account_id' } } },
+        ], edges: [
+          { id: 'left-join', source: 'left', target: 'join', data: { wire: 'dataset' } },
+          { id: 'right-join', source: 'right', target: 'join', data: { wire: 'dataset' } },
+        ] },
+      schemas: { left: { out: cols }, right: { out: cols }, join: { out: cols } },
+    } as any)
+    render(<Inspector />)
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('row_reference_target_mismatch'))
+    expect(screen.getByText('reference match')).toBeInTheDocument()
+    expect(screen.getByText('reference unknown')).toBeInTheDocument()
+    expect(screen.queryByText(/reference safe/i)).not.toBeInTheDocument()
+    joinAnalysis.mockRestore()
   })
 })
 

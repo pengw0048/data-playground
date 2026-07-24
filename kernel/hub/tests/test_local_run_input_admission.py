@@ -719,6 +719,7 @@ def _local_start_context(monkeypatch, *, saved: bool = True):
     monkeypatch.setattr(runs.auth, "auth_enabled", lambda: False)
     monkeypatch.setattr(runs.graph_mod, "resolve_source_refs", lambda *_args: None)
     monkeypatch.setattr(runs, "_reject_invalid", lambda *_args: None)
+    monkeypatch.setattr(runs, "_reject_row_reference_target_mismatch", lambda *_args: None)
     monkeypatch.setattr(runs.compiler, "compile_plan", lambda *_args: SimpleNamespace(acyclic=True))
     monkeypatch.setattr(runs, "_run_output_preflight", lambda *_args: None)
     monkeypatch.setattr(runs, "_route_by_capability", lambda *_args: runner)
@@ -1018,3 +1019,42 @@ def test_failure_before_dispatch_leaves_the_admission_unclaimed(monkeypatch):
     retry, _ = runs.start_run(deps, graph, "source", "local", confirmed=True,
                               submission_id=submission_id)
     assert calls == [retry.run_id]
+
+
+def test_unclaimed_retained_admission_replays_without_live_row_reference_dependencies(
+        monkeypatch):
+    deps, graph = _local_start_context(monkeypatch)
+    submission_id = str(uuid.uuid4())
+    monkeypatch.setattr(
+        runs, "_bind_local_run_manifest",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("crash before dispatch claim")))
+    with pytest.raises(RuntimeError, match="crash before dispatch claim"):
+        runs.start_run(
+            deps, graph, "source", "local", confirmed=True,
+            submission_id=submission_id)
+
+    run_id = metadb.local_run_submission_id(
+        "local", "local-admission", submission_id)
+    assert metadb.local_run_input_admission(run_id) is not None
+    assert metadb.get_run_state(run_id) is None
+
+    def unavailable(*_args, **_kwargs):
+        raise AssertionError("retained replay consulted live catalog/schema facts")
+
+    deps.catalog = SimpleNamespace(resolve_ref=unavailable)
+    deps.resolve_adapter = unavailable
+    monkeypatch.setattr(runs.graph_mod, "resolve_source_refs", unavailable)
+    monkeypatch.setattr(runs, "_reject_row_reference_target_mismatch", unavailable)
+    monkeypatch.setattr(
+        runs, "_bind_local_run_manifest",
+        lambda current_graph, *_args, **_kwargs: current_graph)
+    monkeypatch.setattr(
+        "hub.observability.invoke_backend_run",
+        lambda _runner, _plan, _graph, _target, _placement, *, run_id, **_kwargs:
+        RunStatus(run_id=run_id, status="queued"),
+    )
+    retry, owner = runs.start_run(
+        deps, graph, "source", "local", confirmed=True,
+        submission_id=submission_id)
+    assert retry.run_id == run_id
+    assert owner is deps.runner

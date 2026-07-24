@@ -454,12 +454,30 @@ export interface JoinSuggestion {
   confidence: 'declared' | 'verified' | 'inferred'
   score: number
   reason: string
+  rowReference?: RowReferenceDiagnosis[]
+}
+
+export interface RowReferenceInputIdentity {
+  kind: 'exact' | 'canonical'
+  datasetId: string
+  revisionId?: string | null
+}
+
+export interface RowReferenceDiagnosis {
+  leftInput?: RowReferenceInputIdentity | null
+  rightInput?: RowReferenceInputIdentity | null
+  leftField: string
+  rightField: string
+  status: 'compatible' | 'conflict' | 'unknown'
+  reason: string
 }
 
 export interface JoinAnalysis {
   suggestions: JoinSuggestion[]
   warning?: string | null
   note?: string | null
+  configuredRowReference?: RowReferenceDiagnosis[]
+  blockingCode?: 'row_reference_target_mismatch' | null
 }
 
 export interface Relationship {

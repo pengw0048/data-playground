@@ -253,6 +253,40 @@ class TypedRowReference(Wire):
         return self
 
 
+class RowReferenceInputIdentity(Wire):
+    """A bounded join-input identity, deliberately never a URI or display name."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["exact", "canonical"]
+    dataset_id: str = Field(min_length=1, max_length=512)
+    revision_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _valid_identity(self) -> "RowReferenceInputIdentity":
+        if (self.kind == "exact") != (self.revision_id is not None):
+            raise ValueError("row-reference input identity is invalid")
+        return self
+
+
+class RowReferenceDiagnosis(Wire):
+    """Conservative target-compatibility fact for one join key pair."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    left_input: RowReferenceInputIdentity | None = None
+    right_input: RowReferenceInputIdentity | None = None
+    left_field: str
+    right_field: str
+    left_target: ExactDatasetRef | CanonicalDatasetRef | None = None
+    right_target: ExactDatasetRef | CanonicalDatasetRef | None = None
+    left_key_fields: list[str] = []
+    right_key_fields: list[str] = []
+    status: Literal["compatible", "conflict", "unknown"] = "unknown"
+    evidence_source: Literal["row_reference", "none"] = "none"
+    reason: str = "no_row_reference_evidence"
+
+
 def safe_field_annotations(metadata: dict[bytes, bytes] | None, *,
                            provenance: FieldAnnotationProvenance = "provider") -> list[FieldAnnotation]:
     """Convert native Arrow/Lance metadata to bounded annotations, dropping unsafe raw entries."""
@@ -539,6 +573,7 @@ class JoinSuggestion(Wire):
     confidence: Literal["declared", "verified", "inferred"] = "inferred"
     score: float = 0.0            # ranking (higher = more likely the intended join)
     reason: str = ""              # human-readable why
+    row_reference: list[RowReferenceDiagnosis] = []
 
 
 class JoinAnalysis(Wire):
@@ -548,6 +583,8 @@ class JoinAnalysis(Wire):
     suggestions: list[JoinSuggestion] = []
     warning: str | None = None
     note: str | None = None  # why suggestions are empty / cardinality unknown, when applicable
+    configured_row_reference: list[RowReferenceDiagnosis] = []
+    blocking_code: str | None = None
 
 
 class GrainInfo(Wire):

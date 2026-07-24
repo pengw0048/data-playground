@@ -9316,6 +9316,72 @@ def test_join_suggestions_measure_cardinality():
     assert one_to_many["cardinality"] == "1:N"  # one image id → many events
 
 
+def test_http_join_suggestions_use_stable_registration_identity(monkeypatch):
+    from hub import relationships
+    from hub.models import CatalogTable, ColumnSchema
+    from hub.routers import catalog as catalog_router
+
+    left = CatalogTable(
+        id="transient-left", registration_id="left-registration", version="l1",
+        name="left", uri="/tmp/issue788-http-left.parquet",
+        columns=[ColumnSchema.model_validate({
+            "name": "copied_owner", "type": "int",
+            "rowReference": {
+                "target": {
+                    "kind": "exact", "datasetId": "owners-registration",
+                    "revisionId": "o1",
+                },
+                "keyFields": ["id"], "provenance": "lineage",
+            },
+        })],
+    )
+    right = CatalogTable(
+        id="transient-right", registration_id="owners-registration", version="o1",
+        name="right", uri="/tmp/issue788-http-right.parquet",
+        columns=[ColumnSchema(name="id", type="int")],
+    )
+
+    class Catalog:
+        @staticmethod
+        def get_table(value):
+            return {"left": left, "right": right}[value]
+
+    deps = SimpleNamespace(
+        catalog=Catalog(), storage=None,
+        resolve_adapter=lambda _uri: pytest.fail("patched cardinality oracle resolved an adapter"),
+    )
+    monkeypatch.setattr(
+        relationships, "measure_unique",
+        lambda _uri, _columns, _resolve_adapter: (True, 1))
+    monkeypatch.setattr(catalog_router, "get_deps", lambda: deps)
+    response = client.post(
+        "/api/catalog/join-suggestions",
+        json={"leftUri": "left", "rightUri": "right"},
+    )
+    assert response.status_code == 200, response.text
+    suggestions = response.json()
+    assert suggestions[0]["leftColumns"] == ["copied_owner"]
+    assert suggestions[0]["rowReference"][0]["status"] == "compatible"
+    assert suggestions[0]["cardinality"] == "1:1"
+
+    left.columns[0] = ColumnSchema.model_validate({
+        "name": "copied_owner", "type": "int",
+        "rowReference": {
+            "target": {
+                "kind": "exact", "datasetId": "other-registration",
+                "revisionId": "o1",
+            },
+            "keyFields": ["id"], "provenance": "lineage",
+        },
+    })
+    conflict = client.post(
+        "/api/catalog/join-suggestions",
+        json={"leftUri": "left", "rightUri": "right"},
+    )
+    assert conflict.status_code == 200, conflict.text
+    assert conflict.json() == []
+
+
 def test_grain_propagates_through_relational_ops():
     # the core insight: a filtered/sampled dataset keeps its key (still joinable); a group-by re-grains
     # to its group key. grain_of computes this structurally (no scan).

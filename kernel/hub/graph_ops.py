@@ -258,13 +258,25 @@ def join_hints(deps, left: str, right: str) -> dict:
     from hub.storage import source_read_scope
     (luri, lcols), (ruri, rcols) = (
         _resolve_uri_and_cols(deps, left), _resolve_uri_and_cols(deps, right))
+
+    def stable_identity(value: str):
+        try:
+            table = deps.catalog.get_table(value)
+        except (KeyError, ValueError):
+            return None
+        return rel.input_identity(
+            dataset_id=table.registration_id, revision_id=table.version)
+
+    # Resolve independently: one raw/unavailable side must not erase the other side's retained fact.
+    left_identity, right_identity = stable_identity(left), stable_identity(right)
     with source_read_scope(
             deps.storage, [luri, ruri], owner=f"join-hints:{uuid.uuid4().hex}"):
         lcols = lcols if lcols is not None else normalize_column_schemas(deps.resolve_adapter(luri).schema(luri))
         rcols = rcols if rcols is not None else normalize_column_schemas(deps.resolve_adapter(ruri).schema(ruri))
         sugg = rel.suggest_joins(lcols, rcols,
                                  rel.measured_unique(luri, deps.resolve_adapter),
-                                 rel.measured_unique(ruri, deps.resolve_adapter))
+                                 rel.measured_unique(ruri, deps.resolve_adapter),
+                                 left_identity=left_identity, right_identity=right_identity)
         return {"suggestions": [s.model_dump(by_alias=True) for s in sugg],
                 "declared": [r.model_dump(by_alias=True) for r in deps.catalog.relationships(luri)
                              if ruri in (r.left_uri, r.right_uri)]}
@@ -296,7 +308,12 @@ def validate_graph(deps, graph: dict) -> dict:
             ja = rel.analyze_join(
                 g, n.id, cols, deps.catalog, deps.resolve_adapter, storage=deps.storage)
             joins[n.id] = {"cardinality": (ja.suggestions[0].cardinality if ja.suggestions else "unknown"),
-                           "warning": ja.warning, "note": ja.note}
+                           "warning": ja.warning, "note": ja.note,
+                           "rowReference": [item.model_dump(by_alias=True)
+                                            for item in ja.configured_row_reference],
+                           "blockingCode": ja.blocking_code}
+            if ja.blocking_code:
+                out.setdefault("errors", []).append(ja.blocking_code)
     out["joins"] = joins
     return out
 

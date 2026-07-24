@@ -79,6 +79,10 @@ class ToolError(Exception):
     dispatcher turns it into an MCP `isError` tool result so the model sees the message and can adapt,
     rather than a hard protocol error."""
 
+    def __init__(self, message: str, *, code: str | None = None, retryable: bool | None = None):
+        super().__init__(message)
+        self.code, self.retryable = code, retryable
+
 
 class JsonRpcError(Exception):
     """A protocol-level fault (unknown method / bad params) → a JSON-RPC error object."""
@@ -828,7 +832,10 @@ class Playground:
             return {"needsConfirm": True, "targetNodeId": target, "estRows": est.rows,
                     "reason": est.breakdown or "large or unknown size — a full pass; pass confirm:true to run"}
         except HTTPExc as e:  # invalid/cyclic graph from start_run's server-side checks
-            raise ToolError(str(e.detail))
+            raise ToolError(
+                str(e.detail), code=(str(e.code) if hasattr(e, "code") else None),
+                retryable=(bool(e.retryable) if hasattr(e, "retryable") else None),
+            ) from e
         status = self._await_run(status.run_id)
         return self._run_envelope(status, status.target_node_id or target)
 
@@ -1309,7 +1316,9 @@ class MCPServer:
         try:
             result = tool["handler"](args)
         except ToolError as e:
-            return _tool_result(str(e), is_error=True)
+            payload = ({"detail": str(e), "code": e.code, "retryable": e.retryable}
+                       if e.code is not None else None)
+            return _tool_result(str(e), is_error=True, payload=payload)
         except Exception as e:  # noqa: BLE001 — a tool bug is reported to the model, not crashed on
             return _tool_result(f"{type(e).__name__}: {e}", is_error=True)
         result = _jsonable(result)
@@ -1317,8 +1326,11 @@ class MCPServer:
                 "structuredContent": result, "isError": False}
 
 
-def _tool_result(text: str, is_error: bool = False) -> dict:
-    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+def _tool_result(text: str, is_error: bool = False, payload: dict | None = None) -> dict:
+    result = {"content": [{"type": "text", "text": text}], "isError": is_error}
+    if payload is not None:
+        result["structuredContent"] = payload
+    return result
 
 
 def _err_response(mid: Any, code: int, message: str, data: Any = None) -> dict:
