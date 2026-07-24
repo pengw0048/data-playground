@@ -61,7 +61,7 @@ def plan_hash(graph: Graph, target: str | None, resolve_adapter) -> str:
             # Placement is navigation-only for admitted provider Sources.  Do not let a retained
             # legacy placement hint fork cache identity from the canonical URI/DatasetRef.
             cfg = {key: value for key, value in cfg.items() if key not in {
-                "providerResourceRef", "providerMountId", "providerName",
+                "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName",
             }}
         # bypassed/disabled/title are SIBLINGS of config on data, and the engine changes the lowered
         # relation based on them (engine.py reads node.data.bypassed / .disabled; a metric node emits its

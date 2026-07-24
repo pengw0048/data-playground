@@ -3218,9 +3218,10 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                     assert placement.container_id == folder["id"]
                     assert placement.name == "Duplicate exploration"
                     assert doc["nodes"][0]["data"]["config"] == {
-                        "uri": workspace_scope["uri"],
-                        "tableId": f"tbl_{token}",
-                    }
+                            "uri": workspace_scope["uri"],
+                            "tableId": f"tbl_{token}",
+                            "registrationId": workspace_scope["dataset_id"],
+                        }
 
             renamed = metadb.workspace_update_container(
                 folder["id"], expected_version=folder["version"],

@@ -2,7 +2,7 @@
 import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
-  InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples,
+  InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
   CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
@@ -308,6 +308,20 @@ export const api = {
   table: (id: string) => req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}`),
   tableByRegistration: (id: string) =>
     req<CatalogTable>(`/catalog/tables/${encodeURIComponent(id)}?registration=true`),
+  relatedDatasets: (source: RelatedDatasetIdentity, params: { q?: string; folder?: string; limit?: number } = {}) =>
+    req<RelatedDatasetPage>('/catalog/related-datasets', {
+      method: 'POST', body: JSON.stringify({ source, ...params }),
+    }),
+  relatedDatasetRevisions: (identity: RelatedDatasetIdentity, options: { limit?: number; cursor?: string } = {}) =>
+    req<DatasetRevisionPage>('/catalog/related-datasets/revisions', {
+      method: 'POST', body: JSON.stringify({ identity, ...options }),
+    }),
+  reviewRelatedDatasetRevision: (
+    source: RelatedDatasetIdentity, candidate: RelatedDatasetCandidate, revisionId: string,
+    params: { q?: string; folder?: string } = {},
+  ) => req<RelatedDatasetCandidate>('/catalog/related-datasets/revision-review', {
+    method: 'POST', body: JSON.stringify({ source, candidate, revisionId, ...params }),
+  }),
   datasetRevisions: (tableId: string, options?: { limit?: number; cursor?: string }) => {
     const query = new URLSearchParams()
     if (options?.limit != null) query.set('limit', String(options.limit))
@@ -633,6 +647,19 @@ export const api = {
       method: 'PUT', body: JSON.stringify(doc), keepalive,
     })
   },
+  joinWithRelated: (canvasId: string, body: {
+    expectedCanvasVersion: number
+    sourceNodeId: string
+    joinNodeId?: string
+    sourceIdentity: RelatedDatasetIdentity
+    candidate: RelatedDatasetCandidate
+    q?: string
+    folder?: string
+    how: 'inner' | 'left' | 'right' | 'outer'
+  }) => req<{ ok: boolean; canvas: CanvasDoc; sourceNodeId: string; joinNodeId: string; version: number }>(
+    `/canvas/${encodeURIComponent(canvasId)}/join-with-related`,
+    { method: 'POST', body: JSON.stringify(body) },
+  ),
   deleteCanvas: (id: string) => req<{ ok: boolean }>(`/canvas/${id}`, { method: 'DELETE' }),
   listRuns: (canvasId: string) => req<RunRecordDto[]>(`/canvas/${canvasId}/runs`),
   executionManifest: (canvasId: string, subjectId: string) =>

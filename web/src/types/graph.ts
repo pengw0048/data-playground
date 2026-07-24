@@ -45,9 +45,15 @@ export interface NodeConfig {
   // source
   uri?: string
   tableId?: string
+  // Stable local catalog identity. `tableId` and URI are display/adapter context, not admission
+  // identity for provenance-aware graph edits.
+  registrationId?: string
   datasetRef?: DatasetRef | ParameterRef
   providerResourceRef?: string
   providerMountId?: string
+  // Opaque canonical source binding, scoped by providerMountId. Never reconstruct it from a URI or
+  // a Workspace placement.
+  providerSourceBindingId?: string
   providerName?: string
   providerReadMode?: 'exact' | 'mutable'
   // sample

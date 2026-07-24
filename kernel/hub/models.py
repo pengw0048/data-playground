@@ -587,6 +587,73 @@ class JoinAnalysis(Wire):
     blocking_code: str | None = None
 
 
+class RelatedDatasetIdentity(Wire):
+    """Stable identity used to fence a related-dataset review.
+
+    Local catalog identities are registration-scoped. Provider identities are opaque and only valid
+    together with their mount; neither has a URI/name/table-id fallback.
+    """
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    kind: Literal["local", "provider"] = "local"
+    registration_id: str | None = Field(default=None, min_length=1, max_length=512)
+    mount_id: str | None = Field(default=None, min_length=1, max_length=128)
+    source_binding_id: str | None = Field(default=None, min_length=1, max_length=128)
+    revision_mode: Literal["exact", "current"] = "current"
+    revision_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def _stable_identity_only(self) -> "RelatedDatasetIdentity":
+        if self.kind == "local":
+            if not self.registration_id or self.mount_id or self.source_binding_id:
+                raise ValueError("local related identity requires only registrationId")
+        elif not self.mount_id or not self.source_binding_id or self.registration_id:
+            raise ValueError("provider related identity requires mountId and sourceBindingId")
+        if self.revision_mode == "exact" and not self.revision_id:
+            raise ValueError("exact related identity requires revisionId")
+        if self.revision_mode == "current" and self.revision_id is not None:
+            raise ValueError("current related identity cannot claim a revisionId")
+        return self
+
+
+class RelatedDatasetCandidate(Wire):
+    """One reviewed way to add a second dataset to a Join."""
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    identity: RelatedDatasetIdentity
+    name: str
+    folder: str = ""
+    reason: str
+    evidence: Literal["declared_relationship", "typed_reference", "schema_match"]
+    evidence_status: Literal["declared", "proven", "inferred"]
+    left_columns: list[str]
+    right_columns: list[str]
+    cardinality: Cardinality = "unknown"
+    confidence: Literal["declared", "verified", "inferred"] = "inferred"
+    exact_ref: ExactDatasetRef | None = None
+    warning: str | None = None
+
+
+class RelatedDatasetExclusion(Wire):
+    """A bounded explanation for a tempting but contradicted schema match."""
+    identity: RelatedDatasetIdentity
+    name: str
+    reason: str
+
+
+class RelatedDatasetPage(Wire):
+    """One bounded related-dataset review page; there is intentionally no continuation."""
+    source: RelatedDatasetIdentity
+    source_name: str
+    candidates: list[RelatedDatasetCandidate]
+    excluded: list[RelatedDatasetExclusion] = Field(default_factory=list)
+    limit: int
+    inspected: int
+    truncated: bool = False
+    refinement_required: bool = False
+    scope_note: str | None = Field(default=None, max_length=512)
+
+
 class GrainInfo(Wire):
     """The grain of a relation on the canvas: the key column(s) at which each row is distinct,
     propagated through relational ops. `known=False` means the grain couldn't be determined (an

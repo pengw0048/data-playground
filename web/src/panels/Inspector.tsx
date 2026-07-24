@@ -14,6 +14,7 @@ import { api } from '../api/client'
 import { MergeColumnsControl } from '../components/MergeColumnsControl'
 import { ManagedSidecarMergeControl } from '../components/ManagedSidecarMergeControl'
 import { UpsertControl } from '../components/UpsertControl'
+import { JoinWithRelated } from '../components/JoinWithRelated'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import type { JoinAnalysis, JoinSuggestion } from '../types/api'
 import type { ColumnSchema } from '../types/graph'
@@ -204,6 +205,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
           )}
         </Section>
       </EditOnly>
+
+      {(kind === 'source' || kind === 'join') && <EditOnly enabled={canEdit}>
+        <Section title="Related data">
+          <JoinWithRelated nodeId={nodeId} />
+        </Section>
+      </EditOnly>}
 
       {/* a write node's output destination lives here in the panel, not cluttering the card */}
       {kind === 'write' && <>

@@ -8,6 +8,7 @@ const containerNameA = 'Browser provider collection A'
 const containerNameB = 'Browser provider collection B'
 const datasetNameA = 'Browser provider observations'
 const datasetNameB = 'Browser provider observations'
+const relatedDatasetName = 'Browser provider labels'
 
 test.describe('provider Workspace Source acceptance', () => {
   test.skip(!enabled || !providerRoot, 'set DP_E2E_PROVIDER_ACCEPTANCE=1 and DP_E2E_PROVIDER_ROOT')
@@ -16,6 +17,7 @@ test.describe('provider Workspace Source acceptance', () => {
     const root = resolve(providerRoot!)
     mkdirSync(root, { recursive: true })
     writeFileSync(resolve(root, 'observations.csv'), 'id,value\n1,alpha\n2,beta\n')
+    writeFileSync(resolve(root, 'labels.csv'), 'id,label\n1,one\n2,two\n')
     writeFileSync(resolve(root, 'catalog.json'), JSON.stringify({ resources: [
       { placementId: 'browser-collection-a', kind: 'container', name: containerNameA },
       { placementId: 'browser-collection-b', kind: 'container', name: containerNameB },
@@ -32,13 +34,20 @@ test.describe('provider Workspace Source acceptance', () => {
         revisionId: 'browser-provider-revision-v1',
         columns: [{ name: 'id', type: 'int64' }, { name: 'value', type: 'string' }],
       },
+      {
+        placementId: 'browser-labels-a', datasetId: 'browser-canonical-labels',
+        kind: 'dataset', name: relatedDatasetName, parentPlacementId: 'browser-collection-a',
+        uri: 'labels.csv', revisionId: 'browser-provider-labels-v1',
+        columns: [{ name: 'id', type: 'int64' }, { name: 'label', type: 'string' }],
+      },
     ] }))
   })
 
   test('deduplicates canonical provider placements, then previews, runs, and inspects the exact Source in Chromium', async ({ page }) => {
-    test.setTimeout(60_000)
+    test.setTimeout(90_000)
     const providerCatalogBefore = readFileSync(resolve(providerRoot!, 'catalog.json'))
     const providerDatasetBefore = readFileSync(resolve(providerRoot!, 'observations.csv'))
+    const providerLabelsBefore = readFileSync(resolve(providerRoot!, 'labels.csv'))
     await page.goto('/#/workspace')
     const container = page.getByRole('button', {
       name: new RegExp(`Open folder ${containerNameA} from Source-only mount browser-provider`),
@@ -97,6 +106,37 @@ test.describe('provider Workspace Source acceptance', () => {
     }))
     expect(JSON.stringify(canonicalA)).not.toContain('observations.csv')
     expect(JSON.stringify(canonicalA)).not.toContain(resolve(providerRoot!))
+    const labelsPlacementId = externalPage.items.find(
+      (item) => item.providerPlacementId === 'browser-labels-a',
+    )?.id
+    expect(labelsPlacementId).toBeTruthy()
+    const canonicalLabelsResponse = await page.request.get(
+      `/api/workspace/resources/${encodeURIComponent(labelsPlacementId!)}/canonical-dataset`,
+    )
+    expect(canonicalLabelsResponse.ok()).toBeTruthy()
+    const canonicalLabels = await canonicalLabelsResponse.json() as { datasetIdentity: string }
+    // Provider metadata can expose an immutable typed reference. Refresh the actual provider
+    // catalog before using the Source; this proves the browser picker prefers that authoritative
+    // relationship over an otherwise identical inferred id match.
+    const typedCatalog = JSON.parse(providerCatalogBefore.toString()) as { resources: Array<Record<string, unknown>> }
+    for (const item of typedCatalog.resources) {
+      if (item.datasetId === 'browser-canonical-observations') {
+        item.columns = [
+          {
+            name: 'id', type: 'int64', rowReference: {
+              target: { kind: 'canonical', datasetId: canonicalLabels.datasetIdentity },
+              keyFields: ['id'], provenance: 'provider',
+            },
+          },
+          { name: 'value', type: 'string' },
+        ]
+      }
+    }
+    writeFileSync(resolve(providerRoot!, 'catalog.json'), JSON.stringify(typedCatalog))
+    const refreshedProviderScope = await page.request.get(
+      `/api/workspace/containers/${encodeURIComponent(externalPage.container.id)}`,
+    )
+    expect(refreshedProviderScope.ok()).toBeTruthy()
     const canonicalDetail = detail.getByTestId('canonical-provider-dataset-context')
     await expect(canonicalDetail).toContainText('Exact revision · browser-provider-revision-v1')
     await expect(canonicalDetail).toContainText('id · int64')
@@ -130,7 +170,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
     const canvasLocation = page.getByRole('navigation', { name: 'Canvas Workspace location' })
     await expect(canvasLocation).toContainText(`Workspace/${containerNameA}`)
-    const source = page.locator('.react-flow__node').filter({ hasText: datasetNameA })
+    const source = page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })
     await expect(source).toHaveCount(1)
     await expect(source.locator(
       '[title="Pinned provider revision browser-provider-revision-v1"]',
@@ -138,6 +178,49 @@ test.describe('provider Workspace Source acceptance', () => {
     const canvasId = decodeURIComponent(
       new URL(page.url()).hash.split('/').pop()!.split('?')[0],
     )
+
+    // This is the real provider related-data flow: the picker lists the provider adapter's retained
+    // revision, re-reviews that exact schema, then creates the Source + Join in one Canvas edit.
+    await source.getByText('DATASET', { exact: true }).click()
+    const relatedInspector = page.getByTestId('inspector')
+    await relatedInspector.getByTestId(/^join-with-related-/).click()
+    await expect(page.getByText('Declared and proven references')).toBeVisible()
+    await page.getByRole('button', { name: new RegExp(relatedDatasetName, 'i') }).click()
+    const versionPicker = page.getByLabel('Related dataset version')
+    await expect(versionPicker).toBeVisible()
+    // A real provider-detail failure must not fabricate an exact review or mutate the Canvas.
+    // Restore the fixture immediately, then prove the same retained revision can be reviewed.
+    writeFileSync(resolve(providerRoot!, 'catalog.json'), '{')
+    await versionPicker.selectOption('browser-provider-labels-v1')
+    await expect(page.getByText(/Retained versions unavailable:/)).toBeVisible()
+    expect((await page.request.get(`/api/canvas/${canvasId}`)).ok()).toBeTruthy()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    writeFileSync(resolve(providerRoot!, 'catalog.json'), providerCatalogBefore)
+    // The list still offers v1, but the provider now resolves the stable binding to v2: selecting
+    // v1 must fail closed rather than joining the mutable head under an exact label.
+    writeFileSync(resolve(providerRoot!, 'catalog.json'), providerCatalogBefore.toString().replace(
+      'browser-provider-labels-v1', 'browser-provider-labels-v2',
+    ))
+    await versionPicker.selectOption('browser-provider-labels-v1')
+    await expect(page.getByText(/Retained versions unavailable:/)).toBeVisible()
+    await expect(page.locator('.react-flow__node')).toHaveCount(1)
+    writeFileSync(resolve(providerRoot!, 'catalog.json'), providerCatalogBefore)
+    await versionPicker.selectOption('browser-provider-labels-v1')
+    await expect(page.getByText(/browser-provider-labels-v1/).last()).toBeVisible()
+    const relatedGraphEdit = page.waitForResponse((response) =>
+      response.url().endsWith(`/api/canvas/${canvasId}/join-with-related`)
+      && response.request().method() === 'POST')
+    await page.getByTestId('confirm-related-join').click()
+    expect((await relatedGraphEdit).ok()).toBeTruthy()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    const exactRelatedCanvas = await (await page.request.get(`/api/canvas/${canvasId}`)).json()
+    const relatedSource = exactRelatedCanvas.nodes.find((node: { type: string; data?: { config?: { providerSourceBindingId?: string } } }) =>
+      node.type === 'source'
+      && node.data?.config?.providerSourceBindingId !== canonicalA.sourceBindingId)
+    expect(relatedSource?.data?.config).toMatchObject({
+      providerMountId: 'browser-provider', providerReadMode: 'exact',
+      datasetRef: { kind: 'exact', revisionId: 'browser-provider-labels-v1' },
+    })
 
     await page.goto('/#/workspace')
     const search = page.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' })
@@ -220,7 +303,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await expect(page.getByTestId('toolbar')).toBeVisible()
     await expect(canvasLocation).toContainText(`Workspace/${containerNameA}`)
     await expect(source).toHaveCount(1)
-    await expect(page.locator('.react-flow__node').filter({ hasText: datasetNameB })).toHaveCount(0)
+    await expect(page.locator('.react-flow__node-source').filter({ hasText: datasetNameB })).toHaveCount(0)
 
     await source.getByText('DATASET', { exact: true }).click()
     const inspector = page.getByTestId('inspector')
@@ -268,7 +351,7 @@ test.describe('provider Workspace Source acceptance', () => {
 
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(page.getByTestId('toolbar')).toBeVisible()
-    await expect(page.locator('.react-flow__node').filter({ hasText: datasetNameA })).toHaveCount(1)
+    await expect(page.locator('.react-flow__node-source').filter({ hasText: datasetNameA })).toHaveCount(1)
 
     // The Canvas location came from the stable overlay parent. Returning uses that opaque id and
     // never writes to the provider.
@@ -284,6 +367,7 @@ test.describe('provider Workspace Source acceptance', () => {
       /^\/api\/workspace\/canvases$/,
       /^\/api\/workspace\/canvases\/[^/]+\/datasets$/,
       /^\/api\/canvas\/[^/]+$/,
+      /^\/api\/canvas\/[^/]+\/join-with-related$/,
       /^\/api\/graph\/(plan|schema|estimate)$/,
       /^\/api\/run(\/preview|\/estimate|\/input-drift)?$/,
     ].some((allowed) => allowed.test(path)))).toBe(true)
@@ -345,5 +429,6 @@ test.describe('provider Workspace Source acceptance', () => {
     expect(writes).toEqual(writesBeforeUnavailableReturn)
     expect(readFileSync(resolve(providerRoot!, 'catalog.json'))).toEqual(providerCatalogBefore)
     expect(readFileSync(resolve(providerRoot!, 'observations.csv'))).toEqual(providerDatasetBefore)
+    expect(readFileSync(resolve(providerRoot!, 'labels.csv'))).toEqual(providerLabelsBefore)
   })
 })

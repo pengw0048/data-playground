@@ -171,6 +171,7 @@ def _canonical_graph(
             # the canonical execution identity and must not retain its originating occurrence.
             config.pop("providerResourceRef", None)
             config.pop("providerMountId", None)
+            config.pop("providerSourceBindingId", None)
             config.pop("providerName", None)
             config["datasetRef"] = {
                 "kind": "exact",

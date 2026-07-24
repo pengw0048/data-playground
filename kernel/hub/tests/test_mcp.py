@@ -202,6 +202,23 @@ def test_context_classifies_relationship_and_revision_failures(monkeypatch):
     }
 
 
+def test_related_datasets_requires_a_structured_stable_identity():
+    table = get_deps().catalog.get_table("tbl_events")
+    result = data("related_datasets", {
+        "source": {
+            "kind": "local", "registrationId": table.registration_id,
+            "revisionMode": "current",
+        },
+        "limit": 1,
+    })
+    assert result["state"] == "available"
+    assert call("related_datasets", {"dataset": table.uri})["isError"] is True
+    schema = next(item for item in rpc("tools/list")["result"]["tools"]
+                  if item["name"] == "related_datasets")["inputSchema"]
+    assert set(schema["properties"]) == {"source", "text", "folder", "limit"}
+    assert "uri" not in schema["properties"]["source"]["properties"]
+
+
 def test_context_relationship_window_is_independently_bounded(monkeypatch):
     events, images = _uri("events"), _uri("images")
     relationships = [

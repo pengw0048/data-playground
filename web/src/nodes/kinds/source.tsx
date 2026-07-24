@@ -28,9 +28,11 @@ function exactRevisionFailure(error: unknown): Exclude<ExactRevisionState, 'idle
 const localDatasetBinding = (table: CatalogTable) => ({
   uri: table.uri,
   tableId: table.id,
+  registrationId: table.registrationId ?? undefined,
   datasetRef: undefined,
   providerResourceRef: undefined,
   providerMountId: undefined,
+  providerSourceBindingId: undefined,
   providerName: undefined,
   providerReadMode: undefined,
 })
