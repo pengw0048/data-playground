@@ -392,7 +392,7 @@ class CatalogTable(Wire):
 
 class DatasetRevision(Wire):
     """One immutable provider-native dataset revision."""
-    dataset_id: str = Field(min_length=1, max_length=128)
+    dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
     retention_owner: Literal["provider", "core"] = "provider"
@@ -408,7 +408,7 @@ class ExactDatasetRef(Wire):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
 
     kind: Literal["exact"]
-    dataset_id: str = Field(min_length=1, max_length=128)
+    dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     last_known: DatasetRevisionLastKnown | None = None
 
@@ -427,7 +427,7 @@ class DatasetRevisionPage(Wire):
 
 class DatasetRevisionResolution(Wire):
     """Evidence that a latest/as-of request resolved to an immutable native revision."""
-    dataset_id: str = Field(min_length=1, max_length=128)
+    dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
     retention_owner: Literal["provider", "core"] = "provider"
@@ -494,7 +494,7 @@ class DatasetRevisionPreview(Wire):
 
 class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
-    dataset_id: str = Field(min_length=1, max_length=128)
+    dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     committed_at: datetime.datetime | None = None
     retention_owner: Literal["provider", "core"] = "provider"

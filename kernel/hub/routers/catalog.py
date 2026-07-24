@@ -17,6 +17,7 @@ import os
 import re
 import tempfile
 import uuid
+from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -25,7 +26,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from hub import db, graph as g, metadb, sandbox
+from hub import db, graph as g, metadb, sandbox, workspace_providers
 from hub.api_errors import APIError, APIErrorCode
 from hub.backends import (
     CatalogFieldLineageExporter,
@@ -373,21 +374,61 @@ def get_table(table_id: str, registration: bool = False) -> CatalogTable:
         raise HTTPException(404, f"table '{table_id}' not found")
 
 
-def _revision_adapter(uri: str) -> DatasetRevisionAdapter:
-    adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
-    if not isinstance(adapter, DatasetRevisionAdapter):
+def _revision_adapter(uri: str) -> object:
+    try:
+        adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
+    except workspace_providers.ProviderDatasetOffline as exc:
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
+    except (workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    except PermissionError as exc:
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
+    if not (workspace_providers.provider_dataset_supports_exact(adapter)
+            if workspace_providers.is_provider_dataset_uri(uri)
+            else isinstance(adapter, DatasetRevisionAdapter)):
         raise APIError(501, "dataset_revision_history_unavailable",
                        code=APIErrorCode.NOT_IMPLEMENTED, retryable=False)
     return adapter
 
 
 def _revision_binding_for_table(table_id: str) -> tuple[CatalogTable, dict]:
+    try:
+        provider_uri = workspace_providers.provider_dataset_uri_for_identity(table_id)
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    if provider_uri is not None:
+        # A canonical Workspace provider Source is not a mutable Catalog registration.  Its
+        # DatasetRef identity is nevertheless a first-class revision target.
+        return SimpleNamespace(uri=provider_uri), {
+            "dataset_id": table_id, "uri": provider_uri,
+        }
     table = get_table(table_id)
     binding = metadb.catalog_revision_binding_for_uri(table.uri)
     if binding is None:
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return table, binding
+
+
+def _revision_binding_for_dataset_id(dataset_id: str) -> dict:
+    """Resolve one retained exact DatasetRef without requiring a current table registration."""
+    try:
+        provider_uri = workspace_providers.provider_dataset_uri_for_identity(dataset_id)
+    except workspace_providers.ProviderDatasetUnavailable as exc:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    if provider_uri is not None:
+        return {"dataset_id": dataset_id, "uri": provider_uri}
+    binding = metadb.catalog_revision_binding(dataset_id)
+    if binding is None:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return binding
 
 
 def _revision(dataset_id: str, raw: dict, adapter: DatasetRevisionAdapter) -> DatasetRevision:
@@ -440,10 +481,12 @@ def list_dataset_revisions(table_id: str, limit: int = Query(20, ge=1, le=100),
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
-    except (RevisionProviderOffline, ConnectionError, TimeoutError):
+    except (RevisionProviderOffline, ConnectionError, TimeoutError,
+            workspace_providers.ProviderDatasetOffline):
         raise APIError(503, "dataset_revision_provider_offline",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    except RevisionUnavailable:
+    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     return DatasetRevisionPage(items=[
@@ -468,10 +511,18 @@ def resolve_dataset_revision(table_id: str,
         as_of = as_of.astimezone(datetime.timezone.utc)
     try:
         raw = adapter.resolve_revision(table.uri, as_of=as_of)
+    except (RevisionPermissionLost, PermissionError):
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False)
+    except (RevisionProviderOffline, ConnectionError, TimeoutError,
+            workspace_providers.ProviderDatasetOffline):
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     except RevisionResolutionAmbiguous:
         raise APIError(409, "dataset_revision_resolution_ambiguous",
                        code=APIErrorCode.CONFLICT, retryable=False)
-    except RevisionUnavailable:
+    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     committed_at = _core_owned_committed_at(raw.get("committed_at"), adapter)
@@ -524,10 +575,7 @@ def dataset_revision_capabilities(table_id: str) -> DatasetRevisionCapabilities:
 @router.get("/catalog/revisions/{dataset_id}/{revision_id}", response_model=DatasetRevisionDetail)
 def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionDetail:
     """Return bounded facts and preview for one exact revision; never fall back to current head."""
-    binding = metadb.catalog_revision_binding(dataset_id)
-    if binding is None:
-        raise APIError(410, "dataset_revision_unavailable",
-                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    binding = _revision_binding_for_dataset_id(dataset_id)
     try:
         deps = get_deps()
         adapter = _revision_adapter(binding["uri"])
@@ -543,13 +591,17 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
-    except (RevisionProviderOffline, ConnectionError, TimeoutError):
+    except (RevisionProviderOffline, ConnectionError, TimeoutError,
+            workspace_providers.ProviderDatasetOffline):
         raise APIError(503, "dataset_revision_provider_offline",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    except RevisionUnavailable:
+    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
     table = raw["preview_table"]
+    if hasattr(table, "read_all"):
+        table = table.read_all()
     preview_rows = _table_to_rows(table.slice(0, DATASET_REVISION_PREVIEW_ROWS))
     return DatasetRevisionDetail(
         dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),

@@ -14,7 +14,7 @@ from typing import Literal
 import duckdb
 from fastapi import APIRouter, Depends, Response
 
-from hub import db, metadb, paths
+from hub import db, metadb, paths, workspace_providers
 from hub.api_errors import APIError, APIErrorCode
 from hub.backends import DatasetRevisionAdapter, Relation
 from hub.deps import get_deps
@@ -66,9 +66,12 @@ def supports_dataset_view_source(uri: str, adapter: object) -> bool:
         local = paths.local_path(uri)
     except ValueError:
         local = None
+    exact = (workspace_providers.provider_dataset_supports_exact(adapter)
+             if workspace_providers.is_provider_dataset_uri(uri)
+             else isinstance(adapter, DatasetRevisionAdapter))
     return (
-        local is not None
-        and isinstance(adapter, DatasetRevisionAdapter)
+        (local is not None or workspace_providers.is_provider_dataset_uri(uri))
+        and exact
         and "exact" in set(getattr(adapter, "revision_selectors", ()))
         and getattr(adapter, "retention_owner", "provider") in {"core", "provider"}
     )
@@ -118,7 +121,7 @@ def _stored_definition(uid: str, view_id: str) -> DatasetViewDefinitionV1:
 @dataclass(frozen=True)
 class _ExactSource:
     uri: str
-    adapter: DatasetRevisionAdapter
+    adapter: object
     retention_owner: Literal["core", "provider"]
     detail: dict
     relation: Relation
@@ -126,20 +129,22 @@ class _ExactSource:
 
 @contextlib.contextmanager
 def _open_exact(ref: ExactDatasetRef, *, operation: str) -> Iterator[_ExactSource]:
-    binding = metadb.catalog_revision_binding(ref.dataset_id)
-    if binding is None or binding["dataset_id"] != ref.dataset_id:
-        raise RevisionUnavailable("revision_unavailable")
-    uri = str(binding["uri"])
+    uri = workspace_providers.provider_dataset_uri_for_identity(ref.dataset_id)
+    if uri is None:
+        binding = metadb.catalog_revision_binding(ref.dataset_id)
+        if binding is None or binding["dataset_id"] != ref.dataset_id:
+            raise RevisionUnavailable("revision_unavailable")
+        uri = str(binding["uri"])
     adapter = revision_adapter_for_uri(uri, get_deps().resolve_adapter)
     if not supports_dataset_view_source(uri, adapter):
         raise _DatasetViewUnsupported(
             "DatasetViews currently support advertised local exact revision providers only")
-    assert isinstance(adapter, DatasetRevisionAdapter)
     retention_owner = str(getattr(adapter, "retention_owner", "provider"))
     if retention_owner not in {"core", "provider"}:
         raise _DatasetViewUnsupported("the source does not declare a durable revision owner")
-    artifact_uri = metadb.managed_local_file_revision_artifact(
-        ref.dataset_id, ref.revision_id)
+    artifact_uri = (None if workspace_providers.is_provider_dataset_uri(uri)
+                    else metadb.managed_local_file_revision_artifact(
+                        ref.dataset_id, ref.revision_id))
     if retention_owner == "core" and artifact_uri is None:
         raise RevisionUnavailable("revision_unavailable")
     scope = (source_read_scope(
@@ -260,11 +265,14 @@ def _map_dataset_view_error(exc: Exception) -> APIError:
         return APIError(
             403, "DatasetView source permission was lost",
             code=APIErrorCode.PERMISSION_DENIED, retryable=False)
-    if isinstance(exc, (RevisionProviderOffline, ConnectionError, TimeoutError)):
+    if isinstance(exc, (RevisionProviderOffline, ConnectionError, TimeoutError,
+                        workspace_providers.ProviderDatasetOffline)):
         return APIError(
             503, "DatasetView source provider is offline",
             code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    if isinstance(exc, (RevisionUnavailable, ManagedSourceReadError, KeyError)):
+    if isinstance(exc, (RevisionUnavailable, ManagedSourceReadError, KeyError,
+                        workspace_providers.ProviderDatasetGone,
+                        workspace_providers.ProviderDatasetUnavailable)):
         return APIError(
             410, "DatasetView exact source revision is unavailable",
             code=APIErrorCode.RESOURCE_GONE, retryable=False)

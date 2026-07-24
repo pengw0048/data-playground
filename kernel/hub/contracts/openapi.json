@@ -1137,7 +1137,7 @@
             "title": "Committedat"
           },
           "datasetId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "title": "Datasetid",
             "type": "string"
@@ -1232,7 +1232,7 @@
             "title": "Committedat"
           },
           "datasetId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "title": "Datasetid",
             "type": "string"
@@ -1394,7 +1394,7 @@
             "title": "Committedat"
           },
           "datasetId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "title": "Datasetid",
             "type": "string"
@@ -4638,7 +4638,7 @@
         "description": "Opaque, path-independent identity for one exact retained dataset revision.",
         "properties": {
           "datasetId": {
-            "maxLength": 128,
+            "maxLength": 512,
             "minLength": 1,
             "title": "Datasetid",
             "type": "string"
