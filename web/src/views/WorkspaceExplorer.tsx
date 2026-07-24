@@ -3,7 +3,7 @@ import { api, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
   CatalogTable, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
-  WorkspaceSourceStatus,
+  WorkspaceCanonicalDatasetContext, WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu'
@@ -17,10 +17,147 @@ import { examples } from '../examples'
 
 const LOCAL_ROOT_ID = 'workspace-local-root'
 const PAGE_SIZE = 50
+const WORKSPACE_SEARCH_PAGE_SIZE = 25
+const WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS = 100
+const CANONICAL_CONTEXT_COLUMN_LIMIT = 25
 const WORKSPACE_ROOT_BREADCRUMB: WorkspaceResource = {
   id: `container:${LOCAL_ROOT_ID}`, kind: 'container', name: 'Workspace', detached: false, source: 'local',
 }
 const NON_EMPTY_LOCAL_FOLDER_REASON = "Move or remove this Folder's contents before deleting it."
+const PROVIDER_PLACEMENT_CACHE_MAX_DATASETS = 64
+const PROVIDER_PLACEMENT_CACHE_MAX_PLACEMENTS = 6
+const PROVIDER_PLACEMENT_CACHE_MAX_PATHS = 256
+
+type ProviderPlacementObservation = {
+  placementId: string
+  path: string
+}
+
+type ProviderPlacementObservations = {
+  observe: (
+    resources: WorkspaceResource[], ancestors?: WorkspaceResource[],
+    evidence?: { current: boolean },
+  ) => void
+  alternatePlacements: (resource: WorkspaceResource) => ProviderPlacementObservation[]
+  placementPath: (resource: WorkspaceResource) => string | null
+  reset: () => void
+}
+
+const ProviderPlacementObservationsContext = createContext<ProviderPlacementObservations>({
+  observe: () => undefined,
+  alternatePlacements: () => [],
+  placementPath: () => null,
+  reset: () => undefined,
+})
+
+function providerPlacementId(resource: WorkspaceResource): string | null {
+  return resource.providerPlacementId ?? null
+}
+
+function providerPlacementPathKey(resource: WorkspaceResource): string | null {
+  const placementId = providerPlacementId(resource)
+  return resource.mountId && placementId ? `${resource.mountId}\u0000${placementId}` : null
+}
+
+function providerCanonicalKey(resource: WorkspaceResource): string | null {
+  return resource.mountId && resource.providerDatasetId
+    ? `${resource.mountId}\u0000${resource.providerDatasetId}` : null
+}
+
+function useProviderPlacementObservations(): ProviderPlacementObservations {
+  // This state belongs to this mounted Workspace only. It records returned browse/search/resolve
+  // observations; it neither persists across Workspace lifetimes nor asks a provider for aliases.
+  const canonicalObservations = useRef(new Map<string, Map<string, ProviderPlacementObservation>>())
+  const placementPaths = useRef(new Map<string, string>())
+  const [, setVersion] = useState(0)
+
+  const placementPath = useCallback((resource: WorkspaceResource): string | null => (
+    placementPaths.current.get(providerPlacementPathKey(resource) ?? '') ?? null
+  ), [])
+
+  const observe = useCallback((
+    resources: WorkspaceResource[], ancestors: WorkspaceResource[] = [],
+    evidence: { current: boolean } = { current: false },
+  ) => {
+    let changed = false
+    // A resolution supplies the full ancestor chain. Observe it in order so a nested child can
+    // reuse the complete path of its real parent instead of truncating to the current page name.
+    const observed = [
+      ...ancestors.map((ancestor, index) => ({ resource: ancestor, ancestors: ancestors.slice(0, index) })),
+      ...resources.map((resource) => ({ resource, ancestors })),
+    ]
+    for (const { resource, ancestors: resourceAncestors } of observed) {
+      if (!isExternal(resource)) continue
+      const placementId = providerPlacementId(resource)
+      const placementKey = providerPlacementPathKey(resource)
+      if (!placementId || !placementKey) continue
+      const canonicalKey = resource.kind === 'dataset' ? providerCanonicalKey(resource) : null
+      const currentEvidence = evidence.current
+        && resource.referenceState === 'current'
+        && resource.canonicalReferenceState === 'current'
+        && !resource.detached && !resource.lastKnown
+      if (canonicalKey && !currentEvidence) {
+        const existing = canonicalObservations.current.get(canonicalKey)
+        if (existing?.delete(placementId)) {
+          if (!existing.size) canonicalObservations.current.delete(canonicalKey)
+          changed = true
+        }
+      }
+      const directParent = resourceAncestors[resourceAncestors.length - 1]
+      const parentPath = directParent && isExternal(directParent)
+        ? placementPaths.current.get(providerPlacementPathKey(directParent) ?? '')
+        : resource.mountId && resource.parentProviderPlacementId
+        ? placementPaths.current.get(`${resource.mountId}\u0000${resource.parentProviderPlacementId}`)
+        : undefined
+      const visibleAncestors = resourceAncestors.filter(isExternal).map((item) => item.name)
+      // A path is usable only when it came with named ancestors, from an already observed named
+      // parent, or from a top-level provider placement. Search rows alone never invent one from
+      // opaque placement/parent ids.
+      const path = parentPath ? `${parentPath} / ${resource.name}`
+        : visibleAncestors.length ? [...visibleAncestors, resource.name].join(' / ')
+          : !resource.parentProviderPlacementId ? resource.name : null
+      if (!path) continue
+      placementPaths.current.delete(placementKey)
+      placementPaths.current.set(placementKey, path)
+      while (placementPaths.current.size > PROVIDER_PLACEMENT_CACHE_MAX_PATHS) {
+        placementPaths.current.delete(placementPaths.current.keys().next().value!)
+      }
+      if (!canonicalKey || !currentEvidence) { changed = true; continue }
+      let placements = canonicalObservations.current.get(canonicalKey)
+      if (!placements) {
+        if (canonicalObservations.current.size >= PROVIDER_PLACEMENT_CACHE_MAX_DATASETS) {
+          canonicalObservations.current.delete(canonicalObservations.current.keys().next().value!)
+        }
+        placements = new Map()
+      } else canonicalObservations.current.delete(canonicalKey)
+      placements.delete(placementId)
+      placements.set(placementId, { placementId, path })
+      while (placements.size > PROVIDER_PLACEMENT_CACHE_MAX_PLACEMENTS) {
+        placements.delete(placements.keys().next().value!)
+      }
+      canonicalObservations.current.set(canonicalKey, placements)
+      changed = true
+    }
+    if (changed) setVersion((current) => current + 1)
+  }, [])
+
+  const alternatePlacements = useCallback((resource: WorkspaceResource) => {
+    const canonicalKey = providerCanonicalKey(resource)
+    const currentPlacement = providerPlacementId(resource)
+    if (!canonicalKey || !currentPlacement) return []
+    return [...(canonicalObservations.current.get(canonicalKey)?.values() ?? [])]
+      .filter((placement) => placement.placementId !== currentPlacement)
+  }, [])
+
+  const reset = useCallback(() => {
+    canonicalObservations.current.clear()
+    placementPaths.current.clear()
+  }, [])
+
+  useEffect(() => reset, [reset])
+
+  return useMemo(() => ({ observe, alternatePlacements, placementPath, reset }), [observe, alternatePlacements, placementPath, reset])
+}
 
 const WorkspaceOverflowMenuContext = createContext<{ openId: string | null; setOpenId: (id: string | null) => void }>({
   openId: null, setOpenId: () => undefined,
@@ -206,11 +343,17 @@ export function serializeWorkspaceDatasetQuery(state: CatalogDiscoveryQueryState
 export function WorkspaceExplorer() {
   const scope = useStore((state) => state.workspaceScope) ?? 'all'
   const firstRunChoice = useStore((state) => state.firstRunChoice)
-  return <WorkspaceOverflowMenuProvider><div className="flex h-full min-h-0 flex-col">
+  const providerPlacementObservations = useProviderPlacementObservations()
+  const previousScope = useRef(scope)
+  useEffect(() => {
+    if (previousScope.current !== scope) providerPlacementObservations.reset()
+    previousScope.current = scope
+  }, [scope, providerPlacementObservations])
+  return <ProviderPlacementObservationsContext.Provider value={providerPlacementObservations}><WorkspaceOverflowMenuProvider><div className="flex h-full min-h-0 flex-col">
     {firstRunChoice && <FirstRunCanvasChoice />}
     <WorkspaceLocalDrafts />
     <div className="min-h-0 flex-1">{scope === 'datasets' ? <WorkspaceDatasets /> : <WorkspaceMixedExplorer />}</div>
-  </div></WorkspaceOverflowMenuProvider>
+  </div></WorkspaceOverflowMenuProvider></ProviderPlacementObservationsContext.Provider>
 }
 
 // A first-run choice belongs beside the Workspace, not in a separate tutorial surface: datasets
@@ -247,6 +390,7 @@ function FirstRunCanvasChoice() {
 // and catalog page in the browser. A resource URL is opaque and remains valid when its display name
 // or placement changes; only containers are expanded locally, one page at a time.
 function WorkspaceMixedExplorer() {
+  const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const requestedResourceId = useStore((s) => s.workspaceResourceId)
   const setWorkspaceResource = useStore((s) => s.setWorkspaceResource)
   const searchQuery = useStore((s) => s.workspaceSearchQuery)
@@ -275,6 +419,9 @@ function WorkspaceMixedExplorer() {
   const [selectedView, setSelectedView] = useState<DatasetViewDefinition | null>(null)
   const [selectedDataset, setSelectedDataset] = useState<WorkspaceResource | null>(null)
   const [selectedSource, setSelectedSource] = useState<WorkspaceSourceStatus | null>(null)
+  const [selectedCanonicalSourceBinding, setSelectedCanonicalSourceBinding] = useState<{
+    mountId: string; sourceBindingId: string
+  } | null>(null)
   const [selectedProviderResource, setSelectedProviderResource] = useState<WorkspaceResource | null>(null)
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
   const [resolutionError, setResolutionError] = useState<string | null>(null)
@@ -328,6 +475,7 @@ function WorkspaceMixedExplorer() {
         if (targetId !== loadedContainer.current) setError(unavailable)
         return
       }
+      providerPlacementObservations.observe(page.items, [page.container], { current: true })
       setContainerId(identity(page.container))
       loadedContainer.current = identity(page.container)
       setContainer(page.container)
@@ -345,7 +493,7 @@ function WorkspaceMixedExplorer() {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [])
+  }, [providerPlacementObservations])
 
   useEffect(() => {
     let cancelled = false
@@ -355,7 +503,7 @@ function WorkspaceMixedExplorer() {
       if (!refreshingSelection) {
         selectionRequest.current = requestedResourceId
         selectionContainer.current = null
-        setSelectedTable(null); setSelectedView(null); setSelectedDataset(null); setSelectedSource(null); setSelectedDetached(null); setSelectedProviderResource(null)
+        setSelectedTable(null); setSelectedView(null); setSelectedDataset(null); setSelectedSource(null); setSelectedCanonicalSourceBinding(null); setSelectedDetached(null); setSelectedProviderResource(null)
       }
       if (!requestedResourceId) {
         selectionContainer.current = null
@@ -372,6 +520,10 @@ function WorkspaceMixedExplorer() {
           setLoading(false)
           return
         }
+        providerPlacementObservations.observe(
+          [resolved.resource], resolved.ancestors,
+          { current: resolved.source.completeness === 'complete' },
+        )
         const resolvedContainer = resolved.resource.kind === 'container'
           ? resolved.resource
           : resolved.ancestors[resolved.ancestors.length - 1]
@@ -380,6 +532,7 @@ function WorkspaceMixedExplorer() {
         const container = preserveNavigation ? selectionContainer.current ?? resolvedContainer : resolvedContainer
         if (!preserveNavigation) selectionContainer.current = resolvedContainer
         setSelectedProviderResource(isExternal(resolved.resource) ? resolved.resource : null)
+        setSelectedCanonicalSourceBinding(resolved.canonicalSourceBinding ?? null)
         const resolvedCrumbs = resolved.resource.kind === 'container'
           ? [...resolved.ancestors, resolved.resource]
           : resolved.ancestors
@@ -441,7 +594,7 @@ function WorkspaceMixedExplorer() {
     }
     void resolve()
     return () => { cancelled = true; request.current += 1 }
-  }, [requestedResourceId, searchQuery, load, revision])
+  }, [requestedResourceId, searchQuery, load, revision, providerPlacementObservations])
 
   const open = (resource: WorkspaceResource) => {
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
@@ -644,7 +797,9 @@ function WorkspaceMixedExplorer() {
         pushToast('DatasetView deleted', 'success')
         setWorkspaceResource(`container:${containerId}`)
       }} />}
-      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource} onClose={closeDetail} onRetry={reload} onRelink={() => setRelinkResource(selectedDataset)} onUse={() => useProviderDataset(selectedDataset)} />}
+      {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
+        canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
+        onRelink={() => setRelinkResource(selectedDataset)} onUse={() => useProviderDataset(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {createOpen && canvasDestination(container, 'create') && <NewCanvasDialog container={container!} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
@@ -929,6 +1084,7 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
   onAction: (resource: WorkspaceResource, action: 'new-folder' | 'rename-folder' | 'delete-folder' | 'rename-canvas' | 'move-canvas' | 'delete-canvas') => void
   files: CanvasFile[]
 }) {
+  const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const [groups, setGroups] = useState<WorkspaceSearchGroup[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [hasMore, setHasMore] = useState(false)
@@ -938,28 +1094,96 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
   const [error, setError] = useState<string | null>(null)
   const [loadMoreError, setLoadMoreError] = useState<string | null>(null)
   const request = useRef(0)
+  const enrichment = useRef<AbortController | null>(null)
+  const enrichmentAttempts = useRef(new Set<string>())
+  const loadedProviderOccurrences = useRef(new Map<string, {
+    resource: WorkspaceResource
+    freshness: 'current' | 'stale' | 'unknown'
+  }>())
 
   const load = useCallback(async (nextCursor?: string | null) => {
     const sequence = ++request.current
+    enrichment.current?.abort()
+    const controller = new AbortController()
+    enrichment.current = controller
     const more = !!nextCursor
     if (more) { setLoadingMore(true); setLoadMoreError(null) }
-    else { setLoading(true); setGroups([]); setError(null); setLoadMoreError(null) }
+    else {
+      setLoading(true); setGroups([]); setError(null); setLoadMoreError(null)
+      enrichmentAttempts.current.clear()
+      loadedProviderOccurrences.current.clear()
+    }
     try {
       const page = await api.workspaceSearch(query, {
-        limit: 25, cursor: nextCursor ?? undefined,
+        limit: WORKSPACE_SEARCH_PAGE_SIZE, cursor: nextCursor ?? undefined,
       })
       if (sequence !== request.current) return
+      page.groups.forEach((group) => providerPlacementObservations.observe(
+        group.items, [], { current: group.source.freshness === 'current' },
+      ))
       setCompleteness(page.completeness)
-      setGroups((current) => page.groups.map((group) => {
-        const previous = more ? current.find((item) => item.source.id === group.source.id) : undefined
-        const items = previous ? [...previous.items] : []
-        const seen = new Set(items.map((item) => item.id))
-        items.push(...group.items.filter((item) => !seen.has(item.id)))
-        return { source: group.source, items }
-      }))
+      setGroups((current) => {
+        if (!more) return page.groups
+        const merged = new Map(current.map((group) => [group.source.id, group]))
+        for (const group of page.groups) {
+          const previous = merged.get(group.source.id)
+          const items = previous ? [...previous.items] : []
+          const seen = new Set(items.map((item) => item.id))
+          items.push(...group.items.filter((item) => !seen.has(item.id)))
+          merged.set(group.source.id, { source: group.source, items })
+        }
+        return [...merged.values()]
+      })
       setCursor(page.nextCursor ?? null)
       setHasMore(page.hasMore)
+      const pageOccurrences = page.groups.flatMap((group) => group.items
+        .filter((resource) => isExternal(resource) && resource.kind === 'dataset'
+          && resource.mountId && resource.providerPlacementId)
+        .map((resource) => ({ resource, freshness: group.source.freshness })))
+      for (const occurrence of pageOccurrences) {
+        loadedProviderOccurrences.current.delete(occurrence.resource.id)
+        loadedProviderOccurrences.current.set(occurrence.resource.id, occurrence)
+      }
+      while (loadedProviderOccurrences.current.size > WORKSPACE_SEARCH_ENRICHMENT_MAX_OBSERVATIONS) {
+        loadedProviderOccurrences.current.delete(loadedProviderOccurrences.current.keys().next().value!)
+      }
+      const occurrences = [...loadedProviderOccurrences.current.values()]
+      const nameCounts = new Map<string, number>()
+      for (const { resource } of occurrences) {
+        const key = `${resource.mountId}\u0000${resource.name.toLowerCase()}`
+        nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1)
+      }
+      const duplicateOccurrences = occurrences.filter(({ resource }) => (
+        (nameCounts.get(`${resource.mountId}\u0000${resource.name.toLowerCase()}`) ?? 0) > 1
+        && !providerPlacementObservations.placementPath(resource)
+        && !enrichmentAttempts.current.has(resource.id)
+      )).slice(0, Math.max(0, WORKSPACE_SEARCH_PAGE_SIZE - enrichmentAttempts.current.size))
+      duplicateOccurrences.forEach(({ resource }) => enrichmentAttempts.current.add(resource.id))
+      const resolved = await Promise.all(duplicateOccurrences.map(async (occurrence) => {
+        try {
+          return {
+            occurrence,
+            resolution: await api.workspaceResource(
+              occurrence.resource.id, { signal: controller.signal },
+            ),
+          }
+        } catch {
+          return null
+        }
+      }))
+      if (sequence !== request.current || controller.signal.aborted) return
+      for (const item of resolved) {
+        if (!item?.resolution.resource) continue
+        providerPlacementObservations.observe(
+          [item.resolution.resource], item.resolution.ancestors,
+          {
+            current: item.occurrence.freshness === 'current'
+              && item.resolution.source.completeness === 'complete',
+          },
+        )
+      }
     } catch (caught) {
+      if (controller.signal.aborted) return
       if (sequence === request.current) {
         if (more) setLoadMoreError(errorMessage(caught))
         else setError(errorMessage(caught))
@@ -967,11 +1191,14 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
     } finally {
       if (sequence === request.current) { setLoading(false); setLoadingMore(false) }
     }
-  }, [query])
+  }, [query, providerPlacementObservations])
 
   useEffect(() => {
     void load()
-    return () => { request.current += 1 }
+    return () => {
+      request.current += 1
+      enrichment.current?.abort()
+    }
   }, [load, revision])
 
   const resultCount = groups.reduce((count, group) => count + group.items.length, 0)
@@ -1411,6 +1638,7 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
   onMove?: () => void; onRenameCanvas?: () => void; onDeleteCanvas?: () => void
 }) {
   const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
+  const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const menuOpen = openId === resource.id
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
@@ -1431,7 +1659,7 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
     <button type="button" onClick={onOpen} aria-label={openLabel}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
       {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
@@ -1455,26 +1683,97 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, onClose, onRetry, onRelink, onUse }: {
+function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onRelink, onUse }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
+  canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
   onRetry: () => void; onRelink: () => void; onUse: () => void
 }) {
+  const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
+  const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
+  const [canonicalContextError, setCanonicalContextError] = useState<string | null>(null)
+  const [canonicalContextRevision, setCanonicalContextRevision] = useState(0)
+  const placementId = providerPlacementId(resource)
+  const placementPath = providerPlacementObservations.placementPath(resource)
+  const alternatePlacements = providerPlacementObservations.alternatePlacements(resource)
+  const placementState = resource.referenceState ?? (resource.detached ? 'detached' : 'current')
+  const canonicalState = resource.canonicalReferenceState
+  const canonicalUnavailable = canonicalState != null && canonicalState !== 'current'
+  useEffect(() => {
+    const controller = new AbortController()
+    setCanonicalContext(null)
+    setCanonicalContextError(null)
+    if (!resource.providerDatasetId || !canonicalSourceBinding || placementState !== 'current' || canonicalUnavailable
+        || resource.lastKnown) return () => controller.abort()
+    void api.workspaceCanonicalDataset(resource.id, { signal: controller.signal }).then((context) => {
+      if (controller.signal.aborted) return
+      if (canonicalSourceBinding && (
+        context.mountId !== canonicalSourceBinding.mountId
+        || context.sourceBindingId !== canonicalSourceBinding.sourceBindingId
+        || context.providerDatasetId !== resource.providerDatasetId
+      )) {
+        setCanonicalContextError('The canonical Source generation changed; retry this placement.')
+        return
+      }
+      setCanonicalContext(context)
+    }).catch((caught) => {
+      if (!controller.signal.aborted) setCanonicalContextError(errorMessage(caught))
+    })
+    return () => controller.abort()
+  }, [
+    resource.id, resource.providerDatasetId, resource.lastKnown, placementState,
+    canonicalUnavailable, canonicalSourceBinding, canonicalContextRevision,
+  ])
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
       <div className="mt-5 grid gap-3 text-[12px]">
         <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Source</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div></div>
-        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Stable identity</div><div className="break-all font-mono text-[11px]">{resource.id}</div></div>
-        {resource.resourceId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Provider resource</div><div className="break-all font-mono text-[11px]">{resource.resourceId}</div></div>}
-        {(resource.lastKnown || resource.referenceState && resource.referenceState !== 'current') && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-          Last-known metadata · {resource.referenceState && resource.referenceState !== 'current' ? resource.referenceState.replace('_', ' ') : 'stale path'}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
+        <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Workspace placement</div><div className="break-all font-mono text-[11px]">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-[11px] text-muted-foreground">{placementPath}</div>}</div>
+        {resource.providerDatasetId && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Canonical dataset</div>
+          <div className="mt-1 grid grid-cols-[auto_1fr] gap-x-2 text-[11px]"><span className="text-muted-foreground">Mount</span><span className="break-all font-mono">{resource.mountId}</span>
+            <span className="text-muted-foreground">Dataset ID</span><span className="break-all font-mono">{resource.providerDatasetId}</span></div>
+        </div>}
+        {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
+          && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading canonical dataset context…</div>}
+        {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
+          && !canonicalSourceBinding && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+            Canonical Source binding is unavailable.
+            <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>
+          </div>}
+        {canonicalContext && <div data-testid="canonical-provider-dataset-context" className="rounded-md border border-border p-2 text-[11px]">
+          <div><span className="text-muted-foreground">Source dataset identity</span><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div></div>
+          <div className="mt-1"><span className="text-muted-foreground">Read mode</span><div>{canonicalContext.readMode === 'exact'
+            ? <>Exact revision · <span className="font-mono">{canonicalContext.revisionId}</span>{canonicalContext.committedAt ? ` · committed ${new Date(canonicalContext.committedAt).toLocaleString()}` : ''}</>
+            : 'Current/latest provider state · not an exact revision'}</div></div>
+          <div className="mt-1"><span className="text-muted-foreground">Canonical columns</span>
+            {canonicalContext.columns.length
+              ? <div className="mt-0.5 grid gap-0.5">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
+                {canonicalContext.columns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
+                  && <div className="text-muted-foreground">{canonicalContext.columns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
+              </div>
+              : <div>No canonical columns were reported.</div>}
+          </div>
+        </div>}
+        {canonicalContextError && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          Canonical dataset context is unavailable. {canonicalContextError}
+          <button type="button" onClick={() => setCanonicalContextRevision((current) => current + 1)} className="ml-2 font-semibold underline">Retry canonical detail</button>
+        </div>}
+        <div className="text-[11px] text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
+        {resource.providerDatasetId && canonicalState && <div className="text-[11px] text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
+        {placementState !== 'current' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          Placement state · {placementState.replace('_', ' ')}{canonicalState === 'current' ? ' · canonical dataset is current' : ''}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
           <div className="mt-2 flex gap-3"><button onClick={onRetry} className="font-semibold underline">Retry</button><button onClick={onRelink} className="font-semibold underline">Relink</button></div>
         </div>}
+        {canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Canonical dataset state · {canonicalState.replace('_', ' ')}. This placement remains distinct for navigation and recovery, but its Source action is unavailable.
+          <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>
+        </div>}
+        {resource.lastKnown && placementState === 'current' && !canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Last-known placement metadata{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
+        {alternatePlacements.length > 0 && <div className="rounded-md border border-border bg-muted/25 p-2 text-[11px] text-muted-foreground"><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1">Only placements already loaded in this Workspace session are shown.</div></div>}
         {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
       </div>
       <div className="mt-auto rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
-        This provider resource is source-only. Using the dataset creates only a local Source; it never writes to the provider.
-        <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown}
+        This provider placement is source-only. Using the dataset creates only a local Source; it never writes to the provider. Other Workspace placements use that same canonical Source.
+        <button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
           className="mt-3 block w-full rounded-md bg-foreground px-3 py-2 font-semibold text-background disabled:opacity-50">Use in canvas</button>
       </div>
     </div>

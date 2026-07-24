@@ -358,8 +358,15 @@ export interface WorkspaceResource {
   mountId?: string | null
   provider?: string | null
   resourceId?: string | null
+  /** Opaque provider occurrence used for Workspace URLs, breadcrumbs, and return navigation. */
+  providerPlacementId?: string | null
+  parentProviderPlacementId?: string | null
+  /** Canonical provider dataset identity; unlike a placement, it is shared by aliases. */
+  providerDatasetId?: string | null
   bindingId?: string | null
   referenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error'
+  /** Availability of the canonical provider dataset, independent from this placement. */
+  canonicalReferenceState?: 'current' | 'offline' | 'permission_lost' | 'detached' | 'provider_error' | null
   lastKnown?: boolean
   lastResolvedAt?: string | null
   /** A local Canvas destination paired with this source-only provider resource. */
@@ -393,6 +400,19 @@ export interface WorkspaceResourceResolution {
   resource: WorkspaceResource | null
   ancestors: WorkspaceResource[]
   source: WorkspaceSourceStatus
+  /** Opaque current Source generation for the resource's canonical provider dataset. */
+  canonicalSourceBinding?: { mountId: string; sourceBindingId: string } | null
+}
+export interface WorkspaceCanonicalDatasetContext {
+  mountId: string
+  sourceBindingId: string
+  providerDatasetId: string
+  /** Placement-independent identity used by the eventual Source admission. */
+  datasetIdentity: string
+  readMode: 'exact' | 'current'
+  revisionId?: string | null
+  committedAt?: string | null
+  columns: ColumnSchema[]
 }
 export interface WorkspaceProviderRelinkResult {
   ok: boolean

@@ -6,8 +6,8 @@ const enabled = process.env.DP_E2E_PROVIDER_ACCEPTANCE === '1'
 const providerRoot = process.env.DP_E2E_PROVIDER_ROOT
 const containerNameA = 'Browser provider collection A'
 const containerNameB = 'Browser provider collection B'
-const datasetNameA = 'Browser provider observations A'
-const datasetNameB = 'Browser provider observations B'
+const datasetNameA = 'Browser provider observations'
+const datasetNameB = 'Browser provider observations'
 
 test.describe('provider Workspace Source acceptance', () => {
   test.skip(!enabled || !providerRoot, 'set DP_E2E_PROVIDER_ACCEPTANCE=1 and DP_E2E_PROVIDER_ROOT')
@@ -50,6 +50,7 @@ test.describe('provider Workspace Source acceptance', () => {
     await container.click()
     const externalPage = await (await externalBrowse).json() as {
       container: { id: string; resourceId?: string; providerMutation?: boolean; localPlacement?: { containerId: string; containerVersion: number } }
+      items: Array<{ id: string; providerPlacementId?: string; providerDatasetId?: string }>
     }
     expect(externalPage.container.resourceId).toBe('browser-collection-a')
     expect(externalPage.container.providerMutation).toBe(false)
@@ -62,6 +63,44 @@ test.describe('provider Workspace Source acceptance', () => {
     await resource.click()
     const detail = page.getByRole('dialog', { name: datasetNameA })
     await expect(detail).toContainText('Source-only mount browser-provider · dp-file-catalog')
+    await expect(detail).toContainText('Workspace placement')
+    await expect(detail).toContainText('Canonical datasetMountbrowser-providerDataset IDbrowser-canonical-observations')
+    const placementAId = externalPage.items.find((item) => item.providerPlacementId === 'browser-observations-a')?.id
+    expect(placementAId).toBeTruthy()
+    const placementA = await page.request.get(`/api/workspace/resources/${encodeURIComponent(placementAId!)}`)
+    expect(placementA.ok()).toBeTruthy()
+    const placementAResolution = await placementA.json() as { canonicalSourceBinding?: { mountId: string; sourceBindingId: string } }
+    const canonicalAResponse = await page.request.get(
+      `/api/workspace/resources/${encodeURIComponent(placementAId!)}/canonical-dataset`,
+    )
+    expect(canonicalAResponse.ok()).toBeTruthy()
+    const canonicalA = await canonicalAResponse.json() as {
+      mountId: string
+      sourceBindingId: string
+      providerDatasetId: string
+      datasetIdentity: string
+      readMode: 'exact' | 'current'
+      revisionId?: string | null
+      columns: Array<{ name: string; type: string }>
+    }
+    expect(canonicalA).toEqual(expect.objectContaining({
+      mountId: 'browser-provider',
+      sourceBindingId: placementAResolution.canonicalSourceBinding?.sourceBindingId,
+      providerDatasetId: 'browser-canonical-observations',
+      datasetIdentity: expect.stringMatching(/^workspace-provider:/),
+      readMode: 'exact',
+      revisionId: 'browser-provider-revision-v1',
+      columns: expect.arrayContaining([
+        expect.objectContaining({ name: 'id', type: 'int64' }),
+        expect.objectContaining({ name: 'value', type: 'string' }),
+      ]),
+    }))
+    expect(JSON.stringify(canonicalA)).not.toContain('observations.csv')
+    expect(JSON.stringify(canonicalA)).not.toContain(resolve(providerRoot!))
+    const canonicalDetail = detail.getByTestId('canonical-provider-dataset-context')
+    await expect(canonicalDetail).toContainText('Exact revision · browser-provider-revision-v1')
+    await expect(canonicalDetail).toContainText('id · int64')
+    await expect(canonicalDetail).toContainText('value · string')
     await detail.getByRole('button', { name: 'Use in canvas' }).click()
 
     const useDialog = page.getByRole('dialog', { name: `Use ${datasetNameA}` })
@@ -101,6 +140,13 @@ test.describe('provider Workspace Source acceptance', () => {
     )
 
     await page.goto('/#/workspace')
+    const search = page.getByRole('textbox', { name: 'Search views, datasets, canvases, and containers' })
+    await search.fill(datasetNameA)
+    await search.press('Enter')
+    const searchResults = page.getByTestId('workspace-search-results')
+    await expect(searchResults.getByText(`Placement path · ${containerNameA} / ${datasetNameA}`, { exact: true })).toBeVisible()
+    await expect(searchResults.getByText(`Placement path · ${containerNameB} / ${datasetNameB}`, { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Clear Workspace search' }).click()
     const duplicateContainer = page.getByRole('button', {
       name: new RegExp(`Open folder ${containerNameB} from Source-only mount browser-provider`),
     })
@@ -109,13 +155,36 @@ test.describe('provider Workspace Source acceptance', () => {
       response.url().includes('/api/workspace/containers/')
       && response.request().method() === 'GET')
     await duplicateContainer.click()
-    await duplicateBrowse
+    const duplicatePage = await (await duplicateBrowse).json() as {
+      items: Array<{ id: string; providerPlacementId?: string }>
+    }
+    const placementBId = duplicatePage.items.find(
+      (item) => item.providerPlacementId === 'browser-observations-b',
+    )?.id
+    expect(placementBId).toBeTruthy()
     const duplicateResource = page.getByRole('button', {
       name: new RegExp(`Open dataset ${datasetNameB} from Source-only mount browser-provider`),
     })
     await expect(duplicateResource).toBeVisible({ timeout: 20_000 })
     await duplicateResource.click()
     const duplicateDetail = page.getByRole('dialog', { name: datasetNameB })
+    await expect(duplicateDetail).toContainText(`Also observed at${containerNameA} / ${datasetNameA}`)
+    const placementBRequest = page.waitForResponse((response) =>
+      decodeURIComponent(new URL(response.url()).pathname.split('/').pop() ?? '') === placementBId
+      && response.request().method() === 'GET')
+    await page.reload()
+    const placementBResponse = await placementBRequest
+    const placementBResolution = await placementBResponse.json() as { canonicalSourceBinding?: { mountId: string; sourceBindingId: string } }
+    expect(placementBResolution.canonicalSourceBinding).toEqual(placementAResolution.canonicalSourceBinding)
+    await expect(page.getByRole('dialog', { name: datasetNameB })).toBeVisible()
+    const canonicalBResponse = await page.request.get(
+      `/api/workspace/resources/${encodeURIComponent(placementBId!)}/canonical-dataset`,
+    )
+    expect(canonicalBResponse.ok()).toBeTruthy()
+    expect(await canonicalBResponse.json()).toEqual(canonicalA)
+    await expect(duplicateDetail.getByTestId('canonical-provider-dataset-context')).toContainText(
+      'Exact revision · browser-provider-revision-v1',
+    )
     await duplicateDetail.getByRole('button', { name: 'Use in canvas' }).click()
     const duplicateUseDialog = page.getByRole('dialog', { name: `Use ${datasetNameB}` })
     const chooseCanvas = duplicateUseDialog.getByRole('button', { name: /^Choose a Canvas/ })
@@ -240,6 +309,39 @@ test.describe('provider Workspace Source acceptance', () => {
     await page.getByTestId('app-menu').click()
     await page.getByText('Back to Workspace', { exact: true }).click()
     await expect(page).toHaveURL(new RegExp(`/\\#/workspace/${encodeURIComponent(externalPage.container.id)}`))
+    expect(writes).toEqual(writesBeforeUnavailableReturn)
+
+    let placementState: 'detached' | 'canonical-offline' = 'detached'
+    await page.route((url) => decodeURIComponent(url.pathname.split('/').pop() ?? '') === placementAId, (route) => {
+      const detached = placementState === 'detached'
+      return route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          resource: {
+            id: placementAId, kind: 'dataset', name: datasetNameA, detached,
+            source: 'provider', mountId: 'browser-provider', provider: 'dp-file-catalog',
+            resourceId: 'browser-observations-a', providerPlacementId: 'browser-observations-a',
+            parentProviderPlacementId: 'browser-collection-a', providerDatasetId: 'browser-canonical-observations',
+            referenceState: detached ? 'detached' : 'current',
+            canonicalReferenceState: detached ? 'current' : 'offline', lastKnown: true,
+            providerMutation: false,
+          },
+          ancestors: [externalPage.container],
+          source: { id: 'mount:browser-provider', kind: 'provider', completeness: 'complete' },
+        }),
+      })
+    })
+    await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
+    await expect(page.getByRole('dialog', { name: datasetNameA })).toContainText(
+      'Placement state · detached · canonical dataset is current',
+    )
+    placementState = 'canonical-offline'
+    await page.goto('/#/workspace')
+    await page.goto(`/#/workspace/${encodeURIComponent(placementAId!)}`)
+    const canonicalUnavailable = page.getByRole('dialog', { name: datasetNameA })
+    await expect(canonicalUnavailable).toContainText('Canonical dataset state · offline')
+    await expect(canonicalUnavailable).toContainText('Placement state · current')
+    await expect(canonicalUnavailable.getByRole('button', { name: 'Use in canvas' })).toBeDisabled()
     expect(writes).toEqual(writesBeforeUnavailableReturn)
     expect(readFileSync(resolve(providerRoot!, 'catalog.json'))).toEqual(providerCatalogBefore)
     expect(readFileSync(resolve(providerRoot!, 'observations.csv'))).toEqual(providerDatasetBefore)

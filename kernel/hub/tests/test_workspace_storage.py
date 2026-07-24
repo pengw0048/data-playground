@@ -932,6 +932,22 @@ def test_provider_dataset_canonical_state_is_shared_across_placement_lifecycle(
         left["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
     right_source = workspace_providers.provider_dataset_source(
         right["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
+    left_context = workspace_providers.provider_dataset_context(
+        left["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
+    right_context = workspace_providers.provider_dataset_context(
+        right["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: exact)
+    assert left_context == right_context
+    assert left_context["readMode"] == "exact"
+    assert left_context["revisionId"] == "fixture-revision-1"
+    assert [(column["name"], column["type"])
+            for column in left_context["columns"]] == [("value", "int64")]
+    assert "canonical-dataset.parquet" not in json.dumps(left_context)
+    current_context = workspace_providers.provider_dataset_context(
+        left["id"], uid=metadb.DEFAULT_USER_ID, resolve_physical=lambda _uri: object())
+    assert current_context["datasetIdentity"] == left_context["datasetIdentity"]
+    assert current_context["readMode"] == "current"
+    assert current_context["revisionId"] is None
+    assert current_context["committedAt"] is None
     left_config, right_config = left_source["data"]["config"], right_source["data"]["config"]
     assert left_config["uri"] == right_config["uri"]
     assert left_config["datasetRef"] == right_config["datasetRef"]
