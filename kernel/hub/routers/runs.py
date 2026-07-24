@@ -62,6 +62,7 @@ from hub.models import (
     EstimateRequest,
     ExactDatasetRef,
     Graph,
+    GraphSchema,
     InputDrift,
     InputDriftRequest,
     InputDriftSource,
@@ -1877,8 +1878,8 @@ def run_full_profile(req: ProfileJobRequest, uid: str = Depends(current_user)) -
     return status
 
 
-@router.post("/graph/schema")
-def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> dict:
+@router.post("/graph/schema", response_model=GraphSchema)
+def graph_schema(req: CompileRequest, uid: str = Depends(current_user)) -> GraphSchema:
     """Per-node, per-output-port metadata columns for editor inspection and suggestions."""
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()

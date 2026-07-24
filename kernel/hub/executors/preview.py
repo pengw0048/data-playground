@@ -12,6 +12,7 @@ from typing import Any
 
 from hub import db, graph as g, paths
 from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.executors.schema import apply_derived_references, derived_schemas_for_engine
 from hub.models import Graph, SampleResult, dataset_ref_identity
 from hub.plugins.adapters import revision_adapter_for_uri
 from hub.sampling import provenance_for_graph
@@ -147,6 +148,14 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
                 # pagination assumes a stable row order; a join/aggregate result is unordered, so pages
                 # over such a node may not be perfectly consistent — acceptable for a bounded preview.
                 rows, cols = engine.rows(node_id, k + 1, offset, selected_port)
+                # Runtime types stay authoritative, while row-reference facts come from the same
+                # derivation used by schema inspection, join analysis, and graph validation.
+                derived = derived_schemas_for_engine(
+                    graph, engine, preview_adapter,
+                    node_builders=node_builders, node_specs=node_specs, runtime=True,
+                    allow_revision_detail=False, target_node_id=node_id,
+                )
+                cols = apply_derived_references(cols, derived.get(node_id))
                 has_more = len(rows) > k
                 target = next((node for node in graph.nodes if node.id == node_id), None)
                 config = target.data.get("config", {}) if target and isinstance(target.data, dict) else {}

@@ -618,7 +618,8 @@ class BuildEngine:
         # a declared output-schema contract on a code op: in schema_only mode, stand in a typed empty
         # relation so its columns (and everything downstream) type WITHOUT running the code. A BYPASSED
         # node is skipped — it passes its input through (handled below), so the declaration doesn't apply.
-        if self.schema_only and not _bypassed(node) and (t in _CODE_KINDS or t in self.node_builders):
+        if self.schema_only and not _bypassed(node) and (
+                t in _CODE_KINDS or t in self.node_builders):
             dsch = declared_schema(node)
             if dsch is not None:
                 return self._stand_in(dsch)
