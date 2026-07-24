@@ -1424,9 +1424,16 @@ class LocalRunner:
         from hub import metadb
         parent_uris = metadb.catalog_lineage_parent_tokens(
             g.all_upstream_publication_uris(graph, node.id))
+        admitted = cfg.get("_admittedWriteIntent")
+        admitted_intent = None
+        if admitted is not None:
+            from hub.models import WriteIntent
+            admitted_intent = WriteIntent.model_validate(admitted)
         from hub.plugins.catalog import lineage_for_output
-        lineage = None if parent_contract else lineage_for_output(
-            graph, status.run_id, node.id)
+        lineage = None if parent_contract else (
+            admitted_intent.provenance.publication
+            if admitted_intent is not None
+            else lineage_for_output(graph, status.run_id, node.id))
         # Bind this destination's credential at the object-store open (the scope cursor already
         # snapshotted it via the run-level binding; this makes the per-write credential explicit).
         os_cfg = destinations.object_store_cred_cfg(self.workspace, spec.destination_id)
@@ -1490,7 +1497,6 @@ class LocalRunner:
             _is_core_managed_local_lance_append_sink(spec, logical_uri, logical_adapter)
             and not parent_contract and type(self.catalog) is InMemoryCatalog
         )
-        admitted = cfg.get("_admittedWriteIntent")
         if admitted is not None and not (managed_local_file or managed_local_lance):
             raise RuntimeError(
                 "managed local write admission reached an incompatible execution sink")

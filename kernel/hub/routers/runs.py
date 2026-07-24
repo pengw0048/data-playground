@@ -54,6 +54,7 @@ from hub.run_outputs import (
 from hub.run_parameters import ParameterResolutionError, resolve_graph_parameters
 from hub.security import current_user
 from hub.settings import settings
+from hub.sqlpolicy import identifier_key
 from hub.storage import ManagedSourceReadError, source_read_scope
 from hub.models import (
     CompilePlan,
@@ -612,6 +613,43 @@ def _runner_supports_managed_local_write_intents(deps, runner) -> bool:
         return False
 
 
+def _durable_row_reference_mappings(
+        schema: list[ColumnSchema], *, output_schema: list[ColumnSchema],
+) -> list[dict[str, str | None]]:
+    """Freeze exact row-reference evidence that the output schema can name unambiguously.
+
+    A field projection is valid only when the schema already carries an exact target and can identify
+    the source key field. Unknown and canonical references remain advisory rather than becoming
+    durable evidence at publication time.
+    """
+    mappings: list[dict[str, str | None]] = []
+    output_names = {identifier_key(column.name) for column in output_schema}
+    for column in schema:
+        if identifier_key(column.name) not in output_names:
+            continue
+        reference = column.row_reference
+        if reference is None or reference.target.kind != "exact":
+            continue
+        keys = reference.key_fields
+        if len(keys) == 1:
+            source_field = keys[0]
+        else:
+            source_field = next(
+                (key for key in keys if identifier_key(key) == identifier_key(column.name)),
+                None,
+            )
+        if source_field is None:
+            continue
+        mappings.append({
+            "source_dataset_id": reference.target.dataset_id,
+            "source_version": reference.target.revision_id,
+            "source_field": source_field,
+            "source_field_id": None,
+            "destination_field": column.name,
+        })
+    return mappings
+
+
 def _resolve_write_sink_or_typed_error(spec, deps) -> str:
     """Resolve a Write sink URI, mapping an unknown/unresolvable destination to a typed 4xx so no run
     claim is ever created for a destination that cannot exist."""
@@ -715,6 +753,7 @@ def _write_admission_for_graph(
             provider=provider_name,
             partitions=partitions,
         )
+    schemas: dict[str, list | None] = {}
     try:
         if direct_local:
             # Prefer an explicit declared upstream schema (external-wait fixtures). Fall back to the
@@ -758,11 +797,24 @@ def _write_admission_for_graph(
 
     run_id = metadb.local_run_submission_id(
         str(uid), str(getattr(graph, "id", "") or "") or None, str(submission_id))
-    lineage = lineage_for_output(graph, run_id, node_id)
+    normalized_schema = [ColumnSchema.model_validate(column) for column in schema]
+    inbound = graph_mod.incoming(graph, node_id)
+    reference_schema = schema
+    if len(inbound) == 1:
+        upstream = graph_mod.node_map(graph).get(inbound[0].source)
+        upstream_schema = schemas.get(inbound[0].source)
+        if upstream_schema is None and upstream is not None:
+            upstream_schema = declared_schema(upstream)
+        if upstream_schema is not None:
+            reference_schema = upstream_schema
+    lineage = lineage_for_output(
+        graph, run_id, node_id,
+        field_mappings=_durable_row_reference_mappings(
+            [ColumnSchema.model_validate(column) for column in reference_schema],
+            output_schema=normalized_schema))
     parents = metadb.catalog_lineage_parent_tokens(
         graph_mod.all_upstream_publication_uris(graph, node_id))
     provenance = WriteProvenance(publication=lineage, parents=parents)
-    normalized_schema = [ColumnSchema.model_validate(column) for column in schema]
     if lance_candidate:
         if lance_binding is None or lance_table is None:  # narrowed above; keeps typing explicit
             raise RuntimeError("managed local Lance admission lost its catalog binding")
@@ -1218,7 +1270,7 @@ def _require_graph_read_access(graph, uid: str) -> tuple[str | None, str | None]
 def _invalid_graph(graph, deps, target_node_id: str | None = None) -> tuple[str, bool] | None:
     """Compatibility wrapper around the shared graph-ingress validator."""
     return graph_mod.validation_error(
-        graph, deps.node_specs, deps.node_builders, target_node_id)
+        graph, getattr(deps, "node_specs", {}), getattr(deps, "node_builders", {}), target_node_id)
 
 
 def _reject_invalid(graph, deps, target_node_id: str | None = None) -> None:
@@ -1238,12 +1290,19 @@ def _reject_row_reference_target_mismatch(graph: Graph, deps, target_node_id: st
     from hub import relationships
 
     scoped = _target_execution_graph(graph, target_node_id)
+    configured_joins = [
+        node for node in scoped.nodes
+        if node.type == "join" and relationships._configured_join_key(node) is not None
+    ]
+    # An unconfigured Join only offers advisory suggestions. Do not turn source-free external
+    # waits or backend-capability graphs into a catalog/schema dependency merely to find no
+    # configured target contradiction.
+    if not configured_joins:
+        return
     columns = schema_for_graph(
         scoped, deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
         storage=deps.storage)
-    for node in scoped.nodes:
-        if node.type != "join":
-            continue
+    for node in configured_joins:
         analysis = relationships.analyze_join(
             scoped, node.id, columns, deps.catalog, deps.resolve_adapter, storage=deps.storage)
         if analysis.blocking_code:
@@ -2434,8 +2493,9 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
                 _bind_local_run_manifest(graph, input_manifest, deps, target_node_id)
 
         # Retained-manifest and legacy durable response-loss adoption above remain dependency-free.
-        # Only fresh work consults current catalog/schema facts before any allocation.
-        graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+        # Only fresh work with an executable Source consults the current catalog before allocation.
+        if source_nodes:
+            graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
         _reject_invalid(graph, deps, target_node_id)
         _reject_row_reference_target_mismatch(graph, deps, target_node_id)
 
@@ -2593,7 +2653,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         status = metadb.durable_task(task["task_id"], include_admission=False)
         assert status is not None
         return RunStatus.model_validate(status["status_doc"]), None
-    if fresh_local_admission:
+    if fresh_local_admission and _local_run_source_nodes(graph, target_node_id):
         # A retained exact admission already validated and canonicalized this logical graph before
         # the response was lost; replay must not regain a dependency on the mutable catalog alias.
         graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)

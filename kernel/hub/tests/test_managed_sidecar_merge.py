@@ -10,13 +10,13 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import func, select, update
 
-from hub import managed_sidecar_merge as managed_sidecar_merge_module, metadb
+from hub import managed_sidecar_merge as managed_sidecar_merge_module, metadb, relationships
 from hub.managed_sidecar_merge import (
     ManagedSidecarMergeError, ManagedSidecarMergeIntentV1, ManagedSidecarMergeRequestV1,
     admit_managed_sidecar_merge, prepare_managed_sidecar_merge,
 )
 from hub.merge_columns import MergeColumnRuleV1
-from hub.models import ExactDatasetRef, LineagePublication
+from hub.models import ColumnSchema, ExactDatasetRef, Graph, LineagePublication
 from hub.plugins.adapters import DuckDBAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.storage import LocalStorage
@@ -95,6 +95,97 @@ def _publish_sidecar(
                 destination_field_hash=hashlib.sha256(field.encode()).hexdigest(),
                 created_at=datetime.now(timezone.utc)))
     return sidecar
+
+
+def test_managed_local_join_diagnosis_uses_exact_revision_ledger_identity(
+        local_catalog, tmp_path):
+    """A managed URI's CatalogEntry version is not its durable exact revision identity."""
+    storage, catalog = local_catalog
+    base = _publish(storage, catalog, str(tmp_path / "base.parquet"), "base", pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+    }))
+    sidecar = _publish(storage, catalog, str(tmp_path / "sidecar.parquet"), "sidecar", pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+    }))
+    base_binding = metadb.catalog_revision_binding(base.dataset_id)
+    sidecar_binding = metadb.catalog_revision_binding(sidecar.dataset_id)
+    assert base_binding is not None and sidecar_binding is not None
+    base_table = catalog.get_table(base_binding["uri"])
+    assert (base_table.registration_id, base_table.version) != (
+        base.dataset_id, base.revision_id)
+
+    graph = Graph.model_validate({
+        "id": "managed-local-row-reference", "version": 1,
+        "nodes": [
+            {"id": "sidecar", "type": "source", "data": {"config": {
+                "uri": sidecar_binding["uri"]}}},
+            {"id": "base", "type": "source", "data": {"config": {
+                "uri": base_binding["uri"]}}},
+            {"id": "join", "type": "join", "data": {"config": {
+                "condition": "a.id = b.id"}}},
+        ],
+        "edges": [
+            {"id": "sidecar-join", "source": "sidecar", "target": "join", "targetHandle": "a"},
+            {"id": "base-join", "source": "base", "target": "join", "targetHandle": "b"},
+        ],
+    })
+
+    def columns(target: ExactDatasetRef):
+        return {
+            "sidecar": [ColumnSchema.model_validate({
+                "name": "id", "type": "int64", "rowReference": {
+                    "target": target.model_dump(by_alias=True), "keyFields": ["id"],
+                    "semanticType": "row", "provenance": "lineage",
+                }})],
+            "base": [ColumnSchema(name="id", type="int64")],
+        }
+
+    correct = relationships.analyze_join(
+        graph, "join", columns(base), catalog, lambda _uri: DuckDBAdapter(), storage=storage)
+    assert correct.blocking_code is None
+    assert correct.configured_row_reference[0].status == "compatible"
+
+    wrong = relationships.analyze_join(
+        graph, "join", columns(ExactDatasetRef(
+            kind="exact", dataset_id="wrong-base", revision_id=base.revision_id)),
+        catalog, lambda _uri: DuckDBAdapter(), storage=storage)
+    assert wrong.blocking_code == "row_reference_target_mismatch"
+    assert wrong.configured_row_reference[0].status == "conflict"
+
+
+def test_row_reference_identity_fails_closed_without_current_managed_ledger(
+        local_catalog, tmp_path):
+    """A retained old revision must not be mixed with a managed catalog registration id."""
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "managed.parquet")
+    old = _publish(storage, catalog, logical_uri, "managed", pa.table({"id": [1]}))
+    current = _publish(storage, catalog, logical_uri, "managed", pa.table({"id": [2]}))
+    binding = metadb.catalog_revision_binding(current.dataset_id)
+    assert binding is not None
+    with metadb.session() as session:
+        assert session.get(metadb.ManagedLocalFileRevision, old.revision_id) is not None
+        current_revision = session.get(metadb.ManagedLocalFileRevision, current.revision_id)
+        assert current_revision is not None
+        session.delete(current_revision)
+
+    graph = Graph.model_validate({
+        "id": "managed-ledger-gap", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "data": {"config": {
+            "uri": binding["uri"]}}}],
+        "edges": [],
+    })
+    assert relationships._input_identity(graph, "source", catalog) is None
+
+    ordinary_uri = str(tmp_path / "ordinary.parquet")
+    pq.write_table(pa.table({"id": [1]}), ordinary_uri)
+    catalog._add(name="ordinary", uri=ordinary_uri, strict_probe=True)
+    ordinary = catalog.get_table(ordinary_uri)
+    ordinary_graph = graph.model_copy(deep=True)
+    ordinary_graph.nodes[0].data["config"]["uri"] = ordinary_uri
+    identity = relationships._input_identity(ordinary_graph, "source", catalog)
+    assert identity is not None
+    assert (identity.dataset_id, identity.revision_id) == (
+        ordinary.registration_id, ordinary.version)
 
 
 def test_admit_real_parquet_add_replace_reordered_composite(local_catalog, tmp_path):

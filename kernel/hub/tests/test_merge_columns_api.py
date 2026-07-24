@@ -92,21 +92,39 @@ def _managed_sidecar_request(tmp_path, monkeypatch, *, submission_id: str | None
     deps = Deps(str(tmp_path / "workspace"), str(tmp_path / "data"), maintain_storage=False)
     monkeypatch.setattr(api, "get_deps", lambda: deps)
 
-    def publish(logical: str, name: str, table: pa.Table):
+    def publish(
+            logical: str, name: str, table: pa.Table, *, parents: list[str] | None = None,
+            lineage: LineagePublication | None = None):
         artifact = deps.storage.begin_result(logical, f"managed-sidecar:{name}")
         pq.write_table(table, artifact)
         deps.storage.commit_result(artifact, f"managed-sidecar:{name}")
         row = deps.catalog.publish_managed_local_file_output(
-            name=name, logical_uri=logical, artifact_uri=artifact)
+            name=name, logical_uri=logical, artifact_uri=artifact,
+            parents=parents, lineage=lineage)
         assert deps.storage.release_result(artifact, f"managed-sidecar:{name}")
-        return {"kind": "exact", "datasetId": row["dataset_id"], "revisionId": row["revision_id"]}
+        return row
 
-    base = publish(deps.storage.output_uri("base", ".parquet"), "base", pa.table({
+    base_publication = publish(deps.storage.output_uri("base", ".parquet"), "base", pa.table({
         "id": pa.array([1, 2], type=pa.int32()), "value": [10, 20], "keep": ["a", "b"],
     }))
-    sidecar = publish(deps.storage.output_uri("sidecar", ".parquet"), "sidecar", pa.table({
-        "id": pa.array([2, 1], type=pa.int32()), "replacement": [200, 100], "added": [2, 1],
-    }))
+    base = {"kind": "exact", "datasetId": base_publication["dataset_id"],
+            "revisionId": base_publication["revision_id"]}
+    sidecar_publication = publish(
+        deps.storage.output_uri("sidecar", ".parquet"), "sidecar", pa.table({
+            "id": pa.array([2, 1], type=pa.int32()), "replacement": [200, 100], "added": [2, 1],
+        }),
+        parents=[base_publication["table"].uri],
+        lineage=LineagePublication(
+            idempotency_key=f"managed-sidecar-fixture:{uuid.uuid4().hex}", provenance="manual",
+            field_mappings=[{
+                "source_dataset_id": base_publication["dataset_id"],
+                "source_version": base_publication["revision_id"],
+                "source_field": "id", "source_field_id": None, "destination_field": "id",
+            }],
+        ),
+    )
+    sidecar = {"kind": "exact", "datasetId": sidecar_publication["dataset_id"],
+               "revisionId": sidecar_publication["revision_id"]}
     with metadb.session() as session:
         if session.get(metadb.User, "owner") is None:
             session.add(metadb.User(id="owner", name="Owner"))

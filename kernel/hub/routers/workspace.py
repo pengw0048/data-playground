@@ -33,6 +33,7 @@ from hub.models import (
     Graph,
     RunHistoryRecord,
     RunStatus,
+    WorkspaceAddDatasetResult,
     WorkspaceRunPage,
     WorkspaceBrowsePage,
     WorkspaceResourceResolution,
@@ -415,6 +416,7 @@ class WorkspaceAddDatasetBody(_StrictAuthBody):
     dataset_ids: list[str] = Field(default_factory=list, max_length=50)
     provider_dataset_refs: list[str] = Field(default_factory=list, max_length=1)
     expected_canvas_version: int = Field(ge=1)
+    request_id: str = Field(min_length=1, max_length=128)
 
     @model_validator(mode="after")
     def _bounded_dataset_selection(self) -> "WorkspaceAddDatasetBody":
@@ -833,12 +835,23 @@ def create_workspace_canvas(body: WorkspaceCreateCanvasBody,
         _provider_dataset_action_error(exc)
 
 
-@router.post("/workspace/canvases/{canvas_id}/datasets")
+@router.post("/workspace/canvases/{canvas_id}/datasets", response_model=WorkspaceAddDatasetResult)
 async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddDatasetBody,
                                           uid: str = Depends(current_user)) -> dict:
     """Add one exact local dataset to one explicitly named editable canvas."""
     from hub.main import _broadcast_external_edit, _idle_collab_room_edit
     try:
+        request_intent = {
+            "canvasId": canvas_id,
+            "expectedCanvasVersion": body.expected_canvas_version,
+            "datasetIds": body.dataset_ids,
+            "providerDatasetRefs": body.provider_dataset_refs,
+        }
+        replay = await run_in_threadpool(
+            metadb.workspace_canvas_dataset_add_replay,
+            uid=uid, request_id=str(body.request_id), intent=request_intent)
+        if replay is not None:
+            return replay
         provider_sources = await run_in_threadpool(
             _provider_dataset_sources, body.provider_dataset_refs, uid)
     except (KeyError, PermissionError, ValueError,
@@ -855,12 +868,14 @@ async def add_workspace_dataset_to_canvas(canvas_id: str, body: WorkspaceAddData
                 metadb.workspace_add_datasets_action,
                 uid=uid, canvas_id=canvas_id,
                 expected_canvas_version=body.expected_canvas_version,
-                dataset_ids=body.dataset_ids, provider_sources=provider_sources)
+                dataset_ids=body.dataset_ids, provider_sources=provider_sources,
+                request_id=str(body.request_id), request_intent=request_intent)
         except (KeyError, PermissionError, metadb.WorkspaceVersionConflict, ValueError) as exc:
             _workspace_action_error(exc)
     # This is an out-of-band document edit, like MCP. Nudge any currently open collab room to refetch
     # the committed snapshot so a stale tab cannot later autosave over the appended source.
-    await _broadcast_external_edit(canvas_id)
+    if result["changed"]:
+        await _broadcast_external_edit(canvas_id)
     return result
 
 

@@ -264,7 +264,7 @@ export const api = {
     req<WorkspaceCreateCanvasResult>('/workspace/canvases', {
       method: 'POST', body: JSON.stringify(body),
     }),
-  workspaceAddDatasets: (canvasId: string, body: { datasetIds?: string[]; providerDatasetRefs?: string[]; expectedCanvasVersion: number }) =>
+  workspaceAddDatasets: (canvasId: string, body: { datasetIds?: string[]; providerDatasetRefs?: string[]; expectedCanvasVersion: number; requestId: string }) =>
     req<WorkspaceAddDatasetResult>(`/workspace/canvases/${encodeURIComponent(canvasId)}/datasets`, {
       method: 'POST', body: JSON.stringify(body),
     }),

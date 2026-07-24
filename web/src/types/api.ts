@@ -425,6 +425,9 @@ export interface WorkspaceAddDatasetResult {
   ok: boolean
   id: string
   version: number
+  changed: boolean
+  alreadyPresent: boolean
+  addedCount: number
 }
 export interface CatalogUnregisterResult {
   mode: 'best_effort'

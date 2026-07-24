@@ -150,6 +150,90 @@ def test_retained_durable_replay_adopts_before_row_reference_diagnosis(monkeypat
     assert owner is None
 
 
+def test_fresh_source_free_admission_never_requires_catalog_or_adapter(monkeypatch):
+    from hub.routers import runs
+
+    graph = Graph.model_validate({
+        "id": "source-free-admission", "version": 1,
+        "nodes": [
+            {"id": "wait", "type": "external_wait_fixture", "data": {"config": {}}},
+            {"id": "write", "type": "write", "data": {"config": {}}},
+        ],
+        "edges": [{"id": "wait-write", "source": "wait", "target": "write"}],
+    })
+
+    class ReachedFreshAdmission(Exception):
+        pass
+
+    monkeypatch.setattr(runs.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(runs, "_require_graph_read_access", lambda *_args: None)
+    monkeypatch.setattr(runs.metadb, "canvas_exists", lambda *_args: False)
+    monkeypatch.setattr(runs, "_resolve_parameters", lambda graph, *_args, **_kwargs: graph)
+    monkeypatch.setattr(runs, "_reject_invalid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runs.graph_mod, "resolve_source_refs",
+        lambda *_args: pytest.fail("source-free admission must not resolve catalog refs"))
+    monkeypatch.setattr(
+        runs, "_reject_row_reference_target_mismatch",
+        lambda *_args: (_ for _ in ()).throw(ReachedFreshAdmission()))
+
+    with pytest.raises(ReachedFreshAdmission):
+        runs.start_run(SimpleNamespace(), graph, "write", "owner", confirmed=True)
+
+
+def test_fresh_source_admission_still_resolves_catalog_refs(monkeypatch):
+    from hub.routers import runs
+
+    graph = Graph.model_validate({
+        "id": "source-admission", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "data": {"config": {"uri": "catalog-name"}}},
+            {"id": "write", "type": "write", "data": {"config": {}}},
+        ],
+        "edges": [{"id": "source-write", "source": "source", "target": "write"}],
+    })
+
+    class ReachedFreshAdmission(Exception):
+        pass
+
+    resolved: list[str] = []
+    monkeypatch.setattr(runs.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(runs, "_require_graph_read_access", lambda *_args: None)
+    monkeypatch.setattr(runs.metadb, "canvas_exists", lambda *_args: False)
+    monkeypatch.setattr(runs, "_resolve_parameters", lambda graph, *_args, **_kwargs: graph)
+    monkeypatch.setattr(runs, "_reject_invalid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runs.graph_mod, "resolve_source_refs",
+        lambda _graph, resolver: resolved.append(resolver("catalog-name")))
+    monkeypatch.setattr(
+        runs, "_reject_row_reference_target_mismatch",
+        lambda *_args: (_ for _ in ()).throw(ReachedFreshAdmission()))
+
+    with pytest.raises(ReachedFreshAdmission):
+        runs.start_run(
+            SimpleNamespace(catalog=SimpleNamespace(resolve_ref=lambda value: f"resolved:{value}")),
+            graph, "write", "owner", confirmed=True)
+    assert resolved == ["resolved:catalog-name"]
+
+
+def test_unconfigured_join_does_not_require_row_reference_schema_dependencies(monkeypatch):
+    from hub.routers import runs
+
+    graph = Graph.model_validate({
+        "id": "unconfigured-join", "version": 1,
+        "nodes": [
+            {"id": "join", "type": "join", "data": {"config": {}}},
+        ],
+        "edges": [],
+    })
+    monkeypatch.setattr(
+        runs, "schema_for_graph",
+        lambda *_args, **_kwargs: pytest.fail("unconfigured Join must not inspect schema"))
+
+    runs._reject_row_reference_target_mismatch(
+        graph, SimpleNamespace(), "join")
+
+
 def test_start_run_mismatch_gate_precedes_every_allocation(monkeypatch):
     from hub.api_errors import APIError, APIErrorCode
     from hub import relationships

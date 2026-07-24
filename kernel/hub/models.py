@@ -1190,6 +1190,15 @@ class WorkspaceProviderRelinkResult(Wire):
     previous_resource: WorkspaceResource
 
 
+class WorkspaceAddDatasetResult(Wire):
+    ok: bool = True
+    id: str
+    version: int
+    changed: bool
+    already_present: bool
+    added_count: int
+
+
 class WorkspaceSearchSourceStatus(WorkspaceSourceStatus):
     freshness: Literal["current", "stale", "unknown"]
     search_mode: Literal["native", "fallback", "unsupported"]

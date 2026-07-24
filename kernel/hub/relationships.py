@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from itertools import combinations
 
-from hub import db
+from hub import db, metadb
 from hub import graph as g
 from hub.grain import grain_of
 from hub.models import (
@@ -388,6 +388,25 @@ def _input_identity(graph: Graph, node_id: str, catalog) -> RowReferenceInputIde
         table = catalog.get_table(source_uri)
     except (KeyError, ValueError):
         return None
+    # A managed-local current URI is a mutable catalog projection. Its durable identity is owned by
+    # the revision ledger, so never compare a row reference to CatalogEntry's registration/version.
+    # If either ledger fact is unavailable, retain an unknown identity rather than guessing from the
+    # current catalog row.
+    table_uri = getattr(table, "uri", None)
+    if not isinstance(table_uri, str) or not table_uri:
+        return input_identity(dataset_id=table.registration_id, revision_id=table.version)
+    logical_id = metadb.catalog_managed_logical_id_for_uri(table_uri)
+    if logical_id is not None:
+        # A managed current URI is valid only while the exact current ledger row remains present.
+        # In particular, do not combine this logical id with an older retained revision.
+        head = metadb.catalog_managed_local_head_for_dataset(logical_id)
+        if (head is None or head.get("dataset_id") != logical_id
+                or head.get("artifact_uri") != table_uri):
+            return None
+        revision_id = head.get("revision_id")
+        if not isinstance(revision_id, str):
+            return None
+        return input_identity(dataset_id=logical_id, revision_id=revision_id)
     # Ordinary catalog Sources execute the current URI registration.  A client-carried DatasetRef
     # cannot rebind that URI, and transient table ids/names/URIs are not durable identities.
     return input_identity(dataset_id=table.registration_id, revision_id=table.version)

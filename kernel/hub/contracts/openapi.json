@@ -10855,12 +10855,57 @@
             "maxItems": 1,
             "title": "Providerdatasetrefs",
             "type": "array"
+          },
+          "requestId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Requestid",
+            "type": "string"
           }
         },
         "required": [
-          "expectedCanvasVersion"
+          "expectedCanvasVersion",
+          "requestId"
         ],
         "title": "WorkspaceAddDatasetBody",
+        "type": "object"
+      },
+      "WorkspaceAddDatasetResult": {
+        "properties": {
+          "addedCount": {
+            "title": "Addedcount",
+            "type": "integer"
+          },
+          "alreadyPresent": {
+            "title": "Alreadypresent",
+            "type": "boolean"
+          },
+          "changed": {
+            "title": "Changed",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "ok": {
+            "default": true,
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "changed",
+          "alreadyPresent",
+          "addedCount"
+        ],
+        "title": "WorkspaceAddDatasetResult",
         "type": "object"
       },
       "WorkspaceAddTransformBody": {
@@ -25370,9 +25415,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Add Workspace Dataset To Canvas Api Workspace Canvases  Canvas Id  Datasets Post",
-                  "type": "object"
+                  "$ref": "#/components/schemas/WorkspaceAddDatasetResult"
                 }
               }
             },
