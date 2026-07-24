@@ -525,6 +525,34 @@ class Playground:
             "capabilities": {"revisions": self._revision_capabilities(table)},
         }
 
+    def related_datasets(self, args: dict) -> dict:
+        """The same bounded candidate service used by HTTP and the Canvas picker."""
+        unknown = sorted(set(args) - {"source", "text", "folder", "limit"})
+        if unknown:
+            raise ToolError(f"unknown related_datasets argument '{unknown[0]}'")
+        source = self._req(args, "source")
+        if not isinstance(source, dict):
+            raise ToolError("source must be a stable related-dataset identity object")
+        from hub.models import RelatedDatasetIdentity
+        try:
+            identity = RelatedDatasetIdentity.model_validate(source)
+        except ValueError as exc:
+            raise ToolError(f"invalid related dataset source: {exc}") from exc
+        text = self._bounded_text(
+            args.get("text"), "text", maximum_bytes=_CATALOG_TEXT_MAX_BYTES)
+        folder = self._bounded_text(
+            args.get("folder"), "folder", maximum_bytes=_CATALOG_FOLDER_MAX_BYTES)
+        limit = self._bounded_int(args, "limit", default=10, minimum=1, maximum=20)
+        from hub.related_datasets import related_datasets
+        try:
+            page = related_datasets(
+                self.deps.catalog, self.deps.resolve_adapter, self.deps.storage,
+                identity, q=text, folder=folder, limit=limit,
+            )
+        except Exception as exc:
+            return _catalog_failure(exc)
+        return {"state": "available", **page.model_dump(by_alias=True)}
+
     def _graph_table(self, uri: str, cache: dict[str, Any]):
         if uri in cache:
             return cache[uri], None
@@ -1102,6 +1130,34 @@ def _tool_specs(pg: Playground) -> list[dict]:
                  "type": "integer", "minimum": 1, "maximum": _CATALOG_RELATIONSHIP_LIMIT_MAX,
              },
          }, ["dataset"])},
+        {"name": "related_datasets", "handler": pg.related_datasets,
+         "description": "Read one bounded, evidence-ranked set of datasets related to a selected "
+                        "dataset. Declared relationships lead typed row references and inferred schema "
+                        "matches; only returned candidates have cardinality measured. Read-only.",
+         "inputSchema": _schema({
+             "source": {
+                 "type": "object", "additionalProperties": False,
+                 "description": "stable selected Source identity; never a name, URI, or transient table id",
+                 "properties": {
+                     "kind": {"type": "string", "enum": ["local", "provider"]},
+                     "registrationId": {**_STR, "minLength": 1, "maxLength": 512},
+                     "mountId": {**_STR, "minLength": 1, "maxLength": 128},
+                     "sourceBindingId": {**_STR, "minLength": 1, "maxLength": 128},
+                     "revisionMode": {"type": "string", "enum": ["current", "exact"]},
+                     "revisionId": {**_STR, "minLength": 1, "maxLength": 256},
+                 },
+                 "required": ["kind", "revisionMode"],
+             },
+             "text": {
+                 **_STR, "maxLength": _CATALOG_TEXT_MAX_BYTES,
+                 "description": "optional current search refinement",
+             },
+             "folder": {
+                 **_STR, "maxLength": _CATALOG_FOLDER_MAX_BYTES,
+                 "description": "optional current folder subtree",
+             },
+             "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+         }, ["source"])},
         {"name": "get_relationship_graph", "handler": pg.get_relationship_graph,
          "description": "Read declared catalog relationships around one dataset or one folder, bounded by "
                         "maxHops, maxNodes, and maxEdges. truncated:true means topology was omitted.",

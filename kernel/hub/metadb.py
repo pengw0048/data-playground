@@ -1681,6 +1681,20 @@ class CatalogRelationship(Base):
     doc: Mapped[str] = mapped_column(Text)
 
 
+class CatalogRelationshipEndpoint(Base):
+    """Indexed endpoint projection for bounded incident relationship reads.
+
+    Relationship documents remain the canonical declaration, while this tiny projection makes
+    ``relationships(uri)`` proportional to one dataset's incident edges rather than the catalog's
+    complete relationship history.  It deliberately indexes catalog keys only; it is not a global
+    entity-resolution index.
+    """
+    __tablename__ = "catalog_relationship_endpoints"
+    rel_key: Mapped[str] = mapped_column(
+        String, ForeignKey("catalog_relationships.rel_key", ondelete="CASCADE"), primary_key=True)
+    catalog_key: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+
+
 class CatalogDeclaredKey(Base):
     """An owner-declared primary key, ONE ROW per stable catalog key (columns as JSON) — same
     per-row isolation as CatalogRelationship (no shared-blob lost update)."""
@@ -3787,7 +3801,10 @@ def _workspace_dataset_source_in_session(s, dataset_id: str) -> tuple[CatalogEnt
         "data": {
             "title": entry.name or "dataset",
             "status": "draft",
-            "config": {"uri": entry.uri, "tableId": catalog_doc.get("id") or entry.tbl_id},
+            "config": {
+                "uri": entry.uri, "tableId": catalog_doc.get("id") or entry.tbl_id,
+                "registrationId": entry.registration_id,
+            },
         },
     }
 
@@ -4112,6 +4129,155 @@ def workspace_add_datasets_action(*, uid: str, canvas_id: str,
             ))
             s.flush()
         return result
+
+
+def workspace_apply_related_join_action(
+        *, uid: str, canvas_id: str, expected_canvas_version: int, source_node_id: str,
+        join_node_id: str | None, expected_source_binding: dict, candidate_source: dict,
+        source_identity: dict, candidate_identity: dict, candidate_name: str, how: str,
+        join_config: dict) -> dict:
+    """One final Canvas CAS for the explicit related-data Join flow.
+
+    Candidate discovery/review is read-only. This function is the sole mutation boundary and locks
+    the Canvas before checking the reviewed source, optional empty Join input, and version. Any
+    conflict raises before snapshot/version/node/edge mutation.
+    """
+    if how not in {"inner", "left", "right", "outer"}:
+        raise ValueError("invalid Join type")
+
+    def config_revision_id(config: dict | None) -> str | None:
+        ref = config.get("datasetRef") if isinstance(config, dict) else None
+        if not isinstance(ref, dict):
+            return None
+        if ref.get("kind") == "exact":
+            value = ref.get("revisionId")
+        elif ref.get("kind") == "as_of":
+            resolved = ref.get("resolved")
+            value = resolved.get("revisionId") if isinstance(resolved, dict) else None
+        else:
+            value = None
+        return value if isinstance(value, str) and value else None
+
+    def fence(identity: dict, config: dict | None = None) -> None:
+        """Recheck only durable canonical identity/revision facts inside the Canvas transaction."""
+        kind = identity.get("kind")
+        if kind == "local":
+            registration_id = identity.get("registrationId")
+            if not isinstance(registration_id, str) or not registration_id:
+                raise WorkspaceVersionConflict("local related dataset identity is invalid")
+            entry = s.scalar(select(CatalogEntry).where(
+                CatalogEntry.registration_id == registration_id).limit(1).with_for_update())
+            if entry is None or (config is not None and config.get("registrationId") != registration_id):
+                raise WorkspaceVersionConflict("related local dataset changed after review")
+            if identity.get("revisionMode") == "exact":
+                revision_id = identity.get("revisionId")
+                if not isinstance(revision_id, str) or not revision_id:
+                    raise WorkspaceVersionConflict("related exact revision is invalid")
+                # Core-owned revisions have a durable ledger fence. Other adapters were opened
+                # before this transaction; their canonical registration must still be current here.
+                if entry.logical_id:
+                    revision = s.get(ManagedLocalFileRevision, revision_id, with_for_update=True)
+                    if revision is None or revision.logical_id != entry.logical_id:
+                        raise WorkspaceVersionConflict("related exact revision is unavailable")
+            return
+        if kind == "provider":
+            mount_id, binding_id = identity.get("mountId"), identity.get("sourceBindingId")
+            if not isinstance(mount_id, str) or not isinstance(binding_id, str):
+                raise WorkspaceVersionConflict("provider related dataset identity is invalid")
+            row = s.scalar(select(WorkspaceProviderDataset).where(
+                WorkspaceProviderDataset.mount_id == mount_id,
+                WorkspaceProviderDataset.source_binding_id == binding_id,
+            ).limit(1).with_for_update())
+            if row is None or row.state != "current" or row.uri is None or row.columns_doc is None:
+                raise WorkspaceVersionConflict("related provider dataset binding is unavailable")
+            if config is not None and (config.get("providerMountId") != mount_id
+                                       or config.get("providerSourceBindingId") != binding_id):
+                raise WorkspaceVersionConflict("related provider Source changed after review")
+            if identity.get("revisionMode") == "exact":
+                revision_id = identity.get("revisionId")
+                if (not isinstance(revision_id, str)
+                        or config_revision_id(config) != revision_id):
+                    raise WorkspaceVersionConflict("related provider exact revision changed after review")
+            return
+        raise WorkspaceVersionConflict("related dataset identity is invalid")
+
+    with _workspace_write_session() as s:
+        canvas = s.get(Canvas, canvas_id, with_for_update=True)
+        if canvas is None:
+            raise KeyError(f"canvas '{canvas_id}' not found")
+        if _workspace_canvas_role_in_session(s, canvas, uid) not in ("owner", "editor"):
+            raise PermissionError("you don't have edit access to this canvas")
+        if canvas.version != expected_canvas_version:
+            raise WorkspaceVersionConflict(
+                f"canvas '{canvas_id}' changed from expected version {expected_canvas_version}")
+        try:
+            doc = json.loads(canvas.doc)
+            nodes = doc["nodes"]
+            edges = doc["edges"]
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ValueError(f"canvas '{canvas_id}' has invalid content") from exc
+        if not isinstance(nodes, list) or not isinstance(edges, list):
+            raise ValueError(f"canvas '{canvas_id}' has invalid content")
+        source = next((node for node in nodes if isinstance(node, dict)
+                       and node.get("id") == source_node_id and node.get("type") == "source"), None)
+        source_config = ((source or {}).get("data") or {}).get("config")
+        if not isinstance(source_config, dict) or any(
+                source_config.get(key) != value for key, value in expected_source_binding.items()):
+            raise WorkspaceVersionConflict("selected Source binding changed after review")
+        fence(source_identity, source_config)
+        fence(candidate_identity, candidate_source)
+        suffix = uuid.uuid4().hex[:12]
+        source_id = f"source_related_{suffix}"
+        sx = float((source.get("position") or {}).get("x", 0))
+        sy = float((source.get("position") or {}).get("y", 0))
+        new_source = {
+            "id": source_id, "type": "source", "position": {"x": sx, "y": sy + 220},
+            "data": {"title": candidate_name, "status": "draft", "config": candidate_source,
+                     "history": []},
+        }
+        if join_node_id is None:
+            join_id = f"join_related_{suffix}"
+            new_join = {
+                "id": join_id, "type": "join", "position": {"x": sx + 360, "y": sy + 110},
+                "data": {"title": f"Join {((source.get('data') or {}).get('title') or 'source')} with {candidate_name}",
+                         "status": "draft", "config": {"how": how, **join_config}, "history": []},
+            }
+            new_edges = [
+                {"id": f"edge_related_left_{suffix}", "source": source_node_id, "target": join_id,
+                 "sourceHandle": "out", "targetHandle": "a", "data": {"wire": "dataset"}},
+                {"id": f"edge_related_right_{suffix}", "source": source_id, "target": join_id,
+                 "sourceHandle": "out", "targetHandle": "b", "data": {"wire": "dataset"}},
+            ]
+            nodes.extend([new_source, new_join])
+        else:
+            join = next((node for node in nodes if isinstance(node, dict)
+                         and node.get("id") == join_node_id and node.get("type") == "join"), None)
+            incoming = [edge for edge in edges if isinstance(edge, dict) and edge.get("target") == join_node_id]
+            if (join is None or len(incoming) != 1 or incoming[0].get("source") != source_node_id
+                    or incoming[0].get("targetHandle") not in {"a", "b"}):
+                raise WorkspaceVersionConflict("Join input changed after review")
+            join_id = join_node_id
+            occupied = incoming[0]["targetHandle"]
+            empty = "a" if occupied == "b" else "b"
+            new_source["position"] = {"x": float((join.get("position") or {}).get("x", 0)) - 300,
+                                      "y": float((join.get("position") or {}).get("y", 0)) + 210}
+            join_data = join.setdefault("data", {})
+            old_config = join_data.get("config") if isinstance(join_data.get("config"), dict) else {}
+            join_data["config"] = {**old_config, "how": how, **join_config}
+            join_data["status"] = "draft"
+            nodes.append(new_source)
+            new_edges = [{"id": f"edge_related_right_{suffix}", "source": source_id, "target": join_id,
+                          "sourceHandle": "out", "targetHandle": empty, "data": {"wire": "dataset"}}]
+        edges.extend(new_edges)
+        _snapshot_canvas_in_session(s, canvas, canvas.doc, canvas.version, author_id=uid,
+                                    label="before related-data Join")
+        canvas.version += 1
+        doc["version"] = canvas.version
+        canvas.doc = json.dumps(doc)
+        sync_local_result_owner(s, "canvas", canvas_id, doc)
+        _replace_promoted_transform_refs(s, "canvas", canvas_id, doc)
+        return {"ok": True, "canvas": {**doc, "id": canvas_id}, "sourceNodeId": source_id,
+                "joinNodeId": join_id, "version": canvas.version}
 
 
 def workspace_add_transform_action(
@@ -5872,6 +6038,29 @@ def workspace_provider_dataset_for_source_binding(
                 or row.columns_doc is None):
             return None
         return _workspace_provider_dataset_doc(row)
+
+
+def workspace_provider_dataset_page(*, mount_id: str, query: str | None, limit: int) -> tuple[list[dict], bool]:
+    """One bounded, mount-scoped window of previously resolved provider datasets.
+
+    This is not a cross-provider entity index and never turns a placement, name or URI into a
+    canonical Source identity. It simply reuses the canonical dataset records already admitted by
+    Workspace browse/detail, so related-data discovery can apply the same bounded schema policy to
+    mounted Sources without a local-only fallback.
+    """
+    bounded = max(1, min(int(limit), 50))
+    normalized = " ".join((query or "").split()).lower()
+    with session() as s:
+        stmt = select(WorkspaceProviderDataset).where(
+            WorkspaceProviderDataset.mount_id == mount_id,
+            WorkspaceProviderDataset.state == "current",
+            WorkspaceProviderDataset.uri.is_not(None),
+            WorkspaceProviderDataset.columns_doc.is_not(None),
+        )
+        if normalized:
+            stmt = stmt.where(func.lower(WorkspaceProviderDataset.provider_dataset_id).contains(normalized))
+        rows = list(s.scalars(stmt.order_by(WorkspaceProviderDataset.provider_dataset_id).limit(bounded + 1)))
+        return [_workspace_provider_dataset_doc(row) for row in rows[:bounded]], len(rows) > bounded
 
 
 def workspace_provider_source_binding(binding_id: str) -> dict | None:
@@ -20832,6 +21021,32 @@ def catalog_relationships() -> list[dict]:
         return out
 
 
+def catalog_incident_relationships(uri: str, *, limit: int) -> tuple[list[dict], bool]:
+    """Return at most ``limit`` declarations incident to one canonical catalog identity.
+
+    The caller must treat ``truncated`` as a prompt to refine, never as proof there are no more
+    relationships.  This query is the only built-in relationship read used by related-dataset
+    discovery; the legacy all-relationships listing remains for the ER view.
+    """
+    bounded = max(1, min(int(limit), 128))
+    with session() as s:
+        key = _catalog_token_to_key(s, uri)
+        rows = list(s.scalars(select(CatalogRelationship).join(
+            CatalogRelationshipEndpoint,
+            CatalogRelationshipEndpoint.rel_key == CatalogRelationship.rel_key,
+        ).where(CatalogRelationshipEndpoint.catalog_key == key).order_by(
+            CatalogRelationship.rel_key).limit(bounded + 1)))
+        truncated = len(rows) > bounded
+        out = []
+        for row in rows[:bounded]:
+            doc = json.loads(row.doc)
+            for name in ("leftUri", "left_uri", "rightUri", "right_uri"):
+                if doc.get(name):
+                    doc[name] = _catalog_key_to_uri(s, doc[name])
+            out.append(doc)
+        return out, truncated
+
+
 def catalog_upsert_relationship(rel_key: str, doc: dict) -> None:
     """Insert or replace ONE relationship row (keyed by rel_key) — no read-modify-write of a shared
     blob, so a concurrent declare of a DIFFERENT relationship on another instance can't be lost."""
@@ -20851,6 +21066,12 @@ def catalog_upsert_relationship(rel_key: str, doc: dict) -> None:
             s.add(CatalogRelationship(rel_key=rel_key, doc=payload))
         else:
             r.doc = payload
+        # Replace exactly this declaration's two endpoint projections under the same transaction.
+        s.execute(delete(CatalogRelationshipEndpoint).where(
+            CatalogRelationshipEndpoint.rel_key == rel_key))
+        endpoint_keys = sorted(set(str(doc[key]) for key in endpoint_keys))
+        s.add_all(CatalogRelationshipEndpoint(rel_key=rel_key, catalog_key=key)
+                  for key in endpoint_keys)
 
 
 def catalog_delete_relationship(rel_key: str) -> None:

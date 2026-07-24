@@ -41,7 +41,7 @@ _EDGE_KEYS = frozenset({"id", "source", "target", "sourceHandle", "targetHandle"
 _NODE_DATA_KEYS = frozenset({"title", "status", "config", "bypassed", "disabled"})
 _NODE_DATA_RUNTIME_FIELDS = frozenset({"history", "lastRun", "meta", "result"})
 _CORE_CONFIG_KEYS = frozenset({
-    "uri", "tableId", "datasetRef", "providerResourceRef", "providerMountId", "providerName", "providerReadMode",
+    "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
     "delimiter", "header", "n", "seed", "method", "predicate", "select", "columns", "source", "processor",
     "version", "params", "code", "io", "mode", "onError", "scope", "outputSchema", "outputSchemaSource",
     "outputSchemaCodeHash", "on", "how", "sql", "agg", "column", "chartType", "x", "y", "name", "writeMode",
@@ -165,7 +165,7 @@ def _data_references(canvas: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(config, dict):
             continue
         intent = {key: config[key] for key in (
-            "uri", "tableId", "datasetRef", "providerResourceRef", "providerMountId", "providerName", "providerReadMode",
+            "uri", "tableId", "registrationId", "datasetRef", "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode",
         ) if key in config}
         if intent:
             refs.append({"nodeId": node.get("id"), "intent": intent})
@@ -366,7 +366,7 @@ def _data_diagnostics(canvas: dict[str, Any]) -> list[Diagnostic]:
                     f"Source '{node['id']}' URI is registered, but availability is not probed before warning acknowledgement.",
                     path))
         if any(key in config for key in (
-                "providerResourceRef", "providerMountId", "providerName", "providerReadMode")):
+                "providerResourceRef", "providerMountId", "providerSourceBindingId", "providerName", "providerReadMode")):
             result.append(Diagnostic(
                 "provider_availability_unproven", "warning",
                 f"Source '{node['id']}' keeps provider intent, but this import does not contact that provider before warning acknowledgement.",

@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0046_relationship_incident", "0045_canvas_dataset_add_replays"),
         ("0045_canvas_dataset_add_replays", "0044_provider_lineage_identity"),
         ("0044_provider_lineage_identity", "0043_provider_source_binding"),
         ("0043_provider_source_binding", "0042_field_lineage"),
@@ -101,8 +102,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0045_canvas_dataset_add_replays"]
-    assert metadb.expected_schema_head() == "0045_canvas_dataset_add_replays"
+    assert scripts.get_heads() == ["0046_relationship_incident"]
+    assert metadb.expected_schema_head() == "0046_relationship_incident"
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -422,6 +423,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0046_relationship_incident.py": (
+            "ed37ceedf4177be14df96f890f6b065f41ce83bca7b876ede3e32c99c0ddce2d"
+        ),
         "0045_workspace_canvas_dataset_add_replays.py": (
             "26b3de701742f255655e177327d244a0ef1682bc37247c48670349ebc4a4f2fd"
         ),

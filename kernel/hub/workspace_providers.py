@@ -222,6 +222,22 @@ def provider_dataset_identity(uri: str) -> str | None:
     return f"workspace-provider:{_source_identity_token(mount_id, source_binding_id)}"
 
 
+def provider_dataset_binding_for_identity(dataset_id: str) -> tuple[str, str] | None:
+    """Decode one canonical provider DatasetRef identity without resolving it.
+
+    Callers still need a mount-scoped current-binding lookup before treating the result as a
+    usable dataset.  Invalid and non-provider identities deliberately return ``None`` rather than
+    inviting callers to reconstruct a target from a display name, URI, or browse placement.
+    """
+    prefix = "workspace-provider:"
+    if not isinstance(dataset_id, str) or not dataset_id.startswith(prefix):
+        return None
+    try:
+        return _decode_source_identity_token(dataset_id.removeprefix(prefix))
+    except ProviderDatasetUnavailable:
+        return None
+
+
 def provider_dataset_uri_for_identity(dataset_id: str) -> str | None:
     """Restore the logical URI from one canonical DatasetRef identity, if provider-owned."""
     prefix = "workspace-provider:"
@@ -416,6 +432,7 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
         # admission and execution identity; plan/manifest canonicalization strips these fields.
         "providerResourceRef": resource_ref,
         "providerMountId": resource.get("mountId"),
+        "providerSourceBindingId": source_binding.get("sourceBindingId"),
         "providerName": resource.get("provider"),
     }
     from hub.models import ExactDatasetRef

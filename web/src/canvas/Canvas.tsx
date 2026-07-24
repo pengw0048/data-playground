@@ -168,7 +168,7 @@ export function Canvas() {
       if (!t) continue
       const g = useStore.getState()
       const pos = freePosition(g.doc.nodes, { x: base.x - 116, y: base.y - 40 })
-      g.addNode('source', pos, { uri: t.uri, tableId: t.id }, t.name)
+      g.addNode('source', pos, { uri: t.uri, tableId: t.id, registrationId: t.registrationId ?? undefined }, t.name)
     }
   }, [canEdit, screenToFlowPosition])
 

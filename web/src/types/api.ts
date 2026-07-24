@@ -1,5 +1,5 @@
 // Kernel API DTOs — camelCase on the wire, mirrors kernel/models.py.
-import type { ColumnSchema } from './graph'
+import type { ColumnSchema, ExactDatasetRef } from './graph'
 import type { WireType } from '../theme/tokens'
 
 export interface ResourceSpec {
@@ -501,6 +501,42 @@ export interface JoinAnalysis {
   note?: string | null
   configuredRowReference?: RowReferenceDiagnosis[]
   blockingCode?: 'row_reference_target_mismatch' | null
+}
+
+export interface RelatedDatasetIdentity {
+  kind: 'local' | 'provider'
+  registrationId?: string | null
+  mountId?: string | null
+  sourceBindingId?: string | null
+  revisionMode: 'exact' | 'current'
+  revisionId?: string | null
+}
+
+export interface RelatedDatasetCandidate {
+  identity: RelatedDatasetIdentity
+  name: string
+  folder: string
+  reason: string
+  evidence: 'declared_relationship' | 'typed_reference' | 'schema_match'
+  evidenceStatus: 'declared' | 'proven' | 'inferred'
+  leftColumns: string[]
+  rightColumns: string[]
+  cardinality: Cardinality
+  confidence: 'declared' | 'verified' | 'inferred'
+  exactRef?: ExactDatasetRef | null
+  warning?: string | null
+}
+
+export interface RelatedDatasetPage {
+  source: RelatedDatasetIdentity
+  sourceName: string
+  candidates: RelatedDatasetCandidate[]
+  excluded: Array<{ identity: RelatedDatasetIdentity; name: string; reason: string }>
+  limit: number
+  inspected: number
+  truncated: boolean
+  refinementRequired: boolean
+  scopeNote?: string | null
 }
 
 export interface Relationship {

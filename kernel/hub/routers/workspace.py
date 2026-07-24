@@ -31,6 +31,8 @@ from hub.models import (
     DurableTaskInboxUnreadCount,
     ExecutionManifestDetail,
     Graph,
+    RelatedDatasetCandidate,
+    RelatedDatasetIdentity,
     RunHistoryRecord,
     RunStatus,
     WorkspaceAddDatasetResult,
@@ -1208,6 +1210,127 @@ def get_canvas(canvas_id: str, uid: str = Depends(current_user)) -> dict:
         )
     with metadb.session() as s:
         return json.loads(s.get(metadb.Canvas, canvas_id).doc)
+
+
+class JoinWithRelatedRequest(_StrictAuthBody):
+    expected_canvas_version: int = Field(ge=1)
+    source_node_id: str = Field(min_length=1, max_length=256)
+    join_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+    source_identity: RelatedDatasetIdentity
+    candidate: RelatedDatasetCandidate
+    q: str | None = Field(default=None, max_length=512)
+    folder: str | None = Field(default=None, max_length=2048)
+    how: Literal["inner", "left", "right", "outer"] = "inner"
+
+
+def _join_condition(candidate: RelatedDatasetCandidate, *, source_on_b: bool = False) -> dict[str, str]:
+    from hub.sqlpolicy import quote_identifier
+
+    left_columns, right_columns = (
+        (candidate.right_columns, candidate.left_columns) if source_on_b
+        else (candidate.left_columns, candidate.right_columns)
+    )
+    if (
+        len(left_columns) == len(right_columns)
+        and left_columns == right_columns
+    ):
+        return {"on": ", ".join(left_columns), "condition": ""}
+    condition = " AND ".join(
+        f"a.{quote_identifier(left)} = b.{quote_identifier(right)}"
+        for left, right in zip(left_columns, right_columns)
+    )
+    return {"on": "", "condition": condition}
+
+
+@router.post("/canvas/{canvas_id}/join-with-related")
+def join_with_related_dataset(
+    canvas_id: str,
+    body: JoinWithRelatedRequest,
+    uid: str = Depends(current_user),
+) -> dict:
+    """Revalidate the read-only review, then apply one dedicated Canvas CAS edit."""
+    from hub.related_datasets import (
+        current_identity, related_datasets, review_related_dataset_revision,
+        source_identity_from_config,
+    )
+
+    try:
+        doc = get_canvas(canvas_id, uid)
+        graph = Graph.model_validate(doc)
+        source = next((node for node in graph.nodes if node.id == body.source_node_id), None)
+        config = source.data.get("config") if source is not None else None
+        if source is None or source.type != "source" or not isinstance(config, dict):
+            raise ValueError("the selected Source is no longer available")
+        source_identity = source_identity_from_config(get_deps().catalog, config)
+        if source_identity != body.source_identity:
+            raise ValueError("the selected Source binding changed after review")
+        deps = get_deps()
+        if body.candidate.identity.revision_mode == "exact":
+            # A retained selection must be re-read through the exact adapter, not matched against a
+            # current-head candidate list. The returned candidate carries the exact schema evidence
+            # that this final Canvas CAS will fence.
+            candidate = review_related_dataset_revision(
+                deps.catalog, deps.resolve_adapter, deps.storage, source_identity, body.candidate,
+                str(body.candidate.identity.revision_id), q=body.q, folder=body.folder)
+        else:
+            reviewed = related_datasets(deps.catalog, deps.resolve_adapter, deps.storage, source_identity,
+                                        q=body.q, folder=body.folder, limit=20)
+            candidate = next((item for item in reviewed.candidates
+                              if item.identity == body.candidate.identity
+                              and item.evidence == body.candidate.evidence
+                              and item.left_columns == body.candidate.left_columns
+                              and item.right_columns == body.candidate.right_columns), None)
+            if candidate is None:
+                raise ValueError("the related dataset or join evidence changed after review")
+        if candidate.identity.kind == "local":
+            table = current_identity(deps.catalog, candidate.identity)
+            candidate_config: dict[str, Any] = {
+                "registrationId": table.registration_id, "uri": table.uri, "tableId": table.id,
+            }
+        else:
+            binding = metadb.workspace_provider_dataset_for_source_binding(
+                mount_id=str(candidate.identity.mount_id),
+                source_binding_id=str(candidate.identity.source_binding_id))
+            if binding is None or binding.get("referenceState") != "current":
+                raise ValueError("related provider dataset is unavailable")
+            candidate_config = {
+                "uri": workspace_providers.provider_dataset_uri(
+                    str(candidate.identity.mount_id), str(candidate.identity.source_binding_id)),
+                "providerMountId": candidate.identity.mount_id,
+                "providerSourceBindingId": candidate.identity.source_binding_id,
+                "providerReadMode": "exact" if candidate.identity.revision_mode == "exact" else "mutable",
+            }
+        if candidate.exact_ref is not None:
+            from hub.routers.catalog import open_dataset_revision
+            open_dataset_revision(candidate.exact_ref.dataset_id, candidate.exact_ref.revision_id)
+            candidate_config["datasetRef"] = candidate.exact_ref.model_dump(by_alias=True, mode="json")
+        expected_binding = ({"registrationId": source_identity.registration_id}
+                            if source_identity.kind == "local" else {
+                                "providerMountId": source_identity.mount_id,
+                                "providerSourceBindingId": source_identity.source_binding_id,
+                            })
+        source_on_b = False
+        if body.join_node_id is not None:
+            occupied = next((edge.target_handle for edge in graph.edges
+                             if edge.target == body.join_node_id and edge.source == body.source_node_id), None)
+            if occupied not in {"a", "b"}:
+                raise ValueError("Join input changed after review")
+            source_on_b = occupied == "b"
+        return metadb.workspace_apply_related_join_action(
+            uid=uid, canvas_id=canvas_id, expected_canvas_version=body.expected_canvas_version,
+            source_node_id=body.source_node_id, join_node_id=body.join_node_id,
+            expected_source_binding=expected_binding, candidate_source=candidate_config,
+            source_identity=source_identity.model_dump(by_alias=True),
+            candidate_identity=candidate.identity.model_dump(by_alias=True),
+            candidate_name=candidate.name, how=body.how,
+            join_config=_join_condition(candidate, source_on_b=source_on_b))
+    except APIError:
+        raise
+    except (KeyError, PermissionError, ValueError, metadb.WorkspaceVersionConflict) as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+    except Exception as exc:
+        raise APIError(503, f"related dataset candidates unavailable: {type(exc).__name__}",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
 
 
 @router.put("/canvas/{canvas_id}")

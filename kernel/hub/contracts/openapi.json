@@ -5519,6 +5519,84 @@
         "title": "JoinSuggestion",
         "type": "object"
       },
+      "JoinWithRelatedRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/RelatedDatasetCandidate"
+          },
+          "expectedCanvasVersion": {
+            "minimum": 1.0,
+            "title": "Expectedcanvasversion",
+            "type": "integer"
+          },
+          "folder": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "how": {
+            "default": "inner",
+            "enum": [
+              "inner",
+              "left",
+              "right",
+              "outer"
+            ],
+            "title": "How",
+            "type": "string"
+          },
+          "joinNodeId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Joinnodeid"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
+          },
+          "sourceIdentity": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          },
+          "sourceNodeId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Sourcenodeid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedCanvasVersion",
+          "sourceNodeId",
+          "sourceIdentity",
+          "candidate"
+        ],
+        "title": "JoinWithRelatedRequest",
+        "type": "object"
+      },
       "KernelInfo": {
         "properties": {
           "adapters": {
@@ -8232,6 +8310,404 @@
           "uri"
         ],
         "title": "RegisterRequest",
+        "type": "object"
+      },
+      "RelatedDatasetCandidate": {
+        "additionalProperties": false,
+        "description": "One reviewed way to add a second dataset to a Join.",
+        "properties": {
+          "cardinality": {
+            "default": "unknown",
+            "enum": [
+              "1:1",
+              "1:N",
+              "N:1",
+              "N:M",
+              "unknown"
+            ],
+            "title": "Cardinality",
+            "type": "string"
+          },
+          "confidence": {
+            "default": "inferred",
+            "enum": [
+              "declared",
+              "verified",
+              "inferred"
+            ],
+            "title": "Confidence",
+            "type": "string"
+          },
+          "evidence": {
+            "enum": [
+              "declared_relationship",
+              "typed_reference",
+              "schema_match"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "evidenceStatus": {
+            "enum": [
+              "declared",
+              "proven",
+              "inferred"
+            ],
+            "title": "Evidencestatus",
+            "type": "string"
+          },
+          "exactRef": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExactDatasetRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "folder": {
+            "default": "",
+            "title": "Folder",
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          },
+          "leftColumns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Leftcolumns",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "rightColumns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Rightcolumns",
+            "type": "array"
+          },
+          "warning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Warning"
+          }
+        },
+        "required": [
+          "identity",
+          "name",
+          "reason",
+          "evidence",
+          "evidenceStatus",
+          "leftColumns",
+          "rightColumns"
+        ],
+        "title": "RelatedDatasetCandidate",
+        "type": "object"
+      },
+      "RelatedDatasetExclusion": {
+        "description": "A bounded explanation for a tempting but contradicted schema match.",
+        "properties": {
+          "identity": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity",
+          "name",
+          "reason"
+        ],
+        "title": "RelatedDatasetExclusion",
+        "type": "object"
+      },
+      "RelatedDatasetIdentity": {
+        "additionalProperties": false,
+        "description": "Stable identity used to fence a related-dataset review.\n\nLocal catalog identities are registration-scoped. Provider identities are opaque and only valid\ntogether with their mount; neither has a URI/name/table-id fallback.",
+        "properties": {
+          "kind": {
+            "default": "local",
+            "enum": [
+              "local",
+              "provider"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "mountId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mountid"
+          },
+          "registrationId": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Registrationid"
+          },
+          "revisionId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revisionid"
+          },
+          "revisionMode": {
+            "default": "current",
+            "enum": [
+              "exact",
+              "current"
+            ],
+            "title": "Revisionmode",
+            "type": "string"
+          },
+          "sourceBindingId": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcebindingid"
+          }
+        },
+        "title": "RelatedDatasetIdentity",
+        "type": "object"
+      },
+      "RelatedDatasetPage": {
+        "description": "One bounded related-dataset review page; there is intentionally no continuation.",
+        "properties": {
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/RelatedDatasetCandidate"
+            },
+            "title": "Candidates",
+            "type": "array"
+          },
+          "excluded": {
+            "items": {
+              "$ref": "#/components/schemas/RelatedDatasetExclusion"
+            },
+            "title": "Excluded",
+            "type": "array"
+          },
+          "inspected": {
+            "title": "Inspected",
+            "type": "integer"
+          },
+          "limit": {
+            "title": "Limit",
+            "type": "integer"
+          },
+          "refinementRequired": {
+            "default": false,
+            "title": "Refinementrequired",
+            "type": "boolean"
+          },
+          "scopeNote": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scopenote"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          },
+          "sourceName": {
+            "title": "Sourcename",
+            "type": "string"
+          },
+          "truncated": {
+            "default": false,
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source",
+          "sourceName",
+          "candidates",
+          "limit",
+          "inspected"
+        ],
+        "title": "RelatedDatasetPage",
+        "type": "object"
+      },
+      "RelatedDatasetRevisionReviewBody": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/RelatedDatasetCandidate"
+          },
+          "folder": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          }
+        },
+        "required": [
+          "source",
+          "candidate",
+          "revisionId"
+        ],
+        "title": "RelatedDatasetRevisionReviewBody",
+        "type": "object"
+      },
+      "RelatedDatasetRevisionsBody": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity"
+        ],
+        "title": "RelatedDatasetRevisionsBody",
+        "type": "object"
+      },
+      "RelatedDatasetsBody": {
+        "additionalProperties": false,
+        "properties": {
+          "folder": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "limit": {
+            "default": 10,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "q": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Q"
+          },
+          "source": {
+            "$ref": "#/components/schemas/RelatedDatasetIdentity"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "RelatedDatasetsBody",
         "type": "object"
       },
       "Relationship": {
@@ -14472,6 +14948,100 @@
         "summary": "Canvas Active Runs"
       }
     },
+    "/api/canvas/{canvas_id}/join-with-related": {
+      "post": {
+        "description": "Revalidate the read-only review, then apply one dedicated Canvas CAS edit.",
+        "operationId": "join_with_related_dataset_api_canvas__canvas_id__join_with_related_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "canvas_id",
+            "required": true,
+            "schema": {
+              "title": "Canvas Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JoinWithRelatedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Join With Related Dataset Api Canvas  Canvas Id  Join With Related Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Join With Related Dataset"
+      }
+    },
     "/api/canvas/{canvas_id}/kernel": {
       "get": {
         "description": "The per-canvas execution kernel's live state (Jupyter-style), or {exists:false} if none is\nrunning. Token/endpoint are internal — only lease state + the kernel's own /status are surfaced.\nRead-only: this NEVER spawns a kernel, and the /status proxy fast-fails so a dead kernel can't\nstall the request.",
@@ -16501,6 +17071,255 @@
           }
         },
         "summary": "Catalog Register"
+      }
+    },
+    "/api/catalog/related-datasets": {
+      "post": {
+        "description": "One shared, bounded candidate service; only returned candidates are measured.",
+        "operationId": "list_related_datasets_api_catalog_related_datasets_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelatedDatasetsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelatedDatasetPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "List Related Datasets"
+      }
+    },
+    "/api/catalog/related-datasets/revision-review": {
+      "post": {
+        "description": "Return a fresh, exact-schema review before an immutable related Source is added.",
+        "operationId": "review_related_dataset_revision_api_catalog_related_datasets_revision_review_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelatedDatasetRevisionReviewBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelatedDatasetCandidate"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "Review Related Dataset Revision"
+      }
+    },
+    "/api/catalog/related-datasets/revisions": {
+      "post": {
+        "description": "List retained revisions for one already-selected stable related-data binding.",
+        "operationId": "list_related_dataset_revisions_api_catalog_related_datasets_revisions_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-dp-user",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Dp-User"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "dp_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Dp Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelatedDatasetRevisionsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetRevisionPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Request validation failed."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error with a stable code and retry classification."
+          }
+        },
+        "summary": "List Related Dataset Revisions"
       }
     },
     "/api/catalog/relationships": {

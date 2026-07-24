@@ -75,6 +75,9 @@ from hub.models import (
     TransformLibraryPage,
     MAX_CODE_LEN,
     Relationship,
+    RelatedDatasetCandidate,
+    RelatedDatasetPage,
+    RelatedDatasetIdentity,
     SchemaCompatibility,
     SampleRequest,
     SampleResult,
@@ -887,6 +890,106 @@ def declare_key(table_id: str, req: DeclareKeyRequest) -> CatalogTable:
 @router.get("/catalog/relationships", response_model=list[Relationship])
 def list_relationships(uri: str | None = None) -> list[Relationship]:
     return get_deps().catalog.relationships(uri)
+
+
+class RelatedDatasetsBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    source: RelatedDatasetIdentity
+    q: str | None = Field(default=None, max_length=512)
+    folder: str | None = Field(default=None, max_length=2048)
+    limit: int = Field(default=10, ge=1, le=20)
+
+
+class RelatedDatasetRevisionsBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    identity: RelatedDatasetIdentity
+    limit: int = Field(default=20, ge=1, le=20)
+    cursor: str | None = Field(default=None, max_length=256)
+
+
+class RelatedDatasetRevisionReviewBody(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    source: RelatedDatasetIdentity
+    candidate: RelatedDatasetCandidate
+    revision_id: str = Field(min_length=1, max_length=256)
+    q: str | None = Field(default=None, max_length=512)
+    folder: str | None = Field(default=None, max_length=2048)
+
+
+@router.post("/catalog/related-datasets", response_model=RelatedDatasetPage)
+def list_related_datasets(
+    body: RelatedDatasetsBody,
+) -> RelatedDatasetPage:
+    """One shared, bounded candidate service; only returned candidates are measured."""
+    from hub.related_datasets import related_datasets
+
+    deps = get_deps()
+    try:
+        return related_datasets(
+            deps.catalog, deps.resolve_adapter, deps.storage, body.source,
+            q=body.q, folder=body.folder, limit=body.limit,
+        )
+    except KeyError:
+        raise HTTPException(404, "selected dataset not found")
+    except ManagedSourceReadError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(503, f"related dataset candidates unavailable: {type(exc).__name__}")
+
+
+@router.post("/catalog/related-datasets/revisions", response_model=DatasetRevisionPage)
+def list_related_dataset_revisions(body: RelatedDatasetRevisionsBody) -> DatasetRevisionPage:
+    """List retained revisions for one already-selected stable related-data binding."""
+    from hub.related_datasets import related_dataset_revisions
+
+    try:
+        return related_dataset_revisions(
+            get_deps().catalog, get_deps().resolve_adapter, body.identity,
+            limit=body.limit, cursor=body.cursor)
+    except NotImplementedError as exc:
+        raise APIError(501, "related_dataset_revision_history_unavailable",
+                       code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
+    except (RevisionPermissionLost, PermissionError) as exc:
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
+    except (RevisionProviderOffline, ConnectionError, TimeoutError,
+            workspace_providers.ProviderDatasetOffline) as exc:
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
+    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    except (KeyError, ValueError) as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
+
+
+@router.post("/catalog/related-datasets/revision-review", response_model=RelatedDatasetCandidate)
+def review_related_dataset_revision(body: RelatedDatasetRevisionReviewBody) -> RelatedDatasetCandidate:
+    """Return a fresh, exact-schema review before an immutable related Source is added."""
+    from hub.related_datasets import review_related_dataset_revision as review
+
+    deps = get_deps()
+    try:
+        return review(
+            deps.catalog, deps.resolve_adapter, deps.storage, body.source, body.candidate,
+            body.revision_id, q=body.q, folder=body.folder)
+    except NotImplementedError as exc:
+        raise APIError(501, "related_dataset_revision_history_unavailable",
+                       code=APIErrorCode.NOT_IMPLEMENTED, retryable=False) from exc
+    except (RevisionPermissionLost, PermissionError) as exc:
+        raise APIError(403, "dataset_revision_permission_lost",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
+    except (RevisionProviderOffline, ConnectionError, TimeoutError,
+            workspace_providers.ProviderDatasetOffline) as exc:
+        raise APIError(503, "dataset_revision_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True) from exc
+    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+            workspace_providers.ProviderDatasetUnavailable) as exc:
+        raise APIError(410, "dataset_revision_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
+    except (KeyError, ValueError) as exc:
+        raise APIError(409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc
 
 
 @router.post("/catalog/relationships", response_model=list[Relationship])

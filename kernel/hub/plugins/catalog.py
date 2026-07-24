@@ -992,6 +992,17 @@ class InMemoryCatalog:
             rels = [r for r in rels if uri in (r.left_uri, r.right_uri)]
         return rels
 
+    def incident_relationships(self, uri: str, *, limit: int = 64) -> tuple[list[Relationship], bool]:
+        """One indexed, capped incident declaration window for relationship-aware discovery."""
+        raw, truncated = metadb.catalog_incident_relationships(uri, limit=limit)
+        rels: list[Relationship] = []
+        for item in raw:
+            try:
+                rels.append(Relationship.model_validate(item))
+            except Exception:  # noqa: BLE001 - one corrupt declaration must not widen the query
+                continue
+        return rels, truncated
+
     @staticmethod
     def _rel_key(r: Relationship) -> str:
         import json
