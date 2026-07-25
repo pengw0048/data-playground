@@ -43,7 +43,10 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       past: [], future: [], selectedIds: [],
     } as any)
   })
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllEnvs()
+  })
 
   it('shows "—" for an unknown row count, not a fake "0 rows"', () => {
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
@@ -85,8 +88,8 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('Field evidence · 1 columns')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Field evidence · 1 columns'))
+    expect(await screen.findByText('Pinned revision empty-r7 field evidence · 1 columns')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Pinned revision empty-r7 field evidence · 1 columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
     expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
@@ -188,6 +191,42 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     })
     expect(useStore.getState().doc.nodes[0].data.status).toBe('stale')
     expect(useStore.getState().doc.nodes[1].data.status).toBe('stale')
+  })
+
+  it('labels advanced current-head facts separately from the exact pin', async () => {
+    const selected = { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'rev-1' }
+    const data = { title: 'orders', status: 'latest', config: {
+      uri: '/data/orders.lance', tableId: 't1', datasetRef: selected,
+    } }
+    const headColumns = Array.from({ length: 5 }, (_, index) => ({
+      name: `head_${index}`, type: 'int', capabilities: [],
+    }))
+    const pinnedColumns = Array.from({ length: 4 }, (_, index) => ({
+      name: `pin_${index}`, type: 'int', capabilities: [],
+    }))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({
+      catalog: [{
+        id: 't1', name: 'orders', uri: '/data/orders.lance',
+        rowCount: 1_500, version: 'v4', columns: headColumns,
+      }],
+      doc: { id: 'c', name: 'test', version: 1,
+        nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] },
+    } as any)
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'dataset-1', revisionId: 'rev-1', retentionOwner: 'provider',
+      summary: { rowCount: 1_000 },
+      preview: { columns: pinnedColumns, rows: [], hasMore: false, rowLimit: 100 },
+    })
+
+    render1(data)
+
+    expect(screen.getByText('Current head · 1,500 rows · 5 cols · v4')).toBeInTheDocument()
+    expect(await screen.findByLabelText('Pinned revision facts')).toHaveTextContent(
+      'Pinned exact revision rev-1 · 1,000 rows · 4 cols',
+    )
+    expect(screen.getByText('Pinned revision rev-1 field evidence · 4 columns')).toBeInTheDocument()
+    expect(screen.queryByText(/^1,500 rows · 5 cols · v4$/)).toBeNull()
   })
 
   it('omits revision controls once the provider proves it has no selector capability', async () => {
@@ -330,9 +369,54 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     expect(await screen.findByText(/Permission to open exact revision 7 was lost.*latest was not substituted/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact revision' }))
-    expect(await screen.findByText(/Pinned exact revision 7.*1 rows/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Pinned exact revision 7.*1 rows.*0 cols/i)).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
+  })
+
+  it('renders adjacent as-of and revision timestamps in explicit UTC under a non-UTC timezone', async () => {
+    vi.stubEnv('TZ', 'America/Los_Angeles')
+    const selected = {
+      kind: 'as_of' as const, asOf: '2026-07-16T12:38:00Z',
+      resolved: {
+        datasetId: 'dataset-1', revisionId: 'rev-pin', committedAt: '2026-07-16T11:38:00Z',
+        retentionOwner: 'provider', selector: 'as_of' as const,
+      },
+    }
+    const data = { title: 'orders', status: 'latest', config: {
+      uri: 'mem://orders', tableId: 't1', datasetRef: selected,
+    } }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    useStore.setState({ doc: { id: 'c', name: 'test', version: 1,
+      nodes: [{ id: 's1', type: 'source', position: { x: 0, y: 0 }, data }], edges: [] } } as any)
+    mocks.datasetRevisionCapabilities.mockResolvedValue({
+      selectors: ['exact', 'latest', 'as_of'],
+      asOfOrdering: 'latest_committed_at_at_or_before', timezone: 'UTC',
+    })
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [{
+        datasetId: 'dataset-1', revisionId: 'rev-head', committedAt: '2026-07-16T15:38:00Z',
+        retentionOwner: 'provider',
+      }],
+      nextCursor: null, hasMore: false,
+    })
+    mocks.datasetRevision.mockResolvedValueOnce({
+      datasetId: 'dataset-1', revisionId: 'rev-pin', committedAt: '2026-07-16T11:38:00Z',
+      retentionOwner: 'provider', summary: { rowCount: 1 },
+      preview: { columns: [], rows: [], hasMore: false, rowLimit: 100 },
+    })
+
+    render1(data)
+
+    const control = await screen.findByRole('button', {
+      name: 'As of Jul 16, 2026, 12:38:00 UTC → rev-pin',
+    })
+    fireEvent.click(control)
+    expect(screen.getByText('Jul 16, 2026, 15:38:00 UTC')).toBeInTheDocument()
+    expect(screen.getByLabelText('As-of UTC date and time')).toBeInTheDocument()
+    expect(screen.getByLabelText('Pinned revision facts')).toHaveTextContent(
+      'As-of intent Jul 16, 2026, 12:38:00 UTC resolved once to pinned exact revision rev-pin',
+    )
   })
 
   it('stores UTC as-of intent with exact and as-of capabilities after history is ready', async () => {
