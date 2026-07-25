@@ -169,6 +169,9 @@ def _run_allocation_counts() -> tuple[int, int, int, int]:
         ("nested/output.parquet", "path_syntax"),
         (r"nested\output.parquet", "path_syntax"),
         ("family\u0085cost", "path_syntax"),
+        ("*", "path_syntax"),
+        ("?", "path_syntax"),
+        ("[", "path_syntax"),
     ],
 )
 def test_managed_name_admission_returns_field_error_without_publication(
@@ -277,6 +280,7 @@ def test_normal_managed_name_is_preserved_across_admission_receipt_catalog_and_r
     assert exact.json()["datasetId"] == receipt.dataset_id
     assert exact.json()["revisionId"] == receipt.revision_id
     assert exact.json()["name"] == receipt.name
+    assert exact.json()["preview"]["rows"] == [{"value": 1}, {"value": 2}]
 
     metadb.catalog_set_metadata(
         table.uri,

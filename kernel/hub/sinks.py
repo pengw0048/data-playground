@@ -51,7 +51,7 @@ def managed_dataset_name(
         )
     if (
         value.strip(".") == ""
-        or any(character in value for character in ("/", "\\", "\x00", ":"))
+        or any(character in value for character in ("/", "\\", "\x00", ":", "*", "?", "["))
         or any(unicodedata.category(character) == "Cc" for character in value)
     ):
         raise ManagedDatasetNameError(
