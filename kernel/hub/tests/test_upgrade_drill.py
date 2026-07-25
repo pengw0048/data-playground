@@ -64,6 +64,30 @@ def test_candidate_identity_rejects_api_sha_mismatch(tmp_path) -> None:
             {"version": "9.8.7", "sha": "wrong-sha"}, candidate_version, "candidate-sha")
 
 
+def test_candidate_schema_head_uses_isolated_candidate_interpreter(monkeypatch, tmp_path) -> None:
+    candidate_venv = tmp_path / "venv-candidate"
+    observed: tuple[str, ...] | None = None
+
+    def candidate_run(*command: str, **_kwargs) -> subprocess.CompletedProcess[str]:
+        nonlocal observed
+        observed = command
+        return subprocess.CompletedProcess(command, 0, stdout="9.8.7_candidate_head\n")
+
+    monkeypatch.setattr(upgrade_drill, "run", candidate_run)
+
+    assert upgrade_drill.candidate_schema_head(candidate_venv) == "9.8.7_candidate_head"
+    assert observed is not None
+    assert observed[:3] == (str(candidate_venv / "bin" / "python"), "-I", "-c")
+    assert "from hub import metadb" in observed[3]
+    assert "module.is_relative_to(venv)" in observed[3]
+    assert "migrations.is_relative_to(venv)" in observed[3]
+
+
+def test_candidate_schema_rejects_a_migrated_head_that_disagrees_with_the_wheel() -> None:
+    with pytest.raises(RuntimeError, match="target schema '0046' != '9.8.7_candidate_head'"):
+        upgrade_drill.assert_candidate_schema("0046", "9.8.7_candidate_head")
+
+
 @pytest.mark.parametrize("metadata_headers", [
     (
         ("Metadata-Version", "2.1"),
