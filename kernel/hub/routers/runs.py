@@ -683,6 +683,36 @@ def _kernel_run_provably_undispatched(runner, run_id: str, status) -> bool:
             and metadb.backend_job(run_id) is None)
 
 
+def _missing_bounded_schema_blocker(graph: Graph, node_id: str) -> str:
+    """Describe the direct graph evidence a user must fix without changing admission."""
+    nodes = graph_mod.node_map(graph)
+    upstream_ids = sorted({edge.source for edge in graph_mod.incoming(graph, node_id)})
+    upstream_labels: list[str] = []
+    for upstream_id in upstream_ids:
+        upstream = nodes.get(upstream_id)
+        data = upstream.data if upstream is not None and isinstance(upstream.data, dict) else {}
+        title = data.get("title")
+        if isinstance(title, str) and title.strip():
+            upstream_labels.append(f'“{title.strip()}”')
+        else:
+            upstream_labels.append(f'with node ID “{upstream_id}”')
+
+    if len(upstream_labels) == 1:
+        transform = f"the upstream transform {upstream_labels[0]}"
+        subject = f"{transform} does not have"
+        action = f"Select {transform}, then in the Inspector choose"
+    elif upstream_labels:
+        subject = "one or more direct upstream transforms do not have"
+        action = "Select each direct upstream transform, then in the Inspector choose"
+    else:
+        subject = "the upstream transform connected to this Write does not have"
+        action = "Select that upstream transform, then in the Inspector choose"
+    return (
+        f"{subject} a bounded output schema contract. {action} Output schema "
+        "(contract) → Infer from sample."
+    )
+
+
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
         supplied: WriteIntent | None = None, *, direct_local: bool = False) -> WriteAdmission:
@@ -791,8 +821,7 @@ def _write_admission_for_graph(
                   else "replace" if supplied and supplied.mode == "replace" else "create"),
             provider=("managed-local-lance" if lance_candidate else "managed-local-file"),
             partitions=partitions,
-            blocker=("input schema is not available from bounded metadata; "
-                     "declare the upstream output schema before running"),
+            blocker=_missing_bounded_schema_blocker(graph, node_id),
         )
 
     run_id = metadb.local_run_submission_id(
