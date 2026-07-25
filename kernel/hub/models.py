@@ -359,6 +359,8 @@ class ColumnSchema(Wire):
     has_default: bool | None = Field(default=None, description="Whether a non-null field has a source default; null means unknown.")
     provenance: SchemaProvenance = Field(default="inferred", description="Evidence source for this field metadata.")
     capabilities: list[str] = []
+    media_kind: Literal["image", "video", "unknown"] | None = Field(
+        default=None, description="Detected media kind when the media capability has value evidence.")
     annotations: list[FieldAnnotation] = Field(default_factory=list, max_length=32)
     row_reference: TypedRowReference | None = None
 

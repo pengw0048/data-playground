@@ -576,10 +576,11 @@ class BuildEngine:
         names = _dedupe_names(tbl.column_names)
         if names != tbl.column_names:
             tbl = tbl.rename_columns(names)
+        preview_rows = tbl.to_pylist()
         cols = tag_columns([ColumnSchema(
             name=n, type=display_type(str(t)), physical_type=str(t), provenance="inferred")
-            for n, t in zip(tbl.column_names, tbl.schema.types)])
-        return _table_to_rows(tbl), cols
+            for n, t in zip(tbl.column_names, tbl.schema.types)], sample_rows=preview_rows)
+        return _table_to_rows(preview_rows), cols
 
     # -- inputs ------------------------------------------------------------ #
     def _inputs(self, node: GraphNode) -> list[Relation]:
@@ -1487,9 +1488,9 @@ def _conform(tbl: "pa.Table", schema: "pa.Schema", node) -> "pa.Table":
                              f"safely reconciled ({detail or e}); a transform must emit one schema") from e
 
 
-def _table_to_rows(tbl: "pa.Table") -> list[dict]:
+def _table_to_rows(table_or_rows) -> list[dict]:
     import decimal
-    rows = tbl.to_pylist()
+    rows = table_or_rows if isinstance(table_or_rows, list) else table_or_rows.to_pylist()
     for r in rows:
         for k, v in list(r.items()):
             if isinstance(v, decimal.Decimal):

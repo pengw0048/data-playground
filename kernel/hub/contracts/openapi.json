@@ -938,6 +938,23 @@
             "description": "Whether a non-null field has a source default; null means unknown.",
             "title": "Hasdefault"
           },
+          "mediaKind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "image",
+                  "video",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Detected media kind when the media capability has value evidence.",
+            "title": "Mediakind"
+          },
           "name": {
             "title": "Name",
             "type": "string"
