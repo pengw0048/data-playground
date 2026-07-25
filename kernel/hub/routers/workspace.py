@@ -1783,7 +1783,7 @@ def put_settings_batch(
         )
         return JSONResponse(
             status_code=409,
-            content=conflict.model_dump(mode="json", by_alias=True),
+            content=conflict.model_dump(mode="json", by_alias=True, exclude_none=True),
         )
     if body.changes:
         _settings_batch_audit(
