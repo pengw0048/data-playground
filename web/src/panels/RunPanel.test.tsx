@@ -173,6 +173,25 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.edit).toHaveBeenCalledWith('target')
   })
 
+  it('explains why a known-row run with unknown byte width needs confirmation', () => {
+    mocks.state.runs.target = {
+      phase: 'confirm',
+      estimate: {
+        rows: 2,
+        bytes: null,
+        placement: 'local',
+        needsConfirm: true,
+        breakdown: 'size unknown · 2 rows · confirmation required: Binary column "payload" has no fixed-width byte-size evidence; Data Playground did not scan values to guess.',
+      },
+    }
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByText('HEADS UP')).toBeVisible()
+    expect(screen.getByText('2 rows')).toBeVisible()
+    expect(screen.getByText(/Binary column "payload" has no fixed-width byte-size evidence/)).toBeVisible()
+    expect(screen.getByText(/did not scan values to guess/)).toBeVisible()
+  })
+
   it('shows configured column merges only through their certified admission control', async () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },

@@ -30,31 +30,38 @@ _BLOCKING = {"sort", "dedup", "aggregate", "join", "sql", "vector-search", "wind
 # code ops: output cardinality can't be known without running them.
 _CODE = {"transform", "section"}
 
-# a coarse per-column byte width by (display) type — for turning a row count into a working-set size.
+# A coarse per-column byte width by display type. Variable binary values are deliberately absent:
+# their payloads can vary from bytes to megabytes, so no fixed estimate is defensible.
 _TYPE_W = {
     "int": 8, "integer": 8, "bigint": 8, "long": 8, "smallint": 8, "tinyint": 8, "hugeint": 16,
     "double": 8, "float": 8, "real": 8, "decimal": 8, "number": 8, "numeric": 8,
     "bool": 1, "boolean": 1, "date": 8, "timestamp": 8, "time": 8, "uuid": 16,
-    "string": 24, "str": 24, "text": 24, "varchar": 24, "char": 24, "json": 64, "blob": 64, "bytea": 64,
+    "string": 24, "str": 24, "text": 24, "varchar": 24, "char": 24, "json": 64,
 }
 _DEFAULT_ROW_BYTES = 64
 _VEC_RE = re.compile(r"\[(\d+)\]")  # a fixed-size array/vector suffix — e.g. float[1024] (an embedding)
+_FIXED_BINARY_RE = re.compile(r"fixed_size_binary\s*\[\s*(\d+)\s*\]", re.IGNORECASE)
 _LIST_ELEMS = 16                    # assumed element count for a variable-length list (no length in the type)
 _NESTED_W = 128                     # a struct/map value — coarse, deliberately generous (stay conservative)
 
 
-def _col_width(t: str) -> int:
+def _col_width(t: str, physical_type: str | None = None) -> int | None:
     """Byte width for one (display-typed) column, honoring list/vector dimensionality. The plain scalar
     map alone under-counts embeddings catastrophically: a float[1024] scored as base `float`=8B is a
     ~500x undercount, which then mis-sizes a vector working set as 'tiny' and mis-places it local."""
     t = t.strip().lower()
     base = t.split("[")[0].split("(")[0].strip()
-    bw = _TYPE_W.get(base, 16)
+    if base == "bytes":
+        fixed = _FIXED_BINARY_RE.fullmatch(str(physical_type or "").strip())
+        return int(fixed.group(1)) if fixed else None
+    bw = _TYPE_W.get(base)
     m = _VEC_RE.search(t)
-    if m:                                       # fixed-size vector/array: N elements of the base type
+    if m and bw is not None:                    # fixed-size vector/array: N elements of the base type
         return int(m.group(1)) * bw
-    if t.endswith("[]") or base in ("list", "array"):  # variable-length list — assume a modest length
-        return _LIST_ELEMS * bw
+    if t.endswith("[]"):
+        return _LIST_ELEMS * bw if bw is not None else None
+    if base in ("list", "array"):                # type-erased list — retain the existing coarse estimate
+        return _LIST_ELEMS * 16
     if base in ("struct", "map"):               # nested value with no flat width
         return _NESTED_W
     return bw
@@ -66,19 +73,53 @@ class SizeEst:
     bytes: int | None           # estimated output bytes (rows × row width); None when rows unknown
     confidence: str             # "exact" (measured/counted) · "bounded" (an upper bound) · "unknown"
     blocking: bool = False      # this node's OWN op needs ~O(input) memory (drives region placement)
+    uncertainty: str | None = None
+
+
+@dataclass(frozen=True)
+class WidthEst:
+    bytes_per_row: int | None
+    uncertainty: str | None = None
 
 
 def is_blocking(node_type: str) -> bool:
     return node_type in _BLOCKING
 
 
-def _row_width(cols) -> int:
-    """Bytes/row from a node's (display-typed) column schema, or a default when the schema is unknown."""
+def _physical_type(c) -> str | None:
+    value = c.get("physicalType", c.get("physical_type")) if isinstance(c, dict) \
+        else getattr(c, "physical_type", None)
+    return str(value) if value is not None else None
+
+
+def _estimated_row_width(cols) -> WidthEst:
+    """Bytes/row from schema evidence; missing schemas retain the established coarse fallback."""
     if not cols:
-        return _DEFAULT_ROW_BYTES
-    total = sum(_col_width(str((c.get("type") if isinstance(c, dict) else getattr(c, "type", "")) or ""))
-                for c in cols)
-    return max(total, 8)
+        return WidthEst(_DEFAULT_ROW_BYTES)
+    total = 0
+    for column in cols:
+        logical = _coltype(column)
+        width = _col_width(logical, _physical_type(column))
+        if width is None:
+            name = _colname(column) or "(unnamed)"
+            if logical.strip().lower().split("[")[0].split("(")[0].strip() == "bytes":
+                reason = (
+                    f'Binary column "{name}" has no fixed-width byte-size evidence; '
+                    "Data Playground did not scan values to guess."
+                )
+            else:
+                reason = (
+                    f'Column "{name}" has unrecognized display type "{logical or "unknown"}", '
+                    "so its byte width cannot be estimated."
+                )
+            return WidthEst(None, reason)
+        total += width
+    return WidthEst(max(total, 8))
+
+
+def _row_width(cols) -> int:
+    """Runtime batching width; admission uses `_estimated_row_width` and preserves unknown."""
+    return _estimated_row_width(cols).bytes_per_row or 16
 
 
 def _coltype(c) -> str:
@@ -92,25 +133,31 @@ def _colname(c) -> str:
 _LISTLEN_CACHE: dict[tuple[str, str, str], int] = {}
 
 
-def _source_width(resolve_adapter, uri: str, cols) -> int:
+def _source_width(resolve_adapter, uri: str, cols) -> WidthEst:
     """Bytes/row for a SOURCE — like _row_width, but for a variable-length list column (`float[]`) it
     PROBES the real average element count from a bounded sample instead of assuming _LIST_ELEMS. Parquet
     stores a fixed-size embedding as a variable list (the dimension is lost on disk), so a 4096-wide
     embedding otherwise scores 16*w and the byte confirm-gate misses the multi-GB table it targets. The
     byte gate takes the max over the cone, so getting the source right is what makes the gate fire. Memoized."""
     if not cols:
-        return _DEFAULT_ROW_BYTES
+        return WidthEst(_DEFAULT_ROW_BYTES)
     total = 0
     for c in cols:
         t = _coltype(c).strip().lower()
         base = t[:-2].strip() if t.endswith("[]") else ("list" if t.split("[")[0].split("(")[0] in ("list", "array") else None)
         if base is not None and not _VEC_RE.search(t):  # a variable list with no known dimension → probe it
             n = _probed_list_len(resolve_adapter, uri, _colname(c))
-            bw = _TYPE_W.get(base.split("[")[0].split("(")[0], 16)
+            element_type = base.split("[")[0].split("(")[0]
+            bw = 16 if element_type == "list" else _TYPE_W.get(element_type)
+            if bw is None:
+                return _estimated_row_width(cols)
             total += (n if n is not None else _LIST_ELEMS) * bw
         else:
-            total += _col_width(t)
-    return max(total, 8)
+            width = _col_width(t, _physical_type(c))
+            if width is None:
+                return _estimated_row_width(cols)
+            total += width
+    return WidthEst(max(total, 8))
 
 
 def _probed_list_len(resolve_adapter, uri: str, col: str) -> int | None:
@@ -185,8 +232,13 @@ def _counted(resolve_adapter, uri: str, revision_id: str | None = None) -> int |
     return n
 
 
-def _sized(rows: int | None, conf: str, width: int, blocking: bool = False) -> SizeEst:
-    return SizeEst(rows=rows, bytes=(rows * width if rows is not None else None), confidence=conf, blocking=blocking)
+def _sized(rows: int | None, conf: str, width: WidthEst, blocking: bool = False) -> SizeEst:
+    byts = rows * width.bytes_per_row \
+        if rows is not None and width.bytes_per_row is not None else None
+    return SizeEst(
+        rows=rows, bytes=byts, confidence=conf, blocking=blocking,
+        uncertainty=width.uncertainty if rows is not None and byts is None else None,
+    )
 
 
 def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
@@ -220,13 +272,19 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         cone = {n.id for n in g.upstream_chain(graph, target)}
         order = [n for n in order if n.id in cone]
 
-    widths: dict[str, int] = {}  # per-node per-row byte width, propagated from the MEASURED source width
+    widths: dict[str, WidthEst] = {}  # per-node width, including explicit unknown-width evidence
 
-    def width(nid: str) -> int:
-        return _row_width(schemas.get(nid))
+    def width(nid: str) -> WidthEst:
+        return _estimated_row_width(schemas.get(nid))
 
-    def in_width(nid: str) -> int:  # widest input's per-row width (0 if no sized input yet)
-        return max((widths[e.source] for e in g.incoming(graph, nid) if e.source in widths), default=0)
+    def in_width(nid: str) -> WidthEst | None:
+        candidates = [widths[e.source] for e in g.incoming(graph, nid) if e.source in widths]
+        if not candidates:
+            return None
+        unknown = next((item for item in candidates if item.bytes_per_row is None), None)
+        if unknown is not None:
+            return unknown
+        return max(candidates, key=lambda item: item.bytes_per_row or 0)
 
     def inputs(nid: str) -> list[SizeEst]:
         return [out[e.source] for e in g.incoming(graph, nid) if e.source in out]
@@ -257,7 +315,12 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
             # true per-row size — a float[1024] scored as base `float`=8B mis-sizes a region ~1000x small.
             w = _source_width(resolve_adapter, uri, schemas.get(nid))
         elif pass_through:
-            w = max(w, in_width(nid))
+            upstream = in_width(nid)
+            if upstream is not None:
+                if upstream.bytes_per_row is None or w.bytes_per_row is None:
+                    w = upstream if upstream.bytes_per_row is None else w
+                elif upstream.bytes_per_row > w.bytes_per_row:
+                    w = upstream
         widths[nid] = w
 
         # 1) a measured actual always wins (the canvas is iterative — the 2nd run has ground truth)

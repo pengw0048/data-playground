@@ -123,6 +123,8 @@ _TYPE_MAP = {
 
 def display_type(duckdb_type: str) -> str:
     t = str(duckdb_type).upper()
+    if t.startswith("FIXED_SIZE_BINARY["):
+        return "bytes"
     if t.endswith("[]"):
         return f"{display_type(t[:-2])}[]"
     if t.startswith(("DECIMAL", "NUMERIC")):

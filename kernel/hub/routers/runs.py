@@ -2190,8 +2190,8 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     placement policy, and the UI hint all share ONE estimator: also returns the full per-node `sizes` so
     the caller can hand THIS schema+actual-aware estimate to the RunController's placement (else placement
     would re-estimate with coarse default widths and the measured vector/decimal widths would be inert
-    there). (None, None, {}) when nothing is countable — the gate then errs toward NOT blocking (an
-    uncountable source can't be scanned → fails fast anyway)."""
+    there). A known row count plus an unknown column width keeps bytes=None so the confirm gate can ask;
+    (None, None, {}) when nothing is countable retains the existing fast-failure behavior."""
     from hub.estimate import estimate_sizes
     try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
         schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
@@ -2208,8 +2208,26 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
         return None, None, {}
     rows = [s.rows for s in sizes.values() if s.rows is not None]
-    byts = [s.bytes for s in sizes.values() if s.bytes is not None]
-    return (max(rows) if rows else None), (max(byts) if byts else None), sizes
+    known_row_sizes = [size for size in sizes.values() if size.rows is not None]
+    byts = [size.bytes for size in known_row_sizes if size.bytes is not None]
+    byte_size = None if any(size.bytes is None for size in known_row_sizes) \
+        else (max(byts) if byts else None)
+    return (max(rows) if rows else None), byte_size, sizes
+
+
+def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimate:
+    """Surface the first concrete missing-width fact when a known-row run needs confirmation."""
+    if estimate.rows is None or estimate.bytes is not None:
+        return estimate
+    reasons = list(dict.fromkeys(
+        size.uncertainty for size in sizes.values()
+        if size.rows is not None and size.bytes is None and size.uncertainty
+    ))
+    reason = reasons[0] if reasons else (
+        "Byte size is unknown because bounded column-width evidence is unavailable."
+    )
+    estimate.breakdown = f"{estimate.breakdown} · confirmation required: {reason}"
+    return estimate
 
 
 def _metadata_only_cone_size(
@@ -2336,7 +2354,7 @@ def run_estimate(req: EstimateRequest, uid: str = Depends(current_user)) -> RunE
     if multi_output:
         _controller_regions_for_run(
             deps, graph, req.target_node_id, output_target, sizes, multi_output=True)
-    est = runner.estimate(plan, rows, byts)
+    est = _explain_unknown_byte_size(runner.estimate(plan, rows, byts), sizes)
     return est
 
 
@@ -2740,7 +2758,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(
             409, "the selected execution owner cannot consume the managed-local write admission; "
             "discard it and retry with an in-process local plan")
-    est = runner.estimate(plan, rows, byts)
+    est = _explain_unknown_byte_size(runner.estimate(plan, rows, byts), sizes)
     if est.needs_confirm and not confirmed:
         raise RunNeedsConfirm(est)
     durable_managed_write = effective_write_intent is not None and (
