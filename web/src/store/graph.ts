@@ -991,6 +991,8 @@ export interface AgentMsg { role: 'user' | 'agent'; text: string; plan?: string[
 
 export interface NodeRevealRequest { id: number; canvasId: string; nodeId: string }
 export interface CanvasViewportFitRequest { id: number; canvasId: string; documentIdentity: string }
+export interface ToastAction { label: string; onClick: () => void | Promise<unknown> }
+export interface ToastOptions { actions?: ToastAction[]; dedupeKey?: string }
 
 // Fit identity is deliberately geometry-only: transient run badges may settle while React Flow is
 // measuring, but a different node set or position must never consume an example's viewport request.
@@ -1164,8 +1166,8 @@ interface Store {
   openCodeFullscreen: (nodeId: string, param: string, lang?: string) => void
   closeCodeFullscreen: () => void
   // transient notifications surfaced as toasts (errors/info) — so failures aren't silent
-  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string }[]
-  pushToast: (msg: string, kind?: 'error' | 'info' | 'success') => void
+  toasts: { id: string; kind: 'error' | 'info' | 'success'; msg: string; actions?: ToastAction[]; dedupeKey?: string }[]
+  pushToast: (msg: string, kind?: 'error' | 'info' | 'success', options?: ToastOptions) => void
   dismissToast: (id: string) => void
   // realtime collaboration presence: other people currently on this canvas (live cursors + avatars)
   peers: Record<string, { name: string; color: string; cursor?: { x: number; y: number } }>
@@ -1525,9 +1527,10 @@ export const useStore = create<Store>((set, get) => ({
   dropPeer: (id) => set((s) => { const peers = { ...s.peers }; delete peers[id]; return { peers } }),
   clearPeers: () => set({ peers: {} }),
   toasts: [],
-  pushToast: (msg, kind = 'info') => {
+  pushToast: (msg, kind = 'info', options) => {
+    if (options?.dedupeKey && get().toasts.some((toast) => toast.dedupeKey === options.dedupeKey)) return
     const id = `t_${Math.floor(performance.now())}_${Math.random().toString(36).slice(2, 6)}`
-    set((s) => ({ toasts: [...s.toasts, { id, kind, msg }] }))
+    set((s) => ({ toasts: [...s.toasts, { id, kind, msg, ...options }] }))
     setTimeout(() => get().dismissToast(id), kind === 'error' ? 7000 : 4000)
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
@@ -3473,7 +3476,7 @@ export const useStore = create<Store>((set, get) => ({
       const conflict = error instanceof KernelError && (error.status === 404 || error.status === 409)
       const denied = error instanceof KernelError && (error.status === 401 || error.status === 403)
       const message = conflict
-        ? 'The server Canvas changed or was deleted. Open the server copy or keep this draft as a new Canvas.'
+        ? 'The server Canvas changed or was deleted. Your local draft is preserved; keep it as a new Canvas to continue editing.'
         : denied
           ? 'Current access does not permit syncing this draft.'
           : `Sync failed: ${error instanceof Error ? error.message : 'the hub is unreachable'}`
@@ -3496,7 +3499,19 @@ export const useStore = create<Store>((set, get) => ({
         set({ accessDenied: true, canvasRole: null, agentOpen: false })
         void get().refreshFiles()
       }
-      get().pushToast(stored.ok ? message : stored.error!, 'error')
+      get().pushToast(stored.ok ? message : stored.error!, 'error', conflict && stored.ok ? {
+        dedupeKey: `canvas-sync-conflict:${failed.draftId}`,
+        actions: [
+          ...(failed.baseCanvasId ? [{
+            label: 'Open server copy',
+            onClick: () => get().openFile(failed.baseCanvasId!, { serverCopy: true }),
+          }] : []),
+          {
+            label: 'Keep local draft as new Canvas',
+            onClick: () => get().forkLocalDraft(failed.draftId),
+          },
+        ],
+      } : undefined)
       _draftSyncInFlight.delete(syncKey)
     }
   },
