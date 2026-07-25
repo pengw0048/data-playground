@@ -664,12 +664,12 @@ def _resolve_write_sink_or_typed_error(spec, deps) -> str:
 def _preflight_write_target_destination(deps, graph, node_id: str) -> None:
     """Reject an unknown Write destination with a typed 4xx before a run claim exists, on paths that
     skip write admission (direct API / MCP callers supply no submissionId)."""
-    from hub.sinks import SinkSpec
+    from hub.sinks import api_sink_spec
     node = next((candidate for candidate in graph.nodes if candidate.id == node_id), None)
     if node is None or node.type != "write":
         return
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-    spec = SinkSpec.from_config(
+    spec = api_sink_spec(
         cfg, node.data.get("title") if isinstance(node.data, dict) else None)
     _resolve_write_sink_or_typed_error(spec, deps)
 
@@ -719,7 +719,7 @@ def _write_admission_for_graph(
     """Resolve one metadata-only Write card contract without allocating an artifact."""
     from hub.plugins.catalog import InMemoryCatalog, lineage_for_output
     from hub.sinks import (
-        SinkSpec, is_core_managed_local_file_sink,
+        api_sink_spec, is_core_managed_local_file_sink,
         is_core_managed_local_lance_append_sink,
     )
 
@@ -727,7 +727,7 @@ def _write_admission_for_graph(
     if node is None or node.type != "write":
         raise HTTPException(400, f"node '{node_id}' is not a write")
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
-    spec = SinkSpec.from_config(
+    spec = api_sink_spec(
         cfg, node.data.get("title") if isinstance(node.data, dict) else None)
     logical_uri = _resolve_write_sink_or_typed_error(spec, deps)
     adapter = deps.resolve_adapter(logical_uri)

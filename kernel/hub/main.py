@@ -341,6 +341,8 @@ async def _stable_api_http_error(request: Request, exc: StarletteHTTPException):
             detail=exc.detail,
             code=code,
             retryable=retryable,
+            field=getattr(exc, "field", None),
+            reason=getattr(exc, "reason", None),
             headers=exc.headers,
         )
     return await http_exception_handler(request, exc)

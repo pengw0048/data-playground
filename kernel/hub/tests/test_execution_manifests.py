@@ -547,6 +547,7 @@ def test_receipt_and_canvas_lineage_retain_manifest_after_run_owner_pruning(monk
 
     receipt = WriteReceipt(
         dataset_id="dataset-output", revision_id="revision-output",
+        name="result",
         parent_head=ExactDatasetRef(
             kind="exact", dataset_id="dataset-output", revision_id="revision-parent"),
         head=DatasetRevision(

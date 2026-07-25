@@ -18267,6 +18267,10 @@ def _managed_local_write_receipt_in_session(
         receipt = WriteReceipt.model_validate(json.loads(revision.write_receipt_doc or ""))
     except (TypeError, ValueError) as exc:
         raise RuntimeError("managed local write receipt is invalid") from exc
+    try:
+        revision_name = json.loads(revision.table_doc).get("name")
+    except (TypeError, ValueError):
+        revision_name = None
     ref = s.get(LocalResultReference, {
         "uri": revision.artifact_uri,
         "owner_kind": "managed_file_revision",
@@ -18279,6 +18283,7 @@ def _managed_local_write_receipt_in_session(
             or receipt.publication.idempotency_key != idempotency_key
             or receipt.provenance.publication.run_id != revision.run_id
             or receipt.execution_manifest_sha256 != revision.execution_manifest_sha256
+            or receipt.name != revision_name
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
@@ -18329,6 +18334,10 @@ def _managed_local_lance_write_receipt_in_session(
         receipt = WriteReceipt.model_validate(json.loads(row.write_receipt_doc))
     except (TypeError, ValueError) as exc:
         raise RuntimeError("managed local Lance write receipt is invalid") from exc
+    try:
+        intent_name = json.loads(intent_doc)["destination"]["name"]
+    except (KeyError, TypeError, ValueError):
+        intent_name = None
     if (receipt.dataset_id != row.dataset_id
             or receipt.revision_id != row.revision_id
             or receipt.publication.provider != "managed-local-lance"
@@ -18338,6 +18347,8 @@ def _managed_local_lance_write_receipt_in_session(
             or receipt.provenance.publication.run_id != row.run_id
             or receipt.execution_manifest_sha256 != row.execution_manifest_sha256):
         raise RuntimeError("managed local Lance write receipt lost its exact revision evidence")
+    if receipt.name != intent_name:
+        raise RuntimeError("managed local Lance write receipt changed its dataset name")
     return receipt.model_dump(by_alias=True, mode="json")
 
 
@@ -18624,6 +18635,7 @@ def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
         expected = intent.expected_head
         if (expected is None
                 or receipt.dataset_id != intent.destination.dataset_id
+                or receipt.name != intent.destination.name
                 or receipt.head.dataset_id != receipt.dataset_id
                 or receipt.head.revision_id != receipt.revision_id
                 or receipt.parent_head != expected
@@ -18887,6 +18899,7 @@ def catalog_publish_managed_local_file(
             receipt = WriteReceipt(
                 dataset_id=logical.logical_id,
                 revision_id=revision_id,
+                name=typed_intent.destination.name,
                 parent_head=parent_head,
                 head=DatasetRevision(
                     dataset_id=logical.logical_id,

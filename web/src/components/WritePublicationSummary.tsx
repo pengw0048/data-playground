@@ -28,6 +28,7 @@ function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
     </button>
     {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-background p-2 text-muted-foreground">
       <div className="font-semibold text-foreground">Exact revision {detail.datasetId}@{detail.revisionId}</div>
+      {detail.name && <div>Name <span className="font-mono">{detail.name}</span></div>}
       <div>Committed {detail.committedAt ?? 'unknown'}</div>
       <div>{detail.summary?.rowCount?.toLocaleString?.() ?? 'unknown'} rows · {schemaFieldCount} schema {schemaFieldCount === 1 ? 'field' : 'fields'}</div>
       <div>{detail.parentRevisionId ? <>Parent <span className="font-mono">{detail.parentRevisionId}</span></> : 'No parent revision'}</div>
@@ -112,9 +113,12 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
   const summaryAdmission = completed ? outcomeAdmission : admission
+  const acceptedName = receipt?.name
+    ?? summaryAdmission?.intent?.destination.name
+    ?? outputName
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
-      <div><span className="font-semibold text-foreground">Output name</span><div className="font-mono text-foreground">{outputName}</div></div>
+      <div><span className="font-semibold text-foreground">Output name</span><div className="font-mono text-foreground">{acceptedName}</div></div>
       <div><span className="font-semibold text-foreground">Destination</span><div className="text-muted-foreground">{destination}</div></div>
       <div><span className="font-semibold text-foreground">Publication mode</span><div className="text-muted-foreground">{publicationMode(summaryAdmission?.mode)}</div></div>
       {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
@@ -124,7 +128,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
         : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish</div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <strong>{outputName} published</strong> · {receipt.rows.toLocaleString()} rows
+        <strong>{acceptedName} published</strong> · {receipt.rows.toLocaleString()} rows
         <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
       </div>}
     </div>

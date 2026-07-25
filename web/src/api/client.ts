@@ -23,12 +23,32 @@ export class KernelError extends Error {
   status: number
   code?: string
   retryable?: boolean
-  constructor(status: number, message: string, code?: string, retryable?: boolean) {
+  field?: string
+  reason?: string
+  constructor(
+    status: number, message: string, code?: string, retryable?: boolean,
+    field?: string, reason?: string,
+  ) {
     super(message)
     this.status = status
     this.code = code
     this.retryable = retryable
+    this.field = field
+    this.reason = reason
   }
+}
+
+export function managedDatasetNameErrorMessage(error: unknown): string | null {
+  if (!(error instanceof KernelError)
+      || error.code !== 'invalid_managed_dataset_name'
+      || error.field !== 'filename') return null
+  if (error.reason === 'blank') return 'Enter a managed dataset name.'
+  if (error.reason === 'path_syntax') return 'Use one managed dataset name, without a path or URI.'
+  if (error.reason === 'surrounding_whitespace') {
+    return 'Remove whitespace before or after the managed dataset name.'
+  }
+  if (error.reason === 'invalid_type') return 'Enter the managed dataset name as text.'
+  return 'Enter a valid managed dataset name.'
 }
 
 export interface CanvasCopyRequest {
@@ -52,16 +72,21 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
     let detail = res.statusText
     let code: string | undefined
     let retryable: boolean | undefined
+    let field: string | undefined
+    let reason: string | undefined
     try {
       const body = await res.json()
       detail = body.detail ?? detail
       code = typeof body.code === 'string' ? body.code : undefined
       retryable = typeof body.retryable === 'boolean' ? body.retryable : undefined
+      field = typeof body.field === 'string' ? body.field : undefined
+      reason = typeof body.reason === 'string' ? body.reason : undefined
     } catch {
       /* noop */
     }
     throw new KernelError(
-      res.status, typeof detail === 'string' ? detail : JSON.stringify(detail), code, retryable,
+      res.status, typeof detail === 'string' ? detail : JSON.stringify(detail),
+      code, retryable, field, reason,
     )
   }
   return res.json() as Promise<T>

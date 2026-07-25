@@ -1,5 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
-import { api, KernelError, setApiUser, toGraph, toMergeColumnsGraph } from './client'
+import {
+  api, KernelError, managedDatasetNameErrorMessage, setApiUser, toGraph, toMergeColumnsGraph,
+} from './client'
 import type { CanvasDoc } from '../types/graph'
 import type { WriteIntent } from '../types/api'
 
@@ -20,6 +22,42 @@ describe('API error recovery contract', () => {
       status: 503, message: 'dataset_revision_provider_offline',
       code: 'service_unavailable', retryable: true,
     })
+  })
+
+  it('preserves field-specific managed-name diagnostics without parsing detail', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      detail: 'localized prose may change',
+      code: 'invalid_managed_dataset_name',
+      retryable: false,
+      field: 'filename',
+      reason: 'path_syntax',
+    }), { status: 422, headers: { 'Content-Type': 'application/json' } }))
+
+    const doc: CanvasDoc = {
+      id: 'managed-name-error',
+      version: 1,
+      nodes: [{
+        id: 'write',
+        type: 'write',
+        position: { x: 0, y: 0 },
+        data: { title: 'write', config: { filename: '../escape.parquet' } },
+      }],
+      edges: [],
+    }
+    const error = await api.writeAdmission(
+      doc,
+      'write',
+      '11111111-1111-4111-8111-111111111111',
+    ).catch((caught) => caught)
+    expect(error).toBeInstanceOf(KernelError)
+    expect(error).toMatchObject({
+      status: 422,
+      code: 'invalid_managed_dataset_name',
+      field: 'filename',
+      reason: 'path_syntax',
+    })
+    expect(managedDatasetNameErrorMessage(error)).toBe(
+      'Use one managed dataset name, without a path or URI.')
   })
 })
 

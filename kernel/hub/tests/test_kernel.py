@@ -9972,7 +9972,7 @@ def test_assert_node_is_a_transparent_gate_before_a_write(tmp_path):
         return Graph(**{"id": "c", "version": 1, "nodes": [
             N("s", "source", {"uri": ev}),
             N("a", "assert", {"predicate": pred, "severity": sev}),
-            N("wr", "write", {"filename": str(tmp_path / "asserted.parquet")}),
+            N("wr", "write", {"filename": f"asserted-{tmp_path.name}.parquet"}),
         ], "edges": [E("s", "a"), E("a", "wr", "pass")]})  # write reads the PASSTHROUGH handle
 
     # the two ports are distinct: 'out' (default) = violations, 'pass' = every input row
@@ -14770,7 +14770,7 @@ def test_ray_whole_run_enforces_and_forwards_final_region_resources(tmp_path, mo
         edges = []
         if with_write:
             nodes.append(_ray_node(
-                "write", "write", {"filename": str(tmp_path / "ray-final.parquet")}
+                "write", "write", {"filename": "ray-final.parquet"}
             ))
             edges.append(_ray_edge("src", "write"))
         return Graph(**{

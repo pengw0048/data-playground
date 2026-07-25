@@ -373,6 +373,7 @@ def test_managed_sidecar_terminal_cleanup_race_refreshes_status_and_jobs(tmp_pat
             now = metadb._durable_task_db_now(session)
             receipt = WriteReceipt(
                 dataset_id="terminal-race", revision_id=f"revision-{task_id}",
+                name=f"terminal-race-{task_id}",
                 head=DatasetRevision(
                     dataset_id="terminal-race", revision_id=f"revision-{task_id}"),
                 rows=3, bytes=30, schema=[],

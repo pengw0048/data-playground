@@ -131,6 +131,7 @@ def _lance_append_receipt(intent: WriteIntent, adapter, backend_version: str) ->
     return WriteReceipt(
         dataset_id=dataset_id,
         revision_id=str(committed_version),
+        name=intent.destination.name,
         parent_head=expected,
         head=DatasetRevision(
             dataset_id=dataset_id,

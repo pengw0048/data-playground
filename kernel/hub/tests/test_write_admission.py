@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -12,10 +13,13 @@ import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from hub import db, metadb
 from hub.api_errors import APIErrorCode
-from hub.models import ColumnSchema, Graph
+from hub.models import (
+    ColumnSchema, Graph, PerNodeStatus, RunOutput, RunStatus, WriteAdmission,
+)
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
@@ -133,6 +137,212 @@ def _publish(deps, admission, values):
         intent=admission.intent,
         write_artifact=writer,
     )
+
+
+def _managed_publication_counts() -> tuple[int, int, int]:
+    with metadb.session() as session:
+        return tuple(int(session.scalar(
+            select(func.count()).select_from(model)) or 0) for model in (
+                metadb.CatalogEntry,
+                metadb.CatalogLogicalDataset,
+                metadb.ManagedLocalFileRevision,
+            ))
+
+
+def _run_allocation_counts() -> tuple[int, int, int, int]:
+    with metadb.session() as session:
+        return tuple(int(session.scalar(
+            select(func.count()).select_from(model)) or 0) for model in (
+                metadb.RunState,
+                metadb.RunRecord,
+                metadb.RunInputAdmission,
+                metadb.DurableTask,
+            ))
+
+
+@pytest.mark.parametrize(
+    ("filename", "reason"),
+    [
+        ("", "blank"),
+        ("   ", "blank"),
+        ("../escape.parquet", "path_syntax"),
+        ("nested/output.parquet", "path_syntax"),
+        (r"nested\output.parquet", "path_syntax"),
+    ],
+)
+def test_managed_name_admission_returns_field_error_without_publication(
+        contract, monkeypatch, filename, reason):
+    deps, graph = contract
+    next(node for node in graph.nodes if node.id == "write").data["config"]["filename"] = filename
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    before_publications = _managed_publication_counts()
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "nodeId": "write",
+        "submissionId": "10111111-1111-4111-8111-111111111111",
+    })
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {
+        "detail": (
+            "managed dataset name must not be blank"
+            if reason == "blank"
+            else "managed dataset name must be one name, not a path or URI"
+        ),
+        "code": APIErrorCode.INVALID_MANAGED_DATASET_NAME,
+        "retryable": False,
+        "field": "filename",
+        "reason": reason,
+    }
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+    assert _managed_publication_counts() == before_publications
+
+
+def test_direct_run_returns_the_same_name_error_before_run_allocation(
+        contract, monkeypatch):
+    deps, graph = contract
+    next(node for node in graph.nodes if node.id == "write").data["config"][
+        "filename"] = "../escape.parquet"
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+        "confirmed": True,
+    })
+
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == APIErrorCode.INVALID_MANAGED_DATASET_NAME
+    assert response.json()["field"] == "filename"
+    assert response.json()["reason"] == "path_syntax"
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_normal_managed_name_is_preserved_across_admission_receipt_catalog_and_revision(
+        contract, monkeypatch):
+    from hub.routers import catalog as catalog_routes
+
+    deps, graph = contract
+    write = next(node for node in graph.nodes if node.id == "write")
+    write.data["config"]["filename"] = "family cost"
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: deps)
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "nodeId": "write",
+        "submissionId": "10222222-2222-4222-8222-222222222222",
+    })
+
+    assert response.status_code == 200, response.text
+    admission = WriteAdmission.model_validate(response.json())
+    assert admission.intent is not None
+    assert write.data["config"]["filename"] == admission.intent.destination.name == "family cost"
+
+    receipt = _publish(deps, admission, [1, 2])
+    table = deps.catalog.get_table(receipt.dataset_id)
+    assert receipt.name == table.name == admission.intent.destination.name
+    assert receipt.publication.logical_uri == admission.intent.destination.logical_uri
+    assert os.path.splitext(os.path.basename(receipt.publication.logical_uri))[0] == table.name
+
+    with metadb.session() as session:
+        revision = session.get(metadb.ManagedLocalFileRevision, receipt.revision_id)
+        assert revision is not None
+        assert json.loads(revision.table_doc)["name"] == table.name
+
+    exact = TestClient(app).get(
+        f"/api/catalog/revisions/{receipt.dataset_id}/{receipt.revision_id}")
+    assert exact.status_code == 200, exact.text
+    assert exact.json()["datasetId"] == receipt.dataset_id
+    assert exact.json()["revisionId"] == receipt.revision_id
+    assert exact.json()["name"] == receipt.name
+
+    metadb.catalog_set_metadata(
+        table.uri,
+        folder="",
+        owner=None,
+        description=None,
+        tags=[],
+        name="current friendly name",
+    )
+    assert deps.catalog.get_table(receipt.dataset_id).name == "current friendly name"
+    exact_after_rename = TestClient(app).get(
+        f"/api/catalog/revisions/{receipt.dataset_id}/{receipt.revision_id}")
+    assert exact_after_rename.status_code == 200, exact_after_rename.text
+    assert exact_after_rename.json()["name"] == receipt.name
+
+
+def test_every_execution_sink_boundary_rejects_invalid_name_before_effect(contract):
+    from hub.compiler import compile_plan
+    from hub.plugins.runner import LocalRunner, _CancelToken
+    from hub.sinks import ManagedDatasetNameError, SinkSpec
+    from hub.subprocess_runner import SubprocessRunner
+
+    deps, graph = contract
+    write = next(node for node in graph.nodes if node.id == "write")
+    write.data["config"]["filename"] = "../escape.parquet"
+    plan = compile_plan(graph, "write", deps.registry, deps.node_specs)
+    status = RunStatus(
+        run_id="invalid-name-execution",
+        status="queued",
+        target_node_id="write",
+        per_node=[PerNodeStatus(node_id="write", status="queued", label="write")],
+        outputs=[RunOutput(
+            node_id="write",
+            port_id="out",
+            wire="dataset",
+            publication_kind="catalog",
+            outcome="pending",
+        )],
+    )
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    before_publications = _managed_publication_counts()
+    local = LocalRunner(
+        deps.resolve_adapter,
+        deps.registry,
+        deps.catalog,
+        deps.workspace,
+        node_specs=deps.node_specs,
+        storage=deps.storage,
+    )
+
+    with pytest.raises(ManagedDatasetNameError, match="not a path"):
+        local._run_object_store_cfg(plan, {"write": write})
+    with pytest.raises(ManagedDatasetNameError, match="not a path"):
+        local._commit_write(
+            write, graph, None, status, None, _CancelToken())
+
+    isolated = SubprocessRunner(
+        deps.workspace,
+        deps.catalog.data_dir,
+        catalog=deps.catalog,
+        storage=deps.storage,
+        resolve_adapter=deps.resolve_adapter,
+        node_specs=deps.node_specs,
+        registry=deps.registry,
+    )
+    with pytest.raises(ManagedDatasetNameError, match="not a path"):
+        isolated._claim_sink_contracts(plan, graph, status.run_id, status)
+
+    with pytest.raises(ManagedDatasetNameError, match="not a path"):
+        SinkSpec(
+            name="../escape",
+            filename="../escape.parquet",
+            extension=".parquet",
+            mode="overwrite",
+            destination_id=None,
+            destination_path="",
+            partition_by="",
+        )
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+    assert _managed_publication_counts() == before_publications
 
 
 def test_preflight_is_metadata_only_and_derives_create_then_replace(contract):

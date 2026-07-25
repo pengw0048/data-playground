@@ -6,6 +6,7 @@
         "enum": [
           "invalid_request",
           "invalid_graph",
+          "invalid_managed_dataset_name",
           "row_reference_target_mismatch",
           "identity_reference_required",
           "identity_reference_unavailable",
@@ -43,6 +44,30 @@
           "detail": {
             "description": "Human-readable detail; clients must not parse this value.",
             "title": "Detail"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Request field associated with a field-specific error.",
+            "title": "Field"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable field-specific reason; clients must not infer it from detail.",
+            "title": "Reason"
           },
           "retryable": {
             "description": "Whether the server knows that retrying the same request is safe under this operation's semantics.",
@@ -1239,6 +1264,19 @@
             "minLength": 1,
             "title": "Datasetid",
             "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
           },
           "parentRevisionId": {
             "anyOf": [
@@ -10409,6 +10447,30 @@
             "description": "Human-readable detail; clients must not parse this value.",
             "title": "Detail"
           },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Request field associated with a field-specific error.",
+            "title": "Field"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable field-specific reason; clients must not infer it from detail.",
+            "title": "Reason"
+          },
           "retryable": {
             "description": "Whether the server knows that retrying the same request is safe under this operation's semantics.",
             "title": "Retryable",
@@ -13382,6 +13444,12 @@
           "head": {
             "$ref": "#/components/schemas/DatasetRevision"
           },
+          "name": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
           "parentHead": {
             "anyOf": [
               {
@@ -13430,6 +13498,7 @@
         "required": [
           "datasetId",
           "revisionId",
+          "name",
           "head",
           "rows",
           "bytes",

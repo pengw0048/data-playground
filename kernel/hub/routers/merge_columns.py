@@ -28,7 +28,7 @@ from hub.models import (
 )
 from hub.plugins.catalog import InMemoryCatalog
 from hub.security import current_user
-from hub.sinks import SinkSpec, is_core_managed_local_file_sink, preflight_sink
+from hub.sinks import api_sink_spec, is_core_managed_local_file_sink, preflight_sink
 from hub.sparse_outputs import (
     SparseOutputAdmissionRequest, SparseOutputError, SparseOutputMaterializationConflict,
     admit_sparse_output, materialize_sparse_output, prepare_sparse_output_admission,
@@ -178,7 +178,7 @@ def _request_sha256(request: MergeColumnsRequestV1) -> str:
         raise APIError(409, "merge-columns requires one exact Source revision",
                        code=APIErrorCode.CONFLICT, retryable=False)
     try:
-        spec = SinkSpec.from_config(
+        spec = api_sink_spec(
             _node_config(write), write.data.get("title") if isinstance(write.data, dict) else None)
     except ValueError:
         raise APIError(409, "merge-columns requires the default managed-local Parquet destination",
@@ -261,7 +261,7 @@ def _prepared(request: MergeColumnsRequestV1, uid: str):
                        code=APIErrorCode.CONFLICT, retryable=False)
     deps = get_deps()
     try:
-        spec = SinkSpec.from_config(
+        spec = api_sink_spec(
             _node_config(write), write.data.get("title") if isinstance(write.data, dict) else None)
         logical_uri = preflight_sink(spec, deps.workspace, deps.storage, deps.resolve_adapter)
         adapter = deps.resolve_adapter(logical_uri)

@@ -974,6 +974,7 @@ class ManagedLocalFileRevisionAdapter:
             table = detail["table"]
             return {
                 "revision_id": detail["revision_id"],
+                "name": table.name,
                 "committed_at": detail["committed_at"],
                 "parent_revision_id": detail["parent_revision_id"],
                 "producer_operation": "overwrite",

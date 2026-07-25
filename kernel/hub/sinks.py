@@ -19,6 +19,54 @@ _KNOWN_EXTENSIONS = (
 _FORMAT_EXTENSIONS = {"parquet": ".parquet", "csv": ".csv", "lance": ".lance"}
 
 
+class ManagedDatasetNameError(ValueError):
+    """A logical managed-dataset name that cannot be interpreted without rewriting it."""
+
+    field = "filename"
+
+    def __init__(self, detail: str, *, reason: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+
+
+def managed_dataset_name(
+        value: object, *, format_name: object = "parquet") -> tuple[str, str, str]:
+    """Return the exact logical name, physical filename, and extension for one Write name.
+
+    A logical dataset name is one basename, never a path or URI. Accepted characters are preserved
+    byte-for-byte; this boundary rejects inputs that would otherwise require silent sanitization.
+    """
+
+    if not isinstance(value, str):
+        raise ManagedDatasetNameError(
+            "managed dataset name must be a string", reason="invalid_type")
+    if not value.strip():
+        raise ManagedDatasetNameError(
+            "managed dataset name must not be blank", reason="blank")
+    if value != value.strip():
+        raise ManagedDatasetNameError(
+            "managed dataset name must not contain surrounding whitespace",
+            reason="surrounding_whitespace",
+        )
+    if (
+        value.strip(".") == ""
+        or any(character in value for character in ("/", "\\", "\x00", ":"))
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ManagedDatasetNameError(
+            "managed dataset name must be one name, not a path or URI",
+            reason="path_syntax",
+        )
+
+    name, extension = os.path.splitext(value)
+    filename = value
+    if extension.lower() not in _KNOWN_EXTENSIONS:
+        extension = _FORMAT_EXTENSIONS.get(str(format_name or "parquet").lower(), ".parquet")
+        name = value
+        filename = f"{value}{extension}"
+    return name, filename, extension
+
+
 @dataclass(frozen=True)
 class SinkSpec:
     """Normalized, provider-neutral write-node configuration."""
@@ -31,19 +79,25 @@ class SinkSpec:
     destination_path: str
     partition_by: str
 
+    def __post_init__(self) -> None:
+        # Keep direct construction from bypassing the same invariant enforced by ``from_config``.
+        name, filename, extension = managed_dataset_name(self.filename)
+        if (self.name, self.filename, self.extension) != (name, filename, extension):
+            raise ValueError("sink name, filename, and extension must describe one exact dataset name")
+
     @classmethod
     def from_config(cls, config: dict | None, title: str | None = None) -> "SinkSpec":
         cfg = config or {}
-        raw = cfg.get("filename") or cfg.get("name") or title or "output"
-        filename = (
-            "".join(c if c.isalnum() or c in "_-." else "_" for c in str(raw)).strip(".")
-            or "output"
-        )
-        name, extension = os.path.splitext(filename)
-        if extension.lower() not in _KNOWN_EXTENSIONS:
-            extension = _FORMAT_EXTENSIONS.get(str(cfg.get("format") or "parquet").lower(), ".parquet")
-            name = filename
-            filename = f"{filename}{extension}"
+        if "filename" in cfg:
+            raw = cfg["filename"]
+        elif "name" in cfg:
+            raw = cfg["name"]
+        elif title:
+            raw = title
+        else:
+            raw = "output"
+        name, filename, extension = managed_dataset_name(
+            raw, format_name=cfg.get("format") or "parquet")
 
         mode = cfg.get("writeMode") or "overwrite"
         if mode not in ("overwrite", "append"):
@@ -74,6 +128,24 @@ class SinkSpec:
                 workspace, self.destination_id, self.destination_path, self.filename
             )
         return storage.output_uri(self.name, self.extension)
+
+
+def api_sink_spec(config: dict | None, title: str | None = None) -> SinkSpec:
+    """Build the shared sink contract and preserve name diagnostics in the HTTP error envelope."""
+
+    try:
+        return SinkSpec.from_config(config, title)
+    except ManagedDatasetNameError as exc:
+        from hub.api_errors import APIError, APIErrorCode
+
+        raise APIError(
+            422,
+            str(exc),
+            code=APIErrorCode.INVALID_MANAGED_DATASET_NAME,
+            retryable=False,
+            field=exc.field,
+            reason=exc.reason,
+        ) from exc
 
 
 @dataclass(frozen=True)

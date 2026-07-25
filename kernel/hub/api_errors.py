@@ -24,6 +24,7 @@ class APIErrorCode(StrEnum):
 
     INVALID_REQUEST = "invalid_request"
     INVALID_GRAPH = "invalid_graph"
+    INVALID_MANAGED_DATASET_NAME = "invalid_managed_dataset_name"
     ROW_REFERENCE_TARGET_MISMATCH = "row_reference_target_mismatch"
     IDENTITY_REFERENCE_REQUIRED = "identity_reference_required"
     IDENTITY_REFERENCE_UNAVAILABLE = "identity_reference_unavailable"
@@ -59,6 +60,14 @@ class APIErrorResponse(BaseModel):
             "Whether the server knows that retrying the same request is safe under this operation's "
             "semantics."
         )
+    )
+    field: str | None = Field(
+        default=None,
+        description="Request field associated with a field-specific error.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Stable field-specific reason; clients must not infer it from detail.",
     )
 
 
@@ -109,11 +118,15 @@ class APIError(HTTPException):
         *,
         code: APIErrorCode,
         retryable: bool,
+        field: str | None = None,
+        reason: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(status_code=status_code, detail=detail, headers=headers)
         self.code = code
         self.retryable = retryable
+        self.field = field
+        self.reason = reason
 
 
 def classify_http_error(exc: HTTPException) -> tuple[APIErrorCode, bool]:
@@ -135,15 +148,22 @@ def api_error_response(
     detail: Any,
     code: APIErrorCode,
     retryable: bool,
+    field: str | None = None,
+    reason: str | None = None,
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Serialize the stable envelope without changing the existing ``detail`` value."""
 
+    content = {"detail": detail, "code": code, "retryable": retryable}
+    if field is not None:
+        content["field"] = field
+    if reason is not None:
+        content["reason"] = reason
     return JSONResponse(
         status_code=status_code,
         # Encode the original detail directly. RequestValidationError may carry exception objects in
         # ``ctx``; FastAPI's jsonable_encoder handles those, while forcing them through a Pydantic
         # model's JSON serializer first would fail before the compatibility field reaches the wire.
-        content=jsonable_encoder({"detail": detail, "code": code, "retryable": retryable}),
+        content=jsonable_encoder(content),
         headers=headers,
     )
