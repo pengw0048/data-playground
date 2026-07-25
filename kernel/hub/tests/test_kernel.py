@@ -10262,11 +10262,44 @@ def test_row_width_accounts_for_vector_and_list_columns():
     assert _col_width("struct") >= 64              # nested value, coarse
     assert _col_width("bytes") is None              # variable payload: no fabricated scalar width
     assert _col_width("bytes[]") is None
-    assert _col_width("blob") is None               # dead display aliases do not silently reappear
-    assert _col_width("bytea") is None
+    assert _col_width("blob") == 16                 # dead display aliases use the generic scalar fallback
+    assert _col_width("bytea") == 16
     assert _col_width("bytes", "fixed_size_binary[16]") == 16
     wide = _row_width([{"name": "id", "type": "int"}, {"name": "emb", "type": "float[1024]"}])
     assert wide >= 1024 * 8 and wide > _row_width([{"name": "id", "type": "int"}]) * 100
+    mixed = _row_width([
+        {"name": "payload", "type": "bytes", "physicalType": "BLOB"},
+        {"name": "embedding", "type": "float[4096]"},
+    ])
+    assert mixed == 16 + 4096 * 8  # runtime batching keeps the known vector contribution
+
+
+def test_unmapped_non_binary_types_keep_small_estimates_known():
+    from hub import compiler
+    from hub.estimate import _col_width, estimate_sizes
+    from hub.models import Graph
+
+    deps = get_deps()
+    for logical_type in ("utinyint", "usmallint", "uinteger", "timestamp_s", "timestamp_ms", "timestamp_ns"):
+        assert _col_width(logical_type) == 16
+
+    graph = Graph(**{
+        "id": "fallback-widths", "version": 1,
+        "nodes": [N("s", "source", {"uri": _uri("events")})],
+        "edges": [],
+    })
+    estimate = estimate_sizes(
+        graph, deps.resolve_adapter,
+        schemas={"s": [
+            {"name": "count", "type": "uinteger", "physicalType": "UINTEGER"},
+            {"name": "captured_at", "type": "timestamp_ms", "physicalType": "TIMESTAMP_MS"},
+        ]},
+        actuals={"s": 10},
+    )["s"]
+    assert estimate.rows == 10 and estimate.bytes == 10 * 32
+    assert estimate.uncertainty is None
+    plan = compiler.compile_plan(graph, "s", deps.registry, deps.node_specs)
+    assert deps.runner.estimate(plan, estimate.rows, estimate.bytes).needs_confirm is False
 
 
 def test_source_metadata_count_is_memoized_by_fingerprint():

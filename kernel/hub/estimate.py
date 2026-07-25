@@ -54,12 +54,12 @@ def _col_width(t: str, physical_type: str | None = None) -> int | None:
     if base == "bytes":
         fixed = _FIXED_BINARY_RE.fullmatch(str(physical_type or "").strip())
         return int(fixed.group(1)) if fixed else None
-    bw = _TYPE_W.get(base)
+    bw = _TYPE_W.get(base, 16)
     m = _VEC_RE.search(t)
-    if m and bw is not None:                    # fixed-size vector/array: N elements of the base type
+    if m:                                       # fixed-size vector/array: N elements of the base type
         return int(m.group(1)) * bw
     if t.endswith("[]"):
-        return _LIST_ELEMS * bw if bw is not None else None
+        return _LIST_ELEMS * bw
     if base in ("list", "array"):                # type-erased list — retain the existing coarse estimate
         return _LIST_ELEMS * 16
     if base in ("struct", "map"):               # nested value with no flat width
@@ -102,24 +102,24 @@ def _estimated_row_width(cols) -> WidthEst:
         width = _col_width(logical, _physical_type(column))
         if width is None:
             name = _colname(column) or "(unnamed)"
-            if logical.strip().lower().split("[")[0].split("(")[0].strip() == "bytes":
-                reason = (
-                    f'Binary column "{name}" has no fixed-width byte-size evidence; '
-                    "Data Playground did not scan values to guess."
-                )
-            else:
-                reason = (
-                    f'Column "{name}" has unrecognized display type "{logical or "unknown"}", '
-                    "so its byte width cannot be estimated."
-                )
-            return WidthEst(None, reason)
+            return WidthEst(
+                None,
+                f'Binary column "{name}" has no fixed-width byte-size evidence; '
+                "Data Playground did not scan values to guess.",
+            )
         total += width
     return WidthEst(max(total, 8))
 
 
 def _row_width(cols) -> int:
-    """Runtime batching width; admission uses `_estimated_row_width` and preserves unknown."""
-    return _estimated_row_width(cols).bytes_per_row or 16
+    """Numeric runtime batching width; unknown columns retain the historical 16-byte fallback."""
+    if not cols:
+        return _DEFAULT_ROW_BYTES
+    total = sum(
+        _col_width(_coltype(column), _physical_type(column)) or 16
+        for column in cols
+    )
+    return max(total, 8)
 
 
 def _coltype(c) -> str:
@@ -148,7 +148,7 @@ def _source_width(resolve_adapter, uri: str, cols) -> WidthEst:
         if base is not None and not _VEC_RE.search(t):  # a variable list with no known dimension → probe it
             n = _probed_list_len(resolve_adapter, uri, _colname(c))
             element_type = base.split("[")[0].split("(")[0]
-            bw = 16 if element_type == "list" else _TYPE_W.get(element_type)
+            bw = None if element_type == "bytes" else _TYPE_W.get(element_type, 16)
             if bw is None:
                 return _estimated_row_width(cols)
             total += (n if n is not None else _LIST_ELEMS) * bw
