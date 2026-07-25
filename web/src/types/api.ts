@@ -135,6 +135,7 @@ export interface DatasetRevisionPreview {
 }
 
 export interface DatasetRevisionDetail extends DatasetRevision {
+  name?: string | null
   parentRevisionId?: string | null
   producerOperation?: string | null
   summary: DatasetRevisionSummary
@@ -773,6 +774,7 @@ export interface WriteIntent {
 export interface WriteReceipt {
   datasetId: string
   revisionId: string
+  name: string
   parentHead?: { kind: 'exact'; datasetId: string; revisionId: string } | null
   head: { datasetId: string; revisionId: string; committedAt?: string | null; retentionOwner: string }
   rows: number

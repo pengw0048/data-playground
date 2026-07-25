@@ -6,6 +6,22 @@ import { TooltipProvider } from '@/components/ui/tooltip'
 const apiMocks = vi.hoisted(() => ({ writeAdmission: vi.fn() }))
 
 vi.mock('../../api/client', () => ({
+  KernelError: class KernelError extends Error {
+    status: number
+    code?: string
+    field?: string
+    reason?: string
+    constructor(status: number, message: string, code?: string, _retryable?: boolean, field?: string, reason?: string) {
+      super(message); this.status = status; this.code = code; this.field = field; this.reason = reason
+    }
+  },
+  managedDatasetNameErrorMessage: (error: any) => (
+    error?.code === 'invalid_managed_dataset_name'
+      && error?.field === 'filename'
+      && error?.reason === 'path_syntax'
+      ? 'Use one managed dataset name, without a path or URI.'
+      : null
+  ),
   api: new Proxy({}, { get: (_target, property) => property === 'writeAdmission'
     ? apiMocks.writeAdmission : async () => ({}) }),
 }))
@@ -13,6 +29,7 @@ vi.mock('../../api/client', () => ({
 import './write'
 import { getComponent } from '../registry'
 import { useStore } from '../../store/graph'
+import { KernelError } from '../../api/client'
 
 describe('Write card — typed local mode truth', () => {
   beforeEach(() => {
@@ -124,5 +141,37 @@ describe('Write card — typed local mode truth', () => {
     expect(useStore.getState().runs.write.writeSubmissionId).not.toBe('completed-submission')
     await Promise.resolve()
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the typed managed-name reason beside the filename field', async () => {
+    useStore.setState({
+      runs: { write: { phase: 'idle' } },
+      doc: {
+        ...useStore.getState().doc,
+        nodes: [{
+          ...useStore.getState().doc.nodes[0],
+          data: {
+            ...useStore.getState().doc.nodes[0].data,
+            config: { filename: '../escape.parquet', writeMode: 'overwrite' },
+          },
+        }],
+      },
+    } as any)
+    apiMocks.writeAdmission.mockRejectedValueOnce(new KernelError(
+      422,
+      'server prose is not the client contract',
+      'invalid_managed_dataset_name',
+      false,
+      'filename',
+      'path_syntax',
+    ))
+    const Write = getComponent('write')!
+    const data = useStore.getState().doc.nodes[0].data
+
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={data} /></ReactFlowProvider></TooltipProvider>)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Use one managed dataset name, without a path or URI.')
+    expect(screen.getByPlaceholderText('output.parquet')).toHaveAttribute('aria-invalid', 'true')
   })
 })

@@ -534,6 +534,7 @@ class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
     dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
+    name: str | None = Field(default=None, min_length=1, max_length=512)
     committed_at: datetime.datetime | None = None
     retention_owner: Literal["provider", "core"] = "provider"
     parent_revision_id: str | None = Field(default=None, max_length=256)
@@ -924,6 +925,7 @@ class WriteReceipt(Wire):
 
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=512)
     parent_head: ExactDatasetRef | None = None
     head: DatasetRevision
     rows: int = Field(ge=0, le=MAX_SAFE_INTEGER)

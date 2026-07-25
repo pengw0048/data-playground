@@ -284,6 +284,7 @@ def test_lance_exact_revision_detail_is_bounded_and_keeps_parent_after_head_move
     assert len(detail["preview"]["rows"]) == 100
     assert detail["preview"]["hasMore"] is True
     assert detail["preview"]["rows"][0] == {"value": 0}
+    assert detail["name"] is None
 
 
 def test_lance_exact_revision_detail_preserves_schema_for_empty_revision(tmp_path):

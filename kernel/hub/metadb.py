@@ -18267,6 +18267,10 @@ def _managed_local_write_receipt_in_session(
         receipt = WriteReceipt.model_validate(json.loads(revision.write_receipt_doc or ""))
     except (TypeError, ValueError) as exc:
         raise RuntimeError("managed local write receipt is invalid") from exc
+    try:
+        revision_name = json.loads(revision.table_doc).get("name")
+    except (TypeError, ValueError):
+        revision_name = None
     ref = s.get(LocalResultReference, {
         "uri": revision.artifact_uri,
         "owner_kind": "managed_file_revision",
@@ -18279,6 +18283,7 @@ def _managed_local_write_receipt_in_session(
             or receipt.publication.idempotency_key != idempotency_key
             or receipt.provenance.publication.run_id != revision.run_id
             or receipt.execution_manifest_sha256 != revision.execution_manifest_sha256
+            or receipt.name != revision_name
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
     return receipt.model_dump(by_alias=True, mode="json")
@@ -18311,6 +18316,42 @@ def _managed_local_merge_replay_in_session(
     return receipt
 
 
+def _validated_managed_local_lance_write_receipt(
+        row: ManagedLocalLanceWriteReceipt) -> dict:
+    try:
+        from hub.models import WriteIntent, WriteReceipt
+
+        intent = WriteIntent.model_validate(json.loads(row.write_intent_doc))
+        receipt = WriteReceipt.model_validate(json.loads(row.write_receipt_doc))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("managed local Lance write receipt is invalid") from exc
+    canonical_intent = json.dumps(
+        intent.model_dump(by_alias=True, mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if (canonical_intent != row.write_intent_doc
+            or intent.idempotency_key != row.idempotency_key
+            or intent.destination.provider != "managed-local-lance"
+            or intent.destination.dataset_id != row.dataset_id
+            or intent.destination.logical_uri != row.logical_uri
+            or receipt.dataset_id != row.dataset_id
+            or receipt.revision_id != row.revision_id
+            or receipt.name != intent.destination.name
+            or receipt.head.dataset_id != row.dataset_id
+            or receipt.head.revision_id != row.revision_id
+            or receipt.parent_head != intent.expected_head
+            or receipt.publication.provider != "managed-local-lance"
+            or receipt.publication.logical_uri != row.logical_uri
+            or receipt.publication.artifact_uri != row.logical_uri
+            or receipt.publication.idempotency_key != row.idempotency_key
+            or receipt.provenance != intent.provenance
+            or receipt.provenance.publication.run_id != row.run_id
+            or receipt.execution_manifest_sha256 != row.execution_manifest_sha256):
+        raise RuntimeError("managed local Lance write receipt lost its exact revision evidence")
+    return receipt.model_dump(by_alias=True, mode="json")
+
+
 def _managed_local_lance_write_receipt_in_session(
         s, idempotency_key: str, intent_doc: str, *, lock: bool = False) -> dict | None:
     query = select(ManagedLocalLanceWriteReceipt).where(
@@ -18323,22 +18364,7 @@ def _managed_local_lance_write_receipt_in_session(
     if row.write_intent_doc != intent_doc:
         raise ManagedLocalWriteConflict(
             f"managed local write idempotency key collision: {idempotency_key}")
-    try:
-        from hub.models import WriteReceipt
-
-        receipt = WriteReceipt.model_validate(json.loads(row.write_receipt_doc))
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("managed local Lance write receipt is invalid") from exc
-    if (receipt.dataset_id != row.dataset_id
-            or receipt.revision_id != row.revision_id
-            or receipt.publication.provider != "managed-local-lance"
-            or receipt.publication.logical_uri != row.logical_uri
-            or receipt.publication.artifact_uri != row.logical_uri
-            or receipt.publication.idempotency_key != idempotency_key
-            or receipt.provenance.publication.run_id != row.run_id
-            or receipt.execution_manifest_sha256 != row.execution_manifest_sha256):
-        raise RuntimeError("managed local Lance write receipt lost its exact revision evidence")
-    return receipt.model_dump(by_alias=True, mode="json")
+    return _validated_managed_local_lance_write_receipt(row)
 
 
 def _validate_managed_local_lance_destination_in_session(
@@ -18571,6 +18597,23 @@ def catalog_managed_local_lance_write_receipt(value: object) -> dict | None:
         return receipt
 
 
+def managed_local_lance_revision_name(
+        dataset_id: str, revision_id: str) -> str | None:
+    """Return a name only when one exact durable managed-local Lance receipt proves it."""
+    with session() as s:
+        row = s.scalars(select(ManagedLocalLanceWriteReceipt).where(
+            ManagedLocalLanceWriteReceipt.dataset_id == str(dataset_id),
+            ManagedLocalLanceWriteReceipt.revision_id == str(revision_id),
+        ).limit(1)).first()
+        if row is None:
+            return None
+        receipt = _validated_managed_local_lance_write_receipt(row)
+        name = receipt.get("name")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("managed local Lance write receipt has no dataset name")
+        return name
+
+
 def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
     """Serialize one admitted Lance append and persist its exact provider receipt.
 
@@ -18624,6 +18667,7 @@ def catalog_publish_managed_local_lance_write(value: object, publish) -> dict:
         expected = intent.expected_head
         if (expected is None
                 or receipt.dataset_id != intent.destination.dataset_id
+                or receipt.name != intent.destination.name
                 or receipt.head.dataset_id != receipt.dataset_id
                 or receipt.head.revision_id != receipt.revision_id
                 or receipt.parent_head != expected
@@ -18887,6 +18931,7 @@ def catalog_publish_managed_local_file(
             receipt = WriteReceipt(
                 dataset_id=logical.logical_id,
                 revision_id=revision_id,
+                name=typed_intent.destination.name,
                 parent_head=parent_head,
                 head=DatasetRevision(
                     dataset_id=logical.logical_id,

@@ -84,6 +84,7 @@ def _submit_local(uid: str, canvas_id: str):
 def _done_status(task_id: str, key: str) -> dict:
     receipt = WriteReceipt(
         dataset_id="ds", revision_id="rev-1",
+        name="result",
         head=DatasetRevision(dataset_id="ds", revision_id="rev-1"),
         rows=1, bytes=8, schema=[],
         publication=WritePublicationIdentity(

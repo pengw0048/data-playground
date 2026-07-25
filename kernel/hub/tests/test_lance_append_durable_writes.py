@@ -15,9 +15,11 @@ import uuid
 
 import pyarrow as pa
 import pytest
+from fastapi.testclient import TestClient
 
 from hub import durable_tasks, metadb
 from hub.deps import Deps
+from hub.main import app
 from hub.models import Graph, WriteIntent
 from hub.routers import runs
 from hub.routers.runs import _write_admission_for_graph
@@ -136,6 +138,31 @@ def test_managed_lance_append_publishes_exactly_one_version_and_receipt(
     assert receipt["publication"]["provider"] == "managed-local-lance"
     assert _lance_version_count(dest_uri) == versions_before + 1
     assert lance.dataset(dest_uri).to_table()["value"].to_pylist() == [1, 7, 8]
+    table = deps.catalog.get_table(receipt["datasetId"])
+    assert receipt["name"] == table.name == admission.intent.destination.name
+
+    from hub.routers import catalog as catalog_routes
+
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: deps)
+    exact_url = (
+        f"/api/catalog/revisions/{receipt['datasetId']}/{receipt['revisionId']}")
+    exact = TestClient(app).get(exact_url)
+    assert exact.status_code == 200, exact.text
+    assert exact.json()["name"] == receipt["name"]
+
+    metadb.catalog_set_metadata(
+        table.uri,
+        folder="",
+        owner=None,
+        description=None,
+        tags=[],
+        name="renamed current Lance dataset",
+    )
+    assert deps.catalog.get_table(receipt["datasetId"]).name == "renamed current Lance dataset"
+    exact_after_rename = TestClient(app).get(exact_url)
+    assert exact_after_rename.status_code == 200, exact_after_rename.text
+    assert exact_after_rename.json()["name"] == receipt["name"]
+
     jobs = metadb.list_workspace_runs(uid, run_id=task["id"])
     assert jobs["items"][0]["outputReceipt"]["revisionId"] == "2"
 

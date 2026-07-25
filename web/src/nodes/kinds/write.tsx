@@ -1,8 +1,9 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
 import { useStore } from '../../store/graph'
 import { Field, MiniInput, MiniSelect } from '../../ui/controls'
+import { managedDatasetNameErrorMessage } from '../../api/client'
 
 function Write({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
@@ -10,8 +11,10 @@ function Write({ id, data }: NodeComponentProps) {
   const mode = (data.config.writeMode as 'append' | 'overwrite') ?? 'overwrite'
   const dest = (data.config.destName as string | undefined) ?? 'Workspace outputs'
   const prepareWrite = useStore((s) => s.prepareWrite)
-  const admission = useStore((s) => s.runs[id]?.writeAdmission)
+  const admission = useStore((s) => s.runs[id]?.writeAdmission
+    ?? (s.runs[id]?.phase === 'done' ? s.runs[id]?.writeOutcomeAdmission : undefined))
   const runPhase = useStore((s) => s.runs[id]?.phase)
+  const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
   const merge = data.config.mergeColumns as { taskId?: string; rules?: unknown[] } | undefined
@@ -19,12 +22,20 @@ function Write({ id, data }: NodeComponentProps) {
   useEffect(() => {
     if (runPhase === 'estimating' || runPhase === 'confirm'
         || runPhase === 'drift' || runPhase === 'running') return
-    void prepareWrite(id).catch(() => { /* the Run panel surfaces actionable admission failures */ })
+    let active = true
+    void prepareWrite(id).then(() => {
+      if (active) setNameError(null)
+    }).catch((error: unknown) => {
+      if (active) setNameError(managedDatasetNameErrorMessage(error))
+      // Other admission failures remain in the Run panel; this inline surface owns only this field.
+    })
+    return () => { active = false }
   // A terminal run deliberately drops its admission/submission identity so a later managed write
   // cannot reuse a completed request. Re-run the existing preflight when that happens: config is
   // unchanged, but the card still needs a truthful current destination summary. Active run intent
   // owns admission while it estimates, waits at a gate, or executes; the card must not race it.
   }, [id, data.config, admission, runPhase, prepareWrite])
+  const displayName = admission?.intent?.destination.name ?? name
   const semantics = receipt
     ? `revision ${receipt.revisionId}`
     : admission?.managed
@@ -33,10 +44,12 @@ function Write({ id, data }: NodeComponentProps) {
   const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   const upsertSemantics = upsert?.taskId ? 'keyed upsert tracked' : upsert?.keys?.length ? 'keyed upsert configured' : null
   return (
-    <NodeCard id={id} data={data} metaOverride={name ? `→ ${dest} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : 'name an output → (destination in the panel)'}>
+    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${dest} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : 'name an output → (destination in the panel)'}>
       <div className="flex gap-2">
         <Field label="file name" style={{ flex: 1.6 }}>
-          <MiniInput value={name} placeholder="output.parquet" onChange={(v) => updateConfig(id, { filename: v })} />
+          <MiniInput value={name} placeholder="output.parquet" invalid={nameError != null}
+            onChange={(v) => updateConfig(id, { filename: v })} />
+          {nameError && <span role="alert" className="text-[10px] leading-snug text-destructive">{nameError}</span>}
         </Field>
         <Field label="mode" style={{ flex: 1 }}>
           <MiniSelect value={mode} onChange={(v) => updateConfig(id, { writeMode: v })} options={[
