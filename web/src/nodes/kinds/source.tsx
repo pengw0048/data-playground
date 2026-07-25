@@ -12,6 +12,22 @@ import { datasetRefIdentity, isParameterRef, type DatasetRef } from '../../types
 
 type ExactRevisionState = 'idle' | 'checking' | 'available' | 'unavailable' | 'permission' | 'offline' | 'error'
 
+const revisionUtcFormatter = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'UTC',
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+})
+
+function formatRevisionUtc(value: string): string {
+  const instant = new Date(value)
+  return Number.isNaN(instant.getTime()) ? 'time unknown' : `${revisionUtcFormatter.format(instant)} UTC`
+}
+
 const kernelErrorStatus = (error: unknown) => typeof error === 'object' && error !== null
   && typeof (error as { status?: unknown }).status === 'number'
   ? (error as { status: number }).status : undefined
@@ -63,13 +79,14 @@ function Source({ id, data }: NodeComponentProps) {
   const providerDataset = !!data.config.providerResourceRef
   const datasetRef = data.config.datasetRef
   const datasetParameter = isParameterRef(datasetRef) ? datasetRef : null
+  const selectedRef = datasetRef && !isParameterRef(datasetRef) ? datasetRef : null
   const canvasParameters = useStore((s) => s.doc.parameters)
   const datasetParameters = (canvasParameters ?? []).filter((item) => item.type === 'dataset')
-  const providerRevision = providerDataset && datasetRef && !isParameterRef(datasetRef)
-    ? datasetRefIdentity(datasetRef).revisionId : undefined
+  const providerRevision = providerDataset && selectedRef
+    ? datasetRefIdentity(selectedRef).revisionId : undefined
   const providerRevisionLabel = providerRevision && providerRevision.length > 24
     ? `${providerRevision.slice(0, 12)}…${providerRevision.slice(-8)}` : providerRevision
-  const selectedExact = datasetRef && !isParameterRef(datasetRef) ? datasetRefIdentity(datasetRef) : null
+  const selectedExact = selectedRef ? datasetRefIdentity(selectedRef) : null
   const [exactDetail, setExactDetail] = useState<DatasetRevisionDetail | null>(null)
   const [exactDetailState, setExactDetailState] = useState<ExactRevisionState>('idle')
   const [exactDetailRequest, setExactDetailRequest] = useState(0)
@@ -148,9 +165,12 @@ function Source({ id, data }: NodeComponentProps) {
     setDialog(false); setOpen(false)
   }
 
-  const meta = table
+  const headMeta = table
     // an UNKNOWN count (null/undefined) shows "—", not a fake "0 rows" (UX-14)
     ? `${table.rowCount == null ? '—' : table.rowCount.toLocaleString()} rows · ${table.columns.length} cols · ${table.version ?? 'v1'}`
+    : null
+  const meta = headMeta
+    ? selectedExact ? `Current head · ${headMeta}` : headMeta
     : providerDataset
       ? `${data.config.providerReadMode === 'exact' ? 'exact revision' : 'mutable preview only'} · ${data.config.providerName ?? 'provider'}`
       : 'pick a table'
@@ -234,8 +254,17 @@ function Source({ id, data }: NodeComponentProps) {
       {providerRevision && <div title={`Pinned provider revision ${providerRevision}`} className="mt-1.5 truncate rounded-md border border-border bg-muted/30 px-2 py-1 text-[10px] text-muted-foreground">
         Pinned provider revision {providerRevisionLabel}
       </div>}
+      {selectedExact && exactDetailState === 'available' && exactDetail && (
+        <div aria-label="Exact pin facts" className="mt-1 break-all text-[9.5px] text-muted-foreground">
+          {selectedRef?.kind === 'as_of'
+            ? `As-of intent ${formatRevisionUtc(selectedRef.asOf)} resolved once to exact pin`
+            : 'Exact pin'} revision {exactDetail.revisionId} · {exactDetail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows · {exactDetail.preview.columns.length} cols
+        </div>
+      )}
       {evidenceColumns && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
-        <summary className="cursor-pointer font-medium text-muted-foreground">Field evidence · {evidenceColumns.length} columns</summary>
+        <summary className="cursor-pointer font-medium text-muted-foreground">
+          {selectedExact ? `Exact pin revision ${selectedExact.revisionId} field evidence` : 'Field evidence'} · {evidenceColumns.length} columns
+        </summary>
         <div className="mt-1 grid max-h-28 gap-0.5 overflow-y-auto">
           {evidenceColumns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
         </div>
@@ -247,8 +276,8 @@ function Source({ id, data }: NodeComponentProps) {
         <option value="">Pinned/current dataset</option>
         {datasetParameters.map((item) => <option key={item.name} value={item.name}>Parameter: {item.label || item.name}</option>)}
       </select>}
-      {!datasetParameter && !providerDataset && (table || data.config.datasetRef) && <RevisionControl nodeId={id} table={table} selected={data.config.datasetRef as DatasetRef | undefined}
-        exactDetail={exactDetail} exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
+      {!datasetParameter && !providerDataset && (table || selectedRef) && <RevisionControl nodeId={id} table={table} selected={selectedRef ?? undefined}
+        exactDetailState={exactDetailState} onRetryExact={() => setExactDetailRequest((value) => value + 1)}
         canEdit={canEdit} onChange={(datasetRef) => updateConfig(id, { datasetRef })} />}
       <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" style={{ display: 'none' }}
         onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
@@ -257,11 +286,10 @@ function Source({ id, data }: NodeComponentProps) {
   )
 }
 
-function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDetailState: detailState, onRetryExact, canEdit, onChange }: {
+function RevisionControl({ nodeId, table, selected, exactDetailState: detailState, onRetryExact, canEdit, onChange }: {
   nodeId: string
   table?: CatalogTable
   selected?: DatasetRef
-  exactDetail: DatasetRevisionDetail | null
   exactDetailState: ExactRevisionState
   onRetryExact: () => void
   canEdit: boolean
@@ -393,7 +421,7 @@ function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDe
     ? selected.resolved.committedAt
     : selected?.lastKnown?.committedAt
   const staleLastKnown = lastKnownAt
-    ? <> Last known provider commit {new Date(lastKnownAt).toLocaleString()} <span className="font-semibold">(stale)</span>.</>
+    ? <> Last known provider commit {formatRevisionUtc(lastKnownAt)} <span className="font-semibold">(stale)</span>.</>
     : null
   const controlAvailable = (exactAvailable && availability === 'available') || asOfAvailable
   const registrationReplaced = selectedExact != null && revisions.length > 0
@@ -405,7 +433,7 @@ function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDe
   const capabilityError = availability === 'error' && !exactAvailable && !asOfAvailable
   const controlLabel = checking && !controlAvailable ? 'Checking revision capabilities…'
     : !controlAvailable ? 'Revision selection unavailable'
-      : selected?.kind === 'as_of' ? `As of ${new Date(selected.asOf).toLocaleString()} → ${selectedExact?.revisionId}`
+      : selected?.kind === 'as_of' ? `As of ${formatRevisionUtc(selected.asOf)} → ${selectedExact?.revisionId}`
         : selectedExact ? `Change pinned revision ${selectedExact.revisionId}`
           : availability === 'available' && asOfAvailable ? 'Choose exact or as-of revision'
             : asOfAvailable ? 'Choose revision as of a time' : 'Pin exact revision'
@@ -428,11 +456,6 @@ function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDe
         </div>
       )}
       {selectedExact && detailState === 'checking' && <div role="status" className="mt-1 text-[9.5px] text-muted-foreground">Opening selected revision {selectedExact.revisionId}…</div>}
-      {selected && detailState === 'available' && detail && (
-        <div className="mt-1 break-all text-[9.5px] text-muted-foreground">
-          {selected.kind === 'as_of' ? `As-of intent ${new Date(selected.asOf).toLocaleString()} resolved once to` : 'Pinned exact'} revision {detail.revisionId} · {detail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows
-        </div>
-      )}
       {selectedExact && detailState === 'unavailable' && (
         <div role="alert" className="mt-1 text-[9.5px] text-destructive">
           Selected revision {selectedExact.revisionId} or its registration is missing or compacted. Selection preserved; latest was not substituted.
@@ -483,7 +506,7 @@ function RevisionControl({ nodeId, table, selected, exactDetail: detail, exactDe
               }} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent ${active ? 'bg-accent' : ''}`}>
               <span className="dp-mono min-w-0 flex-1 truncate text-[11px] font-semibold text-foreground">{revision.revisionId}</span>
               {index === 0 && <span className="rounded bg-muted px-1 text-[9px] text-muted-foreground">latest retained</span>}
-              <span className="shrink-0 text-[9px] text-muted-foreground">{revision.committedAt ? new Date(revision.committedAt).toLocaleString() : 'time unknown'}</span>
+              <span className="shrink-0 text-[9px] text-muted-foreground">{revision.committedAt ? formatRevisionUtc(revision.committedAt) : 'time unknown'}</span>
             </button>
           )
         })}
