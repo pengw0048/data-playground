@@ -55,6 +55,39 @@ class NotPreviewable(Exception):
         super().__init__(reason)
 
 
+class UserCodeError(Exception):
+    """A transform author's exception, kept distinct from truthful preview refusal."""
+
+    def __init__(
+            self, node: GraphNode, exc: Exception, *,
+            row_index: int | None = None,
+            available_columns: list[str] | None = None):
+        self.node = node
+        self.exception_type = type(exc).__name__
+        self.message = str(exc)
+        self.row_index = row_index
+        self.available_columns = list(available_columns or [])
+        self.guidance = (
+            sandbox.disallowed_builtin_guidance(getattr(exc, "name", None))
+            if isinstance(exc, NameError) else None
+        )
+        location = f" at input row index {row_index}" if row_index is not None else ""
+        text = f"User code raised {self.exception_type}{location}: {self.message}"
+        if self.available_columns:
+            text += f". Available columns: {', '.join(self.available_columns)}"
+        if self.guidance:
+            text += f". {self.guidance}"
+        super().__init__(text)
+
+
+def _user_code_error(
+        node: GraphNode, exc: Exception, *,
+        row_index: int | None = None,
+        available_columns: list[str] | None = None) -> UserCodeError:
+    return UserCodeError(
+        node, exc, row_index=row_index, available_columns=available_columns)
+
+
 def _cfg(node: GraphNode) -> dict:
     return node.data.get("config", {}) if isinstance(node.data, dict) else {}
 
@@ -1162,14 +1195,18 @@ class BuildEngine:
                 table = pa.concat_tables(tables) if tables else parent.limit(0).to_arrow_table()
                 return db.conn().from_arrow(table)
             out: list[dict] = []
+            input_row_offset = 0
             for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
-                out.extend(_apply_fn(fn, batch, mode, on_error, node))
+                out.extend(_apply_fn(
+                    fn, batch, mode, on_error, node, row_offset=input_row_offset))
+                input_row_offset += batch.num_rows
             table = pa.Table.from_pylist(out) if out else parent.limit(0).to_arrow_table()
             return db.conn().from_arrow(table)
-        except NotPreviewable:
+        except (NotPreviewable, UserCodeError):
             raise
         except Exception as e:  # noqa: BLE001
-            raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
+            raise _user_code_error(
+                node, e, available_columns=list(parent.columns)) from e
 
     def _transform_spill(self, node, parent, fn, mode, on_error, fmt="rows") -> Relation:
         """Full-run transform: stream output batches to a temp Parquet (bounded memory, out-of-core)."""
@@ -1210,12 +1247,15 @@ class BuildEngine:
             else:
                 # stream output rows and flush on a BYTE budget (with a hard row cap as a backstop), so a
                 # flat_map with a huge per-row fan-out never balloons the buffer — memory stays bounded.
+                input_row_offset = 0
                 for batch in parent.to_arrow_reader(batch_size=_XF_BATCH):
-                    for r in _iter_fn(fn, batch, mode, on_error, node):
+                    for r in _iter_fn(
+                            fn, batch, mode, on_error, node, row_offset=input_row_offset):
                         buf.append(r)
                         nbytes += _est_row_bytes(r)
                         if nbytes >= FLUSH_BYTES or len(buf) >= FLUSH_ROWS:
                             flush()
+                    input_row_offset += batch.num_rows
                 flush()
         except BaseException:
             # close + delete the partial spill so we never leak a handle or a truncated file
@@ -1310,7 +1350,9 @@ _SPILL_FLUSH_BYTES = 128 * 1024 * 1024
 _SPILL_FLUSH_ROWS = 500_000
 
 
-def _iter_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node):
+def _iter_fn(
+        fn, batch: "pa.RecordBatch", mode: str, on_error: str, node,
+        *, row_offset: int = 0):
     """Yield the transform's output rows for one input batch. flat_map/flat_map_generator are STREAMED
     (yield from — no per-row list()), so a large per-row fan-out never materializes here; the spill
     caller flushes on a BYTE budget, keeping memory bounded regardless of fan-out."""
@@ -1330,8 +1372,9 @@ def _iter_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node):
                     except Exception:  # noqa: BLE001 — this row genuinely fails; drop just it
                         continue
                 return
-            raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
-    for r in rows:
+            raise _user_code_error(
+                node, e, available_columns=list(batch.schema.names)) from e
+    for row_index, r in enumerate(rows, start=row_offset):
         try:
             if mode == "map":
                 yield fn(dict(r))
@@ -1343,11 +1386,16 @@ def _iter_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node):
         except Exception as e:  # noqa: BLE001
             if on_error == "skip":
                 continue
-            raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
+            raise _user_code_error(
+                node, e, row_index=row_index,
+                available_columns=list(batch.schema.names)) from e
 
 
-def _apply_fn(fn, batch: "pa.RecordBatch", mode: str, on_error: str, node) -> list[dict]:
-    return list(_iter_fn(fn, batch, mode, on_error, node))
+def _apply_fn(
+        fn, batch: "pa.RecordBatch", mode: str, on_error: str, node,
+        *, row_offset: int = 0) -> list[dict]:
+    return list(_iter_fn(
+        fn, batch, mode, on_error, node, row_offset=row_offset))
 
 
 def _est_row_bytes(v, _depth: int = 0) -> int:
@@ -1380,7 +1428,7 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
     pyarrow is always present."""
     try:
         return _run_batch(fn, table, fmt)
-    except NotPreviewable:
+    except (NotPreviewable, UserCodeError):
         raise
     except Exception as e:  # noqa: BLE001
         if on_error == "skip":
@@ -1394,7 +1442,8 @@ def _apply_batch(fn, table: "pa.Table", fmt: str, on_error: str, node) -> "pa.Ta
                 except Exception:  # noqa: BLE001
                     continue
             return pa.concat_tables(parts) if parts else None
-        raise NotPreviewable(node, f"cell error: {type(e).__name__}: {e}") from e
+        raise _user_code_error(
+            node, e, available_columns=list(table.column_names)) from e
 
 
 def _run_batch(fn, table: "pa.Table", fmt: str) -> "pa.Table":

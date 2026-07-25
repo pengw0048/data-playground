@@ -9,6 +9,7 @@ OS-level isolation. Honest about the limit rather than pretending otherwise.
 
 from __future__ import annotations
 
+import builtins as python_builtins
 import threading
 import types
 from typing import Any, Callable
@@ -33,18 +34,33 @@ _ALLOWED_MODULES = {
     "pyarrow": __import__("pyarrow"),
 }
 
+SAFE_BUILTIN_NAMES = (
+    "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float",
+    "frozenset", "int", "isinstance", "issubclass", "len", "list", "map", "max",
+    "min", "print", "range", "reversed", "round", "set", "sorted", "str", "sum",
+    "tuple", "zip", "True", "False", "None", "ValueError", "KeyError", "TypeError",
+    "IndexError", "Exception", "repr", "ord", "chr", "hex", "bin",
+)
+SAFE_EXCEPTION_NAMES = ("ValueError", "KeyError", "TypeError", "IndexError", "Exception")
+
 _SAFE_BUILTINS = {
     name: __builtins__[name] if isinstance(__builtins__, dict) else getattr(__builtins__, name)
-    for name in (
-        "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter", "float",
-        "frozenset", "int", "isinstance", "issubclass", "len", "list", "map", "max",
-        "min", "print", "range", "reversed", "round", "set", "sorted", "str", "sum",
-        "tuple", "zip", "True", "False", "None", "ValueError", "KeyError", "TypeError",
-        "IndexError", "Exception", "repr", "ord", "chr", "hex", "bin",
-    )  # NOTE: no "format" — str.format("{0.__class__...}") reaches dunders through a format field
+    for name in SAFE_BUILTIN_NAMES
 }
 
 _ENTRY_NAMES = ["fn", "transform", "process", "map", "op"]
+
+
+def disallowed_builtin_guidance(name: str | None) -> str | None:
+    """Explain a real Python builtin excluded from the ad-hoc-cell namespace."""
+    if not name or name in _SAFE_BUILTINS or not hasattr(python_builtins, name):
+        return None
+    allowed = ", ".join(SAFE_BUILTIN_NAMES)
+    exceptions = ", ".join(SAFE_EXCEPTION_NAMES)
+    return (
+        f"'{name}' is a Python builtin, but it is outside the ad-hoc cell allowlist. "
+        f"Allowed builtins: {allowed}. Permitted exception types: {exceptions}."
+    )
 
 
 # Extra top-level modules a cell may import — the canvas's declared dependencies, installed by the

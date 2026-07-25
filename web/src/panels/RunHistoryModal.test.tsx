@@ -70,7 +70,7 @@ beforeEach(() => {
   useStore.setState({
     currentUser: { id: 'alice', name: 'Alice' },
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
-    previews: {}, runs: {}, toasts: [],
+    previews: {}, runs: {}, toasts: [], fullscreenCode: null,
   } as any)
 })
 
@@ -539,6 +539,71 @@ describe('durable full results', () => {
     expect(receipt).toHaveTextContent(/parent 7/i)
     expect(receipt).toHaveTextContent(/backend 8\.0\.0/i)
     expect(receipt).not.toHaveTextContent(/\/outputs\/existing\.lance/i)
+  })
+
+  it('renders typed user-code exceptions with an edit action and no full-pass retry', async () => {
+    const doc = {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'target', type: 'transform', position: { x: 0, y: 0 },
+        data: {
+          title: 'Parse learning rate', status: 'failed',
+          config: { source: 'adhoc', mode: 'map', code: 'def fn(row): return row' },
+          history: [],
+        },
+      }],
+    }
+    useStore.setState({
+      doc, canvasRole: 'owner',
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        error: true, notPreviewable: false, failureCategory: 'user_code_exception',
+        reason: "User code raised NameError at input row index 3: name 'RuntimeError' is not defined",
+        userCodeException: {
+          nodeId: 'target', nodeTitle: 'Parse learning rate',
+          exceptionType: 'NameError', message: "name 'RuntimeError' is not defined", rowIndex: 3,
+          availableColumns: ['id', 'lr'],
+          guidance: "'RuntimeError' is outside the ad-hoc cell allowlist. Allowed builtins: ValueError.",
+        },
+      }) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Your Python transform raised an exception')).toBeInTheDocument()
+    expect(screen.getByText("NameError: name 'RuntimeError' is not defined")).toBeInTheDocument()
+    expect(screen.getByText('Input row index: 3')).toBeInTheDocument()
+    expect(screen.getByText(/Available columns:/)).toHaveTextContent('id, lr')
+    expect(screen.getByText(/outside the ad-hoc cell allowlist/)).toBeInTheDocument()
+    expect(screen.queryByText('Not sample-previewable')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Run a full pass/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/add an explicit cast/i)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Edit code' }))
+    expect(useStore.getState().fullscreenCode).toEqual({
+      nodeId: 'target', param: 'code', lang: 'python',
+    })
+  })
+
+  it('does not classify a preview failure by parsing its message', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'failed', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        error: true, notPreviewable: false, failureCategory: 'runtime_error',
+        reason: "cell error: ValueError: could not convert string to float: 'n/a'",
+      }) },
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.getByText('Preview failed')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+    expect(screen.queryByText('Your Python transform raised an exception')).not.toBeInTheDocument()
   })
 
   it('offers sample/full switching for previewable nodes after a full run', async () => {

@@ -29,6 +29,7 @@ DataCompleteness = Literal["complete", "page", "sample", "capped", "unknown"]
 DataLimitReason = Literal["preview-scan", "interactive-row-budget"]
 DataLimitScope = Literal["each-source", "result-window"]
 SampleStrategy = Literal["prefix", "reservoir"]
+SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
 MAX_SAFE_INTEGER = 2**53 - 1
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
@@ -1535,6 +1536,20 @@ class DatasetViewDeleteResult(Wire):
     deleted: bool
 
 
+class UserCodeExceptionDetail(Wire):
+    node_id: str | None = None
+    node_title: str | None = None
+    exception_type: str = Field(min_length=1)
+    message: str
+    row_index: int | None = Field(
+        default=None,
+        ge=0,
+        description="Zero-based input row index when the row-oriented transform can identify it.",
+    )
+    available_columns: list[str] = Field(default_factory=list)
+    guidance: str | None = None
+
+
 class SampleResult(Wire):
     """One page of rows plus an explicit statement of what that page represents.
 
@@ -1595,10 +1610,28 @@ class SampleResult(Wire):
     not_previewable: bool = False
     error: bool = False        # a real failure (bad code / bad query), distinct from P8 not_previewable
     reason: str | None = None
+    failure_category: SampleFailureCategory | None = None
+    user_code_exception: UserCodeExceptionDetail | None = None
     wire: WireType = "dataset"
 
     @model_validator(mode="after")
     def _truthful_scope(self) -> "SampleResult":
+        if self.user_code_exception is not None:
+            if not self.error or self.not_previewable:
+                raise ValueError("a user-code exception must be an error, not a preview refusal")
+            if self.failure_category not in (None, "user_code_exception"):
+                raise ValueError("userCodeException requires failureCategory=user_code_exception")
+            self.failure_category = "user_code_exception"
+        elif self.not_previewable:
+            if self.failure_category not in (None, "not_previewable"):
+                raise ValueError("notPreviewable requires failureCategory=not_previewable")
+            self.failure_category = "not_previewable"
+        elif self.error:
+            if self.failure_category not in (None, "runtime_error"):
+                raise ValueError("an ordinary preview error requires failureCategory=runtime_error")
+            self.failure_category = "runtime_error"
+        elif self.failure_category is not None:
+            raise ValueError("a successful sample cannot carry a failureCategory")
         limit_parts = (self.row_limit, self.limit_reason, self.limit_scope)
         if any(part is not None for part in limit_parts) and not all(
                 part is not None for part in limit_parts):

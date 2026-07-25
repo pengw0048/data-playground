@@ -10055,6 +10055,22 @@
             "title": "Error",
             "type": "boolean"
           },
+          "failureCategory": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_previewable",
+                  "user_code_exception",
+                  "runtime_error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failurecategory"
+          },
           "hasMore": {
             "anyOf": [
               {
@@ -10192,6 +10208,16 @@
             "description": "Whether this response is not a proven complete dataset/result. Every successful non-complete response is truncated; unavailable responses are not.",
             "title": "Truncated",
             "type": "boolean"
+          },
+          "userCodeException": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UserCodeExceptionDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "wire": {
             "default": "dataset",
@@ -11236,6 +11262,78 @@
           "name"
         ],
         "title": "UserBody",
+        "type": "object"
+      },
+      "UserCodeExceptionDetail": {
+        "properties": {
+          "availableColumns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Availablecolumns",
+            "type": "array"
+          },
+          "exceptionType": {
+            "minLength": 1,
+            "title": "Exceptiontype",
+            "type": "string"
+          },
+          "guidance": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guidance"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "nodeId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nodeid"
+          },
+          "nodeTitle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nodetitle"
+          },
+          "rowIndex": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Zero-based input row index when the row-oriented transform can identify it.",
+            "title": "Rowindex"
+          }
+        },
+        "required": [
+          "exceptionType",
+          "message"
+        ],
+        "title": "UserCodeExceptionDetail",
         "type": "object"
       },
       "ValidationError": {

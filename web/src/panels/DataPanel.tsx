@@ -22,6 +22,8 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   const preview = useStore((s) => s.previews[nodeId])
   const runPreview = useStore((s) => s.runPreview)
   const requestRun = useStore((s) => s.requestRun)
+  const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
+  const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const doc = useStore((s) => s.doc)
   const node = doc.nodes.find((n) => n.id === nodeId)
   const outputPorts = node ? nodeOutputs(node) : []
@@ -98,6 +100,16 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   if (preview.loading) return withOutputPorts(<Skeleton />)
   if (preview.error) return withOutputPorts(<ErrorState reason={preview.error} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
   const res = preview.result!
+  if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
+    const failureNodeId = res.userCodeException.nodeId ?? nodeId
+    const failureNode = doc.nodes.find((candidate) => candidate.id === failureNodeId)
+    const canEditFailure = canEdit && failureNode?.type === 'transform'
+      && failureNode.data.config.source !== 'library'
+    return withOutputPorts(<UserCodeFailure failure={res.userCodeException}
+      onEdit={canEditFailure
+        ? () => openCodeFullscreen(failureNodeId, 'code', 'python')
+        : undefined} />)
+  }
   if (res.error) return withOutputPorts(<ErrorState reason={res.reason ?? 'preview failed'} onRetry={() => runPreview(nodeId, offset, requestPortId)} />)
   const isMetric = node?.type === 'metric'
   const isChart = node?.type === 'chart'
@@ -998,6 +1010,50 @@ function ErrorState({ title = 'Preview failed', reason, onRetry, onCancel }: {
     </div>
   )
 }
+
+
+function UserCodeFailure({
+  failure, onEdit,
+}: {
+  failure: NonNullable<SampleResult['userCodeException']>
+  onEdit?: () => void
+}) {
+  const location = failure.nodeTitle || failure.nodeId
+  return (
+    <div className="dp-dark px-5 py-6 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-destructive/10 text-destructive">
+        <Icon name="code" size={18} />
+      </div>
+      <div className="text-[13px] font-semibold text-destructive">
+        Your Python transform raised an exception
+      </div>
+      {location && <div className="mt-1 text-[11px]">Transform: {location}</div>}
+      <div className="dp-mono mx-auto mt-2 max-w-[420px] whitespace-pre-wrap rounded-lg border border-destructive/20 bg-destructive/10 p-2.5 text-left text-[11px] leading-normal text-muted-foreground">
+        {failure.exceptionType}: {failure.message}
+      </div>
+      {failure.rowIndex != null && (
+        <div className="mt-2 text-[11px]">Input row index: {failure.rowIndex}</div>
+      )}
+      {failure.availableColumns.length > 0 && (
+        <div className="mt-1 text-[11px]">
+          Available columns: <span className="dp-mono">{failure.availableColumns.join(', ')}</span>
+        </div>
+      )}
+      {failure.guidance && (
+        <div className="mx-auto mt-2 max-w-[440px] text-left text-[11px] leading-normal">
+          {failure.guidance}
+        </div>
+      )}
+      <div className="mx-auto mt-2 max-w-[380px] text-[11px]">
+        Edit the transform code or handle this input value before previewing again.
+      </div>
+      {onEdit && (
+        <Button variant="outline" size="sm" onClick={onEdit} className="mt-3.5">Edit code</Button>
+      )}
+    </div>
+  )
+}
+
 
 // Page a durable run output through its server-owned run/node/port identity. The kernel resolves the
 // URI after authorization, so a stale or tampered client URI cannot redirect this result view.
