@@ -607,6 +607,9 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         table = table.read_all()
     preview_rows = _table_to_rows(table.slice(0, DATASET_REVISION_PREVIEW_ROWS))
     revision_name = raw.get("name")
+    if not isinstance(revision_name, str) or not revision_name:
+        revision_name = metadb.managed_local_lance_revision_name(
+            binding["dataset_id"], str(raw["revision_id"]))
     return DatasetRevisionDetail(
         dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
         name=revision_name if isinstance(revision_name, str) and revision_name else None,

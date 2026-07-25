@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import unicodedata
 from dataclasses import dataclass
 
 
@@ -51,7 +52,7 @@ def managed_dataset_name(
     if (
         value.strip(".") == ""
         or any(character in value for character in ("/", "\\", "\x00", ":"))
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(unicodedata.category(character) == "Cc" for character in value)
     ):
         raise ManagedDatasetNameError(
             "managed dataset name must be one name, not a path or URI",
@@ -88,9 +89,9 @@ class SinkSpec:
     @classmethod
     def from_config(cls, config: dict | None, title: str | None = None) -> "SinkSpec":
         cfg = config or {}
-        if "filename" in cfg:
+        if cfg.get("filename") is not None:
             raw = cfg["filename"]
-        elif "name" in cfg:
+        elif cfg.get("name") is not None:
             raw = cfg["name"]
         elif title:
             raw = title

@@ -168,6 +168,7 @@ def _run_allocation_counts() -> tuple[int, int, int, int]:
         ("../escape.parquet", "path_syntax"),
         ("nested/output.parquet", "path_syntax"),
         (r"nested\output.parquet", "path_syntax"),
+        ("family\u0085cost", "path_syntax"),
     ],
 )
 def test_managed_name_admission_returns_field_error_without_publication(
@@ -223,6 +224,19 @@ def test_direct_run_returns_the_same_name_error_before_run_allocation(
     assert _run_allocation_counts() == before_runs
     assert _managed_publication_counts() == before_publications
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_sink_config_treats_injected_null_filename_as_absent():
+    from hub.sinks import SinkSpec
+
+    spec = SinkSpec.from_config({
+        "filename": None,
+        "name": "aggregate output",
+        "format": "parquet",
+    })
+
+    assert spec.name == "aggregate output"
+    assert spec.filename == "aggregate output.parquet"
 
 
 def test_normal_managed_name_is_preserved_across_admission_receipt_catalog_and_revision(
