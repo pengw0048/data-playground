@@ -6,7 +6,7 @@ import type { CatalogTable } from '../types/api'
 const mocks = vi.hoisted(() => ({
   tablesPage: vi.fn(), facets: vi.fn(), catalogTree: vi.fn(), searchCatalog: vi.fn(),
   registerFile: vi.fn(), registerDataset: vi.fn(), lineage: vi.fn(), sample: vi.fn(), table: vi.fn(), tableByRegistration: vi.fn(),
-  datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
+  datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(), resolveDatasetRevision: vi.fn(),
   setTableMetadata: vi.fn(), saveTableEdit: vi.fn(), unregisterTable: vi.fn(), unregisterTables: vi.fn(),
   catalogFolders: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), deleteFolder: vi.fn(),
 }))
@@ -76,6 +76,7 @@ describe('Catalog discovery request and mutation truth', () => {
     mocks.datasetRevisionCapabilities.mockResolvedValue({
       selectors: [], asOfOrdering: null, timezone: null, datasetViewSave: false,
     })
+    mocks.resolveDatasetRevision.mockRejectedValue(Object.assign(new Error('revision resolution absent'), { status: 501 }))
     mocks.sample.mockResolvedValue({
       columns: TABLE.columns, rows: [{ order_id: 1 }], rowCount: 2,
       hasMore: true, truncated: true, completeness: 'page',
@@ -420,6 +421,81 @@ describe('Catalog discovery request and mutation truth', () => {
       'No rows returned by this preview; the dataset contains 120 rows.',
     )).toBeInTheDocument()
   })
+
+  it('keeps v3 facts revision-bound while preview advances, then refreshes exact v4 facts', async () => {
+    const v3Columns = [{ name: 'legacy_code', type: 'string' }]
+    const v4Columns = [{ name: 'order_id', type: 'int' }, { name: 'status', type: 'string' }]
+    const cachedV3 = { ...TABLE, rowCount: 3, version: 'catalog-v3', columns: v3Columns }
+    const v3 = {
+      datasetId: 'orders-dataset', revisionId: '3', committedAt: '2026-07-24T12:00:00Z',
+      retentionOwner: 'provider', selector: 'latest',
+    }
+    const v4 = {
+      datasetId: 'orders-dataset', revisionId: '4', committedAt: '2026-07-25T12:00:00Z',
+      retentionOwner: 'provider', selector: 'latest',
+    }
+    mocks.tablesPage.mockResolvedValue({ items: [cachedV3], total: 1, hasMore: false })
+    mocks.lineage.mockResolvedValue({ rootUri: cachedV3.uri, nodes: [], edges: [] })
+    mocks.resolveDatasetRevision
+      .mockResolvedValueOnce(v3)
+      .mockResolvedValueOnce(v3)
+      .mockResolvedValueOnce(v4)
+      .mockResolvedValue(v4)
+    mocks.datasetRevision
+      .mockResolvedValueOnce({
+        ...v3, parentRevisionId: '2', producerOperation: null,
+        summary: { rowCount: 3 },
+        preview: { columns: v3Columns, rows: [{ legacy_code: 'old' }], hasMore: false, rowLimit: 100 },
+      })
+      .mockRejectedValueOnce(new Error('provider offline'))
+      .mockResolvedValueOnce({
+        ...v4, parentRevisionId: '3', producerOperation: null,
+        summary: { rowCount: 4 },
+        preview: { columns: v4Columns, rows: [{ order_id: 1, status: 'ready' }], hasMore: false, rowLimit: 100 },
+      })
+    mocks.sample.mockResolvedValue({
+      columns: v4Columns, rows: [{ order_id: 1, status: 'ready' }], rowCount: 4,
+      hasMore: true, truncated: true, completeness: 'page', notPreviewable: false, wire: 'dataset',
+      sampleProvenance: {
+        strategy: 'prefix', seed: null, requestedRows: 30, scannedRows: null, returnedRows: 1,
+        totalRows: 4, datasetIdentity: cachedV3.uri, datasetRevision: 'lance-v4',
+        identity: 'b'.repeat(64), limitations: [],
+      },
+    })
+
+    render(<CatalogDiscoveryFixture />)
+    fireEvent.click(await screen.findByText('orders'))
+
+    expect(await screen.findByText(/not bound to latest head orders-dataset@3/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Catalog snapshot catalog-v3')
+    fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
+    expect(await screen.findByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    expect(screen.getByText('3 rows')).toBeInTheDocument()
+    expect(screen.getByText('· 1 cols')).toBeInTheDocument()
+    expect(screen.getByText('legacy_code')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('detail-preview'))
+    expect(await screen.findByText('Input mem://orders · revision lance-v4.')).toBeInTheDocument()
+    expect(await screen.findByText(/latest head is orders-dataset@4/i)).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    expect(screen.getByText('3 rows')).toBeInTheDocument()
+    expect(screen.getByText('· 1 cols')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
+    expect(await screen.findByText("Couldn't refresh exact head facts: provider offline")).toBeInTheDocument()
+    expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@3')
+    expect(screen.getByTestId('dataset-facts-stale')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('refresh-dataset-facts'))
+    await waitFor(() => expect(screen.getByTestId('dataset-facts-source')).toHaveTextContent('Exact revision orders-dataset@4'))
+    expect(screen.getByText('4 rows')).toBeInTheDocument()
+    expect(screen.getByText('· 2 cols')).toBeInTheDocument()
+    expect(screen.queryByText('legacy_code')).not.toBeInTheDocument()
+    expect(screen.getByText('· verified latest head')).toBeInTheDocument()
+    expect(screen.queryByTestId('dataset-facts-stale')).not.toBeInTheDocument()
+    expect(mocks.datasetRevision).toHaveBeenNthCalledWith(1, 'orders-dataset', '3')
+    expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'orders-dataset', '4')
+    expect(mocks.datasetRevision).toHaveBeenNthCalledWith(3, 'orders-dataset', '4')
+  })
 })
 
 describe('Catalog discovery selection, register modal, and rename', () => {
@@ -431,6 +507,7 @@ describe('Catalog discovery selection, register modal, and rename', () => {
     mocks.searchCatalog.mockResolvedValue([])
     mocks.lineage.mockResolvedValue({ rootUri: TABLE.uri, nodes: [], edges: [] })
     mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
+    mocks.resolveDatasetRevision.mockRejectedValue(Object.assign(new Error('revision resolution absent'), { status: 501 }))
     mocks.saveTableEdit.mockResolvedValue(TABLE)
     mocks.unregisterTables.mockResolvedValue({
       mode: 'best_effort', limit: 50,
@@ -583,6 +660,7 @@ describe('Catalog discovery folder child request identity', () => {
     mocks.facets.mockResolvedValue({ folders: [], tags: [], owners: [] })
     mocks.searchCatalog.mockResolvedValue([])
     mocks.datasetRevisions.mockRejectedValue(Object.assign(new Error('history absent'), { status: 501 }))
+    mocks.resolveDatasetRevision.mockRejectedValue(Object.assign(new Error('revision resolution absent'), { status: 501 }))
     mocks.catalogFolders.mockResolvedValue([])
     mocks.createFolder.mockResolvedValue({ path: 'created' })
     mocks.renameFolder.mockResolvedValue({ ok: true })
