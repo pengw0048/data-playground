@@ -358,16 +358,21 @@ class LocalRunner:
         # No fabricated ETA — a per-op seconds guess is uncalibrated and misleadingly precise. The honest
         # cost signal is DATA VOLUME: confirm on estimated bytes (primary), because a 5M-row pass over one
         # int (~20 MB) is trivial while 200k wide rows can be gigabytes — the old pure row gate misfired on
-        # both. Fall back to the row count when byte size is unknown. Unknown-and-uncountable means the
-        # source can't be scanned either → the run fails fast → no confirm gate.
+        # both. A known row count with unknown byte width requires confirmation: variable binary columns
+        # can make a small-looking row count arbitrarily expensive. Unknown-and-uncountable keeps its
+        # existing fast-failure behavior and does not add a gate.
         placement: Placement = "local"  # the only backend today; a cluster runner (plugin) sets its own
         if rows is None and byts is None:
             return RunEstimate(rows=None, bytes=None, placement=placement, needs_confirm=False,
                                breakdown=f"size unknown · {len(plan.steps)} steps · out-of-core")
         # EITHER signal trips the gate: large estimated bytes (catches few-but-WIDE rows the row count
-        # misses) OR a large row count (the width estimate under-counts variable-length strings/blobs, so
+        # misses) OR a large row count (the width estimate can under-count variable-length strings, so
         # the row threshold stays a floor). Neither subsumes the other.
-        needs = (byts is not None and byts >= _CONFIRM_BYTES) or (rows is not None and rows >= _CONFIRM_ROWS)
+        needs = (
+            (rows is not None and byts is None)
+            or (byts is not None and byts >= _CONFIRM_BYTES)
+            or (rows is not None and rows >= _CONFIRM_ROWS)
+        )
         size = _fmt_bytes(byts) if byts is not None else "size unknown"
         rowstr = f"{rows:,} rows" if rows is not None else "unknown rows"
         return RunEstimate(rows=rows, bytes=byts, placement=placement, needs_confirm=needs,

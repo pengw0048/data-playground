@@ -1199,6 +1199,10 @@ def test_map_column_type_is_distinct_from_struct():
     from hub.plugins.adapters import display_type
     assert display_type("MAP(VARCHAR, BIGINT)") == "map"   # was folded into 'struct' → UI showed [N]
     assert display_type("STRUCT(a INTEGER)") == "struct"
+    assert display_type("BLOB") == "bytes"
+    assert display_type("BINARY") == "bytes"
+    assert display_type("LARGE_BINARY") == "bytes"
+    assert display_type("fixed_size_binary[16]") == "bytes"
 
 
 def test_sandbox_set_allowed_replaces_not_grows():
@@ -3358,8 +3362,8 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     plan = compiler.compile_plan(g, "s", deps.registry, deps.node_specs)
     r = deps.runner
     assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
-    assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10          # small known
-    assert r.estimate(plan, 6_000_000).needs_confirm is True                                        # big rows, no bytes → row gate
+    assert r.estimate(plan, 10).needs_confirm is True and r.estimate(plan, 10).rows == 10  # known rows, unknown bytes
+    assert r.estimate(plan, 6_000_000).needs_confirm is True                              # big rows, no bytes → gate
     # the cost model gates on EITHER signal: large bytes OR a large row count (neither subsumes the other) —
     assert r.estimate(plan, 200_000, 3 << 30).needs_confirm is True       # 200k WIDE rows = ~3GB → byte gate (row count wouldn't)
     assert r.estimate(plan, 6_000_000, 20 << 20).needs_confirm is True    # 6M rows (only ~20MB) → row floor still gates
@@ -10189,6 +10193,7 @@ def test_estimate_sizes_is_conservative_and_honest():
     assert e["p"].rows == min(100, e["s"].rows) and e["p"].confidence == "bounded"  # sample ≤ n
     assert e["a"].rows is None and e["a"].confidence == "unknown" and e["a"].blocking  # aggregate collapse: unknown
     assert e["s"].bytes and e["s"].bytes > 0  # bytes scale with rows
+    assert e["s"].bytes == e["s"].rows * 64   # no schema keeps the established coarse fallback
 
     # a measured actual overrides the estimate and propagates downstream
     e2 = est(nodes, edges, actuals={"f": 42})
@@ -10255,8 +10260,46 @@ def test_row_width_accounts_for_vector_and_list_columns():
     assert _col_width("int[3]") == 3 * 8
     assert _col_width("varchar[]") > 24            # variable-length list of strings > a single string
     assert _col_width("struct") >= 64              # nested value, coarse
+    assert _col_width("bytes") is None              # variable payload: no fabricated scalar width
+    assert _col_width("bytes[]") is None
+    assert _col_width("blob") == 16                 # dead display aliases use the generic scalar fallback
+    assert _col_width("bytea") == 16
+    assert _col_width("bytes", "fixed_size_binary[16]") == 16
     wide = _row_width([{"name": "id", "type": "int"}, {"name": "emb", "type": "float[1024]"}])
     assert wide >= 1024 * 8 and wide > _row_width([{"name": "id", "type": "int"}]) * 100
+    mixed = _row_width([
+        {"name": "payload", "type": "bytes", "physicalType": "BLOB"},
+        {"name": "embedding", "type": "float[4096]"},
+    ])
+    assert mixed == 16 + 4096 * 8  # runtime batching keeps the known vector contribution
+
+
+def test_unmapped_non_binary_types_keep_small_estimates_known():
+    from hub import compiler
+    from hub.estimate import _col_width, estimate_sizes
+    from hub.models import Graph
+
+    deps = get_deps()
+    for logical_type in ("utinyint", "usmallint", "uinteger", "timestamp_s", "timestamp_ms", "timestamp_ns"):
+        assert _col_width(logical_type) == 16
+
+    graph = Graph(**{
+        "id": "fallback-widths", "version": 1,
+        "nodes": [N("s", "source", {"uri": _uri("events")})],
+        "edges": [],
+    })
+    estimate = estimate_sizes(
+        graph, deps.resolve_adapter,
+        schemas={"s": [
+            {"name": "count", "type": "uinteger", "physicalType": "UINTEGER"},
+            {"name": "captured_at", "type": "timestamp_ms", "physicalType": "TIMESTAMP_MS"},
+        ]},
+        actuals={"s": 10},
+    )["s"]
+    assert estimate.rows == 10 and estimate.bytes == 10 * 32
+    assert estimate.uncertainty is None
+    plan = compiler.compile_plan(graph, "s", deps.registry, deps.node_specs)
+    assert deps.runner.estimate(plan, estimate.rows, estimate.bytes).needs_confirm is False
 
 
 def test_source_metadata_count_is_memoized_by_fingerprint():
@@ -10305,12 +10348,71 @@ def test_source_width_probes_wide_list_columns(tmp_path):
                              "emb": pa.array([[1.0] * 512] * 64, type=pa.list_(pa.float32(), 512))}), p)
     cols = [{"name": "id", "type": "int"}, {"name": "emb", "type": "float[]"}]
     assert _col_width("float[]") == 128                              # the flat (undercounting) default
-    w = _source_width(d.resolve_adapter, p, cols)
+    w = _source_width(d.resolve_adapter, p, cols).bytes_per_row
+    assert w is not None
     assert w >= 512 * 4, f"probe should score the ~512-wide embedding, got {w}"   # ~2056, not 8+128
     # end-to-end: the source's byte estimate reflects the probed width (feeds the byte confirm-gate)
     g = Graph(**{"id": "c", "version": 1, "nodes": [N("s", "source", {"uri": p})], "edges": []})
     est = estimate_sizes(g, d.resolve_adapter, schemas={"s": cols})
     assert est["s"].bytes and est["s"].bytes >= 64 * 512 * 4          # 64 rows × ~2KB, not 64 × 136
+
+
+def test_binary_width_unknown_propagates_without_scanning_values(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from hub.estimate import estimate_sizes
+    from hub.models import Graph
+
+    path = str(tmp_path / "binary.parquet")
+    pq.write_table(pa.table({"id": [1, 2], "payload": [b"a", b"x" * 1024]}), path)
+    graph = Graph(**{
+        "id": "binary-width", "version": 1,
+        "nodes": [
+            N("s", "source", {"uri": path}),
+            N("f", "filter", {"predicate": "id > 0"}),
+            N("sort", "sort", {"by": "id"}),
+        ],
+        "edges": [E("s", "f"), E("f", "sort")],
+    })
+    schemas = {
+        "s": [{"name": "id", "type": "int"}, {"name": "payload", "type": "bytes", "physicalType": "BLOB"}],
+        "f": [{"name": "id", "type": "int"}, {"name": "payload", "type": "bytes", "physicalType": "BLOB"}],
+        "sort": [{"name": "id", "type": "int"}, {"name": "payload", "type": "bytes", "physicalType": "BLOB"}],
+    }
+    estimate = estimate_sizes(graph, get_deps().resolve_adapter, schemas=schemas)
+    assert estimate["s"].rows == 2 and estimate["s"].bytes is None
+    assert estimate["f"].rows == 2 and estimate["f"].bytes is None
+    assert 'Binary column "payload"' in (estimate["f"].uncertainty or "")
+    assert "sort" in get_deps().controller._cost_requires(graph, "sort", estimate)
+
+
+def test_binary_run_estimate_requires_confirmation_and_explains_missing_evidence(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = str(tmp_path / "binary-confirm.parquet")
+    pq.write_table(pa.table({"id": [1, 2], "payload": [b"a", b"x" * 1024]}), path)
+    graph = {
+        "id": "binary-confirm", "version": 1,
+        "nodes": [N("s", "source", {"uri": path})],
+        "edges": [],
+    }
+    response = client.post(
+        "/api/run/estimate", json={"graph": graph, "targetNodeId": "s"},
+    )
+    assert response.status_code == 200
+    estimate = response.json()
+    assert estimate["rows"] == 2
+    assert estimate["bytes"] is None
+    assert estimate["needsConfirm"] is True
+    assert 'Binary column "payload" has no fixed-width byte-size evidence' in estimate["breakdown"]
+    assert "did not scan values to guess" in estimate["breakdown"]
+    unconfirmed = client.post(
+        "/api/run", json={"graph": graph, "targetNodeId": "s", "confirmed": False},
+    )
+    assert unconfirmed.status_code == 409
+    assert "unknown size" in unconfirmed.json()["detail"]
 
 
 def test_latest_actuals_feeds_estimator_only_for_latest_nodes():
