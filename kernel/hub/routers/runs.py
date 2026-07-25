@@ -699,13 +699,13 @@ def _missing_bounded_schema_blocker(graph: Graph, node_id: str) -> str:
 
     if len(upstream_labels) == 1:
         transform = f"the upstream transform {upstream_labels[0]}"
-        subject = f"{transform} has"
+        subject = f"{transform} does not have"
         action = f"Select {transform}, then in the Inspector choose"
     elif upstream_labels:
-        subject = "every direct upstream transform has"
+        subject = "one or more direct upstream transforms do not have"
         action = "Select each direct upstream transform, then in the Inspector choose"
     else:
-        subject = "the upstream transform connected to this Write has"
+        subject = "the upstream transform connected to this Write does not have"
         action = "Select that upstream transform, then in the Inspector choose"
     return (
         f"{subject} a bounded output schema contract. {action} Output schema "

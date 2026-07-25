@@ -238,7 +238,8 @@ def test_admitted_exact_source_schema_uses_its_revision_without_mutable_scan(tmp
             deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111115")
         assert unavailable.intent is None
         assert unavailable.blocker == (
-            "the upstream transform with node ID “select” has a bounded output schema contract. "
+            "the upstream transform with node ID “select” does not have a bounded output schema "
+            "contract. "
             "Select the upstream transform with node ID “select”, then in the Inspector choose "
             "Output schema (contract) → Infer from sample.")
         assert source_adapter.opened[0] == "revision-1"
@@ -258,7 +259,8 @@ def test_missing_schema_blocker_names_the_direct_upstream_transform(contract, mo
 
     assert admission.intent is None
     assert admission.blocker == (
-        "the upstream transform “Normalize purchases” has a bounded output schema contract. "
+        "the upstream transform “Normalize purchases” does not have a bounded output schema "
+        "contract. "
         "Select the upstream transform “Normalize purchases”, then in the Inspector choose "
         "Output schema (contract) → Infer from sample.")
 
@@ -327,9 +329,9 @@ def test_direct_local_admission_blocks_ambiguous_predecessors_regardless_of_edge
     assert all(admission.intent is None for admission in admissions)
     assert all(
         admission.blocker
-        == "every direct upstream transform has a bounded output schema contract. Select each "
-        "direct upstream transform, then in the Inspector choose Output schema (contract) → "
-        "Infer from sample."
+        == "one or more direct upstream transforms do not have a bounded output schema contract. "
+        "Select each direct upstream transform, then in the Inspector choose Output schema "
+        "(contract) → Infer from sample."
         for admission in admissions
     )
 
