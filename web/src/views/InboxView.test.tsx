@@ -40,6 +40,12 @@ describe('InboxView', () => {
     useStore.setState({ view: 'inbox', inboxQuery: '', jobsQuery: '', toasts: [] } as never)
   })
 
+  it('scopes Inbox outcomes to durable background work', () => {
+    render(<InboxView />)
+    expect(screen.getByText('Outcomes from your durable background work')).toBeInTheDocument()
+    expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
+  })
+
   it('loads items, marks read, and opens an authorized job', async () => {
     const user = userEvent.setup()
     mocks.inboxMarkRead.mockResolvedValue(item({ readAt: '2026-07-17T12:05:00Z' }))
