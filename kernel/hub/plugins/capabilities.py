@@ -23,6 +23,13 @@ MediaKind = Literal["image", "video", "unknown"]
 
 _IMAGE_EXTENSIONS = {"avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"}
 _VIDEO_EXTENSIONS = {"m4v", "mkv", "mov", "mp4", "webm"}
+_IMAGE_FTYP_BRANDS = {
+    b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1",
+}
+_VIDEO_FTYP_BRANDS = {
+    b"3g2a", b"3g2b", b"3gp4", b"3gp5", b"3gp6", b"3gp7", b"avc1", b"M4V ", b"M4VH", b"M4VP",
+    b"mp41", b"mp42", b"mp71", b"qt  ",
+}
 _MAX_MEDIA_SAMPLE_ROWS = 256
 _MAX_MEDIA_CELL_BYTES = 4096
 _MAX_MEDIA_URL_LENGTH = 8192
@@ -39,19 +46,28 @@ def is_media_column(col: ColumnSchema) -> bool:
 
 def _kind_from_bytes(value: object) -> MediaKind | None:
     try:
-        data = bytes(value)[:_MAX_MEDIA_CELL_BYTES]
+        if isinstance(value, bytes):
+            data = value[:_MAX_MEDIA_CELL_BYTES]
+        elif isinstance(value, bytearray):
+            data = bytes(value[:_MAX_MEDIA_CELL_BYTES])
+        elif isinstance(value, memoryview):
+            data = value.cast("B")[:_MAX_MEDIA_CELL_BYTES].tobytes()
+        else:
+            return None
     except (TypeError, ValueError, MemoryError):
         return None
     if data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
         return "image"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image"
-    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in {b"avif", b"avis", b"heic", b"heix"}:
-        return "image"
     if data.startswith(b"\x1aE\xdf\xa3"):
         return "video"  # WebM/Matroska container evidence
     if len(data) >= 12 and data[4:8] == b"ftyp":
-        return "video"  # ISO base media (MP4/MOV family)
+        brand = data[8:12]
+        if brand in _IMAGE_FTYP_BRANDS:
+            return "image"
+        if brand in _VIDEO_FTYP_BRANDS:
+            return "video"
     return None
 
 

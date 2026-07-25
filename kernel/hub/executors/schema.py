@@ -109,10 +109,18 @@ def _by_name(columns: list[ColumnSchema]) -> dict[str, list[ColumnSchema]]:
 
 
 def _reference_copy(
-        output: ColumnSchema, source: ColumnSchema | None) -> ColumnSchema:
-    return output.model_copy(update={
+        output: ColumnSchema, source: ColumnSchema | None, *, media: bool = False,
+) -> ColumnSchema:
+    updates: dict = {
         "row_reference": source.row_reference if source is not None else None,
-    })
+    }
+    # Callers set media=True only where a declaration/provider schema owns the field or an
+    # existing derivation has already proved the field identity. Do not turn this into generic
+    # capability propagation: runtime value evidence and other capabilities keep their own paths.
+    if media and source is not None and "media" in source.capabilities:
+        updates["capabilities"] = sorted({*output.capabilities, "media"})
+        updates["media_kind"] = source.media_kind or output.media_kind or "unknown"
+    return output.model_copy(update=updates)
 
 
 def _unknown_references(columns: list[ColumnSchema]) -> list[ColumnSchema]:
@@ -120,7 +128,8 @@ def _unknown_references(columns: list[ColumnSchema]) -> list[ColumnSchema]:
 
 
 def _matching_reference_columns(
-        output: list[ColumnSchema], source: list[ColumnSchema]) -> list[ColumnSchema]:
+        output: list[ColumnSchema], source: list[ColumnSchema], *, media: bool = False,
+) -> list[ColumnSchema]:
     candidates = _by_name(source)
     output_names = _by_name(output)
     return [
@@ -131,6 +140,7 @@ def _matching_reference_columns(
                 and len(matches := candidates.get(identifier_key(column.name), [])) == 1
             )
             else None,
+            media=media,
         )
         for column in output
     ]
@@ -414,13 +424,13 @@ def derive_reference_schema(
     known_inputs = [schema for schema in inputs if schema is not None]
     if _bypassed(node):
         return (
-            _matching_reference_columns(observed, known_inputs[0])
+            _matching_reference_columns(observed, known_inputs[0], media=True)
             if len(known_inputs) == 1 else _unknown_references(observed)
         )
     config = resolve_config(node)
     if node.type == "source":
         return (
-            [_reference_copy(output, evidence)
+            [_reference_copy(output, evidence, media=True)
              for output, evidence in zip(observed, source_evidence, strict=True)]
             if source_evidence is not None
             and _same_names(observed, source_evidence)
@@ -428,14 +438,14 @@ def derive_reference_schema(
         )
     declaration = _declared_output(node, node_builders)
     if declaration is not None:
-        return _matching_reference_columns(observed, declaration)
+        return _matching_reference_columns(observed, declaration, media=True)
     if node.type in _UNTYPED or node.type == "sql":
         return _unknown_references(observed)
     if not known_inputs or len(known_inputs) != len(inputs):
         return _unknown_references(observed)
     if node.type in _REFERENCE_PASSTHROUGH:
         return (
-            _matching_reference_columns(observed, known_inputs[0])
+            _matching_reference_columns(observed, known_inputs[0], media=True)
             if len(known_inputs) == 1 else _unknown_references(observed)
         )
     if node.type == "select" and len(known_inputs) == 1:
@@ -459,7 +469,7 @@ def apply_derived_references(
     if derived is None or not _same_names(observed, derived):
         return _unknown_references(observed)
     return [
-        _reference_copy(runtime, metadata)
+        _reference_copy(runtime, metadata, media=True)
         for runtime, metadata in zip(observed, derived, strict=True)
     ]
 

@@ -212,7 +212,8 @@ def test_catalog_and_capabilities():
         matches = client.get("/api/catalog/tables", params={"q": name}).json()["items"]
         tabs[name] = next(t for t in matches if t["name"] == name)
     caps = {c["name"]: c["capabilities"] for c in tabs["images"]["columns"]}
-    assert "media" in caps["image_url"] and "vector" in caps["embedding"]
+    assert "media" not in caps["image_url"]  # schema-only names are not media evidence
+    assert "vector" in caps["embedding"]
     assert tabs["images"]["rowCount"] == 500
 
 
