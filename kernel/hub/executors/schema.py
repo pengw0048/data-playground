@@ -119,7 +119,11 @@ def _reference_copy(
     # capability propagation: runtime value evidence and other capabilities keep their own paths.
     if media and source is not None and "media" in source.capabilities:
         updates["capabilities"] = sorted({*output.capabilities, "media"})
-        updates["media_kind"] = source.media_kind or output.media_kind or "unknown"
+        updates["media_kind"] = (
+            output.media_kind
+            if output.media_kind in ("image", "video")
+            else source.media_kind or output.media_kind or "unknown"
+        )
     return output.model_copy(update=updates)
 
 

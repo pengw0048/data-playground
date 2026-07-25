@@ -79,20 +79,29 @@ def test_schema_only_tagging_requires_an_explicit_media_capability() -> None:
     assert declared.capabilities == ["media"] and declared.media_kind == "unknown"
 
 
-def test_preview_preserves_provider_declared_media_for_an_opaque_value() -> None:
+def test_preview_preserves_declared_and_sampled_media_kinds_through_filter() -> None:
     class PrivateMediaAdapter:
         name = "private-media"
 
         @staticmethod
         def schema(_uri: str) -> list[ColumnSchema]:
-            return [ColumnSchema(
-                name="asset", type="string", provenance="provider",
-                capabilities=["media", "provider-private"],
-            )]
+            return [
+                ColumnSchema(
+                    name="asset", type="string", provenance="provider",
+                    capabilities=["media", "provider-private"], media_kind="unknown",
+                ),
+                ColumnSchema(
+                    name="image", type="bytes", provenance="provider",
+                    capabilities=["media"], media_kind="unknown",
+                ),
+            ]
 
         @staticmethod
         def preview_scan(_uri: str, *, limit: int = 2000, **_kwargs):
-            table = pa.table({"asset": ["private-object-key"]})
+            table = pa.table({
+                "asset": ["private-object-key"],
+                "image": [b"\x89PNG\r\n\x1a\n"],
+            })
             return db.conn().from_arrow(table).limit(limit)
 
         scan = preview_scan
@@ -124,6 +133,9 @@ def test_preview_preserves_provider_declared_media_for_an_opaque_value() -> None
         result = preview_node(
             graph, target, 5, lambda _uri: adapter, {}, storage=None,
         )
-        assert not result.error and result.rows == [{"asset": "private-object-key"}]
-        assert result.columns[0].capabilities == ["media"]
-        assert result.columns[0].media_kind == "unknown"
+        assert not result.error
+        columns = {column.name: column for column in result.columns}
+        assert columns["asset"].capabilities == ["media"]
+        assert columns["asset"].media_kind == "unknown"
+        assert columns["image"].capabilities == ["media"]
+        assert columns["image"].media_kind == "image"
