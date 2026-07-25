@@ -65,6 +65,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const outputName = String(writeConfig.filename ?? writeConfig.name ?? target?.data.title ?? 'output')
   const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
   const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
+  const primaryActionLabel = isWrite ? 'Publish revision' : 'Run'
+  const previewActionLabel = isWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
   if (isConfiguredManagedSidecarMerge) return (
     <div className="p-3.5">
@@ -138,11 +140,14 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           )}
           {phase === 'confirm' ? (
             <div className="mt-3.5 flex gap-2">
-              <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">Run</Button>
+              <Button size="sm" onClick={() => doRun(nodeId, true)} disabled={!canEdit}
+                title={canEdit ? primaryActionLabel : 'View-only canvas'}
+                className="flex-1 bg-[#d99a2b] text-white hover:bg-[#c98d24]">{primaryActionLabel}</Button>
               <Button size="sm" variant="outline" onClick={() => useStore.getState().closePanel(nodeId)} className="flex-1">Cancel</Button>
             </div>
           ) : (
-            <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit} title={canEdit ? 'Run' : 'View-only canvas'} className="mt-3.5 w-full">Run</Button>
+            <Button size="sm" onClick={() => doRun(nodeId, false)} disabled={!canEdit}
+              title={canEdit ? primaryActionLabel : 'View-only canvas'} className="mt-3.5 w-full">{primaryActionLabel}</Button>
           )}
         </>
       )}
@@ -156,8 +161,8 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
           <InputDriftNotice drift={run.inputDrift} doc={doc} />
           <div className="mt-3 flex gap-2">
             <Button size="sm" onClick={() => doRun(nodeId, !!est?.needsConfirm, true)} disabled={!canEdit}
-              title={canEdit ? 'Run the exact preview inputs' : 'View-only canvas'} className="flex-1">
-              Run preview inputs
+              title={canEdit ? `${previewActionLabel} at their exact revisions` : 'View-only canvas'} className="flex-1">
+              {previewActionLabel}
             </Button>
             <Button size="sm" variant="outline" onClick={() => void refreshPreviewInputs(nodeId)} disabled={!canEdit}
               title={canEdit ? 'Accept latest inputs and refresh the preview' : 'View-only canvas'} className="flex-1">
@@ -171,7 +176,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <div className="mb-2.5 flex items-center gap-2">
             <span className="dp-running-glyph text-primary">●</span>
-            <span className="text-[13px] font-semibold">running</span>
+            <span className="text-[13px] font-semibold">{isWrite ? 'publishing managed revision' : 'running'}</span>
             {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
           {/* step-progress (deterministic) when we have it, else the row-based fallback */}
@@ -185,7 +190,10 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </div>
           )}
           <PerNode st={st} />
-          <RunOutputs outputs={st.outputs} />
+          {isWrite
+            ? <WritePublicationSummary compact outputName={outputName} destination={destination}
+                admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing />
+            : <RunOutputs outputs={st.outputs} />}
           <Button size="sm" variant="outline" onClick={() => cancel(nodeId)} disabled={!canEdit} title={canEdit ? 'Stop this run' : 'View-only canvas'} className="mt-3 w-full">
             <Icon name="stop" size={12} /> Stop
           </Button>
@@ -194,7 +202,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
 
       {phase === 'done' && st && (
         isWrite ? <>
-          <Label>PUBLISHED</Label>
+          <Label>MANAGED REVISION PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
             outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed />
           <PerNode st={st} compact />

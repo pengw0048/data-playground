@@ -390,13 +390,13 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
   )
 }
 
-// The write node's output destination — chosen here in the property panel via the save dialog.
+// The managed publication destination — storage layout stays owned by Data Playground.
 function WriteDestination({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const [dlg, setDlg] = useState(false)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
-  const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
+  const filename = String(cfg.filename ?? cfg.name ?? 'output')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
   const destPath = String(cfg.destPath ?? '')
   const admission = useStore((s) => s.runs[nodeId]?.writeAdmission
@@ -408,15 +408,15 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
   const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
-    <Section title="Publication">
+    <Section title="Managed publication">
       <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
         outcomeAdmission={outcomeAdmission} receipt={receipt ?? admission?.recoveredReceipt}
-        outputs={outputs} completed={phase === 'done'} />
+        outputs={outputs} completed={phase === 'done'} publishing={phase === 'running'} />
       <div className="mt-2">
-        <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
+        <CodeBtn icon="export" label="Choose managed destination…" onClick={() => setDlg(true)} />
       </div>
       {dlg && (
-        <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
+        <FileDialog mode="save" title="Choose managed destination" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
       )}
     </Section>

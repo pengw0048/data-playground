@@ -314,10 +314,10 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
 
     const publication = screen.getByLabelText('Write publication')
-    expect(publication).toHaveTextContent('Output name')
-    expect(publication).toHaveTextContent('Workspace outputs')
+    expect(publication).toHaveTextContent('Proposed dataset name')
+    expect(publication).toHaveTextContent('Default managed storage')
     expect(publication).toHaveTextContent(label)
-    expect(publication).toHaveTextContent('Ready to publish')
+    expect(publication).toHaveTextContent('Ready to publish a managed revision')
     expect(screen.getByText('Publication details').closest('details')).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Publication details'))
     expect(publication).toHaveTextContent('managed-local-file')
@@ -369,7 +369,7 @@ describe('Inspector — effective named outputs', () => {
     render(<Inspector />)
 
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
-    expect(screen.getByText('Publication mode').parentElement).toHaveTextContent('Append to the selected dataset')
+    expect(screen.getByText('Revision mode').parentElement).toHaveTextContent('Append to the selected dataset')
     expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     fireEvent.click(screen.getByText('Publication details'))
     expect(screen.getByLabelText('Write publication')).toHaveTextContent('dataset-lance@8')
