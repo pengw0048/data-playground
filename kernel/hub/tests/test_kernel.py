@@ -3886,7 +3886,22 @@ def test_canvas_version_history_and_restore():
     assert len(versions) >= 1  # snapshot A is there to restore
     restored = client.post("/api/canvas/cvh/restore", json={"version_id": versions[-1]["id"]}).json()
     assert [n["id"] for n in restored["doc"]["nodes"]] == ["n1"]  # node is back
-    assert [n["id"] for n in client.get("/api/canvas/cvh").json()["nodes"]] == ["n1"]  # persisted
+    restored_version = restored["doc"]["version"]
+    persisted = client.get("/api/canvas/cvh").json()
+    listed = next(c for c in client.get("/api/canvas").json() if c["id"] == "cvh")
+    assert restored_version == persisted["version"] == listed["version"]
+    assert [n["id"] for n in persisted["nodes"]] == ["n1"]  # persisted
+    edited = {**persisted, "name": "Edited after restore"}
+    saved = client.put(
+        f"/api/canvas/cvh?expectedVersion={restored_version}", json=edited)
+    assert saved.status_code == 200
+    assert saved.json()["version"] == restored_version + 1
+    stale = client.put(
+        f"/api/canvas/cvh?expectedVersion={restored_version}",
+        json={**edited, "name": "Stale concurrent edit"},
+    )
+    assert stale.status_code == 409
+    assert client.get("/api/canvas/cvh").json()["name"] == "Edited after restore"
     # the restore itself snapshotted the pre-restore (empty) state, so it's undoable too
     assert any(v["label"] == "before restore" for v in client.get("/api/canvas/cvh/versions").json())
     client.delete("/api/canvas/cvh")
