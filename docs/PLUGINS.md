@@ -347,8 +347,11 @@ export DP_CATALOG_MOUNTS='[
 
 `id` is the stable local mount identity and must be unique. Configuration is passed only to the
 installed provider and is never returned by the API; changing mount identity or configuration
-invalidates outstanding mixed-browse cursors. A malformed entry or failed provider activation is
-reported as an unavailable source while local and other healthy sources remain browseable.
+invalidates outstanding mixed-browse cursors. A config value may use `env:NAME` or `file:/path`.
+The hub resolves that value only while constructing the provider mount; sensitive-looking keys must
+use a registered SecretRef rather than inline material. Resolved values never enter API responses,
+logs, backups, or execution manifests. A malformed entry or failed provider activation is reported
+as an unavailable source while local and other healthy sources remain browseable.
 
 Use a conformance fixture whose first two deterministic root containers share a display name but have
 distinct placement IDs, and give each a dataset occurrence with the same dataset ID, canonical URI, and

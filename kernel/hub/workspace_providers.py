@@ -62,16 +62,47 @@ class ProviderDatasetOffline(ProviderDatasetUnavailable):
     """A valid provider dataset binding could not be read because its provider is offline."""
 
 
+class MountConfigError(ValueError):
+    """Operator mount configuration would expose credential material outside the resolver boundary."""
+
+
 @dataclass(frozen=True)
 class _MountedProvider:
     mount: CatalogMount
     container_id: str
+    config_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
 class _Source:
     kind: Literal["local", "provider", "configuration"]
     mounted: _MountedProvider | None = None
+
+
+def _resolve_mount_config(config: dict[str, str]) -> dict[str, str]:
+    """Resolve registered SecretRefs immediately before a mount reaches its provider.
+
+    Mount configuration is operator-owned and never persisted or returned through Workspace.  Keep
+    its plaintext-free values unchanged, but resolve configured credentials only in this hub process
+    and reject inline material under the same sensitive-key policy as execution manifests.
+    """
+    from hub.execution_manifest import _SENSITIVE_KEY
+    from hub.secrets import is_registered_secret_ref, resolve_secret_value
+
+    resolved: dict[str, str] = {}
+    for key, value in config.items():
+        if _SENSITIVE_KEY.search(key) and value not in (None, "") and not is_registered_secret_ref(value):
+            raise MountConfigError(
+                f"catalog mount configuration cannot retain sensitive field {key!r}")
+        if not is_registered_secret_ref(value):
+            resolved[key] = value
+            continue
+        try:
+            resolved[key] = resolve_secret_value(value, allow_plaintext=False)
+        except Exception:
+            raise MountConfigError(
+                "catalog mount secret reference could not be resolved") from None
+    return resolved
 
 
 def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
@@ -99,9 +130,11 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
             config = item.get("config", {})
             if not isinstance(config, dict):
                 raise ValueError
+            config_fingerprint = hashlib.sha256(json.dumps(
+                config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             mount = CatalogMount.model_validate({
                 "id": item["id"], "provider": item["provider"],
-                "config": config,
+                "config": _resolve_mount_config(config),
             })
             container_id = item.get("containerId", metadb.LOCAL_WORKSPACE_ROOT_ID)
             if ("\x00" in mount.id or "\x00" in mount.provider
@@ -114,7 +147,8 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
             invalid = True
             continue
         seen.add(mount.id)
-        mounts.append(_MountedProvider(mount=mount, container_id=container_id))
+        mounts.append(_MountedProvider(
+            mount=mount, container_id=container_id, config_fingerprint=config_fingerprint))
     mounts.sort(key=lambda configured: configured.mount.id)
     return mounts, invalid
 
@@ -151,7 +185,9 @@ def _mount_fingerprint(mounts: list[_MountedProvider], invalid: bool) -> str:
         "id": item.mount.id,
         "provider": item.mount.provider,
         "containerId": item.container_id,
-        "config": item.mount.config,
+        # Use the operator-owned (unresolved) configuration digest, never material resolved for the
+        # provider.  This fingerprint crosses the cursor boundary, so it must not vary with a token.
+        "config": item.config_fingerprint,
     } for item in mounts]
     payload = json.dumps([value, invalid], sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()[:24]
@@ -976,7 +1012,7 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
         metadb.workspace_provider_ensure_overlay_anchor(binding_id)
     mounted = next((item for item in mounts if item.mount.id == mount_id), None)
     cached_mount = _MountedProvider(
-        CatalogMount(id=mount_id, provider=cached["provider"], config={}), cached["containerId"])
+        CatalogMount(id=mount_id, provider=cached["provider"], config={}), cached["containerId"], "")
     provider_source = _Source("provider", mounted) if mounted is not None else _Source("configuration")
     sources = [_Source("local"), provider_source]
     fingerprint = _mount_fingerprint([mounted], invalid) if mounted is not None else _mount_fingerprint([], invalid)
@@ -1253,6 +1289,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
                 cached_mount = _MountedProvider(
                     CatalogMount(id=binding["mountId"], provider=binding["provider"], config={}),
                     binding["containerId"],
+                    "",
                 )
                 return _overlay_cached_resolution(
                     overlay["resource"], binding, cached_mount, _Source("configuration"), uid=uid,
@@ -1295,6 +1332,7 @@ def resolve(resource_ref: str, *, uid: str) -> dict:
         cached_mount = _MountedProvider(
             CatalogMount(id=mount_id, provider=cached["provider"], config={}),
             cached["containerId"],
+            "",
         )
         return _cached_resolution(
             cached, cached_mount, _Source("configuration"), uid=uid,
@@ -1453,6 +1491,7 @@ def relink(
             CatalogMount(
                 id=previous["mountId"], provider=previous["provider"], config={}),
             previous["containerId"],
+            "",
         )),
     }
 
