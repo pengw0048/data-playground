@@ -3093,6 +3093,52 @@ describe('graph store — core authority ops', () => {
     })
   })
 
+  it('offers one actionable recovery notification for a concurrent Canvas edit', async () => {
+    const doc = { ...emptyTestDoc('existing'), name: 'local edit', nodes: [NODE('local-node')] }
+    expect(writeCanvasDraft({
+      draftId: doc.id,
+      principalId: 'alice',
+      canvasId: doc.id,
+      baseCanvasId: doc.id,
+      baseVersion: 1,
+      name: doc.name,
+      doc,
+      createAttemptDoc: null,
+      syncState: 'dirty',
+      lastLocalEditAt: '2026-07-25T12:00:00.000Z',
+    }).ok).toBe(true)
+    useStore.getState().refreshLocalDrafts()
+    expect(useStore.getState().openLocalDraft(doc.id)).toBe(true)
+    apiMocks.saveCanvas.mockRejectedValue(new KernelError(409, 'another session saved first'))
+
+    await useStore.getState().retryLocalDraft(doc.id)
+    await useStore.getState().retryLocalDraft(doc.id)
+
+    const conflicts = useStore.getState().toasts.filter((toast) => toast.dedupeKey === `canvas-sync-conflict:${doc.id}`)
+    expect(conflicts).toHaveLength(1)
+    const conflict = conflicts[0]
+    expect(conflict.msg).toContain('local draft is preserved')
+    expect(conflict.actions?.map((action) => action.label)).toEqual([
+      'Open server copy',
+      'Keep local draft as new Canvas',
+    ])
+
+    const serverCopy = { ...doc, name: 'server edit', version: 2 }
+    apiMocks.getCanvas.mockResolvedValueOnce(serverCopy)
+    await conflict.actions?.[0].onClick()
+    expect(apiMocks.getCanvas).toHaveBeenCalledWith(doc.id)
+    expect(useStore.getState().doc).toMatchObject({ id: doc.id, name: 'server edit', version: 2 })
+
+    await conflict.actions?.[1].onClick()
+    expect(apiMocks.createCanvas).toHaveBeenLastCalledWith(expect.objectContaining({
+      id: expect.not.stringMatching(new RegExp(`^${doc.id}$`)),
+      name: 'local edit (recovered)',
+      nodes: doc.nodes,
+    }))
+    expect(useStore.getState().doc).toMatchObject({ name: 'local edit (recovered)', nodes: doc.nodes })
+    expect(useStore.getState().localDrafts).toEqual([])
+  })
+
   it('clears another principal draft list synchronously on identity change', async () => {
     apiMocks.createCanvas.mockRejectedValueOnce(new TypeError('offline'))
     await useStore.getState().newFile()

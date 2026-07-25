@@ -42,7 +42,19 @@ export function Toaster() {
             <div key={t.id} data-testid="toast"
               className={cn('flex items-start gap-2.5 rounded-md border px-3 py-2.5 text-xs leading-snug shadow-lg', s.cls)}>
               <Icon name={s.icon} size={13} style={{ marginTop: 1, flexShrink: 0 }} />
-              <span className="flex-1 break-words">{t.msg}</span>
+              <div className="min-w-0 flex-1">
+                <span className="break-words">{t.msg}</span>
+                {t.actions && t.actions.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {t.actions.map((action) => (
+                      <Button key={action.label} variant="outline" size="sm" className="h-6 px-2 text-[11px]" onClick={() => {
+                        void action.onClick()
+                        dismiss(t.id)
+                      }}>{action.label}</Button>
+                    ))}
+                  </div>
+                )}
+              </div>
               <button onClick={() => dismiss(t.id)} aria-label="Dismiss"
                 className="shrink-0 border-0 bg-transparent text-inherit opacity-70 transition-opacity hover:opacity-100">
                 <Icon name="close" size={12} />
