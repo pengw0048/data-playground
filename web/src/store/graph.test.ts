@@ -290,6 +290,110 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(0)  // back to the empty baseline
   })
 
+  it('makes each edge add and selected-edge deletion one undoable action', () => {
+    const first = { id: 'first', source: 'a', target: 'b', data: { wire: 'dataset' as const } }
+    const selfLoop = { id: 'self-loop', source: 'a', target: 'a', data: { wire: 'dataset' as const } }
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [NODE('a'), NODE('b')], edges: [] },
+    }))
+
+    useStore.getState().connect(first)
+    useStore.getState().connect(selfLoop)
+    expect(useStore.getState().past).toHaveLength(2)
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+
+    useStore.setState({ selectedIds: ['self-loop'], selectedId: 'self-loop' })
+    useStore.getState().removeSelected()
+    expect(useStore.getState().past).toHaveLength(3)
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+  })
+
+  it('keeps menu-created node and edge in the same undo action', () => {
+    register({
+      kind: 'history-auto-node', title: 'History node', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'History node', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [NODE('source')], edges: [] },
+    }))
+
+    const node = useStore.getState().addNode('history-auto-node', { x: 100, y: 0 })
+    expect(node).not.toBeNull()
+    useStore.getState().connect({
+      id: 'auto-edge', source: 'source', target: node!.id, data: { wire: 'dataset' },
+    }, { history: 'current' })
+
+    expect(useStore.getState().past).toHaveLength(1)
+    expect(useStore.getState().doc.nodes).toHaveLength(2)
+    expect(useStore.getState().doc.edges).toHaveLength(1)
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.nodes.map((item) => item.id)).toEqual(['source'])
+    expect(useStore.getState().doc.edges).toHaveLength(0)
+    useStore.getState().redo()
+    expect(useStore.getState().doc.nodes).toHaveLength(2)
+    expect(useStore.getState().doc.edges).toHaveLength(1)
+  })
+
+  it('reconnects an edge as one undoable action while retaining its stable identity', () => {
+    const latest = (id: string) => ({
+      ...NODE(id),
+      data: { ...NODE(id).data, status: 'latest' as const },
+    })
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [latest('source'), latest('old-target'), latest('new-target'), latest('downstream')],
+        edges: [
+          { id: 'rerouted', source: 'source', target: 'old-target', data: { wire: 'dataset' } },
+          { id: 'downstream-edge', source: 'new-target', target: 'downstream', data: { wire: 'dataset' } },
+        ],
+      },
+    }))
+
+    useStore.getState().reconnectEdge('rerouted', {
+      id: 'discarded-replacement-id',
+      source: 'source',
+      target: 'new-target',
+      data: { wire: 'dataset' },
+    })
+
+    expect(useStore.getState().past).toHaveLength(1)
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'new-target',
+    })
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['source', 'latest'],
+      ['old-target', 'latest'],
+      ['new-target', 'stale'],
+      ['downstream', 'stale'],
+    ])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'old-target',
+    })
+    expect(useStore.getState().future).toHaveLength(1)
+
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'new-target',
+    })
+    expect(useStore.getState().past).toHaveLength(1)
+  })
+
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
     const plugin = NODE('plugin', 'configured-plugin')
     const sink = NODE('sink', 'write')
