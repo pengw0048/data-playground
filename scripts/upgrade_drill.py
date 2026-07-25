@@ -27,7 +27,6 @@ from typing import Any
 
 SOURCE_VERSION = "0.1.0"
 SOURCE_SCHEMA = "0038_inbox_dataset_scoped"
-TARGET_SCHEMA = "0039_folder_replays"
 SOURCE_SHA = "172866586a503d3df7e9a2ed399bc20b9e510129"
 SOURCE_WHEEL_URL = (
     "https://github.com/pengw0048/data-playground/releases/download/v0.1.0/"
@@ -121,6 +120,43 @@ def assert_candidate_identity(
     if (api_version.get("version"), api_version.get("sha")) != (candidate_version, candidate_sha):
         raise RuntimeError(
             f"candidate is not v{candidate_version}: {api_version!r}")
+
+
+def candidate_schema_head(venv: Path) -> str:
+    """Read the expected head from the installed candidate wheel, never this checkout."""
+    probe = """
+import sys
+from pathlib import Path
+
+from hub import metadb
+
+venv = Path(sys.prefix).resolve()
+module = Path(metadb.__file__).resolve()
+migrations = Path(metadb._MIGRATIONS_DIR).resolve()
+assert module.is_relative_to(venv), module
+assert migrations.is_relative_to(venv), migrations
+print(metadb.expected_schema_head())
+"""
+    result = run(str(venv / "bin" / "python"), "-I", "-c", probe)
+    head = result.stdout.strip()
+    if not head or "\n" in head:
+        raise RuntimeError(f"candidate wheel returned an invalid schema head: {head!r}")
+    return head
+
+
+def assert_candidate_schema(applied_head: str, expected_head: str) -> None:
+    if applied_head != expected_head:
+        raise RuntimeError(f"target schema {applied_head!r} != {expected_head!r}")
+
+
+def normalize_revision_preview_defaults(preview: dict[str, Any]) -> dict[str, Any]:
+    """Fill defaults omitted by older APIs without hiding meaningful schema changes."""
+    normalized = json.loads(json.dumps(preview))
+    for column in normalized.get("columns", []):
+        if isinstance(column, dict):
+            column.setdefault("annotations", [])
+            column.setdefault("rowReference", None)
+    return normalized
 
 
 def start_hub(dataplay: Path, workspace: Path, env: dict[str, str], port: int, log: Path) \
@@ -360,7 +396,8 @@ def collect(base_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         "revisions": [{
             "datasetId": revision["datasetId"], "revisionId": revision["revisionId"],
             "parentRevisionId": revision.get("parentRevisionId"),
-            "summary": revision["summary"], "preview": revision["preview"],
+            "summary": revision["summary"],
+            "preview": normalize_revision_preview_defaults(revision["preview"]),
         } for revision in revisions],
         "jobs": [{
             "runId": jobs_by_run[run_id].get("runId"),
@@ -434,6 +471,7 @@ def main() -> None:
     install(uv, source_venv, source_wheel, postgres=args.backend == "postgres")
     install(uv, candidate_venv, args.candidate_wheel.resolve(), postgres=args.backend == "postgres")
     candidate_version = candidate_wheel_version(args.candidate_wheel)
+    candidate_schema = candidate_schema_head(candidate_venv)
     candidate_sha256 = hashlib.sha256(args.candidate_wheel.read_bytes()).hexdigest()
     env = os.environ.copy()
     env.update({
@@ -466,8 +504,7 @@ def main() -> None:
         run(str(candidate_venv / "bin" / "dataplay"), "migrate", "--workspace", str(workspace),
             env=candidate_env)
         after_schema = schema_head(args.backend, workspace, args.postgres_url)
-        if after_schema != TARGET_SCHEMA:
-            raise RuntimeError(f"target schema {after_schema!r} != {TARGET_SCHEMA!r}")
+        assert_candidate_schema(after_schema, candidate_schema)
         process = start_hub(candidate_venv / "bin" / "dataplay", workspace, candidate_env, args.port,
                             root / "candidate.log")
         target_version = request(base_url, "GET", "/api/version")
@@ -477,7 +514,7 @@ def main() -> None:
             raise RuntimeError("bounded retained-state evidence changed:\n" + json.dumps(
                 {"before": before, "after": after}, indent=2))
         evidence = {
-            "contract": f"v{SOURCE_VERSION}/{SOURCE_SCHEMA} -> v{candidate_version}/{TARGET_SCHEMA}",
+            "contract": f"v{SOURCE_VERSION}/{SOURCE_SCHEMA} -> v{candidate_version}/{candidate_schema}",
             "backend": args.backend, "sourceVersion": source_version,
             "targetVersion": target_version, "backup": backup, "retainedState": after,
             "artifacts": {
