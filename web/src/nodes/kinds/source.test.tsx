@@ -88,8 +88,8 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
       datasetRef: { kind: 'exact', datasetId: 'provider-orders', revisionId: 'empty-r7' },
     } })
 
-    expect(await screen.findByText('Exact pin revision empty-r7 field evidence · 1 columns')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Exact pin revision empty-r7 field evidence · 1 columns'))
+    expect(await screen.findByText('Pinned revision empty-r7 field evidence · 1 columns')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Pinned revision empty-r7 field evidence · 1 columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for customer_id' }))
     expect(await screen.findByTestId('field-evidence-customer_id')).toHaveTextContent('selected exact schema')
     expect(mocks.datasetRevision).toHaveBeenCalledTimes(1)
@@ -222,10 +222,10 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     render1(data)
 
     expect(screen.getByText('Current head · 1,500 rows · 5 cols · v4')).toBeInTheDocument()
-    expect(await screen.findByLabelText('Exact pin facts')).toHaveTextContent(
-      'Exact pin revision rev-1 · 1,000 rows · 4 cols',
+    expect(await screen.findByLabelText('Pinned revision facts')).toHaveTextContent(
+      'Pinned exact revision rev-1 · 1,000 rows · 4 cols',
     )
-    expect(screen.getByText('Exact pin revision rev-1 field evidence · 4 columns')).toBeInTheDocument()
+    expect(screen.getByText('Pinned revision rev-1 field evidence · 4 columns')).toBeInTheDocument()
     expect(screen.queryByText(/^1,500 rows · 5 cols · v4$/)).toBeNull()
   })
 
@@ -369,7 +369,7 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
 
     expect(await screen.findByText(/Permission to open exact revision 7 was lost.*latest was not substituted/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry exact revision' }))
-    expect(await screen.findByText(/Exact pin revision 7.*1 rows.*0 cols/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Pinned exact revision 7.*1 rows.*0 cols/i)).toBeInTheDocument()
     expect(mocks.datasetRevision).toHaveBeenNthCalledWith(2, 'dataset-1', '7')
     expect(useStore.getState().doc.nodes[0].data.config.datasetRef).toEqual(selected)
   })
@@ -414,8 +414,8 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
     fireEvent.click(control)
     expect(screen.getByText('Jul 16, 2026, 15:38:00 UTC')).toBeInTheDocument()
     expect(screen.getByLabelText('As-of UTC date and time')).toBeInTheDocument()
-    expect(screen.getByLabelText('Exact pin facts')).toHaveTextContent(
-      'As-of intent Jul 16, 2026, 12:38:00 UTC resolved once to exact pin revision rev-pin',
+    expect(screen.getByLabelText('Pinned revision facts')).toHaveTextContent(
+      'As-of intent Jul 16, 2026, 12:38:00 UTC resolved once to pinned exact revision rev-pin',
     )
   })
 

@@ -255,15 +255,15 @@ function Source({ id, data }: NodeComponentProps) {
         Pinned provider revision {providerRevisionLabel}
       </div>}
       {selectedExact && exactDetailState === 'available' && exactDetail && (
-        <div aria-label="Exact pin facts" className="mt-1 break-all text-[9.5px] text-muted-foreground">
+        <div aria-label="Pinned revision facts" className="mt-1 break-all text-[9.5px] text-muted-foreground">
           {selectedRef?.kind === 'as_of'
-            ? `As-of intent ${formatRevisionUtc(selectedRef.asOf)} resolved once to exact pin`
-            : 'Exact pin'} revision {exactDetail.revisionId} · {exactDetail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows · {exactDetail.preview.columns.length} cols
+            ? `As-of intent ${formatRevisionUtc(selectedRef.asOf)} resolved once to pinned exact revision ${exactDetail.revisionId}`
+            : `Pinned exact revision ${exactDetail.revisionId}`} · {exactDetail.summary.rowCount?.toLocaleString() ?? 'unknown'} rows · {exactDetail.preview.columns.length} cols
         </div>
       )}
       {evidenceColumns && <details className="mt-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-[10px]">
         <summary className="cursor-pointer font-medium text-muted-foreground">
-          {selectedExact ? `Exact pin revision ${selectedExact.revisionId} field evidence` : 'Field evidence'} · {evidenceColumns.length} columns
+          {selectedExact ? `Pinned revision ${selectedExact.revisionId} field evidence` : 'Field evidence'} · {evidenceColumns.length} columns
         </summary>
         <div className="mt-1 grid max-h-28 gap-0.5 overflow-y-auto">
           {evidenceColumns.map((column) => <FieldEvidenceButton key={column.name} column={column} marker className="dp-mono truncate rounded px-1 py-0.5 text-left hover:bg-accent" />)}
