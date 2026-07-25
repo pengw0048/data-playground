@@ -30,6 +30,7 @@ import {
   type ExampleReplacementSnapshot,
 } from './exampleReplacement'
 import { confirmedLocalMode, LAST_USER_KEY } from '../localIdentity'
+import { graphHasCycle } from '../canvas/connectionCycle'
 
 export type PanelKind = 'data' | 'run' | 'history' | 'lineage' | 'section'
 
@@ -1199,6 +1200,17 @@ interface Store {
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
 export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'transforms' | 'relationships'
 
+// The kernel is authoritative for graph validity. These metadata calls otherwise intentionally
+// tolerate an offline kernel, but a deliberate invalid_graph refusal needs a visible explanation.
+function surfaceInvalidGraphRefusal(state: Pick<Store, 'toasts' | 'pushToast'>, error: unknown): boolean {
+  if (!(error instanceof KernelError) || error.code !== 'invalid_graph') return false
+  const message = error.message || 'The graph cannot run.'
+  if (!state.toasts.some((toast) => toast.kind === 'error' && toast.msg === message)) {
+    state.pushToast(message, 'error')
+  }
+  return true
+}
+
 function emptyDoc(): CanvasDoc {
   // a random suffix keeps ids unique — performance.now() resets per page load, so a bare timestamp can
   // collide across freshly-loaded tabs/tests and leak one canvas's runs/history into another
@@ -2196,11 +2208,11 @@ export const useStore = create<Store>((set, get) => ({
     void api.schema(metadataDoc, id, undefined, metadataBindings).then((schemas) => {
       if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== metadataFingerprint) return
       set((s) => ({ schemas: { ...s.schemas, ...schemas } }))
-    }).catch(() => {})
+    }).catch((error) => { surfaceInvalidGraphRefusal(get(), error) })
     void api.graphSizes(metadataDoc, id, metadataBindings).then((sizes) => {
       if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== metadataFingerprint) return
       set((s) => ({ sizes: { ...s.sizes, ...sizes } }))
-    }).catch(() => {})
+    }).catch((error) => { surfaceInvalidGraphRefusal(get(), error) })
     if (continuation?.kind === 'profile') {
       get().closePanel(id)
       await get().prepareFullProfile(id, continuation.portId)
@@ -2245,6 +2257,7 @@ export const useStore = create<Store>((set, get) => ({
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
       } } }))
+      surfaceInvalidGraphRefusal(get(), e)
     }
   },
 
@@ -2409,6 +2422,15 @@ export const useStore = create<Store>((set, get) => ({
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
     const sinks = doc.nodes.filter((n) => !n.parentId && !hasOutgoing.has(n.id) && nodeRunnable(doc, n.id))
+    if (!sinks.length) {
+      get().pushToast(
+        graphHasCycle(doc.edges)
+          ? 'Cannot rerun: graph has a cycle. Remove it or use a Section for control flow.'
+          : 'Nothing to rerun: no runnable terminal node.',
+        'error',
+      )
+      return
+    }
     // don't kick off pipelines that would fail on a missing required field (matches the disabled ▶)
     const valid = sinks.filter((n) => !hasInvalidUpstream(doc, n.id, numericParamDrafts))
     valid.forEach((n) => get().requestRun(n.id))
@@ -3627,10 +3649,10 @@ export const useStore = create<Store>((set, get) => ({
     // guard against out-of-order responses: only the latest request may write the schema map
     const seq = ++_schemaSeq
     try { const schemas = await api.schema(get().doc); if (seq === _schemaSeq) set({ schemas }) }
-    catch { /* offline: keep last-known */ }
+    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline: keep last-known */ }
     // size estimate for the card "~N rows" hint — same trigger, independent (a failure never affects schemas)
     try { const sizes = await api.graphSizes(get().doc); if (seq === _schemaSeq) set({ sizes }) }
-    catch { /* offline / no sources countable: keep last-known */ }
+    catch (error) { surfaceInvalidGraphRefusal(get(), error) /* offline / no sources countable: keep last-known */ }
   },
 
   setAgentOpen: (v) => {

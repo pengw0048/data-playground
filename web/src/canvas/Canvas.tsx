@@ -3,7 +3,7 @@ import {
   ReactFlow, Background, BackgroundVariant, MiniMap,
   applyNodeChanges, applyEdgeChanges, useNodesInitialized, useReactFlow,
   useStore as useReactFlowStore,
-  type Node, type Edge, type Connection, type NodeChange, type EdgeChange,
+  type Node, type Edge, type Connection, type NodeChange, type EdgeChange, type OnConnectEnd,
 } from '@xyflow/react'
 import { allSpecs, buildNodeTypes } from '../nodes'
 import { SECTION_W, SECTION_H } from '../nodes/kinds/section'
@@ -25,6 +25,7 @@ import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
 import { locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
+import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -131,6 +132,9 @@ export function Canvas() {
   const nodesInitialized = useNodesInitialized()
   const revealedRequestId = useRef<number | null>(null)
   const fittedRequestId = useRef<number | null>(null)
+  // React Flow validates a reconnect before calling `onReconnect`. Keep the edge being moved here
+  // so the validator can exclude it from the target-port and cycle checks.
+  const reconnectingEdgeId = useRef<string | null>(null)
 
   // realtime collaboration: join this canvas's presence room; leave on switch/unmount
   const docId = doc.id
@@ -314,6 +318,7 @@ export function Canvas() {
 
   const isValidConnection = useCallback((c: Connection | Edge) => {
     if (!canEdit) return false
+    if (cycleConnectionReason(doc.edges, c, reconnectingEdgeId.current)) return false
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt) return false
@@ -321,9 +326,18 @@ export function Canvas() {
     // one edge per input port (each handle is single-input; join has separate a/b handles) — unless the
     // port is `multi` (union), which stacks many incoming edges on the same handle.
     if (portMulti(tgt.type, c.targetHandle)) return true
-    const occupied = doc.edges.some((e) => e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
+    const occupied = doc.edges.some((e) => e.id !== reconnectingEdgeId.current
+      && e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
     return !occupied
   }, [canEdit, doc.nodes, doc.edges])
+
+  // `isValidConnection` only returns a boolean. React Flow gives us the rejected endpoints at the
+  // end of a drag, which lets the product explain why the connection did not persist.
+  const onConnectEnd = useCallback<OnConnectEnd>((_event, state) => {
+    if (state.isValid !== false || !state.fromNode || !state.toNode) return
+    const reason = cycleGestureReason(doc.edges, state, reconnectingEdgeId.current)
+    if (reason) useStore.getState().pushToast(reason, 'error')
+  }, [doc.edges])
 
   const onConnect = useCallback((c: Connection) => {
     if (!isValidConnection(c)) return
@@ -339,6 +353,7 @@ export function Canvas() {
   // swap it. Without this a wire could only be changed by deleting a node.
   const onReconnect = useCallback((oldEdge: Edge, c: Connection) => {
     if (!canEdit) return
+    if (cycleConnectionReason(doc.edges, c, oldEdge.id)) return
     const sw = portWire(doc.nodes, c.source!, c.sourceHandle, 'source')
     const tgt = doc.nodes.find((n) => n.id === c.target)
     if (!tgt || !canConnect(sw, tgt.type, c.targetHandle)) return
@@ -459,7 +474,10 @@ export function Canvas() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onConnectEnd={onConnectEnd}
         onReconnect={onReconnect}
+        onReconnectStart={(_, edge) => { reconnectingEdgeId.current = edge.id }}
+        onReconnectEnd={() => { reconnectingEdgeId.current = null }}
         onEdgeDoubleClick={(_, edge) => { if (canEdit) removeEdge(edge.id) }}
         onNodeDragStop={onNodeDragStop}
         isValidConnection={isValidConnection}
