@@ -16,14 +16,15 @@ describe('WireEdge', () => {
   it('renders a visible, generous hit target for a persisted degenerate self-loop', () => {
     const props = {
       id: 'self-loop', source: 'node', target: 'node',
-      sourceX: 100, sourceY: 100, targetX: 100, targetY: 100,
+      // Match a standard 232px card: output on the right, input on the left.
+      sourceX: 232, sourceY: 80, targetX: 0, targetY: 80,
       sourcePosition: Position.Right, targetPosition: Position.Left,
       sourceHandleId: null, targetHandleId: null, selected: false, markerEnd: 'dp-arrow', data: {},
     } as EdgeProps
     const { container } = render(<svg><WireEdge {...props} /></svg>)
 
     expect(container.querySelector('.react-flow__edge-path')).toHaveAttribute(
-      'd', 'M100,100 C148,44 148,156 100,100',
+      'd', 'M232,80 C325,-59 -93,-59 0,80',
     )
     expect(container.querySelector('.react-flow__edge-interaction')).toHaveAttribute('stroke-width', '28')
   })

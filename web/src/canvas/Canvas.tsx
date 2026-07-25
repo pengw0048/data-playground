@@ -564,7 +564,7 @@ export function Canvas() {
               useStore.getState().connect({
                 id: newId('e'), source: menu.source.nodeId!, target: node.id,
                 sourceHandle: menu.source.handleId, targetHandle: null, data: { wire },
-              })
+              }, { history: 'current' })
             }
             setMenu(null)
           }}
@@ -586,7 +586,7 @@ export function Canvas() {
               useStore.getState().connect({
                 id: newId('e'), source: finder.source.nodeId, target: node.id,
                 sourceHandle: finder.source.handleId, targetHandle: target.id, data: { wire: finder.wire },
-              })
+              }, { history: 'current' })
             }
             setFinder(null)
           }}

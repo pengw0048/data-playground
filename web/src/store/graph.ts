@@ -1051,7 +1051,7 @@ interface Store {
   setNumericParamDraft: (id: string, param: string, text: string | undefined) => void
   updateData: (id: string, patch: Partial<NodeData>) => void
   removeNode: (id: string) => void
-  connect: (edge: CanvasEdge) => void
+  connect: (edge: CanvasEdge, options?: { history?: 'new' | 'current' }) => void
   reconnectEdge: (id: string, edge: CanvasEdge) => void
   removeEdge: (id: string) => void
   select: (id: string | null) => void
@@ -1736,9 +1736,9 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
-  connect: (edge) => {
+  connect: (edge, options) => {
     if (!roleCanEdit(get().canvasRole)) return
-    get().commit()
+    if (options?.history !== 'current') get().commit()
     set((s) => {
       // one edge per (target, targetHandle) for single-input ports; joins allow two.
       const stale = downstream(s.doc, edge.target)

@@ -318,6 +318,35 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
   })
 
+  it('keeps menu-created node and edge in the same undo action', () => {
+    register({
+      kind: 'history-auto-node', title: 'History node', category: 'compute',
+      inputs: [{ id: 'in', wire: 'dataset' }], outputs: [{ id: 'out', wire: 'dataset' }],
+      canBypass: false, blurb: '',
+      defaultData: () => ({ title: 'History node', config: {}, status: 'draft', history: [] }),
+    }, () => null)
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [NODE('source')], edges: [] },
+    }))
+
+    const node = useStore.getState().addNode('history-auto-node', { x: 100, y: 0 })
+    expect(node).not.toBeNull()
+    useStore.getState().connect({
+      id: 'auto-edge', source: 'source', target: node!.id, data: { wire: 'dataset' },
+    }, { history: 'current' })
+
+    expect(useStore.getState().past).toHaveLength(1)
+    expect(useStore.getState().doc.nodes).toHaveLength(2)
+    expect(useStore.getState().doc.edges).toHaveLength(1)
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.nodes.map((item) => item.id)).toEqual(['source'])
+    expect(useStore.getState().doc.edges).toHaveLength(0)
+    useStore.getState().redo()
+    expect(useStore.getState().doc.nodes).toHaveLength(2)
+    expect(useStore.getState().doc.edges).toHaveLength(1)
+  })
+
   it('reconnects an edge as one undoable action while retaining its stable identity', () => {
     const latest = (id: string) => ({
       ...NODE(id),
