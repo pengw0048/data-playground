@@ -49,9 +49,11 @@ Within the profiles above, supported core paths preserve these requirements:
 - Shared mode fails before binding unless signed sessions, Secure cookies, and a real TLS-terminating
   reverse proxy's precise `DP_TRUSTED_PROXIES` allow-list are configured. Canvas and administrative
   actions remain role-gated.
-- Cred secret fields and plugin settings marked `secret` persist SecretRefs such as `env:NAME` or
-  `file:/path`, not resolved values. Supported APIs redact residual plaintext, and one-shot subruns and
-  Ray drivers do not receive the hub's session-signing or metadata-database credentials.
+- Cred secret fields, plugin settings marked `secret`, and sensitive `DP_CATALOG_MOUNTS` config values
+  use SecretRefs such as `env:NAME` or `file:/path`, not resolved values. The hub resolves a mount
+  reference only for its installed provider; supported APIs, logs, backups, and execution manifests do
+  not receive the resolved value. One-shot subruns and Ray drivers do not receive the hub's
+  session-signing or metadata-database credentials.
 - If a destination selects a Cred, an execution backend must explicitly declare that it can honor that
   selection. Otherwise the run fails before dispatch; ambient identity is used only when no Cred is
   selected.

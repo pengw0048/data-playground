@@ -24,6 +24,74 @@ from hub.catalog_provider import (
 )
 
 
+def test_mount_secret_references_resolve_at_the_provider_boundary_without_serializing_material(
+        monkeypatch, tmp_path):
+    """Mount SecretRefs resolve only in the provider call, never in Workspace's public projection."""
+    from hub import workspace_providers
+    from hub.execution_manifest import assert_secret_free
+
+    env_secret = "mount-env-secret"
+    file_secret = "mount-file-secret"
+    secret_file = tmp_path / "mount-token"
+    secret_file.write_text(file_secret + "\n", encoding="utf-8")
+    monkeypatch.setenv("DP_MOUNT_TEST_TOKEN", env_secret)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": "secret-mount", "provider": "fixture", "config": {
+            "apiKey": "env:DP_MOUNT_TEST_TOKEN", "password": f"file:{secret_file}",
+            "endpoint": "https://catalog.example.test",
+        },
+    }]))
+
+    mounts, invalid = workspace_providers._configured_mounts()
+    assert invalid is False and len(mounts) == 1
+    mount = mounts[0].mount
+    assert mount.config == {
+        "apiKey": env_secret, "password": file_secret,
+        "endpoint": "https://catalog.example.test",
+    }
+
+    class Provider:
+        def list_children(self, received, _parent, *, limit, cursor=None):
+            assert received == mount
+            return ProviderPage()
+
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: Provider())
+    reads = workspace_providers._prefetch_provider_pages(
+        [workspace_providers._Source("provider", mounts[0])], 0, limit=1, source_cursor=None)
+    assert reads[0] == ProviderPage()
+
+    public = workspace_providers._source_status(
+        workspace_providers._Source("provider", mounts[0]), "complete")
+    cursor = workspace_providers._cursor_encode(
+        "local-mounted", "workspace-local-root",
+        workspace_providers._mount_fingerprint(mounts, False), 0, None, [])
+    serialized = json.dumps({"api": public, "cursor": cursor})
+    assert env_secret not in serialized and file_secret not in serialized
+    monkeypatch.setenv("DP_MOUNT_TEST_TOKEN", "rotated-mount-env-secret")
+    rotated, rotated_invalid = workspace_providers._configured_mounts()
+    assert rotated_invalid is False
+    assert workspace_providers._mount_fingerprint(rotated, False) == (
+        workspace_providers._mount_fingerprint(mounts, False))
+    # Source admissions use this secret-free manifest boundary; mount config is not part of it.
+    assert_secret_free({"providerMountId": mount.id, "providerSourceBindingId": "a" * 32})
+
+
+def test_mount_sensitive_inline_config_is_rejected_without_echoing_material(monkeypatch):
+    from hub import workspace_providers
+
+    inline = "inline-mount-secret"
+    with pytest.raises(workspace_providers.MountConfigError, match="sensitive field 'apiKey'") as exc:
+        workspace_providers._resolve_mount_config({"apiKey": inline})
+    assert inline not in str(exc.value)
+
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": "bad-secret-mount", "provider": "fixture", "config": {"apiKey": inline},
+    }]))
+    mounts, invalid = workspace_providers._configured_mounts()
+    assert mounts == [] and invalid is True
+    assert inline not in workspace_providers._configured_source_error()
+
+
 def _write_catalog(root: Path, resources: list[dict]) -> None:
     root.mkdir()
     (root / "catalog.json").write_text(json.dumps({"resources": resources}))
