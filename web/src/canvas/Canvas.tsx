@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ReactFlow, Background, BackgroundVariant, MiniMap,
-  applyNodeChanges, applyEdgeChanges, useNodesInitialized, useReactFlow,
+  applyNodeChanges, useNodesInitialized, useReactFlow,
   useStore as useReactFlowStore,
   type Node, type Edge, type Connection, type NodeChange, type EdgeChange, type OnConnectEnd,
 } from '@xyflow/react'
@@ -117,7 +117,6 @@ export function Canvas() {
   const viewportFitRequest = useStore((s) => s.viewportFitRequest)
   const acknowledgeViewportFit = useStore((s) => s.acknowledgeViewportFit)
   const setNodes = useStore((s) => s.setNodes)
-  const setEdges = useStore((s) => s.setEdges)
   const connect = useStore((s) => s.connect)
   const removeEdge = useStore((s) => s.removeEdge)
   const setParent = useStore((s) => s.setParent)
@@ -280,9 +279,12 @@ export function Canvas() {
     () => doc.edges.map((e) => ({
       id: e.id, source: e.source, target: e.target,
       sourceHandle: e.sourceHandle ?? undefined, targetHandle: e.targetHandle ?? undefined,
+      // Match node selection: React Flow receives a controlled edge list, so selection must be
+      // reflected from the store or an edge click is lost on the next render.
+      selected: selectedIds.includes(e.id),
       type: 'wire', data: { ...(e.data as any), warned: warnedIds.has(e.target) }, markerEnd: 'dp-arrow',
     })),
-    [doc.edges, warnedIds],
+    [doc.edges, selectedIds, warnedIds],
   )
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
@@ -311,10 +313,14 @@ export function Canvas() {
 
   const onEdgesChange = useCallback((changes: EdgeChange[]) => {
     if (!canEdit) return
-    const applied = applyEdgeChanges(changes, rfEdges)
-    const keep = new Set(applied.map((e) => e.id))
-    setEdges(doc.edges.filter((e) => keep.has(e.id)))
-  }, [canEdit, rfEdges, doc.edges, setEdges])
+    // Edge clicks emit selection changes, just like nodes. Keep their ids in the common selection
+    // state so the existing Delete handler can remove either kind of graph element in one action.
+    const selected = changes.filter((change) => change.type === 'select') as Array<{ id: string; selected: boolean }>
+    if (!selected.length) return
+    const ids = new Set(useStore.getState().selectedIds)
+    for (const change of selected) (change.selected ? ids.add(change.id) : ids.delete(change.id))
+    useStore.getState().setSelection([...ids])
+  }, [canEdit])
 
   const isValidConnection = useCallback((c: Connection | Edge) => {
     if (!canEdit) return false

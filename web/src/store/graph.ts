@@ -1856,24 +1856,27 @@ export const useStore = create<Store>((set, get) => ({
     if (!roleCanEdit(get().canvasRole)) return
     const ids = get().selectedIds.length ? get().selectedIds : (get().selectedId ? [get().selectedId!] : [])
     if (!ids.length) return
-    Object.values(get().profileJobs).filter((job) => ids.includes(job.nodeId))
+    const state = get()
+    const nodeIds = new Set(ids.filter((id) => state.doc.nodes.some((node) => node.id === id)))
+    const edgeIds = new Set(ids.filter((id) => state.doc.edges.some((edge) => edge.id === id)))
+    if (!nodeIds.size && !edgeIds.size) return
+    Object.values(state.profileJobs).filter((job) => nodeIds.has(job.nodeId))
       .forEach(cancelDetachedProfileJob)
     get().commit()
-    const kill = new Set(ids)
     set((s) => {
-      const previews = Object.fromEntries(Object.entries(s.previews).filter(([k]) => !kill.has(k)))
-      const runs = Object.fromEntries(Object.entries(s.runs).filter(([k]) => !kill.has(k)))
+      const previews = Object.fromEntries(Object.entries(s.previews).filter(([k]) => !nodeIds.has(k)))
+      const runs = Object.fromEntries(Object.entries(s.runs).filter(([k]) => !nodeIds.has(k)))
       const profileJobs = Object.fromEntries(
-        Object.entries(s.profileJobs).filter(([, job]) => !kill.has(job.nodeId)),
+        Object.entries(s.profileJobs).filter(([, job]) => !nodeIds.has(job.nodeId)),
       )
       return {
         doc: {
           ...s.doc,
-          nodes: s.doc.nodes.filter((n) => !kill.has(n.id)),
-          edges: s.doc.edges.filter((e) => !kill.has(e.source) && !kill.has(e.target)),
+          nodes: s.doc.nodes.filter((n) => !nodeIds.has(n.id)),
+          edges: s.doc.edges.filter((e) => !edgeIds.has(e.id) && !nodeIds.has(e.source) && !nodeIds.has(e.target)),
         },
         selectedId: null, selectedIds: [],
-        openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => !kill.has(k))),
+        openPanels: Object.fromEntries(Object.entries(s.openPanels).filter(([k]) => !nodeIds.has(k))),
         previews, runs, profileJobs,
       }
     })

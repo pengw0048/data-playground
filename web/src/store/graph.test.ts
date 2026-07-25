@@ -290,6 +290,34 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.nodes).toHaveLength(0)  // back to the empty baseline
   })
 
+  it('makes each edge add and selected-edge deletion one undoable action', () => {
+    const first = { id: 'first', source: 'a', target: 'b', data: { wire: 'dataset' as const } }
+    const selfLoop = { id: 'self-loop', source: 'a', target: 'a', data: { wire: 'dataset' as const } }
+    useStore.setState((state) => ({
+      doc: { ...state.doc, nodes: [NODE('a'), NODE('b')], edges: [] },
+    }))
+
+    useStore.getState().connect(first)
+    useStore.getState().connect(selfLoop)
+    expect(useStore.getState().past).toHaveLength(2)
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+
+    useStore.setState({ selectedIds: ['self-loop'], selectedId: 'self-loop' })
+    useStore.getState().removeSelected()
+    expect(useStore.getState().past).toHaveLength(3)
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first', 'self-loop'])
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
+  })
+
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
     const plugin = NODE('plugin', 'configured-plugin')
     const sink = NODE('sink', 'write')

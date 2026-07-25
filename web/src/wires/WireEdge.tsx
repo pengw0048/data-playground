@@ -7,7 +7,12 @@ import { nodeOutputs } from '../nodes/registry'
 // glance, not only at the ports); the active run path renders blue (P4, FR-E5).
 export function WireEdge(props: EdgeProps) {
   const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, source, target, sourceHandleId, selected, markerEnd, data } = props
-  const [path] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition })
+  // A persisted self-loop can have coincident handle coordinates. getBezierPath then produces a
+  // zero-length path, which makes the otherwise valid edge impossible to select and delete.
+  // Draw it outside the node instead; new loops are rejected before this renderer is reached.
+  const [path] = source === target
+    ? [`M${sourceX},${sourceY} C${sourceX + 48},${sourceY - 56} ${targetX + 48},${targetY + 56} ${targetX},${targetY}`]
+    : getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition })
   const warned = !!(data as { warned?: boolean } | undefined)?.warned  // target references a missing column
 
   // two primitive selectors (not a new object) so an edge doesn't re-render on every unrelated change
@@ -34,6 +39,7 @@ export function WireEdge(props: EdgeProps) {
       id={id}
       path={path}
       markerEnd={active ? 'url(#dp-arrow-active)' : selected ? 'url(#dp-arrow-sel)' : markerEnd}
+      interactionWidth={28}
       style={{ stroke, strokeWidth: active ? 2.2 : 1.5, strokeDasharray: warned && !active && !selected ? '5 3' : undefined, transition: 'stroke .15s' }}
     />
   )
