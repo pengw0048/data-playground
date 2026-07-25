@@ -70,7 +70,7 @@ class MountConfigError(ValueError):
 class _MountedProvider:
     mount: CatalogMount
     container_id: str
-    config_fingerprint: str
+    config_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -94,17 +94,19 @@ def _resolve_mount_config(config: dict[str, str]) -> dict[str, str]:
         if _SENSITIVE_KEY.search(key) and value not in (None, "") and not is_registered_secret_ref(value):
             raise MountConfigError(
                 f"catalog mount configuration cannot retain sensitive field {key!r}")
-        resolved[key] = (
-            resolve_secret_value(value, allow_plaintext=False)
-            if is_registered_secret_ref(value) else value
-        )
+        if not is_registered_secret_ref(value):
+            resolved[key] = value
+            continue
+        try:
+            resolved[key] = resolve_secret_value(value, allow_plaintext=False)
+        except Exception:
+            raise MountConfigError(
+                "catalog mount secret reference could not be resolved") from None
     return resolved
 
 
 def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
     """Parse operator-owned mount config while keeping malformed sources isolated from local data."""
-    from hub.secrets import SecretResolveError
-
     raw = (os.environ.get("DP_CATALOG_MOUNTS") or "").strip()
     if not raw:
         return [], False
@@ -141,7 +143,7 @@ def _configured_mounts() -> tuple[list[_MountedProvider], bool]:
                 raise ValueError
             if mount.id in seen:
                 raise ValueError
-        except (KeyError, TypeError, ValueError, SecretResolveError):
+        except (KeyError, TypeError, ValueError):
             invalid = True
             continue
         seen.add(mount.id)

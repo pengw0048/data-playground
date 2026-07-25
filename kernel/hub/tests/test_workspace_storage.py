@@ -2040,6 +2040,56 @@ def test_workspace_rejects_falsy_non_object_mount_config(monkeypatch, config):
     assert invalid
 
 
+def test_workspace_isolates_secret_resolver_failures_without_exposing_details(
+        workspace_scope, monkeypatch, caplog):
+    from hub.secrets import register_resolver, unregister_resolver
+
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    folder = metadb.workspace_create_container(
+        metadb.LOCAL_WORKSPACE_ROOT_ID, f"workspace-{token}-resolver-failure")
+    scheme = f"test-mount-{token}"
+    sentinel = f"resolver-material-{token}"
+
+    def failing_resolver(_reference: str) -> str:
+        raise RuntimeError(sentinel)
+
+    register_resolver(scheme, failing_resolver)
+    try:
+        monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([
+            {
+                "id": f"bad-{token}",
+                "provider": "fixture",
+                "containerId": folder["id"],
+                "config": {"credential": f"{scheme}:credential"},
+            },
+            {
+                "id": f"healthy-{token}",
+                "provider": "fixture",
+                "containerId": folder["id"],
+            },
+        ]))
+        provider = _WorkspaceFixtureProvider()
+        monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+
+        mounts, invalid = workspace_providers._configured_mounts()
+        assert [mounted.mount.id for mounted in mounts] == [f"healthy-{token}"]
+        assert invalid is True
+
+        with TestClient(app) as client:
+            response = client.get(f"/api/workspace/containers/{folder['id']}")
+        assert response.status_code == 200, response.text
+        page = response.json()
+        assert any(item.get("resourceId") == "dataset-a" for item in page["items"])
+        assert {source["id"] for source in page["sources"]} == {
+            "local", f"mount:healthy-{token}", "configuration",
+        }
+        assert page["sources"][-1]["error"] == "catalog mount configuration is invalid"
+        assert sentinel not in response.text
+        assert sentinel not in caplog.text
+    finally:
+        unregister_resolver(scheme)
+
+
 def test_workspace_composes_mounts_with_per_source_errors_stable_cursors_and_deep_links(
         workspace_scope, monkeypatch):
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
@@ -2690,6 +2740,8 @@ def test_workspace_degraded_container_binding_lazily_installs_anchor(workspace_s
 
 def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
         workspace_scope, monkeypatch):
+    provider_credential = "must-not-be-cached"
+    monkeypatch.setenv("DP_TEST_PROVIDER_CREDENTIAL", provider_credential)
     token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
     root = metadb.local_workspace_root()
     folder = metadb.workspace_create_container(root["id"], f"workspace-{token}-repair")
@@ -2703,6 +2755,7 @@ def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
 
     def resolve(mount, resource_id):
         nonlocal resolve_calls
+        assert mount.config["credential"] == provider_credential
         resolve_calls += 1
         failure = mode["failure"]
         if failure is None:
@@ -2726,12 +2779,13 @@ def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
     monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
     mount_config = json.dumps([{
         "id": mount_id, "provider": "fixture", "containerId": folder["id"],
-        "config": {"credential": "must-not-be-cached"},
+        "config": {"credential": "env:DP_TEST_PROVIDER_CREDENTIAL"},
     }])
     monkeypatch.setenv("DP_CATALOG_MOUNTS", mount_config)
 
     with TestClient(app) as client:
         page = client.get(f"/api/workspace/containers/{folder['id']}").json()
+        assert provider_credential not in json.dumps(page)
         resource = next(
             item for item in page["items"] if item.get("resourceId") == "dataset-a")
         stable_ref = resource["id"]
@@ -2820,7 +2874,7 @@ def test_workspace_provider_reference_recovery_detach_and_explicit_relink(
         assert old is not None and old.state == "detached" and old.active is False
         assert new is not None and new.relinked_from_id == binding_id and new.active is True
         serialized = json.dumps(metadb._workspace_provider_binding_doc(new), default=str)
-        assert "must-not-be-cached" not in serialized
+        assert provider_credential not in serialized
         assert "uri" not in serialized.lower()
 
 
