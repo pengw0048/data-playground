@@ -11,7 +11,7 @@ import uuid
 from typing import Any
 
 from hub import db, graph as g, paths
-from hub.executors.engine import BuildEngine, NotPreviewable
+from hub.executors.engine import BuildEngine, NotPreviewable, UserCodeError
 from hub.executors.schema import apply_derived_references, derived_schemas_for_engine
 from hub.models import Graph, SampleResult, dataset_ref_identity
 from hub.plugins.adapters import revision_adapter_for_uri
@@ -207,6 +207,24 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
         return run_with_timeout(work, PREVIEW_BUDGET_S, on_timeout=on_timeout)
     except ManagedSourceReadError as e:
         return SampleResult(error=True, reason=str(e))
+    except UserCodeError as e:
+        return SampleResult(
+            error=True,
+            reason=str(e),
+            failure_category="user_code_exception",
+            user_code_exception={
+                "node_id": e.node.id,
+                "node_title": (
+                    str(e.node.data.get("title"))
+                    if isinstance(e.node.data, dict) and e.node.data.get("title") else None
+                ),
+                "exception_type": e.exception_type,
+                "message": e.message,
+                "row_index": e.row_index,
+                "available_columns": e.available_columns,
+                "guidance": e.guidance,
+            },
+        )
     except NotPreviewable as e:
         return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
     except Exception as e:  # noqa: BLE001

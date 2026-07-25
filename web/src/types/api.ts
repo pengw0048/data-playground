@@ -600,6 +600,16 @@ export interface SampleResult {
   notPreviewable: boolean
   error?: boolean
   reason?: string | null
+  failureCategory?: 'not_previewable' | 'user_code_exception' | 'runtime_error' | null
+  userCodeException?: {
+    nodeId?: string | null
+    nodeTitle?: string | null
+    exceptionType: string
+    message: string
+    rowIndex?: number | null
+    availableColumns: string[]
+    guidance?: string | null
+  } | null
   wire: string
 }
 

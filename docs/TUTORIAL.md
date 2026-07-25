@@ -58,6 +58,27 @@ Now select `aggregate` and choose **View data**. Its panel says **Not sample-pre
 as though it were the result would be misleading. This is deliberate: a preview is shown only when it
 can preserve the operation's meaning. The same rule applies to writes and other global operations.
 
+### Python Transform cell boundary
+
+An ad-hoc Python Transform runs with a deliberately small builtin allowlist. The permitted builtins
+are exactly:
+
+```text
+abs, all, any, bool, dict, divmod, enumerate, filter, float, frozenset, int, isinstance,
+issubclass, len, list, map, max, min, print, range, reversed, round, set, sorted, str, sum,
+tuple, zip, True, False, None, ValueError, KeyError, TypeError, IndexError, Exception, repr,
+ord, chr, hex, bin
+```
+
+The permitted exception types are `ValueError`, `KeyError`, `TypeError`, `IndexError`, and
+`Exception`. Other Python exception classes, including `RuntimeError`, are not available inside an
+ad-hoc cell. `format`, `getattr`, and `type` are deliberately excluded: format fields and dynamic
+attribute/type introspection can bypass the cell's dunder and attribute guards. Use ordinary string
+operations and direct access to known data fields instead.
+
+This allowlist is a soft execution guard, not a hostile-code security boundary. Canvas-declared
+dependencies separately control which additional modules a cell may import.
+
 ## 4. Publish a managed result
 
 Select the `top_users` **Write** card. It is configured to publish to **Workspace outputs** as

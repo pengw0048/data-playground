@@ -1429,6 +1429,91 @@ def test_code_cell_preview_profile_disabled_in_auth_mode(monkeypatch):
     assert pf.not_previewable and "multi-user" in (pf.reason or "")
 
 
+def _user_code_preview(code: str) -> tuple[dict, dict]:
+    graph = {"id": "user-code-failure", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")}),
+        N("transform", "transform", {"mode": "map", "code": code}),
+    ], "edges": [E("source", "transform")]}
+    response = client.post(
+        "/api/run/preview", json={"graph": graph, "nodeId": "transform", "k": 5})
+    assert response.status_code == 200, response.text
+    return graph, response.json()
+
+
+def test_user_code_exceptions_have_typed_preview_diagnostics_and_no_cast_hint():
+    graph, conversion = _user_code_preview(
+        "def fn(row):\n    return {**row, 'lr': float(row['event'])}")
+    assert conversion["error"] is True and conversion["notPreviewable"] is False
+    assert conversion["failureCategory"] == "user_code_exception"
+    detail = conversion["userCodeException"]
+    assert detail == {
+        "nodeId": "transform",
+        "nodeTitle": "transform",
+        "exceptionType": "ValueError",
+        "message": "could not convert string to float: 'view'",
+        "rowIndex": 0,
+        "availableColumns": ["id", "user_id", "event", "amount"],
+        "guidance": None,
+    }
+    assert "cell error:" not in conversion["reason"]
+
+    _, missing = _user_code_preview(
+        "def fn(row):\n    return {'value': row['learning_rate']}")
+    assert missing["failureCategory"] == "user_code_exception"
+    assert missing["userCodeException"]["exceptionType"] == "KeyError"
+    assert missing["userCodeException"]["rowIndex"] == 0
+    assert missing["userCodeException"]["availableColumns"] == [
+        "id", "user_id", "event", "amount"]
+
+    _, disallowed = _user_code_preview(
+        "def fn(row):\n    raise RuntimeError('not permitted')")
+    assert disallowed["userCodeException"]["exceptionType"] == "NameError"
+    guidance = disallowed["userCodeException"]["guidance"]
+    assert "outside the ad-hoc cell allowlist" in guidance
+    assert "Allowed builtins: abs, all, any" in guidance
+    assert (
+        "Permitted exception types: ValueError, KeyError, TypeError, IndexError, Exception"
+        in guidance
+    )
+
+    _, explicit = _user_code_preview("def fn(row):\n    raise ValueError('bad row')")
+    assert explicit["userCodeException"]["exceptionType"] == "ValueError"
+    assert explicit["userCodeException"]["message"] == "bad row"
+
+    _, sandbox_failure = _user_code_preview(
+        "def fn(row):\n    return __builtins__")
+    assert sandbox_failure["error"] is True and sandbox_failure["notPreviewable"] is False
+    assert sandbox_failure["failureCategory"] == "runtime_error"
+    assert sandbox_failure["userCodeException"] is None
+    assert "SandboxError" in sandbox_failure["reason"]
+
+    started = client.post(
+        "/api/run",
+        json={"graph": graph, "targetNodeId": "transform", "confirmed": True},
+    )
+    assert started.status_code == 200, started.text
+    failed = _poll(started.json()["runId"])
+    assert failed["status"] == "failed"
+    assert "User code raised ValueError at input row index 0" in failed["error"]
+    assert "add an explicit cast" not in failed["error"]
+    assert "Hint:" not in failed["error"]
+
+
+def test_grouped_aggregate_preview_refusal_contract_is_unchanged():
+    graph = {"id": "aggregate-refusal", "version": 1, "nodes": [
+        N("source", "source", {"uri": _uri("events")}),
+        N("aggregate", "aggregate", {"groupBy": "event", "aggs": "count(*) AS n"}),
+    ], "edges": [E("source", "aggregate")]}
+    response = client.post(
+        "/api/run/preview", json={"graph": graph, "nodeId": "aggregate", "k": 5})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["notPreviewable"] is True and result["error"] is False
+    assert result["failureCategory"] == "not_previewable"
+    assert result["userCodeException"] is None
+    assert result["reason"] == "grouped aggregate — needs a full pass (a sample would lie)"
+
+
 def test_full_profile_has_a_deadline_and_does_not_pin_the_kernel(monkeypatch, tmp_path):
     # P0-EXEC-02: a full profile must be deadline-bounded + interruptible, so a huge pure-SQL aggregate
     # can't pin the warm kernel forever. A 62.5B-row hashed cross join over the wired input cannot finish in
@@ -2229,7 +2314,7 @@ def test_map_batches_skip_isolates_bad_rows_not_the_whole_batch():
     # depended on the batch size (2048 in preview vs 8192 in the run), making preview disagree with the
     # run. Skip now re-runs the UDF row-by-row and keeps the successes, dropping only the rows that fail.
     import pyarrow as pa
-    from hub.executors.engine import _apply_fn, _apply_batch, NotPreviewable, _XF_BATCH
+    from hub.executors.engine import _apply_fn, _apply_batch, UserCodeError, _XF_BATCH
     assert _XF_BATCH == _XF_BATCH  # single constant → preview and run read at the same batch size
 
     def rows_fn(rows):
@@ -2237,7 +2322,7 @@ def test_map_batches_skip_isolates_bad_rows_not_the_whole_batch():
     batch = pa.RecordBatch.from_pylist([{"x": 1}, {"x": 0}, {"x": 2}, {"x": 4}])
     out = _apply_fn(rows_fn, batch, "map_batches", "skip", None)
     assert [r["y"] for r in out] == [100, 50, 25]  # bad row dropped; the other 3 kept (NOT the batch)
-    with pytest.raises(NotPreviewable):
+    with pytest.raises(UserCodeError):
         _apply_fn(rows_fn, batch, "map_batches", "raise", None)
 
     def arrow_fn(t):  # fails the whole batch when a zero is present; each good 1-row slice passes

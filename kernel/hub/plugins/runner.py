@@ -18,7 +18,7 @@ import time
 import uuid
 
 from hub import db, graph as g
-from hub.executors.engine import BuildEngine
+from hub.executors.engine import BuildEngine, UserCodeError
 from hub.models import (
     CompilePlan,
     Graph,
@@ -124,9 +124,12 @@ def _step_progress(status) -> "float | None":
     return sum(1 for p in pn if p.status in ("done", "failed")) / len(pn)
 
 
-def _diagnose(msg: str) -> str | None:
+def _diagnose(error: BaseException | str) -> str | None:
     """Map a common engine error to ONE actionable hint (the run failure's 'how to fix'). Honest: only
     recognized patterns get a hint; anything else shows the raw error alone (never fabricate a cause)."""
+    if isinstance(error, UserCodeError):
+        return None
+    msg = str(error)
     m = msg.lower()
     if ("referenced column" in m or "not found in from" in m
             or "not present in the input schema" in m):  # specifically an unknown COLUMN
@@ -997,7 +1000,7 @@ class LocalRunner:
                     self._cleanup_new_result_artifacts(run_id, preserve=preserve)
 
                     status.status = "failed"
-                    msg = f"{type(e).__name__}: {e}"
+                    msg = str(e) if isinstance(e, UserCodeError) else f"{type(e).__name__}: {e}"
                     if guard_error is not None:
                         msg += ("; provisional outputs were discarded after an ownership fence "
                                 f"failed: {type(guard_error).__name__}: {guard_error}")
@@ -1005,7 +1008,7 @@ class LocalRunner:
                         settle_uncommitted_outputs(status, "failed", msg)
                     else:
                         discard_unpublished_outputs(status, "failed", msg)
-                    hint = _diagnose(str(e))
+                    hint = _diagnose(e)
                     tail = f"\nHint: {hint}" if hint else ""
                     # steps run sequentially, so the one still 'running' is exactly where it broke — attribute
                     # the error THERE (the card + per-node list show which node failed and why), not just a
