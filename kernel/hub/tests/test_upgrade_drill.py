@@ -88,6 +88,36 @@ def test_candidate_schema_rejects_a_migrated_head_that_disagrees_with_the_wheel(
         upgrade_drill.assert_candidate_schema("0046", "9.8.7_candidate_head")
 
 
+def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
+    legacy = {
+        "columns": [{"name": "id", "type": "int64"}],
+        "rows": [[1]],
+    }
+    explicit_defaults = {
+        "columns": [{
+            "name": "id",
+            "type": "int64",
+            "annotations": [],
+            "rowReference": None,
+        }],
+        "rows": [[1]],
+    }
+    meaningful = {
+        "columns": [{
+            "name": "id",
+            "type": "int64",
+            "annotations": [{"key": "unit", "value": "meters", "encoding": "utf8"}],
+            "rowReference": {"target": {"kind": "canonical", "datasetId": "owners"}},
+        }],
+        "rows": [[1]],
+    }
+
+    assert upgrade_drill.normalize_revision_preview_defaults(legacy) == explicit_defaults
+    assert upgrade_drill.normalize_revision_preview_defaults(meaningful) == meaningful
+    assert upgrade_drill.normalize_revision_preview_defaults(meaningful) != explicit_defaults
+    assert legacy["columns"] == [{"name": "id", "type": "int64"}]
+
+
 @pytest.mark.parametrize("metadata_headers", [
     (
         ("Metadata-Version", "2.1"),

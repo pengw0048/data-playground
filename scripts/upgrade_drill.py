@@ -149,6 +149,16 @@ def assert_candidate_schema(applied_head: str, expected_head: str) -> None:
         raise RuntimeError(f"target schema {applied_head!r} != {expected_head!r}")
 
 
+def normalize_revision_preview_defaults(preview: dict[str, Any]) -> dict[str, Any]:
+    """Fill defaults omitted by older APIs without hiding meaningful schema changes."""
+    normalized = json.loads(json.dumps(preview))
+    for column in normalized.get("columns", []):
+        if isinstance(column, dict):
+            column.setdefault("annotations", [])
+            column.setdefault("rowReference", None)
+    return normalized
+
+
 def start_hub(dataplay: Path, workspace: Path, env: dict[str, str], port: int, log: Path) \
         -> subprocess.Popen[str]:
     handle = log.open("w", encoding="utf-8")
@@ -386,7 +396,8 @@ def collect(base_url: str, identity: dict[str, Any]) -> dict[str, Any]:
         "revisions": [{
             "datasetId": revision["datasetId"], "revisionId": revision["revisionId"],
             "parentRevisionId": revision.get("parentRevisionId"),
-            "summary": revision["summary"], "preview": revision["preview"],
+            "summary": revision["summary"],
+            "preview": normalize_revision_preview_defaults(revision["preview"]),
         } for revision in revisions],
         "jobs": [{
             "runId": jobs_by_run[run_id].get("runId"),
