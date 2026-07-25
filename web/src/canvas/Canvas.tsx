@@ -25,7 +25,7 @@ import { connectCollab, disconnectCollab, sendCursor } from '../collab/collab'
 import { Button } from '@/components/ui/button'
 import { locateNode } from './locateNode'
 import { useExampleCreationIntent } from './useExampleCreationIntent'
-import { cycleConnectionReason } from './connectionCycle'
+import { cycleConnectionReason, cycleGestureReason } from './connectionCycle'
 
 const edgeTypes = { wire: WireEdge }
 
@@ -335,10 +335,7 @@ export function Canvas() {
   // end of a drag, which lets the product explain why the connection did not persist.
   const onConnectEnd = useCallback<OnConnectEnd>((_event, state) => {
     if (state.isValid !== false || !state.fromNode || !state.toNode) return
-    const reason = cycleConnectionReason(doc.edges, {
-      source: state.fromNode.id,
-      target: state.toNode.id,
-    }, reconnectingEdgeId.current)
+    const reason = cycleGestureReason(doc.edges, state, reconnectingEdgeId.current)
     if (reason) useStore.getState().pushToast(reason, 'error')
   }, [doc.edges])
 

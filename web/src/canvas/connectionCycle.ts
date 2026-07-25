@@ -5,6 +5,27 @@ type CandidateConnection = {
   target: string | null | undefined
 }
 
+export type ConnectionGesture = {
+  fromNode: { id: string } | null
+  toNode: { id: string } | null
+  fromHandle: { type: 'source' | 'target' } | null
+}
+
+/**
+ * React Flow reports the fixed end of a reconnect as `fromNode`, so these values describe the
+ * gesture rather than graph direction. A gesture that starts from a target handle runs backwards:
+ * the node reached by the pointer becomes the graph source.
+ */
+export function graphConnectionFromGesture(
+  gesture: ConnectionGesture,
+): CandidateConnection | null {
+  const { fromNode, toNode, fromHandle } = gesture
+  if (!fromNode || !toNode || !fromHandle) return null
+  return fromHandle.type === 'target'
+    ? { source: toNode.id, target: fromNode.id }
+    : { source: fromNode.id, target: toNode.id }
+}
+
 /**
  * Returns the user-facing reason when adding a directed edge would make the canvas cyclic.
  *
@@ -39,6 +60,15 @@ export function cycleConnectionReason(
     pending.push(...(outgoing.get(nodeId) ?? []))
   }
   return null
+}
+
+export function cycleGestureReason(
+  edges: readonly CanvasEdge[],
+  gesture: ConnectionGesture,
+  ignoredEdgeId?: string | null,
+): string | null {
+  const connection = graphConnectionFromGesture(gesture)
+  return connection ? cycleConnectionReason(edges, connection, ignoredEdgeId) : null
 }
 
 /** True when a persisted/imported graph contains any directed cycle. */
