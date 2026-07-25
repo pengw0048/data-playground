@@ -8,7 +8,7 @@ const apiMocks = vi.hoisted(() => ({
   estimate: vi.fn(), inputDrift: vi.fn(), run: vi.fn(), profileEstimate: vi.fn(), profileIdentity: vi.fn(), fullProfile: vi.fn(), runStatus: vi.fn(), cancelRun: vi.fn(),
   writeAdmission: vi.fn(),
   executionManifest: vi.fn(),
-  activeRuns: vi.fn(), profileJobs: vi.fn(),
+  activeRuns: vi.fn(), profileJobs: vi.fn(), schema: vi.fn(), graphSizes: vi.fn(),
   promote: vi.fn(), processors: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
@@ -55,11 +55,19 @@ vi.mock('../api/client', () => ({
                       ? apiMocks.profileJobs
                       : property === 'promote'
                         ? apiMocks.promote
-                        : property === 'processors'
-                          ? apiMocks.processors
+              : property === 'processors'
+                ? apiMocks.processors
+                : property === 'schema'
+                  ? apiMocks.schema
+                  : property === 'graphSizes'
+                    ? apiMocks.graphSizes
           : async () => ({}),
   }),
-  KernelError: class KernelError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status } },
+  KernelError: class KernelError extends Error {
+    status: number
+    code?: string
+    constructor(status: number, message: string, code?: string) { super(message); this.status = status; this.code = code }
+  },
   setApiUser: vi.fn(),
 }))
 
@@ -128,6 +136,8 @@ describe('graph store — core authority ops', () => {
     }))
     apiMocks.activeRuns.mockReset().mockResolvedValue([])
     apiMocks.profileJobs.mockReset().mockResolvedValue([])
+    apiMocks.schema.mockReset().mockResolvedValue({})
+    apiMocks.graphSizes.mockReset().mockResolvedValue({})
     apiMocks.promote.mockReset()
     apiMocks.processors.mockReset().mockResolvedValue([])
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
@@ -487,6 +497,50 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: doc.id }), 'section',
     ))
     expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('explains why rerun all cannot start a legacy graph with no terminal sink', () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    const filter = NODE('filter', 'filter')
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, filter],
+      edges: [
+        { id: 'source-filter', source: 'source', target: 'filter', data: { wire: 'dataset' as const } },
+        { id: 'filter-source', source: 'filter', target: 'source', data: { wire: 'dataset' as const } },
+      ],
+    }
+    useStore.setState({ doc })
+
+    useStore.getState().rerunAll()
+
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error', msg: 'Cannot rerun: graph has a cycle. Remove it or use a Section for control flow.',
+    }])
+  })
+
+  it('surfaces invalid_graph refusals from execution and graph-metadata endpoints', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: '/data/events.lance' }
+    const target = NODE('target', 'filter')
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, target],
+      edges: [{ id: 'source-target', source: 'source', target: 'target', data: { wire: 'dataset' as const } }],
+    }
+    const refusal = new KernelError(400, 'graph has a cycle — control flow must be encapsulated (§5.7)', 'invalid_graph')
+    useStore.setState({ doc })
+    apiMocks.estimate.mockRejectedValue(refusal)
+
+    await useStore.getState().requestRun('target')
+    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
+
+    useStore.setState({ toasts: [] })
+    apiMocks.schema.mockRejectedValue(refusal)
+    apiMocks.graphSizes.mockRejectedValue(refusal)
+    await useStore.getState().refreshSchemas()
+    expect(useStore.getState().toasts).toMatchObject([{ kind: 'error', msg: refusal.message }])
+    expect(useStore.getState().toasts).toHaveLength(1)
   })
 
   it('keeps preview inputs for full runs and refreshes moved heads only after acceptance', async () => {
