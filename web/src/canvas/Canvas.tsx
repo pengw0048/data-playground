@@ -118,6 +118,7 @@ export function Canvas() {
   const acknowledgeViewportFit = useStore((s) => s.acknowledgeViewportFit)
   const setNodes = useStore((s) => s.setNodes)
   const connect = useStore((s) => s.connect)
+  const reconnectEdge = useStore((s) => s.reconnectEdge)
   const removeEdge = useStore((s) => s.removeEdge)
   const setParent = useStore((s) => s.setParent)
   const select = useStore((s) => s.select)
@@ -366,10 +367,9 @@ export function Canvas() {
     const occupied = !portMulti(tgt.type, c.targetHandle) && doc.edges.some((e) => e.id !== oldEdge.id
       && e.target === c.target && (e.targetHandle ?? null) === (c.targetHandle ?? null))
     if (occupied) return
-    removeEdge(oldEdge.id)
-    connect({ id: newId('e'), source: c.source!, target: c.target!,
+    reconnectEdge(oldEdge.id, { id: oldEdge.id, source: c.source!, target: c.target!,
       sourceHandle: c.sourceHandle, targetHandle: c.targetHandle, data: { wire: (sw ?? 'dataset') as WireType } })
-  }, [canEdit, doc.nodes, doc.edges, removeEdge, connect])
+  }, [canEdit, doc.nodes, doc.edges, reconnectEdge])
 
   // Dropping a node onto a section makes it a contained child (parentId); dragging it out detaches
   // it. Coordinates convert between absolute (top-level) and relative-to-section on the boundary.

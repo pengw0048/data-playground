@@ -1052,6 +1052,7 @@ interface Store {
   updateData: (id: string, patch: Partial<NodeData>) => void
   removeNode: (id: string) => void
   connect: (edge: CanvasEdge) => void
+  reconnectEdge: (id: string, edge: CanvasEdge) => void
   removeEdge: (id: string) => void
   select: (id: string | null) => void
   requestNodeReveal: (canvasId: string, nodeId: string) => void
@@ -1747,6 +1748,27 @@ export const useStore = create<Store>((set, get) => ({
           : n,
       )
       return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes } }
+    })
+  },
+
+  reconnectEdge: (id, edge) => {
+    if (!roleCanEdit(get().canvasRole)) return
+    if (!get().doc.edges.some((candidate) => candidate.id === id)) return
+    get().commit()
+    set((s) => {
+      const stale = downstream(s.doc, edge.target)
+      const nodes = s.doc.nodes.map((n) =>
+        (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
+          ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
+          : n,
+      )
+      return {
+        doc: {
+          ...s.doc,
+          edges: s.doc.edges.map((candidate) => candidate.id === id ? { ...edge, id } : candidate),
+          nodes,
+        },
+      }
     })
   },
 

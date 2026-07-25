@@ -318,6 +318,53 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().doc.edges.map((edge) => edge.id)).toEqual(['first'])
   })
 
+  it('reconnects an edge as one undoable action while retaining its stable identity', () => {
+    const latest = (id: string) => ({
+      ...NODE(id),
+      data: { ...NODE(id).data, status: 'latest' as const },
+    })
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: [latest('source'), latest('old-target'), latest('new-target'), latest('downstream')],
+        edges: [
+          { id: 'rerouted', source: 'source', target: 'old-target', data: { wire: 'dataset' } },
+          { id: 'downstream-edge', source: 'new-target', target: 'downstream', data: { wire: 'dataset' } },
+        ],
+      },
+    }))
+
+    useStore.getState().reconnectEdge('rerouted', {
+      id: 'discarded-replacement-id',
+      source: 'source',
+      target: 'new-target',
+      data: { wire: 'dataset' },
+    })
+
+    expect(useStore.getState().past).toHaveLength(1)
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'new-target',
+    })
+    expect(useStore.getState().doc.nodes.map((node) => [node.id, node.data.status])).toEqual([
+      ['source', 'latest'],
+      ['old-target', 'latest'],
+      ['new-target', 'stale'],
+      ['downstream', 'stale'],
+    ])
+
+    useStore.getState().undo()
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'old-target',
+    })
+    expect(useStore.getState().future).toHaveLength(1)
+
+    useStore.getState().redo()
+    expect(useStore.getState().doc.edges[0]).toMatchObject({
+      id: 'rerouted', source: 'source', target: 'new-target',
+    })
+    expect(useStore.getState().past).toHaveLength(1)
+  })
+
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
     const plugin = NODE('plugin', 'configured-plugin')
     const sink = NODE('sink', 'write')
