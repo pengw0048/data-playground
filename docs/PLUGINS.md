@@ -695,5 +695,33 @@ sanitized; implementation exceptions and tracebacks stay in server logs. The end
 pack's schema and current values (for secrets, the reference string, not the resolved credential).
 
 A changed setting applies on the next kernel start — plugins register once at startup, same as their env
-fallbacks. Config fields need a drop-in `dataplay.toml`; `DP_PLUGINS` / entry-point packs still read env
+fallbacks. Drop-in packs declare config in their workspace `dataplay.toml`; installed entry-point packs
+may package that file alongside their module. `DP_PLUGINS` modules without a manifest still read env
 directly. `dp_sql_catalog` is the worked example.
+
+### Supplying one plugin credential to workloads
+
+An installed entry-point plugin may package the same `dataplay.toml` alongside its module and declare a
+secret config field with `workload_env = true`. Its required `env` name is the exact, additional key that
+core may forward into a workload:
+
+```toml
+[[config]]
+key = "service_token"
+type = "password"
+env = "DP_MY_PLUGIN_SERVICE_TOKEN"
+secret = true
+workload_env = true
+```
+
+The operator enables it by setting `plugin.<entry-point-name>.service_token` to an `env:` or `file:`
+SecretRef in Settings, or headlessly by setting `DP_MY_PLUGIN_SERVICE_TOKEN`. At launch, core resolves the
+reference only in the parent process and forwards the material under that declared name. An unset field
+does not cross the boundary. The fixed core workload allowlist is unchanged; a declaration cannot replace
+a core-owned environment key, and plugins declaring no such field behave exactly as before. This is the
+only plugin workload-environment declaration path; it is not a general environment passthrough.
+
+The value is absent from supported browser/config responses, logs, run artifacts, execution manifests,
+and sanitized error envelopes. It is nevertheless readable by arbitrary Python running in that workload.
+Use this only for plugins and canvas authors trusted with that credential; it is not per-node or
+per-canvas isolation. `dp_run_log` is the packaged reference manifest.

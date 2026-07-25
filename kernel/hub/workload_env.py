@@ -71,6 +71,18 @@ _DATA_CREDENTIAL_ENV = frozenset({
     "DP_S3_KEY", "DP_S3_SECRET",
 })
 
+
+def is_core_workload_env_key(key: str) -> bool:
+    """Whether ``key`` belongs to core's fixed workload allowlist.
+
+    Plugin declarations may add a narrowly opted-in credential, but must never replace runtime,
+    data-plane, host, or metadata settings that core already owns.
+    """
+    return key in (
+        _HOST_RUNTIME_ENV | _WORKLOAD_RUNTIME_ENV | _DATA_CONNECTION_ENV | _DATA_CREDENTIAL_ENV
+        | {"DP_DATABASE_URL", "DP_AUTH_MODE"}
+    )
+
 EPHEMERAL_OBJECT_STORE_CRED_ID = "ephemeral-workload-object-store"
 _PROMOTED_SIDECAR_KEY = "_promotedTransformDefinitions"
 _MAX_PROMOTED_SIDECAR_DEFINITIONS = 512
@@ -116,6 +128,12 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
     # Auth mode controls filesystem/path confinement, but children never receive material that can sign
     # sessions or bootstrap an administrator. This derived boolean is the only auth value they need.
     _derived_auth_mode(src, env)
+    # A plugin may opt one declared secret config field into this child environment.  Resolve it in
+    # the parent only; the value is never part of an execution manifest or a public plugin/config
+    # projection.  Injectable ``source`` callers are pure allowlist tests, not live plugin launches.
+    if source is None:
+        from hub.deps import get_deps
+        env.update(get_deps().plugin_workload_env())
     return env
 
 

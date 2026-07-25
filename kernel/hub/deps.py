@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import importlib.resources
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable
 
@@ -380,12 +382,13 @@ def _result_put(key, doc) -> None:
 
 
 _CONFIG_TYPES = {"string", "text", "int", "float", "bool", "select", "password"}
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _normalize_config(raw) -> list[dict]:
     """dataplay.toml `[[config]]` → a clean list of UI fields. Keeps only entries with a non-empty string
     `key`; fills `type` (default 'string'; unknown → 'string') and `label` (default = key); passes through
-    default/env/secret/options/help/placeholder. Malformed entries are dropped (never fatal)."""
+    default/env/secret/workload_env/options/help/placeholder. Malformed entries are dropped (never fatal)."""
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
@@ -394,11 +397,30 @@ def _normalize_config(raw) -> list[dict]:
             continue
         field = {"key": f["key"], "type": f.get("type") if f.get("type") in _CONFIG_TYPES else "string",
                  "label": str(f.get("label") or f["key"])}
-        for k in ("default", "env", "secret", "options", "help", "placeholder"):
+        for k in ("default", "env", "secret", "workload_env", "options", "help", "placeholder"):
             if k in f:
                 field[k] = f[k]
         out.append(field)
     return out
+
+
+def _validate_workload_env_config(config: list[dict]) -> str | None:
+    """Keep the one plugin-to-workload declaration path narrow and non-overriding."""
+    from hub.workload_env import is_core_workload_env_key
+
+    for field in config:
+        if "workload_env" not in field:
+            continue
+        if field["workload_env"] is not True:
+            return f"workload_env config '{field['key']}' must be true"
+        env = field.get("env")
+        if not field.get("secret"):
+            return f"workload_env config '{field['key']}' must set secret = true"
+        if not isinstance(env, str) or not _ENVIRONMENT_NAME.fullmatch(env):
+            return f"workload_env config '{field['key']}' must declare an environment variable name"
+        if is_core_workload_env_key(env):
+            return f"workload_env config '{field['key']}' cannot override core environment '{env}'"
+    return None
 
 
 def _host_capacity() -> ResourceSpec:
@@ -697,6 +719,35 @@ class Deps:
             chosen = settings.execution or "kernel"   # DP_EXECUTION overrides; else the kernel is default
         return chosen
 
+    def plugin_workload_env(self) -> dict[str, str]:
+        """Resolve the operator-enabled installed-plugin credentials for a workload launch.
+
+        This is deliberately not a general environment bridge: only a manifest field that is both
+        ``secret = true`` and ``workload_env = true`` may contribute, under its declared ``env`` name.
+        UI values remain SecretRefs in metadata and are resolved only at this parent-side boundary.
+        """
+        from hub import metadb
+        from hub.secrets import resolve_secret_value
+
+        forwarded: dict[str, str] = {}
+        for pack, manifest in self._manifests.items():
+            for field in manifest.get("config", []):
+                if field.get("workload_env") is not True:
+                    continue
+                value = metadb.get_setting(
+                    f"plugin.{pack}.{field['key']}", "global", default=None)
+                if value not in (None, ""):
+                    try:
+                        value = resolve_secret_value(value, allow_plaintext=False)
+                    except Exception as exc:  # never expose a reference or its material in dispatch errors
+                        raise RuntimeError(
+                            f"workload configuration for plugin '{pack}' could not be resolved") from exc
+                else:
+                    value = os.environ.get(field["env"])
+                if value not in (None, ""):
+                    forwarded[field["env"]] = str(value)
+        return forwarded
+
     def kernel_backend(self):
         """The registered per-canvas KernelBackend (for preview/profile routing), or None."""
         from hub.kernel_backend import KernelBackend
@@ -768,6 +819,11 @@ class Deps:
                 try:
                     fn = ep.load()
                     mod = sys.modules.get(getattr(fn, "__module__", "") or "")
+                    manifest_error = self._read_installed_manifest(mod, ep.name)
+                    if manifest_error:
+                        self._record_plugin_problem(entry, manifest_error)
+                        continue
+                    entry["config"] = self._manifests.get(ep.name, {}).get("config") or None
                     err = _core_api_error(getattr(mod, "MIN_CORE_API", getattr(mod, "min_core_api", None))) if mod else None
                     if err:  # entry-point plugin declares an unsupported core → skip before register (OSS-01)
                         self._record_plugin_problem(entry, err)
@@ -812,6 +868,11 @@ class Deps:
                 self._record_plugin_problem(entry, err)
                 return False
             man["config"] = _normalize_config(man.get("config"))  # [[config]] → clean UI-field list (may be [])
+            config_error = _validate_workload_env_config(man["config"])
+            if config_error:
+                entry = self._new_plugin_status(name, "drop-in")
+                self._record_plugin_problem(entry, config_error)
+                return False
             self._manifests[name] = man
             return True
         except Exception as e:  # noqa: BLE001
@@ -821,6 +882,32 @@ class Deps:
                 f"Manifest is invalid ({type(e).__name__}); fix dataplay.toml and restart.",
             )
             return False
+
+    def _read_installed_manifest(self, module, name: str) -> str | None:
+        """Load an optional package-local manifest for a ``dataplay.plugins`` entry point."""
+        package = getattr(module, "__package__", None) or getattr(module, "__name__", None)
+        if not package:
+            return None
+        try:
+            resource = importlib.resources.files(package).joinpath("dataplay.toml")
+            if not resource.is_file():
+                return None
+            import tomllib
+            man = tomllib.loads(resource.read_text(encoding="utf-8"))
+        except Exception:
+            return "Installed plugin manifest is invalid; fix dataplay.toml and restart."
+        missing = [key for key in ("name", "version") if key not in man]
+        if missing:
+            return f"Manifest is missing required fields: {', '.join(missing)}."
+        err = _core_api_error(man.get("min_core_api"))
+        if err:
+            return err
+        man["config"] = _normalize_config(man.get("config"))
+        config_error = _validate_workload_env_config(man["config"])
+        if config_error:
+            return config_error
+        self._manifests[name] = man
+        return None
 
     def _register_module(self, mod: str, reg: Registry, *, source: str = "module") -> None:
         manifest = self._manifests.get(mod, {})

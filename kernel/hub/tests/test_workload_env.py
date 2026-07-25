@@ -79,6 +79,25 @@ def test_long_lived_kernel_profile_only_adds_the_current_metadata_bridge():
     assert env["DP_AUTH_MODE"] == "1"
 
 
+def test_declared_plugin_environment_reaches_only_workload_child_profiles(monkeypatch):
+    """The single opt-in applies uniformly to kernel and isolated children, never to a test source."""
+    from hub import deps as deps_module
+    from hub.kernel_backend import _kernel_child_env
+    from hub.subprocess_runner import _subrun_child_env
+
+    class PluginConfig:
+        def plugin_workload_env(self):
+            return {"DP_REFERENCE_PLUGIN_TOKEN": "plugin-workload-secret"}
+
+    monkeypatch.setattr(deps_module, "get_deps", lambda: PluginConfig())
+    for child in (build_workload_env(), _kernel_child_env(), _subrun_child_env()):
+        assert child["DP_REFERENCE_PLUGIN_TOKEN"] == "plugin-workload-secret"
+        _assert_control_secrets_absent(child)
+    # Injectable sources are intentionally a pure core-allowlist seam: a declaration is live
+    # configuration, not a way for callers to smuggle an arbitrary key through this test interface.
+    assert "DP_REFERENCE_PLUGIN_TOKEN" not in build_workload_env(source=_source())
+
+
 def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():
     source = _source()
     source["DP_AUTH_SECRET"] = "   "

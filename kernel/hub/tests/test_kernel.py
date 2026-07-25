@@ -6763,6 +6763,61 @@ def test_plugin_secret_not_leaked_via_settings():
         metadb.set_setting("plugin.dp_secretpk.host", "", "global")
 
 
+def test_plugin_workload_secret_is_opt_in_and_absent_from_public_surfaces(monkeypatch, caplog):
+    """A declared plugin secret reaches only child envs, never settings/plugins/manifests/errors/logs."""
+    import json as _json
+
+    from hub import metadb
+    from hub.deps import Registry, get_deps
+    from hub.execution_manifest import build_execution_manifest
+    from hub.models import Graph
+    from hub.workload_env import build_workload_env
+
+    deps = get_deps()
+    secret = "plugin-workload-material"
+    field = {
+        "key": "service_token", "type": "password", "env": "DP_TEST_PLUGIN_TOKEN",
+        "secret": True, "workload_env": True,
+    }
+    fake = {"name": "dp_workloadpk", "source": "entry_point", "config": [field]}
+    deps.plugins.append(fake)
+    deps._manifests["dp_workloadpk"] = {"config": [field]}
+    try:
+        # Unset means no forwarding; the existing allowlist behavior for all other plugins is unchanged.
+        assert "DP_TEST_PLUGIN_TOKEN" not in build_workload_env()
+        monkeypatch.setenv("DP_TEST_PLUGIN_TOKEN", secret)
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_workloadpk.service_token",
+            "value": "env:DP_TEST_PLUGIN_TOKEN"})
+        assert build_workload_env()["DP_TEST_PLUGIN_TOKEN"] == secret
+        # The in-process runner has no child boundary; a fresh plugin registration receives the same
+        # effective config through the existing SecretRef machinery.
+        registry = Registry(deps); registry._pack = "dp_workloadpk"
+        assert registry.config("service_token") == secret
+
+        _sha, manifest = build_execution_manifest(
+            Graph(id="plugin-workload", version=1, nodes=[], edges=[]), target_node_id=None,
+            target_port_id=None, input_manifest=None, write_intent=None, deps=deps)
+        public = _json.dumps({
+            "settings": client.get("/api/settings").json(),
+            "plugins": client.get("/api/plugins").json(),
+            "manifest": _json.loads(manifest),
+        })
+        assert secret not in public and secret not in caplog.text
+
+        client.put("/api/settings", json={
+            "scope": "global", "key": "plugin.dp_workloadpk.service_token",
+            "value": "env:DP_MISSING_PLUGIN_TOKEN"})
+        with pytest.raises(RuntimeError) as exc:
+            build_workload_env()
+        assert "DP_MISSING_PLUGIN_TOKEN" not in str(exc.value)
+        assert secret not in str(exc.value)
+    finally:
+        deps.plugins.remove(fake)
+        deps._manifests.pop("dp_workloadpk", None)
+        metadb.set_setting("plugin.dp_workloadpk.service_token", "", "global")
+
+
 def test_json_view_capability_reference_plugin(tmp_path):
     # the dp_json_view reference plugin adds a VIEWER TAB with no frontend code: its detector tags
     # JSON-doc columns, and its declarative viewer is surfaced in KernelInfo.capability_views for the

@@ -51,6 +51,34 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
         "DP_DATABASE_URL": f"sqlite:///{decoy_workspace / 'metadata.db'}",
         "DP_PLUGINS": "dp_run_log",
     }
+    workload_secret = "installed-workload-secret"
+    workload_workspace = tmp_path / "workload-probe"
+    workload_probe = """
+import os
+from hub import metadb
+from hub.deps import set_workspace
+from hub.workload_env import build_workload_env
+
+metadb.init_db()
+deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"], maintain_storage=False)
+entry = next(item for item in deps.plugins if item["name"] == "dp-run-log")
+field = next(item for item in entry["config"] if item["key"] == "workload_token")
+assert field["secret"] is True and field["workload_env"] is True
+assert "DP_RUN_LOG_WORKLOAD_TOKEN" not in build_workload_env()
+os.environ["DP_RUN_LOG_WORKLOAD_TOKEN"] = "installed-workload-secret"
+assert build_workload_env()["DP_RUN_LOG_WORKLOAD_TOKEN"] == "installed-workload-secret"
+print("installed workload manifest passed")
+    """
+    workload_checked = _run(
+        [str(python), "-c", workload_probe], cwd=tmp_path, env=env | {
+            "DP_WORKSPACE": str(workload_workspace),
+            "DP_DATA_DIR": str(workload_workspace / "data"),
+            "DP_DATABASE_URL": f"sqlite:///{workload_workspace / 'metadata.db'}",
+        })
+    assert workload_checked.returncode == 0, workload_checked.stderr
+    assert workload_checked.stdout.strip() == "installed workload manifest passed"
+    assert workload_secret not in workload_checked.stdout + workload_checked.stderr
+
     checked = _run(
         [str(python), "-m", "hub.plugin_conformance", "dp-run-log",
          "--workspace", str(workspace), "--telemetry-log", str(telemetry_log)],

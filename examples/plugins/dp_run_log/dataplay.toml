@@ -11,3 +11,14 @@ label = "Run-telemetry log file"
 default = "run-telemetry.jsonl"
 env = "DP_RUN_LOG"
 help = "Each finished run is appended here as one JSON line."
+
+# An installed plugin may explicitly opt one secret config into workload processes.  Its `env` name
+# is both the headless configuration fallback and the only child-process key core will forward.
+[[config]]
+key = "workload_token"
+type = "password"
+label = "Workload service token"
+env = "DP_RUN_LOG_WORKLOAD_TOKEN"
+secret = true
+workload_env = true
+help = "SecretRef or headless environment value forwarded only to execution workloads."
