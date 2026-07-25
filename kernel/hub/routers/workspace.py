@@ -1415,13 +1415,13 @@ def restore_canvas(canvas_id: str, req: RestoreRequest, uid: str = Depends(curre
         # snapshot the CURRENT state first so a restore is itself undoable, then swap in the old doc
         metadb._snapshot_canvas_in_session(
             s, c, c.doc, c.version, author_id=uid, label="before restore")
-        c.doc = doc
         c.version = (c.version or 1) + 1
-        restored_doc = json.loads(doc)
+        restored_doc = {**json.loads(doc), "id": canvas_id, "version": c.version}
+        c.doc = json.dumps(restored_doc)
         metadb.sync_local_result_owner(s, "canvas", canvas_id, restored_doc)
         metadb._replace_promoted_transform_refs(
             s, "canvas", canvas_id, restored_doc)
-    return {"ok": True, "id": canvas_id, "doc": json.loads(doc)}
+    return {"ok": True, "id": canvas_id, "doc": restored_doc}
 
 
 @router.delete("/canvas/{canvas_id}")
