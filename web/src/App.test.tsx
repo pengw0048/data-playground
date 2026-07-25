@@ -21,6 +21,7 @@ vi.mock('./panels/CodeFullscreen', () => ({ CodeFullscreen: () => null }))
 vi.mock('./views/Shell', () => ({ Shell: () => <div>Shell</div> }))
 vi.mock('./views/Login', () => ({ Login: () => <div data-testid="login">Login</div> }))
 vi.mock('./ui/Toaster', () => ({ Toaster: () => null }))
+vi.mock('./HubLiveness', () => ({ HubLiveness: () => null }))
 vi.mock('./router', () => ({ initRouter: mocks.initRouter }))
 vi.mock('./nodes/capabilities', () => ({ syncPluginCapabilities: mocks.syncPluginCapabilities }))
 

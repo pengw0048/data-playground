@@ -19,6 +19,7 @@ import { syncPluginCapabilities } from './nodes/capabilities'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { useCollapsibleRegion } from './layoutPreferences'
 import { confirmedLocalMode, rememberAuthMode } from './localIdentity'
+import { HubLiveness } from './HubLiveness'
 
 type AuthState =
   | { kind: 'checking' }
@@ -140,6 +141,7 @@ export default function App() {
           <Shell />
         )}
         <CodeFullscreen />
+        <HubLiveness />
         <Toaster />
       </ErrorBoundary>
     </ReactFlowProvider>

@@ -69,6 +69,7 @@ beforeEach(() => {
   apiMock.preflightFullResultExport.mockReset().mockResolvedValue('/api/run/full-result-export')
   useStore.setState({
     currentUser: { id: 'alice', name: 'Alice' },
+    kernelUp: true,
     doc: { id: 'history-canvas', name: 'History', version: 1, nodes: [], edges: [], requirements: [] },
     previews: {}, runs: {}, toasts: [], fullscreenCode: null,
   } as any)

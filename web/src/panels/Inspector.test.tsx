@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { Inspector, PortRow, canDeclareNodeSchema, canDeclareSchemaKind } from './Inspector'
 import type { ColumnSchema } from '../types/graph'
 import { register } from '../nodes/registry'
@@ -11,6 +11,10 @@ const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
   { name: 'amount', type: 'double', capabilities: [] },
 ]
+
+beforeEach(() => {
+  useStore.setState({ kernelUp: true })
+})
 
 function registerSpec(kind: string, source?: string) {
   register({

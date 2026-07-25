@@ -76,7 +76,7 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
     void refresh()
     const id = window.setInterval(() => void refresh(), open ? 3_000 : 30_000)
     return () => window.clearInterval(id)
-  }, [refresh, runActive, open])
+  }, [refresh, runActive, open, kernelUp])
 
   const cat = category(kernelUp, offline, status)
 
@@ -138,8 +138,8 @@ export function KernelBadge({ kernelUp, kernelInfo }: { kernelUp: boolean; kerne
             variant="outline"
             size="sm"
             className="mt-1 w-full"
-            disabled={!canEdit || restarting}
-            title={canEdit ? 'Clear warm state and restart the kernel' : 'View-only canvas'}
+            disabled={!canEdit || !kernelUp || restarting}
+            title={!canEdit ? 'View-only canvas' : !kernelUp ? 'Hub offline' : 'Clear warm state and restart the kernel'}
             onClick={restart}
           >
             <Icon name="refresh" size={13} /> {restarting ? 'Restarting…' : 'Restart kernel'}

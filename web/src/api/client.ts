@@ -222,6 +222,9 @@ export interface AgentStatus {
 }
 
 export const api = {
+  livez: (options?: { signal?: AbortSignal }) => req<{ ok: boolean }>('/livez', {
+    signal: options?.signal,
+  }),
   kernel: () => req<KernelInfo>('/kernel'),
   nodes: () => req<BackendNodeSpec[]>('/nodes'),
   registerFile: (uri: string, name?: string) =>

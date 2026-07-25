@@ -143,7 +143,7 @@ describe('graph store — core authority ops', () => {
     useStore.setState({ currentUser: { id: 'alice', name: 'Alice' } })
     useStore.setState({
       doc: { id: 'c', version: 1, name: 'test', nodes: [], edges: [], requirements: [] },
-      canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: false,
+      canvasRole: 'owner', past: [], future: [], toasts: [], agentOpen: false, accessDenied: false, kernelUp: true,
       profileJobs: {}, agentLog: [], localDrafts: [], draftStorageErrors: [], currentDraftId: null,
       serverVersion: 1, saved: true, viewportFitRequest: null,
     })
@@ -497,6 +497,30 @@ describe('graph store — core authority ops', () => {
       expect.objectContaining({ id: doc.id }), 'section',
     ))
     expect(useStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('blocks execution entry points while the hub is offline without mutating the graph', async () => {
+    const source = NODE('source')
+    source.data.config = { uri: 'events' }
+    const doc = {
+      id: 'c', version: 1, name: 'offline draft', requirements: [],
+      nodes: [source], edges: [],
+    }
+    useStore.setState({ doc, kernelUp: false, toasts: [] })
+
+    await useStore.getState().runPreview('source')
+    await useStore.getState().requestRun('source')
+    useStore.getState().rerunAll()
+
+    expect(apiMocks.preview).not.toHaveBeenCalled()
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().doc).toBe(doc)
+    expect(useStore.getState().toasts).toMatchObject([{
+      kind: 'error',
+      msg: 'Hub offline — reconnect before starting or controlling execution.',
+      dedupeKey: 'hub-offline-execution',
+    }])
   })
 
   it('explains why rerun all cannot start a legacy graph with no terminal sink', () => {
