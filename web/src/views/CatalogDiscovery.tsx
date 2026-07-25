@@ -7,7 +7,10 @@ import { VirtualList } from '../ui/VirtualList'
 import { FileDialog } from '../ui/FileDialog'
 import { DatasetRevisionHistory } from './DatasetRevisionHistory'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
-import type { CatalogQueryParams, CatalogTable, CatalogUnregisterResult, Facets, FolderNode, KernelInfo, LineageResult, SampleResult } from '../types/api'
+import type {
+  CatalogQueryParams, CatalogTable, CatalogUnregisterResult, DatasetRevisionDetail,
+  DatasetRevisionResolution, Facets, FolderNode, KernelInfo, LineageResult, SampleResult,
+} from '../types/api'
 
 // The Workspace dataset discovery surface is built to browse thousands of datasets. Nothing is loaded up front: a left
 // FOLDER TREE (lazy), a center VIRTUALIZED list fed by a server-side filtered/sorted/paginated query
@@ -20,6 +23,15 @@ export const CATALOG_BATCH_LIMIT = 50
 const ROW_H = 58
 type Sort = NonNullable<CatalogQueryParams['sort']>
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
+const statusOf = (e: unknown) => e instanceof KernelError ? e.status
+  : typeof e === 'object' && e !== null ? (e as { status?: unknown }).status : undefined
+const sameRevision = (
+  left: { datasetId: string; revisionId: string } | null,
+  right: { datasetId: string; revisionId: string } | null,
+) => left !== null && right !== null
+  && left.datasetId === right.datasetId && left.revisionId === right.revisionId
+const revisionLabel = (revision: { datasetId: string; revisionId: string }) =>
+  `${revision.datasetId}@${revision.revisionId}`
 
 /**
  * The bounded catalog browser is deliberately independent from the destination of a `Use` action.
@@ -927,6 +939,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const [preview, setPreview] = useState<SampleResult | null>(null)  // lazy: fetched on first expand only
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  const [latestHead, setLatestHead] = useState<DatasetRevisionResolution | null>(null)
+  const [headChecking, setHeadChecking] = useState(true)
+  const [headError, setHeadError] = useState<string | null>(null)
+  const [exactFacts, setExactFacts] = useState<DatasetRevisionDetail | null>(null)
+  const [factsLoading, setFactsLoading] = useState(false)
+  const [factsError, setFactsError] = useState<string | null>(null)
   const initialKey = (t: CatalogTable) => t.keys?.find((k) => k.confidence === 'declared')?.columns ?? []
   const [declaredPk, setDeclaredPk] = useState(() => initialKey(table))
   const [conflict, setConflict] = useState(false)
@@ -934,6 +952,38 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const closeRef = useRef<HTMLButtonElement>(null)
   const lineageRequest = useRef(0)
   const previewRequest = useRef(0)
+  const headRequest = useRef(0)
+  const factsRequest = useRef(0)
+
+  const resolveLatestHead = useCallback(async () => {
+    const request = ++headRequest.current
+    setHeadChecking(true); setHeadError(null)
+    try {
+      const next = await api.resolveDatasetRevision(table.id)
+      if (request === headRequest.current) {
+        setLatestHead(next)
+        setFactsError(null)
+      }
+    } catch (e) {
+      if (request !== headRequest.current) return
+      const status = statusOf(e)
+      if (status === 501 || status === 410) setLatestHead(null)
+      else setHeadError(errorMessage(e))
+    } finally {
+      if (request === headRequest.current) setHeadChecking(false)
+    }
+  }, [table.id])
+
+  useEffect(() => {
+    headRequest.current += 1
+    factsRequest.current += 1
+    setLatestHead(null); setHeadError(null); setExactFacts(null); setFactsError(null); setFactsLoading(false)
+    void resolveLatestHead()
+    return () => {
+      headRequest.current += 1
+      factsRequest.current += 1
+    }
+  }, [resolveLatestHead, table.registrationId, table.version])
 
   const loadLineage = useCallback(async () => {
     const s = ++lineageRequest.current
@@ -957,7 +1007,12 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     setPreviewLoading(true); setPreviewError(null)
     try {
       const next = await api.sample(table.uri, 30)
-      if (s === previewRequest.current) setPreview(next)
+      if (s === previewRequest.current) {
+        setPreview(next)
+        // Preview is a current-data read. Re-resolve the provider-native head afterwards instead
+        // of comparing unrelated row counts or adapter fingerprints.
+        void resolveLatestHead()
+      }
     } catch (e) {
       if (s === previewRequest.current) setPreviewError(errorMessage(e))
     } finally {
@@ -968,6 +1023,27 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
     const next = !previewOpen
     setPreviewOpen(next)
     if (next && !preview && !previewLoading) void loadPreview()
+  }
+  const refreshHeadFacts = async () => {
+    if (!latestHead) return
+    const target = latestHead
+    const request = ++factsRequest.current
+    setFactsLoading(true); setFactsError(null)
+    try {
+      const next = await api.datasetRevision(target.datasetId, target.revisionId)
+      if (request !== factsRequest.current) return
+      if (!sameRevision(next, target)) {
+        throw new Error(`Exact revision response did not match ${revisionLabel(target)}`)
+      }
+      setExactFacts(next)
+      // Fence the bounded exact read with a second head resolution. If the provider advanced while
+      // it was loading, the exact facts remain visible but are explicitly stale against the new head.
+      void resolveLatestHead()
+    } catch (e) {
+      if (request === factsRequest.current) setFactsError(errorMessage(e))
+    } finally {
+      if (request === factsRequest.current) setFactsLoading(false)
+    }
   }
   const unregister = async () => {
     if (!unregisterSupported || !base.registrationId || !base.metadataRevision) {
@@ -1043,6 +1119,11 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   const children = (lin?.edges ?? []).filter((e) => e.parent === lineageRoot)
   const lineageNode = (u: string) => lin?.nodes.find((n) => n.uri === u)
   const nameOf = (u: string) => lineageNode(u)?.name ?? u.split('/').slice(-1)[0]
+  const displayRowCount = exactFacts ? exactFacts.summary.rowCount : table.rowCount
+  const displayColumns = exactFacts ? exactFacts.preview.columns : table.columns
+  const factsMatchKnownHead = sameRevision(exactFacts, latestHead)
+  const factsVerifiedLatest = factsMatchKnownHead && !headChecking && !headError
+  const catalogSnapshotLabel = table.version ?? 'identity unavailable'
 
   const togglePk = (col: string) => {
     const next = declaredPk.includes(col) ? declaredPk.filter((c) => c !== col) : [...declaredPk, col]
@@ -1065,11 +1146,41 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
 
         <div className="flex flex-col gap-4 p-4 text-[12.5px]">
           <div className="flex flex-wrap gap-3 text-[11.5px] text-muted-foreground">
-            <span>{table.rowCount == null ? '—' : table.rowCount.toLocaleString()} rows</span>
-            <span>· {table.columns?.length ?? 0} cols</span>
-            <span>· {table.version ?? 'v1'}</span>
+            <span>{displayRowCount == null ? '—' : displayRowCount.toLocaleString()} rows</span>
+            <span>· {displayColumns.length} cols</span>
+            <span data-testid="dataset-facts-source">· {exactFacts
+              ? `Exact revision ${revisionLabel(exactFacts)}`
+              : `Catalog snapshot ${catalogSnapshotLabel}`}</span>
+            {factsVerifiedLatest ? <span>· verified latest head</span> : null}
             {table.usage ? <span>· used {table.usage}×</span> : null}
           </div>
+
+          {headChecking && !latestHead ? (
+            <div role="status" className="text-[11px] text-muted-foreground">Checking latest dataset head…</div>
+          ) : null}
+          {headError ? (
+            <div role="alert" className="flex items-center justify-between gap-2 rounded-lg border border-destructive/30 px-3 py-2 text-[11px] text-destructive">
+              <span>Couldn't verify the latest dataset head: {headError}</span>
+              <button type="button" onClick={() => void resolveLatestHead()} className="shrink-0 font-semibold underline">Retry</button>
+            </div>
+          ) : null}
+          {latestHead && !factsMatchKnownHead ? (
+            <div role="status" data-testid="dataset-facts-stale"
+              className="flex flex-col gap-2 rounded-lg border border-amber-300/60 bg-amber-50/70 px-3 py-2 text-[11px] text-amber-950 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-100">
+              <div>
+                <div className="font-semibold">Dataset facts need refresh</div>
+                <div className="break-words">{exactFacts
+                  ? `Header and Columns are bound to exact revision ${revisionLabel(exactFacts)}; latest head is ${revisionLabel(latestHead)}.`
+                  : `Header and Columns are from catalog snapshot ${catalogSnapshotLabel}, which is not bound to latest head ${revisionLabel(latestHead)}.`}</div>
+              </div>
+              {factsError ? <div role="alert">Couldn't refresh exact head facts: {factsError}</div> : null}
+              <button type="button" onClick={() => void refreshHeadFacts()} disabled={factsLoading}
+                data-testid="refresh-dataset-facts"
+                className="self-start font-semibold underline disabled:opacity-50">
+                {factsLoading ? 'Refreshing head facts…' : factsError ? 'Retry head facts' : 'Refresh head facts'}
+              </button>
+            </div>
+          ) : null}
 
           <DatasetRevisionHistory key={`${table.id}:${initialRevisionId ?? ''}:${initialRevisionDatasetId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
 
@@ -1096,7 +1207,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
           <section>
             <div className="mb-1 text-[10px] font-bold uppercase tracking-wide text-muted-foreground">Columns</div>
             <div className="max-h-[220px] overflow-y-auto rounded-lg border border-border">
-              {table.columns.map((c) => {
+              {displayColumns.map((c) => {
                 const isPk = declaredPk.includes(c.name)
                 return (
                   <div key={c.name} className="flex w-full items-center gap-1 border-b border-border/60 px-2 py-1 last:border-0 hover:bg-accent">
