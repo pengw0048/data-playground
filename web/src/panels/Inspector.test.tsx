@@ -328,7 +328,7 @@ describe('Inspector — effective named outputs', () => {
         writeAdmission: {
           nodeId: 'node', managed: true, destination: '/outputs/existing.lance',
           mode: 'append', provider: 'managed-local-lance', expectedSchema: cols,
-          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' }, blocker: 'the destination head moved',
+          partitions: [], expectedHead: { kind: 'exact', datasetId: 'dataset-lance', revisionId: '7' }, blocker: 'the upstream transform “Normalize purchases” has a bounded output schema contract. In the Inspector, select Output schema (contract) → Infer from sample.',
         },
         status: { outputs: [] },
       } },
@@ -336,7 +336,7 @@ describe('Inspector — effective named outputs', () => {
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the destination head moved')
+    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the upstream transform “Normalize purchases” has a bounded output schema contract. In the Inspector, select Output schema (contract) → Infer from sample.')
     expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })
 

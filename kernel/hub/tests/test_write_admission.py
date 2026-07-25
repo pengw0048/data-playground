@@ -238,13 +238,27 @@ def test_admitted_exact_source_schema_uses_its_revision_without_mutable_scan(tmp
             deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111115")
         assert unavailable.intent is None
         assert unavailable.blocker == (
-            "input schema is not available from bounded metadata; "
-            "declare the upstream output schema before running")
+            "the upstream transform with node ID “select” has a bounded output schema contract. "
+            "In the Inspector, select Output schema (contract) → Infer from sample.")
         assert source_adapter.opened[0] == "revision-1"
         assert source_adapter.opened[1:] and set(source_adapter.opened[1:]) == {"gone"}
         assert source_adapter.mutable_scan_calls == 0
     finally:
         storage.close()
+
+
+def test_missing_schema_blocker_names_the_direct_upstream_transform(contract, monkeypatch):
+    deps, graph = contract
+    graph.nodes[0].data["title"] = "Normalize purchases"
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111117")
+
+    assert admission.intent is None
+    assert admission.blocker == (
+        "the upstream transform “Normalize purchases” has a bounded output schema contract. "
+        "In the Inspector, select Output schema (contract) → Infer from sample.")
 
 
 def test_direct_local_admission_uses_write_predecessor_regardless_of_node_order(contract):
@@ -311,8 +325,9 @@ def test_direct_local_admission_blocks_ambiguous_predecessors_regardless_of_edge
     assert all(admission.intent is None for admission in admissions)
     assert all(
         admission.blocker
-        == "input schema is not available from bounded metadata; "
-        "declare the upstream output schema before running"
+        == "the upstream transforms with node ID “other-source”, with node ID “source” have "
+        "a bounded output schema contract. In the Inspector, select Output schema "
+        "(contract) → Infer from sample."
         for admission in admissions
     )
 
