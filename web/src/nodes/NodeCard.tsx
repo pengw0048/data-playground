@@ -34,6 +34,7 @@ export function NodeCard({ id, data, children, metaOverride }: {
   const spec = getSpec(node?.type ?? 'transform') as NodeSpec | undefined
   const selected = useStore((s) => s.selectedIds.includes(id))
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const kernelUp = useStore((s) => s.kernelUp)
   // the action shelf carries SINGLE-node actions, so only show it for a lone selection — a marquee/
   // shift-select of many cards must not float (and strand) one shelf per card
   const soleSelected = useStore((s) => s.selectedIds.length <= 1 && s.selectedIds.includes(id))
@@ -207,8 +208,8 @@ export function NodeCard({ id, data, children, metaOverride }: {
       {showShelf && (
         <div className="nodrag absolute left-0 top-[calc(100%+5px)] z-[4] inline-flex items-center gap-px rounded-lg border border-border bg-card px-1 py-[3px] shadow-sm">
           <ActionIcon
-            name="eye" label={invalid ?? (runnable ? (openPanel === 'data' ? 'Hide data' : 'View data') : 'Connect a source to preview')}
-            active={openPanel === 'data'} disabled={!runnable || !!invalid}
+            name="eye" label={openPanel === 'data' ? 'Hide data' : !kernelUp ? 'Hub offline — preview unavailable' : invalid ?? (runnable ? 'View data' : 'Connect a source to preview')}
+            active={openPanel === 'data'} disabled={openPanel !== 'data' && (!kernelUp || !runnable || !!invalid)}
             onClick={() => (openPanel === 'data' ? closePanel(id) : runPreview(id))}
           />
           {/* a source has no compute — its ▶ (a full COUNT/scan) is deliberately not a quick action
@@ -216,9 +217,9 @@ export function NodeCard({ id, data, children, metaOverride }: {
           {kind !== 'source' && (
             <ActionIcon
               name={busy ? 'stop' : 'play'}
-              label={busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
+              label={!kernelUp ? 'Hub offline — run unavailable' : busy ? 'Stop' : invalid ?? (!runnable ? 'Connect a source to run' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run up to here')}
               active={openPanel === 'run'}
-              disabled={!canEdit || ((!runnable || !!invalid) && !busy)}
+              disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && !busy)}
               onClick={() => (busy ? cancelRun(id) : requestRun(id))}
             />
           )}

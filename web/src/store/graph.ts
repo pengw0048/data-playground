@@ -1200,6 +1200,16 @@ interface Store {
   exportLocalDraft: (draftId: string) => void
 }
 
+function hubExecutionAvailable(get: () => Store): boolean {
+  if (get().kernelUp) return true
+  get().pushToast(
+    'Hub offline — reconnect before starting or controlling execution.',
+    'error',
+    { dedupeKey: 'hub-offline-execution' },
+  )
+  return false
+}
+
 // Top-level views (like Figma's Recents / Design surfaces). 'canvas' is the editor; settings is a modal.
 export type DpView = 'canvas' | 'workspace' | 'jobs' | 'inbox' | 'files' | 'transforms' | 'relationships'
 
@@ -1958,6 +1968,7 @@ export const useStore = create<Store>((set, get) => ({
     set((s) => (s.openPanels[id] ? { openPanels: {} } : {})),
 
   runPreview: async (id: string, offset = 0, requestedPortId?: string, refreshLatest = false) => {
+    if (!hubExecutionAvailable(get)) return
     // offset lives in the preview state (single source of truth) so an external Refresh (which
     // re-fetches page 0) and the panel's page controls never disagree.
     const doc = get().doc
@@ -2106,6 +2117,7 @@ export const useStore = create<Store>((set, get) => ({
   // if interested. A confirm gate is the one exception (it needs the panel to show the button).
   requestRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
@@ -2223,6 +2235,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   submitRunParameters: async (id) => {
+    if (!hubExecutionAvailable(get)) return
     const parameterContractFingerprint = JSON.stringify(
       targetParameterDeclarations(get().doc, id))
     const continuation = get().runs[id]?.parameterContinuation
@@ -2249,6 +2262,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   estimate: async (id) => {
+    if (!hubExecutionAvailable(get)) return
     if (hasInvalidUpstream(get().doc, id, get().numericParamDrafts)) return
     const declarations = targetParameterDeclarations(get().doc, id)
     const parameterContractFingerprint = JSON.stringify(declarations)
@@ -2290,6 +2304,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   prepareWrite: async (id) => {
+    if (!hubExecutionAvailable(get)) return undefined
     const doc = get().doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
@@ -2323,6 +2338,7 @@ export const useStore = create<Store>((set, get) => ({
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     if (hasConfiguredManagedSidecarMerge(get().doc, id)) {
       set(() => ({ openPanels: { [id]: 'run' } }))
       get().pushToast('Managed sidecar merge uses its certified admission flow.', 'info')
@@ -2446,6 +2462,7 @@ export const useStore = create<Store>((set, get) => ({
   // its upstream, so the full pipeline re-executes. Notes/unconnected nodes aren't runnable → skipped.
   rerunAll: () => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     const { doc, numericParamDrafts } = get()
     const hasOutgoing = new Set(doc.edges.map((e) => e.source))
     // a section's contained children are run by the section, not as top-level sinks
@@ -2468,6 +2485,7 @@ export const useStore = create<Store>((set, get) => ({
 
   cancelRun: async (id) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     const st = get().runs[id]?.status
     if (!st) return
     await api.cancelRun(st.runId).catch(() => {})
@@ -2487,6 +2505,7 @@ export const useStore = create<Store>((set, get) => ({
   // Capture graph identity around both calls and cancel any superseded scan without ever auto-submitting.
   prepareFullProfile: async (id, requestedPortId) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     const doc = get().doc
     if (!doc.nodes.some((node) => node.id === id)) return
     const declarations = targetParameterDeclarations(doc, id)
@@ -2563,6 +2582,7 @@ export const useStore = create<Store>((set, get) => ({
 
   startFullProfile: async (id, portId) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     const doc = get().doc
     portId = resolvedProfilePort(doc, id, portId)
     const jobKey = profileJobKeyForDoc(doc, id, portId)
@@ -2748,6 +2768,7 @@ export const useStore = create<Store>((set, get) => ({
 
   cancelFullProfile: async (id, portId) => {
     if (!roleCanEdit(get().canvasRole)) return
+    if (!hubExecutionAvailable(get)) return
     portId = resolvedProfilePort(get().doc, id, portId)
     const jobKey = profileJobKeyForDoc(get().doc, id, portId)
     const job = get().profileJobs[jobKey]
@@ -3386,6 +3407,7 @@ export const useStore = create<Store>((set, get) => ({
   },
 
   retryLocalDraft: async (draftId) => {
+    if (!get().kernelUp) return
     const principalId = get().currentUser?.id
     const original = get().localDrafts.find((candidate) => (
       candidate.draftId === draftId && candidate.principalId === principalId

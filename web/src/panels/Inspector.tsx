@@ -129,6 +129,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const inputColumns = useInputColumns(nodeId)
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
+  const kernelUp = useStore((s) => s.kernelUp)
   const { rename, runPreview, requestRun, cancelRun, togglePanel, bypass, disable, duplicate, removeNode, openCodeFullscreen } = useStore.getState()
   const [name, setName] = useState(node?.data.title ?? '')
   useEffect(() => setName(node?.data.title ?? ''), [node?.data.title])
@@ -300,8 +301,8 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
           {kind !== 'note' && <>
-            <Action icon="eye" label="View data" disabled={!runnable || !!invalid} onClick={() => runPreview(nodeId)} />
-          <Action icon={runState === 'running' ? 'stop' : 'play'} label={kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || ((!runnable || !!invalid) && runState !== 'running')}
+            <Action icon="eye" label={!kernelUp ? 'Hub offline — preview unavailable' : 'View data'} disabled={!kernelUp || !runnable || !!invalid} onClick={() => runPreview(nodeId)} />
+          <Action icon={runState === 'running' ? 'stop' : 'play'} label={!kernelUp ? 'Hub offline — run unavailable' : kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />

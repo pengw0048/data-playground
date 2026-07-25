@@ -36,7 +36,7 @@ describe('Write card — typed local mode truth', () => {
       parameterBindings: [],
     })
     useStore.setState({
-      canvasRole: 'owner', doc,
+      canvasRole: 'owner', kernelUp: true, doc,
       runs: { write: { phase: 'idle', writeAdmissionFingerprint: fingerprint, writeAdmission: {
         nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
         mode: 'append', provider: 'managed-local-lance', expectedSchema: [], partitions: [],
