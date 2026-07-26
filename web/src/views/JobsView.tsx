@@ -73,6 +73,7 @@ function selectedQuickView(params: URLSearchParams): QuickView | null {
 const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
+  row_identity_certification: 'Row identity certification',
   merge_columns_write: 'Column merge',
 }
 
@@ -241,7 +242,11 @@ export function JobsView() {
     const runId = item.runId ?? item.id
     setActing(`${runId}:${action}`); setActionError('')
     try {
-      if (item.mergeColumns && item.taskId) {
+      if (item.datasetContext?.taskKind === 'row_identity_certification' && item.taskId) {
+        // Certification has its own owner-scoped durable-task endpoint; it deliberately has no
+        // retry endpoint, so Jobs only dispatches cancellation through that existing contract.
+        if (action === 'cancel') await api.cancelRowIdentityCertificationTask(item.taskId)
+      } else if (item.mergeColumns && item.taskId) {
         const managed = item.mergeColumns.producerKind === 'managed-sidecar'
         if (action === 'cancel') {
           if (managed) await api.cancelManagedSidecarMergeTask(item.taskId)
@@ -478,7 +483,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
-        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
+        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>{dataset.taskKind === 'row_identity_certification' ? 'Open certification' : 'Open revision history'}</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}

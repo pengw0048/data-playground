@@ -8,6 +8,7 @@ import type {
 } from '../types/api'
 import { Icon } from '../ui/Icon'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { RowIdentityCertificationControl } from '../components/RowIdentityCertificationControl'
 
 const PAGE_SIZE = 20
 const MAX_RESERVOIR_SEED = 2_147_483_647
@@ -177,7 +178,8 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
       {selected && <RevisionDetail revision={selected} detail={detail} parent={parent} loading={detailLoading}
         error={detailError} parentError={parentError} onRetry={() => void openRevision(selected)}
         canSave={canSaveView} onSave={setSaveDetail} headRevisionId={items[0]?.revisionId ?? null}
-        onRestore={setRestoreDetail} />}
+        onRestore={setRestoreDetail}
+        declaredKey={table.keys?.find((key) => key.confidence === 'declared')?.columns ?? []} />}
     </>}
     {saveDetail && <SaveDatasetViewDialog table={table} detail={saveDetail} onClose={() => setSaveDetail(null)} />}
     {restoreDetail && <RestoreRevisionDialog detail={restoreDetail} headRevisionId={items[0]?.revisionId ?? ''}
@@ -198,13 +200,14 @@ function HistoryFailure({ message, onRetry }: { message: string; onRetry: () => 
 }
 
 function RevisionDetail({ revision, detail, parent, loading, error, parentError, onRetry, canSave, onSave,
-  headRevisionId, onRestore }: {
+  headRevisionId, onRestore, declaredKey }: {
   revision: DatasetRevision; detail: DatasetRevisionDetail | null; parent: DatasetRevisionDetail | null
   loading: boolean; error: string | null; parentError: string | null; onRetry: () => void
   canSave: boolean
   onSave: (detail: DatasetRevisionDetail) => void
   headRevisionId: string | null
   onRestore: (detail: DatasetRevisionDetail) => void
+  declaredKey: string[]
 }) {
   if (loading) return <div role="status" className="rounded-md bg-muted/40 px-2 py-2 text-[11px] text-muted-foreground">Opening exact revision {revision.revisionId}…</div>
   if (error) return <HistoryFailure message={error} onRetry={onRetry} />
@@ -231,6 +234,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
       </div>
     </div>
     <Summary current={detail.summary} parent={parent?.summary ?? null} />
+    <RowIdentityCertificationControl detail={detail} declaredKey={declaredKey} onRefresh={onRetry} />
     {parentError ? <div role="alert" className="text-[10.5px] text-muted-foreground">{parentError}</div>
       : !detail.parentRevisionId ? <div className="text-[10.5px] text-muted-foreground">No retained parent evidence is available; schema and summary changes are unknown.</div>
         : !parent ? <div role="status" className="text-[10.5px] text-muted-foreground">Loading parent comparison…</div>

@@ -192,6 +192,16 @@ describe('InboxView', () => {
     const link = screen.getByRole('link', { name: 'Revision history' })
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')
   })
+
+  it('uses the server-provided exact certification deep-link', async () => {
+    mocks.inboxList.mockResolvedValue({ items: [item({
+      taskKind: 'row_identity_certification', canvasId: null, canvasName: null,
+      datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Media', deepLink: '#/workspace/dataset%3Ads-1?scope=datasets&revision=rev-1&revisionDataset=ds-1&rowIdentityAction=certify&rowIdentityTask=ric_1' },
+    })], hasMore: false, nextCursor: null })
+    render(<InboxView />)
+    const link = await screen.findByRole('link', { name: 'Open certification' })
+    expect(link).toHaveAttribute('href', expect.stringContaining('rowIdentityTask=ric_1'))
+  })
 })
 
 describe('mergeMonotonic (load-more ordering)', () => {

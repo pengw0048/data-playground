@@ -6844,6 +6844,8 @@ def _dataset_context_from_task(s, task: DurableTask) -> dict | None:
             "scope": "datasets",
             "revision": envelope.revision_id,
             "revisionDataset": envelope.dataset_id,
+            "rowIdentityAction": "certify",
+            "rowIdentityTask": task.id,
         })
         return {
             "task_kind": task.task_kind,

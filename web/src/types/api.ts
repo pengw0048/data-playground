@@ -162,6 +162,34 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   rowIdentity: DatasetRevisionRowIdentity
 }
 
+export interface RowIdentityCertificationPreflight {
+  datasetRef: { kind: 'exact'; datasetId: string; revisionId: string }
+  keyFields: Array<{ name: string; arrowType: string }>
+  schemaSha256: string
+  specSha256: string
+  estimatedScanRows?: number | null
+  estimatedScanBytes?: number | null
+  needsConfirmation: boolean
+  reason?: 'unknown_size' | 'large_scan' | null
+  supported: boolean
+  confirmationSha256: string
+}
+
+export interface RowIdentityCertificationTask {
+  taskId: string
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
+  datasetId: string
+  revisionId: string
+  schemaSha256: string
+  specSha256: string
+  keyColumns: string[]
+  canCancel: boolean
+  receipt?: {
+    outcome: 'certified' | 'already_certified_same_spec' | 'conflicting_retained_spec' | 'duplicate_key' | 'null_key' | 'unsupported_type' | 'stale_or_unavailable_revision' | 'cancelled' | 'failed'
+    certificate?: DatasetRevisionRowIdentity | null
+  } | null
+}
+
 export type DatasetViewSampling =
   | { kind: 'all' }
   | { kind: 'reservoir'; size: number; seed: number }
