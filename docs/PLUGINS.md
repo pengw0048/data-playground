@@ -349,6 +349,22 @@ after a provider restart. The reference
 [`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) reads a `catalog.json`
 document from its `root` mount config and never writes it.
 
+#### From a provider dataset to a Canvas Source
+
+The provider contract supplies a browsable canonical dataset and its physical `uri`; it does not
+define a Source adapter. When a researcher selects that dataset, core creates the Canvas's stable
+`workspace-provider://…` URI and its canonical `workspace-provider:…` dataset identity. It then
+resolves the provider's physical `uri` through the ordinary `DatasetAdapter` registry and binds that
+adapter to the stable Source for the request. Providers must not mint those Workspace identities.
+
+Consequently, a provider that returns a custom URI scheme must also ship a companion adapter through
+the `dataplay.plugins` entry-point group. The reference
+[`dp_file_catalog_provider`](../examples/plugins/dp_file_catalog_provider/) does both: its
+`dataplay.catalog_providers` entry point exposes the read-only catalog, while its
+`dataplay.plugins` entry point registers the `dp-file-catalog://` and
+`dp-file-catalog-mutable://` adapters. A provider that returns a URI already handled by core needs no
+additional adapter.
+
 Place installed providers into bounded Workspace browse with `DP_CATALOG_MOUNTS`, a JSON array of
 local mount configuration. Mounts default to the local Workspace root; `containerId` can place a
 mount's root resources in another local overlay container. For example:
@@ -381,14 +397,18 @@ The minimal JSON shape consumed by the reference provider is:
     {"placementId": "north", "kind": "container", "name": "Shared"},
     {"placementId": "south", "kind": "container", "name": "Shared"},
     {"placementId": "north-sales", "parentPlacementId": "north", "kind": "dataset",
-     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet",
+     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet", "revisionId": "sales-v1",
      "columns": [{"name": "id", "type": "int64"}]},
     {"placementId": "south-sales", "parentPlacementId": "south", "kind": "dataset",
-     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet",
+     "datasetId": "sales", "name": "Sales", "uri": "sales.parquet", "revisionId": "sales-v1",
      "columns": [{"name": "id", "type": "int64"}]}
   ]
 }
 ```
+
+`revisionId` is optional, but when supplied it is the provider-owned immutable token that the
+reference adapter uses to support exact reads. Do not include it unless the provider can guarantee the
+bytes for that token; entries without it remain mutable and preview-only.
 
 All lineage methods exposed by a catalog plugin must agree on authority. An `InMemoryCatalog` subclass
 may serve discovery rows externally while deliberately retaining its inherited core-metadata lineage

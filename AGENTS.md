@@ -7,7 +7,7 @@ Data Playground is a **single product** with two build components managed from t
 - **Kernel** (`kernel/`) — Python 3.12 / FastAPI backend + execution engine (DuckDB, Polars, Arrow) + the `dataplay` CLI. Managed by **uv** (`uv.lock`).
 - **Web** (`web/`) — React + TypeScript + Vite SPA. Managed by **npm** (`package-lock.json`). Built to `web/dist` and served by the kernel.
 
-By default the whole product runs as **one process** on `http://127.0.0.1:8471`. The metadata DB (SQLite) and storage (local filesystem) are embedded, not separate services. Postgres, object storage/MinIO, Ray, Kubernetes, and an LLM agent are all optional scale-out add-ons and are not needed for local development or testing.
+By default one hub process serves the product on `http://127.0.0.1:8471`; the default kernel backend starts a per-canvas kernel subprocess for execution. The metadata DB (SQLite) and storage (local filesystem) are embedded, not separate services. Postgres, object storage/MinIO, Ray, Kubernetes, and an LLM agent are all optional scale-out add-ons and are not needed for local development or testing.
 
 ### Running / building / testing
 
@@ -28,6 +28,6 @@ Standard commands live in the root `Makefile`, `web/package.json`, and `kernel/p
 - **`uv` is not a repo file** — it lives at `~/.local/bin/uv` (installed during environment setup) and is on `PATH` via `~/.bashrc`/`~/.profile`. The update script refreshes dependencies with it.
 - **Build ordering:** `web/dist` is gitignored, so a fresh clone lacks it. The kernel wheel force-includes `../web/dist`, so `web/dist` must exist before `uv sync` (a `hatch_build.py` hook creates an empty one, and `make setup` does `mkdir -p web/dist` first). `make run` rebuilds `web/dist` for real before serving.
 - **Static gates:** kernel uses `ruff` + `basedpyright` (the `python-quality` CI job; `make lint`) plus `pytest` with `error::DeprecationWarning:hub.*` treated as errors; web uses `tsc`. `make preflight` runs them all. There is no black/eslint.
-- **First run auto-seeds** sample data (`events.parquet`, `movies.csv`, `images.parquet`) and creates a default canvas; the DB migrates on startup via Alembic.
+- **First run auto-seeds** sample data (`events.parquet`, `movies.csv`, `images.parquet`); the DB migrates on startup via Alembic. It does not create a default canvas.
 - **`dataplay` tries to auto-open a browser** on startup. In a headless VM this prints harmless `dbus`/`gpu`/`gcm` Chrome errors to the log — the server itself is fine (check `GET /api/livez` → `{"ok":true}`).
 - E2E (`npm run e2e`) boots its own `dataplay` instance on `:8899` with a throwaway SQLite DB, so it does not collide with a `make run` server on `:8471`.

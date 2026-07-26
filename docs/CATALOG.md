@@ -45,6 +45,19 @@ creates `top_users`; opening it shows `events` as a parent. The graph is deliber
 node-capped, so use it to orient an investigation rather than assuming it is an unbounded history
 export.
 
+## Use field evidence and related data
+
+Dataset columns can carry safe annotations and a typed row reference to an exact or canonical target.
+Inspect that field evidence as context, not as a claim inferred from a similarly named column. After a
+Source is on a Canvas, **Join with…** offers a bounded related-data list: declared relationships and
+proven typed references appear before inferred schema matches. Review a candidate and its available
+revision before adding it; an unavailable exact revision is not replaced with the current dataset.
+Each candidate reports `cardinalityState` as `available` or `unmeasured`; exact-revision review does
+not scan the pinned dataset merely to fill an unknown value.
+
+The separate join-suggestion surface measures compatible key pairs on current data where it can. Treat
+an inferred suggestion or an unknown cardinality as a prompt for review, not proof of a relationship.
+
 ## Inspect an exact revision when it exists
 
 Some adapters expose immutable revision history. For those datasets, the detail panel offers
@@ -130,6 +143,15 @@ Key endpoints under `/api`:
   version. Producer operation is `null` when the provider does not record it. Missing, compacted,
   unregistered, or unsupported revisions return a stable unavailable result and never fall back to
   current head.
+- `POST /catalog/related-datasets` — a bounded, evidence-ranked candidate page for one stable local or
+  provider Source identity. Declared relationships, typed row references, and inferred schema matches
+  remain distinct evidence classes.
+- `POST /catalog/related-datasets/revisions` — bounded revision history for an already selected stable
+  related-data identity.
+- `POST /catalog/related-datasets/revision-review` — a fresh exact-schema review of one related-data
+  candidate before it is added as an immutable Source.
+- `POST /catalog/join-suggestions` — ranked join key pairs for two datasets, with cardinality measured
+  on the data where it can be established.
 - `POST /data/sample` — bounded dataset rows plus explicit `completeness`, `rowLimit`,
   `limitReason`, and `limitScope` metadata. `limitScope=result-window` identifies the 2,000-row
   interactive artifact window; graph previews use `each-source` instead because their source budget
@@ -176,6 +198,13 @@ it.
   publication and lineage behavior; that preserves local output handling and does not write to the
   external service. Provider-native write-back is a deliberate implementation responsibility, not a
   capability inferred from external discovery.
+
+Operators configure read-only Workspace mounts with `DP_CATALOG_MOUNTS`, a JSON array of `{id,
+provider, config}` entries (and optional `containerId`). A mount identifies an installed
+`dataplay.catalog_providers` provider and remains separate from the application-wide catalog or a write
+destination. Keep sensitive config values in `env:NAME` or `file:/path` SecretRefs; see the
+[mount contract and example](PLUGINS.md#read-only-external-catalog-mounts) for the complete shape and
+failure behavior.
 
 The built-in catalog is itself a first-party plugin (`hub/plugins/default_catalog.py`) that calls
 `reg.set_catalog(InMemoryCatalog(...))` before workspace plugins load. A later plugin can replace it
