@@ -9,6 +9,13 @@ export function publicationMode(mode: WriteAdmission['mode'] | undefined): strin
   return 'Revision mode is not available yet'
 }
 
+function writeMode(mode: WriteAdmission['mode'] | undefined): string {
+  if (mode === 'append') return 'Append provider output'
+  if (mode === 'replace' || mode === 'overwrite') return 'Overwrite provider output'
+  if (mode === 'create') return 'Create provider output'
+  return 'Write mode is not available yet'
+}
+
 function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -123,28 +130,43 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
   const summaryAdmission = completed ? outcomeAdmission : admission
+  const managed = receipt != null || summaryAdmission?.managed === true
+  const providerNeutral = summaryAdmission?.managed === false
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
       <div>
-        <span className="font-semibold text-foreground">{acceptedName ? 'Accepted dataset name' : 'Proposed dataset name'}</span>
+        <span className="font-semibold text-foreground">
+          {managed ? acceptedName ? 'Accepted dataset name' : 'Proposed dataset name' : 'Output name'}
+        </span>
         <div className="font-mono text-foreground">{displayedName}</div>
       </div>
       <div>
-        <span className="font-semibold text-foreground">Managed destination</span>
-        <div className="text-muted-foreground">{managedDestinationLabel(destination)}</div>
+        <span className="font-semibold text-foreground">{managed ? 'Managed destination' : 'Destination'}</span>
+        <div className="text-muted-foreground">{managed ? managedDestinationLabel(destination) : destination}</div>
       </div>
       <div className="text-muted-foreground">
-        Data Playground manages the physical storage layout and records each publication as a versioned revision.
+        {managed
+          ? 'Data Playground manages the physical storage layout and records each publication as a versioned revision.'
+          : providerNeutral
+            ? 'This execution backend writes provider output and does not create a managed dataset revision.'
+            : 'Admission has not determined whether this execution can publish a managed dataset revision.'}
       </div>
-      <div><span className="font-semibold text-foreground">Revision mode</span><div className="text-muted-foreground">{publicationMode(summaryAdmission?.mode)}</div></div>
+      <div>
+        <span className="font-semibold text-foreground">{managed ? 'Revision mode' : 'Write mode'}</span>
+        <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
+      </div>
       {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Cannot publish until</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
-        : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">Publication outcome is unknown; no exact receipt was recorded.</div>
+        : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
+            {providerNeutral ? 'Provider output completed without a managed revision receipt.' : 'Publication outcome is unknown; no exact receipt was recorded.'}
+          </div>
         : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Publishing this managed revision…</div>
-        : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish a managed revision</div>
+        : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">
+            {managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
+          </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
         <div><strong>Managed dataset published</strong></div>

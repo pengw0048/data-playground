@@ -70,12 +70,16 @@ describe('FileDialog request and open-mutation truth', () => {
       backends: ['local'],
     })
     const pick = vi.fn()
-    render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={pick} />)
+    render(<FileDialog mode="save" managed defaultName="results" onClose={vi.fn()} onPick={pick} />)
 
     expect(await screen.findByText('Managed destinations')).toBeVisible()
     expect(screen.getByText('Choose managed destination')).toBeVisible()
     expect(screen.getAllByText('Default managed storage')).toHaveLength(2)
     expect(screen.getByText('Dataset name')).toBeVisible()
+    expect(screen.queryByText('orders.csv')).not.toBeInTheDocument()
+    expect(screen.queryByTitle('New folder')).not.toBeInTheDocument()
+    expect(mocks.browseDestination).not.toHaveBeenCalled()
+    expect(mocks.mkdirDestination).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Use destination' }))
 
     expect(pick).toHaveBeenCalledWith({

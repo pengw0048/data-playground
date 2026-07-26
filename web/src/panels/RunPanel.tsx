@@ -65,8 +65,9 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
   const outputName = String(writeConfig.filename ?? writeConfig.name ?? target?.data.title ?? 'output')
   const destination = `${String(writeConfig.destName ?? 'Workspace outputs')}${writeConfig.destPath ? `/${String(writeConfig.destPath)}` : ''}`
   const receipt = st?.outputs.find((output) => output.writeReceipt)?.writeReceipt ?? writeAdmission?.recoveredReceipt
-  const primaryActionLabel = isWrite ? 'Publish revision' : 'Run'
-  const previewActionLabel = isWrite ? 'Publish preview inputs' : 'Run preview inputs'
+  const isManagedWrite = isWrite && (receipt != null || writeAdmission?.managed === true)
+  const primaryActionLabel = isManagedWrite ? 'Publish revision' : 'Run'
+  const previewActionLabel = isManagedWrite ? 'Publish preview inputs' : 'Run preview inputs'
 
   if (isConfiguredManagedSidecarMerge) return (
     <div className="p-3.5">
@@ -176,7 +177,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
         <>
           <div className="mb-2.5 flex items-center gap-2">
             <span className="dp-running-glyph text-primary">●</span>
-            <span className="text-[13px] font-semibold">{isWrite ? 'publishing managed revision' : 'running'}</span>
+            <span className="text-[13px] font-semibold">{isManagedWrite ? 'publishing managed revision' : 'running'}</span>
             {st.progress != null && <span className="text-[11.5px] text-muted-foreground">{Math.round(st.progress * 100)}%</span>}
           </div>
           {/* step-progress (deterministic) when we have it, else the row-based fallback */}
@@ -190,7 +191,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
             </div>
           )}
           <PerNode st={st} />
-          {isWrite
+          {isManagedWrite
             ? <WritePublicationSummary compact outputName={outputName} destination={destination}
                 admission={writeAdmission} receipt={receipt} outputs={st.outputs} publishing />
             : <RunOutputs outputs={st.outputs} />}
@@ -201,7 +202,7 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
       )}
 
       {phase === 'done' && st && (
-        isWrite ? <>
+        isManagedWrite ? <>
           <Label>MANAGED REVISION PUBLISHED</Label>
           <WritePublicationSummary outputName={outputName} destination={destination} admission={writeAdmission}
             outcomeAdmission={run?.writeOutcomeAdmission} receipt={receipt} outputs={st.outputs} completed />

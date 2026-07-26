@@ -253,6 +253,50 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
   })
 
+  it('keeps provider-neutral Write execution in the ordinary Run and output model', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { filename: 'results.parquet' } },
+    }]
+    mocks.state.doc.parameters = []
+    const admission = {
+      nodeId: 'target', mode: 'overwrite', provider: 'plugin-sink',
+      destination: 's3://example/results.parquet', managed: false, expectedSchema: [], partitions: [],
+    }
+    mocks.state.runs = { target: {
+      phase: 'estimated', estimate: { rows: 2, placement: 'ray', needsConfirm: false },
+      writeAdmission: admission, status: { outputs: [] },
+    } }
+    const { rerender } = render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
+      'This execution backend writes provider output and does not create a managed dataset revision.')
+
+    mocks.state.runs.target = {
+      phase: 'running', writeAdmission: admission,
+      status: {
+        runId: 'provider-job', status: 'running', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 1, totalRows: 2, ms: 10, placement: 'ray', perNode: [], outputs: [],
+      },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByText('running')).toBeVisible()
+    expect(screen.queryByText('publishing managed revision')).not.toBeInTheDocument()
+
+    mocks.state.runs.target = {
+      phase: 'done', writeOutcomeAdmission: admission,
+      status: {
+        runId: 'provider-job', status: 'done', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'ray', perNode: [], outputs: [],
+      },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByText('DONE')).toBeVisible()
+    expect(screen.queryByText('MANAGED REVISION PUBLISHED')).not.toBeInTheDocument()
+  })
+
   it('uses the same receipt-backed publication hierarchy after an ordinary Write succeeds', () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },

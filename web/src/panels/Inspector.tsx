@@ -390,7 +390,7 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
   )
 }
 
-// The managed publication destination — storage layout stays owned by Data Playground.
+// The Write destination. Admission decides whether the selected execution publishes a managed revision.
 function WriteDestination({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
@@ -406,17 +406,21 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const statusOutputs = useStore((s) => s.runs[nodeId]?.status?.outputs)
   const outputs = statusOutputs ?? []
   const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
+  const publicationReceipt = receipt ?? admission?.recoveredReceipt
+  const managed = publicationReceipt != null
+    || admission?.managed === true
+    || (phase === 'done' && outcomeAdmission?.managed === true)
   const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
-    <Section title="Managed publication">
+    <Section title={managed ? 'Managed publication' : 'Write output'}>
       <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
-        outcomeAdmission={outcomeAdmission} receipt={receipt ?? admission?.recoveredReceipt}
-        outputs={outputs} completed={phase === 'done'} publishing={phase === 'running'} />
+        outcomeAdmission={outcomeAdmission} receipt={publicationReceipt}
+        outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'} />
       <div className="mt-2">
-        <CodeBtn icon="export" label="Choose managed destination…" onClick={() => setDlg(true)} />
+        <CodeBtn icon="export" label={managed ? 'Choose managed destination…' : 'Choose destination…'} onClick={() => setDlg(true)} />
       </div>
       {dlg && (
-        <FileDialog mode="save" title="Choose managed destination" defaultName={filename} onClose={() => setDlg(false)}
+        <FileDialog mode="save" managed={managed} defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
       )}
     </Section>

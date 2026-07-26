@@ -32,7 +32,7 @@ describe('WritePublicationSummary exact receipt action', () => {
     expect(screen.queryByText('family_cost.parquet')).not.toBeInTheDocument()
   })
 
-  it('separates a proposed name from server admission and shows publication in progress', () => {
+  it('waits for managed admission before promising a revision and then shows publication in progress', () => {
     const admission = {
       nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
       destination: '/outputs/family_cost.parquet', expectedSchema: [], partitions: [],
@@ -41,8 +41,10 @@ describe('WritePublicationSummary exact receipt action', () => {
     const { rerender } = render(<WritePublicationSummary outputName="family cost"
       destination="Workspace outputs" />)
 
-    expect(screen.getByText('Proposed dataset name')).toBeVisible()
+    expect(screen.getByText('Output name')).toBeVisible()
     expect(screen.getByText('family cost')).toBeVisible()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
+      'Admission has not determined whether this execution can publish a managed dataset revision.')
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Readiness has not been checked yet')
 
     rerender(<WritePublicationSummary outputName="family cost" destination="Workspace outputs"
@@ -67,6 +69,22 @@ describe('WritePublicationSummary exact receipt action', () => {
     expect(screen.queryByText('next')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Published result')).toHaveTextContent('Managed dataset published')
     expect(screen.getByLabelText('Published result')).toHaveTextContent('published · revision revision-7 · 2 rows')
+  })
+
+  it('does not promise a managed revision for provider-neutral admission', () => {
+    const admission = {
+      nodeId: 'write', managed: false, provider: 'plugin-sink', mode: 'overwrite',
+      destination: 's3://example/output.parquet', expectedSchema: [], partitions: [],
+    } as any
+    render(<WritePublicationSummary outputName="output.parquet" destination="External destination"
+      outcomeAdmission={admission} completed />)
+
+    const summary = screen.getByLabelText('Write publication')
+    expect(summary).toHaveTextContent('Output name')
+    expect(summary).toHaveTextContent('Overwrite provider output')
+    expect(summary).toHaveTextContent('Provider output completed without a managed revision receipt.')
+    expect(summary).not.toHaveTextContent('Data Playground manages the physical storage layout')
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission in the task-first summary after active admission cleanup or replacement', () => {
