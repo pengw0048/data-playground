@@ -28,7 +28,9 @@ jobs:
       - name: Read package version
         id: ver
         run: |
-          V=$(python3 -c "import re,pathlib; t=pathlib.Path('kernel/pyproject.toml').read_text(); print(re.search(r'(?m)^version\s*=\s*\"([^\"]+)\"', t).group(1))")
+          V="$(python3 scripts/check_release_versions.py \
+            --pyproject kernel/pyproject.toml \
+            --print-version)"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "package version: $V"
 
@@ -131,7 +133,9 @@ jobs:
       - name: Read package version
         id: ver
         run: |
-          V=$(python3 -c "import re,pathlib; t=pathlib.Path('kernel/pyproject.toml').read_text(); print(re.search(r'(?m)^version\s*=\s*\"([^\"]+)\"', t).group(1))")
+          V="$(python3 scripts/check_release_versions.py \
+            --pyproject kernel/pyproject.toml \
+            --print-version)"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 

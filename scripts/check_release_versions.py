@@ -2,7 +2,9 @@
 """Enforce one version identity across packaging surfaces (REL-01 / issue #114).
 
 Compares sources that are present; missing optional sources are skipped unless
-``--require`` lists them. Fail when any present value disagrees.
+``--require`` lists them. Fail when any present value disagrees. Python normalizes
+the checked-in SemVer development spelling ``X.Y.Z-dev.N`` to ``X.Y.Z.devN`` in
+wheel metadata, so compare those equivalent spellings canonically.
 
 Examples::
 
@@ -11,7 +13,7 @@ Examples::
       --package-json web/package.json \\
       --wheel dist/*.whl \\
       --api-version-json /tmp/version.json \\
-      --image-label 0.2.3 \\
+      --image-label 1.2.3 \\
       --git-tag          # only when GITHUB_REF_TYPE=tag
 
     # Fail unless every named source was supplied and agreed:
@@ -26,6 +28,17 @@ import re
 import sys
 import zipfile
 from pathlib import Path
+
+
+_SEMVER_DEV = re.compile(r"^(?P<release>\d+(?:\.\d+){2,})-dev\.(?P<serial>\d+)$")
+_CLEAN_RELEASE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _canonical_version(value: str) -> str:
+    """Match Python's metadata spelling for the supported SemVer dev convention."""
+    if match := _SEMVER_DEV.fullmatch(value):
+        return f"{match.group('release')}.dev{match.group('serial')}"
+    return value
 
 
 def _read_pyproject(path: Path) -> str:
@@ -85,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="org.opencontainers.image.version from docker inspect")
     p.add_argument("--git-tag", action="store_true",
                    help="When GITHUB_REF_TYPE=tag, require the tag to match")
+    p.add_argument("--release", action="store_true",
+                   help="Require an exact clean release version, never a development identity")
+    p.add_argument("--print-version", action="store_true",
+                   help="Print the canonical agreed version without JSON wrapping")
     p.add_argument("--require", default="",
                    help="Comma-separated sources that must be present: "
                         "pyproject,package_json,wheel,api,image,tag")
@@ -113,12 +130,24 @@ def main(argv: list[str] | None = None) -> int:
     if not found:
         raise SystemExit("no version sources provided")
 
-    values = set(found.values())
+    canonical = {source: _canonical_version(value) for source, value in found.items()}
+    if args.release:
+        non_release = {source: value for source, value in canonical.items()
+                       if not _CLEAN_RELEASE.fullmatch(value)}
+        if non_release:
+            lines = "\n".join(f"  {k}={v!r}" for k, v in sorted(non_release.items()))
+            raise SystemExit(f"release version identity must be an exact clean version:\n{lines}")
+
+    values = set(canonical.values())
     if len(values) != 1:
-        lines = "\n".join(f"  {k}={v!r}" for k, v in sorted(found.items()))
+        lines = "\n".join(f"  {k}={v!r}" for k, v in sorted(canonical.items()))
         raise SystemExit(f"version identity mismatch:\n{lines}")
 
-    print(json.dumps({"ok": True, "version": next(iter(values)), "sources": found}, indent=2))
+    version = next(iter(values))
+    if args.print_version:
+        print(version)
+        return 0
+    print(json.dumps({"ok": True, "version": version, "sources": canonical}, indent=2))
     return 0
 
 

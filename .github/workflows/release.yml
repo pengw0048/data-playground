@@ -142,6 +142,7 @@ jobs:
             --pyproject kernel/pyproject.toml \
             --package-json web/package.json \
             --git-tag \
+            --release \
             --require pyproject,package_json,tag
 
       - name: Download wheel artifact
@@ -203,6 +204,7 @@ jobs:
             --api-version-json /tmp/release-api-version.json \
             --image-label "${LABEL}" \
             --git-tag \
+            --release \
             --require pyproject,package_json,wheel,api,image,tag
 
       - name: Generate SBOM for the wheel

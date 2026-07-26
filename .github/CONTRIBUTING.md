@@ -23,6 +23,15 @@ For a focused kernel test, use `cd kernel && uv run pytest -q path/to/test.py::t
 To reproduce the kernel dependency environment without changing the lockfile, use
 `cd kernel && uv sync --extra dev --frozen`, then `uv run --no-sync pytest -q`.
 
+## Development version identity
+
+`main` carries the next development-line identity `0.3.0-dev.0` in package manifests; Python package
+metadata normalizes it to `0.3.0.dev0`. The minor-version step is intentional because `main` includes
+breaking provider and MCP contracts since v0.2.3. This marks source builds as development snapshots;
+it does not cut or promise a release. Release closeout replaces the suffix with the exact clean tag
+version across the release-owned manifests; `scripts/check_release_versions.py --release` rejects a
+development identity for a tagged release.
+
 Metadata schema changes add a new forward Alembic migration from the current head — a linear chain
 rooted at `kernel/hub/migrations/versions/0001_schema_baseline.py` — and extend its fresh-database
 tests (`kernel/hub/tests/test_migrations.py` pins the full chain and every migration's content hash).
