@@ -6,7 +6,8 @@ that profile. It does not certify a particular host, cluster, identity system, o
 
 This document is the canonical public boundary for deployment and security claims. The
 [security policy](../.github/SECURITY.md) explains how to report a vulnerability; the
-[release gates](CI.md) explain which evidence is required before publishing a version.
+[release gates](CI.md) identify the exact-candidate evidence required before publishing and distinguish
+it from PR and scheduled advisory evidence that does not block a release.
 
 ## Deployment profiles
 
