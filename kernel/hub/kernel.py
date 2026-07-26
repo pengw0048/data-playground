@@ -197,7 +197,7 @@ def _start_admitted_profile(
 def _admitted_kernel_graph(body: RunBody, *, kernel_canvas: str, deps, metadata):
     """Validate a kernel command against its durable admission and reopen exact Source bindings."""
     from hub.local_run_inputs import LocalRunInputError, bind_manifest, validate_manifest, validate_manifest_graph
-    from hub.models import Graph
+    from hub.workload_env import restore_workload_graph
 
     try:
         admission = metadata.local_run_input_admission(body.run_id)
@@ -212,7 +212,7 @@ def _admitted_kernel_graph(body: RunBody, *, kernel_canvas: str, deps, metadata)
     if manifest != persisted:
         raise LocalRunInputError("kernel transport manifest does not match its persisted admission")
     try:
-        graph = Graph(**body.graph)
+        graph = restore_workload_graph(body.graph, body.target)
     except Exception as exc:
         raise LocalRunInputError("kernel graph payload is malformed") from exc
     if graph.id != kernel_canvas:

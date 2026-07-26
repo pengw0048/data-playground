@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -225,7 +226,10 @@ def test_bound_section_input_does_not_claim_transitive_source_identity(tmp_path,
             subengine.relation("sidecar")
 
 
-def test_generated_region_ref_is_not_reported_as_a_direct_source(tmp_path, monkeypatch):
+def test_generated_region_ref_is_not_reported_as_a_direct_source_after_worker_restore(
+        tmp_path, monkeypatch):
+    from hub.workload_env import prepare_workload_graph, restore_workload_graph
+
     deps = _fixture_deps(tmp_path)
     original = Graph(**{"id": "region-source-boundary", "version": 1, "nodes": [
         _node("source", "source", {"uri": "fixture://base"}),
@@ -247,8 +251,25 @@ def test_generated_region_ref_is_not_reported_as_a_direct_source(tmp_path, monke
     subgraph = deps.controller._subgraph(
         original, final_region, {"filter": "fixture://region-ref"})
     assert graph_mod.structural_errors(subgraph, deps.node_specs) == []
-    sidecar = next(node for node in subgraph.nodes if node.id == "sidecar")
-    engine = _engine(deps, subgraph)
+    generated = next(node for node in subgraph.nodes if node.type == "source")
+    payload = prepare_workload_graph(subgraph, "sidecar", deps.registry)
+    assert payload["_controllerGeneratedSourceIds"] == [generated.id]
+    assert "_publication_source_uris" not in payload
+
+    worker_graph = restore_workload_graph(json.loads(json.dumps(payload)), "sidecar")
+    for malformed_ids in (
+            generated.id, [generated.id, generated.id], ["sidecar"], ["missing"]):
+        malformed = json.loads(json.dumps(payload))
+        malformed["_controllerGeneratedSourceIds"] = malformed_ids
+        with pytest.raises(RuntimeError, match="generated Source classification"):
+            restore_workload_graph(malformed, "sidecar")
+
+    public_graph = Graph.model_validate(payload)
+    assert "_controllerGeneratedSourceIds" not in prepare_workload_graph(
+        public_graph, "sidecar", deps.registry)
+
+    sidecar = next(node for node in worker_graph.nodes if node.id == "sidecar")
+    engine = _engine(deps, worker_graph)
     port = ctx.immediate_inputs(engine, sidecar).port("in")
     assert port.count == 1
     assert port.inputs[0].kind is None

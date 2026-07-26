@@ -166,7 +166,10 @@ class _Ctx:
         by_port: dict[str, list[ImmediateInput]] = {port.id: [] for port in spec.inputs}
         nodes = getattr(engine, "_nodes", {})
         graph = getattr(engine, "graph", None)
-        generated_refs = getattr(graph, "_publication_source_uris", {})
+        generated_refs = (
+            set(getattr(graph, "_publication_source_uris", {}))
+            | set(getattr(graph, "_controller_generated_source_ids", ()))
+        )
         for edge in getattr(graph, "edges", ()):
             if edge.target != node.id:
                 continue
