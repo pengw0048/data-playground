@@ -1337,6 +1337,9 @@
             "title": "Revisionid",
             "type": "string"
           },
+          "rowIdentity": {
+            "$ref": "#/components/schemas/DatasetRevisionRowIdentity"
+          },
           "summary": {
             "$ref": "#/components/schemas/DatasetRevisionSummary"
           }
@@ -1345,7 +1348,8 @@
           "datasetId",
           "revisionId",
           "summary",
-          "preview"
+          "preview",
+          "rowIdentity"
         ],
         "title": "DatasetRevisionDetail",
         "type": "object"
@@ -1488,6 +1492,90 @@
           "selector"
         ],
         "title": "DatasetRevisionResolution",
+        "type": "object"
+      },
+      "DatasetRevisionRowIdentity": {
+        "description": "Bounded availability of logical row-addressed reads for one exact revision.",
+        "properties": {
+          "datasetId": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Datasetid",
+            "type": "string"
+          },
+          "encodingVersion": {
+            "anyOf": [
+              {
+                "const": "row-identity-v1",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Encodingversion"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetRevisionRowIdentityField"
+            },
+            "maxItems": 32,
+            "title": "Fields",
+            "type": "array"
+          },
+          "proofStatus": {
+            "enum": [
+              "certified",
+              "unavailable"
+            ],
+            "title": "Proofstatus",
+            "type": "string"
+          },
+          "revisionId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Revisionid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "datasetId",
+          "revisionId",
+          "proofStatus"
+        ],
+        "title": "DatasetRevisionRowIdentity",
+        "type": "object"
+      },
+      "DatasetRevisionRowIdentityField": {
+        "description": "One ordered, certified logical row-identity field for an exact revision.",
+        "properties": {
+          "arrowType": {
+            "enum": [
+              "int8",
+              "int16",
+              "int32",
+              "int64",
+              "uint8",
+              "uint16",
+              "uint32",
+              "uint64",
+              "string"
+            ],
+            "title": "Arrowtype",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "arrowType"
+        ],
+        "title": "DatasetRevisionRowIdentityField",
         "type": "object"
       },
       "DatasetRevisionSummary": {

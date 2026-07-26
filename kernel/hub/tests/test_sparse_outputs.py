@@ -151,6 +151,13 @@ def test_admission_retains_only_existing_exact_base_and_replays_atomically(local
     assert len(refs) == 1
     assert refs[0].uri == metadb.managed_local_file_revision_artifact(
         published["dataset_id"], published["revision_id"])
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        published["dataset_id"], published["revision_id"]) == {
+            "datasetId": published["dataset_id"], "revisionId": published["revision_id"],
+            "proofStatus": "certified",
+            "fields": [{"name": "id", "arrowType": "int32"}],
+            "encodingVersion": "row-identity-v1",
+        }
     assert sorted(path.relative_to(storage.root) for path in Path(storage.root).rglob("*")) == before_files
     with metadb.session() as session:
         assert session.scalar(select(func.count()).select_from(metadb.LocalResultArtifact)) == before_artifacts

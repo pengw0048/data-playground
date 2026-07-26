@@ -20,6 +20,7 @@ from hub.row_identity import (
     RowIdentityValidationError,
     _encode_identity,
     _spec_digest,
+    certify_and_persist_exact_row_identity,
     certify_row_identity_coverage,
     validate_row_identity_coverage,
 )
@@ -310,6 +311,21 @@ def test_key_set_digests_must_agree_exactly_with_coverage_counts(local_catalog, 
     with pytest.raises(RowIdentityValidationError, match="row identity evidence is invalid"):
         _validate(replace(partial, candidate=replace(
             partial.candidate, key_set_digest=partial.base.key_set_digest)), published, partial.spec.digest)
+
+
+def test_exact_identity_certificate_persists_and_replays_for_the_postgres_lifecycle_job(
+        local_catalog, tmp_path):
+    """This file is selected by CI's PostgreSQL lifecycle job under DP_TEST_DATABASE_URL."""
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "persisted-certificate.parquet"), pa.table({
+        "id": pa.array([1, 2], type=pa.int32()),
+    }))
+    exact = _exact(published)
+
+    descriptor = certify_and_persist_exact_row_identity(storage, exact, ["id"])
+    assert certify_and_persist_exact_row_identity(storage, exact, ["id"]) == descriptor
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        exact.dataset_id, exact.revision_id) == descriptor
 
 
 @pytest.mark.parametrize("mutate", [

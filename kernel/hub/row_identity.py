@@ -258,6 +258,60 @@ def certify_row_identity_coverage(
     return certificate
 
 
+def certify_exact_row_identity(
+        storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        owner: str = "row-identity-certification",
+) -> RowIdentityCoverageV1:
+    """Certify exactly one managed-local revision's own logical key once.
+
+    This is deliberately separate from coverage certification: there is no candidate relation and
+    no interactive fallback.  The resulting complete certificate can be persisted by a caller for
+    later row-addressed reads, while catalog detail remains a metadata-only lookup.
+    """
+    exact = _exact_ref(dataset_ref)
+    declared = _declared_keys(key_columns)
+    artifact_uri = metadb.managed_local_file_revision_artifact(*exact)
+    if artifact_uri is None:
+        raise RowIdentityUnavailable("exact row identity source is unavailable")
+
+    try:
+        with db.base_guard(), source_read_scope(storage, [artifact_uri], owner=owner):
+            base = DuckDBAdapter().scan(artifact_uri)
+            base_schema = _relation_schema(base)
+            fields = _key_fields(base_schema, declared)
+            spec = _spec(exact, fields, base_schema)
+            evidence = _scan_evidence(_key_relation(base, declared), fields)
+    except ManagedSourceUnavailable as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
+    except RowIdentityError:
+        raise
+    except Exception as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
+
+    status: Literal["complete", "invalid"] = (
+        "invalid" if evidence.null_rows or evidence.duplicate_groups else "complete")
+    certificate = RowIdentityCoverageV1(
+        spec=spec, base=evidence, candidate=evidence,
+        matched_identities=evidence.unique_identities, missing_identities=0,
+        extra_identities=0, status=status)
+    validate_row_identity_coverage(certificate, dataset_ref, spec.digest)
+    return certificate
+
+
+def certify_and_persist_exact_row_identity(
+        storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        owner: str = "row-identity-certification",
+) -> dict:
+    """Run the explicit whole-revision proof operation and retain its reusable descriptor."""
+    certificate = certify_exact_row_identity(
+        storage, dataset_ref, key_columns, owner=owner)
+    if certificate.status != "complete":
+        raise RowIdentityValidationError("row identity evidence is invalid")
+    return metadb.managed_local_row_identity_certificate_store(
+        dataset_ref.dataset_id, dataset_ref.revision_id,
+        serialize_row_identity_coverage(certificate, dataset_ref, certificate.spec.digest))
+
+
 def freeze_row_identity_spec(
         dataset_ref: ExactDatasetRef, key_columns: Sequence[str], base_relation,
 ) -> RowIdentitySpecV1:

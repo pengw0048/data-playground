@@ -55,6 +55,7 @@ from hub.models import (
     CatalogTable,
     ColumnSchema,
     DatasetRevisionDetail,
+    DatasetRevisionRowIdentity,
     DatasetRevisionCapabilities,
     DatasetRevision,
     DatasetRevisionPage,
@@ -610,6 +611,14 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     if not isinstance(revision_name, str) or not revision_name:
         revision_name = metadb.managed_local_lance_revision_name(
             binding["dataset_id"], str(raw["revision_id"]))
+    row_identity = metadb.managed_local_row_identity_certificate_descriptor(
+        binding["dataset_id"], str(raw["revision_id"]))
+    if row_identity is None:
+        row_identity = {
+            "datasetId": binding["dataset_id"],
+            "revisionId": str(raw["revision_id"]),
+            "proofStatus": "unavailable",
+        }
     return DatasetRevisionDetail(
         dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
         name=revision_name if isinstance(revision_name, str) and revision_name else None,
@@ -622,6 +631,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),
         preview=DatasetRevisionPreview(columns=raw["columns"], rows=preview_rows,
                                        has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
+        row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
     )
 
 

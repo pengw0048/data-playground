@@ -125,6 +125,13 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
     prepared = prepare_sparse_output_admission(storage, request)
     sparse_id = _sparse_id(prepared.owner_id, prepared.canvas_id, prepared.submission_id)
     try:
+        # This durable admission is an explicit production proof trigger: its existing exact
+        # coverage scan has already established the base's ordered key facts.  Retain that proof
+        # without another scan so later exact-revision interactive reads can reuse it.
+        evidence = json.loads(prepared.documents["evidence"])
+        if evidence["status"] == "complete":
+            metadb.managed_local_row_identity_certificate_store(
+                prepared.dataset_ref.dataset_id, prepared.dataset_ref.revision_id, evidence)
         document, created = metadb.sparse_output_admit(
             owner_id=prepared.owner_id, canvas_id=prepared.canvas_id,
             submission_id=prepared.submission_id, sparse_id=sparse_id,
@@ -135,6 +142,8 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
     except metadb.SparseOutputSubmissionConflict as exc:
         raise SparseOutputSubmissionConflict(
             "SparseOutput submission belongs to a different immutable admission") from exc
+    except (metadb.RowIdentityCertificateConflict, ValueError) as exc:
+        raise SparseOutputValidationError("SparseOutput row identity is invalid") from exc
     return SparseOutputAdmission(id=document["id"], created=created, document=document)
 
 
