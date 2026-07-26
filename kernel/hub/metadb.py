@@ -20472,8 +20472,7 @@ def managed_local_row_identity_certificate_descriptor(
         storage, dataset_id: str, revision_id: str,
 ) -> dict | None:
     """Return checked retained evidence while a bounded exact-artifact identity guard is held."""
-    from hub.models import ExactDatasetRef
-    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
+    from hub.row_identity import RowIdentityValidationError
     from hub.storage import ManagedSourceUnavailable, source_read_scope
 
     try:
@@ -20485,25 +20484,11 @@ def managed_local_row_identity_certificate_descriptor(
             if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
                 return None
             info = os.fstat(guards[0].artifact_fileno())
-            artifact_identity = int(info.st_dev), int(info.st_ino)
-            with session() as s:
-                row = s.get(ManagedLocalRowIdentityCertificate, revision_id)
-                revision = s.get(ManagedLocalFileRevision, revision_id)
-                artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
-                            if revision is not None else None)
-                if (row is None or revision is None or row.logical_id != dataset_id
-                        or revision.logical_id != dataset_id or revision.artifact_uri != artifact_uri
-                        or artifact is None or artifact.state != "ready"
-                        or (row.artifact_dev, row.artifact_ino) != artifact_identity
-                        or row.certificate_sha256
-                        != hashlib.sha256(row.certificate_doc.encode()).hexdigest()
-                        or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
-                    return None
-                expected = ExactDatasetRef(kind="exact", dataset_id=dataset_id, revision_id=revision_id)
-                certificate = decode_row_identity_coverage(
-                    json.loads(row.certificate_doc), expected, row.row_identity_spec_sha256)
-                if certificate.status != "complete" or certificate.spec.schema_digest != row.schema_sha256:
-                    return None
+            certificate = managed_local_row_identity_certificate_for_artifact(
+                dataset_id, revision_id, artifact_uri,
+                artifact_dev=int(info.st_dev), artifact_ino=int(info.st_ino),
+            )
+            if certificate is not None:
                 descriptor = {
                     "datasetId": dataset_id,
                     "revisionId": revision_id,
@@ -20516,6 +20501,43 @@ def managed_local_row_identity_certificate_descriptor(
                 return descriptor
     except (ManagedSourceUnavailable, OSError, RuntimeError, TypeError, ValueError,
             RowIdentityValidationError):
+        return None
+
+
+def managed_local_row_identity_certificate_for_artifact(
+        dataset_id: str, revision_id: str, artifact_uri: str, *,
+        artifact_dev: int, artifact_ino: int,
+):
+    """Revalidate and return retained proof bound to one already-held exact artifact inode."""
+    from hub.models import ExactDatasetRef
+    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
+
+    try:
+        if (type(artifact_dev) is not int or artifact_dev < 0
+                or type(artifact_ino) is not int or artifact_ino < 0):
+            return None
+        with session() as s:
+            row = s.get(ManagedLocalRowIdentityCertificate, str(revision_id))
+            revision = s.get(ManagedLocalFileRevision, str(revision_id))
+            artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
+                        if revision is not None else None)
+            if (row is None or revision is None or row.logical_id != str(dataset_id)
+                    or revision.logical_id != str(dataset_id)
+                    or revision.artifact_uri != str(artifact_uri)
+                    or artifact is None or artifact.state != "ready"
+                    or (row.artifact_dev, row.artifact_ino) != (artifact_dev, artifact_ino)
+                    or row.certificate_sha256
+                    != hashlib.sha256(row.certificate_doc.encode()).hexdigest()
+                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
+                return None
+            expected = ExactDatasetRef(
+                kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
+            certificate = decode_row_identity_coverage(
+                json.loads(row.certificate_doc), expected, row.row_identity_spec_sha256)
+            if certificate.status != "complete" or certificate.spec.schema_digest != row.schema_sha256:
+                return None
+            return certificate
+    except (KeyError, RuntimeError, TypeError, ValueError, RowIdentityValidationError):
         return None
 
 

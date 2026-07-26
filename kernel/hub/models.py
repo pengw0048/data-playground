@@ -559,6 +559,28 @@ class DatasetRevisionRowIdentity(Wire):
         return self
 
 
+class MediaCellIdentityValue(Wire):
+    """One ordered, typed logical-row identity value for an exact media-cell read."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    name: str = Field(min_length=1, max_length=256)
+    arrow_type: Literal[
+        "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64", "string",
+    ]
+    value: str = Field(max_length=8192)
+
+
+class MediaCellRequest(Wire):
+    """Address one column in one certified logical row; never a storage URI or physical offset."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    identity: list[MediaCellIdentityValue] = Field(min_length=1, max_length=32)
+    column: str = Field(min_length=1, max_length=256)
+
+
 class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
     dataset_id: str = Field(min_length=1, max_length=512)
