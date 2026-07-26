@@ -976,14 +976,7 @@ def test_workspace_pages_keep_degraded_items_and_continue_enumeration(
         "provider": "fixture",
     }]))
 
-    root = workspace_providers.browse(
-        metadb.LOCAL_WORKSPACE_ROOT_ID,
-        uid=metadb.DEFAULT_USER_ID,
-        limit=50,
-    )
-    remote_parent = next(
-        item for item in root["items"]
-        if item.get("mountId") == mount_id and item["providerPlacementId"] == "parent")
+    remote_parent = _browse_provider_root_item(mount_id, "parent")
     parent_identity = remote_parent["id"].split(":", 1)[1]
     first = workspace_providers.browse(
         parent_identity, uid=metadb.DEFAULT_USER_ID, limit=2)
