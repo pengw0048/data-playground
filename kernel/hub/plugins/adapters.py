@@ -958,6 +958,17 @@ class ManagedLocalFileRevisionAdapter:
         except (KeyError, OSError, duckdb.Error) as exc:
             _raise_revision_access_error(exc)
 
+    def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]:
+        """Read the schema persisted with one immutable local revision, without opening rows."""
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_schema(uri, revision_id)
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            _raise_revision_access_error(exc)
+
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded facts and preview from one exact immutable local Parquet artifact."""
         from hub import metadb
@@ -1231,6 +1242,16 @@ class LanceAdapter:
             dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
             dataset.schema  # force a missing-version failure before creating the scanner
             return db.conn().from_arrow(dataset.scanner(limit=int(limit)).to_reader())
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            _raise_revision_access_error(exc)
+
+    def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]:
+        """Read the requested retained Lance version's schema, never current-head metadata."""
+        try:
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
+            return adapter_arrow_schema_columns(self, dataset.schema)
         except RevisionUnavailable:
             raise
         except Exception as exc:

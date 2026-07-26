@@ -221,9 +221,14 @@ def _source_evidence(
             _dataset_id, revision_id = dataset_ref_identity(dataset_ref)
         if revision_id is not None:
             if not allow_revision_detail:
-                # A provider's revision-detail implementation may open the complete exact relation.
-                # Interactive preview must retain its source bound rather than fetching extra evidence.
-                return None
+                # Interactive preview only accepts an adapter's explicit metadata-only capability.
+                # Never substitute revision detail, exact-open, or mutable-head schema here: each can
+                # either exceed the preview bound or attach evidence from another revision.
+                revision_schema = getattr(
+                    revision_adapter_for_uri(uri, resolve_adapter), "revision_schema", None)
+                if not callable(revision_schema):
+                    return None
+                return _columns(revision_schema(uri, str(revision_id)))
             detail = revision_adapter_for_uri(uri, resolve_adapter).revision_detail(
                 uri, str(revision_id), preview_limit=1)
             return _columns(detail["columns"])

@@ -345,6 +345,19 @@ class DatasetRevisionAdapter(Protocol):
 
 
 @runtime_checkable
+class DatasetRevisionSchemaAdapter(Protocol):
+    """Optional metadata-only field schema for one immutable adapter revision.
+
+    Implementations must address only ``revision_id`` and read no rows, revision history, or mutable
+    head metadata.  Interactive previews feature-detect this separately from
+    :class:`DatasetRevisionAdapter`: an exact provider remains valid when it cannot make this bounded
+    schema claim.
+    """
+
+    def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]: ...
+
+
+@runtime_checkable
 class DatasetRevisionPreviewAdapter(Protocol):
     """Optional source-bounded preview read for one immutable adapter revision.
 
