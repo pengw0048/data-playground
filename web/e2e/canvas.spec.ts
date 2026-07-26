@@ -1778,7 +1778,7 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
       await expect(runPanel.getByText('HEADS UP')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Run', exact: true }).click()
+      await runPanel.getByRole('button', { name: 'Publish revision', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
@@ -1814,7 +1814,11 @@ test.describe('Data Playground canvas', () => {
 
       // Lance create/replace is deliberately provider-neutral; it only prepares an existing registered
       // destination for the typed append journey below.
-      await expect(inspector.getByLabel('Write publication')).toContainText('Replace the selected dataset')
+      const providerPublication = inspector.getByLabel('Write publication')
+      await expect(providerPublication.getByText('Write mode').locator('..'))
+        .toContainText('Overwrite provider output')
+      await expect(providerPublication.getByLabel('Write readiness'))
+        .toContainText('Ready to run with provider output')
       let fixtureRunId: string | undefined
       page.on('response', async (response) => {
         if (!response.url().endsWith('/api/run') || response.request().method() !== 'POST') return
@@ -1842,10 +1846,10 @@ test.describe('Data Playground canvas', () => {
       })
       await page.getByRole('combobox', { name: 'mode' }).selectOption('append')
       const appendPublication = inspector.getByLabel('Write publication')
-      await expect(appendPublication.getByText('Revision mode').locator('..'))
-        .toContainText('Replace the selected dataset')
+      await expect(appendPublication.getByText('Write mode').locator('..'))
+        .toContainText('Overwrite provider output')
       await expect(appendPublication.getByLabel('Write readiness'))
-        .toContainText('Publication outcome is unknown; no exact receipt was recorded.')
+        .toContainText('Provider output completed without a managed revision receipt.')
       const appendDetails = appendPublication.locator('details')
       await expect(appendDetails).toContainText(/Completed admission:.*mode overwrite/)
       await expect(appendDetails).toContainText(/Next admission:.*mode append/)
@@ -1903,7 +1907,7 @@ test.describe('Data Playground canvas', () => {
       await inspector.getByRole('button', { name: 'Run', exact: true }).click()
       const runPanel = page.getByTestId('panel-run')
       await expect(runPanel.getByText('HEADS UP')).toBeVisible()
-      await runPanel.getByRole('button', { name: 'Run', exact: true }).click()
+      await runPanel.getByRole('button', { name: 'Publish revision', exact: true }).click()
       await expect(runPanel.getByText('run failed')).toBeVisible({ timeout: 15_000 })
       await runPanel.getByRole('button', { name: 'Retry', exact: true }).click()
 
