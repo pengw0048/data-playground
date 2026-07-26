@@ -16,7 +16,8 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Mapping
 
 from hub.backends import CatalogProvider, NodeBuilder
 from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
@@ -95,12 +96,32 @@ class Registry:
         schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
         field = next((f for f in schema if isinstance(f, dict) and f.get("key") == key), None)
         secret = bool(field and field.get("secret"))
+        if field and field.get("workload_env") is True:
+            from hub.workload_env import WORKLOAD_CHILD_MARKER, workload_child_allows_plugin
+            marker = os.environ.get(WORKLOAD_CHILD_MARKER)
+            if marker is not None:
+                if (
+                    pack
+                    and self._entry is not None
+                    and self._entry.get("source") == "entry_point"
+                    and workload_child_allows_plugin(marker, pack)
+                ):
+                    inherited = os.environ.get(str(field["env"]))
+                    return inherited if inherited not in (None, "") else default
+                return default
         if pack:
             from hub import metadb
             v = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
             if v not in (None, ""):
                 if secret:
                     from hub.secrets import resolve_secret_value
+                    if field and field.get("workload_env") is True:
+                        try:
+                            return resolve_secret_value(v, allow_plaintext=False)
+                        except Exception:
+                            raise RuntimeError(
+                                f"workload configuration for plugin '{pack}' "
+                                "could not be resolved") from None
                     return resolve_secret_value(v)
                 return v
         if field and field.get("env") and os.environ.get(field["env"]) not in (None, ""):
@@ -408,18 +429,31 @@ def _validate_workload_env_config(config: list[dict]) -> str | None:
     """Keep the one plugin-to-workload declaration path narrow and non-overriding."""
     from hub.workload_env import is_core_workload_env_key
 
+    keys: set[str] = set()
+    env_targets: set[str] = set()
     for field in config:
+        key = str(field["key"])
+        if key in keys:
+            return f"config key '{key}' is declared more than once"
+        keys.add(key)
+        declared_env = field.get("env")
+        if isinstance(declared_env, str):
+            if declared_env in env_targets:
+                return f"config environment target '{declared_env}' is declared more than once"
+            env_targets.add(declared_env)
         if "workload_env" not in field:
             continue
         if field["workload_env"] is not True:
-            return f"workload_env config '{field['key']}' must be true"
-        env = field.get("env")
-        if not field.get("secret"):
-            return f"workload_env config '{field['key']}' must set secret = true"
+            return f"workload_env config '{key}' must be true"
+        env = declared_env
+        if field.get("secret") is not True:
+            return f"workload_env config '{key}' must set secret = true"
+        if field.get("default") not in (None, ""):
+            return f"workload_env config '{key}' cannot declare a default"
         if not isinstance(env, str) or not _ENVIRONMENT_NAME.fullmatch(env):
-            return f"workload_env config '{field['key']}' must declare an environment variable name"
+            return f"workload_env config '{key}' must declare an environment variable name"
         if is_core_workload_env_key(env):
-            return f"workload_env config '{field['key']}' cannot override core environment '{env}'"
+            return f"workload_env config '{key}' cannot override core environment '{env}'"
     return None
 
 
@@ -475,6 +509,7 @@ class Deps:
         # discoveries, failures, or effective capability ownership.
         self._plugin_capability_owners: dict[str, dict] = {}
         self._manifests: dict[str, dict] = {}
+        self._plugin_workload_fields: tuple[tuple[str, dict], ...] = ()
         # Plugins register before services are constructed.  Keep the collection available now so a
         # plugin backend can register itself, then append the built-ins after they bind the final catalog.
         self.runners: list = []
@@ -526,6 +561,7 @@ class Deps:
         self.runner.result_put = _result_put
         self.runners = [self.runner]
         self._materialize_plugin_runners()
+        self._finalize_plugin_workload_env()
         # Whole-dataset profiles are inspection jobs, not materialized graph runs, but they share
         # the same durable RunState status/cancel/recovery contract.
         from hub.profile_jobs import ProfileProcessRunner
@@ -719,34 +755,77 @@ class Deps:
             chosen = settings.execution or "kernel"   # DP_EXECUTION overrides; else the kernel is default
         return chosen
 
-    def plugin_workload_env(self) -> dict[str, str]:
+    def _finalize_plugin_workload_env(self) -> None:
+        """Freeze conflict-free declarations from successfully active installed plugins."""
+        candidates: list[tuple[str, dict, dict]] = []
+        for entry in self.plugins:
+            if entry.get("source") != "entry_point" or entry.get("state") != "active":
+                continue
+            pack = str(entry["name"])
+            for field in entry.get("config") or []:
+                if field.get("workload_env") is True:
+                    candidates.append((pack, field, entry))
+
+        by_target: dict[str, list[tuple[str, dict, dict]]] = {}
+        for candidate in candidates:
+            by_target.setdefault(str(candidate[1]["env"]), []).append(candidate)
+        conflicts = {
+            target for target, owners in by_target.items()
+            if len(owners) > 1
+        }
+        for target in sorted(conflicts):
+            for _pack, _field, entry in sorted(
+                    by_target[target], key=lambda item: (item[0], str(item[1]["key"]))):
+                self._record_plugin_problem(
+                    entry,
+                    f"Workload environment target '{target}' conflicts with another active plugin.",
+                    conflict=True,
+                )
+        self._plugin_workload_fields = tuple(
+            (pack, field)
+            for pack, field, entry in sorted(
+                candidates, key=lambda item: (item[0], str(item[1]["key"])))
+            if str(field["env"]) not in conflicts and entry.get("state") == "active"
+        )
+
+    def plugin_workload_env(
+        self,
+        *,
+        inherited: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         """Resolve the operator-enabled installed-plugin credentials for a workload launch.
 
         This is deliberately not a general environment bridge: only a manifest field that is both
         ``secret = true`` and ``workload_env = true`` may contribute, under its declared ``env`` name.
-        UI values remain SecretRefs in metadata and are resolved only at this parent-side boundary.
+        UI values remain SecretRefs in hub metadata and are resolved only at the first parent-side
+        boundary. A marked workload child reuses only the already-forwarded declared target values.
         """
         from hub import metadb
         from hub.secrets import resolve_secret_value
 
         forwarded: dict[str, str] = {}
-        for pack, manifest in self._manifests.items():
-            for field in manifest.get("config", []):
-                if field.get("workload_env") is not True:
-                    continue
+        for pack, field in self._plugin_workload_fields:
+            target = str(field["env"])
+            if inherited is not None:
+                value = inherited.get(target)
+            else:
                 value = metadb.get_setting(
                     f"plugin.{pack}.{field['key']}", "global", default=None)
                 if value not in (None, ""):
                     try:
                         value = resolve_secret_value(value, allow_plaintext=False)
-                    except Exception as exc:  # never expose a reference or its material in dispatch errors
+                    except Exception:  # never retain a resolver exception chain or configured reference
                         raise RuntimeError(
-                            f"workload configuration for plugin '{pack}' could not be resolved") from exc
+                            f"workload configuration for plugin '{pack}' could not be resolved") from None
                 else:
-                    value = os.environ.get(field["env"])
-                if value not in (None, ""):
-                    forwarded[field["env"]] = str(value)
+                    value = os.environ.get(target)
+            if value not in (None, ""):
+                forwarded[target] = str(value)
         return forwarded
+
+    def plugin_workload_names(self) -> tuple[str, ...]:
+        """Installed plugin identities authorized by the hub marker for this workload."""
+        return tuple(sorted({pack for pack, _field in self._plugin_workload_fields}))
 
     def kernel_backend(self):
         """The registered per-canvas KernelBackend (for preview/profile routing), or None."""
@@ -811,11 +890,24 @@ class Deps:
             self._register_module(mod, reg)
         try:
             from importlib.metadata import entry_points
-            for ep in entry_points(group="dataplay.plugins"):
+            installed_entry_points = list(entry_points(group="dataplay.plugins"))
+            duplicate_names = {
+                name for name, count in Counter(
+                    ep.name for ep in installed_entry_points).items()
+                if count > 1
+            }
+            for ep in installed_entry_points:
                 package = getattr(getattr(ep, "dist", None), "name", None) or ep.name
                 version = getattr(getattr(ep, "dist", None), "version", None)
                 entry = self._new_plugin_status(
                     ep.name, "entry_point", package=package, version=version)
+                if ep.name in duplicate_names:
+                    self._record_plugin_problem(
+                        entry,
+                        f"Installed plugin entry point name '{ep.name}' is declared more than once.",
+                        conflict=True,
+                    )
+                    continue
                 try:
                     fn = ep.load()
                     mod = sys.modules.get(getattr(fn, "__module__", "") or "")

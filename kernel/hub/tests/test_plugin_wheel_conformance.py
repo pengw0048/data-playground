@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import textwrap
 import time
 import urllib.request
 from pathlib import Path
@@ -23,18 +24,75 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
     uv = shutil.which("uv")
     assert uv is not None, "the supported wheel conformance path requires uv"
 
+    probe_plugin = tmp_path / "dp-workload-probe"
+    probe_plugin.mkdir()
+    (probe_plugin / "pyproject.toml").write_text(textwrap.dedent("""
+        [project]
+        name = "dp-workload-probe"
+        version = "0.1.0"
+        requires-python = ">=3.11"
+        dependencies = ["data-playground>=0.1.0"]
+
+        [project.entry-points."dataplay.plugins"]
+        dp-workload-probe = "dp_workload_probe:register"
+
+        [build-system]
+        requires = ["hatchling"]
+        build-backend = "hatchling.build"
+
+        [tool.hatch.build.targets.wheel.force-include]
+        "__init__.py" = "dp_workload_probe/__init__.py"
+        "dataplay.toml" = "dp_workload_probe/dataplay.toml"
+    """))
+    (probe_plugin / "dataplay.toml").write_text(textwrap.dedent("""
+        name = "dp-workload-probe"
+        version = "0.1.0"
+
+        [[config]]
+        key = "token"
+        type = "password"
+        label = "Workload probe token"
+        env = "DP_WORKLOAD_PROBE_TOKEN"
+        secret = true
+        workload_env = true
+    """))
+    (probe_plugin / "__init__.py").write_text(textwrap.dedent("""
+        import json
+        import os
+        from pathlib import Path
+
+        def register(reg):
+            configured = reg.config("token") not in (None, "")
+            if os.environ.get("DP_WORKLOAD_EPHEMERAL") == "1":
+                path = Path(os.environ["DP_WORKSPACE"]) / "subrun-token-presence.jsonl"
+                with path.open("a") as stream:
+                    stream.write(json.dumps(configured) + "\\n")
+            reg.add_telemetry_sink(lambda _record: None)
+    """))
+
     core_dist = tmp_path / "core-dist"
     plugin_dist = tmp_path / "plugin-dist"
+    probe_dist = tmp_path / "probe-dist"
     assert _run([uv, "build", "--wheel", "--out-dir", str(core_dist)], cwd=kernel).returncode == 0
     assert _run([uv, "build", "--wheel", "--out-dir", str(plugin_dist)], cwd=plugin).returncode == 0
+    assert _run(
+        [uv, "build", "--wheel", "--out-dir", str(probe_dist)],
+        cwd=probe_plugin,
+    ).returncode == 0
     core_wheel, = core_dist.glob("data_playground-*.whl")
     plugin_wheel, = plugin_dist.glob("dp_run_log-*.whl")
+    probe_wheel, = probe_dist.glob("dp_workload_probe-*.whl")
 
     venv = tmp_path / "venv"
     assert _run([uv, "venv", str(venv)], cwd=tmp_path).returncode == 0
     python = venv / "bin" / "python"
     install = _run(
-        [uv, "pip", "install", "--python", str(python), str(core_wheel), str(plugin_wheel)], cwd=tmp_path)
+        [
+            uv, "pip", "install", "--python", str(python),
+            str(core_wheel), str(plugin_wheel), str(probe_wheel),
+        ],
+        cwd=tmp_path,
+    )
     assert install.returncode == 0, install.stderr
 
     clean_env = os.environ.copy()
@@ -51,33 +109,207 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
         "DP_DATABASE_URL": f"sqlite:///{decoy_workspace / 'metadata.db'}",
         "DP_PLUGINS": "dp_run_log",
     }
-    workload_secret = "installed-workload-secret"
-    workload_workspace = tmp_path / "workload-probe"
-    workload_probe = """
+    workload_secret = "installed-env-workload-secret"
+    file_workload_secret = "installed-file-workload-secret"
+
+    # Exercise the production spawn wiring too: the Hub run route starts a real detached
+    # ``hub.kernel``, whose default runner starts a real ``hub.subrun``. A test-only installed plugin
+    # records only a typed presence bit from that innermost process, never credential material.
+    actual_workspace = tmp_path / "actual-workload-probe"
+    actual_workspace.mkdir()
+    actual_probe = """
+import json
 import os
-from hub import metadb
+import socket
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+import uvicorn
+
+from hub import kernel_backend, metadb, secrets
 from hub.deps import set_workspace
-from hub.workload_env import build_workload_env
+from hub.settings import settings
+
+workspace = Path(os.environ["DP_WORKSPACE"])
+data_dir = Path(os.environ["DP_DATA_DIR"])
+workspace.mkdir(parents=True, exist_ok=True)
+data_dir.mkdir(parents=True, exist_ok=True)
+probe_log = workspace / "subrun-token-presence.jsonl"
+target = "DP_WORKLOAD_PROBE_TOKEN"
+source = "DP_PARENT_ONLY_WORKLOAD_PROBE_TOKEN"
+setting = "plugin.dp-workload-probe.token"
+env_secret = os.environ.pop("TEST_ONLY_ENV_WORKLOAD_SECRET")
+file_secret = os.environ.pop("TEST_ONLY_FILE_WORKLOAD_SECRET")
+os.environ.pop(target, None)
+os.environ.pop(source, None)
 
 metadb.init_db()
-deps = set_workspace(os.environ["DP_WORKSPACE"], os.environ["DP_DATA_DIR"], maintain_storage=False)
-entry = next(item for item in deps.plugins if item["name"] == "dp-run-log")
-field = next(item for item in entry["config"] if item["key"] == "workload_token")
-assert field["secret"] is True and field["workload_env"] is True
-assert "DP_RUN_LOG_WORKLOAD_TOKEN" not in build_workload_env()
-os.environ["DP_RUN_LOG_WORKLOAD_TOKEN"] = "installed-workload-secret"
-assert build_workload_env()["DP_RUN_LOG_WORKLOAD_TOKEN"] == "installed-workload-secret"
-print("installed workload manifest passed")
+deps = set_workspace(str(workspace), str(data_dir), maintain_storage=False)
+entry = next(item for item in deps.plugins if item["name"] == "dp-workload-probe")
+assert entry["state"] == "active"
+settings.execution = "kernel"
+source_path = data_dir / "actual-source.csv"
+source_path.write_text("amount\\n1\\n2\\n")
+deps.catalog._add(name="actual_source", uri=str(source_path), strict_probe=True)
+
+from hub.main import app
+
+with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+server = uvicorn.Server(uvicorn.Config(
+    app, host="127.0.0.1", port=port, log_level="error", access_log=False,
+))
+thread = threading.Thread(target=server.run, daemon=True)
+thread.start()
+base_url = f"http://127.0.0.1:{port}"
+
+
+def api(path, *, body=None):
+    request = urllib.request.Request(
+        base_url + path,
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="GET" if body is None else "POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise AssertionError(f"{path}: {exc.read().decode(errors='replace')}") from None
+
+
+deadline = time.monotonic() + 15
+while True:
+    try:
+        assert api("/api/livez") == {"ok": True}
+        break
+    except (AssertionError, OSError):
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.05)
+
+started_canvases = []
+
+
+def shutdown_kernel(canvas_id):
+    kernel = metadb.get_kernel(canvas_id)
+    if kernel and kernel.get("endpoint"):
+        try:
+            kernel_backend._post(
+                kernel["endpoint"],
+                "/shutdown",
+                kernel["token"],
+                {},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+
+def run_actual_scenario(label, expected_presence):
+    canvas_id = f"actual-workload-{label}-{uuid.uuid4().hex}"
+    started_canvases.append(canvas_id)
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id,
+            owner_id="local",
+            name=f"actual workload {label}",
+        ))
+    graph = {
+        "id": canvas_id,
+        "version": 1,
+        "nodes": [{
+            "id": "source",
+            "type": "source",
+            "position": {"x": 0, "y": 0},
+            "data": {"title": "source", "config": {"uri": str(source_path)}},
+        }],
+        "edges": [],
+    }
+    started = api("/api/run", body={
+        "graph": graph,
+        "targetNodeId": "source",
+        "confirmed": True,
+        "submissionId": str(uuid.uuid4()),
+    })
+    run_id = started["runId"]
+    deadline = time.monotonic() + 45
+    while True:
+        status = api(f"/api/run/{run_id}")
+        if status["status"] in ("done", "failed", "cancelled"):
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"actual workload {label} did not finish")
+        time.sleep(0.1)
+    assert status["status"] == "done", status.get("error")
+    observed = [json.loads(line) for line in probe_log.read_text().splitlines()]
+    assert len(observed) == len(started_canvases)
+    assert observed[-1] is expected_presence
+    serialized = json.dumps({"status": status, "observed": observed})
+    assert env_secret not in serialized and file_secret not in serialized
+    shutdown_kernel(canvas_id)
+
+
+try:
+    # Fresh workloads prove the target is absent rather than retained from a prior run.
+    metadb.set_setting(setting, "", "global")
+    run_actual_scenario("absent", False)
+
+    # The source key is parent-only and differs from the plugin's declared child target.
+    os.environ[source] = env_secret
+    assert target not in os.environ
+    metadb.set_setting(setting, f"env:{source}", "global")
+    run_actual_scenario("env", True)
+
+    # Delete the file on the hub's first resolution. Kernel and subrun must reuse the target.
+    secret_file = workspace / "single-read-parent-token"
+    secret_file.write_text(file_secret)
+
+    def consume_file(path):
+        location = Path(path.strip())
+        value = location.read_text().splitlines()[0]
+        location.unlink()
+        return value
+
+    secrets.ensure_builtin_resolvers()
+    secrets.unregister_resolver("file")
+    secrets.register_resolver("file", consume_file)
+    os.environ[target] = "wrong-headless-fallback"
+    metadb.set_setting(setting, f"file:{secret_file}", "global")
+    run_actual_scenario("file", True)
+    assert not secret_file.exists()
+finally:
+    for canvas_id in started_canvases:
+        shutdown_kernel(canvas_id)
+    server.should_exit = True
+    thread.join(timeout=15)
+    assert not thread.is_alive()
+
+print("actual kernel and isolated workload chain passed")
     """
-    workload_checked = _run(
-        [str(python), "-c", workload_probe], cwd=tmp_path, env=env | {
-            "DP_WORKSPACE": str(workload_workspace),
-            "DP_DATA_DIR": str(workload_workspace / "data"),
-            "DP_DATABASE_URL": f"sqlite:///{workload_workspace / 'metadata.db'}",
-        })
-    assert workload_checked.returncode == 0, workload_checked.stderr
-    assert workload_checked.stdout.strip() == "installed workload manifest passed"
-    assert workload_secret not in workload_checked.stdout + workload_checked.stderr
+    actual_env = clean_env | {
+        "DP_WORKSPACE": str(actual_workspace / "workspace"),
+        "DP_DATA_DIR": str(actual_workspace / "data"),
+        "DP_DATABASE_URL": f"sqlite:///{actual_workspace / 'metadata.db'}",
+        "DP_KERNEL_IDLE_TTL": "20",
+        "DP_KERNEL_ISOLATE_RUNS": "1",
+        "TEST_ONLY_ENV_WORKLOAD_SECRET": workload_secret,
+        "TEST_ONLY_FILE_WORKLOAD_SECRET": file_workload_secret,
+    }
+    actual_checked = _run(
+        [str(python), "-c", actual_probe],
+        cwd=actual_workspace,
+        env=actual_env,
+    )
+    assert actual_checked.returncode == 0, actual_checked.stderr
+    assert actual_checked.stdout.strip() == "actual kernel and isolated workload chain passed"
+    assert workload_secret not in actual_checked.stdout + actual_checked.stderr
+    assert file_workload_secret not in actual_checked.stdout + actual_checked.stderr
 
     checked = _run(
         [str(python), "-m", "hub.plugin_conformance", "dp-run-log",

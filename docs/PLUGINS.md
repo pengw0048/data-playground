@@ -716,12 +716,24 @@ workload_env = true
 
 The operator enables it by setting `plugin.<entry-point-name>.service_token` to an `env:` or `file:`
 SecretRef in Settings, or headlessly by setting `DP_MY_PLUGIN_SERVICE_TOKEN`. At launch, core resolves the
-reference only in the parent process and forwards the material under that declared name. An unset field
-does not cross the boundary. The fixed core workload allowlist is unchanged; a declaration cannot replace
-a core-owned environment key, and plugins declaring no such field behave exactly as before. This is the
-only plugin workload-environment declaration path; it is not a general environment passthrough.
+reference once in the hub and forwards the material under that declared name. A kernel reuses only that
+target value for an isolated subrun; it does not reopen the hub's `env:` or `file:` reference. The UI
+setting takes precedence over the headless target fallback, and an unset field does not cross the
+boundary.
 
-The value is absent from supported browser/config responses, logs, run artifacts, execution manifests,
-and sanitized error envelopes. It is nevertheless readable by arbitrary Python running in that workload.
-Use this only for plugins and canvas authors trusted with that credential; it is not per-node or
+Only a successfully active installed entry-point plugin is eligible to forward its declaration.
+Registration failures, plugins with no effective capability, drop-ins, and configured modules do not
+forward or consume it through this config contract in workload children. Config keys and environment
+targets must be unique within a manifest, and installed entry-point names must be unique. If active
+installed plugins claim the same target, every claimant enters the `conflict` state and that target is
+not forwarded. A declaration also cannot replace any core-owned runtime, data-plane, auth,
+agent/provider, or control-plane environment name. Plugin-specific names, including `DP_*` names,
+remain valid. This is the only plugin workload-environment declaration path; it is not a general
+environment passthrough.
+
+Core does not serialize the material into Settings or plugin API projections, the hash-bound Data
+Playground execution manifest, or core-generated resolver and dispatch errors. The material is
+necessarily readable by the plugin and arbitrary Python in the workload process. Core does not
+content-redact author-controlled logs, results, artifacts, or raised errors, so that code can disclose
+it. Use this only for plugins and canvas authors trusted with that credential; it is not per-node or
 per-canvas isolation. `dp_run_log` is the packaged reference manifest.

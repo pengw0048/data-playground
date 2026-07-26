@@ -10,10 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from hub.workload_env import (build_workload_credential_env, build_workload_env,
-                              build_workload_semantic_env, data_plane_object_store_config,
-                              EPHEMERAL_OBJECT_STORE_CRED_ID, initialize_ephemeral_metadata,
-                              prepare_workload_graph)
+from hub.workload_env import (CORE_CONTROL_PLANE_ENV, EPHEMERAL_OBJECT_STORE_CRED_ID,
+                              WORKLOAD_CHILD_MARKER, build_workload_credential_env,
+                              build_workload_env, build_workload_semantic_env,
+                              data_plane_object_store_config, initialize_ephemeral_metadata,
+                              prepare_workload_graph, workload_child_allows_plugin)
 
 
 _CONTROL_SECRETS = {
@@ -48,6 +49,19 @@ def _assert_control_secrets_absent(env: dict[str, str]) -> None:
     assert "provider-secret" not in env.values()
 
 
+def _mock_no_plugin_workload(monkeypatch) -> None:
+    from hub import deps as deps_module
+
+    class NoPluginConfig:
+        def plugin_workload_env(self, *, inherited=None):
+            return {}
+
+        def plugin_workload_names(self):
+            return ()
+
+    monkeypatch.setattr(deps_module, "get_deps", lambda: NoPluginConfig())
+
+
 def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity():
     env = build_workload_env(include_metadata_db=False, source=_source())
     _assert_control_secrets_absent(env)
@@ -64,6 +78,7 @@ def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity(
 def test_subrun_backend_uses_the_one_shot_profile(monkeypatch):
     from hub.subprocess_runner import _subrun_child_env
 
+    _mock_no_plugin_workload(monkeypatch)
     for key, value in _source().items():
         monkeypatch.setenv(key, value)
     env = _subrun_child_env()
@@ -86,16 +101,93 @@ def test_declared_plugin_environment_reaches_only_workload_child_profiles(monkey
     from hub.subprocess_runner import _subrun_child_env
 
     class PluginConfig:
-        def plugin_workload_env(self):
+        def plugin_workload_env(self, *, inherited=None):
+            assert inherited is None
             return {"DP_REFERENCE_PLUGIN_TOKEN": "plugin-workload-secret"}
+
+        def plugin_workload_names(self):
+            return ("reference-plugin",)
 
     monkeypatch.setattr(deps_module, "get_deps", lambda: PluginConfig())
     for child in (build_workload_env(), _kernel_child_env(), _subrun_child_env()):
         assert child["DP_REFERENCE_PLUGIN_TOKEN"] == "plugin-workload-secret"
+        assert workload_child_allows_plugin(
+            child[WORKLOAD_CHILD_MARKER],
+            "reference-plugin",
+        )
         _assert_control_secrets_absent(child)
     # Injectable sources are intentionally a pure core-allowlist seam: a declaration is live
     # configuration, not a way for callers to smuggle an arbitrary key through this test interface.
-    assert "DP_REFERENCE_PLUGIN_TOKEN" not in build_workload_env(source=_source())
+    pure = build_workload_env(source=_source())
+    assert "DP_REFERENCE_PLUGIN_TOKEN" not in pure
+    assert WORKLOAD_CHILD_MARKER not in pure
+
+
+def test_plugin_workload_declarations_reject_every_core_owned_target():
+    from hub.deps import _validate_workload_env_config
+
+    required_control_names = {
+        "DP_AUTH_SECRET",
+        "DP_AUTH_PASSWORD",
+        "DP_AGENT_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "DP_POSTGRES_PASSWORD",
+        "AWS_SECURITY_TOKEN",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    }
+    assert required_control_names <= CORE_CONTROL_PLANE_ENV
+    reserved = CORE_CONTROL_PLANE_ENV | {
+        "DP_AUTH_MODE",
+        "DP_DATABASE_URL",
+        "DP_WORKSPACE",
+        "AWS_SECRET_ACCESS_KEY",
+        "PATH",
+    }
+    for target in sorted(reserved):
+        error = _validate_workload_env_config([{
+            "key": "token",
+            "env": target,
+            "secret": True,
+            "workload_env": True,
+        }])
+        assert error == f"workload_env config 'token' cannot override core environment '{target}'"
+
+    # Core reserves exact names, not the DP_ namespace. Plugin-owned names remain valid.
+    assert _validate_workload_env_config([{
+        "key": "token",
+        "env": "DP_REFERENCE_PLUGIN_TOKEN",
+        "secret": True,
+        "workload_env": True,
+    }]) is None
+
+
+def test_plugin_workload_manifest_rejects_duplicate_keys_targets_and_defaults():
+    from hub.deps import _validate_workload_env_config
+
+    base = {"secret": True, "workload_env": True}
+    assert _validate_workload_env_config([
+        {"key": "token", "env": "DP_FIRST_PLUGIN_TOKEN", **base},
+        {"key": "token", "env": "DP_SECOND_PLUGIN_TOKEN", **base},
+    ]) == "config key 'token' is declared more than once"
+    assert _validate_workload_env_config([
+        {"key": "first", "env": "DP_SHARED_PLUGIN_TOKEN", **base},
+        {"key": "second", "env": "DP_SHARED_PLUGIN_TOKEN", **base},
+    ]) == "config environment target 'DP_SHARED_PLUGIN_TOKEN' is declared more than once"
+    assert _validate_workload_env_config([{
+        "key": "token",
+        "env": "DP_REFERENCE_PLUGIN_TOKEN",
+        "default": "not-a-secret-reference",
+        **base,
+    }]) == "workload_env config 'token' cannot declare a default"
+    for invalid_secret in (False, "false", 1):
+        assert _validate_workload_env_config([{
+            "key": "token",
+            "env": "DP_REFERENCE_PLUGIN_TOKEN",
+            "secret": invalid_secret,
+            "workload_env": True,
+        }]) == "workload_env config 'token' must set secret = true"
 
 
 def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():
@@ -149,6 +241,7 @@ def test_job_artifact_size_bound_applies_to_writes_and_reads(tmp_path, monkeypat
 def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
     from hub.pod_spawner import PodSpawner
 
+    _mock_no_plugin_workload(monkeypatch)
     for key, value in _source().items():
         monkeypatch.setenv(key, value)
     pod = PodSpawner("/workspace", "/data")._pod_body("kernel", ["python", "-m", "hub.kernel"])
@@ -160,6 +253,7 @@ def test_pod_manifest_uses_the_same_explicit_profile(monkeypatch):
 
 
 def test_ray_driver_uses_one_shot_profile(monkeypatch):
+    _mock_no_plugin_workload(monkeypatch)
     for key, value in _source().items():
         monkeypatch.setenv(key, value)
     src = Path(__file__).resolve().parents[3] / "examples" / "plugins" / "dp_ray" / "__init__.py"
