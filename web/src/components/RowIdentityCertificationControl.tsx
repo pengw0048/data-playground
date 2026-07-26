@@ -149,16 +149,29 @@ export function RowIdentityCertificationControl({
     setEncodedQuery(query.toString());
   };
   const persistPending = (value: PendingCertification) => {
-    if (!currentUser?.id) return;
-    localStorage.setItem(
-      pendingKey(currentUser.id, detail),
-      JSON.stringify(value),
-    );
+    if (!currentUser?.id) return false;
+    try {
+      localStorage.setItem(
+        pendingKey(currentUser.id, detail),
+        JSON.stringify(value),
+      );
+    } catch {
+      setError(
+        "This browser could not retain the confirmed submission, so no scan was started.",
+      );
+      return false;
+    }
     setPending(value);
+    return true;
   };
   const clearPending = () => {
-    if (currentUser?.id)
-      localStorage.removeItem(pendingKey(currentUser.id, detail));
+    if (currentUser?.id) {
+      try {
+        localStorage.removeItem(pendingKey(currentUser.id, detail));
+      } catch {
+        // The server task route remains authoritative even if browser storage is unavailable.
+      }
+    }
     setPending(null);
   };
 
@@ -174,6 +187,9 @@ export function RowIdentityCertificationControl({
     setTask(null);
     setBusy(null);
     setError("");
+    return () => {
+      requestGeneration.current += 1;
+    };
   }, [currentUser?.id, detail.datasetId, detail.revisionId]); // schema changes cannot occur for an exact revision
 
   useEffect(() => {
@@ -260,30 +276,12 @@ export function RowIdentityCertificationControl({
     setBusy("submit");
     setError("");
     try {
-      const fresh = await api.rowIdentityCertificationPreflight({
-        datasetId: detail.datasetId,
-        revisionId: detail.revisionId,
-        keyColumns: saved.keyColumns,
-      });
-      if (generation !== requestGeneration.current) return;
-      setPreflight(fresh);
-      if (
-        fresh.schemaSha256 !== saved.schemaSha256 ||
-        fresh.specSha256 !== saved.specSha256
-      ) {
-        setError(
-          "The saved confirmation no longer matches this exact revision. Check the scan again before starting new work.",
-        );
-        return;
-      }
       const next = await api.submitRowIdentityCertification({
         datasetId: detail.datasetId,
         revisionId: detail.revisionId,
         keyColumns: saved.keyColumns,
         submissionId: saved.submissionId,
-        confirmationSha256: fresh.needsConfirmation
-          ? saved.confirmationSha256
-          : undefined,
+        confirmationSha256: saved.confirmationSha256,
       });
       if (generation !== requestGeneration.current) return;
       setTask(next);
@@ -373,10 +371,10 @@ export function RowIdentityCertificationControl({
       schemaSha256: preflight.schemaSha256,
       specSha256: preflight.specSha256,
     };
-    const generation = ++requestGeneration.current;
-    persistPending(saved);
-    setBusy("submit");
     setError("");
+    if (!persistPending(saved)) return;
+    const generation = ++requestGeneration.current;
+    setBusy("submit");
     try {
       const next = await api.submitRowIdentityCertification({
         datasetId: detail.datasetId,
@@ -419,9 +417,14 @@ export function RowIdentityCertificationControl({
   };
   const outcome =
     currentTask?.receipt?.outcome ??
-    (currentTask?.status === "cancelled" ? "cancelled" : "failed");
+    (currentTask?.status === "cancelled"
+      ? "cancelled"
+      : currentTask?.status === "failed" || currentTask?.status === "done"
+        ? "failed"
+        : "");
   const taskSucceeded = currentTask?.status === "done" && SUCCESS.has(outcome);
   const intentLocked = !!currentTask || !!pending;
+  const selectionLocked = intentLocked || busy !== null;
   const chooseAnotherKey =
     currentTask != null &&
     ["duplicate_key", "null_key", "unsupported_type"].includes(outcome);
@@ -491,7 +494,7 @@ export function RowIdentityCertificationControl({
                     <label className="min-w-0 flex-1">
                       <input
                         type="checkbox"
-                        disabled={intentLocked}
+                        disabled={selectionLocked}
                         checked={index >= 0}
                         onChange={() =>
                           changeKeys(
@@ -513,7 +516,7 @@ export function RowIdentityCertificationControl({
                         <button
                           type="button"
                           aria-label={`Move ${column} earlier`}
-                          disabled={intentLocked || index === 0}
+                          disabled={selectionLocked || index === 0}
                           onClick={() =>
                             changeKeys(
                               keys.map((key, i) =>
@@ -531,7 +534,7 @@ export function RowIdentityCertificationControl({
                         <button
                           type="button"
                           aria-label={`Move ${column} later`}
-                          disabled={intentLocked || index === keys.length - 1}
+                          disabled={selectionLocked || index === keys.length - 1}
                           onClick={() =>
                             changeKeys(
                               keys.map((key, i) =>

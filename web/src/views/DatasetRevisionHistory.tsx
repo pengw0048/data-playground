@@ -40,6 +40,8 @@ function delta(current?: number | null, parent?: number | null) {
 }
 
 export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisionDatasetId }: { table: CatalogTable; initialRevisionId?: string; initialRevisionDatasetId?: string }) {
+  const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
+  const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
   const [availability, setAvailability] = useState<'checking' | 'supported' | 'absent' | 'unavailable' | 'error'>('checking')
   const [items, setItems] = useState<DatasetRevision[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
@@ -59,6 +61,19 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   const historyRequest = useRef(0)
   const capabilityRequest = useRef(0)
   const detailRequest = useRef(0)
+
+  const navigateRevision = useCallback((revision: DatasetRevision) => {
+    const params = new URLSearchParams(encodedQuery)
+    const sameExact = params.get('revision') === revision.revisionId
+      && params.get('revisionDataset') === revision.datasetId
+    params.set('revision', revision.revisionId)
+    params.set('revisionDataset', revision.datasetId)
+    if (!sameExact) {
+      params.delete('rowIdentityAction')
+      params.delete('rowIdentityTask')
+    }
+    setEncodedQuery(params.toString())
+  }, [encodedQuery, setEncodedQuery])
 
   const loadFirst = useCallback(async () => {
     const request = ++historyRequest.current
@@ -160,7 +175,10 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
           {items.map((revision) => {
             const active = selected?.datasetId === revision.datasetId && selected.revisionId === revision.revisionId
             return <button key={`${revision.datasetId}:${revision.revisionId}`} type="button"
-              aria-label={`Open revision ${revision.revisionId}`} onClick={() => void openRevision(revision)}
+              aria-label={`Open revision ${revision.revisionId}`} onClick={() => {
+                navigateRevision(revision)
+                void openRevision(revision)
+              }}
               className={`flex w-full items-start gap-2 border-b border-border/60 px-2 py-1.5 text-left last:border-0 hover:bg-accent ${active ? 'bg-accent' : ''}`}>
               <span className="min-w-0 flex-1">
                 <span className="dp-mono block break-all text-[10.5px] font-semibold text-foreground">{revision.revisionId}</span>
@@ -186,9 +204,10 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
       onClose={() => setRestoreDetail(null)}
       onRestored={(child) => {
         setRestoreDetail(null)
-        void loadFirst()
-        void openRevision({ datasetId: child.sourceDatasetId, revisionId: child.childRevisionId!,
-          committedAt: null, retentionOwner: 'core' })
+        const restored = { datasetId: child.sourceDatasetId, revisionId: child.childRevisionId!,
+          committedAt: null, retentionOwner: 'core' as const }
+        navigateRevision(restored)
+        void openRevision(restored)
       }} />}
   </section>
 }

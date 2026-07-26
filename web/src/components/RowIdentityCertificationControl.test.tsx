@@ -34,6 +34,7 @@ vi.mock("../api/client", () => ({
 }));
 
 import { RowIdentityCertificationControl } from "./RowIdentityCertificationControl";
+import { KernelError } from "../api/client";
 
 const detail = {
   datasetId: "dataset-1",
@@ -229,12 +230,56 @@ describe("RowIdentityCertificationControl", () => {
         expect.objectContaining({
           submissionId: "persisted-id",
           keyColumns: ["order,id"],
+          confirmationSha256: "confirmation",
         }),
       ),
     );
+    expect(mocks.preflight).not.toHaveBeenCalled();
     expect(mocks.state.setWorkspaceDatasetQuery.mock.calls.at(-1)[0]).toContain(
       "rowIdentityTask=recovered-task",
     );
+  });
+
+  it("releases a pending intent when exact replay is definitively rejected", async () => {
+    globalThis.localStorage.setItem(
+      "dataplay.row-identity-certification.v1:alice:dataset-1:revision-1",
+      JSON.stringify({
+        submissionId: "rejected-id",
+        keyColumns: ["order,id"],
+        confirmationSha256: "old-confirmation",
+        schemaSha256: "old-schema",
+        specSha256: "old-spec",
+      }),
+    );
+    mocks.submit.mockRejectedValueOnce(
+      new KernelError(409, "confirmation changed"),
+    );
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={[]}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Recover previous submission",
+      }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "confirmation changed",
+    );
+    expect(
+      globalThis.localStorage.getItem(
+        "dataplay.row-identity-certification.v1:alice:dataset-1:revision-1",
+      ),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Check scan cost" }),
+    ).toBeVisible();
   });
 
   it("clears the prior task immediately while a new route task loads and keeps it cleared when loading fails", async () => {
@@ -275,6 +320,69 @@ describe("RowIdentityCertificationControl", () => {
       "new task unavailable",
     );
     expect(screen.queryByRole("button", { name: "Cancel task" })).toBeNull();
+  });
+
+  it("does not navigate back to an exact revision after an in-flight submit unmounts", async () => {
+    const submitted = deferred<ReturnType<typeof certificationTask>>();
+    mocks.submit.mockReturnValueOnce(submitted.promise);
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    const view = render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={["order,id"]}
+        onRefresh={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Check scan cost" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Confirm and start full scan",
+      }),
+    );
+    await waitFor(() => expect(mocks.submit).toHaveBeenCalledOnce());
+
+    view.unmount();
+    await act(async () => {
+      submitted.resolve(certificationTask("late-task", ["order,id"]));
+    });
+    expect(mocks.state.setWorkspaceDatasetQuery).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate back to an exact revision after an in-flight recovery unmounts", async () => {
+    globalThis.localStorage.setItem(
+      "dataplay.row-identity-certification.v1:alice:dataset-1:revision-1",
+      JSON.stringify({
+        submissionId: "recover-late",
+        keyColumns: ["order,id"],
+        confirmationSha256: "confirmation",
+        schemaSha256: "schema",
+        specSha256: "spec",
+      }),
+    );
+    const submitted = deferred<ReturnType<typeof certificationTask>>();
+    mocks.submit.mockReturnValueOnce(submitted.promise);
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    const view = render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={[]}
+        onRefresh={vi.fn()}
+      />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Recover previous submission",
+      }),
+    );
+    await waitFor(() => expect(mocks.submit).toHaveBeenCalledOnce());
+
+    view.unmount();
+    await act(async () => {
+      submitted.resolve(certificationTask("late-recovery", ["order,id"]));
+    });
+    expect(mocks.state.setWorkspaceDatasetQuery).not.toHaveBeenCalled();
   });
 
   it("ignores a stale route response and cancels only the newly loaded task", async () => {
@@ -454,6 +562,110 @@ describe("RowIdentityCertificationControl", () => {
       "4 rows · 1.0 KiB",
     );
     expect(screen.queryByText(/0\.0 MiB/)).toBeNull();
+  });
+
+  it("locks key selection while an exact preflight is in flight", async () => {
+    const pendingPreflight = deferred<typeof preflight>();
+    mocks.preflight.mockReturnValueOnce(pendingPreflight.promise);
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={["order,id"]}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Check scan cost" }));
+    expect(screen.getByRole("checkbox", { name: /order,id/ })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: /sequence/ })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Move order,id later" }),
+    ).toBeDisabled();
+    await act(async () => {
+      pendingPreflight.resolve(preflight);
+    });
+    expect(await screen.findByText("Ordered key schema:")).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: /sequence/ })).toBeEnabled();
+  });
+
+  it("fails visibly before submission when browser recovery storage is unavailable", async () => {
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    vi.spyOn(globalThis.localStorage, "setItem").mockImplementation(() => {
+      throw new Error("storage disabled");
+    });
+    render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={["order,id"]}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Check scan cost" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Confirm and start full scan",
+      }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "could not retain the confirmed submission",
+    );
+    expect(mocks.submit).not.toHaveBeenCalled();
+  });
+
+  it("attaches the accepted task route even when pending storage cannot be removed", async () => {
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify";
+    vi.spyOn(globalThis.localStorage, "removeItem").mockImplementation(() => {
+      throw new Error("storage disabled");
+    });
+    render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={["order,id"]}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Check scan cost" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Confirm and start full scan",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        mocks.state.setWorkspaceDatasetQuery.mock.calls.at(-1)?.[0],
+      ).toContain("rowIdentityTask=task-1"),
+    );
+  });
+
+  it("keeps an active certification attached without offering a duplicate scan", async () => {
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify&rowIdentityTask=running-task";
+    mocks.task.mockResolvedValueOnce(
+      certificationTask("running-task", ["order,id"]),
+    );
+    render(
+      <RowIdentityCertificationControl
+        detail={detail}
+        declaredKey={[]}
+        onRefresh={vi.fn()}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Cancel task" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Start again" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Check scan cost" }),
+    ).toBeNull();
   });
 
   it("shows a done conflicting certificate as an actionable terminal failure", async () => {

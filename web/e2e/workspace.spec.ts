@@ -146,7 +146,11 @@ test('browses and opens one exact retained dataset revision without drifting to 
       summary: { rowCount: 2, dataFileCount: 2, totalBytes: 32, fragmentCount: 2 },
       preview: {
         columns: [{ fieldId: 'amount', name: 'amount', type: 'int', nullable: false, provenance: 'provider', capabilities: [] }],
-        rows: [{ amount: 2 }], hasMore: true, rowLimit: 100,
+        rows: [{ amount: 2 }], rowIdentities: null, hasMore: true, rowLimit: 100,
+      },
+      rowIdentity: {
+        datasetId: 'stable-dataset', revisionId: 'rev-2', proofStatus: 'unavailable',
+        certificationSupported: false, fields: [], encodingVersion: null,
       },
     } : {
       datasetId: 'stable-dataset', revisionId: 'rev-1', committedAt: '2026-07-15T12:00:00Z',
@@ -154,7 +158,11 @@ test('browses and opens one exact retained dataset revision without drifting to 
       summary: { rowCount: 1, dataFileCount: 1, totalBytes: 16, fragmentCount: 1 },
       preview: {
         columns: [{ fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
-        rows: [{ amount: 1 }], hasMore: false, rowLimit: 100,
+        rows: [{ amount: 1 }], rowIdentities: null, hasMore: false, rowLimit: 100,
+      },
+      rowIdentity: {
+        datasetId: 'stable-dataset', revisionId: 'rev-1', proofStatus: 'unavailable',
+        certificationSupported: false, fields: [], encodingVersion: null,
       },
     } })
   })
