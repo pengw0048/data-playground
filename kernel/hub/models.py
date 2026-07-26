@@ -20,6 +20,8 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
+from hub.version import current_version
+
 # dataset/selection/sample/sql-view are the data wires; metric/value are leaf/value wires
 # (a metric or a node value driving another node's param). All must be representable on an edge.
 WireType = Literal["dataset", "selection", "sample", "sql-view", "metric", "value"]
@@ -2580,7 +2582,7 @@ class KernelInfo(Wire):
     mode: Literal["local", "distributed"] = "local"
     backend: str = "duckdb"
     warm: bool = True
-    version: str = "0.2.3"
+    version: str = current_version()
     adapters: list[str] = []
     runners: list[str] = []
     processors: list[str] = []

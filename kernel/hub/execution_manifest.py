@@ -6,12 +6,12 @@ import hashlib
 import json
 import re
 import secrets
-from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from hub.deps import CORE_API_VERSION
 from hub.models import Graph, WriteIntent
+from hub.version import current_version
 
 SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -47,10 +47,7 @@ class ExecutionManifestError(ValueError):
 
 
 def core_package_version() -> str:
-    try:
-        return package_version("data-playground")
-    except PackageNotFoundError:
-        return "0.2.3"
+    return current_version()
 
 
 def assert_secret_free(

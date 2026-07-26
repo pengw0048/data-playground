@@ -54,6 +54,7 @@ from hub.routers import (
 )
 from hub.routers.runs import _status_or_lost
 from hub.security import current_user
+from hub.version import current_version
 
 
 class _RequestBodyTooLarge(HTTPException):
@@ -321,7 +322,7 @@ async def _lifespan(_app):
             drain_sinks()
 
 
-app = FastAPI(title="Data Playground kernel", version="0.2.3", lifespan=_lifespan)
+app = FastAPI(title="Data Playground kernel", version=current_version(), lifespan=_lifespan)
 _SENSITIVE_VALIDATION_BODY_DETAILS = {
     "/api/auth/login": "invalid authentication request body",
     "/api/auth/password": "invalid authentication request body",
@@ -1649,17 +1650,12 @@ def version() -> dict:
     # core lib versions. SECRETS ARE REDACTED: the DB is reported as its dialect only (never the
     # DP_DATABASE_URL creds).
     import platform
-    from importlib.metadata import PackageNotFoundError, version as pkg_version
-
     import duckdb
     import pyarrow
 
     from hub import auth
     from hub.settings import settings
-    try:
-        package_version = pkg_version("data-playground")
-    except PackageNotFoundError:  # bare source tree without an install — release builds always install
-        package_version = "unknown"
+    package_version = current_version()
     sha = os.environ.get("DP_GIT_SHA", "").strip()
     if not sha:
         try:

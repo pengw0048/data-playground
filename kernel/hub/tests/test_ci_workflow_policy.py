@@ -152,6 +152,25 @@ def test_release_reuses_core_checks_at_the_candidate_revision() -> None:
                     assert step["with"]["ref"] == "${{ inputs.expected_sha || github.sha }}"
 
 
+def test_release_workflow_requires_a_clean_version_identity() -> None:
+    commands = [step.get("run", "") for step in _workflow("release.yml")["jobs"]["publish"]["steps"]]
+    release_checks = [command for command in commands if "check_release_versions.py" in command]
+    assert len(release_checks) == 2
+    assert all("--release" in command for command in release_checks)
+
+
+def test_release_artifact_smokes_use_the_canonical_package_version() -> None:
+    jobs = _workflow("release-artifacts.yml")["jobs"]
+    for job in ("wheel-smoke", "image-smoke"):
+        read_version = next(
+            step for step in jobs[job]["steps"] if step.get("name") == "Read package version")
+        command = read_version["run"]
+        assert "scripts/check_release_versions.py" in command
+        assert "--pyproject kernel/pyproject.toml" in command
+        assert "--print-version" in command
+        assert "re.search" not in command
+
+
 def test_required_e2e_does_not_run_the_smoke_suite_twice() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     commands = [step.get("run", "") for step in jobs["e2e"]["steps"]]

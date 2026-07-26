@@ -39,9 +39,10 @@ from collections import deque
 from typing import Any, Callable
 
 from hub import graph_ops
+from hub.version import current_version
 
 SERVER_NAME = "data-playground"
-SERVER_VERSION = "0.2.3"
+SERVER_VERSION = current_version()
 # Protocol versions we understand. We answer `initialize` with the client's version when we know it,
 # else our latest — the spec's negotiation (the client may then disconnect if it can't live with ours).
 _SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
