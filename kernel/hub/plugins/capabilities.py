@@ -44,7 +44,8 @@ def is_media_column(col: ColumnSchema) -> bool:
     return "media" in col.capabilities
 
 
-def _kind_from_bytes(value: object) -> MediaKind | None:
+def media_content_type_from_bytes(value: object) -> tuple[MediaKind, str] | None:
+    """Return a conservative media kind/MIME pair from a bounded byte prefix."""
     try:
         if isinstance(value, bytes):
             data = value[:_MAX_MEDIA_CELL_BYTES]
@@ -56,19 +57,32 @@ def _kind_from_bytes(value: object) -> MediaKind | None:
             return None
     except (TypeError, ValueError, MemoryError):
         return None
-    if data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
-        return "image"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image", "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image", "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image", "image/gif"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image"
+        return "image", "image/webp"
     if data.startswith(b"\x1aE\xdf\xa3"):
-        return "video"  # WebM/Matroska container evidence
+        if b"matroska" in data:
+            return "video", "video/x-matroska"
+        return "video", "video/webm"
     if len(data) >= 12 and data[4:8] == b"ftyp":
         brand = data[8:12]
         if brand in _IMAGE_FTYP_BRANDS:
-            return "image"
+            if brand in {b"avif", b"avis"}:
+                return "image", "image/avif"
+            return "image", ("image/heif" if brand in {b"mif1", b"msf1"} else "image/heic")
         if brand in _VIDEO_FTYP_BRANDS:
-            return "video"
+            return "video", ("video/quicktime" if brand == b"qt  " else "video/mp4")
     return None
+
+
+def _kind_from_bytes(value: object) -> MediaKind | None:
+    detected = media_content_type_from_bytes(value)
+    return detected[0] if detected is not None else None
 
 
 def _kind_from_url(value: object) -> MediaKind | None:

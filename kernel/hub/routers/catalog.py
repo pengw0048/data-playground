@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -75,6 +75,7 @@ from hub.models import (
     TransformLibraryDetail,
     TransformLibraryPage,
     MAX_CODE_LEN,
+    MediaCellRequest,
     Relationship,
     RelatedDatasetCandidate,
     RelatedDatasetPage,
@@ -632,6 +633,84 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         preview=DatasetRevisionPreview(columns=raw["columns"], rows=preview_rows,
                                        has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
         row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
+    )
+
+
+@router.post(
+    "/catalog/revisions/{dataset_id}/{revision_id}/media-cell",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "The exact bounded media cell bytes.",
+            "content": {
+                media_type: {"schema": {"type": "string", "format": "binary"}}
+                for media_type in (
+                    "image/png", "image/jpeg", "image/gif", "image/webp",
+                    "image/avif", "image/heic", "image/heif",
+                    "video/webm", "video/x-matroska", "video/mp4", "video/quicktime",
+                )
+            },
+        },
+    },
+)
+def open_media_cell(
+        req: MediaCellRequest,
+        dataset_id: str = Path(..., min_length=1, max_length=512),
+        revision_id: str = Path(..., min_length=1, max_length=256),
+) -> Response:
+    """Return one bounded media cell addressed only by certified exact logical identity."""
+    from hub.media_cells import (
+        MediaCellIdentityInvalid,
+        MediaCellIdentityUnavailable,
+        MediaCellRowAmbiguous,
+        MediaCellRowNotFound,
+        MediaCellSourceDenied,
+        MediaCellTooLarge,
+        MediaCellUnavailable,
+        MediaCellUnsupported,
+        read_managed_local_media_cell,
+    )
+
+    binding = _revision_binding_for_dataset_id(dataset_id)
+    try:
+        content, content_type = read_managed_local_media_cell(
+            storage=get_deps().storage,
+            dataset_uri=binding["uri"],
+            dataset_id=dataset_id,
+            revision_id=revision_id,
+            request=req,
+        )
+    except MediaCellIdentityUnavailable:
+        raise APIError(409, "media_cell_identity_unavailable",
+                       code=APIErrorCode.MEDIA_CELL_IDENTITY_UNAVAILABLE, retryable=False)
+    except MediaCellIdentityInvalid:
+        raise APIError(422, "media_cell_identity_invalid",
+                       code=APIErrorCode.MEDIA_CELL_IDENTITY_INVALID, retryable=False)
+    except MediaCellRowNotFound:
+        raise APIError(404, "media_cell_row_not_found",
+                       code=APIErrorCode.MEDIA_CELL_ROW_NOT_FOUND, retryable=False)
+    except MediaCellRowAmbiguous:
+        raise APIError(409, "media_cell_row_ambiguous",
+                       code=APIErrorCode.MEDIA_CELL_ROW_AMBIGUOUS, retryable=False)
+    except MediaCellTooLarge:
+        raise APIError(413, "media_cell_too_large",
+                       code=APIErrorCode.PAYLOAD_TOO_LARGE, retryable=False)
+    except MediaCellSourceDenied:
+        raise APIError(403, "media_cell_source_denied",
+                       code=APIErrorCode.PERMISSION_DENIED, retryable=False)
+    except MediaCellUnsupported:
+        raise APIError(415, "media_cell_unsupported",
+                       code=APIErrorCode.MEDIA_CELL_UNSUPPORTED, retryable=False)
+    except MediaCellUnavailable:
+        raise APIError(410, "media_cell_unavailable",
+                       code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
