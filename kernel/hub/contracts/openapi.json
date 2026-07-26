@@ -12917,6 +12917,18 @@
             "title": "Source",
             "type": "string"
           },
+          "unavailableReason": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailablereason"
+          },
           "version": {
             "anyOf": [
               {

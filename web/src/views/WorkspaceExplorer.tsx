@@ -174,6 +174,20 @@ const isExternal = (resource: WorkspaceResource | null) => resource?.source === 
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
 const isCurrentCatalogLocation = (resource: WorkspaceResource | null) => !!resource && !resource.detached
   && (identity(resource) === LOCAL_ROOT_ID || resource.catalogFolderState === 'current')
+function itemAvailability(resource: WorkspaceResource): {
+  state: 'unavailable' | 'unsupported'; label: 'Unavailable' | 'Unsupported'; reason: string
+} | null {
+  const raw = resource.unavailableReason
+  if (!raw) return null
+  if (raw.startsWith('Unsupported: ')) {
+    return { state: 'unsupported', label: 'Unsupported', reason: raw.slice('Unsupported: '.length) }
+  }
+  return {
+    state: 'unavailable',
+    label: 'Unavailable',
+    reason: raw.startsWith('Unavailable: ') ? raw.slice('Unavailable: '.length) : raw,
+  }
+}
 function folderDeleteMode(resource: WorkspaceResource): 'delete' | 'explain' | null {
   if (resource.canDeleteFolder) return 'delete'
   return resource.folderMutationUnavailableReason === NON_EMPTY_LOCAL_FOLDER_REASON ? 'explain' : null
@@ -599,6 +613,7 @@ function WorkspaceMixedExplorer() {
   }, [requestedResourceId, searchQuery, load, revision, providerPlacementObservations])
 
   const open = (resource: WorkspaceResource) => {
+    if (itemAvailability(resource)) return
     if (resource.kind === 'canvas') { void openFile(identity(resource)); return }
     setWorkspaceResource(resource.id)
   }
@@ -700,7 +715,7 @@ function WorkspaceMixedExplorer() {
           <h1 className="text-[20px] font-bold text-foreground">Workspace</h1>
           <nav aria-label="Workspace path" className="mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden text-[11.5px] text-muted-foreground">
             <button onClick={() => setWorkspaceResource(null)} className="shrink-0 hover:text-foreground">Workspace</button>
-            {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1"><span>/</span><button onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground">{crumb.name}</button></span>)}
+            {crumbs.slice(1).map((crumb) => <span key={crumb.id} className="flex min-w-0 items-center gap-1"><span>/</span><button disabled={!!itemAvailability(crumb)} onClick={() => setWorkspaceResource(crumb.id)} className="truncate hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60">{crumb.name}</button></span>)}
           </nav>
         </div>
         <WorkspaceScopeTabs active="all" onChange={(next) => {
@@ -759,6 +774,7 @@ function WorkspaceMixedExplorer() {
           <button onClick={reload} className="font-semibold underline">Retry</button>
         </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : items.length ? <div className="mx-auto grid max-w-5xl gap-2">
           {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
+            onRetry={reload}
             onNewFolder={resource.kind === 'container' && resource.canCreateFolder
               ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
             onRenameFolder={resource.kind === 'container' && resource.canRenameFolder
@@ -1644,13 +1660,14 @@ function Modal({ label, onClose, children }: { label: string; onClose: () => voi
   </div>
 }
 
-function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDeleteCanvas }: {
+function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, onDeleteFolder, onMove, onRenameCanvas, onDeleteCanvas }: {
   resource: WorkspaceResource; onOpen: () => void; onNewFolder?: () => void; onRenameFolder?: () => void; onDeleteFolder?: () => void
-  onMove?: () => void; onRenameCanvas?: () => void; onDeleteCanvas?: () => void
+  onRetry?: () => void; onMove?: () => void; onRenameCanvas?: () => void; onDeleteCanvas?: () => void
 }) {
   const { openId, setOpenId } = useContext(WorkspaceOverflowMenuContext)
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const menuOpen = openId === resource.id
+  const unavailable = itemAvailability(resource)
   const icon = resource.kind === 'dataset' ? 'db' : resource.kind === 'dataset_view' ? 'sample' : resource.kind === 'canvas' ? 'grid' : 'chevronRight'
   const kind = resource.kind === 'container' ? 'Folder' : resource.kind === 'canvas' ? 'Canvas' : resource.kind === 'dataset_view' ? 'DatasetView' : 'Dataset'
   const source = isExternal(resource) ? `Source-only mount ${resource.mountId ?? 'external'}${resource.provider ? ` · ${resource.provider}` : ''}`
@@ -1666,14 +1683,17 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
       ? 'This catalog manages its folders. You can still create a local Canvas here. Folder rename, move, and delete are unavailable here; this does not change the connected catalog.'
       : 'This catalog manages its folders. Folder rename, move, and delete are unavailable here. No local Canvas placement is available here.'
     : null
-  return <div className="flex min-w-0 items-center rounded-lg border border-border bg-card hover:border-primary/40 hover:bg-accent">
-    <button type="button" onClick={onOpen} aria-label={openLabel}
-      className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left">
+  return <div className={`flex min-w-0 items-center rounded-lg border border-border bg-card ${unavailable ? '' : 'hover:border-primary/40 hover:bg-accent'}`}>
+    <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!!unavailable}
+      title={unavailable?.reason}
+      className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left disabled:cursor-not-allowed">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="block truncate text-[13px] font-semibold text-foreground">{resource.name}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
-      {resource.kind === 'container' && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
+      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
+      {resource.kind === 'container' && !unavailable && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
-    <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
+    {unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
+      className="mr-2 shrink-0 font-semibold text-primary underline">Retry</button>}
+    {!unavailable && <DropdownMenu open={menuOpen} onOpenChange={(open) => setOpenId(open ? resource.id : null)} modal={false}>
       <DropdownMenuTrigger asChild>
         <button type="button" aria-label={`More actions for ${resource.name}`}
           onPointerDown={(event) => {
@@ -1690,7 +1710,7 @@ function ResourceRow({ resource, onOpen, onNewFolder, onRenameFolder, onDeleteFo
         {onMove && <DropdownMenuItem onSelect={onMove}>Move</DropdownMenuItem>}
         {onDeleteCanvas && <DropdownMenuItem onSelect={onDeleteCanvas} className="text-destructive focus:text-destructive">Delete</DropdownMenuItem>}
       </DropdownMenuContent>
-    </DropdownMenu>
+    </DropdownMenu>}
   </div>
 }
 
@@ -1709,6 +1729,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   const placementState = resource.referenceState ?? (resource.detached ? 'detached' : 'current')
   const canonicalState = resource.canonicalReferenceState
   const canonicalUnavailable = canonicalState != null && canonicalState !== 'current'
+  const unavailable = itemAvailability(resource)
   useEffect(() => {
     const controller = new AbortController()
     setCanonicalContext(null)
@@ -1775,8 +1796,8 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
           Placement state · {placementState.replace('_', ' ')}{canonicalState === 'current' ? ' · canonical dataset is current' : ''}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
           <div className="mt-2 flex gap-3"><button onClick={onRetry} className="font-semibold underline">Retry</button><button onClick={onRelink} className="font-semibold underline">Relink</button></div>
         </div>}
-        {canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Canonical dataset state · {canonicalState.replace('_', ' ')}. This placement remains distinct for navigation and recovery, but its Source action is unavailable.
-          <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>
+        {canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Canonical dataset state · {canonicalState.replace('_', ' ')}. {unavailable ? `${unavailable.label}: ${unavailable.reason}` : 'This placement remains distinct for navigation and recovery, but its Source action is unavailable.'}
+          {unavailable?.state !== 'unsupported' && <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>}
         </div>}
         {resource.lastKnown && placementState === 'current' && !canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Last-known placement metadata{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
         {alternatePlacements.length > 0 && <div className="rounded-md border border-border bg-muted/25 p-2 text-[11px] text-muted-foreground"><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1">Only placements already loaded in this Workspace session are shown.</div></div>}

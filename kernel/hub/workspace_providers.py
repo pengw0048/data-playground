@@ -251,10 +251,13 @@ def provider_dataset_identity(uri: str) -> str | None:
         return None
     mount_id, source_binding_id = _decode_source_identity_token(
         uri.removeprefix(_PROVIDER_DATASET_URI_PREFIX))
-    binding = metadb.workspace_provider_dataset_for_source_binding(
+    binding = metadb.workspace_provider_dataset_state_for_source_binding(
         mount_id=mount_id, source_binding_id=source_binding_id)
-    if binding is None:
+    if binding is None or binding["referenceState"] == "detached":
         raise ProviderDatasetGone("provider dataset binding is unavailable")
+    if (binding["referenceState"] == "provider_error"
+            or binding["uri"] is None or binding["columns"] is None):
+        raise ProviderDatasetUnavailable("provider dataset metadata is unavailable")
     return f"workspace-provider:{_source_identity_token(mount_id, source_binding_id)}"
 
 
@@ -441,6 +444,8 @@ def provider_dataset_source(resource_ref: str, *, uid: str,
     if (not isinstance(resource, dict) or resource.get("kind") != "dataset"
             or resource.get("source") != "provider"):
         raise ValueError("only a provider dataset can be used as a Source")
+    if resource.get("canonicalReferenceState") == "provider_error":
+        raise ProviderDatasetUnavailable("provider dataset metadata is unavailable")
     if source.get("completeness") != "complete" or resource.get("lastKnown"):
         state = resource.get("referenceState") or source.get("referenceState")
         if state == "permission_lost":
@@ -558,15 +563,26 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
     )
     state = binding["referenceState"]
     canonical_state = binding.get("canonicalReferenceState")
+    item_error = (
+        binding.get("canonicalLastError")
+        if binding["kind"] == "dataset" and canonical_state == "provider_error"
+        else binding.get("lastError") if state == "provider_error" else None
+    )
+    unavailable_reason = (
+        item_error
+        if isinstance(item_error, str)
+        and item_error.startswith(("Unavailable: ", "Unsupported: "))
+        else None
+    )
     anchor = (metadb.workspace_provider_overlay_anchor(binding["bindingId"])
               if binding["kind"] == "container" else None)
-    if anchor is None and binding["kind"] == "container":
+    if anchor is None and binding["kind"] == "container" and unavailable_reason is None:
         # The normal path is a pure metadata read.  A legacy 0033 binding has no anchor until its
         # first display, including when its provider is currently unavailable, so only that miss
         # takes the narrow Workspace write lock to install the durable local capability.
         anchor = metadb.workspace_provider_ensure_overlay_anchor(binding["bindingId"])
     local_placement = None
-    if anchor is not None:
+    if anchor is not None and unavailable_reason is None:
         local_placement = {
             "writable": True,
             "canCreateCanvas": True,
@@ -603,6 +619,7 @@ def _binding_resource(binding: dict, mounted: _MountedProvider) -> dict:
         "canRenameFolder": False,
         "canDeleteFolder": False,
         "folderMutationUnavailableReason": "This provider location does not support local Folder changes.",
+        "unavailableReason": unavailable_reason,
     }
 
 
@@ -631,6 +648,8 @@ def _workspace_resource(
         provider_dataset_id=item.dataset_id,
         uri=item.uri,
         columns=item.columns,
+        availability=item.availability,
+        availability_reason=item.availability_reason,
     )
     return _binding_resource(binding, mounted)
 
@@ -1005,15 +1024,40 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
         binding_id, mount_id=mount_id, provider_placement_id=resource_id)
     if cached is None:
         raise KeyError("Workspace provider binding not found")
+    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
+    cached_mount = _MountedProvider(
+        CatalogMount(id=mount_id, provider=cached["provider"], config={}), cached["containerId"], "")
+    provider_source = _Source("provider", mounted) if mounted is not None else _Source("configuration")
+    public_container = _binding_resource(cached, cached_mount)
+    if (public_container.get("unavailableReason")
+            and mounted is not None
+            and cached["provider"] == mounted.mount.provider):
+        availability = (
+            "unsupported"
+            if str(public_container["unavailableReason"]).startswith("Unsupported: ")
+            else "unavailable"
+        )
+        return {
+            "container": public_container,
+            "items": [],
+            "nextCursor": None,
+            "hasMore": False,
+            "completeness": "partial",
+            "sources": [
+                _source_status(_Source("local"), "complete"),
+                _source_status(
+                    provider_source,
+                    availability,
+                    str(public_container["unavailableReason"]).split(": ", 1)[-1],
+                    "provider_error",
+                ),
+            ],
+        }
     # A pre-0034 cached container has no anchor until it is first exposed.  Direct external
     # browsing must take the same one-time recovery path as root browse; subsequent reads stay
     # metadata-only and never acquire the Workspace write lock.
     if metadb.workspace_provider_overlay_anchor(binding_id) is None:
         metadb.workspace_provider_ensure_overlay_anchor(binding_id)
-    mounted = next((item for item in mounts if item.mount.id == mount_id), None)
-    cached_mount = _MountedProvider(
-        CatalogMount(id=mount_id, provider=cached["provider"], config={}), cached["containerId"], "")
-    provider_source = _Source("provider", mounted) if mounted is not None else _Source("configuration")
     sources = [_Source("local"), provider_source]
     fingerprint = _mount_fingerprint([mounted], invalid) if mounted is not None else _mount_fingerprint([], invalid)
     source_index, source_cursor, history, reconciliation_placement_ids = _cursor_decode(
@@ -1024,7 +1068,6 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
         for index, source in enumerate(sources)
     ]
     items: list[dict] = []
-    public_container = _binding_resource(cached, cached_mount)
     next_state: tuple[
         int, str | None, list[tuple[str, str | None]], list[str] | None,
     ] | None = None
@@ -1109,6 +1152,8 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                             provider_dataset_id=resolved.item.dataset_id,
                             uri=resolved.item.uri,
                             columns=resolved.item.columns,
+                            availability=resolved.item.availability,
+                            availability_reason=resolved.item.availability_reason,
                             parent_is_known=False)
                         container = _binding_resource(binding, mounted)
                         ancestry_completeness = (
@@ -1118,58 +1163,75 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                             if dropped else ancestry.reason)
                         container = {**container, "lastKnown": True}
                     public_container = container
-                    page = bounded_list_children(
-                        provider, mounted.mount, resource_id, limit=remaining, cursor=source_cursor,
-                        timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
-                    if len(page.items) > remaining:
+                    if container.get("unavailableReason"):
+                        availability = (
+                            "unsupported"
+                            if str(container["unavailableReason"]).startswith("Unsupported: ")
+                            else "unavailable"
+                        )
                         statuses[current] = _source_status(
-                            source, "unavailable", "catalog provider exceeded the requested browse limit")
+                            source,
+                            availability,
+                            str(container["unavailableReason"]).split(": ", 1)[-1],
+                            "provider_error",
+                        )
                     else:
-                        items.extend(
-                            _workspace_resource(item, mounted, parent_binding_id=container["bindingId"])
-                            for item in page.items)
-                        reconciliation_placement_ids = _extend_reconciliation_placements(
-                            reconciliation_placement_ids, page.items)
-                        reconciliation_incomplete = False
-                        if page.state == "ready" and page.next_cursor is None:
-                            reconciliation_incomplete = (
-                                reconciliation_placement_ids is None
-                                or _reconcile_complete_children(
-                                    provider,
-                                    mounted,
-                                    parent_provider_placement_id=resource_id,
-                                    seen_provider_placement_ids=set(
-                                        reconciliation_placement_ids or []),
+                        page = bounded_list_children(
+                            provider, mounted.mount, resource_id,
+                            limit=remaining, cursor=source_cursor,
+                            timeout=_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS)
+                        if len(page.items) > remaining:
+                            statuses[current] = _source_status(
+                                source, "unavailable",
+                                "catalog provider exceeded the requested browse limit")
+                        else:
+                            items.extend(
+                                _workspace_resource(
+                                    item, mounted, parent_binding_id=container["bindingId"])
+                                for item in page.items)
+                            reconciliation_placement_ids = _extend_reconciliation_placements(
+                                reconciliation_placement_ids, page.items)
+                            reconciliation_incomplete = False
+                            if page.state == "ready" and page.next_cursor is None:
+                                reconciliation_incomplete = (
+                                    reconciliation_placement_ids is None
+                                    or _reconcile_complete_children(
+                                        provider,
+                                        mounted,
+                                        parent_provider_placement_id=resource_id,
+                                        seen_provider_placement_ids=set(
+                                            reconciliation_placement_ids or []),
+                                    )
                                 )
-                            )
-                        if page.state == "ready" and page.next_cursor is not None:
-                            if not page.items:
-                                statuses[current] = _source_status(
-                                    source, "unavailable", "catalog provider returned a non-advancing page")
+                            if page.state == "ready" and page.next_cursor is not None:
+                                if not page.items:
+                                    statuses[current] = _source_status(
+                                        source, "unavailable",
+                                        "catalog provider returned a non-advancing page")
+                                else:
+                                    statuses[current] = _source_status(
+                                        source,
+                                        "page" if ancestry_completeness == "complete"
+                                        else ancestry_completeness,
+                                        ancestry_error,
+                                    )
+                                    next_state = (
+                                        current, page.next_cursor, history,
+                                        reconciliation_placement_ids,
+                                    )
+                                    break
                             else:
+                                completeness = "complete" if page.state == "ready" else page.state
                                 statuses[current] = _source_status(
                                     source,
-                                    "page" if ancestry_completeness == "complete"
-                                    else ancestry_completeness,
-                                    ancestry_error,
+                                    "partial" if completeness == "complete"
+                                    and reconciliation_incomplete else
+                                    ancestry_completeness if completeness == "complete"
+                                    else completeness,
+                                    ("some missing placements could not be refreshed"
+                                     if reconciliation_incomplete else
+                                     ancestry_error if completeness == "complete" else page.reason),
                                 )
-                                next_state = (
-                                    current, page.next_cursor, history,
-                                    reconciliation_placement_ids,
-                                )
-                                break
-                        else:
-                            completeness = "complete" if page.state == "ready" else page.state
-                            statuses[current] = _source_status(
-                                source,
-                                "partial" if completeness == "complete"
-                                and reconciliation_incomplete else
-                                ancestry_completeness if completeness == "complete"
-                                else completeness,
-                                ("some missing placements could not be refreshed"
-                                 if reconciliation_incomplete else
-                                 ancestry_error if completeness == "complete" else page.reason),
-                            )
 
         current += 1
         source_cursor = None

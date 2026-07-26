@@ -20,6 +20,7 @@ from hub.models import ColumnSchema, Wire
 
 ProviderState = Literal["ready", "partial", "unavailable", "unsupported"]
 ProviderFailure = Literal["offline", "permission_lost", "not_found", "provider_error"]
+ResourceAvailability = Literal["available", "unavailable", "unsupported"]
 _PROVIDER_READ_CONCURRENCY = 8
 _provider_read_slots = threading.BoundedSemaphore(_PROVIDER_READ_CONCURRENCY)
 _provider_read_executor = concurrent.futures.ThreadPoolExecutor(
@@ -54,11 +55,26 @@ class CatalogResource(Wire):
     dataset_id: str | None = Field(default=None, min_length=1, max_length=512)
     uri: str | None = Field(default=None, max_length=8192)
     columns: list[ColumnSchema] = Field(default_factory=list, max_length=2048)
+    availability: ResourceAvailability = "available"
+    availability_reason: str | None = Field(default=None, min_length=1, max_length=512)
 
     @model_validator(mode="after")
     def _dataset_shape(self) -> "CatalogResource":
-        if self.kind == "dataset" and (self.dataset_id is None or not self.uri):
+        if self.availability == "available" and self.availability_reason is not None:
+            raise ValueError("an available resource cannot carry an availability reason")
+        if self.availability != "available" and (
+                self.availability_reason is None or not self.availability_reason.strip()):
+            raise ValueError("an unavailable resource requires an availability reason")
+        if self.kind == "dataset" and self.availability == "available" and (
+                self.dataset_id is None or not self.uri):
             raise ValueError("a dataset occurrence requires a canonical dataset ID and URI")
+        if self.kind == "dataset" and self.availability != "available" and (
+                self.dataset_id is None):
+            raise ValueError("an unavailable dataset occurrence requires a canonical dataset ID")
+        if self.kind == "dataset" and self.availability != "available" and (
+                self.uri is not None or self.columns):
+            raise ValueError(
+                "an unavailable dataset occurrence cannot carry URI or columns")
         if self.kind == "container" and (
             self.dataset_id is not None or self.uri is not None or self.columns
         ):
@@ -172,12 +188,12 @@ def _validate_occurrences(items: list[CatalogResource]) -> None:
     placement_ids = [item.placement_id for item in items]
     if len(set(placement_ids)) != len(placement_ids):
         raise ValueError("provider placement IDs must be unique within one result")
-    canonical: dict[str, tuple[str, list[ColumnSchema]]] = {}
+    canonical: dict[str, tuple[ResourceAvailability, str | None, list[ColumnSchema]]] = {}
     for item in items:
         if item.kind != "dataset":
             continue
-        assert item.dataset_id is not None and item.uri is not None
-        facts = (item.uri, item.columns)
+        assert item.dataset_id is not None
+        facts = (item.availability, item.uri, item.columns)
         previous = canonical.setdefault(item.dataset_id, facts)
         if previous != facts:
             raise ValueError("one dataset ID cannot have conflicting canonical facts")
