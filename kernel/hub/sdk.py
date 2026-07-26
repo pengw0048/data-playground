@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import dataclass
 from typing import Callable, TypeVar
 
 import pyarrow as pa
@@ -36,13 +37,109 @@ from hub.sqlpolicy import bind_input_ctes, identifier, quote_identifier, validat
 
 __all__ = [
     "NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "identifier", "quote_identifier",
-    "close_resources",
+    "close_resources", "DatasetBinding", "ImmediateInput", "ImmediateInputPort",
+    "ImmediateInputs", "UnsupportedUpstreamError",
 ]
 
 _T = TypeVar("_T")
 _RESOURCES: dict[str, object] = {}   # process-global warm handles, kept alive across batches AND runs
 _RESOURCE_LOCK = threading.RLock()   # REENTRANT: a factory may itself call ctx.resource() for another key
 _MISSING = object()                  # sentinel so a factory returning None is still cached (not rebuilt)
+
+
+@dataclass(frozen=True)
+class DatasetBinding:
+    """One canonical dataset identity proved for an immediate Source input.
+
+    ``revision_id`` is absent for a current/mutable source.  A missing binding means that the
+    source has no single identity the core can prove; plugins must not reconstruct one from a URI,
+    name, or another node's configuration.
+    """
+
+    dataset_id: str
+    revision_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ImmediateInput:
+    """The deliberately small public description of one directly wired input."""
+
+    kind: str
+    dataset: DatasetBinding | None = None
+
+
+@dataclass(frozen=True)
+class ImmediateInputPort:
+    """All direct inputs wired to one declared input port, in canvas edge order."""
+
+    id: str
+    inputs: tuple[ImmediateInput, ...]
+
+    @property
+    def count(self) -> int:
+        return len(self.inputs)
+
+
+@dataclass(frozen=True)
+class ImmediateInputs:
+    """A bounded snapshot of a builder node's declared input ports."""
+
+    ports: tuple[ImmediateInputPort, ...]
+
+    def port(self, port_id: str) -> ImmediateInputPort:
+        for port in self.ports:
+            if port.id == port_id:
+                return port
+        raise KeyError(f"node has no input port {port_id!r}")
+
+
+class UnsupportedUpstreamError(ValueError):
+    """A plugin's documented immediate-input contract is not satisfied."""
+
+
+def _source_dataset_binding(source) -> DatasetBinding | None:
+    """Return only a Source's already-admitted canonical binding, never a guessed identity."""
+    data = source.data if isinstance(source.data, dict) else {}
+    config = data.get("config") if isinstance(data, dict) else None
+    if not isinstance(config, dict):
+        return None
+
+    dataset_ref = config.get("datasetRef")
+    selected: tuple[str, str] | None = None
+    if dataset_ref is not None:
+        try:
+            from hub.models import dataset_ref_identity
+            selected = dataset_ref_identity(dataset_ref)
+        except ValueError:
+            return None
+
+    bound_id = config.get("_input_dataset_id")
+    bound_revision = config.get("_input_revision_id")
+    bound = (
+        (bound_id, bound_revision)
+        if isinstance(bound_id, str) and bound_id and isinstance(bound_revision, str) and bound_revision
+        else None
+    )
+    if selected is not None and bound is not None and selected != bound:
+        return None
+
+    uri = config.get("uri")
+    if isinstance(uri, str):
+        from hub import workspace_providers
+        if workspace_providers.is_provider_dataset_uri(uri):
+            try:
+                canonical_id = workspace_providers.provider_dataset_identity(uri)
+            except workspace_providers.ProviderDatasetUnavailable:
+                return None
+            if ((selected is not None and selected[0] != canonical_id)
+                    or (bound is not None and bound[0] != canonical_id)):
+                return None
+            revision_id = selected[1] if selected is not None else (
+                bound[1] if bound is not None else None)
+            return DatasetBinding(dataset_id=canonical_id, revision_id=revision_id)
+
+    identity = selected or bound
+    return DatasetBinding(*identity) if identity is not None else None
 
 
 class _Ctx:
@@ -54,6 +151,39 @@ class _Ctx:
         name = db.unique_view("sdk")  # process-globally-unique + tracked for cleanup
         rel.create_view(name, replace=True)
         return db.conn().sql(bind_input_ctes(validated, [name]))
+
+    def immediate_inputs(self, engine, node) -> ImmediateInputs:
+        """Describe only ``node``'s directly wired inputs, grouped by declared input port.
+
+        The snapshot exposes input counts, producing node kinds, and a canonical Source dataset
+        binding when core has already proved one.  It deliberately exposes no graph, node data,
+        edges, URI, or transitive ancestry.  Plugins that need a stricter shape should raise
+        :class:`UnsupportedUpstreamError` before doing work.
+        """
+        spec = getattr(engine, "node_specs", {}).get(node.type)
+        if spec is None:
+            return ImmediateInputs(())
+        by_port: dict[str, list[ImmediateInput]] = {port.id: [] for port in spec.inputs}
+        nodes = getattr(engine, "_nodes", {})
+        for edge in getattr(getattr(engine, "graph", None), "edges", ()):
+            if edge.target != node.id:
+                continue
+            port_id = edge.target_handle
+            if port_id is None and len(spec.inputs) == 1:
+                port_id = spec.inputs[0].id
+            if port_id not in by_port:
+                continue
+            upstream = nodes.get(edge.source)
+            if upstream is None:
+                continue
+            by_port[port_id].append(ImmediateInput(
+                kind=upstream.type,
+                dataset=_source_dataset_binding(upstream) if upstream.type == "source" else None,
+            ))
+        return ImmediateInputs(tuple(
+            ImmediateInputPort(id=port.id, inputs=tuple(by_port[port.id]))
+            for port in spec.inputs
+        ))
 
     def arrow_map(self, rel, fn: Callable[["pa.RecordBatch"], "pa.RecordBatch | list[dict]"]):
         """Apply a Python fn over Arrow batches (the escape hatch). Returns a relation."""

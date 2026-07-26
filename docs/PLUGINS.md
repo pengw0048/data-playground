@@ -36,6 +36,10 @@ wide input through as a deceptive sidecar. Its output is only a candidate. Core 
 sidecar/base identities, coverage, schema, current head, and final receipt when the researcher
 separately configures the managed-sidecar merge.
 
+When a sidecar must be tied to one known immediate base, set its optional `sourceDatasetId` to the
+canonical dataset id. The fixture then requires exactly one direct `source` input and rejects any
+unproved or different identity before it builds the sidecar.
+
 ## The shape of a plugin
 
 A plugin is a Python package with a `register(reg)` function. Each process that loads the plugin calls
@@ -88,6 +92,15 @@ on a preview sample or at full scale.
   CTE `input` (no textual placeholder substitution)
 - `ctx.arrow_map(rel, fn)` — `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over Arrow batches
 - `ctx.polars(rel, fn)` — `fn(polars.DataFrame) -> polars.DataFrame`
+- `ctx.immediate_inputs(engine, node)` — a read-only snapshot of the node's declared input ports.
+  Each port gives its direct input count and, for each wired input, only the producing node `kind` and
+  a `dataset` binding (`dataset_id`, optional `revision_id`) when core has already proved one. A
+  provider Source uses the same canonical `workspace-provider:*` identity used by Source admission;
+  a URI, display name, mutable revision, or another node's configuration is never exposed or used as
+  an identity.
+  Use this for a narrowly documented shape check and raise `UnsupportedUpstreamError` before work when
+  it is not met. It is deliberately not graph traversal: it exposes no graph, edges, node data, or
+  transitive ancestry, so plugins do not need to import `hub.graph`.
 - `ctx.resource(key, factory)` — a warm handle built once by `factory()` and reused across batches and
   runs on the same per-canvas kernel. Namespace `key` (for example `f"{pack}:{model}"`). Thread-safe.
   For plugin nodes with an explicit resource lifecycle, not transform cells; neither is a security

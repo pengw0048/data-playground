@@ -6,7 +6,7 @@ its ordinary output as a managed-local sidecar, then the core-owned Write admiss
 exact revision into a separately chosen base.
 """
 
-from hub.sdk import NodeSpec, ParamSpec, PortSpec, ctx
+from hub.sdk import NodeSpec, ParamSpec, PortSpec, UnsupportedUpstreamError, ctx
 from hub.sqlpolicy import identifier, quote_identifier, validate_identifier_alias
 
 
@@ -18,13 +18,29 @@ SPEC = NodeSpec(
         ParamSpec(name="identity", type="string", label="logical identity column"),
         ParamSpec(name="value", type="string", label="numeric source column"),
         ParamSpec(name="output", type="string", label="derived payload column"),
+        ParamSpec(name="sourceDatasetId", type="string",
+                  label="required canonical source dataset id (optional)"),
     ],
     blurb="retain one logical identity and emit one neutral derived sidecar column",
 )
 
 
 def build(engine, node, inputs):
+    upstream = ctx.immediate_inputs(engine, node).port("in")
+    if upstream.count != 1:
+        raise UnsupportedUpstreamError("sidecar fixture requires exactly one immediate input")
+    if upstream.inputs[0].kind != "source":
+        raise UnsupportedUpstreamError("sidecar fixture requires a direct Source input")
     cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
+    expected_dataset_id = str(cfg.get("sourceDatasetId") or "").strip()
+    if expected_dataset_id:
+        dataset = upstream.inputs[0].dataset
+        if dataset is None:
+            raise UnsupportedUpstreamError(
+                "sidecar fixture requires a direct Source with a proved dataset identity")
+        if dataset.dataset_id != expected_dataset_id:
+            raise UnsupportedUpstreamError(
+                "sidecar fixture input does not match the required source dataset identity")
     identity = str(cfg.get("identity") or "").strip()
     value = str(cfg.get("value") or "").strip()
     output = str(cfg.get("output") or "").strip()
