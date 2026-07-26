@@ -529,6 +529,7 @@ def derived_schemas_for_engine(
         source_evidence: dict[str, list[ColumnSchema] | None] | None = None,
         allow_revision_detail: bool = True,
         target_node_id: str | None = None,
+        source_evidence_only_ids: set[str] | None = None,
 ) -> dict[str, list[ColumnSchema] | None]:
     """Derive schemas from one already-scoped engine.
 
@@ -537,6 +538,7 @@ def derived_schemas_for_engine(
     carry no inherited reference.
     """
     untyped = _UNTYPED | set(node_builders or {})
+    source_evidence_only_ids = source_evidence_only_ids or set()
 
     def blocks(column: GraphNode) -> bool:
         return (
@@ -572,6 +574,20 @@ def derived_schemas_for_engine(
                 observed[node.id] = None
                 continue
         declaration = declared_schema(node)
+        if not runtime and node.id in source_evidence_only_ids:
+            # A prepared full-pass node may decide which native rows to admit only after the
+            # immutable input manifest is frozen. Before that point, a Source relation — including
+            # scan(limit=0) — is not a metadata contract and can make an eager adapter read rows.
+            # Use only an explicit declaration or the exact-revision metadata evidence collected
+            # above; otherwise keep the schema honestly unknown.
+            if declaration is not None:
+                try:
+                    observed[node.id] = _columns(declaration)
+                except ValueError:
+                    observed[node.id] = None
+            else:
+                observed[node.id] = evidence.get(node.id)
+            continue
         if (
             not runtime
             and node.type in untyped
@@ -605,6 +621,9 @@ def schema_for_graph(
 ) -> dict[str, list | None]:
     if not g.is_acyclic(graph):
         return {}
+    from hub.local_run_inputs import prepared_ancestor_source_node_ids
+    prepared_sources = prepared_ancestor_source_node_ids(
+        graph, None, node_builders, reject_disabled_ancestors=False)
     engine = BuildEngine(
         graph, resolve_adapter, registry, sample_k=None, full=True,
         node_builders=node_builders, node_specs=node_specs, schema_only=True,
@@ -613,15 +632,32 @@ def schema_for_graph(
     with source_read_scope(
             storage, g.execution_source_uris(graph, None),
             owner=f"schema:{uuid.uuid4().hex}"):
-        evidence = {
-            node.id: _source_evidence(node, resolve_adapter)
-            for node in graph.nodes if node.type == "source"
-        }
+        evidence = {}
+        for node in graph.nodes:
+            if node.type != "source":
+                continue
+            config = (
+                node.data.get("config", {})
+                if isinstance(node.data, dict) else {}
+            )
+            has_exact_binding = isinstance(config, dict) and (
+                config.get("_input_revision_id") is not None
+                or isinstance(config.get("datasetRef"), dict)
+            )
+            evidence[node.id] = (
+                _source_evidence(
+                    node, resolve_adapter,
+                    allow_revision_detail=str(node.id) not in prepared_sources,
+                )
+                if str(node.id) not in prepared_sources or has_exact_binding
+                else None
+            )
         with db.run_scope():
             derived = derived_schemas_for_engine(
                 graph, engine, resolve_adapter,
                 node_builders=node_builders, node_specs=node_specs,
                 source_evidence=evidence,
+                source_evidence_only_ids=prepared_sources,
             )
     return {
         node_id: _wire(columns)

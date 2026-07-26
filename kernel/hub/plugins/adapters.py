@@ -1236,6 +1236,45 @@ class LanceAdapter:
             _raise_revision_access_error(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
 
+    def open_revision_native_rows(
+            self, uri: str, revision_id: str, *,
+            native_row_ids: tuple[int, ...]) -> Relation:
+        """Read one exact Lance version through its native ``_rowid`` range planner.
+
+        A Lance ``take()`` index is positional and is therefore never a substitute for ``_rowid``.
+        The virtual-column filter is recognized by Lance as native row ranges: absent addresses are
+        omitted, while provider work stays bounded to the supplied unique addresses.
+        """
+        if not isinstance(native_row_ids, tuple):
+            raise TypeError("native row ids must be a tuple")
+        if len(native_row_ids) > 50:
+            raise ValueError("exact native-row reads accept at most 50 row ids")
+        if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                or value < 0 or value > (1 << 64) - 1
+                for value in native_row_ids):
+            raise ValueError("native row ids must be uint64 integers")
+        if len(set(native_row_ids)) != len(native_row_ids):
+            raise ValueError("native row ids must be unique")
+        try:
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
+            dataset.schema  # force the exact retained-version check before scanner construction
+            if not native_row_ids:
+                reader = dataset.scanner(limit=0, with_row_id=True).to_reader()
+            else:
+                # Quoted decimal text avoids DataFusion parsing uint64 values above INT64_MAX as
+                # lossy float literals. Values were validated as uint64 above, so this is not an
+                # expression-injection surface.
+                values = ", ".join(
+                    f"CAST('{value}' AS BIGINT UNSIGNED)" for value in native_row_ids)
+                reader = dataset.scanner(
+                    filter=f"_rowid IN ({values})", with_row_id=True).to_reader()
+            return db.conn().from_arrow(reader)
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            _raise_revision_access_error(exc)
+
     def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
         """Open one retained Lance version with its scanner cap before yielding a relation."""
         try:

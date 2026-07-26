@@ -243,7 +243,8 @@ def _sized(rows: int | None, conf: str, width: WidthEst, blocking: bool = False)
 
 def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
                    schemas: dict | None = None, actuals: dict[str, int | None] | None = None,
-                   storage=None) -> dict[str, SizeEst]:
+                   storage=None,
+                   no_row_probe_source_ids: set[str] | None = None) -> dict[str, SizeEst]:
     """Fence managed sources for the entire fingerprint/count estimation pass."""
     import uuid
     from hub.storage import source_read_scope
@@ -252,12 +253,15 @@ def estimate_sizes(graph: Graph, resolve_adapter, *, target: str | None = None,
             storage, g.execution_source_uris(graph, target),
             owner=f"estimate:{uuid.uuid4().hex}"):
         return _estimate_sizes_unfenced(
-            graph, resolve_adapter, target=target, schemas=schemas, actuals=actuals)
+            graph, resolve_adapter, target=target, schemas=schemas, actuals=actuals,
+            no_row_probe_source_ids=no_row_probe_source_ids)
 
 
 def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | None = None,
                              schemas: dict | None = None,
-                             actuals: dict[str, int | None] | None = None) -> dict[str, SizeEst]:
+                             actuals: dict[str, int | None] | None = None,
+                             no_row_probe_source_ids: set[str] | None = None,
+                             ) -> dict[str, SizeEst]:
     """Estimate node output sizes in topological order. `target` restricts the pass to that node's
     upstream cone (bounds how many sources we count); None estimates the whole graph (for the UI hint).
     `schemas` (node_id -> column list, e.g. from executors.schema.schema_for_graph) sharpens the byte
@@ -266,6 +270,7 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         return {}
     schemas = schemas or {}
     actuals = actuals or {}
+    no_row_probe_source_ids = no_row_probe_source_ids or set()
     out: dict[str, SizeEst] = {}
     order = g.topo_order(graph)
     if target:
@@ -313,7 +318,19 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         elif t == "source" and uri:
             # MEASURE list/vector-column widths (embeddings) from the real schema so the byte gate sees the
             # true per-row size — a float[1024] scored as base `float`=8B mis-sizes a region ~1000x small.
-            w = _source_width(resolve_adapter, uri, schemas.get(nid))
+            if nid in no_row_probe_source_ids:
+                columns = schemas.get(nid)
+                w = (
+                    _estimated_row_width(columns)
+                    if columns
+                    else WidthEst(
+                        None,
+                        "Prepared input column width is unknown because pre-admission "
+                        "sizing did not read source rows.",
+                    )
+                )
+            else:
+                w = _source_width(resolve_adapter, uri, schemas.get(nid))
         elif pass_through:
             upstream = in_width(nid)
             if upstream is not None:
@@ -339,11 +356,32 @@ def _estimate_sizes_unfenced(graph: Graph, resolve_adapter, *, target: str | Non
         if t == "source":
             config = resolve_config(node)
             revision_id = config.get("_input_revision_id")
-            n = _counted(
-                resolve_adapter, uri,
-                str(revision_id) if isinstance(revision_id, str) and revision_id else None,
-            ) if uri else None
-            out[nid] = _sized(n, "exact" if n is not None else "unknown", w)
+            protected = nid in no_row_probe_source_ids
+            if not uri:
+                n = None
+            elif protected:
+                # ``metadata_count`` is an explicit bounded current-head capability and is safe
+                # before admission freezes that head. Once a revision is already pinned, using the
+                # current count would describe the wrong input; revision_detail is not a metadata-
+                # only contract because it may read preview rows.
+                n = (
+                    _counted(resolve_adapter, uri)
+                    if not isinstance(revision_id, str) or not revision_id
+                    else None
+                )
+            else:
+                n = _counted(
+                    resolve_adapter, uri,
+                    str(revision_id)
+                    if isinstance(revision_id, str) and revision_id else None,
+                )
+            size = _sized(n, "exact" if n is not None else "unknown", w)
+            if protected and n is None:
+                size.uncertainty = (
+                    "Prepared input may require an unrestricted full read, but no bounded "
+                    "metadata row count is available."
+                )
+            out[nid] = size
             continue
 
         if t == "sample":

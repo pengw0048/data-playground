@@ -9,9 +9,10 @@ import logging
 import os
 import stat
 import uuid
+from collections.abc import Mapping
 
 from hub import db, graph as graph_mod, metadb
-from hub.backends import DatasetRevisionAdapter
+from hub.backends import DatasetRevisionAdapter, _PreparedNodeRegistration
 from hub.models import dataset_ref_identity
 from hub.plugins.adapters import (
     DuckDBAdapter,
@@ -40,6 +41,61 @@ _EXACT_ADMISSION_ATTEMPTS = 2
 
 class LocalRunInputError(RuntimeError):
     """The admitted local-run input contract is malformed, stale, or unavailable."""
+
+
+def _disabled(node) -> bool:
+    return bool(node.data.get("disabled")) if isinstance(node.data, dict) else False
+
+
+def prepared_ancestor_source_node_ids(
+        graph, target_node_id: str | None,
+        node_builders: Mapping[str, object] | None,
+        *, reject_disabled_ancestors: bool = True,
+) -> set[str]:
+    """Return every Source ancestor of enabled prepared nodes in the execution cone.
+
+    Direct-input validation belongs to the later preparation phase. Admission must still avoid an
+    unrestricted read for an ultimately invalid ``Source -> intermediate -> prepared`` topology.
+    """
+    if not node_builders:
+        return set()
+    cone = graph_mod.upstream_chain(graph, target_node_id) if target_node_id else graph.nodes
+    nodes = {str(node.id): node for node in cone}
+    prepared = [
+        node for node in nodes.values()
+        if not _disabled(node)
+        and isinstance(node_builders.get(node.type), _PreparedNodeRegistration)
+    ]
+    source_ids: set[str] = set()
+    for prepared_node in prepared:
+        ancestors = [
+            node for node in graph_mod.upstream_chain(graph, prepared_node.id)
+            if str(node.id) != str(prepared_node.id) and str(node.id) in nodes
+        ]
+        if reject_disabled_ancestors and any(_disabled(node) for node in ancestors):
+            raise LocalRunInputError(
+                "prepared node has a disabled execution ancestor")
+        source_ids.update(
+            str(node.id) for node in ancestors if node.type == "source")
+    return source_ids
+
+
+def _validate_prepared_revision_without_rows(
+        adapter, uri: str, revision_id: str) -> None:
+    """Prove one exact revision is retained without an unrestricted row reader."""
+    revision_schema = getattr(adapter, "revision_schema", None)
+    if callable(revision_schema):
+        revision_schema(uri, revision_id)
+        return
+    open_native_rows = getattr(adapter, "open_revision_native_rows", None)
+    if callable(open_native_rows):
+        # Empty exact intersection is the same optional #900 capability, not a second hidden SPI
+        # prerequisite. Its contract permits no unrestricted scan and therefore proves retention
+        # without reading a provider row.
+        open_native_rows(uri, revision_id, native_row_ids=())
+        return
+    raise LocalRunInputError(
+        "prepared exact input revision has no zero-row validation capability")
 
 
 def supports_local_file_snapshot(uri: str, adapter) -> bool:
@@ -304,12 +360,15 @@ def validate_manifest_graph(graph, target_node_id: str | None, manifest: object,
 def bind_manifest(
     graph, target_node_id: str | None, manifest: object, resolve_adapter, *,
     allow_prebound_provider: bool = False, preview_limit: int | None = None,
+    node_builders: Mapping[str, object] | None = None,
 ):
     """Reopen admitted provider revisions and bind them only to a private dispatch graph."""
     admitted = validate_manifest_graph(
         graph, target_node_id, manifest, require_bound_revisions=False)
     bound = graph.model_copy(deep=True)
     sources = source_nodes(bound, target_node_id)
+    prepared_sources = prepared_ancestor_source_node_ids(
+        bound, target_node_id, node_builders)
     for node, item in zip(sources, admitted, strict=True):
         config = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         if isinstance(config, dict):
@@ -421,7 +480,11 @@ def bind_manifest(
         try:
             with db.base_guard():
                 if preview_limit is None:
-                    adapter.open_revision(revision_uri, item["revision_id"])
+                    if str(node.id) in prepared_sources:
+                        _validate_prepared_revision_without_rows(
+                            adapter, revision_uri, item["revision_id"])
+                    else:
+                        adapter.open_revision(revision_uri, item["revision_id"])
                 else:
                     preview_revision = getattr(adapter, "preview_revision", None)
                     if not callable(preview_revision):

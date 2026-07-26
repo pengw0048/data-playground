@@ -38,7 +38,8 @@ from hub.sqlpolicy import bind_input_ctes, identifier, quote_identifier, validat
 __all__ = [
     "NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "identifier", "quote_identifier",
     "close_resources", "DatasetBinding", "ImmediateInput", "ImmediateInputPort",
-    "ImmediateInputs", "UnsupportedUpstreamError",
+    "ImmediateInputs", "ExactSourceRowRestriction", "NodePreparation",
+    "UnsupportedUpstreamError",
 ]
 
 _T = TypeVar("_T")
@@ -91,6 +92,27 @@ class ImmediateInputs:
             if port.id == port_id:
                 return port
         raise KeyError(f"node has no input port {port_id!r}")
+
+
+@dataclass(frozen=True)
+class ExactSourceRowRestriction:
+    """One bounded native-row restriction for a directly wired exact Source input."""
+
+    input_port: str
+    native_row_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class NodePreparation:
+    """One full-pass preparation result.
+
+    ``state`` is opaque to core and delivered once to the matching prepared builder. ``restriction``
+    is the sole supported pre-lowering input operation; general predicates and graph rewrites are
+    intentionally outside this contract.
+    """
+
+    state: object = None
+    restriction: ExactSourceRowRestriction | None = None
 
 
 class UnsupportedUpstreamError(ValueError):

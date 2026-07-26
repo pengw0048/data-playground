@@ -790,6 +790,40 @@ class LocalRunner:
                 self._scopes[run_id] = scope  # cancel() interrupts this scope's cursor
             try:
                 last_step_published = False
+                # Prepared plugin nodes must perform their bounded service work and exact native-row
+                # opens before the plan constructs any ordinary Source scanner.
+                preparation_started: dict[str, float] = {}
+
+                def preparation_started_for(node_id: str) -> None:
+                    preparation_started[node_id] = time.monotonic()
+                    prepared_status = next(
+                        (item for item in status.per_node if item.node_id == node_id), None)
+                    if prepared_status is not None:
+                        prepared_status.status = "running"
+                    self._emit(graph, status)
+
+                def preparation_finished_for(
+                        node_id: str, error: Exception | None) -> None:
+                    prepared_status = next(
+                        (item for item in status.per_node if item.node_id == node_id), None)
+                    if prepared_status is None:
+                        return
+                    elapsed = time.monotonic() - preparation_started.pop(
+                        node_id, time.monotonic())
+                    prepared_status.ms = int(elapsed * 1000)
+                    if error is None:
+                        # Preparation is only the node's first phase; its builder still executes in
+                        # plan order. Preserve the preparation duration for the final accumulated time.
+                        prepared_status.status = "queued"
+                    elif not cancel.is_set():
+                        prepared_status.error = f"{type(error).__name__}: {error}"
+                    self._emit(graph, status)
+
+                engine.prepare(
+                    cancelled=cancel.is_set,
+                    on_node_start=preparation_started_for,
+                    on_node_finish=preparation_finished_for,
+                )
                 for step in plan.steps:
                     last_step_published = False
                     if cache_pin is not None:
@@ -831,11 +865,14 @@ class LocalRunner:
                     else:
                         # Build every declared output, but do not select one for a multi-output
                         # intermediate. Its downstream edge owns the explicit source-port choice.
-                        engine.build(step.node_id)  # build (lazy) — cheap
-                        self._check_schema(nm[step.node_id], engine)  # enforce a pinned contract (may raise)
+                        fully_restricted_source = engine.source_is_fully_restricted(step.node_id)
+                        if not fully_restricted_source:
+                            engine.build(step.node_id)  # build (lazy) — cheap
+                            self._check_schema(
+                                nm[step.node_id], engine)  # enforce a pinned contract (may raise)
                     if pn:
                         pn.status = "done"
-                        pn.ms = int((time.time() - t0) * 1000)
+                        pn.ms = (pn.ms or 0) + int((time.time() - t0) * 1000)
                         pn.rows = rows_seen or None
                     status.rows_processed = rows_seen
                     status.progress = _step_progress(status)  # fraction of steps complete (deterministic)

@@ -108,6 +108,259 @@ def test_kernel_transport_reopens_the_admitted_lance_revision_after_head_move_an
             body, kernel_canvas=graph.id, deps=deps, metadata=metadb)
 
 
+@pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
+def test_prepared_exact_source_uses_zero_row_validation_through_router_and_kernel_bind(
+        tmp_path, indirect):
+    lance = pytest.importorskip("lance")
+    from hub.deps import Registry
+    from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, PortSpec
+    from hub.sdk import ExactSourceRowRestriction, NodePreparation
+
+    uri = str(tmp_path / "prepared-input.lance")
+    lance.write_dataset(pa.table({"value": [1]}), uri)
+    catalog = InMemoryCatalog(
+        str(tmp_path / "data"), lambda _uri: LanceAdapter())
+    table = catalog._add(name="prepared-input", uri=uri, strict_probe=True)
+    binding = metadb.catalog_revision_binding_for_uri(uri)
+    assert binding is not None
+    admitted_revision = LanceAdapter().resolve_revision(uri)["revision_id"]
+    native_calls = []
+    delegate = LanceAdapter()
+
+    class NativeOnlyExactAdapter:
+        name = "lance"
+
+        def revision_history(self, uri, *, limit, cursor=None):
+            return delegate.revision_history(uri, limit=limit, cursor=cursor)
+
+        def resolve_revision(self, uri, *, as_of=None):
+            return delegate.resolve_revision(uri, as_of=as_of)
+
+        def open_revision(self, *_args, **_kwargs):
+            pytest.fail("prepared admission must not unrestricted-open the exact revision")
+
+        def revision_detail(self, uri, revision_id, *, preview_limit):
+            return delegate.revision_detail(
+                uri, revision_id, preview_limit=preview_limit)
+
+        def open_revision_native_rows(
+                self, uri, revision_id, *, native_row_ids):
+            native_calls.append((revision_id, native_row_ids))
+            return delegate.open_revision_native_rows(
+                uri, revision_id, native_row_ids=native_row_ids)
+
+        def scan(self, *_args, **_kwargs):
+            pytest.fail("prepared dispatch must not scan the mutable Source")
+
+    adapter = NativeOnlyExactAdapter()
+    specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    deps = SimpleNamespace(
+        resolve_adapter=lambda _uri: adapter,
+        builtin_kinds=set(specs),
+        node_specs=specs,
+        node_builders={},
+        node_ir={},
+    )
+    prepared_spec = NodeSpec(
+        kind="kernel-prepared-exact-row-test",
+        title="kernel prepared exact row test",
+        category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")],
+        outputs=[PortSpec(id="out", wire="dataset")],
+        previewable=False,
+    )
+
+    def prepare(_params, _immediate_inputs):
+        return NodePreparation(
+            state="kernel-state",
+            restriction=ExactSourceRowRestriction("in", (0,)),
+        )
+
+    def build(_engine, _node, inputs, state):
+        assert state == "kernel-state"
+        return inputs[0]
+
+    Registry(deps).add_node(prepared_spec, build, prepare=prepare)
+    nodes = [
+        {
+            "id": "source", "type": "source",
+            "data": {"config": {
+                "uri": uri,
+                "tableId": table.id,
+                "datasetRef": {
+                    "kind": "exact",
+                    "datasetId": binding["dataset_id"],
+                    "revisionId": admitted_revision,
+                },
+            }},
+        },
+        {
+            "id": "prepared", "type": prepared_spec.kind,
+            "data": {"config": {}},
+        },
+    ]
+    edges = [{
+        "id": "source-prepared",
+        "source": "source",
+        "target": "prepared",
+        "data": {"wire": "dataset"},
+    }]
+    if indirect:
+        nodes.insert(1, {
+            "id": "middle", "type": "transform",
+            "data": {"config": {
+                "mode": "map",
+                "code": "def fn(row):\n    return row",
+            }},
+        })
+        edges = [
+            {
+                "id": "source-middle",
+                "source": "source",
+                "target": "middle",
+                "data": {"wire": "dataset"},
+            },
+            {
+                "id": "middle-prepared",
+                "source": "middle",
+                "target": "prepared",
+                "data": {"wire": "dataset"},
+            },
+        ]
+    graph = Graph.model_validate({
+        "id": f"prepared-kernel-{uuid.uuid4().hex}",
+        "version": 1,
+        "nodes": nodes,
+        "edges": edges,
+    })
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=graph.id, owner_id="local", name="prepared kernel transport"))
+
+    manifest = runs._resolve_local_run_manifest(graph, "prepared", deps)
+    run_id, created = metadb.admit_local_run_inputs(
+        uid="local", canvas_id=graph.id, submission_id=str(uuid.uuid4()),
+        target_node_id="prepared",
+        intent_sha256=runs._local_run_intent_sha256(graph, "prepared"),
+        manifest=manifest,
+    )
+    assert created is True
+    lance.write_dataset(pa.table({"value": [2]}), uri, mode="append")
+
+    dispatch = runs._bind_local_run_manifest(
+        graph, manifest, deps, "prepared")
+    body = RunBody(
+        run_id=run_id,
+        graph=dispatch.model_dump(),
+        target="prepared",
+        input_manifest=manifest,
+    )
+    rebound, carried = _admitted_kernel_graph(
+        body, kernel_canvas=graph.id, deps=deps, metadata=metadb)
+    assert carried == manifest
+    assert native_calls == [(admitted_revision, ())] * 3
+
+    engine = BuildEngine(
+        rebound, deps.resolve_adapter, {}, full=True,
+        node_builders=deps.node_builders, node_specs=deps.node_specs,
+        output_node="prepared",
+    )
+    if indirect:
+        from hub.sdk import UnsupportedUpstreamError
+        with pytest.raises(UnsupportedUpstreamError, match="directly wired"):
+            engine.prepare()
+        assert native_calls == [(admitted_revision, ())] * 3
+    else:
+        with db.run_scope():
+            engine.prepare()
+            assert engine.relation("prepared").fetchall() == [(1, 0)]
+        assert native_calls[-1] == (admitted_revision, (0,))
+
+
+@pytest.mark.parametrize("disabled_node", ["source", "middle"])
+def test_disabled_prepared_ancestor_fails_before_manifest_adapter_resolution(
+        disabled_node):
+    from hub.api_errors import APIError
+    from hub.deps import Registry
+    from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, PortSpec
+    from hub.sdk import NodePreparation
+
+    specs = {spec.kind: spec for spec in BUILTIN_NODE_SPECS}
+    adapter_calls = []
+
+    def resolve_adapter(_uri):
+        adapter_calls.append("resolved")
+        pytest.fail("disabled prepared ancestry must fail before adapter resolution")
+
+    deps = SimpleNamespace(
+        resolve_adapter=resolve_adapter,
+        builtin_kinds=set(specs),
+        node_specs=specs,
+        node_builders={},
+        node_ir={},
+    )
+    prepared_spec = NodeSpec(
+        kind="disabled-ancestor-prepared-test",
+        title="disabled ancestor prepared test",
+        category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")],
+        outputs=[PortSpec(id="out", wire="dataset")],
+        previewable=False,
+    )
+    Registry(deps).add_node(
+        prepared_spec,
+        lambda _engine, _node, inputs, _state: inputs[0],
+        prepare=lambda _params, _inputs: NodePreparation(),
+    )
+    graph = Graph.model_validate({
+        "id": f"disabled-prepared-{disabled_node}",
+        "version": 1,
+        "nodes": [
+            {
+                "id": "source", "type": "source",
+                "data": {
+                    "disabled": disabled_node == "source",
+                    "config": {"uri": "spy://source"},
+                },
+            },
+            {
+                "id": "middle", "type": "transform",
+                "data": {
+                    "disabled": disabled_node == "middle",
+                    "config": {
+                        "mode": "map",
+                        "code": "def fn(row):\n    return row",
+                    },
+                },
+            },
+            {
+                "id": "prepared", "type": prepared_spec.kind,
+                "data": {"config": {}},
+            },
+        ],
+        "edges": [
+            {"id": "source-middle", "source": "source", "target": "middle"},
+            {"id": "middle-prepared", "source": "middle", "target": "prepared"},
+        ],
+    })
+    with pytest.raises(APIError, match="disabled"):
+        runs._resolve_local_run_manifest(graph, "prepared", deps)
+
+    manifest = [{
+        "node_id": "source",
+        "dataset_id": "dataset",
+        "revision_id": "revision",
+        "provider": "provider",
+        "resolved_at": "2026-07-26T00:00:00+00:00",
+    }]
+    with pytest.raises(LocalRunInputError, match="disabled"):
+        bind_manifest(
+            graph, "prepared", manifest, resolve_adapter,
+            node_builders=deps.node_builders,
+        )
+    assert adapter_calls == []
+
+
 def test_manifest_binding_replaces_untrusted_preview_limit_and_keeps_full_run_exact(tmp_path):
     lance = pytest.importorskip("lance")
     uri = str(tmp_path / "input.lance")

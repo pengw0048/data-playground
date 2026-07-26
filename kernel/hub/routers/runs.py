@@ -41,7 +41,6 @@ from hub.execution_manifest import (
     execution_manifest_accepts_graph_replay,
     execution_manifest_admission,
 )
-from hub.local_run_inputs import LocalRunInputError
 from hub.plugins.adapters import (
     RevisionPermissionLost,
     RevisionProviderOffline,
@@ -437,7 +436,21 @@ def _resolve_local_run_manifest(
     """Resolve every local-run Source once through its registered exact-revision provider."""
     resolved_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     manifest: list[dict[str, str]] = []
-    for node in _local_run_source_nodes(graph, target_node_id):
+    sources = _local_run_source_nodes(graph, target_node_id)
+    from hub.local_run_inputs import (
+        LocalRunInputError as ManifestInputError,
+        _validate_prepared_revision_without_rows,
+        prepared_ancestor_source_node_ids,
+    )
+    try:
+        prepared_sources = prepared_ancestor_source_node_ids(
+            graph, target_node_id, getattr(deps, "node_builders", None))
+    except ManifestInputError as exc:
+        raise APIError(
+            409, str(exc), code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
+            retryable=False,
+        ) from exc
+    for node in sources:
         cfg = node.data.get("config", {}) if isinstance(node.data, dict) else {}
         uri = str(cfg.get("uri") or "")
         from hub import workspace_providers
@@ -479,7 +492,7 @@ def _resolve_local_run_manifest(
                      else isinstance(adapter, DatasetRevisionAdapter))
             if not exact:
                 if provider_dataset_id is not None:
-                    raise LocalRunInputError(
+                    raise ManifestInputError(
                         "provider dataset is mutable-only and cannot enter an immutable run manifest")
                 if isinstance(dataset_ref, dict) or not materialize_local_files:
                     raise RuntimeError("source has no provider-native exact revision")
@@ -508,11 +521,15 @@ def _resolve_local_run_manifest(
                     raise ValueError("selected dataset identity does not match the current registration")
                 with db.base_guard():
                     if preview_limit is None:
-                        adapter.open_revision(uri, revision_id)
+                        if str(node.id) in prepared_sources:
+                            _validate_prepared_revision_without_rows(
+                                adapter, uri, revision_id)
+                        else:
+                            adapter.open_revision(uri, revision_id)
                     else:
                         preview_revision = getattr(adapter, "preview_revision", None)
                         if not callable(preview_revision):
-                            raise LocalRunInputError(
+                            raise ManifestInputError(
                                 "exact input revision has no bounded preview capability")
                         preview_revision(uri, revision_id, limit=preview_limit)
                 provider = str(getattr(adapter, "name", "") or "")
@@ -520,7 +537,7 @@ def _resolve_local_run_manifest(
                 resolved = adapter.resolve_revision(uri)
                 revision_id = str(resolved.get("revision_id") or "")
                 provider = str(getattr(adapter, "name", "") or "")
-        except LocalRunInputError as exc:
+        except ManifestInputError as exc:
             raise APIError(
                 409, str(exc), code=APIErrorCode.LOCAL_RUN_INPUT_BINDING_FAILED,
                 retryable=False,
@@ -558,7 +575,9 @@ def _bind_local_run_manifest(
 
     try:
         return bind_manifest(
-            graph, target_node_id, manifest, deps.resolve_adapter, preview_limit=preview_limit)
+            graph, target_node_id, manifest, deps.resolve_adapter,
+            preview_limit=preview_limit,
+            node_builders=getattr(deps, "node_builders", None))
     except (PermissionError, RevisionPermissionLost) as exc:
         raise APIError(
             403, "permission to read an exact input revision was lost",
@@ -2282,16 +2301,24 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
     there). A known row count plus an unknown column width keeps bytes=None so the confirm gate can ask;
     (None, None, {}) when nothing is countable retains the existing fast-failure behavior."""
     from hub.estimate import estimate_sizes
+    from hub.local_run_inputs import prepared_ancestor_source_node_ids
+    prepared_sources = prepared_ancestor_source_node_ids(
+        req_graph, target_node_id, deps.node_builders,
+        reject_disabled_ancestors=False)
+    scoped_graph = _target_execution_graph(req_graph, target_node_id)
     try:  # per-node schemas sharpen the byte width (else a flat default/row makes the byte gate meaningless)
-        schemas = schema_for_graph(req_graph, deps.resolve_adapter, deps.registry,
+        schemas = schema_for_graph(scoped_graph, deps.resolve_adapter, deps.registry,
                                    deps.node_builders, deps.node_specs, storage=deps.storage)
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — schema inference is best-effort; fall back to default widths
         schemas = None
     try:
-        sizes = estimate_sizes(req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
-                               actuals=_actuals_for(req_graph, deps), storage=deps.storage)
+        sizes = estimate_sizes(
+            req_graph, deps.resolve_adapter, target=target_node_id, schemas=schemas,
+            actuals=_actuals_for(req_graph, deps), storage=deps.storage,
+            no_row_probe_source_ids=prepared_sources,
+        )
     except ManagedSourceReadError as e:
         raise HTTPException(400, str(e))
     except Exception:  # noqa: BLE001 — a bad estimate must not block the gate
@@ -2306,6 +2333,20 @@ def _cone_size(req_graph, target_node_id, deps) -> "tuple[int | None, int | None
 
 def _explain_unknown_byte_size(estimate: RunEstimate, sizes: dict) -> RunEstimate:
     """Surface the first concrete missing-width fact when a known-row run needs confirmation."""
+    if estimate.rows is None and estimate.bytes is None:
+        reasons = list(dict.fromkeys(
+            size.uncertainty for size in sizes.values()
+            if size.rows is None and size.uncertainty
+        ))
+        if reasons:
+            # A prepared node is allowed to return no restriction, or another enabled branch may
+            # still consume the Source normally. Unknown pre-admission cost therefore requires the
+            # same explicit confirmation as a known row count with unknown width.
+            estimate.needs_confirm = True
+            estimate.breakdown = (
+                f"{estimate.breakdown} · confirmation required: {reasons[0]}"
+            )
+        return estimate
     if estimate.rows is None or estimate.bytes is not None:
         return estimate
     reasons = list(dict.fromkeys(
