@@ -20356,21 +20356,40 @@ def _managed_local_row_identity_certificate_store(
                 if revision is not None and revision.logical_id == dataset_id else None)
     if revision is None or artifact is None or artifact.state != "ready":
         raise ValueError("row identity exact revision is unavailable")
+    values = {
+        "revision_id": revision_id,
+        "logical_id": dataset_id,
+        "schema_sha256": decoded.spec.schema_digest,
+        "row_identity_spec_sha256": spec_digest,
+        "certificate_doc": canonical,
+        "certificate_sha256": certificate_sha256,
+        "artifact_dev": artifact_dev,
+        "artifact_ino": artifact_ino,
+        "created_at": _now(),
+    }
+    # The insert is the missing-row mutex on SQLite, where the FOR UPDATE reads above are ignored.
+    dialect = s.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+    else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
+        raise RuntimeError("unsupported metadata database dialect")
+    s.execute(dialect_insert(ManagedLocalRowIdentityCertificate).values(
+        **values,
+    ).on_conflict_do_nothing(
+        index_elements=[ManagedLocalRowIdentityCertificate.revision_id],
+    ))
     existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
-    if existing is not None:
-        if (existing.logical_id != dataset_id or existing.schema_sha256 != decoded.spec.schema_digest
-                or existing.row_identity_spec_sha256 != spec_digest
-                or existing.certificate_doc != canonical
-                or existing.certificate_sha256 != certificate_sha256
-                or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
-            raise RowIdentityCertificateConflict(
-                "exact revision already has a different row identity certificate")
-        return descriptor
-    s.add(ManagedLocalRowIdentityCertificate(
-        revision_id=revision_id, logical_id=dataset_id, schema_sha256=decoded.spec.schema_digest,
-        row_identity_spec_sha256=spec_digest, certificate_doc=canonical,
-        certificate_sha256=certificate_sha256, artifact_dev=artifact_dev,
-        artifact_ino=artifact_ino, created_at=_now()))
+    if existing is None:  # pragma: no cover - defensive database contract check
+        raise RuntimeError("row identity certificate reservation failed")
+    if (existing.logical_id != dataset_id or existing.schema_sha256 != decoded.spec.schema_digest
+            or existing.row_identity_spec_sha256 != spec_digest
+            or existing.certificate_doc != canonical
+            or existing.certificate_sha256 != certificate_sha256
+            or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
+        raise RowIdentityCertificateConflict(
+            "exact revision already has a different row identity certificate")
     return descriptor
 
 

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from hub import metadb
 from hub.models import ExactDatasetRef
@@ -80,6 +84,97 @@ def _revision_detail(monkeypatch, catalog, storage, published: dict):
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
         catalog=catalog, storage=storage, resolve_adapter=lambda _uri: DuckDBAdapter()))
     return catalog_routes.open_dataset_revision(published["dataset_id"], published["revision_id"])
+
+
+def _concurrent_standalone_certifications(
+        storage, exact: ExactDatasetRef, key_specs: tuple[tuple[str, ...], tuple[str, ...]],
+        monkeypatch, *, synchronize_sqlite_missing_reads: bool,
+) -> list[dict | Exception]:
+    store_barrier = threading.Barrier(2)
+    original_store = metadb.managed_local_row_identity_certificate_store
+
+    def synchronized_store(*args, **kwargs):
+        store_barrier.wait(timeout=10)
+        return original_store(*args, **kwargs)
+
+    def certify(keys: tuple[str, ...]) -> dict | Exception:
+        try:
+            return certify_and_persist_exact_row_identity(storage, exact, list(keys))
+        except Exception as exc:  # noqa: BLE001 — the assertion verifies the public exception type
+            return exc
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            metadb, "managed_local_row_identity_certificate_store", synchronized_store)
+        if synchronize_sqlite_missing_reads:
+            missing_barrier = threading.Barrier(2)
+            original_get = Session.get
+
+            def synchronized_missing_get(self, entity, ident, **kwargs):
+                row = original_get(self, entity, ident, **kwargs)
+                if entity is metadb.ManagedLocalRowIdentityCertificate and row is None:
+                    missing_barrier.wait(timeout=10)
+                return row
+
+            patch.setattr(Session, "get", synchronized_missing_get)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(certify, keys) for keys in key_specs]
+            return [future.result(timeout=20) for future in futures]
+
+
+def _assert_concurrent_first_certifications(
+        storage, catalog, tmp_path, monkeypatch, *,
+        key_specs: tuple[tuple[str, ...], tuple[str, ...]],
+) -> None:
+    published = _publish(storage, catalog, str(tmp_path / "concurrent.parquet"), pa.table({
+        "id": pa.array([1, 2], pa.int32()),
+        "name": pa.array(["first", "second"]),
+    }))
+    exact = _exact(published)
+    dialect = metadb.engine().dialect.name
+    results = _concurrent_standalone_certifications(
+        storage, exact, key_specs, monkeypatch,
+        synchronize_sqlite_missing_reads=dialect == "sqlite")
+
+    if key_specs[0] == key_specs[1]:
+        assert all(isinstance(result, dict) for result in results)
+        assert results[0] == results[1]
+        expected = results[0]
+    else:
+        successes = [result for result in results if isinstance(result, dict)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert isinstance(failures[0], metadb.RowIdentityCertificateConflict)
+        assert not isinstance(failures[0], IntegrityError)
+        expected = successes[0]
+
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        storage, exact.dataset_id, exact.revision_id) == expected
+
+
+@pytest.mark.parametrize("key_specs", [
+    (("id",), ("id",)),
+    (("id",), ("name",)),
+], ids=["same-spec", "different-spec"])
+def test_sqlite_concurrent_first_standalone_certification_has_one_typed_winner(
+        local_catalog, tmp_path, monkeypatch, key_specs):
+    if metadb.engine().dialect.name != "sqlite":
+        pytest.skip("SQLite concurrency contract")
+    _assert_concurrent_first_certifications(
+        *local_catalog, tmp_path, monkeypatch, key_specs=key_specs)
+
+
+@pytest.mark.parametrize("key_specs", [
+    (("id",), ("id",)),
+    (("id",), ("name",)),
+], ids=["same-spec", "different-spec"])
+def test_postgres_concurrent_first_standalone_certification_has_one_typed_winner(
+        local_catalog, tmp_path, monkeypatch, key_specs):
+    if metadb.engine().dialect.name != "postgresql":
+        pytest.skip("PostgreSQL concurrency contract")
+    _assert_concurrent_first_certifications(
+        *local_catalog, tmp_path, monkeypatch, key_specs=key_specs)
 
 
 def test_certified_descriptor_is_reusable_after_head_moves_without_rescanning(
