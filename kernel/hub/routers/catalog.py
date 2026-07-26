@@ -40,6 +40,7 @@ from hub.plugins.adapters import (
     RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
     revision_adapter_for_uri,
 )
+from hub.plugins.capabilities import tag_columns
 from hub.plugins.importer import ImporterNotConfigured
 from hub.routers.dataset_views import supports_dataset_view_source
 from hub.sampling import provenance_for_dataset
@@ -612,6 +613,12 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             if hasattr(table, "read_all"):
                 table = table.read_all()
             preview_table = table.slice(0, DATASET_REVISION_PREVIEW_ROWS)
+            # Keep raw bounded values only until the schema detector has consumed them. The public
+            # presentation conversion below replaces byte values with a safe size placeholder.
+            raw_preview_rows = preview_table.to_pylist()
+            preview_columns = tag_columns(
+                normalize_column_schemas(raw["columns"]), sample_rows=raw_preview_rows,
+            )
             resolved_revision_id = str(raw["revision_id"])
             if (certification_facts is not None
                     and resolved_revision_id != certification_facts["revision_id"]):
@@ -653,7 +660,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    preview_rows = _table_to_rows(preview_table)
+    preview_rows = _table_to_rows(raw_preview_rows)
     revision_name = raw.get("name")
     if not isinstance(revision_name, str) or not revision_name:
         revision_name = metadb.managed_local_lance_revision_name(
@@ -669,7 +676,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             row_count=raw.get("row_count"), data_file_count=raw.get("data_file_count"),
             total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),
         preview=DatasetRevisionPreview(
-            columns=raw["columns"], rows=preview_rows, row_identities=row_identities,
+            columns=preview_columns, rows=preview_rows, row_identities=row_identities,
             has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
         row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
     )

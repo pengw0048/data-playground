@@ -10,7 +10,7 @@ import type {
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
-  RowIdentityCertificationPreflight, RowIdentityCertificationTask,
+  RowIdentityCertificationPreflight, RowIdentityCertificationTask, MediaCellRequest,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -108,6 +108,41 @@ async function reqVoid(path: string, opts?: RequestInit): Promise<void> {
     }
     throw new KernelError(res.status, typeof detail === 'string' ? detail : JSON.stringify(detail))
   }
+}
+
+// Media cells are the one catalog read that intentionally returns bounded bytes rather than a
+// JSON document. Keep its auth and KernelError envelope handling aligned with req(), without
+// teaching the generic JSON helper to consume a Blob response.
+async function reqBlob(path: string, opts?: RequestInit): Promise<Blob> {
+  const rawBody = opts?.body != null && typeof opts.body !== 'string'
+  const headers: Record<string, string> = {
+    ...(rawBody ? {} : { 'Content-Type': 'application/json' }),
+    ...(opts?.headers as Record<string, string>),
+  }
+  if (_userId) headers['X-DP-User'] = _userId
+  const res = await fetch(`${BASE}${path}`, { ...opts, headers })
+  if (!res.ok) {
+    let detail = res.statusText
+    let code: string | undefined
+    let retryable: boolean | undefined
+    let field: string | undefined
+    let reason: string | undefined
+    try {
+      const body = await res.json()
+      detail = body.detail ?? detail
+      code = typeof body.code === 'string' ? body.code : undefined
+      retryable = typeof body.retryable === 'boolean' ? body.retryable : undefined
+      field = typeof body.field === 'string' ? body.field : undefined
+      reason = typeof body.reason === 'string' ? body.reason : undefined
+    } catch {
+      /* A non-JSON intermediary response still becomes a truthful network/load state. */
+    }
+    throw new KernelError(
+      res.status, typeof detail === 'string' ? detail : JSON.stringify(detail),
+      code, retryable, field, reason,
+    )
+  }
+  return res.blob()
 }
 
 // Strip transient UI-only fields the kernel does not need before sending a graph.
@@ -366,6 +401,12 @@ export const api = {
   },
   datasetRevision: (datasetId: string, revisionId: string) =>
     req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
+  openMediaCell: (
+    datasetId: string, revisionId: string, body: MediaCellRequest, options?: { signal?: AbortSignal },
+  ) => reqBlob(
+    `/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/media-cell`,
+    { method: 'POST', body: JSON.stringify(body), signal: options?.signal },
+  ),
   rowIdentityCertificationPreflight: (body: { datasetId: string; revisionId: string; keyColumns: string[] }) =>
     req<RowIdentityCertificationPreflight>('/catalog/row-identity-certifications/preflight', {
       method: 'POST', body: JSON.stringify(body),

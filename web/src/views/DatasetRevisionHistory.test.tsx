@@ -5,7 +5,7 @@ import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from 
 const mocks = vi.hoisted(() => ({
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
   createDatasetView: vi.fn(), restoreRevision: vi.fn(), restoreRevisionTask: vi.fn(),
-  rowIdentityCertificationTask: vi.fn(),
+  rowIdentityCertificationTask: vi.fn(), openMediaCell: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
@@ -274,6 +274,22 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for amount' }))
     expect(await screen.findByTestId('field-evidence-amount'))
       .toHaveTextContent('retained empty-revision schema')
+  })
+
+  it('opens the stable exact certification action for uncertified binary media without a cell request', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-media', {
+      preview: {
+        columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [{ frame: '<4 bytes>' }], rowIdentities: null, hasMore: false, rowLimit: 100,
+      },
+      rowIdentity: { datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable', certificationSupported: true, fields: [], encodingVersion: null },
+    }))
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
+    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
+    expect(mocks.openMediaCell).not.toHaveBeenCalled()
   })
 
   it('never falls back to latest when the selected exact revision was compacted', async () => {

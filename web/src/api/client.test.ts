@@ -11,6 +11,34 @@ afterEach(() => {
 })
 
 describe('API error recovery contract', () => {
+  it('opens a media cell as a Blob with the normal user header and KernelError envelope', async () => {
+    setApiUser('media researcher')
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('bytes', {
+      status: 200, headers: { 'Content-Type': 'image/png' },
+    }))
+    const identity = [{ name: 'id', arrowType: 'uint64' as const, value: '18446744073709551615' }]
+
+    const blob = await api.openMediaCell('dataset / one', 'revision/one', { identity, column: 'frame' })
+
+    expect(blob.type).toBe('image/png')
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/catalog/revisions/dataset%20%2F%20one/revision%2Fone/media-cell',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ identity, column: 'frame' }),
+        headers: expect.objectContaining({ 'X-DP-User': 'media researcher' }) }),
+    )
+  })
+
+  it('parses the media-cell KernelError JSON envelope instead of attempting JSON on its success body', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      detail: 'media_cell_too_large', code: 'payload_too_large', retryable: false,
+    }), { status: 413, headers: { 'Content-Type': 'application/json' } }))
+
+    const error = await api.openMediaCell('dataset', 'revision', {
+      identity: [{ name: 'id', arrowType: 'int64', value: '9223372036854775807' }], column: 'frame',
+    }).catch((caught) => caught)
+    expect(error).toMatchObject({ status: 413, code: 'payload_too_large', retryable: false })
+  })
+
   it('preserves the stable machine code and retryability for revision recovery UI', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       detail: 'dataset_revision_provider_offline', code: 'service_unavailable', retryable: true,

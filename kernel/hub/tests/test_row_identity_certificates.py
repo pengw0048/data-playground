@@ -448,6 +448,31 @@ def test_preview_identities_canonicalize_exact_composite_values_and_feed_media_r
         assert content_type == "image/png"
 
 
+def test_exact_preview_tags_only_bounded_raw_media_evidence(local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / "raw-media.parquet"), pa.table({
+        "id": pa.array([1], pa.int32()),
+        "image": pa.array([PNG], pa.binary()),
+        "video": pa.array([b"\x1aE\xdf\xa3webm"], pa.binary()),
+        "bytes": pa.array([b"not a supported media value"], pa.binary()),
+    }))
+
+    detail = _revision_detail(monkeypatch, catalog, storage, published)
+    columns = {column.name: column for column in detail.preview.columns}
+
+    assert columns["image"].capabilities == ["media"]
+    assert columns["image"].media_kind == "image"
+    assert columns["video"].capabilities == ["media"]
+    assert columns["video"].media_kind == "video"
+    # No field-name heuristic or arbitrary binary fallback may manufacture a media capability.
+    assert columns["bytes"].capabilities == []
+    assert columns["bytes"].media_kind is None
+    assert detail.preview.rows == [{
+        "id": 1, "image": f"<{len(PNG)} bytes>", "video": "<8 bytes>",
+        "bytes": "<27 bytes>",
+    }]
+
+
 def test_preview_identity_rows_fail_closed_without_breaking_certified_proof(
         local_catalog, tmp_path, monkeypatch):
     storage, catalog = local_catalog

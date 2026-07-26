@@ -25,7 +25,7 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await page.locator('input[type="file"]').setInputFiles({
       name: uploadedName,
       mimeType: "application/vnd.apache.parquet",
-      buffer: await readFile(resolve(".e2e-workspace/data/images.parquet")),
+      buffer: await readFile(resolve(".e2e-workspace/data/binary_media.parquet")),
     });
     uploaded = (await (await uploadedResponse).json()) as UploadedDataset;
 
@@ -62,12 +62,15 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await page.goto(`/#/canvas/${canvasId}`);
     await page.locator('.react-flow__node[data-id="write"]').click();
     const inspector = page.getByTestId("inspector");
+    await inspector.getByRole("button", { name: "Run", exact: true }).click();
+    // Binary fields have no fixed-width estimate, so normal admission truthfully asks for the
+    // existing explicit publication confirmation before it starts the managed Write.
     const runResponse = page.waitForResponse(
       (response) =>
         response.url().endsWith("/api/run") &&
         response.request().method() === "POST",
     );
-    await inspector.getByRole("button", { name: "Run", exact: true }).click();
+    await page.getByRole("button", { name: "Publish revision" }).click();
     const started = await runResponse;
     expect(started.ok()).toBeTruthy();
     const { runId } = (await started.json()) as { runId: string };
@@ -111,14 +114,63 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await history.getByRole("checkbox", { name: /^id/ }).check();
     await history.getByRole("button", { name: "Check scan cost" }).click();
     await expect(history.getByText("Ordered key schema:")).toBeVisible();
+    const exactDetailUrl = `/api/catalog/revisions/${encodeURIComponent(receipt.datasetId)}/${encodeURIComponent(receipt.revisionId)}`;
+    const certifiedDetail = page.waitForResponse(
+      (response) => response.url().endsWith(exactDetailUrl)
+        && response.request().method() === "GET"
+        && response.ok(),
+    );
     await history
       .getByRole("button", {
         name: /Start certification|Confirm and start full scan/,
       })
       .click();
-    await expect(history.getByText("Certified row identity")).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(history.getByText("Certified row identity")).toBeVisible({ timeout: 30_000 });
+    const refreshed = await certifiedDetail;
+    const refreshedDetail = (await refreshed.json()) as {
+      rowIdentity: { proofStatus: string };
+      preview: { rowIdentities: Array<Array<{ name: string; arrowType: string; value: unknown }>> | null };
+    };
+    expect(refreshedDetail.rowIdentity.proofStatus).toBe("certified");
+    const identity = refreshedDetail.preview.rowIdentities?.[0];
+    if (!identity) throw new Error("certified exact detail did not include the preview row identity");
+    await expect(history.getByLabel("Certified row identity")).toBeVisible({ timeout: 30_000 });
+
+    // These are bytes inside the managed output, not direct URL fixtures. Read them only through
+    // the certified exact endpoint and prove that this browser can decode the returned Blobs.
+    await expect(history.getByText("Exact revision preview")).toBeVisible({ timeout: 30_000 });
+    const decoded = await page.evaluate(async ({ datasetId, revisionId, identity }) => {
+      const endpoint = `/api/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/media-cell`;
+      const open = async (column: string) => {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ identity, column }),
+        });
+        if (!response.ok) throw new Error(`media endpoint returned ${response.status}`);
+        return response.blob();
+      };
+      const imageUrl = URL.createObjectURL(await open("image"));
+      const videoUrl = URL.createObjectURL(await open("video"));
+      try {
+        const image = new Image();
+        image.src = imageUrl;
+        await image.decode();
+        const video = document.createElement("video");
+        video.preload = "metadata";
+        video.src = videoUrl;
+        await new Promise<void>((resolve, reject) => {
+          video.addEventListener("loadedmetadata", () => resolve(), { once: true });
+          video.addEventListener("error", () => reject(video.error), { once: true });
+        });
+        return { imageWidth: image.naturalWidth, videoReadyState: video.readyState };
+      } finally {
+        URL.revokeObjectURL(imageUrl);
+        URL.revokeObjectURL(videoUrl);
+      }
+    }, { datasetId: receipt.datasetId, revisionId: receipt.revisionId, identity });
+    expect(decoded.imageWidth).toBeGreaterThan(0);
+    expect(decoded.videoReadyState).toBeGreaterThanOrEqual(1);
 
     await page.reload();
     await expect(history.getByText("Certified row identity")).toBeVisible();

@@ -10,6 +10,7 @@ are injected at the HTTP or browser boundary, not by real credentials.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import shutil
@@ -47,6 +48,16 @@ MANIFEST = {
 
 LANCE_APPEND_TARGET = "lance-append-target"
 
+# Small deterministic browser-decodable media. Keep these in source rather than shelling out to
+# ffmpeg during CI: the E2E journey needs real byte-backed image/video cells, not a mock endpoint.
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/"
+    "9J4qAAAAAElFTkSuQmCC"
+)
+_WEBM = base64.b64decode(
+    "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwH/////////EU2bdKtNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHNTbuMU6uEElTDZ1OsggEa7AEAAAAAAABoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmpyrXsYMPQkBNgI1MYXZmNjIuMTIuMTAyV0GNTGF2ZjYyLjEyLjEwMhZUrmvIrgEAAAAAAAA/14EBc8WIHcTZ1y9/gTecgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4QF9eEA4JCwgRC6gRCagQJVsIRVuYEBElTDZ9hzc6BjwIBnyJpFo4dFTkNPREVSRIeNTGF2ZjYyLjEyLjEwMnNzsmPAi2PFiB3E2dcvf4E3Z8ihRaOHRU5DT0RFUkSHlExhdmM2Mi4yOC4xMDIgbGlidnB4H0O2dUDM54EAo72BAACA8AIAnQEqEAAQAABHCIWFiJmEiAICAnWqA/gD+gINTe4A/v1u8//kb+PnRv/I4//8Sp7jieP//EaAo6yBAGQAsQEAARAQABgAMD/0DADvAP79bvP/5G/j50b/yOP//Eqe44nj//xGgKOsgQDIALEBAAEQEAAYADA/9AwA7wD+/W7z/+Rv4+dG/8jj//xKnuOJ4//8RoCjrIEBLACxAQABEBAAGAAwP/QMAO8A/v1u8//kb+PnRv/I4//8Sp7jieP//EaA"
+)
+
 
 def _write_csv(path: Path, fields: list[str], rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +82,14 @@ def _seed_starter_data(output: Path) -> None:
     events_parquet = output / "events.parquet"
     lance.write_dataset(pq.read_table(events_parquet), str(output / "events.lance"))
     events_parquet.unlink()
+    # The ordinary images fixture intentionally contains public URLs. This separate exact-media
+    # source proves the browser journey against retained binary cells through the bounded endpoint.
+    import pyarrow as pa  # noqa: PLC0415 - available through the kernel runtime used by this script
+
+    pq.write_table(
+        pa.table({"id": pa.array([1], pa.int64()), "image": [_PNG], "video": [_WEBM]}),
+        output / "binary_media.parquet",
+    )
 
 
 def _build_lance_append_target(workspace: Path) -> None:
