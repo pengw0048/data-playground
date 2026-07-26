@@ -5213,11 +5213,11 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
     release_timeout = threading.Event()
     virtual_timeout_fired = threading.Event()
     real_monotonic = time.monotonic
-    frozen_at = real_monotonic()
+    frozen_at = real_monotonic() - 1000
     headless_thread_ids = []
     headless_real_clock = []
     handoff_thread_ids = []
-    handoff_real_clock = []
+    handoff_clock_samples = []
 
     def scoped_monotonic():
         # Only the thread executing _headless_run sees the frozen submission clock. Advance it once after
@@ -5240,7 +5240,7 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
 
         def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
             handoff_thread_ids.append(threading.get_ident())
-            handoff_real_clock.append(time.monotonic())
+            handoff_clock_samples.append((time.monotonic(), real_monotonic()))
             try:
                 entered.set()
                 assert cancelled is not None
@@ -5248,7 +5248,7 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
                     time.sleep(0.01)
                 return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
             finally:
-                handoff_real_clock.append(time.monotonic())
+                handoff_clock_samples.append((time.monotonic(), real_monotonic()))
 
     slow = _SlowRegionAdapter()
     monkeypatch.setattr(d, "resolve_adapter",
@@ -5266,9 +5266,10 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
             result["error"] = exc
 
     worker = threading.Thread(target=run_headless, daemon=True)
+    handoff_entered = False
     try:
         worker.start()
-        assert entered.wait(timeout=30), "CLI cancelled before the region handoff entered write"
+        handoff_entered = entered.wait(timeout=30)
     finally:
         # Let the virtual timeout elapse even if the entry assertion fails, then require the owned worker
         # to finish so this test cannot leak a blocked controller thread into later tests.
@@ -5277,12 +5278,17 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
         metadb.set_setting("backend", previous_backend, "global")
 
     assert not worker.is_alive(), "headless timeout did not finish cancellation"
-    assert "error" not in result, repr(result.get("error"))
+    worker_error = result.get("error")
+    if worker_error is not None:
+        assert isinstance(worker_error, BaseException)
+        raise worker_error
+    assert handoff_entered, "CLI cancelled before the region handoff entered write"
     assert virtual_timeout_fired.is_set(), "test never advanced the headless timeout clock"
     assert len(headless_real_clock) >= 2 and headless_real_clock[-1] > headless_real_clock[0], (
         "cancel acknowledgement did not advance on the real headless clock")
     assert handoff_thread_ids and handoff_thread_ids[0] != headless_thread_ids[0]
-    assert len(handoff_real_clock) == 2 and handoff_real_clock[1] > handoff_real_clock[0], (
+    assert len(handoff_clock_samples) == 2
+    assert all(0 <= actual - patched < 1 for patched, actual in handoff_clock_samples), (
         "virtual headless time leaked into the handoff worker")
     code = result.get("code")
 
