@@ -532,6 +532,33 @@ class DatasetRevisionPreview(Wire):
     row_limit: Literal[100] = 100
 
 
+class DatasetRevisionRowIdentityField(Wire):
+    """One ordered, certified logical row-identity field for an exact revision."""
+    name: str = Field(min_length=1, max_length=256)
+    arrow_type: Literal[
+        "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64", "string",
+    ]
+
+
+class DatasetRevisionRowIdentity(Wire):
+    """Bounded availability of logical row-addressed reads for one exact revision."""
+    dataset_id: str = Field(min_length=1, max_length=512)
+    revision_id: str = Field(min_length=1, max_length=256)
+    proof_status: Literal["certified", "unavailable"]
+    fields: list[DatasetRevisionRowIdentityField] = Field(default_factory=list, max_length=32)
+    encoding_version: Literal["row-identity-v1"] | None = None
+
+    @model_validator(mode="after")
+    def _validate_proof_shape(self) -> "DatasetRevisionRowIdentity":
+        if self.proof_status == "certified":
+            if not self.fields or self.encoding_version is None:
+                raise ValueError("certified row identity requires fields and encoding")
+        elif self.fields or self.encoding_version is not None:
+            raise ValueError("unavailable row identity cannot expose a descriptor")
+        return self
+
+
 class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
     dataset_id: str = Field(min_length=1, max_length=512)
@@ -543,6 +570,7 @@ class DatasetRevisionDetail(Wire):
     producer_operation: str | None = Field(default=None, max_length=128)
     summary: DatasetRevisionSummary
     preview: DatasetRevisionPreview
+    row_identity: DatasetRevisionRowIdentity
 
 
 class CatalogPublicationReceipt(Wire):

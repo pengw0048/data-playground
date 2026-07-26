@@ -92,6 +92,8 @@ class SparseOutputPreparation:
     base_schema: pa.Schema
     sidecar_schema: pa.Schema
     identity_columns: tuple[str, ...]
+    artifact_dev: int
+    artifact_ino: int
 
 
 @dataclass(frozen=True)
@@ -131,10 +133,13 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
             input_dataset_id=prepared.dataset_ref.dataset_id,
             input_revision_id=prepared.dataset_ref.revision_id,
             documents=prepared.documents, digests=prepared.digests,
-            row_identity_spec_sha256=prepared.row_identity_spec_sha256)
+            row_identity_spec_sha256=prepared.row_identity_spec_sha256,
+            artifact_dev=prepared.artifact_dev, artifact_ino=prepared.artifact_ino)
     except metadb.SparseOutputSubmissionConflict as exc:
         raise SparseOutputSubmissionConflict(
             "SparseOutput submission belongs to a different immutable admission") from exc
+    except ValueError as exc:
+        raise SparseOutputValidationError("SparseOutput row identity is invalid") from exc
     return SparseOutputAdmission(id=document["id"], created=created, document=document)
 
 
@@ -154,7 +159,11 @@ def prepare_sparse_output_admission(
         raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable")
     try:
         with db.base_guard(), source_read_scope(
-                storage, [artifact_uri], owner=f"sparse-output-preflight:{uuid.uuid4().hex}"):
+                storage, [artifact_uri],
+                owner=f"sparse-output-preflight:{uuid.uuid4().hex}") as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                raise OSError("SparseOutput exact base identity is unavailable")
+            artifact_info = os.fstat(guards[0].artifact_fileno())
             base = DuckDBAdapter().scan(artifact_uri)
             validated = validate_fragment(FragmentKind.PROJECTION, expression, con=db.conn())
             if any(function.name.lower() == "row_number" for function in validated.functions):
@@ -182,7 +191,8 @@ def prepare_sparse_output_admission(
         owner_id=owner_id, canvas_id=canvas_id, submission_id=submission_id,
         dataset_ref=dataset_ref, documents=documents, digests=digests,
         row_identity_spec_sha256=frozen_spec.digest, base_schema=base_schema,
-        sidecar_schema=output_schema, identity_columns=identity_columns)
+        sidecar_schema=output_schema, identity_columns=identity_columns,
+        artifact_dev=int(artifact_info.st_dev), artifact_ino=int(artifact_info.st_ino))
 
 
 def materialize_sparse_output(
