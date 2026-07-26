@@ -140,7 +140,7 @@ def review_related_dataset_revision(
     """
     page = related_datasets(
         catalog, resolve_adapter, storage, source_identity, q=q, folder=folder,
-        limit=MAX_RELATED_DATASETS)
+        limit=MAX_RELATED_DATASETS, _measure_cardinality=False)
     base = next((item for item in page.candidates
                  if _stable_identity_matches(item.identity, candidate.identity)
                  and item.evidence == candidate.evidence
@@ -177,7 +177,7 @@ def review_related_dataset_revision(
         "identity": selected_identity,
         "exact_ref": exact_ref,
         "cardinality": declared_cardinality,
-        "cardinality_state": "measured" if declared_cardinality != "unknown" else "unmeasured",
+        "cardinality_state": "available" if declared_cardinality != "unknown" else "unmeasured",
         "cardinality_reason": None if declared_cardinality != "unknown" else (
             "Fan-out was not measured because this join uses an exact revision; "
             "measuring it would require scanning the pinned dataset."
@@ -387,8 +387,9 @@ def _fanout(cardinality: str) -> str | None:
 
 
 def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDatasetIdentity, *,
-                     q: str | None = None, folder: str | None = None, limit: int = 10) -> RelatedDatasetPage:
-    """Return a bounded, ranked candidate page and measure only its visible candidates."""
+                     q: str | None = None, folder: str | None = None, limit: int = 10,
+                     _measure_cardinality: bool = True) -> RelatedDatasetPage:
+    """Return a bounded, ranked candidate page; normal discovery measures only visible candidates."""
     source = _source_from_identity(catalog, dataset, resolve_adapter)
     bounded = max(1, min(int(limit), MAX_RELATED_DATASETS))
     scope = _scope_page(catalog, q=q, folder=folder)
@@ -534,7 +535,7 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                            owner=f"related-datasets:{source.dataset_id}"):
         for seed in visible:
             cardinality = seed.declared_cardinality
-            cardinality_state = "measured" if cardinality != "unknown" else "unmeasured"
+            cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
             cardinality_reason = None
             # A current-head measurement must never be presented as evidence for an exact review.
             # Keep an owner-declared cardinality, but do not scan an exact revision merely to fill
@@ -546,14 +547,14 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                     "Fan-out was not measured because this join uses an exact revision; "
                     "measuring it would require scanning the pinned dataset."
                 )
-            elif cardinality == "unknown":
+            elif cardinality == "unknown" and _measure_cardinality:
                 try:
                     left = relationships.measure_unique(source.uri, seed.left_columns, resolve_adapter)[0]
                     right = relationships.measure_unique(seed.table.uri, seed.right_columns, resolve_adapter)[0]
                     cardinality = relationships.cardinality(left, right)
                 except Exception:
                     cardinality = "unknown"
-                cardinality_state = "measured" if cardinality != "unknown" else "unmeasured"
+                cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
             candidates.append(RelatedDatasetCandidate(
                 identity=seed.identity, name=seed.table.name,
                 folder=seed.table.folder, reason=seed.reason, evidence=seed.evidence,

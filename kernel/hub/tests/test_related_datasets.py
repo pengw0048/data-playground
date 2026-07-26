@@ -673,13 +673,69 @@ def test_retained_revision_picker_uses_bounded_history_and_rechecks_exact_schema
         catalog, lambda _uri: _UnavailableAdapter(),
         RelatedDatasetIdentity(kind="local", registration_id=target.registration_id), limit=20)
     assert [(item.dataset_id, item.revision_id) for item in revisions.items] == [("logical-users", "v2")]
+    measured: list[str] = []
+
+    def fail_if_measured(uri, *_args, **_kwargs):
+        measured.append(uri)
+        raise AssertionError("exact revision review must not measure cardinality")
+
+    monkeypatch.setattr(related.relationships, "measure_unique", fail_if_measured)
     exact = related.review_related_dataset_revision(
         catalog, lambda _uri: _UnavailableAdapter(), None, page.source, candidate, "v2")
+    assert measured == []
     assert exact.identity.revision_mode == "exact" and exact.identity.revision_id == "v2"
     assert exact.exact_ref is not None and exact.exact_ref.dataset_id == "logical-users"
     assert exact.cardinality == "unknown"
     assert exact.cardinality_state == "unmeasured"
     assert exact.cardinality_reason and "exact revision" in exact.cardinality_reason
+
+
+def test_exact_review_keeps_declared_cardinality_without_measuring(monkeypatch):
+    from hub import related_datasets as related
+
+    source = _table("events", [ColumnSchema(name="user_id", type="int")])
+    target = _table("users", [ColumnSchema(name="id", type="int")])
+
+    class Revisions:
+        retention_owner = "provider"
+
+        def revision_history(self, *_args, **_kwargs):
+            raise AssertionError("not used by exact review")
+
+        def revision_detail(self, uri, revision_id, *, preview_limit):
+            assert uri == target.uri and revision_id == "v2" and preview_limit == 1
+            return {"revision_id": "v2", "columns": [{"name": "id", "type": "int"}]}
+
+        def resolve_revision(self, *_args, **_kwargs):
+            raise AssertionError("not used by exact review")
+
+        def open_revision(self, *_args, **_kwargs):
+            raise AssertionError("not used by exact review")
+
+    adapter = Revisions()
+    monkeypatch.setattr(related, "revision_adapter_for_uri",
+                        lambda uri, _resolve: adapter if uri == target.uri else _UnavailableAdapter())
+    monkeypatch.setattr(related.metadb, "catalog_revision_binding_for_uri",
+                        lambda uri: {"dataset_id": "logical-users"} if uri == target.uri else None)
+    catalog = _Catalog([source, target], [Relationship(
+        left_uri=source.uri, left_columns=["user_id"], right_uri=target.uri,
+        right_columns=["id"], cardinality="1:N",
+    )])
+    page = related_datasets(catalog, lambda _uri: _UnavailableAdapter(), None, source.registration_id)
+    candidate = next(item for item in page.candidates if item.name == "users")
+
+    def fail_if_measured(*_args, **_kwargs):
+        raise AssertionError("exact revision review must not measure cardinality")
+
+    monkeypatch.setattr(related.relationships, "measure_unique", fail_if_measured)
+    exact = related.review_related_dataset_revision(
+        catalog, lambda _uri: _UnavailableAdapter(), None, page.source, candidate, "v2")
+
+    assert exact.cardinality == "1:N"
+    assert exact.cardinality_state == "available"
+    assert exact.cardinality_reason is None
+    assert exact.confidence == "declared"
+    assert exact.warning == "This join may multiply rows; inspect the resulting Join analysis before running."
 
 
 def test_provider_row_reference_conflict_uses_canonical_provider_identity(monkeypatch):

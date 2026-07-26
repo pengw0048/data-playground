@@ -578,7 +578,7 @@ export interface RelatedDatasetCandidate {
   leftColumns: string[]
   rightColumns: string[]
   cardinality: Cardinality
-  cardinalityState: 'measured' | 'unmeasured'
+  cardinalityState: 'available' | 'unmeasured'
   cardinalityReason?: string | null
   confidence: 'declared' | 'verified' | 'inferred'
   exactRef?: ExactDatasetRef | null

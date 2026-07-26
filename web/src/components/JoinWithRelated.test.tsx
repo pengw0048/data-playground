@@ -45,7 +45,7 @@ const page = {
     name: 'orders', folder: '', reason: 'matching key column(s) — cardinality not measurable here',
     evidence: 'schema_match', evidenceStatus: 'inferred',
     leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:N',
-    cardinalityState: 'measured',
+    cardinalityState: 'available',
     confidence: 'verified', warning: 'This join is 1:N: right fans out, so rows may multiply.',
   }],
   excluded: [],
