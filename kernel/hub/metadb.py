@@ -25,7 +25,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index,
@@ -38,6 +38,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from hub.models import (
     ColumnSchema, DatasetRevisionRowIdentity, SchemaCompatibility, SchemaFieldCompatibility,
+    ROW_IDENTITY_FIELD_NAME_MAX,
 )
 from hub.settings import settings
 
@@ -655,7 +656,8 @@ class DurableTask(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'restore_revision_write','keyed_upsert_write','distribution_report')",
+            "'restore_revision_write','keyed_upsert_write','distribution_report',"
+            "'row_identity_certification')",
             name="ck_durable_task_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
@@ -666,9 +668,14 @@ class DurableTask(Base):
             "AND dataset_view_id IS NULL AND target_node_id = 'restore-revision') OR "
             "(task_kind = 'keyed_upsert_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'keyed-upsert') OR "
+            "(task_kind = 'row_identity_certification' AND canvas_id IS NULL "
+            "AND dataset_view_id IS NULL AND target_node_id = 'row-identity-certification' "
+            "AND execution_manifest_sha256 IS NULL AND graph_doc IS NULL "
+            "AND write_intent IS NULL) OR "
             "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL AND target_node_id = 'managed-sidecar-merge') OR "
-            "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write') "
+            "(task_kind NOT IN ('distribution_report','restore_revision_write','keyed_upsert_write',"
+            "'row_identity_certification') "
             "AND canvas_id IS NOT NULL AND target_node_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_subject"),
         UniqueConstraint(
@@ -768,16 +775,19 @@ class DurableTaskInboxItem(Base):
         CheckConstraint(
             "task_kind IN ('managed_local_write','external_wait',"
             "'linear_checkpoint_write','bounded_fanout_write','merge_columns_write',"
-            "'distribution_report','restore_revision_write','keyed_upsert_write')",
+            "'distribution_report','restore_revision_write','keyed_upsert_write',"
+            "'row_identity_certification')",
             name="ck_durable_task_inbox_kind"),
         CheckConstraint(
             "(task_kind = 'distribution_report' AND canvas_id IS NULL "
             "AND dataset_view_id IS NOT NULL) OR "
-            "(task_kind IN ('restore_revision_write','keyed_upsert_write') "
+            "(task_kind IN ('restore_revision_write','keyed_upsert_write',"
+            "'row_identity_certification') "
             "AND canvas_id IS NULL AND dataset_view_id IS NULL) OR "
             "(task_kind = 'merge_columns_write' AND canvas_id IS NULL "
             "AND dataset_view_id IS NULL) OR (task_kind NOT IN "
-            "('distribution_report','restore_revision_write','keyed_upsert_write') "
+            "('distribution_report','restore_revision_write','keyed_upsert_write',"
+            "'row_identity_certification') "
             "AND canvas_id IS NOT NULL AND dataset_view_id IS NULL)",
             name="ck_durable_task_inbox_subject"),
         CheckConstraint(
@@ -894,6 +904,40 @@ class KeyedUpsertTaskEnvelope(Base):
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     __table_args__ = (
         UniqueConstraint("write_idempotency_key", name="uq_keyed_upsert_write_key"),
+    )
+
+
+class RowIdentityCertificationTaskEnvelope(Base):
+    """Frozen exact-revision proof admission plus its bounded terminal receipt."""
+    __tablename__ = "row_identity_certification_task_envelopes"
+    task_id: Mapped[str] = mapped_column(
+        String, ForeignKey("durable_tasks.id"), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    keys_doc: Mapped[str] = mapped_column(Text, nullable=False)
+    schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    supported: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    confirmation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    estimated_rows: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    estimated_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    receipt_doc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        CheckConstraint("length(schema_sha256) = 64", name="ck_row_identity_task_schema_sha"),
+        CheckConstraint("length(spec_sha256) = 64", name="ck_row_identity_task_spec_sha"),
+        CheckConstraint(
+            "length(confirmation_sha256) = 64", name="ck_row_identity_task_confirm_sha"),
+        CheckConstraint(
+            "estimated_rows IS NULL OR estimated_rows >= 0",
+            name="ck_row_identity_task_estimated_rows"),
+        CheckConstraint(
+            "estimated_bytes IS NULL OR estimated_bytes >= 0",
+            name="ck_row_identity_task_estimated_bytes"),
     )
 
 
@@ -6578,11 +6622,12 @@ _JOBS_HIDDEN_TASK_KINDS = frozenset({"distribution_report"})
 _INBOX_PRODUCER_KINDS = frozenset({
     "managed_local_write", "external_wait", "linear_checkpoint_write",
     "bounded_fanout_write", "merge_columns_write", "distribution_report",
-    "restore_revision_write", "keyed_upsert_write",
+    "restore_revision_write", "keyed_upsert_write", "row_identity_certification",
 })
 # Canvas-less durable tasks whose Jobs/Inbox subject is a dataset revision history, not a canvas.
 _DATASET_SCOPED_TASK_KINDS = frozenset({
     "restore_revision_write", "keyed_upsert_write", "merge_columns_write",
+    "row_identity_certification",
 })
 # Inbox generic write copy is reserved for Canvas-owned publication tasks. Dataset-scoped outcomes
 # keep their revision-history subject instead of pretending to be a newly named Canvas output.
@@ -6648,6 +6693,15 @@ _INBOX_DIAGNOSTIC_ALLOWLIST = {
         "stale_expected_head",
         "revision_unavailable",
     }),
+    "row_identity_certification": frozenset({
+        "durable_task_attempts_exhausted",
+        "conflicting_retained_spec",
+        "duplicate_key",
+        "null_key",
+        "unsupported_type",
+        "stale_or_unavailable_revision",
+        "failed",
+    }),
 }
 _INBOX_DIAGNOSTIC_FALLBACK = {
     "managed_local_write": "managed_local_write_failed",
@@ -6658,6 +6712,7 @@ _INBOX_DIAGNOSTIC_FALLBACK = {
     "distribution_report": "distribution_report_failed",
     "restore_revision_write": "restore_write_failed",
     "keyed_upsert_write": "keyed_upsert_write_failed",
+    "row_identity_certification": "row_identity_certification_failed",
 }
 
 
@@ -6776,30 +6831,49 @@ def _dataset_context_from_write_intent(task_kind: str, write_intent: str | None)
     }
 
 
+def _dataset_context_from_task(s, task: DurableTask) -> dict | None:
+    if task.task_kind == "row_identity_certification":
+        envelope = s.get(RowIdentityCertificationTaskEnvelope, task.id)
+        if envelope is None:
+            raise RuntimeError("row identity certification dataset context is unavailable")
+        query = urlencode({
+            "scope": "datasets",
+            "revision": envelope.revision_id,
+            "revisionDataset": envelope.dataset_id,
+        })
+        return {
+            "task_kind": task.task_kind,
+            "dataset_id": envelope.dataset_id,
+            "revision_id": envelope.revision_id,
+            "name": envelope.dataset_name,
+            "deep_link": (
+                f"#/workspace/{quote(f'dataset:{envelope.dataset_id}', safe='')}?{query}"),
+        }
+    return _dataset_context_from_write_intent(task.task_kind, task.write_intent)
+
+
 def _durable_task_dataset_context(s, task_id: str) -> dict | None:
     """Frozen dataset subject for one canvas-less dataset-scoped durable Task, or ``None``."""
     task = s.get(DurableTask, str(task_id))
     if task is None:
         return None
-    return _dataset_context_from_write_intent(task.task_kind, task.write_intent)
+    return _dataset_context_from_task(s, task)
 
 
 def _inbox_dataset_contexts(s, task_ids: set[str]) -> dict[str, dict]:
     """Map dataset-scoped Inbox task ids to their frozen dataset subject in one query."""
     if not task_ids:
         return {}
-    rows = s.execute(select(
-        DurableTask.id, DurableTask.task_kind, DurableTask.write_intent,
-    ).where(
+    rows = list(s.scalars(select(DurableTask).where(
         DurableTask.id.in_(task_ids),
         DurableTask.task_kind.in_(_DATASET_SCOPED_TASK_KINDS),
         DurableTask.canvas_id.is_(None),
-    )).all()
+    )))
     contexts: dict[str, dict] = {}
-    for task_id, task_kind, write_intent in rows:
-        context = _dataset_context_from_write_intent(task_kind, write_intent)
+    for task in rows:
+        context = _dataset_context_from_task(s, task)
         if context is not None:
-            contexts[task_id] = context
+            contexts[task.id] = context
     return contexts
 
 
@@ -7032,6 +7106,13 @@ def keyed_upsert_submission_id(uid: str, submission_id: str) -> str:
         f"keyed-upsert-write-v1\0{uid}\0{str(submission_id).lower()}".encode()).hexdigest()[:48]
 
 
+def row_identity_certification_submission_id(uid: str, submission_id: str) -> str:
+    """Deterministic owner+submission identity for one exact-revision certification Task."""
+    return "ric_" + hashlib.sha256(
+        f"row-identity-certification-v1\0{uid}\0{str(submission_id).lower()}".encode()
+    ).hexdigest()[:48]
+
+
 def managed_sidecar_merge_submission_id(uid: str, submission_id: str) -> str:
     """Deterministic owner+submission identity for a canvas-less exact-sidecar merge Task."""
     return "msm_" + hashlib.sha256(
@@ -7145,6 +7226,37 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
             "target_node_id": task.target_node_id, "target_port_id": None,
             "upsert_intent": json.loads(envelope.upsert_intent_doc),
             "upsert_evidence": json.loads(envelope.evidence_doc),
+        }
+    if task.task_kind == "row_identity_certification":
+        envelope = s.get(RowIdentityCertificationTaskEnvelope, task.id)
+        if envelope is None or task.input_manifest is None:
+            raise RuntimeError("row identity certification durable admission is incomplete")
+        try:
+            keys = json.loads(envelope.keys_doc)
+            input_manifest = json.loads(task.input_manifest)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("row identity certification durable admission is invalid") from exc
+        if (not isinstance(keys, list) or not keys
+                or any(not isinstance(key, str) or not key for key in keys)
+                or input_manifest != [{
+                    "node_id": "row-identity-certification",
+                    "dataset_id": envelope.dataset_id,
+                    "revision_id": envelope.revision_id,
+                    "provider": "managed-local-file",
+                }]):
+            raise RuntimeError("row identity certification durable admission is invalid")
+        return {
+            "graph_doc": None, "input_manifest": input_manifest, "write_intent": None,
+            "target_node_id": task.target_node_id, "target_port_id": None,
+            "row_identity_certification": {
+                "dataset_id": envelope.dataset_id,
+                "revision_id": envelope.revision_id,
+                "keys": keys,
+                "schema_sha256": envelope.schema_sha256,
+                "spec_sha256": envelope.spec_sha256,
+                "supported": envelope.supported,
+                "confirmation_sha256": envelope.confirmation_sha256,
+            },
         }
     if task.task_kind == "merge_columns_write":
         envelope = s.get(MergeColumnsTaskEnvelope, task.id, with_for_update=True)
@@ -7829,6 +7941,118 @@ def submit_keyed_upsert_task(
         return _durable_task_doc(s, task), True
 
 
+def submit_row_identity_certification_task(
+        *, uid: str, submission_id: str, dataset_id: str, revision_id: str,
+        dataset_name: str | None, keys: list[str], schema_sha256: str, spec_sha256: str,
+        supported: bool, confirmation_sha256: str,
+        estimated_rows: int | None, estimated_bytes: int | None,
+        artifact_uri: str, max_attempts: int = 3) -> tuple[dict, bool]:
+    """Atomically admit one frozen exact managed-local certification on generic Task primitives."""
+    submission = str(submission_id).lower()
+    uid, dataset_id, revision_id = str(uid), str(dataset_id), str(revision_id)
+    if (not submission or len(submission) > 128 or submission != submission.strip()
+            or "\x00" in submission):
+        raise ValueError("row identity certification submission id is invalid")
+    if (not dataset_id or len(dataset_id) > 128 or not revision_id or len(revision_id) > 256
+            or any(not isinstance(value, str) or not value
+                   or len(value) > ROW_IDENTITY_FIELD_NAME_MAX
+                   for value in keys)
+            or not 1 <= len(keys) <= 16 or len(set(keys)) != len(keys)):
+        raise ValueError("row identity certification identity is invalid")
+    if (dataset_name is not None
+            and (not dataset_name or len(dataset_name) > 512 or "\x00" in dataset_name)):
+        raise ValueError("row identity certification dataset name is invalid")
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (
+            schema_sha256, spec_sha256, confirmation_sha256)):
+        raise ValueError("row identity certification digest is invalid")
+    if type(supported) is not bool:
+        raise ValueError("row identity certification support fact is invalid")
+    if any(value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0)
+            for value in (estimated_rows, estimated_bytes)):
+        raise ValueError("row identity certification estimate is invalid")
+    if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+            or not 1 <= max_attempts <= 3):
+        raise ValueError("row identity certification max attempts is invalid")
+    keys_doc = json.dumps(keys, separators=(",", ":"), ensure_ascii=False)
+    input_manifest = [{
+        "node_id": "row-identity-certification",
+        "dataset_id": dataset_id,
+        "revision_id": revision_id,
+        "provider": "managed-local-file",
+    }]
+    input_doc = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
+    request_sha = hashlib.sha256(json.dumps({
+        "datasetId": dataset_id, "revisionId": revision_id, "keys": keys,
+        "schemaSha256": schema_sha256, "specSha256": spec_sha256,
+        "supported": supported,
+        "confirmationSha256": confirmation_sha256,
+    }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    task_id = row_identity_certification_submission_id(uid, submission)
+    target = "row-identity-certification"
+    with session() as s:
+        user = s.get(User, uid, with_for_update=True)
+        if user is None:
+            raise RuntimeError("row identity certification owner does not exist")
+        if s.get_bind().dialect.name == "sqlite":
+            s.execute(update(User).where(User.id == uid).values(created_at=User.created_at))
+        now = _durable_task_db_now(s)
+        existing = s.get(DurableTask, task_id, with_for_update=True)
+        if existing is not None:
+            envelope = s.get(
+                RowIdentityCertificationTaskEnvelope, task_id, with_for_update=True)
+            if (envelope is None or existing.owner_id != uid
+                    or existing.task_kind != "row_identity_certification"
+                    or existing.submission_id != submission
+                    or existing.intent_sha256 != request_sha
+                    or envelope.dataset_id != dataset_id
+                    or envelope.revision_id != revision_id
+                    or envelope.keys_doc != keys_doc
+                    or envelope.schema_sha256 != schema_sha256
+                    or envelope.spec_sha256 != spec_sha256
+                    or envelope.supported != supported
+                    or envelope.confirmation_sha256 != confirmation_sha256):
+                raise DurableTaskSubmissionConflict(
+                    "row identity certification submission does not match its frozen admission")
+            return _durable_task_doc(s, existing), False
+        # Do not lock the artifact ahead of ``sync_local_result_owner``. Source guards acquire the
+        # lifecycle registry before the artifact; taking these in the opposite order deadlocks a
+        # concurrent request still finishing preflight. The sync below takes the canonical
+        # registry -> revision -> artifact order and revalidates readiness before admission commits.
+        revision = s.get(ManagedLocalFileRevision, revision_id)
+        artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
+                    if revision is not None and revision.logical_id == dataset_id else None)
+        if (revision is None or artifact is None or artifact.state != "ready"
+                or revision.artifact_uri != str(artifact_uri)):
+            raise ValueError("row identity certification exact revision is unavailable")
+        task = DurableTask(
+            id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
+            submission_id=submission, intent_sha256=request_sha, target_node_id=target,
+            task_kind="row_identity_certification", execution_manifest_sha256=None,
+            backend_kind="local", graph_doc=None, input_manifest=input_doc, write_intent=None,
+            status="queued", status_doc=json.dumps(_task_status_doc(task_id, target), default=str),
+            max_attempts=max_attempts, created_at=now, updated_at=now)
+        envelope = RowIdentityCertificationTaskEnvelope(
+            task_id=task_id, dataset_id=dataset_id, revision_id=revision_id,
+            dataset_name=dataset_name, keys_doc=keys_doc, schema_sha256=schema_sha256,
+            spec_sha256=spec_sha256, supported=supported,
+            confirmation_sha256=confirmation_sha256,
+            estimated_rows=estimated_rows, estimated_bytes=estimated_bytes,
+            created_at=now, updated_at=now)
+        s.add(task)
+        s.flush()
+        s.add_all((DurableTaskAttempt(
+            id=uuid.uuid4().hex, task_id=task_id, attempt_number=1,
+            status="queued", created_at=now), envelope))
+        try:
+            s.flush()
+            sync_local_result_owner(s, "durable_task", task_id, input_manifest)
+        except IntegrityError as exc:
+            raise DurableTaskSubmissionConflict(
+                "row identity certification submission conflicts") from exc
+        return _durable_task_doc(s, task), True
+
+
 def submit_linear_checkpoint_task(
         *, uid: str, canvas_id: str, submission_id: str,
         final_target_node_id: str, checkpoint_id: str, checkpoint_node_id: str,
@@ -8225,6 +8449,23 @@ def _finish_task_with_landed_write_receipt(s, task, attempt, now) -> bool:
     return True
 
 
+def _row_identity_certification_receipt(
+        task: DurableTask, envelope: RowIdentityCertificationTaskEnvelope, outcome: str, *,
+        certificate: object | None = None) -> str:
+    value = {
+        "schemaVersion": 1,
+        "taskId": task.id,
+        "datasetId": envelope.dataset_id,
+        "revisionId": envelope.revision_id,
+        "schemaSha256": envelope.schema_sha256,
+        "specSha256": envelope.spec_sha256,
+        "keyColumns": json.loads(envelope.keys_doc),
+        "outcome": outcome,
+        "certificate": certificate,
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
 def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.datetime) -> None:
     if task.task_kind == "distribution_report":
         report = s.get(DistributionReportEnvelope, task.id, with_for_update=True)
@@ -8242,6 +8483,19 @@ def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.dateti
         if (envelope.producer_kind == "managed-sidecar"
                 and not _managed_sidecar_task_requires_input_refs(task)):
             _drop_local_result_owner(s, "durable_task", task.id)
+    elif task.task_kind == "row_identity_certification":
+        envelope = s.get(
+            RowIdentityCertificationTaskEnvelope, task.id, with_for_update=True)
+        if envelope is None:
+            raise RuntimeError("row identity certification envelope is unavailable")
+        if task.status not in _TERMINAL_RUN:
+            raise RuntimeError("row identity certification envelope has no terminal task state")
+        if envelope.receipt_doc is None:
+            outcome = "cancelled" if task.status == "cancelled" else "failed"
+            envelope.receipt_doc = _row_identity_certification_receipt(
+                task, envelope, outcome)
+        envelope.updated_at = envelope.completed_at = now
+        _drop_local_result_owner(s, "durable_task", task.id)
 
 
 def _claim_durable_task_kind(
@@ -8341,6 +8595,11 @@ def claim_restore_revision_task(task_id: str, owner_token: str) -> dict | None:
 def claim_keyed_upsert_task(task_id: str, owner_token: str) -> dict | None:
     """Claim one keyed-upsert Task under its dedicated recovery/worker path."""
     return _claim_durable_task_kind(task_id, owner_token, "keyed_upsert_write")
+
+
+def claim_row_identity_certification_task(task_id: str, owner_token: str) -> dict | None:
+    """Claim one exact-revision certification Task on the shared durable lease."""
+    return _claim_durable_task_kind(task_id, owner_token, "row_identity_certification")
 
 
 def durable_task_attempt_should_stop(task_id: str, attempt_id: str, owner_token: str) -> bool:
@@ -8504,6 +8763,123 @@ def finish_durable_task_attempt(
                              else None),
             now=now)
         return True
+
+
+def _finish_row_identity_certification_in_session(
+        s, task: DurableTask, attempt: DurableTaskAttempt,
+        envelope: RowIdentityCertificationTaskEnvelope, *, status: str, outcome: str,
+        diagnostic_code: str | None, certificate: object | None = None) -> bool:
+    now = _durable_task_db_now(s)
+    attempt.status = status
+    attempt.progress = 1.0 if status == "done" else attempt.progress
+    attempt.error = diagnostic_code
+    attempt.completed_at = now
+    attempt.lease_until = now
+    task.status = status
+    task.progress = attempt.progress
+    task.error = diagnostic_code
+    # Certification is inspection work, not a graph publication.  A successful ordinary
+    # targeted RunStatus requires committed outputs, so keep its generic status document
+    # untargeted while the durable Task itself retains the certification target identity.
+    status_doc = _task_status_doc(task.id, None, status)
+    status_doc["progress"] = task.progress
+    status_doc["error"] = diagnostic_code
+    task.status_doc = json.dumps(status_doc, default=str)
+    task.completed_at = task.updated_at = now
+    envelope.receipt_doc = _row_identity_certification_receipt(
+        task, envelope, outcome, certificate=certificate)
+    _terminalize_hidden_task_envelope(s, task, now)
+    _emit_durable_task_inbox_item(
+        s, task=task, attempt=attempt, task_status=status,
+        diagnostic_code=diagnostic_code, now=now)
+    return True
+
+
+def finish_row_identity_certification_scan(
+        task_id: str, attempt_id: str, owner_token: str, certificate: object, *,
+        artifact_dev: int, artifact_ino: int) -> bool:
+    """Atomically retain a complete proof and its terminal Task receipt, or retain neither."""
+    from hub.models import ExactDatasetRef
+    from hub.row_identity import decode_row_identity_coverage
+
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        envelope = s.get(
+            RowIdentityCertificationTaskEnvelope, str(task_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until if attempt is not None else None
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task is None or attempt is None or envelope is None
+                or task.task_kind != "row_identity_certification"
+                or task.status in _TERMINAL_RUN
+                or attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        if task.cancel_requested:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="cancelled",
+                outcome="cancelled", diagnostic_code=None)
+        expected = ExactDatasetRef(
+            kind="exact", dataset_id=envelope.dataset_id, revision_id=envelope.revision_id)
+        decoded = decode_row_identity_coverage(
+            certificate, expected, envelope.spec_sha256)
+        if decoded.spec.schema_digest != envelope.schema_sha256:
+            raise ValueError("row identity certification schema changed")
+        if decoded.status != "complete":
+            outcome = "null_key" if decoded.base.null_rows else "duplicate_key"
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome=outcome, diagnostic_code=outcome)
+        # Interactive readers take the lifecycle registry before the artifact. Only this durable
+        # finish path also drops its input owner during terminalization, so acquire the registry
+        # before certificate storage locks the revision/artifact and reuse it through cleanup.
+        _lock_local_result_registry(s)
+        try:
+            descriptor, created = _managed_local_row_identity_certificate_store(
+                s, envelope.dataset_id, envelope.revision_id, certificate,
+                artifact_dev, artifact_ino)
+        except RowIdentityCertificateConflict:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="conflicting_retained_spec",
+                diagnostic_code="conflicting_retained_spec")
+        return _finish_row_identity_certification_in_session(
+            s, task, attempt, envelope, status="done",
+            outcome=("certified" if created else "already_certified_same_spec"),
+            diagnostic_code=None, certificate=descriptor)
+
+
+def finish_row_identity_certification_failure(
+        task_id: str, attempt_id: str, owner_token: str, outcome: str) -> bool:
+    """Terminalize one owned proof attempt without ever writing certificate state."""
+    allowed = frozenset({
+        "unsupported_type", "stale_or_unavailable_revision", "cancelled", "failed",
+    })
+    if outcome not in allowed:
+        raise ValueError("row identity certification outcome is invalid")
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        envelope = s.get(
+            RowIdentityCertificationTaskEnvelope, str(task_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until if attempt is not None else None
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task is None or attempt is None or envelope is None
+                or task.task_kind != "row_identity_certification"
+                or task.status in _TERMINAL_RUN
+                or attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        cancelled = task.cancel_requested or outcome == "cancelled"
+        return _finish_row_identity_certification_in_session(
+            s, task, attempt, envelope,
+            status="cancelled" if cancelled else "failed",
+            outcome="cancelled" if cancelled else outcome,
+            diagnostic_code=None if cancelled else outcome)
 
 
 def _request_durable_task_cancel_in_session(s, task: DurableTask) -> dict:
@@ -9180,6 +9556,29 @@ def recoverable_keyed_upsert_task_ids(limit: int = 100) -> list[str]:
             DurableTaskAttempt.attempt_number == latest_attempt.c.number,
         )).where(
             DurableTask.task_kind == "keyed_upsert_write",
+            DurableTask.status.in_(("queued", "running")),
+            or_(DurableTaskAttempt.status == "queued",
+                DurableTaskAttempt.lease_until.is_(None),
+                DurableTaskAttempt.lease_until <= now),
+        ).order_by(DurableTask.created_at).limit(limit)).all()
+        return [str(row) for row in rows]
+
+
+def recoverable_row_identity_certification_task_ids(limit: int = 100) -> list[str]:
+    """Return queued or expired certification Tasks for the shared recovery scanner."""
+    with session() as s:
+        now = _durable_task_db_now(s)
+        latest_attempt = select(
+            DurableTaskAttempt.task_id,
+            func.max(DurableTaskAttempt.attempt_number).label("number"),
+        ).group_by(DurableTaskAttempt.task_id).subquery()
+        rows = s.scalars(select(DurableTask.id).join(
+            latest_attempt, latest_attempt.c.task_id == DurableTask.id,
+        ).join(DurableTaskAttempt, and_(
+            DurableTaskAttempt.task_id == latest_attempt.c.task_id,
+            DurableTaskAttempt.attempt_number == latest_attempt.c.number,
+        )).where(
+            DurableTask.task_kind == "row_identity_certification",
             DurableTask.status.in_(("queued", "running")),
             or_(DurableTaskAttempt.status == "queued",
                 DurableTaskAttempt.lease_until.is_(None),
@@ -10901,6 +11300,39 @@ def retry_keyed_upsert_task(task_id: str, uid: str, retry_request_id: str) -> di
                 if task is not None else None)
 
 
+def row_identity_certification_task_view(task_id: str, uid: str) -> dict | None:
+    """Return one owner-scoped certification Task and its bounded terminal receipt."""
+    with session() as s:
+        task = s.get(DurableTask, str(task_id))
+        if (task is None or task.task_kind != "row_identity_certification"
+                or task.owner_id != str(uid)):
+            return None
+        envelope = s.get(RowIdentityCertificationTaskEnvelope, task.id)
+        if envelope is None:
+            raise RuntimeError("row identity certification task envelope is unavailable")
+        return {
+            "taskId": task.id,
+            "status": task.status,
+            "datasetId": envelope.dataset_id,
+            "revisionId": envelope.revision_id,
+            "schemaSha256": envelope.schema_sha256,
+            "specSha256": envelope.spec_sha256,
+            "keyColumns": json.loads(envelope.keys_doc),
+            "canCancel": task.status not in _TERMINAL_RUN,
+            "receipt": json.loads(envelope.receipt_doc) if envelope.receipt_doc else None,
+        }
+
+
+def cancel_row_identity_certification_task(task_id: str, uid: str) -> dict | None:
+    """Cancel one owner-scoped certification under the generic durable Task fence."""
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        if (task is None or task.task_kind != "row_identity_certification"
+                or task.owner_id != str(uid)):
+            return None
+        return _request_durable_task_cancel_in_session(s, task)
+
+
 def merge_columns_task_view(
         task_id: str, uid: str, *, producer_kind: str | None = None) -> dict | None:
     """Return a sanitized merge Task view to its Canvas collaborator or headless owner."""
@@ -11617,10 +12049,10 @@ def list_workspace_runs(
                 }
                 can_retry = (task.status in ("failed", "cancelled")
                              and latest["attempt_number"] < task.max_attempts
-                             and task.error != "stale_expected_head")
+                             and task.error != "stale_expected_head"
+                             and task.task_kind != "row_identity_certification")
                 can_cancel = task.status in ("queued", "running")
-                dataset_context = _dataset_context_from_write_intent(
-                    task.task_kind, task.write_intent)
+                dataset_context = _dataset_context_from_task(s, task)
                 merge_view = None
                 if task.task_kind == "merge_columns_write":
                     checkpoint = s.get(DurableCheckpoint, task.id)
@@ -14143,6 +14575,7 @@ def _local_result_revision_identities(owner_kind: str, values: tuple) -> list[tu
             parsed = _managed_sidecar_task_input_manifest(value)
             if parsed is not None:
                 identities.update(parsed[1])
+            identities.update(_manifest_revision_identities(value))
     elif owner_kind in ("profile_job", "run_input_admission", "run_record", "run_state"):
         for value in values:
             identities.update(_manifest_revision_identities(value))
@@ -18534,6 +18967,35 @@ def catalog_managed_local_revision_schema(exact) -> list[ColumnSchema]:
         return table.columns
 
 
+def catalog_managed_local_revision_certification_facts(exact) -> dict:
+    """Return retained exact-revision metadata for certification preflight without opening rows."""
+    from hub.models import CatalogTable, ExactDatasetRef
+
+    ref = ExactDatasetRef.model_validate(exact)
+    with session() as s:
+        row = s.get(ManagedLocalFileRevision, ref.revision_id)
+        logical = s.get(CatalogLogicalDataset, ref.dataset_id)
+        artifact = s.get(LocalResultArtifact, row.artifact_uri) if row is not None else None
+        if (row is None or row.logical_id != ref.dataset_id or logical is None
+                or artifact is None or artifact.state != "ready"):
+            raise KeyError(ref.revision_id)
+        try:
+            table = CatalogTable.model_validate(json.loads(row.table_doc))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("managed local revision schema metadata is invalid") from exc
+        entry = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.logical_id == ref.dataset_id,
+        ).order_by(CatalogEntry.updated_at.desc()).limit(1)).first()
+        return {
+            "dataset_id": ref.dataset_id,
+            "revision_id": ref.revision_id,
+            "dataset_name": entry.name if entry is not None else None,
+            "artifact_uri": row.artifact_uri,
+            "row_count": table.row_count,
+            "columns": table.columns,
+        }
+
+
 def catalog_managed_local_head_for_dataset(dataset_id: str) -> dict | None:
     """Resolve one core managed-local dataset id to its current head for restore admission."""
     with session() as s:
@@ -20391,7 +20853,7 @@ def _row_identity_certificate_payload(
 def _managed_local_row_identity_certificate_store(
         s, dataset_id: str, revision_id: str, certificate: object,
         artifact_dev: int | None, artifact_ino: int | None,
-) -> dict:
+) -> tuple[dict, bool]:
     if (type(artifact_dev) is not int or artifact_dev < 0
             or type(artifact_ino) is not int or artifact_ino < 0):
         raise ValueError("row identity artifact evidence is invalid")
@@ -20422,11 +20884,11 @@ def _managed_local_row_identity_certificate_store(
         from sqlalchemy.dialects.sqlite import insert as dialect_insert
     else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
         raise RuntimeError("unsupported metadata database dialect")
-    s.execute(dialect_insert(ManagedLocalRowIdentityCertificate).values(
+    created = s.scalar(dialect_insert(ManagedLocalRowIdentityCertificate).values(
         **values,
     ).on_conflict_do_nothing(
         index_elements=[ManagedLocalRowIdentityCertificate.revision_id],
-    ))
+    ).returning(ManagedLocalRowIdentityCertificate.revision_id)) is not None
     existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
     if existing is None:  # pragma: no cover - defensive database contract check
         raise RuntimeError("row identity certificate reservation failed")
@@ -20437,7 +20899,7 @@ def _managed_local_row_identity_certificate_store(
             or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
         raise RowIdentityCertificateConflict(
             "exact revision already has a different row identity certificate")
-    return descriptor
+    return descriptor, created
 
 
 def managed_local_row_identity_certificate_store(
@@ -20446,8 +20908,9 @@ def managed_local_row_identity_certificate_store(
 ) -> dict:
     """Durably retain one complete exact-revision certificate, or reject a conflicting proof."""
     with session() as s:
-        return _managed_local_row_identity_certificate_store(
+        descriptor, _created = _managed_local_row_identity_certificate_store(
             s, dataset_id, revision_id, certificate, artifact_dev, artifact_ino)
+        return descriptor
 
 
 def _retain_sparse_row_identity_certificate(

@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0048_row_identity_task", "0047_row_identity_cert"),
         ("0047_row_identity_cert", "0046_relationship_incident"),
         ("0046_relationship_incident", "0045_canvas_dataset_add_replays"),
         ("0045_canvas_dataset_add_replays", "0044_provider_lineage_identity"),
@@ -103,8 +104,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0047_row_identity_cert"]
-    assert metadb.expected_schema_head() == "0047_row_identity_cert"
+    assert scripts.get_heads() == ["0048_row_identity_task"]
+    assert metadb.expected_schema_head() == "0048_row_identity_task"
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -424,6 +425,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0048_row_identity_task.py": (
+            "c3c7b6c5c81ca9a88707207bb3cacfbcb9b07bbad99083f8ff534dbad9812ea9"
+        ),
         "0047_row_identity_certificates.py": (
             "cb015a34c78ad146f22cfdaaaf4407a401fd44bb6f926cecfca9b676ff13adfc"
         ),

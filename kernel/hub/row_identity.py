@@ -11,9 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeVar
 
 import pyarrow as pa
 
@@ -26,6 +26,7 @@ from hub.storage import ManagedSourceUnavailable, source_read_scope
 
 _ENCODING_VERSION = "row-identity-v1"
 _NULL_POLICY = "reject"
+_CommitResult = TypeVar("_CommitResult")
 _SUPPORTED_TYPES: dict[str, tuple[str, int | None, bool | None]] = {
     "int8": ("i8", 1, True), "int16": ("i16", 2, True),
     "int32": ("i32", 4, True), "int64": ("i64", 8, True),
@@ -304,6 +305,31 @@ def certify_and_persist_exact_row_identity(
         owner: str = "row-identity-certification",
 ) -> dict:
     """Run the explicit whole-revision proof operation and retain its reusable descriptor."""
+    def persist(
+            certificate: RowIdentityCoverageV1, artifact_dev: int, artifact_ino: int) -> dict:
+        if certificate.status != "complete":
+            raise RowIdentityValidationError("row identity evidence is invalid")
+        return metadb.managed_local_row_identity_certificate_store(
+            dataset_ref.dataset_id, dataset_ref.revision_id,
+            serialize_row_identity_coverage(
+                certificate, dataset_ref, certificate.spec.digest),
+            artifact_dev=artifact_dev, artifact_ino=artifact_ino)
+
+    return certify_and_commit_exact_row_identity(
+        storage, dataset_ref, key_columns, commit=persist, owner=owner,
+    )
+
+
+def certify_and_commit_exact_row_identity(
+        storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        commit: Callable[[RowIdentityCoverageV1, int, int], _CommitResult],
+        owner: str = "row-identity-certification",
+) -> _CommitResult:
+    """Prove one revision and invoke its durable commit while the exact source guard is held.
+
+    The callback is the worker's atomic metadata boundary.  Keeping it inside the outer lifecycle
+    guard prevents the artifact from changing between whole-revision proof and certificate commit.
+    """
     exact = _exact_ref(dataset_ref)
     artifact_uri = metadb.managed_local_file_revision_artifact(*exact)
     if artifact_uri is None:
@@ -315,13 +341,7 @@ def certify_and_persist_exact_row_identity(
             artifact_info = os.fstat(guards[0].artifact_fileno())
             certificate = certify_exact_row_identity(
                 storage, dataset_ref, key_columns, owner=owner)
-            if certificate.status != "complete":
-                raise RowIdentityValidationError("row identity evidence is invalid")
-            return metadb.managed_local_row_identity_certificate_store(
-                dataset_ref.dataset_id, dataset_ref.revision_id,
-                serialize_row_identity_coverage(
-                    certificate, dataset_ref, certificate.spec.digest),
-                artifact_dev=int(artifact_info.st_dev), artifact_ino=int(artifact_info.st_ino))
+            return commit(certificate, int(artifact_info.st_dev), int(artifact_info.st_ino))
     except ManagedSourceUnavailable as exc:
         raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
 
@@ -336,6 +356,23 @@ def freeze_row_identity_spec(
                  _relation_schema(base_relation))
     _validate_frozen_spec(spec, dataset_ref)
     return spec
+
+
+def freeze_row_identity_spec_from_schema(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], schema: pa.Schema,
+) -> RowIdentitySpecV1:
+    """Freeze V1 identity from a bounded retained Parquet schema metadata read."""
+    exact = _exact_ref(dataset_ref)
+    declared = _declared_keys(key_columns)
+    # Admission must retain a deterministic typed intent even when V1 cannot prove that Arrow
+    # type.  The worker checks ``row_identity_spec_is_supported`` and terminalizes it without a
+    # scan; executable proof paths continue to call the strict default below.
+    return _spec(exact, _key_fields(schema, declared, require_supported=False), schema)
+
+
+def row_identity_spec_is_supported(spec: RowIdentitySpecV1) -> bool:
+    """Whether the frozen key types can be proven by the V1 whole-revision worker."""
+    return all(field.arrow_type in _SUPPORTED_TYPES for field in spec.fields)
 
 
 def _validate_frozen_spec(spec: RowIdentitySpecV1, dataset_ref: ExactDatasetRef) -> None:
@@ -438,7 +475,9 @@ def _relation_schema(relation) -> pa.Schema:
         raise RowIdentityValidationError("row identity relation is invalid") from exc
 
 
-def _key_fields(schema: pa.Schema, keys: tuple[str, ...]) -> tuple[RowIdentityFieldV1, ...]:
+def _key_fields(
+        schema: pa.Schema, keys: tuple[str, ...], *, require_supported: bool = True,
+) -> tuple[RowIdentityFieldV1, ...]:
     fields: list[RowIdentityFieldV1] = []
     for name in keys:
         try:
@@ -446,7 +485,7 @@ def _key_fields(schema: pa.Schema, keys: tuple[str, ...]) -> tuple[RowIdentityFi
         except (KeyError, IndexError) as exc:
             raise RowIdentityValidationError("row identity schema is invalid") from exc
         arrow_type = str(field.type)
-        if arrow_type not in _SUPPORTED_TYPES:
+        if require_supported and arrow_type not in _SUPPORTED_TYPES:
             raise RowIdentityValidationError("row identity schema is invalid")
         fields.append(RowIdentityFieldV1(name=name, arrow_type=arrow_type))
     return tuple(fields)
