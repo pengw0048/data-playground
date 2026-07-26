@@ -64,7 +64,7 @@ class DatasetBinding:
 class ImmediateInput:
     """The deliberately small public description of one directly wired input."""
 
-    kind: str
+    kind: str | None
     dataset: DatasetBinding | None = None
 
 
@@ -165,7 +165,9 @@ class _Ctx:
             return ImmediateInputs(())
         by_port: dict[str, list[ImmediateInput]] = {port.id: [] for port in spec.inputs}
         nodes = getattr(engine, "_nodes", {})
-        for edge in getattr(getattr(engine, "graph", None), "edges", ()):
+        graph = getattr(engine, "graph", None)
+        generated_refs = getattr(graph, "_publication_source_uris", {})
+        for edge in getattr(graph, "edges", ()):
             if edge.target != node.id:
                 continue
             # Reuse structural validation's authoritative default-handle resolver: an omitted
@@ -177,9 +179,17 @@ class _Ctx:
             upstream = nodes.get(edge.source)
             if upstream is None:
                 continue
+            # A controller-generated cross-region ref is implemented as an execution Source, but it
+            # is not the directly wired canvas Source a plugin contract may require. The private,
+            # parent-owned publication sidecar is unforgeable through Graph validation and lets this
+            # bounded snapshot report no producer kind without exposing the ref URI or graph data.
+            generated_ref = upstream.id in generated_refs
             by_port[port_id].append(ImmediateInput(
-                kind=upstream.type,
-                dataset=_source_dataset_binding(upstream) if upstream.type == "source" else None,
+                kind=None if generated_ref else upstream.type,
+                dataset=(
+                    _source_dataset_binding(upstream)
+                    if upstream.type == "source" and not generated_ref else None
+                ),
             ))
         return ImmediateInputs(tuple(
             ImmediateInputPort(id=port.id, inputs=tuple(by_port[port.id]))

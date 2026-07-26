@@ -98,7 +98,8 @@ on a preview sample or at full scale.
   a `dataset` binding (`dataset_id`, optional `revision_id`) when core has already proved one. A
   provider Source uses the same canonical `workspace-provider:*` identity used by Source admission;
   a URI, display name, mutable revision, or another node's configuration is never exposed or used as
-  an identity.
+  an identity. A controller-generated cross-region input retains its count but has `kind=None` and no
+  dataset binding; it is not relabeled as a directly wired Source.
   Use this for a narrowly documented shape check and raise `UnsupportedUpstreamError` before work when
   it is not met. It is deliberately not graph traversal: it exposes no graph, edges, node data, or
   transitive ancestry, so plugins do not need to import `hub.graph`.

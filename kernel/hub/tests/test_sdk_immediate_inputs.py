@@ -8,8 +8,9 @@ import pytest
 
 from hub import db, graph as graph_mod, metadb, workspace_providers
 from hub.executors.engine import BuildEngine
-from hub.models import Graph, GraphNode
+from hub.models import Graph, GraphNode, ResourceSpec
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, PortSpec
+from hub.planner import Region
 from hub.sdk import UnsupportedUpstreamError, ctx
 
 
@@ -222,6 +223,42 @@ def test_bound_section_input_does_not_claim_transitive_source_identity(tmp_path,
         assert ctx.immediate_inputs(subengine, sidecar).port("in").count == 0
         with pytest.raises(UnsupportedUpstreamError, match="exactly one"):
             subengine.relation("sidecar")
+
+
+def test_generated_region_ref_is_not_reported_as_a_direct_source(tmp_path, monkeypatch):
+    deps = _fixture_deps(tmp_path)
+    original = Graph(**{"id": "region-source-boundary", "version": 1, "nodes": [
+        _node("source", "source", {"uri": "fixture://base"}),
+        _node("filter", "filter", {"predicate": "id > 0"}),
+        _node("sidecar", "derive_sidecar_column", {
+            "identity": "id", "value": "signal", "output": "derived",
+        }),
+    ], "edges": [
+        {"id": "source-filter", "source": "source", "target": "filter",
+         "data": {"wire": "dataset"}},
+        {"id": "filter-sidecar", "source": "filter", "target": "sidecar",
+         "data": {"wire": "dataset"}},
+    ]})
+    final_region = Region(
+        id="final", node_ids={"sidecar"}, output_node="sidecar",
+        backend="default", worker=None, requires=ResourceSpec(),
+        cut_inputs=[("filter", None, "sidecar", None)],
+    )
+    subgraph = deps.controller._subgraph(
+        original, final_region, {"filter": "fixture://region-ref"})
+    assert graph_mod.structural_errors(subgraph, deps.node_specs) == []
+    sidecar = next(node for node in subgraph.nodes if node.id == "sidecar")
+    engine = _engine(deps, subgraph)
+    port = ctx.immediate_inputs(engine, sidecar).port("in")
+    assert port.count == 1
+    assert port.inputs[0].kind is None
+    assert port.inputs[0].dataset is None
+
+    sql_calls: list[str] = []
+    monkeypatch.setattr(ctx, "sql", lambda *_args, **_kwargs: sql_calls.append("built"))
+    with db.run_scope(), pytest.raises(UnsupportedUpstreamError, match="direct Source"):
+        engine.relation("sidecar")
+    assert not sql_calls
 
 
 def test_immediate_inputs_reports_only_canonical_provider_binding(monkeypatch):
