@@ -8013,8 +8013,12 @@ def submit_row_identity_certification_task(
                 raise DurableTaskSubmissionConflict(
                     "row identity certification submission does not match its frozen admission")
             return _durable_task_doc(s, existing), False
-        revision = s.get(ManagedLocalFileRevision, revision_id, with_for_update=True)
-        artifact = (s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
+        # Do not lock the artifact ahead of ``sync_local_result_owner``. Source guards acquire the
+        # lifecycle registry before the artifact; taking these in the opposite order deadlocks a
+        # concurrent request still finishing preflight. The sync below takes the canonical
+        # registry -> revision -> artifact order and revalidates readiness before admission commits.
+        revision = s.get(ManagedLocalFileRevision, revision_id)
+        artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
                     if revision is not None and revision.logical_id == dataset_id else None)
         if (revision is None or artifact is None or artifact.state != "ready"
                 or revision.artifact_uri != str(artifact_uri)):

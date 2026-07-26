@@ -397,19 +397,20 @@ def test_uncertain_certificate_transaction_rolls_back_before_failure_receipt(
 def test_postgres_concurrent_submit_has_one_task_attempt_and_revision_pin(dataset):
     _deps, publish = dataset
     published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
-    request = _request(published, submission_id=uuid.uuid4())
+    for _round in range(5):
+        request = _request(published, submission_id=uuid.uuid4())
 
-    def submit(_index: int):
-        return _submit(request)[0]
+        def submit(_index: int):
+            return _submit(request)[0]
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(submit, range(2)))
-    assert results[0].task_id == results[1].task_id
-    with metadb.session() as session:
-        assert session.scalar(select(func.count()).select_from(
-            metadb.DurableTaskAttempt).where(
-            metadb.DurableTaskAttempt.task_id == results[0].task_id)) == 1
-        assert session.scalar(select(func.count()).select_from(
-            metadb.LocalResultReference).where(
-            metadb.LocalResultReference.owner_kind == "durable_task",
-            metadb.LocalResultReference.owner_key == results[0].task_id)) == 1
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, range(2)))
+        assert results[0].task_id == results[1].task_id
+        with metadb.session() as session:
+            assert session.scalar(select(func.count()).select_from(
+                metadb.DurableTaskAttempt).where(
+                metadb.DurableTaskAttempt.task_id == results[0].task_id)) == 1
+            assert session.scalar(select(func.count()).select_from(
+                metadb.LocalResultReference).where(
+                metadb.LocalResultReference.owner_kind == "durable_task",
+                metadb.LocalResultReference.owner_key == results[0].task_id)) == 1
