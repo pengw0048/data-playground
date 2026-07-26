@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from hub import db, metadb, workspace_providers
+from hub import db, graph as graph_mod, metadb, workspace_providers
 from hub.executors.engine import BuildEngine
 from hub.models import Graph, GraphNode
-from hub.nodespecs import NodeSpec, PortSpec
+from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec, PortSpec
 from hub.sdk import UnsupportedUpstreamError, ctx
 
 
@@ -33,6 +33,10 @@ def _engine(deps, graph: Graph) -> BuildEngine:
         graph, lambda _uri: _Adapter(), deps.registry, full=True,
         node_builders=deps.node_builders, node_specs=deps.node_specs,
     )
+
+
+def _node_specs(*specs: NodeSpec) -> dict[str, NodeSpec]:
+    return {spec.kind: spec for spec in [*BUILTIN_NODE_SPECS, *specs]}
 
 
 def _fixture_deps(tmp_path):
@@ -85,8 +89,9 @@ def test_sidecar_fixture_checks_direct_single_source_and_identity_before_its_bui
     multi.edges.append(type(multi.edges[0]).model_validate({
         "id": "second", "source": "other", "target": "sidecar", "data": {"wire": "dataset"},
     }))
-    with db.run_scope(), pytest.raises(UnsupportedUpstreamError, match="exactly one"):
-        _engine(deps, multi).relation("sidecar")
+    assert graph_mod.structural_errors(multi, deps.node_specs) == [
+        "input 'in' on node 'sidecar' has multiple incoming edges ('edge' and 'second')"
+    ]
     assert not sql_calls
 
     wrong_kind = Graph(**{"id": "wrong-kind", "version": 1, "nodes": [
@@ -109,6 +114,114 @@ def test_sidecar_fixture_checks_direct_single_source_and_identity_before_its_bui
     with db.run_scope(), pytest.raises(UnsupportedUpstreamError, match="proved dataset identity"):
         _engine(deps, ambiguous).relation("sidecar")
     assert not sql_calls
+
+
+@pytest.mark.parametrize(
+    ("port_ids", "expected_port"),
+    [
+        (["fallback", "in"], "in"),
+        (["primary", "secondary"], "primary"),
+    ],
+)
+def test_omitted_target_handle_uses_core_default_port_in_real_dispatch(port_ids, expected_port):
+    kind = f"default-port-{expected_port}"
+    spec = NodeSpec(
+        kind=kind, title="default port fixture", category="compute",
+        inputs=[PortSpec(id=port_id) for port_id in port_ids],
+        outputs=[PortSpec(id="out")],
+    )
+    snapshots = []
+
+    def build(engine, node, inputs):
+        snapshots.append(ctx.immediate_inputs(engine, node))
+        return inputs[0]
+
+    graph = Graph(**{"id": kind, "version": 1, "nodes": [
+        _node("source", "source", {"uri": "fixture://source"}),
+        _node("consumer", kind),
+    ], "edges": [
+        {"id": "edge", "source": "source", "target": "consumer", "data": {"wire": "dataset"}},
+    ]})
+    specs = _node_specs(spec)
+    assert graph_mod.structural_errors(graph, specs) == []
+    with db.run_scope():
+        relation = BuildEngine(
+            graph, lambda _uri: _Adapter(), {}, full=True,
+            node_builders={kind: build}, node_specs=specs,
+        ).relation("consumer")
+        assert relation.fetchall() == [(1, 4)]
+
+    assert len(snapshots) == 1
+    assert snapshots[0].port(expected_port).count == 1
+    assert all(
+        port.count == (1 if port.id == expected_port else 0)
+        for port in snapshots[0].ports
+    )
+
+
+def test_legal_multi_port_builder_rejects_multiple_inputs_before_work():
+    kind = "guarded-multi-input"
+    spec = NodeSpec(
+        kind=kind, title="guarded multi input", category="compute",
+        inputs=[PortSpec(id="in", multi=True)],
+        outputs=[PortSpec(id="out")],
+    )
+    work_calls: list[str] = []
+
+    def build(engine, node, inputs):
+        upstream = ctx.immediate_inputs(engine, node).port("in")
+        if upstream.count != 1:
+            raise UnsupportedUpstreamError("guarded fixture requires exactly one immediate input")
+        work_calls.append("built")
+        return inputs[0]
+
+    graph = Graph(**{"id": kind, "version": 1, "nodes": [
+        _node("first", "source", {"uri": "fixture://first"}),
+        _node("second", "source", {"uri": "fixture://second"}),
+        _node("consumer", kind),
+    ], "edges": [
+        {"id": "first-edge", "source": "first", "target": "consumer",
+         "data": {"wire": "dataset"}},
+        {"id": "second-edge", "source": "second", "target": "consumer",
+         "targetHandle": "in", "data": {"wire": "dataset"}},
+    ]})
+    specs = _node_specs(spec)
+    assert graph_mod.structural_errors(graph, specs) == []
+
+    with db.run_scope(), pytest.raises(UnsupportedUpstreamError, match="exactly one"):
+        BuildEngine(
+            graph, lambda _uri: _Adapter(), {}, full=True,
+            node_builders={kind: build}, node_specs=specs,
+        ).relation("consumer")
+    assert not work_calls
+
+
+def test_bound_section_input_does_not_claim_transitive_source_identity(tmp_path, monkeypatch):
+    deps = _fixture_deps(tmp_path)
+    exact = {"kind": "exact", "datasetId": "base-dataset", "revisionId": "r1"}
+    monkeypatch.setattr(
+        metadb, "catalog_revision_binding_for_uri", lambda _uri: {"dataset_id": "base-dataset"})
+    source_graph = Graph(**{"id": "source", "version": 1, "nodes": [
+        _node("source", "source", {"uri": "fixture://base", "datasetRef": exact}),
+    ], "edges": []})
+    section_graph = Graph(**{"id": "section-run", "version": 1, "nodes": [
+        _node("sidecar", "derive_sidecar_column", {
+            "identity": "id", "value": "signal", "output": "derived",
+            "sourceDatasetId": "base-dataset",
+        }),
+    ], "edges": []})
+
+    with db.run_scope():
+        source_relation = _engine(deps, source_graph).relation("source")
+        subengine = BuildEngine(
+            section_graph, lambda _uri: _Adapter(), deps.registry, full=True,
+            node_builders=deps.node_builders, node_specs=deps.node_specs,
+            bound_inputs={"sidecar": source_relation},
+        )
+        sidecar = section_graph.nodes[0]
+        assert ctx.immediate_inputs(subengine, sidecar).port("in").count == 0
+        with pytest.raises(UnsupportedUpstreamError, match="exactly one"):
+            subengine.relation("sidecar")
 
 
 def test_immediate_inputs_reports_only_canonical_provider_binding(monkeypatch):

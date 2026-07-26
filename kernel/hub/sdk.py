@@ -31,7 +31,7 @@ from typing import Callable, TypeVar
 
 import pyarrow as pa
 
-from hub import db
+from hub import db, graph as graph_mod
 from hub.nodespecs import NodeSpec, ParamSpec, PortSpec, WireType  # re-export
 from hub.sqlpolicy import bind_input_ctes, identifier, quote_identifier, validate_query
 
@@ -168,9 +168,10 @@ class _Ctx:
         for edge in getattr(getattr(engine, "graph", None), "edges", ()):
             if edge.target != node.id:
                 continue
-            port_id = edge.target_handle
-            if port_id is None and len(spec.inputs) == 1:
-                port_id = spec.inputs[0].id
+            # Reuse structural validation's authoritative default-handle resolver: an omitted
+            # target handle selects "in" when declared, otherwise the first declared input port.
+            resolved_port = graph_mod._port(node, spec, edge.target_handle, "target")
+            port_id = resolved_port[0] if resolved_port is not None else None
             if port_id not in by_port:
                 continue
             upstream = nodes.get(edge.source)

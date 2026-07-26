@@ -36,9 +36,10 @@ wide input through as a deceptive sidecar. Its output is only a candidate. Core 
 sidecar/base identities, coverage, schema, current head, and final receipt when the researcher
 separately configures the managed-sidecar merge.
 
-When a sidecar must be tied to one known immediate base, set its optional `sourceDatasetId` to the
-canonical dataset id. The fixture then requires exactly one direct `source` input and rejects any
-unproved or different identity before it builds the sidecar.
+The fixture always requires exactly one directly wired `source`; a transform, generated handle, or
+Section-bound relation is not treated as that Source merely because its rows originated there. When
+the sidecar must also be tied to one known base, set optional `sourceDatasetId` to the canonical
+dataset id. That additional check rejects an unproved or different identity before building work.
 
 ## The shape of a plugin
 
