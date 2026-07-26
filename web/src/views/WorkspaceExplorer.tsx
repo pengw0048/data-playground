@@ -772,31 +772,34 @@ function WorkspaceMixedExplorer() {
           onAction={startSearchAction} files={files} /> : error ? <div role="alert" className="mx-auto flex max-w-md flex-col items-center gap-2 rounded-lg border border-destructive/30 p-5 text-center text-[13px] text-destructive">
           <span>Couldn't load this Workspace location: {error}</span>
           <button onClick={reload} className="font-semibold underline">Retry</button>
-        </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : items.length ? <div className="mx-auto grid max-w-5xl gap-2">
-          {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
-            onRetry={reload}
-            onNewFolder={resource.kind === 'container' && resource.canCreateFolder
-              ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
-            onRenameFolder={resource.kind === 'container' && resource.canRenameFolder
-              ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
-            onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
-              ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
-            onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
-              ? () => container && setMoveResource({ resource, sourceContainer: container, sourcePath: crumbs }) : undefined}
-            onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
-              ? () => setCanvasRenameResource(resource) : undefined}
-            onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
-              ? () => setCanvasDeleteResource(resource) : undefined} />)}
-          {loadMoreError && <div role="alert" className="mx-auto mt-2 text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
-          {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mx-auto mt-2 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
+        </div> : loading ? <div className="grid h-full place-items-center text-[13px] text-muted-foreground">Loading Workspace…</div> : <div className="mx-auto flex min-h-full w-full max-w-5xl flex-col">
+          {items.length ? <div className="grid gap-2">
+            {items.map((resource) => <ResourceRow key={resource.id} resource={resource} onOpen={() => open(resource)}
+              onRetry={reload}
+              onNewFolder={resource.kind === 'container' && resource.canCreateFolder
+                ? () => setFolderCreateParent({ resource, path: [...crumbs, resource] }) : undefined}
+              onRenameFolder={resource.kind === 'container' && resource.canRenameFolder
+                ? () => setFolderRenameResource({ resource, path: [...crumbs, resource] }) : undefined}
+              onDeleteFolder={resource.kind === 'container' && folderDeleteMode(resource)
+                ? () => setFolderDeleteResource({ resource, path: [...crumbs, resource] }) : undefined}
+              onMove={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+                ? () => container && setMoveResource({ resource, sourceContainer: container, sourcePath: crumbs }) : undefined}
+              onRenameCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && ['owner', 'editor'].includes(files.find((file) => file.id === identity(resource))?.role ?? '')
+                ? () => setCanvasRenameResource(resource) : undefined}
+              onDeleteCanvas={resource.kind === 'canvas' && !isExternal(resource) && !resource.detached && files.find((file) => file.id === identity(resource))?.role === 'owner'
+                ? () => setCanvasDeleteResource(resource) : undefined} />)}
+          </div> : <div className="grid flex-1 place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
+            ? 'This Workspace location is unavailable.'
+            : hasMore ? 'This page has no items yet. Load more to continue browsing this location.'
+            : isExternal(container) ? canvasDestination(container, 'create')
+              ? 'This source-only provider location is empty. Create a locally owned Canvas here to get started.'
+              : 'This source-only provider location is empty.'
+              : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
+          {loadMoreError && <div role="alert" className="mt-2 self-center text-[12px] text-destructive">Couldn't load more: {loadMoreError}</div>}
+          {hasMore && <button onClick={() => void load(containerId, cursor)} disabled={loadingMore} data-testid="workspace-load-more" className="mt-2 self-center rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground disabled:opacity-50">
             {loadingMore ? 'Loading…' : loadMoreError ? 'Retry load more' : 'Load more'}
           </button>}
-        </div> : <div className="grid h-full place-items-center px-4 text-center text-[13px] text-muted-foreground"><span>{!container
-          ? 'This Workspace location is unavailable.'
-          : isExternal(container) ? canvasDestination(container, 'create')
-            ? 'This source-only provider location is empty. Create a locally owned Canvas here to get started.'
-            : 'This source-only provider location is empty.'
-            : 'This local container is empty. Create a canvas here to get started.'}</span></div>}
+        </div>}
       </div>
 
       {selectedTable && <CatalogDetail table={selectedTable} onClose={closeDetail} onUse={useTable}
@@ -1244,7 +1247,8 @@ function WorkspaceSearchResults({ query, revision, onOpen, onAction, files }: {
     </div>
     {groups.map((group) => <SearchSourceGroup key={group.source.id} group={group} onOpen={onOpen} onAction={onAction} files={files} />)}
     {!resultCount && <div className="rounded-lg border border-dashed border-border p-8 text-center text-[13px] text-muted-foreground">
-      {completeness === 'partial'
+      {hasMore ? 'This page has no matches yet. Load more results to continue searching.'
+        : completeness === 'partial'
         ? 'No matches were returned by the available sources. This is not a complete empty result.'
         : 'No views, datasets, canvases, or containers match this query.'}
     </div>}

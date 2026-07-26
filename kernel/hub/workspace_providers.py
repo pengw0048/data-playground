@@ -973,7 +973,7 @@ def _mixed_page(container_id: str, *, uid: str, limit: int,
                                     reconciliation_placement_ids),
                             )
                 if page.state == "ready" and page.next_cursor is not None:
-                    if not page.items:
+                    if page.next_cursor == source_cursor:
                         statuses[current] = _source_status(
                             source, "unavailable", "catalog provider returned a non-advancing page")
                     else:
@@ -1204,7 +1204,7 @@ def _remote_page(identity: str, *, uid: str, limit: int, cursor: str | None,
                                     )
                                 )
                             if page.state == "ready" and page.next_cursor is not None:
-                                if not page.items:
+                                if page.next_cursor == source_cursor:
                                     statuses[current] = _source_status(
                                         source, "unavailable",
                                         "catalog provider returned a non-advancing page")
@@ -1731,8 +1731,7 @@ def search(query: str, *, uid: str, limit: int = 25,
                 error = provider_page.reason
                 freshness = provider_page.freshness
                 search_mode = "unsupported" if provider_page.state == "unsupported" else "native"
-                if next_cursor is not None and (
-                        not items or next_cursor == previous["cursor"]):
+                if next_cursor is not None and next_cursor == previous["cursor"]:
                     completeness, error, next_cursor = (
                         "unavailable", "catalog provider returned a non-advancing search page", None)
                     items = []
