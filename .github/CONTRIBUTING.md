@@ -51,6 +51,17 @@ there is no backfill path into the baseline.
 - The core stays provider-agnostic and offline-first. Anything specific to one backend, store, or
   vendor belongs in a plugin, not in `kernel/hub/`.
 
+## Dependency constraints
+
+Library dependencies use a verified minimum version and no upper bound. This keeps plugin packs
+installable alongside the stacks their downstream users already have; an arbitrary ceiling can make
+that co-installation impossible. Do not add upper bounds while updating a dependency floor.
+
+The only exceptions are exact pins with a tested version-specific contract: `duckdb==1.5.4` because
+`hub.sqlpolicy` audits that release's JSON AST and function catalog, and
+`ray[data,default]==2.56.0` because `dp_ray` validates its private hash-shuffle ABI. Keep those pins
+until their corresponding contracts are revalidated for a deliberate patch release update.
+
 ## Adding a plugin
 
 Start with the task-first [plugin onboarding guide](../docs/PLUGIN_ONBOARDING.md): choose the

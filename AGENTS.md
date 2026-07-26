@@ -31,3 +31,8 @@ Standard commands live in the root `Makefile`, `web/package.json`, and `kernel/p
 - **First run auto-seeds** sample data (`events.parquet`, `movies.csv`, `images.parquet`); the DB migrates on startup via Alembic. It does not create a default canvas.
 - **`dataplay` tries to auto-open a browser** on startup. In a headless VM this prints harmless `dbus`/`gpu`/`gcm` Chrome errors to the log — the server itself is fine (check `GET /api/livez` → `{"ok":true}`).
 - E2E (`npm run e2e`) boots its own `dataplay` instance on `:8899` with a throwaway SQLite DB, so it does not collide with a `make run` server on `:8471`.
+
+### Dependency constraints
+
+- Library requirements use a verified floor and no upper bound: plugin packs must co-install with a downstream environment's existing stack. Do not add a ceiling when changing a floor.
+- The only exact-pin exceptions are `duckdb==1.5.4` (`hub.sqlpolicy` audits that release's JSON AST/function catalog) and `ray[data,default]==2.56.0` (`dp_ray` validates its private hash-shuffle ABI). Update either only with a deliberate revalidation of that contract.

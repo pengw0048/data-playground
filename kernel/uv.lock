@@ -669,7 +669,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-ai-slim", extras = ["openai", "anthropic", "google", "groq", "mistral", "cohere", "bedrock"], marker = "extra == 'agent'", specifier = ">=2.5" },
     { name = "pyiceberg", marker = "extra == 'iceberg'", specifier = ">=0.6" },
-    { name = "pylance", marker = "extra == 'lance'", specifier = ">=0.19" },
+    { name = "pylance", marker = "extra == 'lance'", specifier = ">=0.38.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ray", extras = ["data", "default"], marker = "extra == 'ray'", specifier = "==2.56.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
