@@ -2290,9 +2290,19 @@ class DurableTaskDatasetContextView(Wire):
 
     task_kind: Literal[
         "restore_revision_write", "keyed_upsert_write", "merge_columns_write",
+        "row_identity_certification",
     ]
     dataset_id: str = Field(min_length=1, max_length=128)
+    revision_id: str | None = Field(default=None, min_length=1, max_length=256)
     name: str | None = None
+    deep_link: str | None = Field(default=None, min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def _exact_certification_link_is_complete(self) -> "DurableTaskDatasetContextView":
+        exact = self.task_kind == "row_identity_certification"
+        if exact != (self.revision_id is not None and self.deep_link is not None):
+            raise ValueError("row identity certification context requires one exact deep link")
+        return self
 
 
 class DurableTaskInboxCompletedWriteView(Wire):
@@ -2313,7 +2323,7 @@ class DurableTaskInboxItemView(Wire):
     task_kind: Literal[
         "managed_local_write", "external_wait", "linear_checkpoint_write",
         "bounded_fanout_write", "merge_columns_write",
-        "restore_revision_write", "keyed_upsert_write",
+        "restore_revision_write", "keyed_upsert_write", "row_identity_certification",
     ]
     outcome: Literal["completed", "failed", "cancelled"]
     diagnostic_code: str | None = Field(default=None, max_length=64)
