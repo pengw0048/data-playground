@@ -303,6 +303,9 @@ def test_profile_returns_column_stats():
 def test_full_profile_uses_cancellable_job_lifecycle():
     from hub import metadb
 
+    request_id = "req_profile_kernel_01"
+    d = get_deps()
+    owner = d.kernel_backend()
     canvas_id = "profile-kernel-lifecycle"
     with metadb.session() as session:
         if session.get(metadb.Canvas, canvas_id) is None:
@@ -330,25 +333,40 @@ def test_full_profile_uses_cancellable_job_lifecycle():
     assert preflight.status_code == 200, preflight.text
     assert preflight.json()["needsConfirm"] is True
     plan_digest = preflight.json()["planDigest"]
-    submit = client.post("/api/run/profile-job", json={
-        "graph": g, "nodeId": "sel", "planDigest": plan_digest,
-        "submissionId": "00000000-0000-4000-8000-000000000014",
-        "confirmed": True,
-    }, headers={"X-Request-Id": "req_profile_kernel_01"})
-    assert submit.status_code == 200, submit.text
-    started = submit.json()
-    assert started["jobType"] == "profile"
-    assert started["planDigest"] == plan_digest
-    assert started["requestId"] == "req_profile_kernel_01"
+    run_id = None
+    try:
+        submit = client.post("/api/run/profile-job", json={
+            "graph": g, "nodeId": "sel", "planDigest": plan_digest,
+            "submissionId": "00000000-0000-4000-8000-000000000014",
+            "confirmed": True,
+        }, headers={"X-Request-Id": request_id})
+        assert submit.status_code == 200, submit.text
+        started = submit.json()
+        run_id = started["runId"]
+        assert started["jobType"] == "profile"
+        assert started["planDigest"] == plan_digest
+        assert started["requestId"] == request_id
 
-    deadline = time.monotonic() + 5
-    status = started
-    while status["status"] not in ("done", "failed", "cancelled"):
-        assert time.monotonic() < deadline
-        time.sleep(0.02)
-        response = client.get(f"/api/run/{started['runId']}")
-        assert response.status_code == 200, response.text
-        status = response.json()
+        # The durable run state is the cross-process lifecycle signal. A small profile may legitimately
+        # move from queued to terminal between two hub polls, so terminal observation—not a five-second
+        # latency SLA or a sampled intermediate state—is the contract.
+        diagnostic_deadline = time.monotonic() + 30
+        status = started
+        while status["status"] not in ("done", "failed", "cancelled"):
+            response = client.get(f"/api/run/{run_id}")
+            assert response.status_code == 200, response.text
+            status = response.json()
+            if status["status"] not in ("done", "failed", "cancelled"):
+                assert time.monotonic() < diagnostic_deadline, "profile supervisor stopped reporting progress"
+                time.sleep(0.05)
+    finally:
+        if run_id is not None and owner.status(run_id).status in ("queued", "running"):
+            owner.cancel(run_id)
+            cleanup_deadline = time.monotonic() + 15
+            while owner.status(run_id).status not in ("done", "failed", "cancelled") and time.monotonic() < cleanup_deadline:
+                time.sleep(0.05)
+            assert owner.status(run_id).status == "cancelled", "profile child escaped test cleanup"
+
     assert status["status"] == "done", status
     assert status["profile"]["sampled"] is False
     assert status["profile"]["completeness"] == "complete"
@@ -4269,10 +4287,10 @@ def test_run_deadline_hard_kills_a_runaway_child(tmp_path):
     assert st.run_id not in runner._procs or runner._procs[st.run_id].poll() is not None  # child reaped
 
 
-def test_subprocess_region_cancel_stops_materializer_before_publish(tmp_path):
+def test_subprocess_region_cancel_stops_materializer_before_publish(tmp_path, monkeypatch):
     # run_unit uses subrun's materializeUri path (the RunController handoff worker). Cancel after that path
     # reports running, then require terminal cancelled + a reaped child + no handoff artifact.
-    import time as _t
+    import threading
 
     from hub.deps import get_deps
     from hub.models import Graph
@@ -4288,18 +4306,40 @@ def test_subprocess_region_cancel_stops_materializer_before_publish(tmp_path):
     output = str(tmp_path / "region_cancelled.parquet")
     runner = SubprocessRunner(settings.workspace, settings.data_dir,
                               catalog=get_deps().catalog, deadline_s=30)
+    observed_running = threading.Event()
+    observed_cancelled = threading.Event()
+    emit = runner._emit
+
+    def observe_status(graph, status, **kwargs):
+        if status.status == "running":
+            observed_running.set()
+        elif status.status == "cancelled":
+            observed_cancelled.set()
+        emit(graph, status, **kwargs)
+
+    monkeypatch.setattr(runner, "_emit", observe_status)
     st = runner.run_unit(graph, "xf", output)
-    deadline = _t.monotonic() + 10
-    while runner.status(st.run_id).status == "queued" and _t.monotonic() < deadline:
-        _t.sleep(0.05)
-    assert runner.status(st.run_id).status == "running", "materializeUri child never entered its run path"
-    runner.cancel(st.run_id)
-    while runner.status(st.run_id).status not in ("done", "failed", "cancelled") and _t.monotonic() < deadline:
-        _t.sleep(0.05)
-    assert runner.status(st.run_id).status == "cancelled"
-    while st.run_id in runner._procs and _t.monotonic() < deadline:
-        _t.sleep(0.05)
-    assert st.run_id not in runner._procs and not os.path.exists(output)
+
+    def await_cancel_acknowledgement(timeout_s: float) -> bool:
+        cleanup_deadline = time.monotonic() + timeout_s
+        while not runner.cancel_acknowledged(st.run_id) and time.monotonic() < cleanup_deadline:
+            time.sleep(0.05)
+        return runner.cancel_acknowledged(st.run_id)
+
+    try:
+        # Startup and cancellation have separate budgets: a slow runner must not spend the latter before
+        # the materializer has even entered its own run path.
+        assert observed_running.wait(timeout=30), "materializeUri child never entered its run path"
+        runner.cancel(st.run_id)
+        assert observed_cancelled.wait(timeout=15), "cancelled state was never published"
+        assert await_cancel_acknowledgement(15), "cancelled child was not reaped"
+        assert runner.status(st.run_id).status == "cancelled"
+        assert st.run_id not in runner._procs and not os.path.exists(output)
+    finally:
+        # A failed startup assertion used to skip cancel() and leave this deliberately runaway child alive.
+        if st.run_id in runner._procs or st.run_id in runner._process_scopes:
+            runner.cancel(st.run_id)
+            assert await_cancel_acknowledgement(15), "runaway materializer escaped test cleanup"
 
 
 def test_subprocess_run_is_recorded_in_history(tmp_path):
@@ -5140,6 +5180,7 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
     # Hold that handoff, time out the CLI, and prove both the handoff and user output stay unpublished.
     import glob
     import re
+    import threading
     import uuid
 
     from hub import metadb
@@ -5168,34 +5209,56 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
     before = set(glob.glob(os.path.join(region_root, "*")))
     resolve = d.resolve_adapter
     real = resolve(os.path.join(region_root, "probe.parquet"))
-    entered = False
+    entered = threading.Event()
+    release_timeout = threading.Event()
+    real_monotonic = time.monotonic
+    frozen_at = real_monotonic()
+
+    def virtual_monotonic():
+        # Keep the CLI's timeout clock at submission until the adapter has actually entered the handoff
+        # write. The test then advances time in one causal step instead of racing a 10ms timeout against
+        # _headless_run's 250ms poll interval.
+        return frozen_at + (1 if entered.is_set() or release_timeout.is_set() else 0)
 
     class _SlowRegionAdapter:
         def __getattr__(self, name):
             return getattr(real, name)
 
         def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
-            nonlocal entered
-            entered = True
+            entered.set()
             assert cancelled is not None
-            deadline = time.monotonic() + 5
-            while not cancelled() and time.monotonic() < deadline:
+            while not cancelled():
                 time.sleep(0.01)
             return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
 
     slow = _SlowRegionAdapter()
     monkeypatch.setattr(d, "resolve_adapter",
                         lambda uri: slow if os.path.dirname(str(uri)) == region_root else resolve(uri))
+    monkeypatch.setattr(time, "monotonic", virtual_monotonic)
     previous_backend = metadb.get_setting("backend", "global", default="") or ""
     metadb.set_setting("backend", "local-out-of-core", "global")
+    result = {}
+
+    def run_headless():
+        result["code"] = _headless_run(d, cid, "wr", 0.01, as_json=False)
+
+    worker = threading.Thread(target=run_headless, daemon=True)
     try:
-        code = _headless_run(d, cid, "wr", 0.01, as_json=False)
+        worker.start()
+        assert entered.wait(timeout=30), "CLI cancelled before the region handoff entered write"
     finally:
+        # Let the virtual timeout elapse even if the entry assertion fails, then require the owned worker
+        # to finish so this test cannot leak a blocked controller thread into later tests.
+        release_timeout.set()
+        worker.join(timeout=15)
         metadb.set_setting("backend", previous_backend, "global")
+
+    assert not worker.is_alive(), "headless timeout did not finish cancellation"
+    code = result.get("code")
 
     captured = capsys.readouterr()
     match = re.search(r"run (run_[0-9a-f]+)", captured.err)
-    assert code == 124 and match and entered, captured.err
+    assert code == 124 and match and entered.is_set(), captured.err
     run_id = match.group(1)
     assert d.run_index[run_id] is d.controller and d.controller.status(run_id).status == "cancelled"
     assert metadb.get_run_state(run_id)["status"] == "cancelled"
