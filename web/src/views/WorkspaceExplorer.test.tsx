@@ -27,6 +27,7 @@ vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => u
 vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
+  AddDataModal: ({ onClose }: { onClose: () => void }) => <div role="dialog" aria-label="Add data"><span>Upload a local file</span><span>Register an accessible path or URI</span><button onClick={onClose}>Close</button></div>,
   CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
     initialRevisionId, initialRevisionDatasetId,
     onOpenInWorkspace, workspaceLocation, onRetryWorkspaceLocation }: {
@@ -128,6 +129,15 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByTestId('catalog-detail')).toHaveTextContent('observations')
     expect(screen.getByRole('navigation', { name: 'Workspace path' })).toHaveTextContent('Workspace/Research')
     expect(mocks.workspaceBrowse).toHaveBeenCalledWith('folder-1', { limit: 50, cursor: undefined })
+  })
+
+  it('exposes both add-data choices directly from All Workspace', async () => {
+    render(<WorkspaceExplorer />)
+
+    fireEvent.click(await screen.findByTestId('workspace-add-data'))
+    const dialog = screen.getByRole('dialog', { name: 'Add data' })
+    expect(dialog).toHaveTextContent('Upload a local file')
+    expect(dialog).toHaveTextContent('Register an accessible path or URI')
   })
 
   it('resolves a stable DatasetView URL beside its Catalog source and replays its exact revision', async () => {

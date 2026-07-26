@@ -8,7 +8,7 @@ import type {
 import { Icon } from '../ui/Icon'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../components/ui/dropdown-menu'
 import {
-  CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
+  AddDataModal, CATALOG_BATCH_LIMIT, CatalogDetail, CatalogDiscovery, emptyCatalogDiscoveryQuery,
   type CatalogDiscoveryQueryState,
 } from './CatalogDiscovery'
 import { WorkspaceLocalDrafts } from '../canvas/LocalDrafts'
@@ -400,6 +400,7 @@ function WorkspaceMixedExplorer() {
   const currentCanvasId = useStore((s) => s.doc?.id ?? '')
   const refreshFiles = useStore((s) => s.refreshFiles)
   const rememberTables = useStore((s) => s.rememberTables)
+  const uploadDataset = useStore((s) => s.uploadDataset)
   const pushToast = useStore((s) => s.pushToast)
   const switchWorkspaceScope = useStore((s) => s.switchWorkspaceScope)
   const workspaceDatasetQuery = useStore((s) => s.workspaceDatasetQuery)
@@ -426,6 +427,7 @@ function WorkspaceMixedExplorer() {
   const [selectedDetached, setSelectedDetached] = useState<WorkspaceResource | null>(null)
   const [resolutionError, setResolutionError] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  const [addDataOpen, setAddDataOpen] = useState(false)
   const [folderCreateParent, setFolderCreateParent] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[] } | null>(null)
   const [folderRenameResource, setFolderRenameResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[]; fromSearch?: boolean } | null>(null)
   const [folderDeleteResource, setFolderDeleteResource] = useState<{ resource: WorkspaceResource; path: WorkspaceResource[]; fromSearch?: boolean } | null>(null)
@@ -717,6 +719,8 @@ function WorkspaceMixedExplorer() {
             setSearchDraft(''); setWorkspaceSearchQuery('')
           }}><Icon name="close" size={12} /></button>}
         </form>
+        <button type="button" onClick={() => setAddDataOpen(true)} data-testid="workspace-add-data"
+          className="rounded-md bg-foreground px-2.5 py-1.5 text-[12px] font-semibold text-background">Add data</button>
         <div className="hidden items-center gap-2 sm:flex" aria-label="Workspace actions">
           {container?.canCreateFolder && <button onClick={() => setFolderCreateParent({ resource: container, path: crumbs })} disabled={loading}
             className="rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-semibold text-foreground disabled:text-muted-foreground disabled:opacity-65">New folder</button>}
@@ -801,6 +805,8 @@ function WorkspaceMixedExplorer() {
         canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
         onRelink={() => setRelinkResource(selectedDataset)} onUse={() => useProviderDataset(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
+      {addDataOpen && <AddDataModal onClose={() => setAddDataOpen(false)} onUploadDataset={uploadDataset}
+        onCompleted={reload} />}
       {createOpen && canvasDestination(container, 'create') && <NewCanvasDialog container={container!} onClose={() => setCreateOpen(false)}
         onCreated={(canvasId) => { setCreateOpen(false); void openFile(canvasId) }} />}
       {folderCreateParent && <FolderCreateDialog parent={folderCreateParent.resource} path={folderCreateParent.path}
