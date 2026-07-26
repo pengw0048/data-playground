@@ -36,7 +36,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
-from hub.models import ColumnSchema, SchemaCompatibility, SchemaFieldCompatibility
+from hub.models import (
+    ColumnSchema, DatasetRevisionRowIdentity, SchemaCompatibility, SchemaFieldCompatibility,
+)
 from hub.settings import settings
 
 DEFAULT_USER_ID = "local"
@@ -1575,12 +1577,16 @@ class ManagedLocalRowIdentityCertificate(Base):
     row_identity_spec_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     certificate_doc: Mapped[str] = mapped_column(Text, nullable=False)
     certificate_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    artifact_dev: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    artifact_ino: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now)
     __table_args__ = (
         CheckConstraint("length(schema_sha256) = 64", name="ck_row_identity_cert_schema_sha"),
         CheckConstraint("length(row_identity_spec_sha256) = 64", name="ck_row_identity_cert_spec_sha"),
         CheckConstraint("length(certificate_sha256) = 64", name="ck_row_identity_cert_doc_sha"),
+        CheckConstraint("artifact_dev >= 0", name="ck_row_identity_cert_artifact_dev"),
+        CheckConstraint("artifact_ino >= 0", name="ck_row_identity_cert_artifact_ino"),
         Index("ix_row_identity_certificates_logical_revision", "logical_id", "revision_id"),
     )
 
@@ -4633,7 +4639,9 @@ def _sparse_output_doc(row: SparseOutput) -> dict:
 def sparse_output_admit(*, owner_id: str, canvas_id: str, submission_id: str,
                         sparse_id: str, input_dataset_id: str, input_revision_id: str,
                         documents: dict[str, str], digests: dict[str, str],
-                        row_identity_spec_sha256: str) -> tuple[dict, bool]:
+                        row_identity_spec_sha256: str,
+                        artifact_dev: int | None = None,
+                        artifact_ino: int | None = None) -> tuple[dict, bool]:
     """Atomically retain an already-ready exact base beside one immutable sparse admission.
 
     This deliberately bypasses artifact allocation.  The only local lifecycle write is the one
@@ -4707,12 +4715,16 @@ def sparse_output_admit(*, owner_id: str, canvas_id: str, submission_id: str,
         _validate_sparse_output_documents(row)
         if not inserted:
             _validate_sparse_output_reference(s, row)
+            _retain_sparse_row_identity_certificate(
+                s, row, documents["evidence"], artifact_dev, artifact_ino)
             return _sparse_output_doc(row), False
 
         # The local registry is the lifecycle mutex. Keep the caller's read guard alive through this
         # transaction; sync rechecks the exact ready ledger binding before adding its sole durable hold.
         sync_local_result_owner(s, "sparse_output", sparse_id, documents["input"])
         _validate_sparse_output_reference(s, row)
+        _retain_sparse_row_identity_certificate(
+            s, row, documents["evidence"], artifact_dev, artifact_ino)
         return _sparse_output_doc(row), True
 
 
@@ -20285,14 +20297,17 @@ class RowIdentityCertificateConflict(RuntimeError):
     """An exact revision already has a different immutable logical-row proof."""
 
 
+class RowIdentityCertificateUnrepresentable(ValueError):
+    """A valid internal proof cannot fit the bounded public descriptor."""
+
+
 def _canonical_document(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def managed_local_row_identity_certificate_store(
+def _row_identity_certificate_payload(
         dataset_id: str, revision_id: str, certificate: object,
-) -> dict:
-    """Durably retain one complete exact-revision certificate, or reject a conflicting proof."""
+) -> tuple[object, str, str, dict]:
     from hub.models import ExactDatasetRef
     from hub.row_identity import (
         RowIdentityValidationError, decode_row_identity_coverage,
@@ -20318,61 +20333,123 @@ def managed_local_row_identity_certificate_store(
                    for field in decoded.spec.fields],
         "encodingVersion": decoded.spec.encoding_version,
     }
+    try:
+        DatasetRevisionRowIdentity.model_validate(descriptor)
+    except ValueError as exc:
+        raise RowIdentityCertificateUnrepresentable(
+            "row identity certificate has no bounded public descriptor") from exc
+    return decoded, spec_digest, canonical, descriptor
 
-    with session() as s:
-        revision = s.get(ManagedLocalFileRevision, revision_id, with_for_update=True)
-        artifact = (s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
-                    if revision is not None and revision.logical_id == dataset_id else None)
-        if revision is None or artifact is None or artifact.state != "ready":
-            raise ValueError("row identity exact revision is unavailable")
-        existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
-        if existing is not None:
-            if (existing.logical_id != dataset_id or existing.schema_sha256 != decoded.spec.schema_digest
-                    or existing.row_identity_spec_sha256 != spec_digest
-                    or existing.certificate_doc != canonical
-                    or existing.certificate_sha256 != hashlib.sha256(canonical.encode()).hexdigest()):
-                raise RowIdentityCertificateConflict(
-                    "exact revision already has a different row identity certificate")
-            return descriptor
-        s.add(ManagedLocalRowIdentityCertificate(
-            revision_id=revision_id, logical_id=dataset_id, schema_sha256=decoded.spec.schema_digest,
-            row_identity_spec_sha256=spec_digest, certificate_doc=canonical,
-            certificate_sha256=hashlib.sha256(canonical.encode()).hexdigest(), created_at=_now()))
+
+def _managed_local_row_identity_certificate_store(
+        s, dataset_id: str, revision_id: str, certificate: object,
+        artifact_dev: int | None, artifact_ino: int | None,
+) -> dict:
+    if (type(artifact_dev) is not int or artifact_dev < 0
+            or type(artifact_ino) is not int or artifact_ino < 0):
+        raise ValueError("row identity artifact evidence is invalid")
+    decoded, spec_digest, canonical, descriptor = _row_identity_certificate_payload(
+        dataset_id, revision_id, certificate)
+    certificate_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
+    revision = s.get(ManagedLocalFileRevision, revision_id, with_for_update=True)
+    artifact = (s.get(LocalResultArtifact, revision.artifact_uri, with_for_update=True)
+                if revision is not None and revision.logical_id == dataset_id else None)
+    if revision is None or artifact is None or artifact.state != "ready":
+        raise ValueError("row identity exact revision is unavailable")
+    existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
+    if existing is not None:
+        if (existing.logical_id != dataset_id or existing.schema_sha256 != decoded.spec.schema_digest
+                or existing.row_identity_spec_sha256 != spec_digest
+                or existing.certificate_doc != canonical
+                or existing.certificate_sha256 != certificate_sha256
+                or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
+            raise RowIdentityCertificateConflict(
+                "exact revision already has a different row identity certificate")
+        return descriptor
+    s.add(ManagedLocalRowIdentityCertificate(
+        revision_id=revision_id, logical_id=dataset_id, schema_sha256=decoded.spec.schema_digest,
+        row_identity_spec_sha256=spec_digest, certificate_doc=canonical,
+        certificate_sha256=certificate_sha256, artifact_dev=artifact_dev,
+        artifact_ino=artifact_ino, created_at=_now()))
     return descriptor
 
 
+def managed_local_row_identity_certificate_store(
+        dataset_id: str, revision_id: str, certificate: object, *,
+        artifact_dev: int, artifact_ino: int,
+) -> dict:
+    """Durably retain one complete exact-revision certificate, or reject a conflicting proof."""
+    with session() as s:
+        return _managed_local_row_identity_certificate_store(
+            s, dataset_id, revision_id, certificate, artifact_dev, artifact_ino)
+
+
+def _retain_sparse_row_identity_certificate(
+        s, row: SparseOutput, evidence_doc: str,
+        artifact_dev: int | None, artifact_ino: int | None,
+) -> None:
+    """Retain one reusable descriptor without changing valid SparseOutput admission semantics."""
+    evidence = json.loads(evidence_doc)
+    if evidence.get("status") != "complete":
+        return
+    try:
+        _managed_local_row_identity_certificate_store(
+            s, row.input_dataset_id, row.input_revision_id, evidence,
+            artifact_dev, artifact_ino)
+    except (RowIdentityCertificateConflict, RowIdentityCertificateUnrepresentable):
+        # One exact revision advertises one unambiguous public identity. A later valid SparseOutput
+        # may use another key without replacing that descriptor or changing its admission semantics.
+        return
+
+
 def managed_local_row_identity_certificate_descriptor(
-        dataset_id: str, revision_id: str,
+        storage, dataset_id: str, revision_id: str,
 ) -> dict | None:
-    """Return only a checked public descriptor; corruption and unavailable artifacts fail closed."""
+    """Return checked retained evidence while a bounded exact-artifact identity guard is held."""
     from hub.models import ExactDatasetRef
     from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
+    from hub.storage import ManagedSourceUnavailable, source_read_scope
 
     try:
-        with session() as s:
-            row = s.get(ManagedLocalRowIdentityCertificate, revision_id)
-            revision = s.get(ManagedLocalFileRevision, revision_id)
-            artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
-                        if revision is not None else None)
-            if (row is None or revision is None or row.logical_id != dataset_id
-                    or revision.logical_id != dataset_id or artifact is None or artifact.state != "ready"
-                    or row.certificate_sha256 != hashlib.sha256(row.certificate_doc.encode()).hexdigest()
-                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
+        artifact_uri = managed_local_file_revision_artifact(dataset_id, revision_id)
+        if artifact_uri is None:
+            return None
+        with source_read_scope(
+                storage, [artifact_uri], owner=f"row-identity-descriptor:{uuid.uuid4().hex}") as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
                 return None
-            expected = ExactDatasetRef(kind="exact", dataset_id=dataset_id, revision_id=revision_id)
-            certificate = decode_row_identity_coverage(
-                json.loads(row.certificate_doc), expected, row.row_identity_spec_sha256)
-            if certificate.status != "complete" or certificate.spec.schema_digest != row.schema_sha256:
-                return None
-            return {
-                "datasetId": dataset_id,
-                "revisionId": revision_id,
-                "proofStatus": "certified",
-                "fields": [{"name": field.name, "arrowType": field.arrow_type}
-                           for field in certificate.spec.fields],
-                "encodingVersion": certificate.spec.encoding_version,
-            }
-    except (TypeError, ValueError, RowIdentityValidationError):
+            info = os.fstat(guards[0].artifact_fileno())
+            artifact_identity = int(info.st_dev), int(info.st_ino)
+            with session() as s:
+                row = s.get(ManagedLocalRowIdentityCertificate, revision_id)
+                revision = s.get(ManagedLocalFileRevision, revision_id)
+                artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
+                            if revision is not None else None)
+                if (row is None or revision is None or row.logical_id != dataset_id
+                        or revision.logical_id != dataset_id or revision.artifact_uri != artifact_uri
+                        or artifact is None or artifact.state != "ready"
+                        or (row.artifact_dev, row.artifact_ino) != artifact_identity
+                        or row.certificate_sha256
+                        != hashlib.sha256(row.certificate_doc.encode()).hexdigest()
+                        or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
+                    return None
+                expected = ExactDatasetRef(kind="exact", dataset_id=dataset_id, revision_id=revision_id)
+                certificate = decode_row_identity_coverage(
+                    json.loads(row.certificate_doc), expected, row.row_identity_spec_sha256)
+                if certificate.status != "complete" or certificate.spec.schema_digest != row.schema_sha256:
+                    return None
+                descriptor = {
+                    "datasetId": dataset_id,
+                    "revisionId": revision_id,
+                    "proofStatus": "certified",
+                    "fields": [{"name": field.name, "arrowType": field.arrow_type}
+                               for field in certificate.spec.fields],
+                    "encodingVersion": certificate.spec.encoding_version,
+                }
+                DatasetRevisionRowIdentity.model_validate(descriptor)
+                return descriptor
+    except (ManagedSourceUnavailable, OSError, RuntimeError, TypeError, ValueError,
+            RowIdentityValidationError):
         return None
 
 

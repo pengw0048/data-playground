@@ -92,6 +92,8 @@ class SparseOutputPreparation:
     base_schema: pa.Schema
     sidecar_schema: pa.Schema
     identity_columns: tuple[str, ...]
+    artifact_dev: int
+    artifact_ino: int
 
 
 @dataclass(frozen=True)
@@ -125,24 +127,18 @@ def admit_sparse_output(storage, request: SparseOutputAdmissionRequest) -> Spars
     prepared = prepare_sparse_output_admission(storage, request)
     sparse_id = _sparse_id(prepared.owner_id, prepared.canvas_id, prepared.submission_id)
     try:
-        # This durable admission is an explicit production proof trigger: its existing exact
-        # coverage scan has already established the base's ordered key facts.  Retain that proof
-        # without another scan so later exact-revision interactive reads can reuse it.
-        evidence = json.loads(prepared.documents["evidence"])
-        if evidence["status"] == "complete":
-            metadb.managed_local_row_identity_certificate_store(
-                prepared.dataset_ref.dataset_id, prepared.dataset_ref.revision_id, evidence)
         document, created = metadb.sparse_output_admit(
             owner_id=prepared.owner_id, canvas_id=prepared.canvas_id,
             submission_id=prepared.submission_id, sparse_id=sparse_id,
             input_dataset_id=prepared.dataset_ref.dataset_id,
             input_revision_id=prepared.dataset_ref.revision_id,
             documents=prepared.documents, digests=prepared.digests,
-            row_identity_spec_sha256=prepared.row_identity_spec_sha256)
+            row_identity_spec_sha256=prepared.row_identity_spec_sha256,
+            artifact_dev=prepared.artifact_dev, artifact_ino=prepared.artifact_ino)
     except metadb.SparseOutputSubmissionConflict as exc:
         raise SparseOutputSubmissionConflict(
             "SparseOutput submission belongs to a different immutable admission") from exc
-    except (metadb.RowIdentityCertificateConflict, ValueError) as exc:
+    except ValueError as exc:
         raise SparseOutputValidationError("SparseOutput row identity is invalid") from exc
     return SparseOutputAdmission(id=document["id"], created=created, document=document)
 
@@ -163,7 +159,11 @@ def prepare_sparse_output_admission(
         raise SparseOutputUnavailable("SparseOutput exact base revision is unavailable")
     try:
         with db.base_guard(), source_read_scope(
-                storage, [artifact_uri], owner=f"sparse-output-preflight:{uuid.uuid4().hex}"):
+                storage, [artifact_uri],
+                owner=f"sparse-output-preflight:{uuid.uuid4().hex}") as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                raise OSError("SparseOutput exact base identity is unavailable")
+            artifact_info = os.fstat(guards[0].artifact_fileno())
             base = DuckDBAdapter().scan(artifact_uri)
             validated = validate_fragment(FragmentKind.PROJECTION, expression, con=db.conn())
             if any(function.name.lower() == "row_number" for function in validated.functions):
@@ -191,7 +191,8 @@ def prepare_sparse_output_admission(
         owner_id=owner_id, canvas_id=canvas_id, submission_id=submission_id,
         dataset_ref=dataset_ref, documents=documents, digests=digests,
         row_identity_spec_sha256=frozen_spec.digest, base_schema=base_schema,
-        sidecar_schema=output_schema, identity_columns=identity_columns)
+        sidecar_schema=output_schema, identity_columns=identity_columns,
+        artifact_dev=int(artifact_info.st_dev), artifact_ino=int(artifact_info.st_ino))
 
 
 def materialize_sparse_output(

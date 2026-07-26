@@ -612,7 +612,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         revision_name = metadb.managed_local_lance_revision_name(
             binding["dataset_id"], str(raw["revision_id"]))
     row_identity = metadb.managed_local_row_identity_certificate_descriptor(
-        binding["dataset_id"], str(raw["revision_id"]))
+        deps.storage, binding["dataset_id"], str(raw["revision_id"]))
     if row_identity is None:
         row_identity = {
             "datasetId": binding["dataset_id"],

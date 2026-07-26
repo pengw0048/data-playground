@@ -21,6 +21,7 @@ from hub.row_identity import (
     certify_exact_row_identity,
     serialize_row_identity_coverage,
 )
+from hub.sparse_outputs import SparseOutputAdmissionRequest, admit_sparse_output
 from hub.storage import LocalStorage
 
 
@@ -118,7 +119,7 @@ def test_declared_or_invalid_key_does_not_advertise_row_addressing(local_catalog
     with pytest.raises(RowIdentityValidationError, match="row identity evidence is invalid"):
         certify_and_persist_exact_row_identity(storage, _exact(invalid), ["id"])
     assert metadb.managed_local_row_identity_certificate_descriptor(
-        invalid["dataset_id"], invalid["revision_id"]) is None
+        storage, invalid["dataset_id"], invalid["revision_id"]) is None
 
 
 def test_certificate_replay_is_idempotent_but_refuses_different_order_or_corruption(
@@ -132,17 +133,21 @@ def test_certificate_replay_is_idempotent_but_refuses_different_order_or_corrupt
     first = certify_and_persist_exact_row_identity(storage, exact, ["id", "name"])
     assert certify_and_persist_exact_row_identity(storage, exact, ["id", "name"]) == first
     different = certify_exact_row_identity(storage, exact, ["name", "id"])
+    with metadb.session() as session:
+        retained = session.get(metadb.ManagedLocalRowIdentityCertificate, exact.revision_id)
+        artifact_identity = retained.artifact_dev, retained.artifact_ino
     with pytest.raises(metadb.RowIdentityCertificateConflict):
         metadb.managed_local_row_identity_certificate_store(
             exact.dataset_id, exact.revision_id,
-            serialize_row_identity_coverage(different, exact, different.spec.digest))
+            serialize_row_identity_coverage(different, exact, different.spec.digest),
+            artifact_dev=artifact_identity[0], artifact_ino=artifact_identity[1])
 
     with metadb.session() as session:
         row = session.get(metadb.ManagedLocalRowIdentityCertificate, exact.revision_id)
         assert "private-row-key" not in row.certificate_doc
         row.certificate_doc = "{}"
     assert metadb.managed_local_row_identity_certificate_descriptor(
-        exact.dataset_id, exact.revision_id) is None
+        storage, exact.dataset_id, exact.revision_id) is None
 
 
 def test_certificate_fails_closed_when_the_exact_artifact_is_not_ready(local_catalog, tmp_path):
@@ -156,4 +161,54 @@ def test_certificate_fails_closed_when_the_exact_artifact_is_not_ready(local_cat
         revision = session.get(metadb.ManagedLocalFileRevision, exact.revision_id)
         session.get(metadb.LocalResultArtifact, revision.artifact_uri).state = "writing"
     assert metadb.managed_local_row_identity_certificate_descriptor(
-        exact.dataset_id, exact.revision_id) is None
+        storage, exact.dataset_id, exact.revision_id) is None
+
+
+def test_descriptor_shape_overflow_fails_closed_without_breaking_revision_detail(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    key = "k" * 257
+    published = _publish(storage, catalog, str(tmp_path / "long-key.parquet"), pa.table({
+        key: pa.array([1], pa.int32()), "payload": pa.array(["a"]),
+    }))
+    owner, canvas = f"owner-{uuid.uuid4().hex}", f"canvas-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.User(id=owner, name="Long key owner"))
+        session.add(metadb.Canvas(id=canvas, owner_id=owner, name="Long key", doc="{}"))
+
+    admitted = admit_sparse_output(storage, SparseOutputAdmissionRequest(
+        owner_id=owner, canvas_id=canvas, submission_id="long-key",
+        dataset_ref=_exact(published),
+        select_config={"expr": f'"{key}", payload AS score'},
+        identity_columns=[key],
+        provenance={"idempotencyKey": "long-key", "provenance": "manual"},
+    ))
+
+    assert admitted.created is True
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        storage, published["dataset_id"], published["revision_id"]) is None
+    detail = _revision_detail(monkeypatch, catalog, storage, published)
+    assert detail.preview.rows == [{key: 1, "payload": "a"}]
+    assert detail.row_identity.proof_status == "unavailable"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "replaced"])
+def test_descriptor_fails_closed_when_artifact_file_is_missing_or_replaced(
+        local_catalog, tmp_path, mutation):
+    storage, catalog = local_catalog
+    published = _publish(storage, catalog, str(tmp_path / f"{mutation}.parquet"),
+                         pa.table({"id": pa.array([1], pa.int32())}))
+    exact = _exact(published)
+    certify_and_persist_exact_row_identity(storage, exact, ["id"])
+    artifact = metadb.managed_local_file_revision_artifact(exact.dataset_id, exact.revision_id)
+    assert artifact is not None
+    if mutation == "missing":
+        os.unlink(artifact)
+    else:
+        replacement = tmp_path / "replacement.parquet"
+        pq.write_table(pa.table({"id": pa.array([2], pa.int32())}), replacement)
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, artifact)
+
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        storage, exact.dataset_id, exact.revision_id) is None

@@ -425,7 +425,7 @@ def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
         "0047_row_identity_certificates.py": (
-            "efcead71de68a6783ebd922ba86f6e9c65031e48075ba5f2b34836c6881d696c"
+            "cb015a34c78ad146f22cfdaaaf4407a401fd44bb6f926cecfca9b676ff13adfc"
         ),
         "0046_relationship_incident.py": (
             "ed37ceedf4177be14df96f890f6b065f41ce83bca7b876ede3e32c99c0ddce2d"

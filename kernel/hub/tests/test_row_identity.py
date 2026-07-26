@@ -325,7 +325,7 @@ def test_exact_identity_certificate_persists_and_replays_for_the_postgres_lifecy
     descriptor = certify_and_persist_exact_row_identity(storage, exact, ["id"])
     assert certify_and_persist_exact_row_identity(storage, exact, ["id"]) == descriptor
     assert metadb.managed_local_row_identity_certificate_descriptor(
-        exact.dataset_id, exact.revision_id) == descriptor
+        storage, exact.dataset_id, exact.revision_id) == descriptor
 
 
 @pytest.mark.parametrize("mutate", [

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -303,13 +304,26 @@ def certify_and_persist_exact_row_identity(
         owner: str = "row-identity-certification",
 ) -> dict:
     """Run the explicit whole-revision proof operation and retain its reusable descriptor."""
-    certificate = certify_exact_row_identity(
-        storage, dataset_ref, key_columns, owner=owner)
-    if certificate.status != "complete":
-        raise RowIdentityValidationError("row identity evidence is invalid")
-    return metadb.managed_local_row_identity_certificate_store(
-        dataset_ref.dataset_id, dataset_ref.revision_id,
-        serialize_row_identity_coverage(certificate, dataset_ref, certificate.spec.digest))
+    exact = _exact_ref(dataset_ref)
+    artifact_uri = metadb.managed_local_file_revision_artifact(*exact)
+    if artifact_uri is None:
+        raise RowIdentityUnavailable("exact row identity source is unavailable")
+    try:
+        with source_read_scope(storage, [artifact_uri], owner=f"{owner}:persistence") as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                raise RowIdentityUnavailable("exact row identity source is unavailable")
+            artifact_info = os.fstat(guards[0].artifact_fileno())
+            certificate = certify_exact_row_identity(
+                storage, dataset_ref, key_columns, owner=owner)
+            if certificate.status != "complete":
+                raise RowIdentityValidationError("row identity evidence is invalid")
+            return metadb.managed_local_row_identity_certificate_store(
+                dataset_ref.dataset_id, dataset_ref.revision_id,
+                serialize_row_identity_coverage(
+                    certificate, dataset_ref, certificate.spec.digest),
+                artifact_dev=int(artifact_info.st_dev), artifact_ino=int(artifact_info.st_ino))
+    except ManagedSourceUnavailable as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
 
 
 def freeze_row_identity_spec(
