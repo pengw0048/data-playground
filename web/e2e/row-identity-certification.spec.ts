@@ -25,7 +25,7 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await page.locator('input[type="file"]').setInputFiles({
       name: uploadedName,
       mimeType: "application/vnd.apache.parquet",
-      buffer: await readFile(resolve(".e2e-workspace/data/images.parquet")),
+      buffer: await readFile(resolve(".e2e-workspace/data/binary_media.parquet")),
     });
     uploaded = (await (await uploadedResponse).json()) as UploadedDataset;
 
@@ -62,12 +62,15 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await page.goto(`/#/canvas/${canvasId}`);
     await page.locator('.react-flow__node[data-id="write"]').click();
     const inspector = page.getByTestId("inspector");
+    await inspector.getByRole("button", { name: "Run", exact: true }).click();
+    // Binary fields have no fixed-width estimate, so normal admission truthfully asks for the
+    // existing explicit publication confirmation before it starts the managed Write.
     const runResponse = page.waitForResponse(
       (response) =>
         response.url().endsWith("/api/run") &&
         response.request().method() === "POST",
     );
-    await inspector.getByRole("button", { name: "Run", exact: true }).click();
+    await page.getByRole("button", { name: "Publish revision" }).click();
     const started = await runResponse;
     expect(started.ok()).toBeTruthy();
     const { runId } = (await started.json()) as { runId: string };
@@ -111,14 +114,87 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await history.getByRole("checkbox", { name: /^id/ }).check();
     await history.getByRole("button", { name: "Check scan cost" }).click();
     await expect(history.getByText("Ordered key schema:")).toBeVisible();
+    const exactDetailUrl = `/api/catalog/revisions/${encodeURIComponent(receipt.datasetId)}/${encodeURIComponent(receipt.revisionId)}`;
+    const certifiedDetail = page.waitForResponse(
+      (response) => response.url().endsWith(exactDetailUrl)
+        && response.request().method() === "GET"
+        && response.ok(),
+    );
+    const mediaRequest = (column: "image" | "video") => page.waitForRequest(
+      (request) => {
+        if (!request.url().endsWith(`${exactDetailUrl}/media-cell`) || request.method() !== "POST") return false;
+        return (request.postDataJSON() as { column?: string } | null)?.column === column;
+      },
+      { timeout: 30_000 },
+    );
+    const imageRequest = mediaRequest("image");
+    const videoRequest = mediaRequest("video");
     await history
       .getByRole("button", {
         name: /Start certification|Confirm and start full scan/,
       })
       .click();
-    await expect(history.getByText("Certified row identity")).toBeVisible({
-      timeout: 30_000,
+    await expect(history.getByText("Certified row identity")).toBeVisible({ timeout: 30_000 });
+    const refreshed = await certifiedDetail;
+    const refreshedDetail = (await refreshed.json()) as {
+      rowIdentity: { proofStatus: string };
+      preview: { rowIdentities: Array<Array<{ name: string; arrowType: string; value: unknown }>> | null };
+    };
+    expect(refreshedDetail.rowIdentity.proofStatus).toBe("certified");
+    const identity = refreshedDetail.preview.rowIdentities?.[0];
+    if (!identity) throw new Error("certified exact detail did not include the preview row identity");
+    await expect(history.getByLabel("Certified row identity")).toBeVisible({ timeout: 30_000 });
+
+    // These are bytes inside the managed output, not direct URL fixtures. Read them only through
+    // the certified exact endpoint. Assert the shipped renderer, rather than issuing a parallel
+    // fetch in the test that could pass while the product UI remains broken.
+    const exactPreview = history.getByText("Exact revision preview");
+    await expect(exactPreview).toBeVisible({ timeout: 30_000 });
+    await exactPreview.scrollIntoViewIfNeeded();
+    const image = history.getByRole("img", { name: "Media image" });
+    const video = history.getByLabel("Media video");
+    await expect(image).toBeVisible({ timeout: 30_000 });
+    await expect(video).toBeVisible({ timeout: 30_000 });
+    await expect.poll(() => image.evaluate((element) => {
+      const media = element as HTMLImageElement;
+      return media.complete && media.naturalWidth > 0;
+    })).toBe(true);
+    await expect.poll(() => video.evaluate((element) => (element as HTMLVideoElement).readyState))
+      .toBeGreaterThanOrEqual(1);
+
+    const imageBody = imageRequest.then((request) => request.postDataJSON() as {
+      identity: Array<{ name: string; arrowType: string; value: unknown }>;
+      column: string;
     });
+    const videoBody = videoRequest.then((request) => request.postDataJSON() as {
+      identity: Array<{ name: string; arrowType: string; value: unknown }>;
+      column: string;
+    });
+    await expect(imageBody).resolves.toEqual({ identity, column: "image" });
+    await expect(videoBody).resolves.toEqual({ identity, column: "video" });
+
+    // The same rendered cells remain usable at the documented minimum and reference desktop
+    // viewports in both themes; resizing or retheming must not replace them with placeholders.
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport);
+      for (const theme of ["dark", "light"] as const) {
+        const html = page.locator("html");
+        // The Workspace route intentionally has no Canvas TopBar theme button. Apply the same
+        // persisted root contract used by the theme controller so this exact-revision dialog stays
+        // open while its token-driven renderer is checked in both modes.
+        await page.evaluate((next) => {
+          localStorage.setItem("dp-theme", next);
+          if (next === "dark") document.documentElement.setAttribute("data-theme", "dark");
+          else document.documentElement.removeAttribute("data-theme");
+          window.dispatchEvent(new Event("dp-theme-change"));
+        }, theme);
+        if (theme === "dark") await expect(html).toHaveAttribute("data-theme", "dark");
+        else await expect(html).not.toHaveAttribute("data-theme", "dark");
+        await image.scrollIntoViewIfNeeded();
+        await expect(image).toBeVisible();
+        await expect(video).toBeVisible();
+      }
+    }
 
     await page.reload();
     await expect(history.getByText("Certified row identity")).toBeVisible();

@@ -6,6 +6,7 @@ import type { ComponentType } from 'react'
 import { registerCapability } from './registry'
 import { Icon } from '../ui/Icon'
 import type { ColumnSchema } from '../types/graph'
+import { MediaCellRenderer } from '../components/MediaCellRenderer'
 
 type TabProps = { columns: ColumnSchema[]; rows: Record<string, unknown>[] }
 
@@ -14,24 +15,29 @@ const colsWith = (cols: ColumnSchema[], capId: string) => cols.filter((c) => c.c
 // generic renderer 'grid' — a media/image grid over the first column tagged with `capId`
 function gridTab(capId: string): ComponentType<TabProps> {
   return function GridTab({ columns, rows }: TabProps) {
-    const col = colsWith(columns, capId)[0]?.name
-    if (!col) return null
+    const mediaColumn = colsWith(columns, capId)[0]
+    if (!mediaColumn) return null
+    const col = mediaColumn.name
     const labelCol = columns.find((c) => !c.capabilities.includes('media') && !c.capabilities.includes('vector'))?.name
     return (
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 10, padding: 12 }}>
         {rows.slice(0, 60).map((r, i) => {
-          const url = String(r[col] ?? '')
+          const value = r[col]
+          const label = value == null ? 'empty media' : String(value)
           return (
             <div key={i} style={{ background: 'var(--viewer-2)', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--viewer-line)' }}>
               <div style={{ position: 'relative', aspectRatio: '4/3', background: 'hsl(var(--muted))', display: 'grid', placeItems: 'center' }}>
-                <img src={url} loading="lazy" style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                  onError={(e) => { (e.currentTarget.style.display = 'none') }} />
-                <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#c2c6cd', pointerEvents: 'none' }}>
-                  <Icon name="play" size={22} />
-                </div>
+                {capId === 'media' ? <MediaCellRenderer column={col} value={value}
+                  mediaKind={mediaColumn.mediaKind} viewport="grid" /> : <>
+                    <img src={label} loading="lazy" style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                      onError={(e) => { (e.currentTarget.style.display = 'none') }} />
+                    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#c2c6cd', pointerEvents: 'none' }}>
+                      <Icon name="play" size={22} />
+                    </div>
+                  </>}
               </div>
               <div style={{ padding: '6px 8px', fontSize: 10.5, color: 'var(--viewer-text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {labelCol ? String(r[labelCol]) : url.split('/').slice(-2).join('/')}
+                {labelCol ? String(r[labelCol]) : label.split('/').slice(-2).join('/')}
               </div>
             </div>
           )

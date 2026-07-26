@@ -5,7 +5,7 @@ import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from 
 const mocks = vi.hoisted(() => ({
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
   createDatasetView: vi.fn(), restoreRevision: vi.fn(), restoreRevisionTask: vi.fn(),
-  rowIdentityCertificationTask: vi.fn(),
+  rowIdentityCertificationTask: vi.fn(), openMediaCell: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
@@ -16,7 +16,10 @@ vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
     status: number
-    constructor(status: number, message: string) { super(message); this.status = status }
+    code?: string
+    constructor(status: number, message: string, code?: string) {
+      super(message); this.status = status; this.code = code
+    }
   },
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
@@ -274,6 +277,58 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for amount' }))
     expect(await screen.findByTestId('field-evidence-amount'))
       .toHaveTextContent('retained empty-revision schema')
+  })
+
+  it('opens the stable exact certification action for uncertified binary media without a cell request', async () => {
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValue(detail('rev-media', {
+      preview: {
+        columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [{ frame: '<4 bytes>' }], rowIdentities: null, hasMore: false, rowLimit: 100,
+      },
+      rowIdentity: { datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable', certificationSupported: true, fields: [], encodingVersion: null },
+    }))
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
+    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
+    expect(mocks.openMediaCell).not.toHaveBeenCalled()
+  })
+
+  it('refreshes the same exact revision before reopening certification for a stale retained identity', async () => {
+    const certified = detail('rev-media', {
+      preview: {
+        columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [{ frame: '<4 bytes>' }],
+        rowIdentities: [[{ name: 'id', arrowType: 'int64', value: '1' }]],
+        hasMore: false,
+        rowLimit: 100,
+      },
+      rowIdentity: {
+        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'certified',
+        certificationSupported: true, fields: [{ name: 'id', arrowType: 'int64' }], encodingVersion: 'row-identity-v1',
+      },
+    })
+    const unavailable = detail('rev-media', {
+      preview: certified.preview,
+      rowIdentity: {
+        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable',
+        certificationSupported: true, fields: [], encodingVersion: null,
+      },
+    })
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValueOnce(certified).mockResolvedValueOnce(unavailable)
+    mocks.openMediaCell.mockRejectedValue(
+      new KernelError(409, 'identity unavailable', 'media_cell_identity_unavailable'),
+    )
+
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
+
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledTimes(2))
+    expect(mocks.datasetRevision).toHaveBeenLastCalledWith('dataset-stable', 'rev-media')
+    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
   })
 
   it('never falls back to latest when the selected exact revision was compacted', async () => {

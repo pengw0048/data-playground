@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { MediaCellRenderer } from '../components/MediaCellRenderer'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
@@ -732,7 +733,8 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
           </div>
           <div className="min-w-0 flex-1 text-[11.5px]">
             {c.capabilities.includes('media') && row[c.name] != null && (
-              <img src={String(row[c.name])} loading="lazy" className="mb-1.5 block max-h-[140px] max-w-[200px] rounded-md bg-muted" onError={(e) => (e.currentTarget.style.display = 'none')} />
+              <div className="mb-1.5"><MediaCellRenderer column={c.name} value={row[c.name]}
+                mediaKind={c.mediaKind} viewport="detail" /></div>
             )}
             <div className="dp-mono whitespace-pre-wrap break-words text-foreground">
               {row[c.name] == null ? '·' : typeof row[c.name] === 'object' ? JSON.stringify(row[c.name], null, 2) : String(row[c.name])}
@@ -854,13 +856,7 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
 function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value == null) return <span className="text-muted-foreground/60">·</span>
   if (col.capabilities.includes('media')) {
-    const url = String(value)
-    return (
-      <span className="inline-flex items-center gap-1.5">
-        <img src={url} loading="lazy" className="h-6 w-[34px] rounded-sm bg-muted object-cover" onError={(e) => (e.currentTarget.style.display = 'none')} />
-        <span className="max-w-[150px] overflow-hidden text-ellipsis text-muted-foreground">{url.split('/').slice(-1)[0]}</span>
-      </span>
-    )
+    return <MediaCellRenderer column={col.name} value={value} mediaKind={col.mediaKind} viewport="compact" />
   }
   if (col.capabilities.includes('vector') && Array.isArray(value)) {
     return <span className="rounded bg-primary/10 px-1.5 py-px text-[10px] font-semibold text-primary">[{(value as number[]).length}]</span>

@@ -9,6 +9,7 @@ import type {
 import { Icon } from '../ui/Icon'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
 import { RowIdentityCertificationControl } from '../components/RowIdentityCertificationControl'
+import { MediaCellRenderer } from '../components/MediaCellRenderer'
 
 const PAGE_SIZE = 20
 const MAX_RESERVOIR_SEED = 2_147_483_647
@@ -279,7 +280,7 @@ function RevisionDetail({ revision, detail, parent, loading, error, parentError,
               </div>)}
             </div> : <div className="mt-1 text-[9.5px] text-muted-foreground">No schema field changes.</div>}
           </div>}
-    <ExactPreview detail={detail} />
+    <ExactPreview detail={detail} onRefresh={onRetry} />
   </div>
 }
 
@@ -306,8 +307,23 @@ function Summary({ current, parent }: { current: DatasetRevisionSummary; parent:
   </div>
 }
 
-function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
+function ExactPreview({ detail, onRefresh }: { detail: DatasetRevisionDetail; onRefresh: () => void }) {
   const { columns, rows, hasMore, rowLimit } = detail.preview
+  const encodedQuery = useStore((state) => state.workspaceDatasetQuery)
+  const setEncodedQuery = useStore((state) => state.setWorkspaceDatasetQuery)
+  const openCertification = () => {
+    const params = new URLSearchParams(encodedQuery)
+    params.set('revision', detail.revisionId)
+    params.set('revisionDataset', detail.datasetId)
+    params.set('rowIdentityAction', 'certify')
+    params.delete('rowIdentityTask')
+    setEncodedQuery(params.toString())
+    // A certified detail can expose this action only after the exact cell endpoint reports that
+    // its retained identity is no longer valid. Re-read the same exact revision so the existing
+    // certification control receives the authoritative unavailable state instead of dead-ending
+    // behind the stale certified summary.
+    if (detail.rowIdentity.proofStatus === 'certified') onRefresh()
+  }
   return <div>
     <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground">
       <span>Exact revision preview</span>
@@ -318,7 +334,14 @@ function ExactPreview({ detail }: { detail: DatasetRevisionDetail }) {
       : <div className="max-h-[220px] overflow-auto rounded-md border border-border">
         <table className="dp-mono w-max text-[9.5px]">
           <thead><tr>{columns.map((column) => <th key={column.name} className="sticky top-0 border-b border-border bg-muted px-2 py-1 text-left font-semibold"><FieldEvidenceButton column={column} marker className="dp-mono rounded px-0.5 hover:bg-accent" /></th>)}</tr></thead>
-          <tbody>{rows.map((row, index) => <tr key={index}>{columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{cell(row[column.name])}</td>)}</tr>)}</tbody>
+          <tbody>{rows.map((row, index) => <tr key={index}>{columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5">{column.capabilities.includes('media')
+            ? <MediaCellRenderer column={column.name} value={row[column.name]} mediaKind={column.mediaKind} viewport="table"
+                exact={{ datasetId: detail.datasetId, revisionId: detail.revisionId,
+                  identity: detail.preview.rowIdentities?.[index] ?? null,
+                  proofStatus: detail.rowIdentity.proofStatus,
+                  certificationSupported: detail.rowIdentity.certificationSupported,
+                  onOpenCertification: openCertification }} />
+            : cell(row[column.name])}</td>)}</tr>)}</tbody>
         </table>
         {!rows.length && <div className="border-t border-border px-2 py-1.5 text-[10.5px] text-muted-foreground">This exact revision returned no preview rows; its retained schema remains inspectable above.</div>}
       </div>}

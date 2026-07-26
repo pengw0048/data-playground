@@ -133,6 +133,13 @@ export interface MediaCellIdentityValue {
   value: string
 }
 
+export interface MediaCellRequest {
+  // These wire values are deliberately strings. In particular, int64 and uint64 identities must
+  // never take a trip through a JavaScript number before reaching the exact-cell endpoint.
+  identity: MediaCellIdentityValue[]
+  column: string
+}
+
 export interface DatasetRevisionPreview {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]

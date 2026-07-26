@@ -193,6 +193,9 @@ export function RowIdentityCertificationControl({
   }, [currentUser?.id, detail.datasetId, detail.revisionId]); // schema changes cannot occur for an exact revision
 
   useEffect(() => {
+    // A refreshed exact detail is authoritative. Do not reopen the completed task retained in the
+    // route after it has already produced this certified detail, or it would trigger another refresh.
+    if (detail.rowIdentity.proofStatus === "certified") return;
     if (
       task?.taskId === taskId &&
       task.datasetId === detail.datasetId &&
@@ -230,7 +233,7 @@ export function RowIdentityCertificationControl({
     return () => {
       live = false;
     };
-  }, [currentUser?.id, detail.datasetId, detail.revisionId, taskId]);
+  }, [currentUser?.id, detail.datasetId, detail.revisionId, detail.rowIdentity.proofStatus, taskId]);
   useEffect(() => {
     if (!currentTask || !ACTIVE.has(currentTask.status)) return;
     const expected = currentTask.taskId;
@@ -269,6 +272,13 @@ export function RowIdentityCertificationControl({
       onRefresh();
     }
   }, [currentTask, onRefresh]);
+  useEffect(() => {
+    if (detail.rowIdentity.proofStatus !== "certified" || !taskId) return;
+    const query = new URLSearchParams(encodedQuery);
+    query.delete("rowIdentityAction");
+    query.delete("rowIdentityTask");
+    setEncodedQuery(query.toString());
+  }, [detail.rowIdentity.proofStatus, encodedQuery, setEncodedQuery, taskId]);
 
   const recover = async (saved: PendingCertification) => {
     if (!currentUser?.id || busy) return;

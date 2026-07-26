@@ -696,4 +696,32 @@ describe("RowIdentityCertificationControl", () => {
       screen.getByRole("button", { name: "Refresh exact revision" }),
     ).toBeVisible();
   });
+
+  it("does not reopen a completed task after the refreshed exact detail is certified", async () => {
+    mocks.state.workspaceDatasetQuery =
+      "revision=revision-1&revisionDataset=dataset-1&rowIdentityAction=certify&rowIdentityTask=completed-task";
+    const onRefresh = vi.fn();
+    render(
+      <RowIdentityCertificationControl
+        detail={{
+          ...detail,
+          rowIdentity: {
+            ...detail.rowIdentity,
+            proofStatus: "certified",
+            fields: [{ name: "order,id", arrowType: "string" }],
+          },
+        }}
+        declaredKey={[]}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await act(async () => {});
+    expect(screen.getByLabelText("Certified row identity")).toBeVisible();
+    expect(mocks.task).not.toHaveBeenCalled();
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(mocks.state.setWorkspaceDatasetQuery).toHaveBeenCalledWith(
+      "revision=revision-1&revisionDataset=dataset-1",
+    );
+  });
 });
