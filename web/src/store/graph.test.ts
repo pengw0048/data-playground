@@ -1292,10 +1292,127 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeAdmission).toMatchObject({ mode: 'replace' })
   })
 
+  it('keeps unchanged replace admission on the automatic fast path', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    useStore.setState({ doc, runs: {} })
+    const intent = {
+      destination: {
+        logicalUri: '/outputs/output.parquet', name: 'output',
+        datasetId: 'dataset-1', provider: 'managed-local-file' as const,
+      },
+      mode: 'replace' as const, expectedSchema: [{ name: 'value', type: 'int' }],
+      expectedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-1' },
+      idempotencyKey: 'unchanged-write', partitions: [], provenance: {
+        publication: { idempotencyKey: 'unchanged-write', provenance: 'run' }, parents: [],
+      },
+      schemaDrift: {
+        comparedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-1' },
+        compatibility: { status: 'unknown' as const, fields: [{
+          kind: 'unchanged' as const, status: 'unknown' as const,
+          oldName: 'value', newName: 'value',
+          reason: 'logical type is unchanged; nullability is not proven on both versions',
+        }] },
+        requiresConfirmation: false,
+      },
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce({
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace',
+      provider: 'managed-local-file', expectedSchema: intent.expectedSchema, partitions: [],
+      expectedHead: intent.expectedHead, intent,
+    })
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [], outputs: [],
+    })
+
+    await useStore.getState().requestRun('write')
+
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      doc, 'write', false, expect.any(String), undefined, intent)
+    expect(useStore.getState().runs.write.phase).not.toBe('confirm')
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+    useStore.setState({ runs: {} })
+  })
+
+  it('shows exact drift admission before submitting that same confirmed write', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    useStore.setState({ doc, runs: {} })
+    const comparedHead = {
+      kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-1',
+    }
+    const intent = {
+      destination: {
+        logicalUri: '/outputs/output.parquet', name: 'output',
+        datasetId: 'dataset-1', provider: 'managed-local-file' as const,
+      },
+      mode: 'replace' as const, expectedSchema: [
+        { name: 'value', type: 'int' }, { name: 'extra', type: 'string' },
+      ],
+      expectedHead: comparedHead, idempotencyKey: 'drift-write', partitions: [],
+      provenance: {
+        publication: { idempotencyKey: 'drift-write', provenance: 'run' }, parents: [],
+      },
+      schemaDrift: {
+        comparedHead,
+        compatibility: { status: 'compatible' as const, fields: [{
+          kind: 'added' as const, status: 'compatible' as const,
+          newName: 'extra', reason: 'nullable field was added',
+        }] },
+        requiresConfirmation: true,
+      },
+    }
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'replace' as const, provider: 'managed-local-file',
+      expectedSchema: intent.expectedSchema, partitions: [], expectedHead: comparedHead, intent,
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(admission)
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [], outputs: [],
+    })
+
+    await useStore.getState().requestRun('write')
+
+    const submissionId = apiMocks.writeAdmission.mock.calls[0][2]
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'confirm', writeAdmission: admission, writeSubmissionId: submissionId,
+    })
+    expect(useStore.getState().openPanels).toEqual({ write: 'run' })
+    expect(apiMocks.run).not.toHaveBeenCalled()
+
+    await useStore.getState().run('write', true)
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      doc, 'write', true, submissionId, undefined, intent)
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+    useStore.setState({ runs: {} })
+  })
+
   it('surfaces a stale write admission as re-admission work, not a size confirmation', async () => {
     const write = NODE('write', 'write')
     write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
-    useStore.setState({ doc: { id: 'c', version: 1, name: 'test', requirements: [], nodes: [write], edges: [] } })
+    const source = NODE('source')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: {},
+    })
     const admission = {
       nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace',
       provider: 'managed-local-file', expectedSchema: [], partitions: [], intent: { marker: 'frozen' },
@@ -1310,6 +1427,24 @@ describe('graph store — core authority ops', () => {
       phase: 'failed', error: expect.stringContaining('write admission is stale'),
     })
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+
+    const fresh = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace',
+      provider: 'managed-local-file', expectedSchema: [], partitions: [],
+      intent: { marker: 'fresh', schemaDrift: { requiresConfirmation: false } },
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(fresh)
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [], outputs: [],
+    })
+    await useStore.getState().requestRun('write')
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+    expect(apiMocks.writeAdmission.mock.calls[1][2]).not.toBe(apiMocks.writeAdmission.mock.calls[0][2])
+    expect(apiMocks.run.mock.calls[1][5]).toEqual(fresh.intent)
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+    useStore.setState({ runs: {} })
   })
 
   it('reuses the admitted write submission after response loss and a Canvas version save', async () => {

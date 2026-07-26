@@ -861,6 +861,16 @@ class WriteProvenance(Wire):
         return self
 
 
+class WriteSchemaDrift(Wire):
+    """Frozen exact-head schema comparison for one ordinary managed-file replacement."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    compared_head: ExactDatasetRef
+    compatibility: SchemaCompatibility
+    requires_confirmation: bool
+
+
 class WriteIntent(Wire):
     """Frozen pre-1.0 contract for one managed local create, replace, or Lance append."""
 
@@ -873,6 +883,7 @@ class WriteIntent(Wire):
     idempotency_key: str = Field(min_length=1, max_length=2048)
     partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
     provenance: WriteProvenance
+    schema_drift: WriteSchemaDrift | None = None
 
     @model_validator(mode="after")
     def validate_contract(self) -> "WriteIntent":
@@ -907,6 +918,12 @@ class WriteIntent(Wire):
                 raise ValueError("append write requires a .lance destination")
         elif self.destination.provider != "managed-local-file":
             raise ValueError("create/replace writes require the managed-local-file provider")
+        if self.schema_drift is not None:
+            if (self.mode != "replace"
+                    or self.destination.provider != "managed-local-file"
+                    or self.expected_head != self.schema_drift.compared_head):
+                raise ValueError(
+                    "schema drift evidence requires the exact managed-local-file replace head")
         return self
 
 
@@ -937,8 +954,16 @@ class WriteReceipt(Wire):
     partitions: list[WritePartitionExpectation] = Field(default_factory=list, max_length=32)
     publication: WritePublicationIdentity
     provenance: WriteProvenance
+    schema_drift: WriteSchemaDrift | None = None
     execution_manifest_sha256: PlanDigest | None = None
     durable: Literal[True] = True
+
+    @model_validator(mode="after")
+    def validate_schema_drift(self) -> "WriteReceipt":
+        if (self.schema_drift is not None
+                and self.parent_head != self.schema_drift.compared_head):
+            raise ValueError("write receipt schema drift must compare its exact parent head")
+        return self
 
     @property
     def schema(self) -> list[ColumnSchema]:
