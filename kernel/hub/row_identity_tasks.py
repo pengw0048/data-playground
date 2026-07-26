@@ -11,6 +11,7 @@ from typing import Callable
 from hub import db, metadb
 from hub.models import ExactDatasetRef
 from hub.row_identity import (
+    RowIdentityRevisionMismatch,
     RowIdentityUnavailable,
     RowIdentityValidationError,
     certify_and_commit_exact_row_identity,
@@ -90,8 +91,10 @@ def _worker(task_id: str, deps) -> None:
 
                 certify_and_commit_exact_row_identity(
                     deps.storage, exact, keys, commit=commit,
-                    owner=f"row-identity-task:{task_id}")
-        except RowIdentityUnavailable:
+                    owner=f"row-identity-task:{task_id}",
+                    expected_schema_sha256=admission["schema_sha256"],
+                    expected_spec_sha256=admission["spec_sha256"])
+        except (RowIdentityUnavailable, RowIdentityRevisionMismatch):
             if state.lost:
                 return
             metadb.finish_row_identity_certification_failure(
@@ -102,13 +105,13 @@ def _worker(task_id: str, deps) -> None:
                 return
             metadb.finish_row_identity_certification_failure(
                 task_id, attempt_id, owner_token,
-                "cancelled" if state.cancel else "stale_or_unavailable_revision")
+                "cancelled" if state.cancel else "failed")
         except ValueError:
             if state.lost:
                 return
             metadb.finish_row_identity_certification_failure(
                 task_id, attempt_id, owner_token,
-                "cancelled" if state.cancel else "stale_or_unavailable_revision")
+                "cancelled" if state.cancel else "failed")
         except BaseException:
             if state.lost:
                 return

@@ -9,7 +9,6 @@ import uuid
 from typing import Annotated, Literal
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 from fastapi import APIRouter, Depends, Response
 from pydantic import ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -22,8 +21,8 @@ from hub.models import (
     ROW_IDENTITY_FIELD_NAME_MAX, Wire,
 )
 from hub.row_identity import (
-    RowIdentityValidationError,
-    freeze_row_identity_spec_from_schema,
+    RowIdentityUnavailable, RowIdentityValidationError,
+    freeze_row_identity_spec_from_parquet_fileno,
     row_identity_spec_is_supported,
 )
 from hub.row_identity_tasks import dispatch
@@ -120,16 +119,16 @@ def _preflight(request: RowIdentityCertificationRequestV1, storage) -> tuple[
                 raise ManagedSourceUnavailable(
                     "row identity preflight source is unavailable")
             artifact_info = os.fstat(guards[0].artifact_fileno())
-            parquet = pq.ParquetFile(facts["artifact_uri"])
-            spec = freeze_row_identity_spec_from_schema(
-                exact, request.key_columns, parquet.schema_arrow)
+            spec = freeze_row_identity_spec_from_parquet_fileno(
+                exact, request.key_columns, guards[0].artifact_fileno())
             rows = facts["row_count"]
             total_bytes = int(artifact_info.st_size)
     except KeyError as exc:
         raise APIError(
             410, "Exact managed-local revision is unavailable",
             code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
-    except (ManagedSourceUnavailable, OSError, pa.ArrowException) as exc:
+    except (ManagedSourceUnavailable, RowIdentityUnavailable,
+            OSError, pa.ArrowException) as exc:
         raise APIError(
             410, "Exact managed-local revision is unavailable",
             code=APIErrorCode.RESOURCE_GONE, retryable=False) from exc
