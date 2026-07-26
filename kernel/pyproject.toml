@@ -33,7 +33,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-lance = ["pylance>=0.19"]
+# Managed local append requires native transaction commit/recovery and exact-revision statistics APIs.
+lance = ["pylance>=0.38.0"]
 # provider-agnostic LLM agent: Pydantic AI runs the tool-use loop in-process (no CLI, no proxy);
 # LiteLLM stays for provider key-detection + model-string parsing. Native providers cover the rest.
 agent = [
