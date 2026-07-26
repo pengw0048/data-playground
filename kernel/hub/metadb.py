@@ -11314,15 +11314,6 @@ def row_identity_certification_task_view(task_id: str, uid: str) -> dict | None:
         envelope = s.get(RowIdentityCertificationTaskEnvelope, task.id)
         if envelope is None:
             raise RuntimeError("row identity certification task envelope is unavailable")
-        receipt = json.loads(envelope.receipt_doc) if envelope.receipt_doc else None
-        certificate = receipt.get("certificate") if isinstance(receipt, dict) else None
-        if (receipt is not None and receipt.get("schemaVersion") == 1
-                and isinstance(certificate, dict)
-                and certificate.get("proofStatus") == "certified"
-                and "certificationSupported" not in certificate):
-            # #875 V1 receipts predate the capability flag. Their successful proof operation is
-            # managed-local by construction, so upgrade only that bounded public view in memory.
-            certificate["certificationSupported"] = True
         return {
             "taskId": task.id,
             "status": task.status,
@@ -11332,7 +11323,7 @@ def row_identity_certification_task_view(task_id: str, uid: str) -> dict | None:
             "specSha256": envelope.spec_sha256,
             "keyColumns": json.loads(envelope.keys_doc),
             "canCancel": task.status not in _TERMINAL_RUN,
-            "receipt": receipt,
+            "receipt": json.loads(envelope.receipt_doc) if envelope.receipt_doc else None,
         }
 
 

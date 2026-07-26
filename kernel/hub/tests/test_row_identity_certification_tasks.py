@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import threading
 import uuid
@@ -122,16 +121,6 @@ def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
     assert done.receipt.certificate is not None
     assert metadb.managed_local_row_identity_certificate_descriptor(
         deps.storage, published["dataset_id"], published["revision_id"]) is not None
-
-    with metadb.session() as session:
-        envelope = session.get(metadb.RowIdentityCertificationTaskEnvelope, task.task_id)
-        receipt = json.loads(envelope.receipt_doc)
-        del receipt["certificate"]["certificationSupported"]
-        envelope.receipt_doc = json.dumps(
-            receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    done = api.status(task.task_id, "owner")
-    assert done.receipt is not None and done.receipt.certificate is not None
-    assert done.receipt.certificate.certification_supported is True
 
     monkeypatch.setattr(
         "hub.row_identity.DuckDBAdapter.scan",
