@@ -17,8 +17,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from hub import graph as graph_mod, metadb
+from hub import db, graph as graph_mod, metadb
 from hub.execution_manifest import build_execution_manifest
+from hub.executors.engine import BuildEngine
 from hub.local_run_inputs import bind_manifest
 from hub.main import app
 from hub.local_writes import write_managed_local_file
@@ -27,6 +28,7 @@ from hub.models import (
     ExactDatasetRef,
     Graph,
     LineagePublication,
+    PreviewRequest,
     WriteDestination,
     WriteIntent,
     WriteProvenance,
@@ -34,7 +36,8 @@ from hub.models import (
 from hub.nodespecs import BUILTIN_NODE_SPECS
 from hub.plugins.adapters import DuckDBAdapter, ManagedLocalFileRevisionAdapter
 from hub.plugins.catalog import InMemoryCatalog
-from hub.routers import catalog as catalog_routes
+from hub.plugins.processors import ProcessorRegistry
+from hub.routers import catalog as catalog_routes, runs
 from hub.storage import LocalStorage
 
 
@@ -209,6 +212,69 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
             metadb.LocalResultReference.owner_kind == "managed_file_revision",
         )))
     assert {ref.uri for ref in refs} == {first_uri, second_uri}
+
+
+def test_saved_exact_canvas_previews_retained_revision_after_head_replacement_and_restart(
+        local_catalog, tmp_path, monkeypatch):
+    storage, catalog = local_catalog
+    logical_uri = str(tmp_path / "published" / "saved-canvas.parquet")
+    first_uri, first = _publish(storage, catalog, logical_uri, 1)
+    canvas_id = f"saved-exact-{uuid.uuid4().hex}"
+    doc = _exact_canvas_doc(
+        canvas_id, first_uri, first["dataset_id"], first["revision_id"])
+    graph = Graph.model_validate(doc)
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id="local", name="Saved exact revision", version=1,
+            doc=json.dumps(doc)))
+        session.flush()
+        metadb.sync_local_result_owner(session, "canvas", canvas_id, doc)
+
+    second_uri, second = _publish(storage, catalog, logical_uri, 2)
+    assert first_uri != second_uri
+    assert first["dataset_id"] == second["dataset_id"]
+
+    restarted_catalog = InMemoryCatalog(
+        str(tmp_path / "data"), lambda _uri: DuckDBAdapter())
+    restarted_storage = LocalStorage(storage.root)
+    deps = SimpleNamespace(
+        catalog=restarted_catalog,
+        storage=restarted_storage,
+        resolve_adapter=lambda _uri: DuckDBAdapter(),
+        registry=ProcessorRegistry(),
+        node_builders={},
+        node_specs={spec.kind: spec for spec in BUILTIN_NODE_SPECS},
+        chosen_backend=lambda _uid: "local-out-of-core",
+    )
+    monkeypatch.setattr(runs, "get_deps", lambda: deps)
+    try:
+        preview = runs.run_preview(
+            PreviewRequest(graph=graph, node_id="source", k=10),
+            uid="local",
+        )
+
+        manifest = runs._resolve_local_run_manifest(graph, "source", deps)
+        third_uri, third = _publish(storage, catalog, logical_uri, 3)
+        assert third["dataset_id"] == first["dataset_id"]
+        bound = runs._bind_local_run_manifest(graph, manifest, deps, "source")
+        bound_config = bound.nodes[0].data["config"]
+        assert bound_config["uri"] == third_uri
+        assert bound_config["_input_artifact_uri"] == first_uri
+        with db.run_scope():
+            admitted_rows = BuildEngine(
+                bound, deps.resolve_adapter, deps.registry, full=True,
+                node_builders=deps.node_builders, node_specs=deps.node_specs,
+            ).relation("source").fetchall()
+    finally:
+        restarted_storage.close()
+
+    assert preview.not_previewable is False
+    assert preview.error is False
+    assert preview.rows == [{"value": 1}]
+    assert preview.input_manifest is not None
+    assert preview.input_manifest[0]["dataset_id"] == first["dataset_id"]
+    assert preview.input_manifest[0]["revision_id"] == first["revision_id"]
+    assert admitted_rows == [(1,)]
 
 
 def test_typed_local_create_replace_receipts_reopen_exact_revisions_after_restart(
@@ -686,6 +752,8 @@ def test_managed_local_single_unregister_api_preserves_revision_retention(
     artifact, published = _publish(storage, catalog, logical_uri, 1)
     revision_id = published["revision_id"]
     table_id = published["table"].id
+    assert metadb.managed_local_exact_revision_binding(
+        published["dataset_id"], revision_id) is not None
 
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
         catalog=catalog, resolve_adapter=lambda _uri: DuckDBAdapter()))
@@ -712,6 +780,8 @@ def test_managed_local_single_unregister_api_preserves_revision_retention(
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True}
+    assert metadb.managed_local_exact_revision_binding(
+        published["dataset_id"], revision_id) is None
     assert lock_order.index("registry") < lock_order.index("artifact")
     assert metadb.catalog_get(table_id) is None
     with metadb.session() as session:
@@ -877,6 +947,8 @@ def test_revision_gc_waits_for_canvas_and_live_reader_then_converges(local_catal
     with metadb.session() as session:
         assert session.get(metadb.ManagedLocalFileRevision, first["revision_id"]) is None
         assert session.get(metadb.ManagedLocalFileRevision, second["revision_id"]) is not None
+    assert metadb.managed_local_exact_revision_binding(
+        first["dataset_id"], first["revision_id"]) is None
 
 
 def test_admission_and_durable_profile_own_exact_revision_artifacts(local_catalog, tmp_path):
