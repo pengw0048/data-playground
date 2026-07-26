@@ -65,6 +65,12 @@ class _Engine:
     def __init__(self, relations: dict[str, _Relation]):
         self._relations = relations
 
+    def prepare(self, **_kwargs):
+        return None
+
+    def source_is_fully_restricted(self, _node_id: str) -> bool:
+        return False
+
     def build(self, _node_id: str):
         return self._relations
 

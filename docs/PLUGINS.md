@@ -111,6 +111,66 @@ on a preview sample or at full scale.
 
 Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
 
+### Prepare one exact-Source native-row read
+
+A full-run-only node that must do bounded service work before core opens its direct Source may opt
+into one preparation lifecycle (core API 2):
+
+```python
+from hub.sdk import (
+    ExactSourceRowRestriction,
+    NodePreparation,
+    UnsupportedUpstreamError,
+)
+
+def prepare(params, immediate_inputs):
+    source = immediate_inputs.port("in")
+    if source.count != 1 or source.inputs[0].kind != "source":
+        raise UnsupportedUpstreamError("this node requires one direct Source")
+    binding = source.inputs[0].dataset
+    if binding is None or binding.revision_id is None:
+        raise UnsupportedUpstreamError("this node requires an admitted exact Source")
+    row_ids, scores = search_once(params["query"])
+    unique_ids = tuple(dict.fromkeys(row_ids))
+    return NodePreparation(
+        state={"scores": scores},
+        restriction=ExactSourceRowRestriction("in", unique_ids),
+    )
+
+def build(engine, node, inputs, prepared_state):
+    return join_scores(inputs[0], prepared_state["scores"])
+
+def register(reg):
+    reg.add_node(SPEC, build, prepare=prepare)
+```
+
+Core calls `prepare(params, immediate_inputs)` once after full-run admission and before it constructs
+any ordinary Source scanner. `params` is a read-only mapping containing only fields declared by this
+node's `NodeSpec`, with declared defaults applied. `immediate_inputs` is the same bounded identity
+snapshot documented above. The preparer receives no engine, graph, URI, adapter, or Source
+configuration.
+
+The optional restriction names one declared input port. That port must have exactly one directly wired,
+already-admitted immutable Source. Supply at most 50 unique Python `int` values in the uint64 range;
+deduplicate service results before returning. Core opens the admitted revision through the adapter's
+optional exact native-row capability and gives that edge its own relation. Other consumers of the same
+Source retain their ordinary relation and cache. Missing capabilities, invalid topology or ids, and
+provider failures stop before any unrestricted fallback; disabled execution ancestors are rejected
+before preparation or adapter access, and row ids are never interpreted as positional indices. The
+restricted relation has intersection semantics, not candidate ordering; the builder remains responsible
+for its output order and any bounded join to scores in prepared state.
+An `enforceSchema` Source is currently rejected before adapter access because its ordinary runtime
+schema check would construct the unrestricted relation.
+
+The opaque `state` object is passed unchanged to the matching four-argument builder, so a service call
+does not repeat. Preparation runs only for executable full passes. Schema-only planning and interactive
+preview do not invoke it; prepared nodes should declare `previewable=False` and use a declared output
+schema when schema propagation is required. Prepared nodes do not support the `ir=` distributed path.
+Cancellation is checked before each preparation, after its bounded service call returns, and immediately
+before the exact native-row open. The service call itself receives no cancellation API; if it is already
+running, core waits for it to return and then performs no provider row I/O.
+See [`dp_exact_row_fixture`](../examples/plugins/dp_exact_row_fixture/) for the minimal reference.
+
 ## Loading it
 
 Three discovery paths (see `kernel/hub/deps.py`):
@@ -147,9 +207,11 @@ manifest loads versionless.
 
 `register(reg)` can add more than nodes.
 
-`reg.add_node(spec, build[, ir])` registers a canvas node. Optional `ir=ir(node) -> {"op", "config"} |
-None` emits an engine-neutral IR op (for example a clean `map` with inlined `code`) instead of
-`opaque`, so a distributed backend can run it. See the IR section and `dp_upper`.
+`reg.add_node(spec, build[, ir], *, prepare=...)` registers a canvas node. Optional
+`ir=ir(node) -> {"op", "config"} | None` emits an engine-neutral IR op (for example a clean `map`
+with inlined `code`) instead of `opaque`, so a distributed backend can run it. `prepare=` is the
+full-pass-only exact native-row lifecycle above and cannot be combined with `ir=`. See the IR section
+and `dp_upper`.
 
 `reg.add_adapter(adapter)` claims a URI scheme. Implement `DatasetAdapter` in
 `kernel/hub/backends.py`: `name`, `matches`, `scan`, `schema`, `count`, `fingerprint`, `write`, and
@@ -160,6 +222,15 @@ An adapter may also expose `metadata_count(uri)` only when it is an exact, bound
 must not scan rows or perform an unbounded namespace listing. Preflight and recovery also call
 `fingerprint(uri)`; keep it bounded and metadata-only, and return the best available revision token rather
 than promising a content hash. Missing capabilities or uncertain metadata are handled as unknown cost.
+
+An exact-revision adapter may additionally implement
+`open_revision_native_rows(uri, revision_id, *, native_row_ids)`. It receives at most 50 unique uint64
+native identities and must return their exact intersection from that immutable revision, including a
+uint64 `_rowid` column. Missing and stale ids are omitted. The provider read must remain bounded to
+those identities; a full scan, mutable-head reopen, DuckDB predicate fallback, or positional `take()`
+is not conformant. Core may call this capability with an empty tuple during full-run admission or
+rebind to prove the exact revision is still retained without reading rows, when the adapter has no
+`revision_schema` metadata capability. Omit the method when the adapter cannot make that guarantee.
 
 ### Field metadata and typed row references
 
@@ -646,6 +717,8 @@ fixtures exercise public contracts without becoming default product services.
   declares `viewer={"kind":"json"}` so the SPA shows a JSON tab with no frontend code.
 - [`dp_upper`](../examples/plugins/dp_upper/) — `add_node` (+ `ir`): `upper` node whose DuckDB build
   and IR hook share one generated operator, so it runs on Ray too.
+- [`dp_exact_row_fixture`](../examples/plugins/dp_exact_row_fixture/) — `add_node` (+ `prepare`):
+  minimal full-pass exact Source native-row restriction.
 - [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) — `add_node`: cluster near-duplicate
   rows by embedding cosine distance; adds `dup_group` + `is_representative`. Brute-force O(n²) —
   preview on a `sample` first.

@@ -19,7 +19,13 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Mapping
 
-from hub.backends import CatalogProvider, NodeBuilder
+from hub.backends import (
+    CatalogProvider,
+    NodeBuilder,
+    NodePreparer,
+    PreparedNodeBuilder,
+    _PreparedNodeRegistration,
+)
 from hub.models import BackendInfo, CapabilityView, KernelInfo, ResourceSpec, WorkerInfo
 from hub.nodespecs import BUILTIN_NODE_SPECS, NodeSpec
 from hub.plugins.adapters import DuckDBAdapter, default_adapters
@@ -30,8 +36,8 @@ from hub.settings import settings
 
 # Version of the plugin SPI this core exposes. A plugin's dataplay.toml may declare `min_core_api`
 # (an int); a pack requiring a newer core than this is skipped at load with a clear error instead of
-# being registered and crashing later. Bump when a breaking SPI change lands.
-CORE_API_VERSION = 1
+# being registered and crashing later. Bump whenever a plugin may require a newly added contract.
+CORE_API_VERSION = 2
 # The OLDEST plugin API major this core still supports. Bump alongside CORE_API_VERSION when an old
 # major is dropped, so the check is a semantic RANGE (min ≤ need ≤ core), not just a floor: a plugin
 # built for a now-removed major is rejected up front instead of registering and crashing later (OSS-01).
@@ -152,13 +158,23 @@ class Registry:
             raise
         self._activate(f"secret-resolver:{scheme.lower()}", "application")
 
-    def add_node(self, spec: NodeSpec, build: "NodeBuilder | None" = None, ir=None) -> None:
+    def add_node(
+            self, spec: NodeSpec, build: "NodeBuilder | PreparedNodeBuilder | None" = None,
+            ir=None, *, prepare: "NodePreparer | None" = None) -> None:
         # `build` is the node's build callable — see hub.backends.NodeBuilder for its exact
         # signature/return contract (called by the engine as build(engine, node, inputs)).
         # `ir` is an OPTIONAL engine-neutral emit hook: ir(node) -> {"op", "config"} | None. When given,
         # the node lowers to that IR op (e.g. a clean `map` with inlined `code`) instead of `opaque:<kind>`,
         # so a distributed backend (dp_ray) can run it — NOT just DuckDB. The plugin guarantees its build()
         # and its ir op compute the same thing (like the built-in transform shares its operator).
+        # Preparation is intentionally one local-engine lifecycle, not another portable-planning
+        # mechanism. A prepared node therefore cannot also emit distributed IR.
+        if prepare is not None and build is None:
+            raise ValueError("a prepared node requires a builder")
+        if prepare is not None and ir is not None:
+            raise ValueError("a prepared node cannot also register distributed IR")
+        if prepare is not None and not callable(prepare):
+            raise TypeError("node preparer must be callable")
         # refuse to shadow a built-in OR an already-registered plugin kind — overwriting would
         # corrupt the /api/nodes contract and leave the original's build() as dead code
         if spec.kind in self.deps.builtin_kinds:
@@ -174,7 +190,10 @@ class Registry:
         spec = spec.model_copy(update={"source": f"plugin:{self._pack or 'unknown'}"})
         self.deps.node_specs[spec.kind] = spec
         if build is not None:
-            self.deps.node_builders[spec.kind] = build
+            self.deps.node_builders[spec.kind] = (
+                _PreparedNodeRegistration(build=build, prepare=prepare)
+                if prepare is not None else build
+            )
         if ir is not None:
             self.deps.node_ir[spec.kind] = ir
         self._activate(f"node:{spec.kind}", "execution")

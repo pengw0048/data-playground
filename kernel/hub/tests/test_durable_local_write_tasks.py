@@ -365,7 +365,8 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
 
         def open_revision(self, _uri, revision_id):
             self.opened.append(revision_id)
-            return DuckDBAdapter().scan({"v1": str(source), "v2": str(advanced)}[revision_id])
+            return DuckDBAdapter().scan(
+                {"v1": str(source), "v2": str(advanced)}[revision_id])
 
         def revision_detail(self, _uri, revision_id, *, preview_limit):
             relation = self.open_revision(_uri, revision_id)
@@ -392,7 +393,8 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
     source_config = graph.nodes[0].data["config"]
     source_config["uri"] = logical_uri
     source_config["datasetRef"] = {
-        "kind": "exact", "datasetId": workspace_providers.provider_dataset_identity(logical_uri),
+        "kind": "exact",
+        "datasetId": workspace_providers.provider_dataset_identity(logical_uri),
         "revisionId": "v1",
     }
     source_config["providerReadMode"] = "exact"
@@ -415,6 +417,152 @@ def test_durable_worker_reopens_admitted_workspace_provider_revision_after_head_
     assert receipt is not None
     assert pq.read_table(receipt["publication"]["artifactUri"])["value"].to_pylist() == [1, 2]
     assert exact_adapter.opened and set(exact_adapter.opened) == {"v1"}
+    deps.storage.close()
+
+
+def test_durable_prepared_worker_reopens_admitted_workspace_provider_native_rows_after_head_advance(
+        tmp_path, monkeypatch):
+    deps, graph, source, uid = _ordinary_task_context(tmp_path)
+    from hub import db
+    from hub.deps import Registry
+    from hub.nodespecs import NodeSpec, PortSpec
+    from hub.sdk import ExactSourceRowRestriction, NodePreparation
+
+    prepared_kind = "durable-exact-row-test"
+
+    def prepare(_params, _immediate_inputs):
+        return NodePreparation(
+            state="durable-state",
+            restriction=ExactSourceRowRestriction("in", (0,)),
+        )
+
+    def build(_engine, _node, inputs, state):
+        assert state == "durable-state"
+        return inputs[0]
+
+    Registry(deps).add_node(NodeSpec(
+        kind=prepared_kind,
+        title="durable exact row test",
+        category="compute",
+        inputs=[PortSpec(id="in", wire="dataset")],
+        outputs=[PortSpec(id="out", wire="dataset")],
+        previewable=False,
+    ), build, prepare=prepare)
+    graph.nodes.insert(1, type(graph.nodes[0]).model_validate({
+        "id": "prepared", "type": prepared_kind, "data": {"config": {
+            "outputSchema": [
+                {"name": "_rowid", "type": "uint64"},
+                {"name": "value", "type": "int64"},
+            ],
+        }},
+    }))
+    graph.edges = [
+        type(graph.edges[0]).model_validate({
+            "id": "source-prepared", "source": "source", "target": "prepared",
+        }),
+        type(graph.edges[0]).model_validate({
+            "id": "prepared-write", "source": "prepared", "target": "write",
+        }),
+    ]
+    advanced = source.with_name("provider-head-v2.parquet")
+    _write_ordinary_source(advanced, [99])
+    binding = metadb.workspace_provider_cache_resource(
+        mount_id=f"test-mount-{uuid.uuid4().hex}", provider="test-provider",
+        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+        provider_placement_id="provider-dataset",
+        provider_dataset_id="provider-dataset", uri="test-provider://provider-dataset",
+        kind="dataset", name="Provider dataset")
+    source_binding = metadb.workspace_provider_source_binding(binding["bindingId"])
+    assert source_binding is not None
+    logical_uri = workspace_providers.provider_dataset_uri(
+        source_binding["mountId"], source_binding["sourceBindingId"])
+    physical_uri = "test-provider://provider-dataset"
+
+    class ExactProviderAdapter:
+        name = "test-provider-exact"
+
+        def __init__(self):
+            self.head = "v1"
+            self.native_calls: list[tuple[str, tuple[int, ...]]] = []
+
+        def revision_history(self, _uri, *, limit, cursor=None):
+            del limit, cursor
+            return [], None
+
+        def resolve_revision(self, _uri, *, as_of=None):
+            del as_of
+            return {"revision_id": self.head}
+
+        def scan(self, _uri, **_kwargs):
+            pytest.fail("prepared durable replay must not scan a mutable Source")
+
+        def preview_scan(self, *_args, **_kwargs):
+            pytest.fail("prepared admission must not sample rows for width estimation")
+
+        def open_revision(self, _uri, revision_id):
+            pytest.fail(
+                f"prepared durable replay must not unrestricted-open revision {revision_id}")
+
+        def open_revision_native_rows(self, _uri, revision_id, *, native_row_ids):
+            self.native_calls.append((revision_id, native_row_ids))
+            values = {"v1": [1, 2], "v2": [99]}[revision_id]
+            selected = [
+                (row_id, values[row_id])
+                for row_id in native_row_ids if row_id < len(values)
+            ]
+            table = pa.table({
+                "_rowid": pa.array(
+                    [row_id for row_id, _value in selected], type=pa.uint64()),
+                "value": pa.array(
+                    [value for _row_id, value in selected], type=pa.int64()),
+            })
+            return db.conn().from_arrow(table)
+
+        def revision_detail(self, _uri, revision_id, *, preview_limit):
+            pytest.fail(
+                "prepared admission must not preview rows through revision_detail "
+                f"for {revision_id} at limit {preview_limit}")
+
+    exact_adapter = ExactProviderAdapter()
+    bound_adapter = workspace_providers._BoundProviderDatasetAdapter(
+        logical_uri, physical_uri, exact_adapter)
+    original_resolve = deps.resolve_adapter
+
+    def resolve_adapter(uri):
+        if uri == logical_uri:
+            return bound_adapter
+        if uri == physical_uri:
+            return exact_adapter
+        return original_resolve(uri)
+
+    monkeypatch.setattr(deps, "resolve_adapter", resolve_adapter)
+    source_config = graph.nodes[0].data["config"]
+    source_config["uri"] = logical_uri
+
+    status, _dispatched = _start_without_dispatch(
+        deps, graph, uid, str(uuid.uuid4()), monkeypatch)
+    task = metadb.durable_task(status.run_id)
+    assert task is not None
+    canonical_source = task["graph_doc"]["nodes"][0]["data"]["config"]
+    assert canonical_source["datasetRef"] == {
+        "kind": "exact",
+        "datasetId": workspace_providers.provider_dataset_identity(logical_uri),
+        "revisionId": "v1",
+    }
+    assert "uri" not in canonical_source
+    assert physical_uri not in json.dumps(task, default=str)
+
+    exact_adapter.head = "v2"
+    durable_tasks._worker(status.run_id, deps)
+
+    completed = metadb.durable_task(status.run_id)
+    assert completed is not None and completed["status"] == "done", completed["status_doc"].get("error")
+    receipt = completed["output_receipt"]
+    assert receipt is not None
+    assert pq.read_table(receipt["publication"]["artifactUri"])["value"].to_pylist() == [1]
+    assert exact_adapter.native_calls.count(("v1", ())) >= 2
+    assert ("v1", (0,)) in exact_adapter.native_calls
+    assert {revision_id for revision_id, _row_ids in exact_adapter.native_calls} == {"v1"}
     deps.storage.close()
 
 

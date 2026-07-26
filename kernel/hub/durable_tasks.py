@@ -72,7 +72,8 @@ def _worker(task_id: str, deps) -> None:
             graph = Graph.model_validate(claimed["graph_doc"])
             from hub.local_run_inputs import bind_manifest
             graph = bind_manifest(
-                graph, target, claimed["input_manifest"], deps.resolve_adapter)
+                graph, target, claimed["input_manifest"], deps.resolve_adapter,
+                node_builders=deps.node_builders)
             plan = compiler.compile_plan(
                 graph, target, deps.registry, deps.node_specs, deps.node_ir)
             if not plan.acyclic:

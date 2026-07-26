@@ -9,13 +9,17 @@ so what you see on the sample is faithful — except nodes flagged not-previewab
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+from collections.abc import Callable
+from types import MappingProxyType
 
 import duckdb
 import pyarrow as pa
 
 from hub import db, graph as g, sandbox
+from hub.backends import ExactRowRestrictionUnsupported, _PreparedNodeRegistration
 from hub.ir import resolve_config  # single source of built-in node config resolution (shared with the IR)
 from hub.models import PREVIEWABLE_MODES, ColumnSchema, Graph, GraphNode, dataset_ref_identity
 from hub.plugins.adapters import BoundedPreviewUnsupported, display_type, revision_adapter_for_uri
@@ -39,6 +43,7 @@ from hub.sqlpolicy import (
     validate_identifier_schema,
     validate_query,
 )
+from hub.sdk import ExactSourceRowRestriction, NodePreparation, UnsupportedUpstreamError, ctx
 
 Relation = duckdb.DuckDBPyRelation
 
@@ -458,6 +463,30 @@ class BuildEngine:
         # a node builds either one Relation (single output) or a dict of named output ports
         # (multi-output — e.g. a section that emit()s several named result sets)
         self._cache: dict[str, "Relation | dict[str, Relation]"] = {}
+        self._prepared_nodes: set[str] = set()
+        self._prepared_states: dict[str, object] = {}
+        self._delivered_prepared_states: set[str] = set()
+        self._prepared_edge_relations: dict[tuple[str, str], Relation] = {}
+        self._prepared_ancestor_source_ids: set[str] = set()
+        if output_node is None:
+            self._execution_node_ids = set(self._nodes)
+        else:
+            parents: dict[str, list[str]] = {}
+            for edge in graph.edges:
+                parents.setdefault(edge.target, []).append(edge.source)
+            self._execution_node_ids = set()
+            pending = [output_node]
+            while pending:
+                current = pending.pop()
+                if current in self._execution_node_ids:
+                    continue
+                self._execution_node_ids.add(current)
+                pending.extend(parents.get(current, ()))
+        if self.schema_only:
+            from hub.local_run_inputs import prepared_ancestor_source_node_ids
+            self._prepared_ancestor_source_ids = prepared_ancestor_source_node_ids(
+                graph, output_node, self.node_builders,
+                reject_disabled_ancestors=False)
 
     # -- public ------------------------------------------------------------ #
     def build(self, node_id: str) -> None:
@@ -501,6 +530,222 @@ class BuildEngine:
             return dict(built)
         port_id = ports[0].id if ports else "out"
         return {port_id: built}
+
+    def prepare(
+            self, *, cancelled: Callable[[], bool] | None = None,
+            on_node_start: Callable[[str], None] | None = None,
+            on_node_finish: Callable[[str, Exception | None], None] | None = None,
+    ) -> None:
+        """Run every opt-in preparation in this execution cone before any ordinary Source lowering."""
+        if not self.full or self.schema_only:
+            return
+        for node in g.topo_order(self.graph):
+            if node.id not in self._execution_node_ids or _disabled(node):
+                continue
+            if isinstance(self.node_builders.get(node.type), _PreparedNodeRegistration):
+                if cancelled is not None and cancelled():
+                    raise RuntimeError("run cancelled before node preparation")
+                if on_node_start is not None:
+                    on_node_start(str(node.id))
+                try:
+                    self._prepare_node(node, cancelled=cancelled)
+                except Exception as exc:
+                    if on_node_finish is not None:
+                        on_node_finish(str(node.id), exc)
+                    raise
+                else:
+                    if on_node_finish is not None:
+                        on_node_finish(str(node.id), None)
+
+    def source_is_fully_restricted(self, node_id: str) -> bool:
+        """Whether execution has no ordinary edge that needs this Source's unrestricted relation."""
+        node = self._nodes.get(node_id)
+        if (
+            node is None or node.type != "source" or _disabled(node)
+            or node_id == self._output_node
+        ):
+            return False
+        edges = [
+            edge for edge in g.outgoing(self.graph, node_id)
+            if edge.target in self._execution_node_ids
+            and not _disabled(self._nodes[edge.target])
+        ]
+        return bool(edges) and all(
+            (edge.target, edge.id) in self._prepared_edge_relations
+            for edge in edges
+        )
+
+    def _preparation_params(self, node: GraphNode):
+        spec = self.node_specs.get(node.type)
+        if spec is None:
+            return MappingProxyType({})
+        config = resolve_config(node)
+        params = {
+            param.name: copy.deepcopy(
+                config[param.name] if param.name in config else param.default)
+            for param in spec.params
+        }
+        return MappingProxyType(params)
+
+    @staticmethod
+    def _validated_native_row_ids(restriction: ExactSourceRowRestriction) -> tuple[int, ...]:
+        if not isinstance(restriction.input_port, str) or not restriction.input_port:
+            raise ValueError("exact Source row restriction requires an input port")
+        values = restriction.native_row_ids
+        if not isinstance(values, (list, tuple)):
+            raise TypeError("native row ids must be a list or tuple")
+        if len(values) > 50:
+            raise ValueError("exact Source row restriction accepts at most 50 native row ids")
+        row_ids: list[int] = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError("native row ids must be uint64 integers")
+            if value < 0 or value > (1 << 64) - 1:
+                raise ValueError("native row ids must be uint64 integers")
+            row_ids.append(value)
+        if len(set(row_ids)) != len(row_ids):
+            raise ValueError("native row ids must be deduplicated before preparation")
+        return tuple(row_ids)
+
+    def _restriction_edge(
+            self, node: GraphNode, restriction: ExactSourceRowRestriction,
+    ):
+        spec = self.node_specs.get(node.type)
+        if spec is None or all(port.id != restriction.input_port for port in spec.inputs):
+            raise UnsupportedUpstreamError(
+                f"prepared node has no input port {restriction.input_port!r}")
+        edges = []
+        for edge in g.incoming(self.graph, node.id):
+            resolved = g._port(node, spec, edge.target_handle, "target")
+            if resolved is not None and resolved[0] == restriction.input_port:
+                edges.append(edge)
+        if len(edges) != 1:
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction requires exactly one input edge on its port")
+        edge = edges[0]
+        source = self._nodes.get(edge.source)
+        generated = (
+            set(getattr(self.graph, "_publication_source_uris", {}))
+            | set(getattr(self.graph, "_controller_generated_source_ids", ()))
+        )
+        if source is None or source.type != "source" or source.id in generated:
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction requires one directly wired canvas Source")
+        snapshot = ctx.immediate_inputs(self, node).port(restriction.input_port)
+        binding = snapshot.inputs[0].dataset if snapshot.count == 1 else None
+        config = source.data.get("config", {}) if isinstance(source.data, dict) else {}
+        if (
+            binding is None
+            or binding.revision_id is None
+            or not isinstance(config, dict)
+            or config.get("_input_dataset_id") != binding.dataset_id
+            or config.get("_input_revision_id") != binding.revision_id
+            or not isinstance(config.get("_input_provider"), str)
+            or not config.get("_input_provider")
+        ):
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction requires an admitted immutable input")
+        if config.get("enforceSchema"):
+            # LocalRunner's existing Source schema check constructs the unrestricted Source relation.
+            # Until the exact capability can validate that contract itself, fail before adapter
+            # resolution instead of silently defeating the bounded-read guarantee.
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction does not support enforceSchema")
+        return edge, source, config
+
+    def _open_exact_native_rows(
+            self, source: GraphNode, config: dict, native_row_ids: tuple[int, ...]) -> Relation:
+        exact_artifact = self.graph._input_artifact_uris.get(str(source.id))
+        artifact_bound = (
+            exact_artifact is not None
+            and config.get("_input_artifact_uri") == exact_artifact
+        )
+        uri = exact_artifact if artifact_bound else config.get("uri")
+        provider_uri = config.get("_input_provider_uri")
+        if not artifact_bound and isinstance(provider_uri, str) and provider_uri:
+            uri = provider_uri
+        if not isinstance(uri, str) or not uri:
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction requires an admitted immutable input")
+        from hub import paths
+        paths.ensure_local_uri_allowed(uri)
+        adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
+        if (
+            not artifact_bound
+            and str(getattr(adapter, "name", "") or "") != config.get("_input_provider")
+        ):
+            raise UnsupportedUpstreamError(
+                "exact Source row restriction input no longer matches its admitted provider")
+        opener = getattr(adapter, "open_revision_native_rows", None)
+        if not callable(opener):
+            raise ExactRowRestrictionUnsupported(
+                "persisted input revision has no exact native-row capability")
+        return opener(
+            uri, str(config["_input_revision_id"]), native_row_ids=native_row_ids)
+
+    def _prepare_node(
+            self, node: GraphNode, *,
+            cancelled: Callable[[], bool] | None = None) -> None:
+        if node.id in self._prepared_nodes:
+            return
+        registration = self.node_builders.get(node.type)
+        if not isinstance(registration, _PreparedNodeRegistration):
+            return
+        if cancelled is not None and cancelled():
+            raise RuntimeError("run cancelled before node preparation")
+        disabled_ancestor = next((
+            ancestor for ancestor in g.upstream_chain(self.graph, node.id)
+            if ancestor.id != node.id and _disabled(ancestor)
+        ), None)
+        if disabled_ancestor is not None:
+            raise UnsupportedUpstreamError(
+                "prepared node cannot read through a disabled execution ancestor")
+        immediate_inputs = ctx.immediate_inputs(self, node)
+        prepared = registration.prepare(
+            self._preparation_params(node), immediate_inputs)
+        if cancelled is not None and cancelled():
+            raise RuntimeError("run cancelled during node preparation")
+        if not isinstance(prepared, NodePreparation):
+            raise TypeError("node preparer must return NodePreparation")
+        if prepared.restriction is not None:
+            if not isinstance(prepared.restriction, ExactSourceRowRestriction):
+                raise TypeError(
+                    "node preparation restriction must be ExactSourceRowRestriction")
+            native_row_ids = self._validated_native_row_ids(prepared.restriction)
+            edge, source, config = self._restriction_edge(node, prepared.restriction)
+            if cancelled is not None and cancelled():
+                raise RuntimeError("run cancelled before exact native-row read")
+            relation = self._open_exact_native_rows(source, config, native_row_ids)
+            self._prepared_edge_relations[(node.id, edge.id)] = relation
+        self._prepared_states[node.id] = prepared.state
+        self._prepared_nodes.add(node.id)
+
+    def _consume_prepared_state(self, node_id: str):
+        if not self.full or self.schema_only:
+            return None
+        if node_id not in self._prepared_nodes:
+            self._prepare_node(self._nodes[node_id])
+        if node_id in self._delivered_prepared_states:
+            raise RuntimeError("prepared node state was already delivered")
+        self._delivered_prepared_states.add(node_id)
+        return self._prepared_states[node_id]
+
+    def _prepared_revision_zero_rows(
+            self, node: GraphNode, adapter, uri: str, revision_id: str) -> Relation:
+        """Obtain exact schema evidence for a prepared Source without an unrestricted row reader."""
+        if str(node.id) not in self._prepared_ancestor_source_ids:
+            opener = getattr(adapter, "open_revision", None)
+            if not callable(opener):
+                raise NotPreviewable(node, "persisted input revision is unavailable")
+            return opener(uri, revision_id).limit(0)
+        revision_schema = getattr(adapter, "revision_schema", None)
+        if callable(revision_schema):
+            return self._stand_in(revision_schema(uri, revision_id))
+        native_rows = getattr(adapter, "open_revision_native_rows", None)
+        if callable(native_rows):
+            return native_rows(uri, revision_id, native_row_ids=())
+        raise NotPreviewable(
+            node, "prepared exact input revision has no zero-row validation capability")
 
     def _validate_built_outputs(self, node_id: str, built) -> None:
         """Require runtime named outputs to match the declaration exactly."""
@@ -587,7 +832,14 @@ class BuildEngine:
         if node.id in self.bound_inputs:  # section sub-node: input injected by the driver script
             return [self.bound_inputs[node.id]]
         # route each incoming edge by its source port (multi-output nodes build {port -> Relation})
-        return [self.relation(e.source, e.source_handle) for e in g.incoming(self.graph, node.id)]
+        relations = []
+        for edge in g.incoming(self.graph, node.id):
+            restricted = self._prepared_edge_relations.get((node.id, edge.id))
+            relations.append(
+                restricted if restricted is not None
+                else self.relation(edge.source, edge.source_handle)
+            )
+        return relations
 
     def _view(self, rel: Relation, base: str = "v") -> str:
         # process-globally-unique name so concurrent engines never clobber each other's views
@@ -662,6 +914,23 @@ class BuildEngine:
             uri = cfg.get("uri")
             if not uri:
                 raise NotPreviewable(node, "no dataset selected")
+            if (
+                self.schema_only
+                and str(node.id) in self._prepared_ancestor_source_ids
+                and cfg.get("_input_revision_id") is None
+                and not isinstance(cfg.get("datasetRef"), dict)
+            ):
+                # Admission has not frozen this Source yet. Even scan(limit=0) can make an eager
+                # third-party adapter read rows, so downstream schema derivation may use only a
+                # declaration until the exact revision is bound and revision_schema/native-empty
+                # validation becomes available.
+                source_declaration = declared_schema(node)
+                if source_declaration is not None:
+                    return self._stand_in(source_declaration)
+                raise NotPreviewable(
+                    node,
+                    "prepared exact input schema is unavailable before admission",
+                )
             provider_preview_uri = cfg.get("_input_provider_preview_uri")
             provider_inspection = (
                 isinstance(uri, str) and uri.startswith("workspace-provider://")
@@ -707,7 +976,8 @@ class BuildEngine:
                     raise NotPreviewable(node, "selected revision is unavailable; choose another revision or follow latest")
                 try:
                     if self.schema_only:
-                        return open_revision(uri, revision_id).limit(0)
+                        return self._prepared_revision_zero_rows(
+                            node, revision_adapter, uri, revision_id)
                     # An exact revision identity is not by itself a bounded preview claim. The adapter
                     # must receive the hard source cap before it opens/scans the provider revision.
                     if self.sample_k is not None and not self.full and not self.reservoir_preview:
@@ -736,16 +1006,19 @@ class BuildEngine:
                     # An isolated child has a parent-attested retained artifact in place of provider
                     # metadata. Keep that exact sidecar path for schema evidence as well as full runs.
                     try:
+                        if str(node.id) in self._prepared_ancestor_source_ids:
+                            artifact_adapter = revision_adapter_for_uri(
+                                exact_artifact, self.resolve_adapter)
+                            return self._prepared_revision_zero_rows(
+                                node, artifact_adapter, exact_artifact, str(revision_id))
                         return self.resolve_adapter(exact_artifact).scan(exact_artifact, limit=0)
                     except Exception as exc:
                         raise NotPreviewable(
                             node, "persisted input revision is unavailable") from exc
                 revision_adapter = revision_adapter_for_uri(uri, self.resolve_adapter)
-                open_revision = getattr(revision_adapter, "open_revision", None)
-                if not callable(open_revision):
-                    raise NotPreviewable(node, "persisted input revision is unavailable")
                 try:
-                    return open_revision(uri, str(revision_id)).limit(0)
+                    return self._prepared_revision_zero_rows(
+                        node, revision_adapter, uri, str(revision_id))
                 except Exception as exc:  # exact bindings must never fall back to a mutable head
                     raise NotPreviewable(node, "persisted input revision is unavailable") from exc
             if self.schema_only:
@@ -823,6 +1096,11 @@ class BuildEngine:
                     raise
             return rel
 
+        if (
+            self.full and not self.schema_only
+            and isinstance(self.node_builders.get(t), _PreparedNodeRegistration)
+        ):
+            self._prepare_node(node)
         inputs = self._inputs(node)
         # plugin-provided node kinds (§8.1) — dispatch BEFORE the no-inputs guard so a plugin
         # can define a 0-input source/generator. Honor the plugin's declared previewable.

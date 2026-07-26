@@ -170,7 +170,8 @@ def _materialize_prefix(
     graph = Graph.model_validate(claimed["graph_doc"])
     prefix = _prefix_graph(graph, select_id)
     prefix = bind_manifest(
-        prefix, select_id, claimed["input_manifest"], deps.resolve_adapter)
+        prefix, select_id, claimed["input_manifest"], deps.resolve_adapter,
+        node_builders=deps.node_builders)
     metadb.update_durable_task_status(
         task_id, attempt_id, owner_token,
         _progress(task_id, target, phase="materializing", progress=0.2))

@@ -11,6 +11,7 @@ becomes a matter of *which backend*, not a core rewrite.
 from __future__ import annotations
 
 import datetime
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -69,6 +70,42 @@ class NodeBuilder(Protocol):
     """
 
     def __call__(self, engine: Any, node: GraphNode, inputs: list[Relation]) -> "Relation | dict[str, Relation]": ...
+
+
+@runtime_checkable
+class NodePreparer(Protocol):
+    """The narrow pre-lowering callable registered with a prepared plugin node.
+
+    Core supplies only the node's declared, normalized parameters and the existing bounded
+    ``ImmediateInputs`` snapshot. The preparer receives no engine, graph, URI, adapter, or Source
+    configuration handle.
+    """
+
+    def __call__(self, params: Mapping[str, Any], immediate_inputs: Any) -> Any: ...
+
+
+@runtime_checkable
+class PreparedNodeBuilder(Protocol):
+    """A prepared node builder receives the ordinary inputs plus its opaque one-time state."""
+
+    def __call__(
+            self, engine: Any, node: GraphNode, inputs: list[Relation],
+            prepared_state: Any) -> "Relation | dict[str, Relation]": ...
+
+
+@dataclass(frozen=True)
+class _PreparedNodeRegistration:
+    """Internal pairing retained in the existing node-builder registry."""
+
+    build: PreparedNodeBuilder
+    prepare: NodePreparer
+
+    def __call__(self, engine: Any, node: GraphNode, inputs: list[Relation]):
+        return self.build(engine, node, inputs, engine._consume_prepared_state(node.id))
+
+
+class ExactRowRestrictionUnsupported(RuntimeError):
+    """An admitted exact revision cannot provide a bounded native-row read."""
 
 
 @runtime_checkable
@@ -342,6 +379,22 @@ class DatasetRevisionAdapter(Protocol):
     def resolve_revision(self, uri: str, *, as_of: "datetime.datetime | None" = None) -> dict: ...
     def open_revision(self, uri: str, revision_id: str) -> Relation: ...
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict: ...
+
+
+@runtime_checkable
+class DatasetRevisionNativeRowsAdapter(Protocol):
+    """Optional bounded native-row read for one immutable adapter revision.
+
+    ``native_row_ids`` contains at most 50 unique uint64 values. Implementations must address the
+    provider's native row identity, return exact intersection semantics (missing/stale ids are
+    omitted), expose those identities as ``_rowid``, and must never fall back to a full scan or
+    reinterpret the values as positional indices. Core may pass an empty tuple as a zero-row exact
+    revision-retention probe during prepared-node admission or rebind.
+    """
+
+    def open_revision_native_rows(
+            self, uri: str, revision_id: str, *,
+            native_row_ids: tuple[int, ...]) -> Relation: ...
 
 
 @runtime_checkable

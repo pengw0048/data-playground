@@ -221,6 +221,7 @@ def _admitted_kernel_graph(body: RunBody, *, kernel_canvas: str, deps, metadata)
     graph = bind_manifest(
         graph, body.target, manifest, deps.resolve_adapter,
         allow_prebound_provider=True,
+        node_builders=getattr(deps, "node_builders", None),
     )
     validate_manifest_graph(graph, body.target, manifest, require_bound_revisions=True)
     return graph, manifest
