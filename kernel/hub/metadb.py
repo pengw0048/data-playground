@@ -38,6 +38,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from hub.models import (
     ColumnSchema, DatasetRevisionRowIdentity, SchemaCompatibility, SchemaFieldCompatibility,
+    ROW_IDENTITY_FIELD_NAME_MAX,
 )
 from hub.settings import settings
 
@@ -7953,7 +7954,8 @@ def submit_row_identity_certification_task(
             or "\x00" in submission):
         raise ValueError("row identity certification submission id is invalid")
     if (not dataset_id or len(dataset_id) > 128 or not revision_id or len(revision_id) > 256
-            or any(not isinstance(value, str) or not value or len(value) > 256
+            or any(not isinstance(value, str) or not value
+                   or len(value) > ROW_IDENTITY_FIELD_NAME_MAX
                    for value in keys)
             or not 1 <= len(keys) <= 16 or len(set(keys)) != len(keys)):
         raise ValueError("row identity certification identity is invalid")
@@ -8830,6 +8832,10 @@ def finish_row_identity_certification_scan(
             return _finish_row_identity_certification_in_session(
                 s, task, attempt, envelope, status="failed",
                 outcome=outcome, diagnostic_code=outcome)
+        # Interactive readers take the lifecycle registry before the artifact. Only this durable
+        # finish path also drops its input owner during terminalization, so acquire the registry
+        # before certificate storage locks the revision/artifact and reuse it through cleanup.
+        _lock_local_result_registry(s)
         existed = s.get(
             ManagedLocalRowIdentityCertificate, envelope.revision_id,
             with_for_update=True) is not None

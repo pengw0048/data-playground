@@ -271,15 +271,18 @@ def test_descriptor_shape_overflow_fails_closed_without_breaking_revision_detail
         session.add(metadb.User(id=owner, name="Long key owner"))
         session.add(metadb.Canvas(id=canvas, owner_id=owner, name="Long key", doc="{}"))
 
-    admitted = admit_sparse_output(storage, SparseOutputAdmissionRequest(
+    request = SparseOutputAdmissionRequest(
         owner_id=owner, canvas_id=canvas, submission_id="long-key",
         dataset_ref=_exact(published),
         select_config={"expr": f'"{key}", payload AS score'},
         identity_columns=[key],
         provenance={"idempotencyKey": "long-key", "provenance": "manual"},
-    ))
+    )
+    admitted = admit_sparse_output(storage, request)
+    replay = admit_sparse_output(storage, request)
 
     assert admitted.created is True
+    assert replay.created is False and replay.id == admitted.id
     assert metadb.managed_local_row_identity_certificate_descriptor(
         storage, published["dataset_id"], published["revision_id"]) is None
     detail = _revision_detail(monkeypatch, catalog, storage, published)

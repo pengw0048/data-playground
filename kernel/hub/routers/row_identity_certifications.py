@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import uuid
-from typing import Literal
+from typing import Annotated, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -17,7 +17,10 @@ from pydantic.alias_generators import to_camel
 from hub import metadb
 from hub.api_errors import APIError, APIErrorCode
 from hub.deps import get_deps
-from hub.models import DatasetRevisionRowIdentity, ExactDatasetRef, PlanDigest, Wire
+from hub.models import (
+    DatasetRevisionRowIdentity, ExactDatasetRef, PlanDigest,
+    ROW_IDENTITY_FIELD_NAME_MAX, Wire,
+)
 from hub.row_identity import (
     RowIdentityValidationError,
     freeze_row_identity_spec_from_schema,
@@ -31,6 +34,8 @@ from hub.storage import ManagedSourceUnavailable, source_read_scope
 router = APIRouter()
 CONFIRM_ROWS = 1_000_000
 CONFIRM_BYTES = 128 * 1024 * 1024
+RowIdentityCertificationKeyName = Annotated[
+    str, Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)]
 
 
 class RowIdentityCertificationRequestV1(Wire):
@@ -38,7 +43,7 @@ class RowIdentityCertificationRequestV1(Wire):
 
     dataset_id: str = Field(min_length=1, max_length=128)
     revision_id: str = Field(min_length=1, max_length=256)
-    key_columns: list[str] = Field(min_length=1, max_length=16)
+    key_columns: list[RowIdentityCertificationKeyName] = Field(min_length=1, max_length=16)
 
 
 class RowIdentityCertificationSubmitV1(RowIdentityCertificationRequestV1):
@@ -47,7 +52,7 @@ class RowIdentityCertificationSubmitV1(RowIdentityCertificationRequestV1):
 
 
 class RowIdentityCertificationFieldV1(Wire):
-    name: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
     arrow_type: str = Field(min_length=1, max_length=128)
 
 
@@ -85,7 +90,7 @@ class RowIdentityCertificationReceiptV1(Wire):
     revision_id: str = Field(min_length=1, max_length=256)
     schema_sha256: PlanDigest
     spec_sha256: PlanDigest
-    key_columns: list[str] = Field(min_length=1, max_length=16)
+    key_columns: list[RowIdentityCertificationKeyName] = Field(min_length=1, max_length=16)
     outcome: RowIdentityCertificationOutcome
     certificate: DatasetRevisionRowIdentity | None = None
 
@@ -97,7 +102,7 @@ class RowIdentityCertificationTaskV1(Wire):
     revision_id: str = Field(min_length=1, max_length=256)
     schema_sha256: PlanDigest
     spec_sha256: PlanDigest
-    key_columns: list[str] = Field(min_length=1, max_length=16)
+    key_columns: list[RowIdentityCertificationKeyName] = Field(min_length=1, max_length=16)
     can_cancel: bool = False
     receipt: RowIdentityCertificationReceiptV1 | None = None
 

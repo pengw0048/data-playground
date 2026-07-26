@@ -9269,6 +9269,8 @@
           },
           "keyColumns": {
             "items": {
+              "maxLength": 256,
+              "minLength": 1,
               "type": "string"
             },
             "maxItems": 16,
@@ -9345,6 +9347,8 @@
           },
           "keyColumns": {
             "items": {
+              "maxLength": 256,
+              "minLength": 1,
               "type": "string"
             },
             "maxItems": 16,
@@ -9392,6 +9396,8 @@
           },
           "keyColumns": {
             "items": {
+              "maxLength": 256,
+              "minLength": 1,
               "type": "string"
             },
             "maxItems": 16,
@@ -9435,6 +9441,8 @@
           },
           "keyColumns": {
             "items": {
+              "maxLength": 256,
+              "minLength": 1,
               "type": "string"
             },
             "maxItems": 16,

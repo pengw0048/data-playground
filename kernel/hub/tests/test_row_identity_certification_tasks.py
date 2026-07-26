@@ -13,11 +13,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from fastapi import Response
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from hub import metadb, row_identity_tasks
 from hub.api_errors import APIError
 from hub.deps import Deps
+from hub.main import app
 from hub.models import DurableTaskInboxPage, ExactDatasetRef, WorkspaceRunPage
 from hub.routers import row_identity_certifications as api
 from hub.row_identity import (
@@ -160,6 +163,37 @@ def test_confirmation_binds_the_exact_preflight_evidence(dataset, monkeypatch):
     task, status_code = _submit(request.model_copy(update={
         "confirmation_sha256": estimate.confirmation_sha256}))
     assert status_code == 201 and task.status == "queued"
+
+
+def test_oversized_key_name_is_rejected_by_direct_and_http_admission(
+        dataset, monkeypatch):
+    _deps, publish = dataset
+    key = "k" * 257
+    published = publish(pa.table({key: pa.array([1, 2], pa.int64())}))
+    body = {
+        "datasetId": published["dataset_id"],
+        "revisionId": published["revision_id"],
+        "keyColumns": [key],
+    }
+    with pytest.raises(ValidationError):
+        api.RowIdentityCertificationRequestV1.model_validate(body)
+    with pytest.raises(ValueError):
+        metadb.submit_row_identity_certification_task(
+            uid="owner", submission_id=str(uuid.uuid4()),
+            dataset_id=published["dataset_id"], revision_id=published["revision_id"],
+            dataset_name="long key", keys=[key],
+            schema_sha256="0" * 64, spec_sha256="1" * 64,
+            supported=True, confirmation_sha256="2" * 64,
+            estimated_rows=2, estimated_bytes=16, artifact_uri="unused")
+    monkeypatch.setattr(
+        api, "_preflight",
+        lambda *_args, **_kwargs: pytest.fail("invalid key names must not reach preflight"))
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/catalog/row-identity-certifications/preflight",
+        headers={"X-DP-User": "owner"}, json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "string_too_long"
 
 
 @pytest.mark.parametrize(("table", "outcome"), [
@@ -414,3 +448,72 @@ def test_postgres_concurrent_submit_has_one_task_attempt_and_revision_pin(datase
                 metadb.LocalResultReference).where(
                 metadb.LocalResultReference.owner_kind == "durable_task",
                 metadb.LocalResultReference.owner_key == results[0].task_id)) == 1
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires a dedicated PostgreSQL lifecycle lock race")
+def test_postgres_finish_and_preflight_share_registry_revision_artifact_lock_order(
+        dataset, monkeypatch):
+    deps, publish = dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    request = _request(published)
+    task, _ = _submit(request)
+    claim = metadb.claim_row_identity_certification_task(task.task_id, "finisher")
+    assert claim is not None
+    attempt_id = claim["attempts"][-1]["id"]
+    exact = ExactDatasetRef(
+        kind="exact", dataset_id=published["dataset_id"],
+        revision_id=published["revision_id"])
+    certificate = certify_exact_row_identity(deps.storage, exact, ["id"])
+    certificate_doc = serialize_row_identity_coverage(
+        certificate, exact, task.spec_sha256)
+    artifact = metadb.managed_local_file_revision_artifact(
+        published["dataset_id"], published["revision_id"])
+    assert artifact is not None
+    artifact_info = os.stat(artifact)
+
+    original_lock = metadb._lock_local_result_registry
+    reader_has_registry = threading.Event()
+    finisher_entered_registry = threading.Event()
+    calls: dict[str, int] = {}
+    calls_lock = threading.Lock()
+
+    def ordered_lock(session):
+        name = threading.current_thread().name
+        with calls_lock:
+            calls[name] = calls.get(name, 0) + 1
+            first = calls[name] == 1
+        if name == "preflight-reader" and first:
+            row = original_lock(session)
+            reader_has_registry.set()
+            assert finisher_entered_registry.wait(5)
+            return row
+        if name == "certificate-finisher" and first:
+            finisher_entered_registry.set()
+            assert reader_has_registry.wait(5)
+        return original_lock(session)
+
+    monkeypatch.setattr(metadb, "_lock_local_result_registry", ordered_lock)
+
+    def finish():
+        threading.current_thread().name = "certificate-finisher"
+        return metadb.finish_row_identity_certification_scan(
+            task.task_id, attempt_id, "finisher", certificate_doc,
+            artifact_dev=artifact_info.st_dev, artifact_ino=artifact_info.st_ino)
+
+    def preflight():
+        threading.current_thread().name = "preflight-reader"
+        return api.preflight(request, "owner")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finished = pool.submit(finish)
+        read = pool.submit(preflight)
+        assert finished.result(timeout=10) is True
+        assert read.result(timeout=10).dataset_ref == exact
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "done"
+    assert terminal.receipt is not None and terminal.receipt.outcome == "certified"
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        deps.storage, published["dataset_id"], published["revision_id"]) is not None

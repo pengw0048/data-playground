@@ -31,6 +31,7 @@ DataLimitScope = Literal["each-source", "result-window"]
 SampleStrategy = Literal["prefix", "reservoir"]
 SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
 MAX_SAFE_INTEGER = 2**53 - 1
+ROW_IDENTITY_FIELD_NAME_MAX = 256
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
     str,
@@ -534,7 +535,7 @@ class DatasetRevisionPreview(Wire):
 
 class DatasetRevisionRowIdentityField(Wire):
     """One ordered, certified logical row-identity field for an exact revision."""
-    name: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
     arrow_type: Literal[
         "int8", "int16", "int32", "int64",
         "uint8", "uint16", "uint32", "uint64", "string",
