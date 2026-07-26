@@ -99,6 +99,7 @@ def test_saved_contract_round_trips_current_field_model_without_loss():
     fields = [_field(
         "customer_id", "bigint", fieldId="warehouse.customer_id", physicalType="INT64",
         nullable=False, hasDefault=False, provenance="provider", capabilities=["key"],
+        mediaKind=None,
         annotations=[{
             "key": "semantic.type",
             "value": "customer",

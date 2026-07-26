@@ -7,24 +7,111 @@ data qualifies; they never change what connects.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
+from typing import Literal
+from urllib.parse import urlsplit
 
 from hub.models import ColumnSchema
 
-_MEDIA_NAME = re.compile(r"(media|image|img|video|thumb|frame|photo|asset|clip|url|uri|path)", re.I)
-_MEDIA_EXT = re.compile(r"\.(mp4|mov|mkv|webm|png|jpe?g|gif|webp|wav|mp3|flac)\b", re.I)
 _VECTOR_NAME = re.compile(r"(embed|embedding|vector|feature)", re.I)
 # an id-like column name: `id`, `uuid`, `pk`, or a *_id / *_key / *_uid suffix (the usual join keys).
 _KEY_NAME = re.compile(r"^(id|uuid|guid|pk)$|_(id|uid|uuid|guid|key|pk)$", re.I)
 _KEY_TYPES = {"int", "string", "bytes"}  # a plausible join-key type (not float/bool/vector/media)
 
 
+MediaKind = Literal["image", "video", "unknown"]
+
+_IMAGE_EXTENSIONS = {"avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"}
+_VIDEO_EXTENSIONS = {"m4v", "mkv", "mov", "mp4", "webm"}
+_IMAGE_FTYP_BRANDS = {
+    b"avif", b"avis", b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1",
+}
+_VIDEO_FTYP_BRANDS = {
+    b"3g2a", b"3g2b", b"3gp4", b"3gp5", b"3gp6", b"3gp7", b"avc1", b"M4V ", b"M4VH", b"M4VP",
+    b"mp41", b"mp42", b"mp71", b"qt  ",
+}
+_MAX_MEDIA_SAMPLE_ROWS = 256
+_MAX_MEDIA_CELL_BYTES = 4096
+_MAX_MEDIA_URL_LENGTH = 8192
+
+
 def is_media_column(col: ColumnSchema) -> bool:
-    if "media" in col.capabilities:
-        return True
-    t = col.type.lower()
-    if t in {"varchar", "string", "text"} and (_MEDIA_NAME.search(col.name) or _MEDIA_EXT.search(col.name)):
-        return True
-    return False
+    """Whether a producer explicitly declares this schema field as media.
+
+    Value inference deliberately belongs in ``tag_columns`` because schemas alone cannot
+    prove that a suggestive field name actually contains renderable media.
+    """
+    return "media" in col.capabilities
+
+
+def _kind_from_bytes(value: object) -> MediaKind | None:
+    try:
+        if isinstance(value, bytes):
+            data = value[:_MAX_MEDIA_CELL_BYTES]
+        elif isinstance(value, bytearray):
+            data = bytes(value[:_MAX_MEDIA_CELL_BYTES])
+        elif isinstance(value, memoryview):
+            data = value.cast("B")[:_MAX_MEDIA_CELL_BYTES].tobytes()
+        else:
+            return None
+    except (TypeError, ValueError, MemoryError):
+        return None
+    if data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")):
+        return "image"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image"
+    if data.startswith(b"\x1aE\xdf\xa3"):
+        return "video"  # WebM/Matroska container evidence
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in _IMAGE_FTYP_BRANDS:
+            return "image"
+        if brand in _VIDEO_FTYP_BRANDS:
+            return "video"
+    return None
+
+
+def _kind_from_url(value: object) -> MediaKind | None:
+    if not isinstance(value, str) or len(value) > _MAX_MEDIA_URL_LENGTH:
+        return None
+    try:
+        parsed = urlsplit(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme == "data":
+        mime = value[5:].split(";", 1)[0].lower()
+        if mime.startswith("image/"):
+            return "image"
+        if mime.startswith("video/"):
+            return "video"
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    suffix = parsed.path.rsplit(".", 1)
+    if len(suffix) != 2:
+        return None
+    extension = suffix[1].lower()
+    if extension in _IMAGE_EXTENSIONS:
+        return "image"
+    if extension in _VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+def media_kind_from_value(value: object) -> MediaKind | None:
+    """Classify one already-read preview cell without decoding or fetching it."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _kind_from_bytes(value)
+    return _kind_from_url(value)
+
+
+def detect_media_kind(column: str, sample_rows: Sequence[Mapping[str, object]]) -> MediaKind | None:
+    """Return evidence from a bounded preview page, never reading outside it."""
+    kinds = {kind for row in sample_rows[:_MAX_MEDIA_SAMPLE_ROWS]
+             if (kind := media_kind_from_value(row.get(column))) is not None}
+    if not kinds:
+        return None
+    return next(iter(kinds)) if len(kinds) == 1 else "unknown"
 
 
 def is_vector_column(col: ColumnSchema) -> bool:
@@ -65,13 +152,21 @@ def register_detector(cap_id: str, detect) -> None:
         _EXTRA_DETECTORS.append((cap_id, detect))
 
 
-def tag_columns(columns: list[ColumnSchema]) -> list[ColumnSchema]:
-    """Annotate columns with detected capability tags (idempotent) — built-in media/vector/key plus any
-    plugin-registered detectors."""
+def tag_columns(columns: list[ColumnSchema], *, sample_rows: Sequence[Mapping[str, object]] | None = None) -> list[ColumnSchema]:
+    """Annotate columns with explicit or bounded-preview capability evidence.
+
+    Schema-only callers retain declared media capabilities; callers that already have preview
+    rows may add media only when a sampled cell proves a supported image/video value.
+    """
     for c in columns:
         caps = set(c.capabilities)
-        if is_media_column(c):
+        kind = detect_media_kind(c.name, sample_rows) if sample_rows is not None else None
+        if is_media_column(c) or kind is not None:
             caps.add("media")
+            c.media_kind = kind or c.media_kind or "unknown"
+        # Key detection must see media inferred from this preview page too, not just a
+        # pre-existing producer declaration.
+        c.capabilities = sorted(caps)
         if is_vector_column(c):
             caps.add("vector")
         if is_key_column(c):

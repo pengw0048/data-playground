@@ -171,6 +171,7 @@ export interface ColumnSchema {
   hasDefault?: boolean | null
   provenance?: 'inferred' | 'declared' | 'provider'
   capabilities: string[]
+  mediaKind?: 'image' | 'video' | 'unknown' | null
   annotations?: FieldAnnotation[]
   rowReference?: TypedRowReference
 }

@@ -7,6 +7,10 @@ import type { ColumnSchema } from '../types/graph'
 const col = (name: string, caps: string[] = []) => ({ name, type: 'string', capabilities: caps }) as ColumnSchema
 
 describe('plugin capability viewer tabs (syncPluginCapabilities)', () => {
+  it('does not offer Media when the preview has no evidenced media column', () => {
+    expect(capabilitiesFor([col('asset'), col('image_url')]).map((c) => c.id)).not.toContain('media')
+  })
+
   it('registers a generic tab for a known viewer kind; skips an unknown kind', () => {
     syncPluginCapabilities([
       { id: 'json-doc', label: 'JSON', viewer: { kind: 'json' } },
