@@ -92,6 +92,13 @@ The repository cannot prove a concrete deployment production-ready. Operators ar
   and
 - running the relevant release and staging gates on the exact commit and intended topology.
 
+To expose an installed read-only catalog provider in Workspace, configure `DP_CATALOG_MOUNTS` as the
+operator-owned JSON mount list. Each entry selects a unique local mount id, an installed
+`dataplay.catalog_providers` provider, and provider-specific configuration; it does not select a
+writable application catalog or destination. Keep sensitive values as `env:NAME` or `file:/path`
+SecretRefs. The [catalog-mount reference](PLUGINS.md#read-only-external-catalog-mounts) defines the
+accepted shape, bounds, and isolated-failure behavior.
+
 For a shared service, WebSocket peers for one canvas must reach the same hub instance because
 collaboration rooms are process-local. For distributed execution, the operator must additionally
 protect the scheduler/control API, attest the cluster and immutable code image, configure data-plane

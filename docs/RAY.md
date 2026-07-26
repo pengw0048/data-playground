@@ -276,7 +276,7 @@ Current status versus what production ownership still needs:
 - Cluster health and placement truth — partial; target-cone requirements, static advertised-capacity
   admission, GPU/custom task options, and fail-loud unsupported shapes are implemented; live
   discovery/backpressure remain open
-- Runtime compatibility — partial; one supported Ray range and a driver/worker/core/plugin version
+- Runtime compatibility — partial; exactly Ray `2.56.0` and a driver/worker/core/plugin version
   handshake
 - Resilience — partial; active-job worker/head/driver failure tests, retry policy, and orphan cleanup
 - Observability — partial; durable job IDs, control-observation liveness, shared status, and visible

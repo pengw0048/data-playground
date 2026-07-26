@@ -61,6 +61,14 @@ it is the same process, so the run is visible in the UI. The workspace's configu
 applies — the per-canvas kernel by default. For a pure in-process run with no lingering kernel, set
 `DP_EXECUTION=local-out-of-core`.
 
+The default kernel isolates full runs in a killable child process. Set `DP_KERNEL_ISOLATE_RUNS=0`
+(also `false`, `no`, or `off`) only when a trusted deployment needs the older warm in-process behavior;
+previews and sample profiles remain on the warm kernel either way. While isolation is enabled, the
+default kernel refuses a write that selects a Cred because that child process does not receive the
+authoritative Cred resolver. Choose an execution backend that explicitly supports selected destination
+Creds, or disable isolation only after accepting that trade-off; it never silently falls back to ambient
+credentials.
+
 When an MCP tool edits a canvas over HTTP, open browser tabs in that collab room refetch and re-apply.
 stdio cannot do that; reload to see its edits.
 
@@ -79,10 +87,15 @@ Catalog and discovery:
   required columns. To continue, pass the opaque `nextCursor` back as the only argument; it carries
   the exact normalized query and next offset. Continue until `hasMore` is false.
 - `get_dataset_context` — a dataset's canonical identity and URI, organization metadata, complete
-  current `ColumnSchema`, declared/candidate keys, a bounded incident-relationship window, and
+  current `ColumnSchema` (including safe annotations and typed `rowReference` evidence when supplied),
+  declared/candidate keys, a bounded incident-relationship window, and
   truthful revision-capability state. `relationships.truncated` reports when `relationshipLimit`
   omitted relationships; there is no continuation because the provider relationship contract
   cannot resume that window. It returns metadata only.
+- `related_datasets` — a bounded, evidence-ranked set for one stable selected Source identity. Declared
+  relationships lead typed row references, which lead inferred schema matches. Each candidate reports
+  `cardinalityState` as `available` or explicitly `unmeasured`; exact-revision review does not scan the
+  pinned dataset merely to fill an unknown value.
 - `get_relationship_graph` — declared relationship topology around a dataset or folder, bounded by
   `maxHops`, `maxNodes`, and `maxEdges`. `truncated: true` means the returned graph is not complete.
 - `get_dataset_lineage` — bounded canonical lineage around one dataset. `state: unavailable` is
@@ -138,7 +151,9 @@ Use the metadata-only catalog tools before any data sample:
 4. Choose two datasets, then call `join_hints` to measure the join cardinality before adding a join.
 
 MCP has no catalog/relationship mutation or automatic Canvas edits in this workflow. It does not expose
-storage credentials, adapter internals, arbitrary provider metadata, or field-reference semantics.
+storage credentials, adapter internals, or arbitrary provider metadata. It does expose the safe
+`ColumnSchema` annotations and typed `rowReference` facts returned by `get_dataset_context`, and
+`related_datasets` uses typed references as evidence when ranking candidates.
 
 ## Writing transforms, verified
 
