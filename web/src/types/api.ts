@@ -127,11 +127,30 @@ export interface DatasetRevisionSummary {
   fragmentCount?: number | null
 }
 
+export interface MediaCellIdentityValue {
+  name: string
+  arrowType: 'int8' | 'int16' | 'int32' | 'int64' | 'uint8' | 'uint16' | 'uint32' | 'uint64' | 'string'
+  value: string
+}
+
 export interface DatasetRevisionPreview {
   columns: ColumnSchema[]
   rows: Record<string, unknown>[]
+  rowIdentities: Array<MediaCellIdentityValue[] | null> | null
   hasMore: boolean
   rowLimit: 100
+}
+
+export interface DatasetRevisionRowIdentity {
+  datasetId: string
+  revisionId: string
+  proofStatus: 'certified' | 'unavailable'
+  certificationSupported: boolean
+  fields: Array<{
+    name: string
+    arrowType: MediaCellIdentityValue['arrowType']
+  }>
+  encodingVersion?: 'row-identity-v1' | null
 }
 
 export interface DatasetRevisionDetail extends DatasetRevision {
@@ -140,6 +159,7 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   producerOperation?: string | null
   summary: DatasetRevisionSummary
   preview: DatasetRevisionPreview
+  rowIdentity: DatasetRevisionRowIdentity
 }
 
 export type DatasetViewSampling =

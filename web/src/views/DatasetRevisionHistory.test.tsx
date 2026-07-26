@@ -37,7 +37,11 @@ const detail = (revisionId: string, overrides: Partial<DatasetRevisionDetail> = 
   summary: { rowCount: 2, dataFileCount: 1, totalBytes: 20, fragmentCount: 1 },
   preview: {
     columns: [{ fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'provider', capabilities: [] }],
-    rows: [{ amount: 2 }], hasMore: false, rowLimit: 100,
+    rows: [{ amount: 2 }], rowIdentities: null, hasMore: false, rowLimit: 100,
+  },
+  rowIdentity: {
+    datasetId: 'dataset-stable', revisionId, proofStatus: 'unavailable',
+    certificationSupported: false, fields: [], encodingVersion: null,
   },
   ...overrides,
 })
@@ -168,7 +172,7 @@ describe('DatasetRevisionHistory', () => {
         summary: { rowCount: 4, dataFileCount: 2, totalBytes: 45, fragmentCount: 2 },
         preview: {
           columns: [{ fieldId: 'amount', name: 'amount', type: 'int', nullable: false, provenance: 'provider', capabilities: [] }],
-          rows: [{ amount: 4 }], hasMore: true, rowLimit: 100,
+          rows: [{ amount: 4 }], rowIdentities: null, hasMore: true, rowLimit: 100,
         },
       }))
       : Promise.resolve(detail('rev-1')))
@@ -206,6 +210,7 @@ describe('DatasetRevisionHistory', () => {
           }],
         }],
         rows: [],
+        rowIdentities: null,
         hasMore: false,
         rowLimit: 100,
       },

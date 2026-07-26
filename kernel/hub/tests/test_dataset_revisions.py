@@ -163,7 +163,16 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     assert detail["summary"]["rowCount"] == 1
     assert detail["preview"]["columns"][0]["name"] == "value"
     assert detail["preview"]["rows"] == [{"value": 1}]
+    assert detail["preview"]["rowIdentities"] is None
     assert detail["preview"]["hasMore"] is False
+    assert detail["rowIdentity"] == {
+        "datasetId": dataset_id,
+        "revisionId": exact,
+        "proofStatus": "unavailable",
+        "certificationSupported": False,
+        "fields": [],
+        "encodingVersion": None,
+    }
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
 
 

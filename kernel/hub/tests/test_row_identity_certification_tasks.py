@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import datetime
+import os
 import threading
 import uuid
 from contextlib import contextmanager

@@ -155,7 +155,7 @@ def test_admission_retains_only_existing_exact_base_and_replays_atomically(local
     assert metadb.managed_local_row_identity_certificate_descriptor(
         storage, published["dataset_id"], published["revision_id"]) == {
             "datasetId": published["dataset_id"], "revisionId": published["revision_id"],
-            "proofStatus": "certified",
+            "proofStatus": "certified", "certificationSupported": True,
             "fields": [{"name": "id", "arrowType": "int32"}],
             "encodingVersion": "row-identity-v1",
         }

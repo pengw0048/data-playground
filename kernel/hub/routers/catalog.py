@@ -62,6 +62,7 @@ from hub.models import (
     DatasetRevisionPreview,
     DatasetRevisionResolution,
     DatasetRevisionSummary,
+    ExactDatasetRef,
     Facets,
     FieldLineagePage,
     ImportRequest,
@@ -85,6 +86,7 @@ from hub.models import (
     SampleResult,
     normalize_column_schemas,
 )
+from hub.row_identity import canonicalize_preview_row_identities
 from hub.security import current_user
 
 
@@ -584,15 +586,61 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     try:
         deps = get_deps()
         adapter = _revision_adapter(binding["uri"])
-        artifact_uri = metadb.managed_local_file_revision_artifact(dataset_id, revision_id)
+        exact = ExactDatasetRef(
+            kind="exact", dataset_id=binding["dataset_id"], revision_id=revision_id)
+        try:
+            certification_facts = metadb.catalog_managed_local_revision_certification_facts(exact)
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            certification_facts = None
+        artifact_uri = (
+            certification_facts["artifact_uri"]
+            if certification_facts is not None else None)
         source_scope = (source_read_scope(
             deps.storage, [artifact_uri],
             owner=f"catalog-revision:{dataset_id}:{uuid.uuid4().hex}")
-            if artifact_uri is not None else contextlib.nullcontext())
-        with source_scope:
+            if artifact_uri is not None else contextlib.nullcontext([]))
+        with source_scope as guards:
+            artifact_info = None
+            if certification_facts is not None:
+                if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                    raise RevisionUnavailable("revision_unavailable")
+                artifact_info = os.fstat(guards[0].artifact_fileno())
             with db.base_guard():
                 raw = adapter.revision_detail(
                     binding["uri"], revision_id, preview_limit=DATASET_REVISION_PREVIEW_ROWS)
+            table = raw["preview_table"]
+            if hasattr(table, "read_all"):
+                table = table.read_all()
+            preview_table = table.slice(0, DATASET_REVISION_PREVIEW_ROWS)
+            resolved_revision_id = str(raw["revision_id"])
+            if (certification_facts is not None
+                    and resolved_revision_id != certification_facts["revision_id"]):
+                raise RevisionUnavailable("revision_unavailable")
+            certificate = (
+                metadb.managed_local_row_identity_certificate_for_artifact(
+                    binding["dataset_id"], resolved_revision_id, artifact_uri,
+                    artifact_dev=int(artifact_info.st_dev),
+                    artifact_ino=int(artifact_info.st_ino),
+                )
+                if certification_facts is not None and artifact_info is not None else None
+            )
+            row_identities = (
+                canonicalize_preview_row_identities(preview_table, certificate)
+                if certificate is not None else None
+            )
+            certificate_valid = certificate is not None and row_identities is not None
+            row_identity = {
+                "datasetId": binding["dataset_id"],
+                "revisionId": resolved_revision_id,
+                "proofStatus": "certified" if certificate_valid else "unavailable",
+                "certificationSupported": certification_facts is not None,
+                "fields": ([
+                    {"name": field.name, "arrowType": field.arrow_type}
+                    for field in certificate.spec.fields
+                ] if certificate_valid else []),
+                "encodingVersion": (
+                    certificate.spec.encoding_version if certificate_valid else None),
+            }
     except (RevisionPermissionLost, PermissionError):
         raise APIError(403, "dataset_revision_permission_lost",
                        code=APIErrorCode.PERMISSION_DENIED, retryable=False)
@@ -600,28 +648,18 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             workspace_providers.ProviderDatasetOffline):
         raise APIError(503, "dataset_revision_provider_offline",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    except (RevisionUnavailable, workspace_providers.ProviderDatasetGone,
+    except (RevisionUnavailable, ManagedSourceReadError, OSError,
+            workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
-    table = raw["preview_table"]
-    if hasattr(table, "read_all"):
-        table = table.read_all()
-    preview_rows = _table_to_rows(table.slice(0, DATASET_REVISION_PREVIEW_ROWS))
+    preview_rows = _table_to_rows(preview_table)
     revision_name = raw.get("name")
     if not isinstance(revision_name, str) or not revision_name:
         revision_name = metadb.managed_local_lance_revision_name(
             binding["dataset_id"], str(raw["revision_id"]))
-    row_identity = metadb.managed_local_row_identity_certificate_descriptor(
-        deps.storage, binding["dataset_id"], str(raw["revision_id"]))
-    if row_identity is None:
-        row_identity = {
-            "datasetId": binding["dataset_id"],
-            "revisionId": str(raw["revision_id"]),
-            "proofStatus": "unavailable",
-        }
     return DatasetRevisionDetail(
-        dataset_id=binding["dataset_id"], revision_id=str(raw["revision_id"]),
+        dataset_id=binding["dataset_id"], revision_id=resolved_revision_id,
         name=revision_name if isinstance(revision_name, str) and revision_name else None,
         committed_at=_core_owned_committed_at(raw.get("committed_at"), adapter),
         parent_revision_id=raw.get("parent_revision_id"),
@@ -630,8 +668,9 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         summary=DatasetRevisionSummary(
             row_count=raw.get("row_count"), data_file_count=raw.get("data_file_count"),
             total_bytes=raw.get("total_bytes"), fragment_count=raw.get("fragment_count")),
-        preview=DatasetRevisionPreview(columns=raw["columns"], rows=preview_rows,
-                                       has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
+        preview=DatasetRevisionPreview(
+            columns=raw["columns"], rows=preview_rows, row_identities=row_identities,
+            has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
         row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
     )
 

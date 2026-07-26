@@ -32,6 +32,7 @@ SampleStrategy = Literal["prefix", "reservoir"]
 SampleFailureCategory = Literal["not_previewable", "user_code_exception", "runtime_error"]
 MAX_SAFE_INTEGER = 2**53 - 1
 ROW_IDENTITY_FIELD_NAME_MAX = 256
+MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH = 8192
 ProfileCompleteness = Literal["complete", "sample", "unknown"]
 PlanDigest = Annotated[
     str,
@@ -525,12 +526,40 @@ class DatasetRevisionSummary(Wire):
     fragment_count: int | None = Field(default=None, ge=0)
 
 
+class MediaCellIdentityValue(Wire):
+    """One ordered, typed logical-row identity value for an exact media-cell read."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    name: str = Field(min_length=1, max_length=ROW_IDENTITY_FIELD_NAME_MAX)
+    arrow_type: Literal[
+        "int8", "int16", "int32", "int64",
+        "uint8", "uint16", "uint32", "uint64", "string",
+    ]
+    value: str = Field(max_length=MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH)
+
+
+MediaCellIdentity = Annotated[
+    list[MediaCellIdentityValue],
+    Field(min_length=1, max_length=32),
+]
+
+
 class DatasetRevisionPreview(Wire):
     """A fixed, exact-revision preview window; it is never a read of current head."""
     columns: list[ColumnSchema] = Field(default_factory=list)
     rows: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    row_identities: list[MediaCellIdentity | None] | None = Field(
+        max_length=100)
     has_more: bool
     row_limit: Literal[100] = 100
+
+    @model_validator(mode="after")
+    def _validate_row_identity_alignment(self) -> "DatasetRevisionPreview":
+        if (self.row_identities is not None
+                and len(self.row_identities) != len(self.rows)):
+            raise ValueError("preview row identities must align one-to-one with rows")
+        return self
 
 
 class DatasetRevisionRowIdentityField(Wire):
@@ -547,6 +576,7 @@ class DatasetRevisionRowIdentity(Wire):
     dataset_id: str = Field(min_length=1, max_length=512)
     revision_id: str = Field(min_length=1, max_length=256)
     proof_status: Literal["certified", "unavailable"]
+    certification_supported: bool
     fields: list[DatasetRevisionRowIdentityField] = Field(default_factory=list, max_length=32)
     encoding_version: Literal["row-identity-v1"] | None = None
 
@@ -558,19 +588,6 @@ class DatasetRevisionRowIdentity(Wire):
         elif self.fields or self.encoding_version is not None:
             raise ValueError("unavailable row identity cannot expose a descriptor")
         return self
-
-
-class MediaCellIdentityValue(Wire):
-    """One ordered, typed logical-row identity value for an exact media-cell read."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
-
-    name: str = Field(min_length=1, max_length=256)
-    arrow_type: Literal[
-        "int8", "int16", "int32", "int64",
-        "uint8", "uint16", "uint32", "uint64", "string",
-    ]
-    value: str = Field(max_length=8192)
 
 
 class MediaCellRequest(Wire):
@@ -594,6 +611,28 @@ class DatasetRevisionDetail(Wire):
     summary: DatasetRevisionSummary
     preview: DatasetRevisionPreview
     row_identity: DatasetRevisionRowIdentity
+
+    @model_validator(mode="after")
+    def _validate_row_identity_preview(self) -> "DatasetRevisionDetail":
+        if (self.row_identity.dataset_id != self.dataset_id
+                or self.row_identity.revision_id != self.revision_id):
+            raise ValueError("row identity must bind the exact revision detail")
+        identities = self.preview.row_identities
+        if self.row_identity.proof_status == "unavailable":
+            if identities is not None:
+                raise ValueError("unavailable row identity cannot expose preview identities")
+            return self
+        if identities is None:
+            raise ValueError("certified row identity requires aligned preview identities")
+        expected = [
+            (field.name, field.arrow_type)
+            for field in self.row_identity.fields
+        ]
+        if any(identity is not None and [
+                (value.name, value.arrow_type) for value in identity
+        ] != expected for identity in identities):
+            raise ValueError("preview identity must contain every certified field in order")
+        return self
 
 
 class CatalogPublicationReceipt(Wire):
