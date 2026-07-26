@@ -201,6 +201,13 @@ def resolve_source_refs(graph: Graph, resolve) -> None:
         artifact_uri = metadb.managed_local_file_revision_artifact(dataset_id, revision_id)
         if artifact_uri is not None:
             graph._input_artifact_uris[str(node.id)] = artifact_uri
+            binding = metadb.managed_local_exact_revision_binding(
+                dataset_id, revision_id)
+            if binding is not None:
+                # The Canvas may retain the artifact URI that was current when it was saved.
+                # Re-enter through the exact ref's active logical identity while preserving the
+                # selected old artifact above for read fencing.
+                cfg["uri"] = binding["uri"]
 
 
 def incoming(graph: Graph, node_id: str) -> list[GraphEdge]:

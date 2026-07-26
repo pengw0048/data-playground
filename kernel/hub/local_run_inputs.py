@@ -333,17 +333,23 @@ def bind_manifest(
             # from the current admitted manifest so stale state cannot retarget Source execution.
             for field in _DISPATCH_CONFIG_FIELDS:
                 config.pop(field, None)
-        provider_dataset_id = (
-            item["dataset_id"] if prebound_provider_uri
-            else workspace_providers.provider_dataset_identity(source_uri) if source_uri else None)
-        source_binding = (metadb.catalog_revision_binding_for_uri(source_uri)
-                          if provider_dataset_id is None else None)
         dataset_ref = config.get("datasetRef") if isinstance(config, dict) else None
         try:
             selected_identity = (dataset_ref_identity(dataset_ref)
                                  if isinstance(dataset_ref, dict) else None)
         except ValueError as exc:
             raise LocalRunInputError("local run input manifest does not match the graph") from exc
+        if (not prebound_provider_uri
+                and selected_identity == (item["dataset_id"], item["revision_id"])):
+            managed_binding = metadb.managed_local_exact_revision_binding(
+                *selected_identity)
+            if managed_binding is not None:
+                source_uri = str(managed_binding["uri"])
+        provider_dataset_id = (
+            item["dataset_id"] if prebound_provider_uri
+            else workspace_providers.provider_dataset_identity(source_uri) if source_uri else None)
+        source_binding = (metadb.catalog_revision_binding_for_uri(source_uri)
+                          if provider_dataset_id is None else None)
         # Canonical ExecutionManifest graphs intentionally replace provider paths with one exact
         # DatasetRef. Reopen its current registered URI only to reach the already-admitted revision;
         # the dataset/revision/provider tuple below remains the authority and prevents rebinding.

@@ -20713,6 +20713,32 @@ def catalog_revision_binding_for_uri(uri: str) -> dict | None:
         return {"dataset_id": entry.registration_id, "uri": entry.uri}
 
 
+def managed_local_exact_revision_binding(
+        dataset_id: str, revision_id: str) -> dict | None:
+    """Return the active logical access point for one retained core-owned revision.
+
+    The exact DatasetRef is the authority. Its saved artifact URI may no longer be the current
+    catalog projection after head replacement, so callers must not use that path to rediscover the
+    dataset. An unregistered logical dataset deliberately has no access point even while retention
+    still owns its artifact.
+    """
+    with session() as s:
+        logical = s.get(CatalogLogicalDataset, str(dataset_id))
+        revision = s.get(ManagedLocalFileRevision, str(revision_id))
+        if (logical is None or logical.state != "active" or not logical.current_uri
+                or revision is None or revision.logical_id != logical.logical_id):
+            return None
+        entry = s.get(CatalogEntry, logical.current_uri)
+        artifact = s.get(LocalResultArtifact, revision.artifact_uri)
+        if (entry is None or entry.logical_id != logical.logical_id
+                or artifact is None or artifact.state != "ready"):
+            return None
+        return {
+            "dataset_id": logical.logical_id,
+            "uri": entry.uri,
+        }
+
+
 def catalog_managed_logical_id_for_uri(uri: str) -> str | None:
     """Return a catalog entry's managed logical owner without consulting its revision ledger."""
     with session() as s:
