@@ -33,7 +33,20 @@ _INTEGER_RANGES = {
     "uint32": (0, 2**32 - 1),
     "uint64": (0, 2**64 - 1),
 }
-_CANONICAL_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
+_INTEGER_DIGITS = {
+    "int8": 3,
+    "int16": 5,
+    "int32": 10,
+    "int64": 19,
+    "uint8": 3,
+    "uint16": 5,
+    "uint32": 10,
+    "uint64": 20,
+}
+_SIGNED_INTEGER = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
+_UNSIGNED_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_MAX_MEDIA_REFERENCE_BYTES = 8192
+_MAX_DATA_URI_HEADER_BYTES = 256
 
 
 class MediaCellError(RuntimeError):
@@ -84,9 +97,16 @@ def _identity_values(request: MediaCellRequest, certificate) -> list[object]:
         if item.arrow_type == "string":
             values.append(item.value)
             continue
-        if not _CANONICAL_INTEGER.fullmatch(item.value):
+        pattern = (
+            _UNSIGNED_INTEGER if item.arrow_type.startswith("uint") else _SIGNED_INTEGER)
+        digits = item.value.removeprefix("-")
+        if (len(digits) > _INTEGER_DIGITS[item.arrow_type]
+                or not pattern.fullmatch(item.value)):
             raise MediaCellIdentityInvalid("media cell identity is invalid")
-        value = int(item.value)
+        try:
+            value = int(item.value)
+        except (TypeError, ValueError):
+            raise MediaCellIdentityInvalid("media cell identity is invalid") from None
         low, high = _INTEGER_RANGES[item.arrow_type]
         if value < low or value > high:
             raise MediaCellIdentityInvalid("media cell identity is invalid")
@@ -101,22 +121,41 @@ def _media_column(columns, name: str):
     return matches[0]
 
 
-def _exact_cell(artifact_uri: str, certificate, request: MediaCellRequest,
-                values: list[object]) -> object:
+def _exact_cell(artifact_uri: str, certificate, column, values: list[object],
+                max_bytes: int) -> object:
     fields = list(certificate.spec.fields)
-    projection = quote_identifier(request.column)
+    projection = quote_identifier(column.name)
     predicate = " AND ".join(
         f"{quote_identifier(field.name)} = ?" for field in fields)
+    if column.type == "bytes":
+        size = f"octet_length({projection})"
+        bounded_value = f"CASE WHEN {size} <= ? THEN {projection} END"
+        bounds = [max_bytes]
+    elif column.type == "string":
+        size = f"octet_length(encode({projection}))"
+        encoded_limit = ((max_bytes + 2) // 3) * 4 + 4
+        data_uri_limit = _MAX_DATA_URI_HEADER_BYTES + 1 + encoded_limit
+        limit = (
+            f"CASE WHEN starts_with(lower({projection}), 'data:') "
+            "THEN ? ELSE ? END"
+        )
+        bounded_value = f"CASE WHEN {size} <= ({limit}) THEN {projection} END"
+        bounds = [data_uri_limit, _MAX_MEDIA_REFERENCE_BYTES]
+    else:
+        raise MediaCellUnsupported("media cell column is unsupported")
     sql = (
-        f"SELECT {projection} FROM read_parquet(?) "
+        f"SELECT {bounded_value}, {size} FROM read_parquet(?) "
         f"WHERE {predicate} LIMIT 2"
     )
-    rows = db.conn().execute(sql, [artifact_uri, *values]).fetchall()
+    rows = db.conn().execute(sql, [*bounds, artifact_uri, *values]).fetchall()
     if not rows:
         raise MediaCellRowNotFound("media cell row was not found")
     if len(rows) != 1:
         raise MediaCellRowAmbiguous("media cell row identity is ambiguous")
-    return rows[0][0]
+    value, size_value = rows[0]
+    if value is None and isinstance(size_value, int):
+        raise MediaCellTooLarge("media cell exceeds the response limit")
+    return value
 
 
 def _data_uri_bytes(value: str, max_bytes: int) -> bytes:
@@ -124,7 +163,8 @@ def _data_uri_bytes(value: str, max_bytes: int) -> bytes:
         header, encoded = value.split(",", 1)
     except ValueError as exc:
         raise MediaCellUnsupported("media cell value is unsupported") from exc
-    if not header.lower().endswith(";base64"):
+    if (len(header.encode("utf-8")) > _MAX_DATA_URI_HEADER_BYTES
+            or not header.lower().endswith(";base64")):
         raise MediaCellUnsupported("media cell value is unsupported")
     if len(encoded) > ((max_bytes + 2) // 3) * 4 + 4:
         raise MediaCellTooLarge("media cell exceeds the response limit")
@@ -258,7 +298,7 @@ def read_managed_local_media_cell(
                 raise MediaCellIdentityUnavailable("media cell row identity is unavailable")
             values = _identity_values(request, certificate)
             with db.base_guard():
-                value = _exact_cell(artifact_uri, certificate, request, values)
+                value = _exact_cell(artifact_uri, certificate, column, values, max_bytes)
                 expected_kind = media_kind_from_value(value) or column.media_kind
                 content = _cell_bytes(storage, value, max_bytes)
     except MediaCellError:
