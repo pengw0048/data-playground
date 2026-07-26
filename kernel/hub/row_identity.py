@@ -18,7 +18,7 @@ from typing import Literal, TypeVar
 import pyarrow as pa
 
 from hub import db, metadb
-from hub.models import ExactDatasetRef
+from hub.models import ExactDatasetRef, MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH
 from hub.plugins.adapters import DuckDBAdapter
 from hub.sqlpolicy import identifier, quote_identifier
 from hub.storage import ManagedSourceUnavailable, source_read_scope
@@ -27,6 +27,7 @@ from hub.storage import ManagedSourceUnavailable, source_read_scope
 _ENCODING_VERSION = "row-identity-v1"
 _NULL_POLICY = "reject"
 _CommitResult = TypeVar("_CommitResult")
+PREVIEW_ROW_IDENTITIES_MAX_JSON_BYTES = 1024 * 1024
 _SUPPORTED_TYPES: dict[str, tuple[str, int | None, bool | None]] = {
     "int8": ("i8", 1, True), "int16": ("i16", 2, True),
     "int32": ("i32", 4, True), "int64": ("i64", 8, True),
@@ -373,6 +374,75 @@ def freeze_row_identity_spec_from_schema(
 def row_identity_spec_is_supported(spec: RowIdentitySpecV1) -> bool:
     """Whether the frozen key types can be proven by the V1 whole-revision worker."""
     return all(field.arrow_type in _SUPPORTED_TYPES for field in spec.fields)
+
+
+def canonicalize_preview_row_identities(
+        table: pa.Table, certificate: RowIdentityCoverageV1,
+) -> list[list[dict[str, str]] | None] | None:
+    """Build #826-ready identities from one already-materialized exact Arrow preview.
+
+    A schema/certificate mismatch fails the complete sidecar closed. Individual null or
+    unrepresentable values retain their row position as ``None``. The budget is the exact compact
+    JSON UTF-8 size of the array, including list punctuation and required null placeholders.
+    """
+    if not isinstance(table, pa.Table) or not isinstance(certificate, RowIdentityCoverageV1):
+        return None
+    try:
+        expected = ExactDatasetRef(
+            kind="exact", dataset_id=certificate.spec.dataset_id,
+            revision_id=certificate.spec.revision_id)
+        validate_row_identity_coverage(certificate, expected, certificate.spec.digest)
+    except (TypeError, ValueError, RowIdentityValidationError):
+        return None
+    if (certificate.status != "complete"
+            or certificate.spec.schema_digest != _schema_digest(table.schema)):
+        return None
+
+    columns: list[tuple[RowIdentityFieldV1, pa.ChunkedArray]] = []
+    for field in certificate.spec.fields:
+        indices = table.schema.get_all_field_indices(field.name)
+        if len(indices) != 1 or str(table.schema.field(indices[0]).type) != field.arrow_type:
+            return None
+        columns.append((field, table.column(indices[0])))
+
+    identities: list[list[dict[str, str]] | None] = [None] * table.num_rows
+    used = len(json.dumps(
+        identities, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    for row_index in range(table.num_rows):
+        identity: list[dict[str, str]] = []
+        for field, column in columns:
+            scalar = column[row_index]
+            if not scalar.is_valid:
+                identity = []
+                break
+            try:
+                value = scalar.as_py()
+            except Exception:  # noqa: BLE001 - one unrepresentable row fails closed
+                identity = []
+                break
+            if field.arrow_type == "string":
+                canonical = (
+                    value if type(value) is str
+                    and len(value) <= MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH else None)
+            else:
+                canonical = str(value) if type(value) is int else None
+            if canonical is None:
+                identity = []
+                break
+            identity.append({
+                "name": field.name,
+                "arrowType": field.arrow_type,
+                "value": canonical,
+            })
+        if not identity:
+            continue
+        encoded = json.dumps(
+            identity, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        added = len(encoded) - len(b"null")
+        if used + added <= PREVIEW_ROW_IDENTITIES_MAX_JSON_BYTES:
+            identities[row_index] = identity
+            used += added
+    return identities
 
 
 def _validate_frozen_spec(spec: RowIdentitySpecV1, dataset_ref: ExactDatasetRef) -> None:

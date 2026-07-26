@@ -1423,6 +1423,33 @@
             "title": "Hasmore",
             "type": "boolean"
           },
+          "rowIdentities": {
+            "anyOf": [
+              {
+                "items": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "$ref": "#/components/schemas/MediaCellIdentityValue"
+                      },
+                      "maxItems": 32,
+                      "minItems": 1,
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "maxItems": 100,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rowidentities"
+          },
           "rowLimit": {
             "const": 100,
             "default": 100,
@@ -1440,6 +1467,7 @@
           }
         },
         "required": [
+          "rowIdentities",
           "hasMore"
         ],
         "title": "DatasetRevisionPreview",
@@ -1502,6 +1530,10 @@
       "DatasetRevisionRowIdentity": {
         "description": "Bounded availability of logical row-addressed reads for one exact revision.",
         "properties": {
+          "certificationSupported": {
+            "title": "Certificationsupported",
+            "type": "boolean"
+          },
           "datasetId": {
             "maxLength": 512,
             "minLength": 1,
@@ -1546,7 +1578,8 @@
         "required": [
           "datasetId",
           "revisionId",
-          "proofStatus"
+          "proofStatus",
+          "certificationSupported"
         ],
         "title": "DatasetRevisionRowIdentity",
         "type": "object"

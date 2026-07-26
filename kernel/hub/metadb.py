@@ -25,6 +25,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 from sqlalchemy import (
@@ -41,6 +42,9 @@ from hub.models import (
     ROW_IDENTITY_FIELD_NAME_MAX,
 )
 from hub.settings import settings
+
+if TYPE_CHECKING:
+    from hub.row_identity import RowIdentityCoverageV1
 
 DEFAULT_USER_ID = "local"
 LOCAL_WORKSPACE_ROOT_ID = "workspace-local-root"
@@ -11310,6 +11314,15 @@ def row_identity_certification_task_view(task_id: str, uid: str) -> dict | None:
         envelope = s.get(RowIdentityCertificationTaskEnvelope, task.id)
         if envelope is None:
             raise RuntimeError("row identity certification task envelope is unavailable")
+        receipt = json.loads(envelope.receipt_doc) if envelope.receipt_doc else None
+        certificate = receipt.get("certificate") if isinstance(receipt, dict) else None
+        if (receipt is not None and receipt.get("schemaVersion") == 1
+                and isinstance(certificate, dict)
+                and certificate.get("proofStatus") == "certified"
+                and "certificationSupported" not in certificate):
+            # #875 V1 receipts predate the capability flag. Their successful proof operation is
+            # managed-local by construction, so upgrade only that bounded public view in memory.
+            certificate["certificationSupported"] = True
         return {
             "taskId": task.id,
             "status": task.status,
@@ -11319,7 +11332,7 @@ def row_identity_certification_task_view(task_id: str, uid: str) -> dict | None:
             "specSha256": envelope.spec_sha256,
             "keyColumns": json.loads(envelope.keys_doc),
             "canCancel": task.status not in _TERMINAL_RUN,
-            "receipt": json.loads(envelope.receipt_doc) if envelope.receipt_doc else None,
+            "receipt": receipt,
         }
 
 
@@ -20838,6 +20851,7 @@ def _row_identity_certificate_payload(
         "datasetId": dataset_id,
         "revisionId": revision_id,
         "proofStatus": "certified",
+        "certificationSupported": True,
         "fields": [{"name": field.name, "arrowType": field.arrow_type}
                    for field in decoded.spec.fields],
         "encodingVersion": decoded.spec.encoding_version,
@@ -20956,6 +20970,7 @@ def managed_local_row_identity_certificate_descriptor(
                     "datasetId": dataset_id,
                     "revisionId": revision_id,
                     "proofStatus": "certified",
+                    "certificationSupported": True,
                     "fields": [{"name": field.name, "arrowType": field.arrow_type}
                                for field in certificate.spec.fields],
                     "encodingVersion": certificate.spec.encoding_version,
@@ -20970,7 +20985,7 @@ def managed_local_row_identity_certificate_descriptor(
 def managed_local_row_identity_certificate_for_artifact(
         dataset_id: str, revision_id: str, artifact_uri: str, *,
         artifact_dev: int, artifact_ino: int,
-):
+) -> RowIdentityCoverageV1 | None:
     """Revalidate and return retained proof bound to one already-held exact artifact inode."""
     from hub.models import ExactDatasetRef
     from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
