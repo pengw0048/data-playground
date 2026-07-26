@@ -517,3 +517,143 @@ def test_postgres_finish_and_preflight_share_registry_revision_artifact_lock_ord
     assert terminal.receipt is not None and terminal.receipt.outcome == "certified"
     assert metadb.managed_local_row_identity_certificate_descriptor(
         deps.storage, published["dataset_id"], published["revision_id"]) is not None
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires a dedicated PostgreSQL certificate lock race")
+def test_postgres_existing_certificate_finish_and_standalone_store_do_not_deadlock(
+        dataset, monkeypatch):
+    deps, publish = dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    task, _ = _submit(_request(published))
+    claim = metadb.claim_row_identity_certification_task(task.task_id, "finisher")
+    assert claim is not None
+    attempt_id = claim["attempts"][-1]["id"]
+    exact = ExactDatasetRef(
+        kind="exact", dataset_id=published["dataset_id"],
+        revision_id=published["revision_id"])
+    certificate = certify_exact_row_identity(deps.storage, exact, ["id"])
+    certificate_doc = serialize_row_identity_coverage(
+        certificate, exact, task.spec_sha256)
+    artifact = metadb.managed_local_file_revision_artifact(
+        published["dataset_id"], published["revision_id"])
+    assert artifact is not None
+    artifact_info = os.stat(artifact)
+    metadb.managed_local_row_identity_certificate_store(
+        published["dataset_id"], published["revision_id"], certificate_doc,
+        artifact_dev=artifact_info.st_dev, artifact_ino=artifact_info.st_ino)
+
+    original_store = metadb._managed_local_row_identity_certificate_store
+    standalone_has_artifact = threading.Event()
+    finisher_entered_store = threading.Event()
+
+    def ordered_store(*args, **kwargs):
+        if threading.current_thread().name == "certificate-finisher":
+            finisher_entered_store.set()
+            assert standalone_has_artifact.wait(5)
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        metadb, "_managed_local_row_identity_certificate_store", ordered_store)
+
+    def standalone_store():
+        threading.current_thread().name = "standalone-store"
+        with metadb.session() as session:
+            revision = session.get(
+                metadb.ManagedLocalFileRevision, published["revision_id"],
+                with_for_update=True)
+            assert revision is not None
+            assert session.get(
+                metadb.LocalResultArtifact, revision.artifact_uri,
+                with_for_update=True) is not None
+            standalone_has_artifact.set()
+            assert finisher_entered_store.wait(5)
+            return original_store(
+                session, published["dataset_id"], published["revision_id"],
+                certificate_doc, artifact_info.st_dev, artifact_info.st_ino)
+
+    def finish():
+        threading.current_thread().name = "certificate-finisher"
+        return metadb.finish_row_identity_certification_scan(
+            task.task_id, attempt_id, "finisher", certificate_doc,
+            artifact_dev=artifact_info.st_dev, artifact_ino=artifact_info.st_ino)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        standalone = pool.submit(standalone_store)
+        assert standalone_has_artifact.wait(5)
+        finished = pool.submit(finish)
+        assert standalone.result(timeout=10)[1] is False
+        assert finished.result(timeout=10) is True
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "done"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == "already_certified_same_spec"
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires a dedicated PostgreSQL certificate insert race")
+def test_postgres_first_same_spec_race_reports_finish_as_the_loser(
+        dataset, monkeypatch):
+    deps, publish = dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    task, _ = _submit(_request(published))
+    claim = metadb.claim_row_identity_certification_task(task.task_id, "finisher")
+    assert claim is not None
+    attempt_id = claim["attempts"][-1]["id"]
+    exact = ExactDatasetRef(
+        kind="exact", dataset_id=published["dataset_id"],
+        revision_id=published["revision_id"])
+    certificate = certify_exact_row_identity(deps.storage, exact, ["id"])
+    certificate_doc = serialize_row_identity_coverage(
+        certificate, exact, task.spec_sha256)
+    artifact = metadb.managed_local_file_revision_artifact(
+        published["dataset_id"], published["revision_id"])
+    assert artifact is not None
+    artifact_info = os.stat(artifact)
+
+    original_store = metadb._managed_local_row_identity_certificate_store
+    finisher_entered_store = threading.Event()
+    standalone_committed = threading.Event()
+
+    def delayed_store(*args, **kwargs):
+        if threading.current_thread().name == "certificate-finisher":
+            finisher_entered_store.set()
+            assert standalone_committed.wait(5)
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        metadb, "_managed_local_row_identity_certificate_store", delayed_store)
+
+    def finish():
+        threading.current_thread().name = "certificate-finisher"
+        return metadb.finish_row_identity_certification_scan(
+            task.task_id, attempt_id, "finisher", certificate_doc,
+            artifact_dev=artifact_info.st_dev, artifact_ino=artifact_info.st_ino)
+
+    def standalone_store():
+        threading.current_thread().name = "standalone-store"
+        assert finisher_entered_store.wait(5)
+        descriptor = metadb.managed_local_row_identity_certificate_store(
+            published["dataset_id"], published["revision_id"], certificate_doc,
+            artifact_dev=artifact_info.st_dev, artifact_ino=artifact_info.st_ino)
+        standalone_committed.set()
+        return descriptor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finished = pool.submit(finish)
+        standalone = pool.submit(standalone_store)
+        assert standalone.result(timeout=10)["proofStatus"] == "certified"
+        assert finished.result(timeout=10) is True
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "done"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == "already_certified_same_spec"
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalRowIdentityCertificate).where(
+            metadb.ManagedLocalRowIdentityCertificate.revision_id
+            == published["revision_id"])) == 1

@@ -8836,11 +8836,8 @@ def finish_row_identity_certification_scan(
         # finish path also drops its input owner during terminalization, so acquire the registry
         # before certificate storage locks the revision/artifact and reuse it through cleanup.
         _lock_local_result_registry(s)
-        existed = s.get(
-            ManagedLocalRowIdentityCertificate, envelope.revision_id,
-            with_for_update=True) is not None
         try:
-            descriptor = _managed_local_row_identity_certificate_store(
+            descriptor, created = _managed_local_row_identity_certificate_store(
                 s, envelope.dataset_id, envelope.revision_id, certificate,
                 artifact_dev, artifact_ino)
         except RowIdentityCertificateConflict:
@@ -8850,7 +8847,7 @@ def finish_row_identity_certification_scan(
                 diagnostic_code="conflicting_retained_spec")
         return _finish_row_identity_certification_in_session(
             s, task, attempt, envelope, status="done",
-            outcome=("already_certified_same_spec" if existed else "certified"),
+            outcome=("certified" if created else "already_certified_same_spec"),
             diagnostic_code=None, certificate=descriptor)
 
 
@@ -20856,7 +20853,7 @@ def _row_identity_certificate_payload(
 def _managed_local_row_identity_certificate_store(
         s, dataset_id: str, revision_id: str, certificate: object,
         artifact_dev: int | None, artifact_ino: int | None,
-) -> dict:
+) -> tuple[dict, bool]:
     if (type(artifact_dev) is not int or artifact_dev < 0
             or type(artifact_ino) is not int or artifact_ino < 0):
         raise ValueError("row identity artifact evidence is invalid")
@@ -20887,11 +20884,11 @@ def _managed_local_row_identity_certificate_store(
         from sqlalchemy.dialects.sqlite import insert as dialect_insert
     else:  # pragma: no cover - supported deployments use SQLite or PostgreSQL
         raise RuntimeError("unsupported metadata database dialect")
-    s.execute(dialect_insert(ManagedLocalRowIdentityCertificate).values(
+    created = s.scalar(dialect_insert(ManagedLocalRowIdentityCertificate).values(
         **values,
     ).on_conflict_do_nothing(
         index_elements=[ManagedLocalRowIdentityCertificate.revision_id],
-    ))
+    ).returning(ManagedLocalRowIdentityCertificate.revision_id)) is not None
     existing = s.get(ManagedLocalRowIdentityCertificate, revision_id, with_for_update=True)
     if existing is None:  # pragma: no cover - defensive database contract check
         raise RuntimeError("row identity certificate reservation failed")
@@ -20902,7 +20899,7 @@ def _managed_local_row_identity_certificate_store(
             or existing.artifact_dev != artifact_dev or existing.artifact_ino != artifact_ino):
         raise RowIdentityCertificateConflict(
             "exact revision already has a different row identity certificate")
-    return descriptor
+    return descriptor, created
 
 
 def managed_local_row_identity_certificate_store(
@@ -20911,8 +20908,9 @@ def managed_local_row_identity_certificate_store(
 ) -> dict:
     """Durably retain one complete exact-revision certificate, or reject a conflicting proof."""
     with session() as s:
-        return _managed_local_row_identity_certificate_store(
+        descriptor, _created = _managed_local_row_identity_certificate_store(
             s, dataset_id, revision_id, certificate, artifact_dev, artifact_ino)
+        return descriptor
 
 
 def _retain_sparse_row_identity_certificate(
