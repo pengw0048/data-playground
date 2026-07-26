@@ -1175,7 +1175,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
             </div>
           ) : null}
 
-          <DatasetRevisionHistory key={`${table.id}:${initialRevisionId ?? ''}:${initialRevisionDatasetId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
+          <DatasetRevisionHistory key={`${table.id}:${table.registrationId ?? ''}`} table={table} initialRevisionId={initialRevisionId} initialRevisionDatasetId={initialRevisionDatasetId} />
 
           {/* organization editor */}
           <section className="flex flex-col gap-2 rounded-lg border border-border p-3">

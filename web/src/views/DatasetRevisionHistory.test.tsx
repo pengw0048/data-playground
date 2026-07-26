@@ -76,6 +76,9 @@ describe('DatasetRevisionHistory', () => {
     store.workspaceScope = 'datasets'
     store.workspaceResourceId = 'dataset:table-1'
     store.workspaceDatasetQuery = ''
+    store.setWorkspaceDatasetQuery.mockImplementation((query: string) => {
+      store.workspaceDatasetQuery = query
+    })
     store.switchWorkspaceScope.mockImplementation((scope: 'all' | 'datasets') => {
       store.workspaceScope = scope
       store.workspaceResourceId = null
@@ -119,7 +122,7 @@ describe('DatasetRevisionHistory', () => {
     mocks.datasetRevision.mockImplementation((_datasetId: string, revisionId: string) =>
       Promise.resolve(detail(revisionId)))
     mocks.rowIdentityCertificationTask.mockRejectedValue(new Error('old task detached'))
-    render(
+    const view = render(
       <DatasetRevisionHistory
         table={TABLE}
         initialRevisionId="rev-a"
@@ -129,6 +132,14 @@ describe('DatasetRevisionHistory', () => {
 
     await screen.findByText('Exact revision rev-a')
     fireEvent.click(screen.getByRole('button', { name: 'Open revision rev-b' }))
+    view.rerender(
+      <DatasetRevisionHistory
+        table={TABLE}
+        initialRevisionId="rev-b"
+        initialRevisionDatasetId="dataset-stable"
+      />,
+    )
+    await screen.findByText('Exact revision rev-b')
     const next = new URLSearchParams(
       store.setWorkspaceDatasetQuery.mock.calls.at(-1)?.[0],
     )
@@ -137,6 +148,12 @@ describe('DatasetRevisionHistory', () => {
     expect(next.get('revisionDataset')).toBe('dataset-stable')
     expect(next.has('rowIdentityAction')).toBe(false)
     expect(next.has('rowIdentityTask')).toBe(false)
+    expect(
+      mocks.datasetRevision.mock.calls.filter(
+        ([datasetId, revisionId]) =>
+          datasetId === 'dataset-stable' && revisionId === 'rev-b',
+      ),
+    ).toHaveLength(1)
   })
 
   it('distinguishes empty, unavailable, and provider-error history states', async () => {

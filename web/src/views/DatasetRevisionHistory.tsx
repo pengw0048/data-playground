@@ -61,6 +61,7 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   const historyRequest = useRef(0)
   const capabilityRequest = useRef(0)
   const detailRequest = useRef(0)
+  const openedRevision = useRef('')
 
   const navigateRevision = useCallback((revision: DatasetRevision) => {
     const params = new URLSearchParams(encodedQuery)
@@ -108,7 +109,17 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   }, [loadFirst])
 
   useEffect(() => {
-    if (!initialRevisionId || !initialRevisionDatasetId) return
+    if (!initialRevisionId || !initialRevisionDatasetId) {
+      if (openedRevision.current) {
+        openedRevision.current = ''
+        detailRequest.current += 1
+        setSelected(null); setDetail(null); setParent(null)
+        setDetailError(null); setParentError(null); setDetailLoading(false)
+      }
+      return
+    }
+    const identity = JSON.stringify([initialRevisionDatasetId, initialRevisionId])
+    if (openedRevision.current === identity) return
     // The route supplies only a stable dataset/revision identity. Opening it goes through the
     // same exact-revision reader as a click in history; a missing/compacted revision stays honest.
     void openRevision({ datasetId: initialRevisionDatasetId, revisionId: initialRevisionId, retentionOwner: 'core' })
@@ -136,6 +147,7 @@ export function DatasetRevisionHistory({ table, initialRevisionId, initialRevisi
   }
 
   const openRevision = useCallback(async (revision: DatasetRevision) => {
+    openedRevision.current = JSON.stringify([revision.datasetId, revision.revisionId])
     const request = ++detailRequest.current
     setSelected(revision); setDetail(null); setParent(null); setDetailError(null); setParentError(null); setDetailLoading(true)
     try {
