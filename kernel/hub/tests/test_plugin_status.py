@@ -268,3 +268,75 @@ def test_duplicate_installed_entry_point_names_fail_before_loading(tmp_path, mon
     assert {entry["failure_summary"] for entry in duplicates} == {
         "Installed plugin entry point name 'duplicate-installed-pack' is declared more than once."
     }
+
+
+def test_manifestless_entry_point_does_not_inherit_same_named_drop_in(tmp_path, monkeypatch):
+    import importlib.metadata
+
+    from hub import metadb
+
+    workspace = tmp_path / "workspace"
+    name = "same_name_pack"
+    _write_plugin(
+        workspace,
+        name,
+        "from pathlib import Path\n"
+        "from hub.sdk import NodeSpec, PortSpec\n"
+        "def register(reg):\n"
+        "    Path(reg.deps.workspace, 'drop-in-value').write_text(reg.config('token'))\n"
+        "    reg.add_node(NodeSpec(kind='same-name-drop-in', title='drop-in', "
+        "category='compute', inputs=[], outputs=[PortSpec(id='out')], params=[]))\n",
+    )
+    workload_config = (
+        "[[config]]\n"
+        'key = "token"\n'
+        'type = "password"\n'
+        'env = "{target}"\n'
+        "secret = true\n"
+        "workload_env = true\n"
+    )
+    (workspace / "plugins" / name / "dataplay.toml").write_text(
+        f'name = "{name}"\nversion = "1.0.0"\n'
+        + workload_config.format(target="DP_DROP_IN_TARGET")
+    )
+
+    manifestless_observed: list[object] = []
+
+    def register_manifestless(reg):
+        manifestless_observed.append(reg.config("token"))
+        reg.add_telemetry_sink(lambda _record: None)
+
+    class EntryPoint:
+        def __init__(self, entry_name, register):
+            self.name = entry_name
+            self._register = register
+            self.dist = type("Dist", (), {"name": entry_name, "version": "1.0.0"})()
+
+        def load(self):
+            return self._register
+
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda *, group: [EntryPoint(name, register_manifestless)],
+    )
+    monkeypatch.setenv("DP_DROP_IN_SOURCE", "drop-in-material")
+    monkeypatch.setenv("DP_DROP_IN_TARGET", "wrong-drop-in-fallback")
+    configured = {
+        f"plugin.{name}.token": "env:DP_DROP_IN_SOURCE",
+    }
+    monkeypatch.setattr(
+        metadb,
+        "get_setting",
+        lambda key, _scope, _uid=None, default=None: configured.get(key, default),
+    )
+
+    deps = Deps(str(workspace), str(tmp_path / "data"))
+    same_name = [entry for entry in deps.plugins if entry["name"] == name]
+
+    assert (workspace / "drop-in-value").read_text() == "drop-in-material"
+    assert [entry["source"] for entry in same_name] == ["drop-in", "entry_point"]
+    assert same_name[0]["config"][0]["env"] == "DP_DROP_IN_TARGET"
+    assert same_name[1]["config"] is None
+    assert manifestless_observed == [None]
+    assert deps.plugin_workload_env() == {}

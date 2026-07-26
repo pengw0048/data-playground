@@ -93,8 +93,13 @@ class Registry:
         and is resolved here; the material value never lives in the settings row.
         """
         pack = self._pack
-        schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
+        if self._entry is not None:
+            schema = self._entry.get("config") or []
+        else:
+            schema = self.deps._manifests.get(pack, {}).get("config", []) if pack else []
         field = next((f for f in schema if isinstance(f, dict) and f.get("key") == key), None)
+        if self._entry is not None and self._entry.get("source") == "entry_point" and field is None:
+            return default
         secret = bool(field and field.get("secret"))
         if field and field.get("workload_env") is True:
             from hub.workload_env import WORKLOAD_CHILD_MARKER, workload_child_allows_plugin
@@ -911,11 +916,11 @@ class Deps:
                 try:
                     fn = ep.load()
                     mod = sys.modules.get(getattr(fn, "__module__", "") or "")
-                    manifest_error = self._read_installed_manifest(mod, ep.name)
+                    manifest, manifest_error = self._read_installed_manifest(mod)
                     if manifest_error:
                         self._record_plugin_problem(entry, manifest_error)
                         continue
-                    entry["config"] = self._manifests.get(ep.name, {}).get("config") or None
+                    entry["config"] = (manifest.get("config") or None) if manifest else None
                     err = _core_api_error(getattr(mod, "MIN_CORE_API", getattr(mod, "min_core_api", None))) if mod else None
                     if err:  # entry-point plugin declares an unsupported core → skip before register (OSS-01)
                         self._record_plugin_problem(entry, err)
@@ -975,31 +980,30 @@ class Deps:
             )
             return False
 
-    def _read_installed_manifest(self, module, name: str) -> str | None:
-        """Load an optional package-local manifest for a ``dataplay.plugins`` entry point."""
+    def _read_installed_manifest(self, module) -> tuple[dict | None, str | None]:
+        """Return only this installed package's manifest, explicitly distinguishing absence."""
         package = getattr(module, "__package__", None) or getattr(module, "__name__", None)
         if not package:
-            return None
+            return None, None
         try:
             resource = importlib.resources.files(package).joinpath("dataplay.toml")
             if not resource.is_file():
-                return None
+                return None, None
             import tomllib
             man = tomllib.loads(resource.read_text(encoding="utf-8"))
         except Exception:
-            return "Installed plugin manifest is invalid; fix dataplay.toml and restart."
+            return None, "Installed plugin manifest is invalid; fix dataplay.toml and restart."
         missing = [key for key in ("name", "version") if key not in man]
         if missing:
-            return f"Manifest is missing required fields: {', '.join(missing)}."
+            return None, f"Manifest is missing required fields: {', '.join(missing)}."
         err = _core_api_error(man.get("min_core_api"))
         if err:
-            return err
+            return None, err
         man["config"] = _normalize_config(man.get("config"))
         config_error = _validate_workload_env_config(man["config"])
         if config_error:
-            return config_error
-        self._manifests[name] = man
-        return None
+            return None, config_error
+        return man, None
 
     def _register_module(self, mod: str, reg: Registry, *, source: str = "module") -> None:
         manifest = self._manifests.get(mod, {})
