@@ -17,6 +17,8 @@ function Write({ id, data }: NodeComponentProps) {
   const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
+  const managed = receipt != null || admission?.managed === true
+  const destinationLabel = managed && dest === 'Workspace outputs' ? 'default managed storage' : dest
   const merge = data.config.mergeColumns as { taskId?: string; rules?: unknown[] } | undefined
   const upsert = data.config.keyedUpsert as { taskId?: string; keys?: unknown[] } | undefined
   useEffect(() => {
@@ -37,17 +39,17 @@ function Write({ id, data }: NodeComponentProps) {
   }, [id, data.config, admission, runPhase, prepareWrite])
   const displayName = admission?.intent?.destination.name ?? name
   const semantics = receipt
-    ? `revision ${receipt.revisionId}`
+    ? `published revision ${receipt.revisionId}`
     : admission?.managed
       ? admission.blocker ? `blocked · ${admission.blocker}` : `${admission.mode} · ${admission.expectedSchema.length} cols`
       : admission ? `${admission.mode} · ${admission.provider}` : 'checking destination…'
   const mergeSemantics = merge?.taskId ? 'column merge tracked' : merge?.rules?.length ? 'column merge configured' : null
   const upsertSemantics = upsert?.taskId ? 'keyed upsert tracked' : upsert?.keys?.length ? 'keyed upsert configured' : null
   return (
-    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${dest} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : 'name an output → (destination in the panel)'}>
+    <NodeCard id={id} data={data} metaOverride={displayName ? `→ ${destinationLabel} · ${mergeSemantics ?? upsertSemantics ?? semantics}` : `${managed ? 'name a managed dataset' : 'name an output'} → (destination in the panel)`}>
       <div className="flex gap-2">
-        <Field label="file name" style={{ flex: 1.6 }}>
-          <MiniInput value={name} placeholder="output.parquet" invalid={nameError != null}
+        <Field label={managed ? 'dataset name' : 'output name'} style={{ flex: 1.6 }}>
+          <MiniInput value={name} placeholder="output" invalid={nameError != null}
             onChange={(v) => updateConfig(id, { filename: v })} />
           {nameError && <span role="alert" className="text-[10px] leading-snug text-destructive">{nameError}</span>}
         </Field>
@@ -71,8 +73,8 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample', 'selection'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'materialize / commit to a registered dataset',
-    defaultData: () => ({ title: 'write', status: 'draft', config: { writeMode: 'overwrite', filename: 'output.parquet' }, meta: 'sink · needs full pass', needsFullPass: true }),
+    blurb: 'write provider output or publish a managed dataset revision',
+    defaultData: () => ({ title: 'write', status: 'draft', config: { writeMode: 'overwrite', filename: 'output' }, meta: 'sink · needs full pass', needsFullPass: true }),
   },
   Write,
 )

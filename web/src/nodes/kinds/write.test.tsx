@@ -172,6 +172,6 @@ describe('Write card — typed local mode truth', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Use one managed dataset name, without a path or URI.')
-    expect(screen.getByPlaceholderText('output.parquet')).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByPlaceholderText('output')).toHaveAttribute('aria-invalid', 'true')
   })
 })

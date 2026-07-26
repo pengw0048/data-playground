@@ -6,7 +6,14 @@ export function publicationMode(mode: WriteAdmission['mode'] | undefined): strin
   if (mode === 'create') return 'Create a new dataset'
   if (mode === 'append') return 'Append to the selected dataset'
   if (mode === 'replace' || mode === 'overwrite') return 'Replace the selected dataset'
-  return 'Publication mode is not available yet'
+  return 'Revision mode is not available yet'
+}
+
+function writeMode(mode: WriteAdmission['mode'] | undefined): string {
+  if (mode === 'append') return 'Append provider output'
+  if (mode === 'replace' || mode === 'overwrite') return 'Overwrite provider output'
+  if (mode === 'create') return 'Create provider output'
+  return 'Write mode is not available yet'
 }
 
 function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
@@ -23,7 +30,9 @@ function ExactRevisionAction({ receipt }: { receipt: WriteReceipt }) {
   }
   const schemaFieldCount = detail?.preview?.columns?.length ?? 0
   return <>
-    <button type="button" className="ml-2 font-semibold text-primary underline" onClick={() => void open()} disabled={loading}>
+    <button type="button"
+      className="mt-2 inline-flex rounded-md bg-primary px-2.5 py-1.5 text-[10.5px] font-semibold text-primary-foreground shadow-sm disabled:opacity-60"
+      onClick={() => void open()} disabled={loading}>
       {loading ? 'Opening exact revision…' : 'Open exact revision'}
     </button>
     {detail && <div aria-label="Exact revision detail" className="mt-2 rounded border border-border bg-background p-2 text-muted-foreground">
@@ -108,27 +117,60 @@ function PublicationDetails({ admission, outcomeAdmission, receipt, outputs = []
   </details>
 }
 
-export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false }: {
-  outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean
+function managedDestinationLabel(destination: string): string {
+  if (destination === 'Workspace outputs') return 'Default managed storage'
+  if (destination.startsWith('Workspace outputs/')) {
+    return `Default managed storage · ${destination.slice('Workspace outputs/'.length)}`
+  }
+  return destination
+}
+
+export function WritePublicationSummary({ outputName, destination, admission, outcomeAdmission, receipt, outputs, compact = false, completed = false, publishing = false }: {
+  outputName: string; destination: string; admission?: WriteAdmission | null; outcomeAdmission?: WriteAdmission | null; receipt?: WriteReceipt | null; outputs?: RunOutput[]; compact?: boolean; completed?: boolean; publishing?: boolean
 }) {
   const classes = compact ? 'mt-2 text-[10.5px]' : 'rounded-md border border-border bg-muted/30 p-2 text-[11px]'
   const summaryAdmission = completed ? outcomeAdmission : admission
-  const acceptedName = receipt?.name
-    ?? summaryAdmission?.intent?.destination.name
-    ?? outputName
+  const managed = receipt != null || summaryAdmission?.managed === true
+  const providerNeutral = summaryAdmission?.managed === false
+  const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
+  const displayedName = acceptedName ?? outputName
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
-      <div><span className="font-semibold text-foreground">Output name</span><div className="font-mono text-foreground">{acceptedName}</div></div>
-      <div><span className="font-semibold text-foreground">Destination</span><div className="text-muted-foreground">{destination}</div></div>
-      <div><span className="font-semibold text-foreground">Publication mode</span><div className="text-muted-foreground">{publicationMode(summaryAdmission?.mode)}</div></div>
+      <div>
+        <span className="font-semibold text-foreground">
+          {managed ? acceptedName ? 'Accepted dataset name' : 'Proposed dataset name' : 'Output name'}
+        </span>
+        <div className="font-mono text-foreground">{displayedName}</div>
+      </div>
+      <div>
+        <span className="font-semibold text-foreground">{managed ? 'Managed destination' : 'Destination'}</span>
+        <div className="text-muted-foreground">{managed ? managedDestinationLabel(destination) : destination}</div>
+      </div>
+      <div className="text-muted-foreground">
+        {managed
+          ? 'Data Playground manages the physical storage layout and records each publication as a versioned revision.'
+          : providerNeutral
+            ? 'This execution backend writes provider output and does not create a managed dataset revision.'
+            : 'Admission has not determined whether this execution can publish a managed dataset revision.'}
+      </div>
+      <div>
+        <span className="font-semibold text-foreground">{managed ? 'Revision mode' : 'Write mode'}</span>
+        <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
+      </div>
       {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Cannot publish until</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
-        : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">Publication outcome is unknown; no exact receipt was recorded.</div>
-        : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Ready to publish</div>
+        : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
+            {providerNeutral ? 'Provider output completed without a managed revision receipt.' : 'Publication outcome is unknown; no exact receipt was recorded.'}
+          </div>
+        : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Publishing this managed revision…</div>
+        : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">
+            {managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
+          </div>
         : <div aria-label="Write readiness" className="text-muted-foreground">Readiness has not been checked yet.</div>}
       {receipt && <div aria-label="Published result" className="rounded border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5 text-foreground">
-        <strong>{acceptedName} published</strong> · {receipt.rows.toLocaleString()} rows
+        <div><strong>Managed dataset published</strong></div>
+        <div><span className="font-mono">{displayedName}</span> · revision <span className="font-mono">{receipt.revisionId}</span> · {receipt.rows.toLocaleString()} rows</div>
         <ExactRevisionAction key={`${receipt.datasetId}:${receipt.revisionId}`} receipt={receipt} />
       </div>}
     </div>

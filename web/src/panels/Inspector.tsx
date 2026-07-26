@@ -390,13 +390,13 @@ function OutputPortsEditor({ nodeId }: { nodeId: string }) {
   )
 }
 
-// The write node's output destination — chosen here in the property panel via the save dialog.
+// The Write destination. Admission decides whether the selected execution publishes a managed revision.
 function WriteDestination({ nodeId }: { nodeId: string }) {
   const node = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId))
   const updateConfig = useStore((s) => s.updateConfig)
   const [dlg, setDlg] = useState(false)
   const cfg = (node?.data.config ?? {}) as Record<string, unknown>
-  const filename = String(cfg.filename ?? cfg.name ?? 'output.parquet')
+  const filename = String(cfg.filename ?? cfg.name ?? 'output')
   const destName = (cfg.destName as string) ?? 'Workspace outputs'
   const destPath = String(cfg.destPath ?? '')
   const admission = useStore((s) => s.runs[nodeId]?.writeAdmission
@@ -406,14 +406,18 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
   const statusOutputs = useStore((s) => s.runs[nodeId]?.status?.outputs)
   const outputs = statusOutputs ?? []
   const receipt = outputs.find((output) => output.writeReceipt)?.writeReceipt
+  const publicationReceipt = receipt ?? admission?.recoveredReceipt
+  const managed = publicationReceipt != null
+    || admission?.managed === true
+    || (phase === 'done' && outcomeAdmission?.managed === true)
   const destination = `${destName}${destPath ? `/${destPath}` : ''}`
   return (
-    <Section title="Publication">
+    <Section title={managed ? 'Managed publication' : 'Write output'}>
       <WritePublicationSummary outputName={filename} destination={destination} admission={admission}
-        outcomeAdmission={outcomeAdmission} receipt={receipt ?? admission?.recoveredReceipt}
-        outputs={outputs} completed={phase === 'done'} />
+        outcomeAdmission={outcomeAdmission} receipt={publicationReceipt}
+        outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'} />
       <div className="mt-2">
-        <CodeBtn icon="export" label="Change destination…" onClick={() => setDlg(true)} />
+        <CodeBtn icon="export" label="Choose destination…" onClick={() => setDlg(true)} />
       </div>
       {dlg && (
         <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}

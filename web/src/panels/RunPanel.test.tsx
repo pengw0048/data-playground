@@ -220,6 +220,83 @@ describe('RunPanel typed parameter gate', () => {
     await waitFor(() => expect(mocks.state.estimate).toHaveBeenCalledWith('target'))
   })
 
+  it('frames an ordinary Write as publishing a managed revision before and during execution', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { filename: 'results' } },
+    }]
+    mocks.state.doc.parameters = []
+    const admission = {
+      nodeId: 'target', mode: 'create', provider: 'managed-local-file',
+      destination: '/outputs/results.parquet', managed: true, expectedSchema: [], partitions: [],
+      intent: { destination: { name: 'results' } },
+    }
+    mocks.state.runs = { target: {
+      phase: 'estimated', estimate: { rows: 2, placement: 'local', needsConfirm: false },
+      writeAdmission: admission, status: { outputs: [] },
+    } }
+    const { rerender } = render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Publish revision' })).toBeVisible()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Ready to publish a managed revision')
+
+    mocks.state.runs.target = {
+      phase: 'running', writeAdmission: admission,
+      status: {
+        runId: 'write-job', status: 'running', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 1, totalRows: 2, ms: 10, placement: 'local', perNode: [], outputs: [],
+      },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByText('publishing managed revision')).toBeVisible()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent('Publishing this managed revision')
+    expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
+  })
+
+  it('keeps provider-neutral Write execution in the ordinary Run and output model', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { filename: 'results.parquet' } },
+    }]
+    mocks.state.doc.parameters = []
+    const admission = {
+      nodeId: 'target', mode: 'overwrite', provider: 'plugin-sink',
+      destination: 's3://example/results.parquet', managed: false, expectedSchema: [], partitions: [],
+    }
+    mocks.state.runs = { target: {
+      phase: 'estimated', estimate: { rows: 2, placement: 'ray', needsConfirm: false },
+      writeAdmission: admission, status: { outputs: [] },
+    } }
+    const { rerender } = render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Publish revision' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
+      'This execution backend writes provider output and does not create a managed dataset revision.')
+
+    mocks.state.runs.target = {
+      phase: 'running', writeAdmission: admission,
+      status: {
+        runId: 'provider-job', status: 'running', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 1, totalRows: 2, ms: 10, placement: 'ray', perNode: [], outputs: [],
+      },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByText('running')).toBeVisible()
+    expect(screen.queryByText('publishing managed revision')).not.toBeInTheDocument()
+
+    mocks.state.runs.target = {
+      phase: 'done', writeOutcomeAdmission: admission,
+      status: {
+        runId: 'provider-job', status: 'done', jobType: 'run', targetNodeId: 'target',
+        rowsProcessed: 2, totalRows: 2, ms: 10, placement: 'ray', perNode: [], outputs: [],
+      },
+    }
+    rerender(<RunPanel nodeId="target" />)
+    expect(screen.getByText('DONE')).toBeVisible()
+    expect(screen.queryByText('MANAGED REVISION PUBLISHED')).not.toBeInTheDocument()
+  })
+
   it('uses the same receipt-backed publication hierarchy after an ordinary Write succeeds', () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },
@@ -236,7 +313,7 @@ describe('RunPanel typed parameter gate', () => {
         totalRows: 2, ms: 10, placement: 'local', perNode: [], outputs: [{
           nodeId: 'target', portId: 'out', wire: 'dataset', publicationKind: 'catalog', outcome: 'committed',
           uri: 'managed://dataset-1', table: 'results', version: 'revision-9', rows: 2,
-          writeReceipt: { datasetId: 'dataset-1', revisionId: 'revision-9', rows: 2, bytes: 128,
+          writeReceipt: { datasetId: 'dataset-1', revisionId: 'revision-9', name: 'results', rows: 2, bytes: 128,
             durable: true, head: { datasetId: 'dataset-1', revisionId: 'revision-9', committedAt: '2026-07-21T12:00:00Z', retentionOwner: 'core' },
             schema: [{ name: 'id', type: 'bigint' }], partitions: [], publication: {
               provider: 'managed-local-file', logicalUri: 'managed://dataset-1', artifactUri: 'file:///revision-9.parquet',
@@ -248,7 +325,9 @@ describe('RunPanel typed parameter gate', () => {
     render(<RunPanel nodeId="target" />)
     const publication = screen.getByLabelText('Write publication')
     expect(publication).toHaveTextContent('Append to the selected dataset')
-    expect(publication).toHaveTextContent('results.parquet published · 2 rows')
+    expect(publication).toHaveTextContent('Managed dataset published')
+    expect(publication).toHaveTextContent('results · revision revision-9 · 2 rows')
+    expect(screen.getByText('MANAGED REVISION PUBLISHED')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
     const details = screen.getByText('Publication details').closest('details')!

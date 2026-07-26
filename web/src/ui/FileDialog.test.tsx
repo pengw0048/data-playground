@@ -63,4 +63,33 @@ describe('FileDialog request and open-mutation truth', () => {
     await waitFor(() => expect(screen.getByText('dialog closed')).toBeInTheDocument())
     expect(register).toHaveBeenCalledTimes(2)
   })
+
+  it('keeps save selection capability-neutral until the chosen destination is admitted', async () => {
+    mocks.destinations.mockResolvedValueOnce({
+      destinations: [
+        { id: 'managed', name: 'Workspace outputs', backend: 'local', root: '/outputs' },
+        { id: 'external', name: 'External provider', backend: 'plugin', root: 'provider://exports' },
+      ],
+      backends: ['local', 'plugin'],
+    })
+    const pick = vi.fn()
+    render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={pick} />)
+
+    expect(await screen.findByText('Destinations')).toBeVisible()
+    expect(screen.getByText('Choose output destination')).toBeVisible()
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Workspace outputs')
+    fireEvent.click(screen.getByRole('button', { name: 'External provider' }))
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('External provider')
+    expect(screen.queryByText(/managed revision|versioned revision/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Output name')).toBeVisible()
+    expect(screen.queryByText('orders.csv')).not.toBeInTheDocument()
+    expect(screen.queryByTitle('New folder')).not.toBeInTheDocument()
+    expect(mocks.browseDestination).not.toHaveBeenCalled()
+    expect(mocks.mkdirDestination).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Use destination' }))
+
+    expect(pick).toHaveBeenCalledWith({
+      destId: 'external', destName: 'External provider', path: '', filename: 'results',
+    })
+  })
 })

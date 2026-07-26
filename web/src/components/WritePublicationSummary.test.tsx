@@ -26,8 +26,32 @@ describe('WritePublicationSummary exact receipt action', () => {
     render(<WritePublicationSummary outputName="family_cost.parquet"
       destination="Workspace outputs" admission={admission} />)
 
+    expect(screen.getByText('Accepted dataset name')).toBeVisible()
     expect(screen.getByText('family_cost')).toBeVisible()
+    expect(screen.getByText('Default managed storage')).toBeVisible()
     expect(screen.queryByText('family_cost.parquet')).not.toBeInTheDocument()
+  })
+
+  it('waits for managed admission before promising a revision and then shows publication in progress', () => {
+    const admission = {
+      nodeId: 'write', managed: true, provider: 'managed-local-file', mode: 'create',
+      destination: '/outputs/family_cost.parquet', expectedSchema: [], partitions: [],
+      intent: { destination: { name: 'family_cost' } },
+    } as any
+    const { rerender } = render(<WritePublicationSummary outputName="family cost"
+      destination="Workspace outputs" />)
+
+    expect(screen.getByText('Output name')).toBeVisible()
+    expect(screen.getByText('family cost')).toBeVisible()
+    expect(screen.getByLabelText('Write publication')).toHaveTextContent(
+      'Admission has not determined whether this execution can publish a managed dataset revision.')
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Readiness has not been checked yet')
+
+    rerender(<WritePublicationSummary outputName="family cost" destination="Workspace outputs"
+      admission={admission} publishing />)
+    expect(screen.getByText('Accepted dataset name')).toBeVisible()
+    expect(screen.getByText('family_cost')).toBeVisible()
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Publishing this managed revision')
   })
 
   it('keeps the receipt name authoritative when a later admission targets another name', () => {
@@ -41,9 +65,26 @@ describe('WritePublicationSummary exact receipt action', () => {
       destination="Workspace outputs" admission={nextAdmission}
       receipt={{ ...receipt, name: 'published' }} completed />)
 
-    expect(screen.getByText('published')).toBeVisible()
+    expect(screen.getAllByText('published')).toHaveLength(2)
     expect(screen.queryByText('next')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Published result')).toHaveTextContent('published published')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('Managed dataset published')
+    expect(screen.getByLabelText('Published result')).toHaveTextContent('published · revision revision-7 · 2 rows')
+  })
+
+  it('does not promise a managed revision for provider-neutral admission', () => {
+    const admission = {
+      nodeId: 'write', managed: false, provider: 'plugin-sink', mode: 'overwrite',
+      destination: 's3://example/output.parquet', expectedSchema: [], partitions: [],
+    } as any
+    render(<WritePublicationSummary outputName="output.parquet" destination="External destination"
+      outcomeAdmission={admission} completed />)
+
+    const summary = screen.getByLabelText('Write publication')
+    expect(summary).toHaveTextContent('Output name')
+    expect(summary).toHaveTextContent('Overwrite provider output')
+    expect(summary).toHaveTextContent('Provider output completed without a managed revision receipt.')
+    expect(summary).not.toHaveTextContent('Data Playground manages the physical storage layout')
+    expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })
 
   it('keeps the completed admission in the task-first summary after active admission cleanup or replacement', () => {
@@ -55,18 +96,18 @@ describe('WritePublicationSummary exact receipt action', () => {
     const { rerender } = render(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
       outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
 
-    const summaryMode = screen.getByText('Publication mode').parentElement!
+    const summaryMode = screen.getByText('Revision mode').parentElement!
     expect(within(summaryMode).getByText('Create a new dataset')).toBeVisible()
 
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs"
       admission={nextAdmission} outcomeAdmission={outcomeAdmission} receipt={receipt} completed />)
-    expect(within(screen.getByText('Publication mode').parentElement!).getByText('Create a new dataset')).toBeVisible()
+    expect(within(screen.getByText('Revision mode').parentElement!).getByText('Create a new dataset')).toBeVisible()
     expect(screen.queryByLabelText('Write blocker')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Write readiness')).toHaveTextContent('Exact publication receipt recorded')
 
     rerender(<WritePublicationSummary outputName="output.parquet" destination="Workspace outputs" receipt={receipt} completed />)
-    expect(within(screen.getByText('Publication mode').parentElement!)
-      .getByText('Publication mode is not available yet')).toBeVisible()
+    expect(within(screen.getByText('Revision mode').parentElement!)
+      .getByText('Revision mode is not available yet')).toBeVisible()
   })
 
   it('opens only the receipt-backed exact revision and fails closed when it is unavailable', async () => {
