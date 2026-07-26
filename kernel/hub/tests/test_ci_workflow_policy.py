@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from hub import metadb
+
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -71,6 +73,35 @@ _RAY_JOBS_PATHS = _RAY_SHARED_PATHS | {
     "kernel/hub/migrations/**",
 }
 
+_POSTGRES_DURABLE_TASK_SELECTORS = {
+    "managed_local_write": ("hub/tests/test_durable_local_write_tasks.py -k postgres",),
+    "external_wait": ("hub/tests/test_durable_external_wait_tasks.py",),
+    "linear_checkpoint_write": (
+        "hub/tests/test_linear_checkpoint_admission.py",
+        "hub/tests/test_linear_checkpoint_commit.py",
+        "hub/tests/test_linear_checkpoint_lifecycle.py",
+    ),
+    "bounded_fanout_write": ("hub/tests/test_bounded_fanout_write_tasks.py",),
+    "merge_columns_write": (
+        "hub/tests/test_merge_columns.py -k postgres",
+        "hub/tests/test_merge_columns_api.py -k postgres",
+    ),
+    "restore_revision_write": (
+        "hub/tests/test_restore_revision.py",
+        "restore_old_revision_publishes_new_head",
+        "restart_recovery_publishes_a_pending_task",
+    ),
+    "keyed_upsert_write": (
+        "hub/tests/test_keyed_upsert_api.py",
+        "postgres_submission_serializes_on_the_owner_row",
+        "postgres_runtime_claim_recovers_and_fences_expired_owner",
+    ),
+    "distribution_report": ("hub/tests/test_distribution_reports.py",),
+    "row_identity_certification": (
+        "hub/tests/test_row_identity_certification_tasks.py -k postgres",
+    ),
+}
+
 
 def _workflow(name: str) -> dict:
     parsed = yaml.safe_load(
@@ -115,6 +146,25 @@ def test_lean_validation_runs_on_pull_requests_and_main() -> None:
         events = _workflow(name)["on"]
         assert "pull_request" in events
         assert events["push"]["branches"] == ["main"]
+
+
+def test_every_admitted_durable_task_kind_has_a_postgres_ci_selector() -> None:
+    kind_constraint = next(
+        constraint
+        for constraint in metadb.DurableTask.__table__.constraints
+        if constraint.name == "ck_durable_task_kind"
+    )
+    admitted = set(re.findall(r"'([^']+)'", str(kind_constraint.sqltext)))
+    assert admitted == set(_POSTGRES_DURABLE_TASK_SELECTORS)
+
+    job = _workflow("ci.yml")["jobs"]["postgres-migration"]
+    commands = " ".join(
+        step.get("run", "") for step in job["steps"] if step.get("run")
+    )
+    commands = " ".join(commands.split())
+    for kind, selectors in _POSTGRES_DURABLE_TASK_SELECTORS.items():
+        for selector in selectors:
+            assert selector in commands, f"{kind} is missing PostgreSQL CI selector {selector!r}"
 
 
 def test_release_reuses_core_checks_at_the_candidate_revision() -> None:

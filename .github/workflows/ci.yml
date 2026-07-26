@@ -263,6 +263,16 @@ jobs:
           hub/tests/test_merge_columns.py -k postgres
           && uv run pytest -q -o faulthandler_timeout=60
           hub/tests/test_merge_columns_api.py -k postgres
+      - name: Verify newest dataset task lifecycles on PostgreSQL
+        run: >-
+          cd kernel && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_keyed_upsert_api.py
+          -k "postgres_submission_serializes_on_the_owner_row or
+          postgres_runtime_claim_recovers_and_fences_expired_owner"
+          && uv run pytest -q -o faulthandler_timeout=60
+          hub/tests/test_restore_revision.py
+          -k "restore_old_revision_publishes_new_head or
+          restart_recovery_publishes_a_pending_task"
       - name: Verify bounded fan-out plan and runtime contracts on PostgreSQL
         # #415 close bar's "combined proof on PG" — the fan-out slot pool / fencing / GC only exercise
         # real duplicate-owner + varchar(32) semantics on PostgreSQL, not SQLite.

@@ -18,6 +18,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError
 
 from hub import metadb
 from hub.models import ExactDatasetRef
@@ -44,6 +45,106 @@ def _reset_postgres(url: str):
     metadb.engine().dispose()
     metadb._engine = metadb._Session = None
     return admin_engine
+
+
+@pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
+def test_postgres_0040_accepts_managed_sidecar_subject_and_rejects_unknown_producer() -> None:
+    url = os.environ["DP_TEST_DATABASE_URL"]
+    assert url.startswith("postgresql"), "DP_TEST_DATABASE_URL must name a dedicated Postgres database"
+    admin_engine = _reset_postgres(url)
+    owner = f"migration-owner-{uuid.uuid4().hex}"
+    legal_task = f"legal-sidecar-{uuid.uuid4().hex}"
+    invalid_task = f"invalid-sidecar-{uuid.uuid4().hex}"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        with admin_engine.begin() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0039_folder_replays")
+            assert MigrationContext.configure(connection).get_current_revision() == "0039_folder_replays"
+            command.upgrade(metadb._alembic_cfg(connection), "0040_managed_sidecar")
+            assert MigrationContext.configure(connection).get_current_revision() == "0040_managed_sidecar"
+
+        with admin_engine.begin() as connection:
+            connection.execute(text("""
+                INSERT INTO users
+                    (id, name, is_admin, token_epoch, created_at)
+                VALUES
+                    (:owner, 'Migration owner', false, 0, :now)
+            """), {"owner": owner, "now": now})
+            connection.execute(text("""
+                INSERT INTO durable_tasks
+                    (id, owner_id, submission_id, intent_sha256, target_node_id, task_kind,
+                     backend_kind, status, status_doc, cancel_requested, retry_count, max_attempts,
+                     created_at, updated_at)
+                VALUES
+                    (:legal_task, :owner, :legal_submission, :legal_sha,
+                     'managed-sidecar-merge', 'merge_columns_write', 'local', 'queued', '{}',
+                     false, 0, 3, :now, :now),
+                    (:invalid_task, :owner, :invalid_submission, :invalid_sha,
+                     'managed-sidecar-merge', 'merge_columns_write', 'local', 'queued', '{}',
+                     false, 0, 3, :now, :now)
+            """), {
+                "legal_task": legal_task,
+                "invalid_task": invalid_task,
+                "owner": owner,
+                "legal_submission": f"legal-sidecar-{uuid.uuid4().hex}",
+                "invalid_submission": f"invalid-sidecar-{uuid.uuid4().hex}",
+                "legal_sha": "a" * 64,
+                "invalid_sha": "b" * 64,
+                "now": now,
+            })
+            connection.execute(text("""
+                INSERT INTO merge_columns_task_envelopes
+                    (task_id, intent_doc, intent_sha256, merge_doc, merge_sha256,
+                     sparse_output_id, base_dataset_id, base_revision_id, phase,
+                     created_at, updated_at, producer_kind, sidecar_dataset_id,
+                     sidecar_revision_id)
+                VALUES
+                    (:task_id, '{}', :intent_sha, '{}', :merge_sha, NULL,
+                     :base_dataset, :base_revision, 'validating', :now, :now,
+                     'managed-sidecar', :sidecar_dataset, :sidecar_revision)
+            """), {
+                "task_id": legal_task,
+                "intent_sha": "c" * 64,
+                "merge_sha": "d" * 64,
+                "base_dataset": f"base-{uuid.uuid4().hex}",
+                "base_revision": f"base-revision-{uuid.uuid4().hex}",
+                "sidecar_dataset": f"sidecar-{uuid.uuid4().hex}",
+                "sidecar_revision": f"sidecar-revision-{uuid.uuid4().hex}",
+                "now": now,
+            })
+
+        with pytest.raises(IntegrityError) as rejected:
+            with admin_engine.begin() as connection:
+                connection.execute(text("""
+                    INSERT INTO merge_columns_task_envelopes
+                        (task_id, intent_doc, intent_sha256, merge_doc, merge_sha256,
+                         sparse_output_id, base_dataset_id, base_revision_id, phase,
+                         created_at, updated_at, producer_kind, sidecar_dataset_id,
+                         sidecar_revision_id)
+                    VALUES
+                        (:task_id, '{}', :intent_sha, '{}', :merge_sha, NULL,
+                         :base_dataset, :base_revision, 'validating', :now, :now,
+                         'unknown-producer', :sidecar_dataset, :sidecar_revision)
+                """), {
+                    "task_id": invalid_task,
+                    "intent_sha": "e" * 64,
+                    "merge_sha": "f" * 64,
+                    "base_dataset": f"base-{uuid.uuid4().hex}",
+                    "base_revision": f"base-revision-{uuid.uuid4().hex}",
+                    "sidecar_dataset": f"sidecar-{uuid.uuid4().hex}",
+                    "sidecar_revision": f"sidecar-revision-{uuid.uuid4().hex}",
+                    "now": now,
+                })
+        assert rejected.value.orig.diag.constraint_name == "ck_merge_task_producer"
+
+        with admin_engine.begin() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert (
+                MigrationContext.configure(connection).get_current_revision()
+                == metadb.expected_schema_head()
+            )
+    finally:
+        admin_engine.dispose()
 
 
 @pytest.mark.skipif(not os.environ.get("DP_TEST_DATABASE_URL"), reason="requires dedicated Postgres")
