@@ -167,6 +167,28 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
 
 
+def test_lance_revision_schema_reads_only_the_requested_version_metadata(tmp_path, monkeypatch):
+    lance = pytest.importorskip("lance")
+    uri = str(tmp_path / f"revision-schema-{uuid.uuid4().hex}.lance")
+    lance.write_dataset(pa.table({"old_field": [1]}), uri)
+    exact = str(lance.dataset(uri).version)
+    lance.write_dataset(pa.table({"new_field": [2]}), uri, mode="overwrite")
+
+    adapter = LanceAdapter()
+    dataset = adapter._dataset
+    calls: list[dict] = []
+
+    def observed_dataset(observed_uri: str, **kwargs):
+        calls.append(kwargs)
+        return dataset(observed_uri, **kwargs)
+
+    monkeypatch.setattr(adapter, "_dataset", observed_dataset)
+    columns = adapter.revision_schema(uri, exact)
+
+    assert [column.name for column in columns] == ["old_field"]
+    assert calls == [{"version": int(exact)}]
+
+
 def test_lance_as_of_resolution_is_inclusive_bounded_and_advertised(tmp_path):
     _uri, table = _register_lance(tmp_path)
     history = client.get(f"/api/catalog/tables/{table['id']}/revisions").json()["items"]

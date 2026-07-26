@@ -4,7 +4,7 @@ import tracemalloc
 import pyarrow as pa
 
 from hub import db
-from hub.executors.preview import preview_node
+from hub.executors.preview import PREVIEW_SCAN, preview_node
 from hub.models import ColumnSchema, Graph
 from hub.plugins.capabilities import media_kind_from_value, tag_columns
 
@@ -139,3 +139,104 @@ def test_preview_preserves_declared_and_sampled_media_kinds_through_filter() -> 
         assert columns["asset"].media_kind == "unknown"
         assert columns["image"].capabilities == ["media"]
         assert columns["image"].media_kind == "image"
+
+
+def test_exact_preview_uses_only_metadata_schema_and_preserves_media_through_filter() -> None:
+    class ExactMediaAdapter:
+        name = "exact-media"
+
+        def __init__(self) -> None:
+            self.preview_calls: list[tuple[str, int]] = []
+            self.schema_calls: list[str] = []
+
+        def revision_schema(self, _uri: str, revision_id: str) -> list[ColumnSchema]:
+            self.schema_calls.append(revision_id)
+            return [ColumnSchema(
+                name="asset", type="string", provenance="provider",
+                capabilities=["media"], media_kind="image",
+            )]
+
+        def preview_revision(self, _uri: str, revision_id: str, *, limit: int):
+            self.preview_calls.append((revision_id, limit))
+            return db.conn().from_arrow(pa.table({"asset": ["opaque-provider-key"]}))
+
+        @staticmethod
+        def revision_detail(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not request revision detail")
+
+        @staticmethod
+        def open_revision(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not open an exact revision")
+
+        @staticmethod
+        def schema(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not inspect mutable-head schema")
+
+        @staticmethod
+        def revision_history(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not enumerate revision history")
+
+        @staticmethod
+        def count(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not count rows")
+
+    graph = Graph.model_validate({
+        "id": "exact-media", "version": 1,
+        "nodes": [
+            {"id": "source", "type": "source", "position": {"x": 0, "y": 0}, "data": {
+                "config": {"uri": "private://exact-media", "_input_revision_id": "revision-7",
+                           "_input_preview_limit": PREVIEW_SCAN},
+            }},
+            {"id": "filter", "type": "filter", "position": {"x": 100, "y": 0}, "data": {
+                "config": {"predicate": "asset IS NOT NULL"},
+            }},
+        ],
+        "edges": [{"id": "source-filter", "source": "source", "target": "filter",
+                   "data": {"wire": "dataset"}}],
+    })
+    adapter = ExactMediaAdapter()
+
+    for target in ("source", "filter"):
+        result = preview_node(graph, target, 5, lambda _uri: adapter, {}, storage=None)
+        assert not result.error and not result.not_previewable
+        column = result.columns[0]
+        assert column.capabilities == ["media"]
+        assert column.media_kind == "image"
+
+    assert adapter.schema_calls == ["revision-7", "revision-7"]
+    assert adapter.preview_calls == [("revision-7", PREVIEW_SCAN)] * 2
+
+
+def test_exact_preview_without_revision_schema_keeps_sample_media_evidence() -> None:
+    class SampleOnlyExactAdapter:
+        name = "sample-only-exact"
+
+        @staticmethod
+        def preview_revision(_uri: str, _revision_id: str, *, limit: int):
+            assert limit == PREVIEW_SCAN
+            return db.conn().from_arrow(pa.table({"image": [b"\x89PNG\r\n\x1a\n"]}))
+
+        @staticmethod
+        def revision_detail(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not request revision detail")
+
+        @staticmethod
+        def open_revision(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not open an exact revision")
+
+        @staticmethod
+        def schema(*_args, **_kwargs):
+            raise AssertionError("interactive preview must not inspect mutable-head schema")
+
+    graph = Graph.model_validate({
+        "id": "exact-sample-media", "version": 1,
+        "nodes": [{"id": "source", "type": "source", "position": {"x": 0, "y": 0}, "data": {
+            "config": {"uri": "private://exact-sample-media", "_input_revision_id": "revision-3",
+                       "_input_preview_limit": PREVIEW_SCAN},
+        }}], "edges": [],
+    })
+
+    result = preview_node(graph, "source", 5, lambda _uri: SampleOnlyExactAdapter(), {}, storage=None)
+    assert not result.error and not result.not_previewable
+    assert result.columns[0].capabilities == ["media"]
+    assert result.columns[0].media_kind == "image"

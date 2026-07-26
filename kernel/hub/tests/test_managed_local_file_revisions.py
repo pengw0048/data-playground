@@ -168,6 +168,14 @@ def test_local_managed_revision_history_and_exact_open_survive_head_replacement(
     assert selected.fetchall() == [(1,)]
     assert adapter.open_revision(second_uri, second["revision_id"]).fetchall() == [(2,)]
 
+    def no_detail(*_args, **_kwargs):
+        raise AssertionError("must not read revision detail")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(metadb, "managed_local_file_revision_detail", no_detail)
+        schema = adapter.revision_schema(second_uri, first["revision_id"])
+    assert [(column.name, column.type) for column in schema] == [("value", "int")]
+
     monkeypatch.setattr(catalog_routes, "get_deps", lambda: SimpleNamespace(
         catalog=catalog, storage=storage, resolve_adapter=lambda _uri: DuckDBAdapter()))
     table_id = catalog.get_table(second_uri).id

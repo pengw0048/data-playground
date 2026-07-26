@@ -20247,6 +20247,23 @@ def managed_local_file_revision_open(uri: str, revision_id: str) -> str:
         return row.artifact_uri
 
 
+def managed_local_file_revision_schema(uri: str, revision_id: str):
+    """Return the validated schema document owned by one exact retained local revision."""
+    from hub.models import CatalogTable
+
+    with session() as s:
+        entry = s.get(CatalogEntry, str(uri).rstrip("/"))
+        if entry is None or not entry.logical_id:
+            raise KeyError(uri)
+        row = s.get(ManagedLocalFileRevision, str(revision_id))
+        if row is None or row.logical_id != entry.logical_id:
+            raise KeyError(revision_id)
+        artifact = s.get(LocalResultArtifact, row.artifact_uri)
+        if artifact is None or artifact.state != "ready":
+            raise KeyError(revision_id)
+        return CatalogTable.model_validate(json.loads(row.table_doc)).columns
+
+
 def managed_local_file_revision_artifact(dataset_id: str, revision_id: str) -> str | None:
     """Resolve one exact core-owned revision to its managed artifact for read fencing."""
     with session() as s:
