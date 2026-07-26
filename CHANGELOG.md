@@ -8,6 +8,56 @@ uses semver-shaped versions from `kernel/pyproject.toml` / `web/package.json`.
 Every release candidate must retain passing core CI, CodeQL, Gitleaks, and
 [researcher UX acceptance](docs/UX_ACCEPTANCE.md) results for its exact commit before publication.
 
+## Unreleased
+
+Development builds now carry the distinct `0.3.0-dev.0` manifest identity. Installed Python
+artifacts and `/api/version` report its PEP 440-normalized form, `0.3.0.dev0`; this is not a
+published `0.2.3` artifact or a release-support claim.
+
+### Added
+
+- Field metadata, bounded field-lineage evidence, and typed row references make it possible to
+  inspect the provenance of a field without guessing from names or exposing unbounded metadata.
+- **Join with related data** offers a provenance-aware reviewed-join path that preserves the
+  selected source and relationship evidence, and truthfully labels cardinality as `available`
+  or `unmeasured` rather than presenting an exact candidate without a scan as measured.
+- Exact row-identity certification can be requested as durable work and retained with the exact
+  revision, so row-level navigation and byte-backed media remain tied to the data that was proved.
+- Media cells render public image and video values, while byte-backed cells require an exact revision
+  and certified row identity. Unsupported or uncertified values explain the limit rather than falling
+  back to a current revision or proxying a private URL.
+- Plugin authors have a bounded immediate-input seam for checking directly wired, already-proved
+  upstream identities without receiving a graph traversal or mutable display-name shortcut.
+
+### Changed
+
+- Catalog, Canvas, and MCP discovery now expose bounded, truthful context: canonical dataset facts,
+  relationship and lineage windows, field evidence, explicit availability states, and truncation where
+  a result is incomplete.
+- The Workspace and Canvas make recovery states actionable: reopening a saved Canvas fits the
+  viewport to the saved work, conflicts offer recovery actions, invalid cycles are refused before a
+  run, and write/revision status explains what blocked or completed publication.
+- The web app detects hub outages, marks server state as unknown, gates server-backed actions until
+  reconnection, and keeps local Canvas edits available for retry, export, or recovery.
+- Catalog mount credentials accept `env:` and `file:` SecretRefs that are resolved only while the hub
+  constructs the provider. Active installed plugins may declaratively forward one vetted secret to
+  workload children; children receive only that target value and cannot reopen the hub's reference.
+- Managed Write admission compares structural schema changes with the exact current head and requires
+  explicit confirmation before publishing drift.
+- Managed dataset names are validated before submission and rejected with an actionable field error;
+  invalid names are no longer silently sanitized.
+- Managed-sidecar merge work is durable and exact. Researchers choose an exact core-owned base and
+  explicit mappings; plugins can produce a sidecar candidate but cannot claim destination authority.
+
+### Breaking changes
+
+- Catalog-provider integrations must distinguish a canonical dataset identity from each placement.
+  Browse, resolve, and ancestry operate on opaque placement IDs; dataset detail operates on the
+  canonical dataset ID. Display names, paths, URIs, and a single placement ID are not substitutes.
+- The MCP catalog surface replaces `list_datasets` with bounded metadata tools: `search_catalog`,
+  `get_dataset_context`, `get_relationship_graph`, and `get_dataset_lineage`. Agents must respect
+  cursors, availability states, and truncation before treating metadata as complete.
+
 ## [0.2.3] — 2026-07-22
 
 ### Fixed

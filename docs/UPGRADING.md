@@ -1,13 +1,22 @@
 # Upgrade Data Playground in place
 
-This runbook covers a stopped, in-place upgrade from the published `v0.1.0` release to
-`v0.2.0`. It applies to the supported local SQLite workspace and trusted-team PostgreSQL
-metadata profiles. It does not support a live upgrade or a database downgrade.
+This runbook covers a stopped, in-place upgrade from any published `0.2.x` release to
+one exact candidate artifact. It applies to the supported local SQLite workspace and
+trusted-team PostgreSQL metadata profiles. It does not support a live upgrade, a database
+downgrade, or mixing two builds against the same workspace.
 
-The automated release drill performs these same steps with the published v0.1.0 wheel and
-the exact candidate wheel. It certifies SQLite with local files and PostgreSQL metadata with a
-local workspace, and retains a bounded evidence document for both metadata backends. Deployments
-whose `DP_STORAGE_URL` uses object storage must also follow Profile B in
+The release upgrade drill's oldest certified source fixture is the published `v0.1.0`
+wheel. That fixture proves a complete historical upgrade, but it is not a separate fixture
+for every source release. Published `0.2.0`, `0.2.2`, and `0.2.3` use the same linear
+forward migration chain and are supported sources under this policy; `v0.2.1` was not
+published. The published `0.2.x` artifacts are at `0039_folder_replays`.
+
+The drill installs its exact candidate wheel, obtains the candidate's schema head from
+that installed wheel, and compares the migrated database with it. Follow the same rule in
+operations: the candidate is the authority for its target schema. Never transcribe a
+development schema-head constant into this runbook or an upgrade procedure.
+
+Deployments whose `DP_STORAGE_URL` uses object storage must also follow Profile B in
 [Backup and restore](BACKUP_RESTORE.md).
 
 ## 1. Stop and identify the source
@@ -16,7 +25,7 @@ Block new requests and stop every writer except the final hub used to identify t
 While that hub is still running, record its public identity:
 
 ```bash
-BACKUP=/secure/backups/data-playground-v0.1.0-$(date -u +%Y%m%dT%H%M%SZ)
+BACKUP=/secure/backups/data-playground-0.2x-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$BACKUP"
 curl -fsS http://127.0.0.1:8471/api/version | tee "$BACKUP/source-version.json"
 ```
@@ -35,8 +44,9 @@ psql "$DP_DATABASE_URL_LIBPQ" -Atc 'SELECT version_num FROM alembic_version;' \
   | tee "$BACKUP/source-schema.txt"
 ```
 
-For this upgrade, the source identity must be `0.1.0` at
-`0038_inbox_dataset_scoped`. Investigate any different version or schema before proceeding.
+The source `/api/version` must identify a published `0.2.x` artifact, and its schema must be
+the schema shipped by that artifact. For the published `0.2.0`, `0.2.2`, and `0.2.3` artifacts,
+that is `0039_folder_replays`. Investigate a different version or schema before proceeding.
 
 ## 2. Take one complete pre-upgrade backup
 
@@ -67,38 +77,122 @@ Before upgrading, use [Backup and restore](BACKUP_RESTORE.md) Profile B to verif
 version-preserving replica, its object-generation manifest, and the installation namespace marker;
 include all of them in the same consistency backup set.
 
-## 3. Install and migrate the candidate
+## 3. Install, identify, and migrate the exact candidate
 
-Install the exact candidate artifact into a new environment. Keep the old release environment
-available for full-backup rollback, but never run the two releases against the workspace at the
-same time.
+Install the exact candidate artifact into a new environment. Record its wheel checksum and the
+full commit SHA supplied by the candidate build. Keep the old release environment available for
+full-backup rollback, but never run the two releases against the workspace at the same time.
 
 ```bash
-uv venv /opt/data-playground-v0.2.0
-uv pip install --python /opt/data-playground-v0.2.0 /path/to/data_playground-0.2.0-py3-none-any.whl
+set -euo pipefail
 
-# PostgreSQL only: install the release's supported driver into the same environment.
-uv pip install --python /opt/data-playground-v0.2.0 'psycopg[binary]>=3.1.18,<4'
+# Set these to the exact candidate artifact and the full commit SHA recorded by its build.
+CANDIDATE_WHEEL="/absolute/path/to/exact-candidate-wheel.whl"
+CANDIDATE_SHA="replace-with-the-full-candidate-commit-sha"
+CANDIDATE_VENV=/opt/data-playground-candidate
 
-# SQLite
-/opt/data-playground-v0.2.0/bin/dataplay migrate --workspace "$DP_WORKSPACE"
+uv venv "$CANDIDATE_VENV"
+uv pip install --python "$CANDIDATE_VENV" "$CANDIDATE_WHEEL"
 
-# PostgreSQL
-DP_DATABASE_URL="$DP_DATABASE_URL" \
-  /opt/data-playground-v0.2.0/bin/dataplay migrate --workspace "$DP_WORKSPACE"
+# PostgreSQL only: install the candidate's supported driver into the same environment.
+uv pip install --python "$CANDIDATE_VENV" 'psycopg[binary]>=3.1.18,<4'
 ```
 
-`dataplay migrate` is a one-shot operation. It must finish successfully at
-`0039_folder_replays` before any v0.2.0 service starts. Do not start the hub to perform an
-implicit PostgreSQL migration.
+Read the installed candidate's package version and expected schema head before migrating. The
+probe verifies that both the module and migration files come from the candidate environment;
+it must not import a checkout or another environment.
+
+```bash
+set -euo pipefail
+
+CANDIDATE_PROBE_LOG="$BACKUP/candidate-probe.stderr.log"
+: > "$CANDIDATE_PROBE_LOG"
+
+CANDIDATE_VERSION="$(
+  "$CANDIDATE_VENV/bin/python" -I -c '
+import sys
+from importlib.metadata import version
+from pathlib import Path
+from hub import metadb
+
+venv = Path(sys.prefix).resolve()
+assert Path(metadb.__file__).resolve().is_relative_to(venv)
+assert Path(metadb._MIGRATIONS_DIR).resolve().is_relative_to(venv)
+print(version("data-playground"))
+' 2>>"$CANDIDATE_PROBE_LOG"
+)" || {
+  cat "$CANDIDATE_PROBE_LOG" >&2
+  exit 1
+}
+printf '%s\n' "$CANDIDATE_VERSION" | tee "$BACKUP/candidate-version.txt"
+
+CANDIDATE_SCHEMA="$(
+  "$CANDIDATE_VENV/bin/python" -I -c '
+import sys
+from pathlib import Path
+from hub import metadb
+
+venv = Path(sys.prefix).resolve()
+assert Path(metadb.__file__).resolve().is_relative_to(venv)
+assert Path(metadb._MIGRATIONS_DIR).resolve().is_relative_to(venv)
+print(metadb.expected_schema_head())
+' 2>>"$CANDIDATE_PROBE_LOG"
+)" || {
+  cat "$CANDIDATE_PROBE_LOG" >&2
+  exit 1
+}
+printf '%s\n' "$CANDIDATE_SCHEMA" | tee "$BACKUP/candidate-expected-schema.txt"
+```
+
+Probe diagnostics are retained separately in `candidate-probe.stderr.log`, so the two value files
+remain single-value comparison inputs. A failed probe exits before either migration or startup.
+
+The current development manifests use `0.3.0-dev.0`. Python package metadata and `/api/version`
+normalize that identity to `0.3.0.dev0`; use the installed candidate's recorded value, not a
+hand-written version string, for every verification below.
+
+Run the one-shot migration with the candidate. Use the block for the deployment's metadata profile.
+
+For SQLite:
+
+```bash
+set -euo pipefail
+
+DP_GIT_SHA="$CANDIDATE_SHA" \
+  "$CANDIDATE_VENV/bin/dataplay" migrate --workspace "$DP_WORKSPACE" \
+  2>&1 | tee "$BACKUP/candidate-migrate.txt"
+```
+
+For PostgreSQL:
+
+```bash
+set -euo pipefail
+
+DP_GIT_SHA="$CANDIDATE_SHA" DP_DATABASE_URL="$DP_DATABASE_URL" \
+  "$CANDIDATE_VENV/bin/dataplay" migrate --workspace "$DP_WORKSPACE" \
+  2>&1 | tee "$BACKUP/candidate-migrate.txt"
+```
+
+`dataplay migrate` is a one-shot operation. It must finish successfully before any candidate
+service starts. Do not start the hub to perform an implicit PostgreSQL migration.
 
 ## 4. Start and verify
 
-Start v0.2.0 with the same workspace, metadata database, data directory, storage, and config.
-Keep traffic blocked until all checks pass:
+Start the candidate hub with the same workspace, metadata database, data directory, storage, and
+config. Its environment must retain `DP_GIT_SHA="$CANDIDATE_SHA"`; an installed wheel has no checkout
+from which `/api/version` can recover that commit identity. Keep traffic blocked until all checks pass:
 
-1. `GET /api/version` reports `0.2.0`, the expected candidate SHA, database dialect, and storage.
-2. `alembic_version.version_num` is `0039_folder_replays`.
+```bash
+set -euo pipefail
+
+# Retain DP_DATABASE_URL and every other deployment setting used by the old hub.
+DP_GIT_SHA="$CANDIDATE_SHA" \
+  "$CANDIDATE_VENV/bin/dataplay" --workspace "$DP_WORKSPACE"
+```
+
+1. `GET /api/version` reports the version in `candidate-version.txt`, the recorded candidate SHA,
+   database dialect, and storage.
+2. `alembic_version.version_num` equals the sole value in `candidate-expected-schema.txt`.
 3. Catalog tables and a bounded sample of their contents open successfully.
 4. Saved Canvas identities, documents, and version history are retained.
 5. Managed revision identities and history are retained; exact old revisions reopen with the
@@ -111,11 +205,11 @@ verification output with the backup record.
 ## Failure and rollback
 
 There is no supported downgrade. Never run an older `dataplay migrate`, edit Alembic state, or
-start v0.1.0 against metadata already migrated by v0.2.0.
+start the old `0.2.x` build against metadata already migrated by the candidate.
 
-If migration or verification fails, stop every v0.2.0 process. Restore the **entire** pre-upgrade
+If migration or verification fails, stop every candidate process. Restore the **entire** pre-upgrade
 set—SQLite workspace or PostgreSQL dump plus workspace managed bytes/config—and then start the
-old v0.1.0 release against that restored set. A database-only or files-only restore is not a
+old `0.2.x` release against that restored set. A database-only or files-only restore is not a
 rollback because metadata identities and managed revision bytes are one consistency unit.
 For object storage, rollback is certified only when candidate verification remained read-only and
 the original object store and namespace marker are intact. Keep traffic blocked and do not write.
