@@ -509,6 +509,9 @@ def test_provider_typed_reference_is_ranked_before_its_inferred_match(monkeypatc
             return target_row
         return None
     monkeypatch.setattr(related.metadb, "workspace_provider_dataset_for_source_binding", lookup)
+    monkeypatch.setattr(
+        related.metadb, "workspace_provider_dataset_state_for_source_binding", lookup
+    )
     monkeypatch.setattr(related.metadb, "workspace_provider_dataset_page",
                         lambda *, mount_id, query, limit: (fillers if not query else [], not bool(query)))
     page = related_datasets(_Catalog([]), lambda _uri: _UnavailableAdapter(), None,
@@ -558,6 +561,9 @@ def test_provider_typed_reference_never_rebinds_cross_mount_invalid_or_stale(mon
             return None
         return None
     monkeypatch.setattr(related.metadb, "workspace_provider_dataset_for_source_binding", lookup)
+    monkeypatch.setattr(
+        related.metadb, "workspace_provider_dataset_state_for_source_binding", lookup
+    )
     monkeypatch.setattr(related.metadb, "workspace_provider_dataset_page",
                         lambda **_kwargs: ([], False))
     page = related_datasets(_Catalog([]), lambda _uri: _UnavailableAdapter(), None,
