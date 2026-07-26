@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Literal, TypeVar
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from hub import db, metadb
 from hub.models import ExactDatasetRef, MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH
@@ -43,6 +44,10 @@ class RowIdentityError(RuntimeError):
 
 class RowIdentityUnavailable(RowIdentityError):
     """The retained exact artifact or its mandatory lifecycle guard is unavailable."""
+
+
+class RowIdentityRevisionMismatch(RowIdentityError):
+    """The held artifact no longer matches the exact schema/spec admitted for this operation."""
 
 
 class RowIdentityValidationError(RowIdentityError):
@@ -218,15 +223,25 @@ def certify_row_identity_coverage(
         raise RowIdentityUnavailable("exact row identity source is unavailable")
 
     try:
-        with db.base_guard(), source_read_scope(storage, [artifact_uri], owner=owner):
+        with db.base_guard(), source_read_scope(
+                storage, [artifact_uri], owner=owner) as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                raise RowIdentityUnavailable("exact row identity source is unavailable")
+            current_spec = freeze_row_identity_spec_from_parquet_fileno(
+                dataset_ref, key_columns, guards[0].artifact_fileno())
+            if frozen_spec is not None:
+                _validate_frozen_spec(frozen_spec, dataset_ref)
+                if current_spec != frozen_spec:
+                    raise RowIdentityRevisionMismatch(
+                        "exact row identity source no longer matches admission")
+                spec = frozen_spec
+            else:
+                spec = current_spec
             base = DuckDBAdapter().scan(artifact_uri)
             base_schema = _relation_schema(base)
             fields = _key_fields(base_schema, declared)
-            spec = _spec(exact, fields, base_schema)
-            if frozen_spec is not None:
-                _validate_frozen_spec(frozen_spec, dataset_ref)
-                if spec != frozen_spec:
-                    raise RowIdentityValidationError("row identity evidence is invalid")
+            if fields != spec.fields:
+                raise RowIdentityValidationError("row identity schema is invalid")
             _require_candidate_schema(candidate, declared, fields)
 
             base_keys = _key_relation(base, declared)
@@ -264,6 +279,7 @@ def certify_row_identity_coverage(
 def certify_exact_row_identity(
         storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
         owner: str = "row-identity-certification",
+        frozen_spec: RowIdentitySpecV1 | None = None,
 ) -> RowIdentityCoverageV1:
     """Certify exactly one managed-local revision's own logical key once.
 
@@ -278,11 +294,25 @@ def certify_exact_row_identity(
         raise RowIdentityUnavailable("exact row identity source is unavailable")
 
     try:
-        with db.base_guard(), source_read_scope(storage, [artifact_uri], owner=owner):
+        with db.base_guard(), source_read_scope(
+                storage, [artifact_uri], owner=owner) as guards:
+            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                raise RowIdentityUnavailable("exact row identity source is unavailable")
+            current_spec = freeze_row_identity_spec_from_parquet_fileno(
+                dataset_ref, key_columns, guards[0].artifact_fileno())
+            if frozen_spec is not None:
+                _validate_frozen_spec(frozen_spec, dataset_ref)
+                if current_spec != frozen_spec:
+                    raise RowIdentityRevisionMismatch(
+                        "exact row identity source no longer matches admission")
+                spec = frozen_spec
+            else:
+                spec = current_spec
             base = DuckDBAdapter().scan(artifact_uri)
             base_schema = _relation_schema(base)
             fields = _key_fields(base_schema, declared)
-            spec = _spec(exact, fields, base_schema)
+            if fields != spec.fields:
+                raise RowIdentityValidationError("row identity schema is invalid")
             evidence = _scan_evidence(_key_relation(base, declared), fields)
     except ManagedSourceUnavailable as exc:
         raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
@@ -325,6 +355,8 @@ def certify_and_commit_exact_row_identity(
         storage, dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
         commit: Callable[[RowIdentityCoverageV1, int, int], _CommitResult],
         owner: str = "row-identity-certification",
+        expected_schema_sha256: str | None = None,
+        expected_spec_sha256: str | None = None,
 ) -> _CommitResult:
     """Prove one revision and invoke its durable commit while the exact source guard is held.
 
@@ -335,28 +367,26 @@ def certify_and_commit_exact_row_identity(
     artifact_uri = metadb.managed_local_file_revision_artifact(*exact)
     if artifact_uri is None:
         raise RowIdentityUnavailable("exact row identity source is unavailable")
+    if (expected_schema_sha256 is None) != (expected_spec_sha256 is None):
+        raise RowIdentityValidationError("row identity admission is invalid")
     try:
         with source_read_scope(storage, [artifact_uri], owner=f"{owner}:persistence") as guards:
             if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
                 raise RowIdentityUnavailable("exact row identity source is unavailable")
             artifact_info = os.fstat(guards[0].artifact_fileno())
+            frozen_spec = freeze_row_identity_spec_from_parquet_fileno(
+                dataset_ref, key_columns, guards[0].artifact_fileno())
+            if (expected_schema_sha256 is not None
+                    and (frozen_spec.schema_digest != expected_schema_sha256
+                         or frozen_spec.digest != expected_spec_sha256)):
+                raise RowIdentityRevisionMismatch(
+                    "exact row identity source no longer matches admission")
             certificate = certify_exact_row_identity(
-                storage, dataset_ref, key_columns, owner=owner)
+                storage, dataset_ref, key_columns, owner=owner,
+                frozen_spec=frozen_spec)
             return commit(certificate, int(artifact_info.st_dev), int(artifact_info.st_ino))
     except ManagedSourceUnavailable as exc:
         raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
-
-
-def freeze_row_identity_spec(
-        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], base_relation,
-) -> RowIdentitySpecV1:
-    """Freeze V1 key/type/schema facts from the caller's already-guarded exact base relation."""
-    exact = _exact_ref(dataset_ref)
-    declared = _declared_keys(key_columns)
-    spec = _spec(exact, _key_fields(_relation_schema(base_relation), declared),
-                 _relation_schema(base_relation))
-    _validate_frozen_spec(spec, dataset_ref)
-    return spec
 
 
 def freeze_row_identity_spec_from_schema(
@@ -369,6 +399,18 @@ def freeze_row_identity_spec_from_schema(
     # type.  The worker checks ``row_identity_spec_is_supported`` and terminalizes it without a
     # scan; executable proof paths continue to call the strict default below.
     return _spec(exact, _key_fields(schema, declared, require_supported=False), schema)
+
+
+def freeze_row_identity_spec_from_parquet_fileno(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], artifact_fileno: int,
+) -> RowIdentitySpecV1:
+    """Freeze the canonical Parquet footer schema through an already-held artifact handle."""
+    try:
+        with os.fdopen(os.dup(artifact_fileno), "rb") as artifact:
+            schema = pq.ParquetFile(artifact).schema_arrow
+    except (OSError, pa.ArrowException) as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
+    return freeze_row_identity_spec_from_schema(dataset_ref, key_columns, schema)
 
 
 def row_identity_spec_is_supported(spec: RowIdentitySpecV1) -> bool:

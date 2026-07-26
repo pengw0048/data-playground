@@ -26,7 +26,7 @@ from hub.row_identity import (
     RowIdentityError,
     certify_row_identity_coverage,
     decode_row_identity_coverage,
-    freeze_row_identity_spec,
+    freeze_row_identity_spec_from_parquet_fileno,
     serialize_row_identity_coverage,
 )
 from hub.sqlpolicy import FragmentKind, SQLPolicyError, identifier_key, quote_identifier, validate_fragment
@@ -172,7 +172,8 @@ def prepare_sparse_output_admission(
             base_schema = base.limit(0).to_arrow_table().schema
             output_schema = candidate.limit(0).to_arrow_table().schema
             identity_schema, payload_schema = _output_schema(output_schema, identity_columns)
-            frozen_spec = freeze_row_identity_spec(dataset_ref, identity_columns, base)
+            frozen_spec = freeze_row_identity_spec_from_parquet_fileno(
+                dataset_ref, identity_columns, guards[0].artifact_fileno())
             coverage = certify_row_identity_coverage(
                 storage, dataset_ref, identity_columns, candidate,
                 owner=f"sparse-output-coverage:{uuid.uuid4().hex}", frozen_spec=frozen_spec)

@@ -24,9 +24,11 @@ from hub.main import app
 from hub.models import DurableTaskInboxPage, ExactDatasetRef, WorkspaceRunPage
 from hub.routers import row_identity_certifications as api
 from hub.row_identity import (
+    RowIdentityValidationError,
     certify_exact_row_identity,
     serialize_row_identity_coverage,
 )
+from hub.sparse_outputs import SparseOutputAdmissionRequest, admit_sparse_output
 
 
 @pytest.fixture(autouse=True)
@@ -139,6 +141,90 @@ def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
         metadb.list_durable_task_inbox_items("owner", limit=50))
     item = next(item for item in inbox.items if item.task_id == task.task_id)
     assert item.outcome == "completed" and item.dataset_context == job.dataset_context
+
+
+def test_list_column_uses_one_schema_digest_from_preflight_through_worker(dataset):
+    deps, publish = dataset
+    published = publish(pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "vector": pa.array(
+            [[1.0, 2.0], [3.0, 4.0]],
+            type=pa.list_(pa.float32()),
+        ),
+    }))
+    request = _request(published)
+
+    preflight = api.preflight(request, "owner")
+    task, status_code = _submit(request)
+    assert status_code == 201
+    assert task.schema_sha256 == preflight.schema_sha256
+    assert task.spec_sha256 == preflight.spec_sha256
+
+    _run(deps, task.task_id)
+    done = api.status(task.task_id, "owner")
+
+    assert done.status == "done"
+    assert done.receipt is not None
+    assert done.receipt.outcome == "certified"
+    assert done.receipt.certificate is not None
+    assert done.receipt.certificate.dataset_id == published["dataset_id"]
+    assert done.receipt.certificate.revision_id == published["revision_id"]
+
+
+@pytest.mark.parametrize(
+    ("vector_type", "values"),
+    [
+        pytest.param(
+            pa.list_(pa.float32()),
+            [[1.0, 2.0], [3.0, 4.0]],
+            id="regular-list",
+        ),
+        pytest.param(
+            pa.list_(pa.float32(), 2),
+            [[1.0, 2.0], [3.0, 4.0]],
+            id="fixed-size-list",
+        ),
+    ],
+)
+def test_sparse_and_standalone_certification_share_the_footer_spec(
+        dataset, vector_type, values):
+    deps, publish = dataset
+    published = publish(pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "vector": pa.array(values, type=vector_type),
+    }), name="sparse-interop")
+    canvas_id = f"canvas-{uuid.uuid4().hex}"
+    with metadb.session() as session:
+        session.add(metadb.Canvas(
+            id=canvas_id, owner_id="owner", name="Sparse interop", doc="{}"))
+    admit_sparse_output(deps.storage, SparseOutputAdmissionRequest(
+        owner_id="owner",
+        canvas_id=canvas_id,
+        submission_id=str(uuid.uuid4()),
+        dataset_ref=ExactDatasetRef(
+            kind="exact", dataset_id=published["dataset_id"],
+            revision_id=published["revision_id"]),
+        select_config={"expr": "id, vector"},
+        identity_columns=["id"],
+        provenance={
+            "idempotencyKey": f"sparse-{uuid.uuid4().hex}",
+            "provenance": "manual",
+        },
+    ))
+
+    request = _request(published)
+    preflight = api.preflight(request, "owner")
+    task, status_code = _submit(request)
+    assert status_code == 201
+    assert task.schema_sha256 == preflight.schema_sha256
+    assert task.spec_sha256 == preflight.spec_sha256
+
+    _run(deps, task.task_id)
+
+    done = api.status(task.task_id, "owner")
+    assert done.status == "done"
+    assert done.receipt is not None
+    assert done.receipt.outcome == "already_certified_same_spec"
 
 
 def test_confirmation_binds_the_exact_preflight_evidence(dataset, monkeypatch):
@@ -272,6 +358,61 @@ def test_cancel_and_unavailable_revision_never_leave_a_certificate(dataset):
     assert failed.status == "failed"
     assert failed.receipt is not None
     assert failed.receipt.outcome == "stale_or_unavailable_revision"
+
+
+def test_schema_change_after_admission_is_stale_and_retains_no_certificate(dataset):
+    deps, publish = dataset
+    original = publish(pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "vector": pa.array(
+            [[1.0, 2.0], [3.0, 4.0]],
+            type=pa.list_(pa.float32(), 2),
+        ),
+    }), name="schema-change")
+    task, _ = _submit(_request(original))
+    artifact = metadb.managed_local_file_revision_artifact(
+        original["dataset_id"], original["revision_id"])
+    assert artifact is not None
+    replacement = f"{artifact}.replacement"
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2], pa.int64()),
+        "vector": pa.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            type=pa.list_(pa.float32(), 3),
+        ),
+    }), replacement)
+    os.chmod(replacement, 0o600)
+    os.replace(replacement, artifact)
+
+    _run(deps, task.task_id)
+
+    failed = api.status(task.task_id, "owner")
+    assert failed.status == "failed"
+    assert failed.receipt is not None
+    assert failed.receipt.outcome == "stale_or_unavailable_revision"
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        deps.storage, original["dataset_id"], original["revision_id"]) is None
+
+
+def test_internal_validation_failure_is_not_misreported_as_stale(dataset, monkeypatch):
+    deps, publish = dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    task, _ = _submit(_request(published))
+
+    def fail_validation(*_args, **_kwargs):
+        raise RowIdentityValidationError("internal validation failed")
+
+    monkeypatch.setattr(
+        row_identity_tasks, "certify_and_commit_exact_row_identity",
+        fail_validation)
+
+    _run(deps, task.task_id)
+
+    failed = api.status(task.task_id, "owner")
+    assert failed.status == "failed"
+    assert failed.receipt is not None and failed.receipt.outcome == "failed"
+    assert metadb.managed_local_row_identity_certificate_descriptor(
+        deps.storage, published["dataset_id"], published["revision_id"]) is None
 
 
 def test_recovery_claims_one_pending_submission(dataset, monkeypatch):
