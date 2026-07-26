@@ -310,6 +310,8 @@ def test_real_http_retained_revision_review_creates_an_exact_related_source(tmp_
     assert review.status_code == 200, review.text
     exact = review.json()
     assert exact["identity"]["revisionMode"] == "exact"
+    assert exact["cardinalityState"] == "unmeasured"
+    assert "exact revision" in exact["cardinalityReason"]
     assert exact["exactRef"] == {"kind": "exact", "datasetId": right["registrationId"],
                                   "revisionId": "retained-v1", "lastKnown": {"committedAt": "2026-07-24T00:00:00Z"}}
 
@@ -676,6 +678,8 @@ def test_retained_revision_picker_uses_bounded_history_and_rechecks_exact_schema
     assert exact.identity.revision_mode == "exact" and exact.identity.revision_id == "v2"
     assert exact.exact_ref is not None and exact.exact_ref.dataset_id == "logical-users"
     assert exact.cardinality == "unknown"
+    assert exact.cardinality_state == "unmeasured"
+    assert exact.cardinality_reason and "exact revision" in exact.cardinality_reason
 
 
 def test_provider_row_reference_conflict_uses_canonical_provider_identity(monkeypatch):

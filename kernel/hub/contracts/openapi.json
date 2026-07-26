@@ -8603,6 +8603,26 @@
             "title": "Cardinality",
             "type": "string"
           },
+          "cardinalityReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cardinalityreason"
+          },
+          "cardinalityState": {
+            "default": "unmeasured",
+            "enum": [
+              "measured",
+              "unmeasured"
+            ],
+            "title": "Cardinalitystate",
+            "type": "string"
+          },
           "confidence": {
             "default": "inferred",
             "enum": [

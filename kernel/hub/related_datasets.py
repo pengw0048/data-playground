@@ -171,12 +171,19 @@ def review_related_dataset_revision(
         kind="exact", dataset_id=target.revision_dataset_id, revision_id=str(detail["revision_id"]),
         last_known={"committedAt": detail.get("committed_at")},
     )
+    declared_cardinality = (base.cardinality if base.evidence == "declared_relationship"
+                            and base.cardinality != "unknown" else "unknown")
     return base.model_copy(update={
         "identity": selected_identity,
         "exact_ref": exact_ref,
-        "cardinality": "unknown",
-        "confidence": "inferred",
-        "warning": None,
+        "cardinality": declared_cardinality,
+        "cardinality_state": "measured" if declared_cardinality != "unknown" else "unmeasured",
+        "cardinality_reason": None if declared_cardinality != "unknown" else (
+            "Fan-out was not measured because this join uses an exact revision; "
+            "measuring it would require scanning the pinned dataset."
+        ),
+        "confidence": "declared" if declared_cardinality != "unknown" else "inferred",
+        "warning": _fanout(declared_cardinality),
     })
 
 
@@ -527,11 +534,18 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                            owner=f"related-datasets:{source.dataset_id}"):
         for seed in visible:
             cardinality = seed.declared_cardinality
+            cardinality_state = "measured" if cardinality != "unknown" else "unmeasured"
+            cardinality_reason = None
             # A current-head measurement must never be presented as evidence for an exact review.
-            # Adapters do not share a portable exact-cardinality capability yet, so exact means
-            # unknown here rather than a misleading current-head fact.
-            if source.identity.revision_mode == "exact" or seed.exact_ref is not None:
+            # Keep an owner-declared cardinality, but do not scan an exact revision merely to fill
+            # a missing value. The explicit state makes that intentional omission visible.
+            if (source.identity.revision_mode == "exact" or seed.exact_ref is not None) and cardinality == "unknown":
                 cardinality = "unknown"
+                cardinality_state = "unmeasured"
+                cardinality_reason = (
+                    "Fan-out was not measured because this join uses an exact revision; "
+                    "measuring it would require scanning the pinned dataset."
+                )
             elif cardinality == "unknown":
                 try:
                     left = relationships.measure_unique(source.uri, seed.left_columns, resolve_adapter)[0]
@@ -539,11 +553,13 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                     cardinality = relationships.cardinality(left, right)
                 except Exception:
                     cardinality = "unknown"
+                cardinality_state = "measured" if cardinality != "unknown" else "unmeasured"
             candidates.append(RelatedDatasetCandidate(
                 identity=seed.identity, name=seed.table.name,
                 folder=seed.table.folder, reason=seed.reason, evidence=seed.evidence,
                 evidence_status=seed.evidence_status, left_columns=seed.left_columns,
                 right_columns=seed.right_columns, cardinality=cardinality,
+                cardinality_state=cardinality_state, cardinality_reason=cardinality_reason,
                 confidence=("declared" if seed.evidence == "declared_relationship"
                             else "verified" if cardinality != "unknown" else "inferred"),
                 exact_ref=seed.exact_ref, warning=_fanout(cardinality)))

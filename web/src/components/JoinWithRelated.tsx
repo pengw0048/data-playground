@@ -415,8 +415,8 @@ export function JoinWithRelated({ nodeId }: { nodeId: string }) {
                   </select>
                 </div>
               </div>
-              {candidate.warning && <div className="mt-3 rounded border border-amber-300/60 bg-amber-50 p-2 text-[11px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-                ⚠ {candidate.warning}
+              {(candidate.warning || candidate.cardinalityReason) && <div className="mt-3 rounded border border-amber-300/60 bg-amber-50 p-2 text-[11px] text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+                ⚠ {candidate.warning ?? candidate.cardinalityReason}
               </div>}
               {error && <div role="alert" className="mt-3 rounded border border-destructive/30 p-2 text-[11px] text-destructive">
                 {error}
