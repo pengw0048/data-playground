@@ -35,6 +35,7 @@ const TASK_KIND_LABELS: Record<InboxTaskKind, string> = {
   merge_columns_write: 'Merge columns write',
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
+  row_identity_certification: 'Row identity certification',
 }
 
 export function kindLabel(kind: InboxItemDto['taskKind'] | string): string {
@@ -258,9 +259,9 @@ export function InboxView({ onUnreadChange }: { onUnreadChange?: () => void }) {
                         size="sm"
                         asChild
                       >
-                        <a href={routeHash('workspace', undefined, `dataset:${item.datasetContext.datasetId}`)}
+                        <a href={item.datasetContext.deepLink ?? routeHash('workspace', undefined, `dataset:${item.datasetContext.datasetId}`)}
                            onClick={() => void markRead(item)}>
-                          Revision history
+                          {item.datasetContext.taskKind === 'row_identity_certification' ? 'Open certification' : 'Revision history'}
                         </a>
                       </Button>
                     )}

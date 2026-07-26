@@ -1050,6 +1050,11 @@ function WorkspaceDatasets() {
           if (hasExactRevision) {
             params.set('revision', initialRevisionId)
             params.set('revisionDataset', initialRevisionDatasetId)
+            const current = new URLSearchParams(encodedQuery)
+            for (const key of ['rowIdentityAction', 'rowIdentityTask']) {
+              const value = current.get(key)
+              if (value) params.set(key, value)
+            }
           }
           setEncodedQuery(params.toString())
         }}

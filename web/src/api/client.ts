@@ -10,6 +10,7 @@ import type {
   MergeColumnsPreflight, MergeColumnsRequest, MergeColumnsTask, MergeColumnsTaskProjection,
   ManagedSidecarMergePreflight, ManagedSidecarMergeRequest, ManagedSidecarMergeTask,
   RestoreRevisionTask, UpsertPreflight, UpsertRequest, UpsertTask,
+  RowIdentityCertificationPreflight, RowIdentityCertificationTask,
 } from '../types/api'
 import type { CanvasDoc, CanvasParameterBinding, ColumnSchema } from '../types/graph'
 
@@ -365,6 +366,18 @@ export const api = {
   },
   datasetRevision: (datasetId: string, revisionId: string) =>
     req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
+  rowIdentityCertificationPreflight: (body: { datasetId: string; revisionId: string; keyColumns: string[] }) =>
+    req<RowIdentityCertificationPreflight>('/catalog/row-identity-certifications/preflight', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  submitRowIdentityCertification: (body: { datasetId: string; revisionId: string; keyColumns: string[]; submissionId: string; confirmationSha256?: string }) =>
+    req<RowIdentityCertificationTask>('/catalog/row-identity-certifications', {
+      method: 'POST', body: JSON.stringify(body),
+    }),
+  rowIdentityCertificationTask: (taskId: string) =>
+    req<RowIdentityCertificationTask>(`/row-identity-certifications/${encodeURIComponent(taskId)}`),
+  cancelRowIdentityCertificationTask: (taskId: string) =>
+    req<RowIdentityCertificationTask>(`/row-identity-certifications/${encodeURIComponent(taskId)}/cancel`, { method: 'POST' }),
   restoreRevision: (datasetId: string, revisionId: string, body: { submissionId: string; expectedHeadRevisionId: string }) =>
     req<RestoreRevisionTask>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/restore`, {
       method: 'POST', body: JSON.stringify(body),
@@ -788,8 +801,8 @@ export interface BoundedFanoutJobDto {
 }
 export type MergeColumnsJobDto = MergeColumnsTaskProjection
 export interface DistributionReportJobDto { reportId: string; datasetViewId: string; computationVersion: string; measuredRows?: number | null; complete?: boolean | null; reportedColumnCount?: number | null; deepLink: string }
-export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write'
-export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; name?: string | null }
+export type DatasetTaskKind = 'restore_revision_write' | 'keyed_upsert_write' | 'merge_columns_write' | 'row_identity_certification'
+export interface DatasetTaskContextDto { taskKind: DatasetTaskKind; datasetId: string; revisionId?: string | null; name?: string | null; deepLink?: string | null }
 export type WorkspaceJobDto = Omit<RunRecordDto, 'jobType'> & { jobType: 'run' | 'profile' | 'distribution_report'; canvasId: string | null; canvasName: string | null; nodeLabel?: string | null; backend: string; placement: 'local' | 'distributed'; attempt: string; progress?: number | null; updatedAt?: string | null; taskId?: string | null; taskAttempts?: DurableTaskAttemptDto[]; cancelRequested?: boolean; canRetry?: boolean; canCancel?: boolean; writeIntent?: WriteIntent | null; outputReceipt?: WriteReceipt | null; externalWait?: ExternalWaitJobDto | null; checkpoint?: CheckpointJobDto | null; boundedFanout?: BoundedFanoutJobDto | null; mergeColumns?: MergeColumnsJobDto | null; distributionReport?: DistributionReportJobDto | null; datasetContext?: DatasetTaskContextDto | null }
 export interface WorkspaceJobsPage { items: WorkspaceJobDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface WorkspaceJobsQuery { limit?: number; cursor?: string; status?: 'queued' | 'running' | 'done' | 'failed' | 'cancelled'; canvasId?: string; nodeId?: string; runId?: string; backend?: string; after?: string; before?: string; q?: string }
@@ -815,6 +828,7 @@ export type InboxTaskKind =
   | 'merge_columns_write'
   | 'restore_revision_write'
   | 'keyed_upsert_write'
+  | 'row_identity_certification'
 export interface InboxPage { items: InboxItemDto[]; nextCursor?: string | null; hasMore: boolean }
 export interface InboxUnreadCount { count: number }
 export interface InboxListQuery { limit?: number; cursor?: string; filter?: 'unread' | 'all' }

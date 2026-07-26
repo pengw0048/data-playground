@@ -5,10 +5,12 @@ import type { CatalogTable, DatasetRevisionDetail, DatasetViewDefinition } from 
 const mocks = vi.hoisted(() => ({
   datasetRevisions: vi.fn(), datasetRevision: vi.fn(), datasetRevisionCapabilities: vi.fn(),
   createDatasetView: vi.fn(), restoreRevision: vi.fn(), restoreRevisionTask: vi.fn(),
+  rowIdentityCertificationTask: vi.fn(),
 }))
 const store = vi.hoisted(() => ({
   pushToast: vi.fn(), setWorkspaceResource: vi.fn(), switchWorkspaceScope: vi.fn(),
   workspaceScope: 'datasets' as 'all' | 'datasets', workspaceResourceId: 'dataset:table-1' as string | null,
+  workspaceDatasetQuery: '', setWorkspaceDatasetQuery: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   api: mocks,
@@ -73,6 +75,10 @@ describe('DatasetRevisionHistory', () => {
     })
     store.workspaceScope = 'datasets'
     store.workspaceResourceId = 'dataset:table-1'
+    store.workspaceDatasetQuery = ''
+    store.setWorkspaceDatasetQuery.mockImplementation((query: string) => {
+      store.workspaceDatasetQuery = query
+    })
     store.switchWorkspaceScope.mockImplementation((scope: 'all' | 'datasets') => {
       store.workspaceScope = scope
       store.workspaceResourceId = null
@@ -103,6 +109,51 @@ describe('DatasetRevisionHistory', () => {
     render(<DatasetRevisionHistory table={TABLE} initialRevisionId="rev-historical" />)
     await screen.findByText('rev-current')
     expect(mocks.datasetRevision).not.toHaveBeenCalled()
+  })
+
+  it('moves exact route state with a clicked revision and drops an incompatible certification task', async () => {
+    store.workspaceDatasetQuery =
+      'folder=robotics&revision=rev-a&revisionDataset=dataset-stable&rowIdentityAction=certify&rowIdentityTask=task-a'
+    mocks.datasetRevisions.mockResolvedValue({
+      items: [revision('rev-a'), revision('rev-b')],
+      nextCursor: null,
+      hasMore: false,
+    })
+    mocks.datasetRevision.mockImplementation((_datasetId: string, revisionId: string) =>
+      Promise.resolve(detail(revisionId)))
+    mocks.rowIdentityCertificationTask.mockRejectedValue(new Error('old task detached'))
+    const view = render(
+      <DatasetRevisionHistory
+        table={TABLE}
+        initialRevisionId="rev-a"
+        initialRevisionDatasetId="dataset-stable"
+      />,
+    )
+
+    await screen.findByText('Exact revision rev-a')
+    fireEvent.click(screen.getByRole('button', { name: 'Open revision rev-b' }))
+    view.rerender(
+      <DatasetRevisionHistory
+        table={TABLE}
+        initialRevisionId="rev-b"
+        initialRevisionDatasetId="dataset-stable"
+      />,
+    )
+    await screen.findByText('Exact revision rev-b')
+    const next = new URLSearchParams(
+      store.setWorkspaceDatasetQuery.mock.calls.at(-1)?.[0],
+    )
+    expect(next.get('folder')).toBe('robotics')
+    expect(next.get('revision')).toBe('rev-b')
+    expect(next.get('revisionDataset')).toBe('dataset-stable')
+    expect(next.has('rowIdentityAction')).toBe(false)
+    expect(next.has('rowIdentityTask')).toBe(false)
+    expect(
+      mocks.datasetRevision.mock.calls.filter(
+        ([datasetId, revisionId]) =>
+          datasetId === 'dataset-stable' && revisionId === 'rev-b',
+      ),
+    ).toHaveLength(1)
   })
 
   it('distinguishes empty, unavailable, and provider-error history states', async () => {

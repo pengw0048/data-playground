@@ -9,7 +9,12 @@ const DETAIL = (revisionId: string, rows: number) => ({
   summary: { rowCount: rows, dataFileCount: 1, totalBytes: rows * 8, fragmentCount: 1 },
   preview: {
     columns: [{ fieldId: 'amount', name: 'amount', type: 'bigint', nullable: false, provenance: 'core', capabilities: [] }],
-    rows: Array.from({ length: rows }, (_value, index) => ({ amount: index })), hasMore: false, rowLimit: 100,
+    rows: Array.from({ length: rows }, (_value, index) => ({ amount: index })),
+    rowIdentities: null, hasMore: false, rowLimit: 100,
+  },
+  rowIdentity: {
+    datasetId: 'stable-dataset', revisionId, proofStatus: 'unavailable',
+    certificationSupported: false, fields: [], encodingVersion: null,
   },
 })
 

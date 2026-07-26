@@ -137,6 +137,8 @@ def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
     assert job.dataset_context.revision_id == published["revision_id"]
     assert job.dataset_context.deep_link is not None
     assert f"revision={published['revision_id']}" in job.dataset_context.deep_link
+    assert "rowIdentityAction=certify" in job.dataset_context.deep_link
+    assert f"rowIdentityTask={task.task_id}" in job.dataset_context.deep_link
     inbox = DurableTaskInboxPage.model_validate(
         metadb.list_durable_task_inbox_items("owner", limit=50))
     item = next(item for item in inbox.items if item.task_id == task.task_id)

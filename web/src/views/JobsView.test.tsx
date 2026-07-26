@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   workspaceJobs: vi.fn(), executionManifest: vi.fn(), cancelRun: vi.fn(), retryRun: vi.fn(), listCanvases: vi.fn(),
   cancelMergeColumnsTask: vi.fn(), retryMergeColumnsTask: vi.fn(),
   cancelManagedSidecarMergeTask: vi.fn(), retryManagedSidecarMergeTask: vi.fn(), datasetRevision: vi.fn(),
+  cancelRowIdentityCertificationTask: vi.fn(),
 }))
 vi.mock('../api/client', () => ({ api: mocks }))
 vi.mock('../panels/DataPanel', () => ({ FullResult: () => <div data-testid="full-result">artifact</div> }))
@@ -34,6 +35,7 @@ describe('JobsView', () => {
     mocks.retryMergeColumnsTask.mockResolvedValue(undefined)
     mocks.cancelManagedSidecarMergeTask.mockResolvedValue(undefined)
     mocks.retryManagedSidecarMergeTask.mockResolvedValue(undefined)
+    mocks.cancelRowIdentityCertificationTask.mockResolvedValue(undefined)
     mocks.datasetRevision.mockResolvedValue({})
     mocks.listCanvases.mockResolvedValue([])
     useStore.setState({ view: 'jobs', jobsQuery: '', files: [], toasts: [] } as never)
@@ -519,5 +521,18 @@ describe('JobsView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Open run restore-1 in Dataset restore · Climate observations', expanded: false }))
     const link = screen.getByRole('link', { name: 'Open revision history' })
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-9')
+  })
+
+  it('reopens and cancels a certification task through its exact server deep-link', async () => {
+    mocks.workspaceJobs.mockResolvedValue({ items: [job({
+      id: 't:ric-1', runId: 'ric-1', taskId: 'ric-1', status: 'running', canvasId: null, canvasName: null,
+      nodeLabel: 'Camera frames', datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Camera frames', deepLink: '#/workspace/dataset%3Ads-1?scope=datasets&revision=rev-1&revisionDataset=ds-1&rowIdentityAction=certify&rowIdentityTask=ric-1' },
+      canCancel: true,
+    })], hasMore: false, nextCursor: null })
+    render(<JobsView />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open run ric-1 in Row identity certification · Camera frames', expanded: false }))
+    expect(screen.getByRole('link', { name: 'Open certification' })).toHaveAttribute('href', expect.stringContaining('rowIdentityTask=ric-1'))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel task' }))
+    await waitFor(() => expect(mocks.cancelRowIdentityCertificationTask).toHaveBeenCalledWith('ric-1'))
   })
 })
