@@ -167,13 +167,12 @@ raw URI, canvas ID, user input, error message, or `run_` / `req_` / `att_` ident
 
 `AuditEvent.attrs` is small, redacted metadata, not a general payload field. The following actions are
 currently emitted by their corresponding application paths: `auth.login`, `auth.logout`,
-`auth.password_change`, `admin.settings_change`, `sharing.change`, `dataset.access`,
-`dataset.mutation`, `job.submit`, `job.cancel`, and `workspace.relink`. Their outcomes are `success`,
-`failure`, or `denied` as appropriate to that path.
+`auth.password_change`, `admin.settings_change`, `sharing.change`, `job.submit`, `job.cancel`, and
+`workspace.relink`. Their outcomes are `success`, `failure`, or `denied` as appropriate to that path.
 
-`agent.egress`, `secret_ref.change`, and `policy.denial` are schema members only; current core does not
-emit them. Do not build an alert or compliance claim around those actions until the owning product path
-exists.
+`dataset.access`, `dataset.mutation`, `agent.egress`, `secret_ref.change`, and `policy.denial` are
+schema members only; current core does not emit them. Do not build an alert or compliance claim around
+those actions until the owning product path exists.
 
 ### Deliberate non-goals
 
