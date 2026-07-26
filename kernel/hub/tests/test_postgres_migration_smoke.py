@@ -57,7 +57,7 @@ def test_postgres_0040_accepts_managed_sidecar_subject_and_rejects_unknown_produ
     invalid_task = f"invalid-sidecar-{uuid.uuid4().hex}"
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
-        with admin_engine.connect() as connection:
+        with admin_engine.begin() as connection:
             command.upgrade(metadb._alembic_cfg(connection), "0039_folder_replays")
             assert MigrationContext.configure(connection).get_current_revision() == "0039_folder_replays"
             command.upgrade(metadb._alembic_cfg(connection), "0040_managed_sidecar")
@@ -137,7 +137,7 @@ def test_postgres_0040_accepts_managed_sidecar_subject_and_rejects_unknown_produ
                 })
         assert rejected.value.orig.diag.constraint_name == "ck_merge_task_producer"
 
-        with admin_engine.connect() as connection:
+        with admin_engine.begin() as connection:
             command.upgrade(metadb._alembic_cfg(connection), "head")
             assert (
                 MigrationContext.configure(connection).get_current_revision()
