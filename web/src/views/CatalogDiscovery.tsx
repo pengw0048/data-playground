@@ -20,6 +20,7 @@ import type {
 
 const PAGE = 50
 export const CATALOG_BATCH_LIMIT = 50
+export const UPLOAD_FILE_ACCEPT = '.parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc'
 const ROW_H = 58
 type Sort = NonNullable<CatalogQueryParams['sort']>
 const errorMessage = (e: unknown) => e instanceof Error ? e.message : String(e)
@@ -124,7 +125,6 @@ export function CatalogDiscovery({
   const [selected, setSelected] = useState<CatalogTable | null>(null)
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const [selectionRevision, setSelectionRevision] = useState(0)
-  const [dialog, setDialog] = useState(false)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [unregisterResult, setUnregisterResult] = useState<{
@@ -352,15 +352,15 @@ export function CatalogDiscovery({
         <h1 className="text-[20px] font-bold text-foreground">{title}</h1>
         <span className="text-[12px] text-muted-foreground">{total.toLocaleString()} {total === 1 ? 'dataset' : 'datasets'}</span>
         <span className="flex-1" />
-        <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset by path / uri"
+        <button onClick={() => setRegisterOpen(true)} data-testid="register-dataset" title="Register a dataset the kernel can access by path or URI"
           className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background">
-          <Icon name="plus" size={13} /> Register
+          <Icon name="plus" size={13} /> Register path or URI
         </button>
         <button onClick={() => fileRef.current?.click()} title="Upload a dataset file"
           className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3.5 py-1.5 text-[12.5px] font-semibold text-foreground">
           <Icon name="export" size={13} /> Upload
         </button>
-        <input ref={fileRef} type="file" accept=".parquet,.pq,.csv,.tsv,.json,.ndjson,.arrow,.feather,.ipc" className="hidden"
+        <input ref={fileRef} type="file" accept={UPLOAD_FILE_ACCEPT} className="hidden"
           onChange={(e) => { void onUpload(e.target.files?.[0]); e.target.value = '' }} />
       </div>
 
@@ -535,13 +535,6 @@ export function CatalogDiscovery({
           onDeleted={() => { selectTable(null); setCatalogRevision((v) => v + 1); void loadFirst() }} onOpenTable={selectTable}
           onColumn={(c) => { setHasColumns((cur) => cur.includes(c) ? cur : [...cur, c]); selectTable(null) }} />
       )}
-      {dialog && <FileDialog mode="open" title="Open a dataset" onClose={() => setDialog(false)}
-        onPick={async (r) => {
-          await api.registerFile(r.uri)
-          setCatalogRevision((v) => v + 1)
-          await loadFirst()
-          setDialog(false)
-        }} />}
       {registerOpen && <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={onRegistered} />}
 
       {/* Facets stay bounded with the active query. Empty folders remain discoverable through
@@ -1364,6 +1357,76 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
+export function AddDataModal({
+  onClose, onUploadDataset, onCompleted,
+}: {
+  onClose: () => void
+  onUploadDataset: (file: File) => Promise<CatalogTable | null>
+  onCompleted: () => void
+}) {
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [registerOpen, setRegisterOpen] = useState(false)
+  const [uploading, setUploading] = useState(false)
+
+  const upload = async (file?: File) => {
+    if (!file || uploading) return
+    setUploading(true)
+    try {
+      if (await onUploadDataset(file)) {
+        onCompleted()
+        onClose()
+      }
+    } finally { setUploading(false) }
+  }
+
+  if (registerOpen) {
+    return <RegisterModal onClose={() => setRegisterOpen(false)} onRegistered={() => {
+      onCompleted()
+      onClose()
+    }} />
+  }
+
+  return <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
+    <div role="dialog" aria-modal="true" aria-label="Add data" data-testid="add-data-modal"
+      className="flex w-[660px] max-w-full flex-col gap-4 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(event) => event.stopPropagation()}>
+      <div className="flex items-center gap-2">
+        <div className="flex-1">
+          <h2 className="text-[15px] font-bold text-foreground">Add data</h2>
+          <p className="mt-0.5 text-[12px] text-muted-foreground">Choose the option that matches where the data is available.</p>
+        </div>
+        <button onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="upload-local-file-title">
+          <h3 id="upload-local-file-title" className="text-[13px] font-semibold text-foreground">Upload a local file</h3>
+          <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground">
+            Choose a file from this browser. Its bytes are uploaded to Data Playground; the kernel does not need access to your computer first.
+          </p>
+          <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+            Supports Parquet, CSV, TSV, JSON/NDJSON, Arrow, Feather, and IPC files. Uploads are single files; Lance datasets are directories and are not supported here.
+          </p>
+          <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading}
+            className="mt-3 rounded-md bg-foreground px-3 py-1.5 text-[12px] font-semibold text-background disabled:opacity-50">
+            {uploading ? 'Uploading…' : 'Choose local file'}
+          </button>
+          <input ref={fileRef} type="file" accept={UPLOAD_FILE_ACCEPT} className="hidden"
+            onChange={(event) => { void upload(event.target.files?.[0]); event.target.value = '' }} />
+        </section>
+        <section className="rounded-lg border border-border bg-background p-4" aria-labelledby="register-accessible-title">
+          <h3 id="register-accessible-title" className="text-[13px] font-semibold text-foreground">Register an accessible path or URI</h3>
+          <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground">
+            Use a mounted path or object-store URI the kernel/server can already read. This does not browse files on your computer.
+          </p>
+          <button type="button" onClick={() => setRegisterOpen(true)}
+            className="mt-3 rounded-md border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground hover:bg-accent">
+            Register path or URI
+          </button>
+        </section>
+      </div>
+    </div>
+  </div>
+}
+
 // Register modal — the URI is required; name/folder/tags/owner/description are all optional curation
 // the backend register already accepts. Folder autocompletes from the shared #dp-folder-options list.
 function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegistered: (t: CatalogTable) => void }) {
@@ -1375,6 +1438,8 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
   const [owner, setOwner] = useState('')
   const [description, setDescription] = useState('')
   const [busy, setBusy] = useState(false)
+  const [formError, setFormError] = useState<string | null>(null)
+  const [browseOpen, setBrowseOpen] = useState(false)
   const closeRef = useRef<HTMLButtonElement>(null)
   useEffect(() => { closeRef.current?.focus() }, [])
   useEffect(() => {
@@ -1384,8 +1449,12 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
   }, [onClose])
   const stem = uri.trim().replace(/\/+$/, '').split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') ?? ''
   const submit = async () => {
-    const u = uri.trim(); if (!u || busy) return
+    const u = uri.trim()
+    if (busy) return
+    if (!u) { setFormError('Enter a path or URI the kernel can access.'); return }
+    if (u.includes('\u0000')) { setFormError('The path or URI cannot contain a null character.'); return }
     setBusy(true)
+    setFormError(null)
     try {
       const t = await api.registerDataset({
         uri: u,
@@ -1396,21 +1465,35 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
         description: description.trim() || undefined,
       })
       onRegistered(t)
-    } catch (e) { pushToast(errorMessage(e), 'error') }
+    } catch (e) {
+      const detail = errorMessage(e)
+      setFormError(`The kernel could not register “${u}”. Confirm it exists and is readable from the kernel host, then try again. ${detail}`)
+      pushToast(`Registration failed: ${detail}`, 'error')
+    }
     finally { setBusy(false) }
   }
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/30 p-4" onClick={(event) => {
+      if (event.target === event.currentTarget) onClose()
+    }}>
       <div role="dialog" aria-modal="true" aria-label="Register a dataset" data-testid="register-modal"
         className="flex w-[460px] max-w-full flex-col gap-3 rounded-xl border border-border bg-card p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2">
-          <h2 className="flex-1 text-[15px] font-bold text-foreground">Register a dataset</h2>
+          <h2 className="flex-1 text-[15px] font-bold text-foreground">Register an accessible path or URI</h2>
           <button ref={closeRef} onClick={onClose} aria-label="Close" className="text-muted-foreground hover:text-foreground"><Icon name="close" size={15} /></button>
         </div>
+        <p className="text-[11.5px] leading-relaxed text-muted-foreground">
+          The kernel reads this location, not your browser. Absolute paths start on the kernel host; relative paths resolve from the kernel working directory. URI schemes such as <code>s3://</code> use the kernel’s configured storage access.
+        </p>
+        {formError && <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11.5px] text-destructive">{formError}</div>}
         <Field label="Path / URI">
-          <input autoFocus value={uri} onChange={(e) => setUri(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void submit() }}
-            placeholder="/data/events.parquet or s3://bucket/key" className="dp-input" data-testid="register-uri" />
+          <div className="flex gap-2">
+            <input autoFocus value={uri} onChange={(e) => { setUri(e.target.value); setFormError(null) }}
+              onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) void submit() }}
+              placeholder="/data/events.parquet or s3://bucket/key" className="dp-input min-w-0 flex-1" data-testid="register-uri" />
+            <button type="button" onClick={() => setBrowseOpen(true)}
+              className="shrink-0 rounded-md border border-border bg-card px-2.5 text-[11.5px] font-semibold text-foreground hover:bg-accent">Browse kernel storage</button>
+          </div>
         </Field>
         <Field label="Name (optional)"><input value={name} onChange={(e) => setName(e.target.value)} placeholder={stem || 'defaults to the file name'} className="dp-input" /></Field>
         <Field label="Folder (optional)"><input value={folder} onChange={(e) => setFolder(e.target.value)} list="dp-folder-options" placeholder="prod/images" className="dp-input" /></Field>
@@ -1423,6 +1506,8 @@ function RegisterModal({ onClose, onRegistered }: { onClose: () => void; onRegis
             className="rounded-md bg-foreground px-3.5 py-1.5 text-[12.5px] font-semibold text-background disabled:opacity-50">{busy ? 'Registering…' : 'Register'}</button>
         </div>
       </div>
+      {browseOpen && <FileDialog mode="open" title="Browse kernel-visible storage" onClose={() => setBrowseOpen(false)}
+        onPick={({ uri: pickedUri }) => { setUri(pickedUri); setFormError(null); setBrowseOpen(false) }} />}
     </div>
   )
 }

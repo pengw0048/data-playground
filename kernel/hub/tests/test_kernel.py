@@ -1006,6 +1006,14 @@ def test_register_endpoint():
     assert t["name"] == "movies_again" and t["rowCount"] == 200
 
 
+def test_register_unreachable_path_explains_what_the_kernel_could_not_read():
+    missing = f"/tmp/data-playground-missing-{uuid.uuid4().hex}.parquet"
+    response = client.post("/api/catalog/register", json={"uri": missing})
+
+    assert response.status_code == 400
+    assert f"cannot read '{missing}'" in response.json()["detail"]
+
+
 def _upload(filename: str, body: bytes):
     # raw-body upload: the file bytes ARE the body; the name rides in the X-Upload-Filename header
     return client.post("/api/catalog/upload", content=body, headers={"X-Upload-Filename": filename})

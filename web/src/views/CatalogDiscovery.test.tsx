@@ -35,7 +35,7 @@ vi.mock('../ui/VirtualList', () => ({
   </div>,
 }))
 
-import { CatalogDiscovery } from './CatalogDiscovery'
+import { AddDataModal, CatalogDiscovery } from './CatalogDiscovery'
 
 const TABLE: CatalogTable = {
   id: 't1', registrationId: 'registration-orders', name: 'orders', uri: 'mem://orders', rowCount: 2, version: 'v1', folder: 'sales',
@@ -101,6 +101,35 @@ describe('Catalog discovery request and mutation truth', () => {
     await screen.findByRole('dialog', { name: 'orders' })
     expect(mocks.tableByRegistration).toHaveBeenCalledWith('registration-path')
     expect(mocks.table).not.toHaveBeenCalled()
+  })
+
+  it('labels browser upload and kernel-visible registration as distinct add-data actions', async () => {
+    const onUploadDataset = vi.fn().mockResolvedValue(TABLE)
+    const onCompleted = vi.fn()
+    const { container } = render(<AddDataModal onClose={vi.fn()} onUploadDataset={onUploadDataset} onCompleted={onCompleted} />)
+
+    expect(screen.getByText(/bytes are uploaded to Data Playground/i)).toBeVisible()
+    expect(screen.getByText(/Lance datasets are directories and are not supported here/i)).toBeVisible()
+    expect(screen.getByText(/kernel.server can already read/i)).toBeVisible()
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File(['id\n1\n'], 'local.csv', { type: 'text/csv' })] },
+    })
+    await waitFor(() => expect(onUploadDataset).toHaveBeenCalledWith(expect.objectContaining({ name: 'local.csv' })))
+    expect(onCompleted).toHaveBeenCalled()
+  })
+
+  it('states the kernel path convention and keeps an unreachable registration actionable', async () => {
+    mocks.registerDataset.mockRejectedValue(new Error('HTTP 400: cannot read /mounted/missing.parquet'))
+    render(<AddDataModal onClose={vi.fn()} onUploadDataset={vi.fn()} onCompleted={vi.fn()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Register path or URI' }))
+    expect(screen.getByText(/Absolute paths start on the kernel host/i)).toBeVisible()
+    expect(screen.getByText(/relative paths resolve from the kernel working directory/i)).toBeVisible()
+    fireEvent.change(screen.getByTestId('register-uri'), { target: { value: '/mounted/missing.parquet' } })
+    fireEvent.click(screen.getByTestId('register-submit'))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Confirm it exists and is readable from the kernel host')
+    expect(mocks.registerDataset).toHaveBeenCalledWith(expect.objectContaining({ uri: '/mounted/missing.parquet' }))
   })
 
   it('uses the exact receipt identity rather than a mismatched path registration and canonicalizes the path', async () => {
