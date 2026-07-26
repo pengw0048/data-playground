@@ -5812,6 +5812,70 @@ def _workspace_provider_safe_error(state: str) -> str:
     }[state]
 
 
+def _workspace_provider_item_error(availability: str, reason: str) -> str:
+    """Encode the item kind in the one bounded reason field; Workspace adds no availability enum."""
+    if availability not in {"unavailable", "unsupported"}:
+        raise ValueError("invalid provider resource availability")
+    normalized = " ".join(reason.split())
+    if not normalized:
+        raise ValueError("unavailable provider resource requires a reason")
+    return f"{availability.title()}: {normalized}"[:512]
+
+
+def _workspace_provider_upsert_unavailable_dataset(
+    s, *, mount_id: str, provider: str, provider_dataset_id: str,
+    availability: str, availability_reason: str,
+) -> tuple[WorkspaceProviderDataset, bool]:
+    """Retain canonical identity while withholding facts an item could not truthfully report."""
+    if not provider_dataset_id or len(provider_dataset_id) > 512:
+        raise ValueError("invalid canonical provider dataset identity")
+    item_error = _workspace_provider_item_error(availability, availability_reason)
+    row = s.get(
+        WorkspaceProviderDataset,
+        (mount_id, provider_dataset_id),
+        with_for_update=True,
+    )
+    now = _now()
+    if row is None:
+        candidate = WorkspaceProviderDataset(
+            mount_id=mount_id,
+            provider_dataset_id=provider_dataset_id,
+            provider=provider,
+            uri=None,
+            columns_doc=None,
+            state="provider_error",
+            last_error=item_error,
+            last_resolved_at=now,
+        )
+        try:
+            with s.begin_nested():
+                s.add(candidate)
+                s.flush()
+        except IntegrityError:
+            row = s.get(
+                WorkspaceProviderDataset,
+                (mount_id, provider_dataset_id),
+                with_for_update=True,
+            )
+            if row is None:
+                raise
+        else:
+            return candidate, False
+    if row.provider != provider:
+        row.state = "provider_error"
+        row.last_error = "provider returned conflicting canonical dataset facts"
+        row.last_resolved_at = now
+        return row, True
+    if row.state != "detached":
+        # A brand-new placeholder has no facts, but an existing canonical generation retains its
+        # last-known facts as an identity fence. They remain unusable while provider_error, and a
+        # later observation must match them exactly before it can recover this generation.
+        row.state = "provider_error"
+        row.last_error = item_error
+        row.last_resolved_at = now
+    return row, False
+
+
 def _workspace_provider_upsert_dataset(
     s, *, mount_id: str, provider: str, provider_dataset_id: str,
     uri: str, columns: list[ColumnSchema] | list[dict],
@@ -5885,6 +5949,7 @@ def workspace_provider_cache_resource(
     parent_binding_id: str | None = None, parent_is_known: bool = True,
     provider_dataset_id: str | None = None, uri: str | None = None,
     columns: list[ColumnSchema] | list[dict] | None = None,
+    availability: str = "available", availability_reason: str | None = None,
 ) -> dict:
     """Persist a placement occurrence and its independently keyed canonical dataset evidence.
 
@@ -5896,10 +5961,23 @@ def workspace_provider_cache_resource(
         raise ValueError("invalid provider resource kind")
     if not provider_placement_id or len(provider_placement_id) > 512:
         raise ValueError("invalid provider placement identity")
+    if availability not in {"available", "unavailable", "unsupported"}:
+        raise ValueError("invalid provider resource availability")
+    if availability == "available" and availability_reason is not None:
+        raise ValueError("available provider resource cannot carry an availability reason")
+    if availability != "available" and not availability_reason:
+        raise ValueError("unavailable provider resource requires a reason")
     if kind == "dataset":
-        if provider_dataset_id is None or uri is None:
-            raise ValueError("provider dataset placement requires canonical detail")
-        canonical_columns = columns or []
+        if provider_dataset_id is None:
+            raise ValueError("provider dataset placement requires canonical identity")
+        if availability == "available":
+            if uri is None:
+                raise ValueError("available provider dataset placement requires canonical detail")
+            canonical_columns = columns or []
+        else:
+            if uri is not None or columns:
+                raise ValueError("unavailable provider dataset placement cannot carry canonical detail")
+            canonical_columns = []
     else:
         if provider_dataset_id is not None or uri is not None or columns:
             raise ValueError("provider container cannot carry canonical dataset detail")
@@ -5908,15 +5986,27 @@ def workspace_provider_cache_resource(
     with session() as s:
         canonical: WorkspaceProviderDataset | None = None
         canonical_conflict = False
-        if provider_dataset_id is not None and uri is not None:
-            canonical, canonical_conflict = _workspace_provider_upsert_dataset(
-                s,
-                mount_id=mount_id,
-                provider=provider,
-                provider_dataset_id=provider_dataset_id,
-                uri=uri,
-                columns=canonical_columns,
-            )
+        if provider_dataset_id is not None:
+            if availability == "available":
+                assert uri is not None
+                canonical, canonical_conflict = _workspace_provider_upsert_dataset(
+                    s,
+                    mount_id=mount_id,
+                    provider=provider,
+                    provider_dataset_id=provider_dataset_id,
+                    uri=uri,
+                    columns=canonical_columns,
+                )
+            else:
+                assert availability_reason is not None
+                canonical, canonical_conflict = _workspace_provider_upsert_unavailable_dataset(
+                    s,
+                    mount_id=mount_id,
+                    provider=provider,
+                    provider_dataset_id=provider_dataset_id,
+                    availability=availability,
+                    availability_reason=availability_reason,
+                )
 
         row = s.scalar(select(WorkspaceProviderBinding).where(
             WorkspaceProviderBinding.mount_id == mount_id,
@@ -5941,11 +6031,17 @@ def workspace_provider_cache_resource(
                 parent_provider_placement_id=parent_provider_placement_id,
                 parent_binding_id=parent_binding_id,
                 provider_dataset_id=provider_dataset_id,
-                state="provider_error" if canonical_conflict else "current",
+                state=(
+                    "provider_error"
+                    if canonical_conflict or kind == "container" and availability != "available"
+                    else "current"
+                ),
                 active=True,
                 last_error=(
                     "provider returned conflicting canonical dataset facts"
-                    if canonical_conflict else None),
+                    if canonical_conflict else
+                    _workspace_provider_item_error(availability, availability_reason)
+                    if kind == "container" and availability_reason is not None else None),
                 last_resolved_at=_now(),
             )
             s.add(row)
@@ -5994,8 +6090,14 @@ def workspace_provider_cache_resource(
                     # Forward-migrated placements learn their explicit current canonical identity
                     # only from the current provider DTO.
                     row.provider_dataset_id = provider_dataset_id
-                row.state = "current"
-                row.last_error = None
+                if kind == "container" and availability != "available":
+                    assert availability_reason is not None
+                    row.state = "provider_error"
+                    row.last_error = _workspace_provider_item_error(
+                        availability, availability_reason)
+                else:
+                    row.state = "current"
+                    row.last_error = None
             row.last_resolved_at = _now()
         canonical = canonical or _workspace_provider_dataset_for_binding(s, row)
         return _workspace_provider_binding_doc(row, canonical)
@@ -6120,6 +6222,20 @@ def workspace_provider_dataset_for_source_binding(
                 or row.columns_doc is None):
             return None
         return _workspace_provider_dataset_doc(row)
+
+
+def workspace_provider_dataset_state_for_source_binding(
+        *, mount_id: str, source_binding_id: str) -> dict | None:
+    """Resolve canonical state even when item-level unavailability withheld usable facts."""
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or re.fullmatch(r"[0-9a-f]{32}", str(source_binding_id)) is None):
+        return None
+    with session() as s:
+        row = s.scalar(select(WorkspaceProviderDataset).where(
+            WorkspaceProviderDataset.mount_id == mount_id,
+            WorkspaceProviderDataset.source_binding_id == source_binding_id,
+        ))
+        return _workspace_provider_dataset_doc(row) if row is not None else None
 
 
 def workspace_provider_dataset_page(*, mount_id: str, query: str | None, limit: int) -> tuple[list[dict], bool]:

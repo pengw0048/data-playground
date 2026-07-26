@@ -194,6 +194,63 @@ def test_occurrence_contract_rejects_legacy_ids_and_conflicting_facts():
         ProviderPage(items=[first, first])
 
 
+def test_occurrence_contract_represents_bounded_item_availability():
+    unavailable = CatalogResource(
+        placement_id="cold-dataset",
+        dataset_id="canonical-cold",
+        kind="dataset",
+        name="Cold dataset",
+        availability="unavailable",
+        availability_reason="Metadata is still indexing",
+    )
+    unsupported = CatalogResource(
+        placement_id="unsupported-folder",
+        kind="container",
+        name="Unsupported folder",
+        availability="unsupported",
+        availability_reason="This resource type cannot be browsed",
+    )
+    page = ProviderPage(items=[unavailable, unsupported], next_cursor="next")
+    assert page.state == "ready"
+    assert page.next_cursor == "next"
+    assert unavailable.uri is None and unavailable.columns == []
+    assert unavailable.model_dump(by_alias=True)["availabilityReason"] == (
+        "Metadata is still indexing")
+
+    class RootProvider:
+        def list_children(self, _mount, parent_placement_id, *, limit, cursor=None):
+            assert parent_placement_id is None and limit == 1 and cursor is None
+            return ProviderPage(items=[unavailable])
+
+    listed = bounded_list_children(
+        RootProvider(), CatalogMount(id="root-items", provider="fixture"), None, limit=1)
+    assert listed.state == "ready" and listed.items == [unavailable]
+
+    with pytest.raises(ValueError, match="requires an availability reason"):
+        CatalogResource(
+            placement_id="missing-reason", kind="container", name="Missing reason",
+            availability="unavailable",
+        )
+    with pytest.raises(ValueError, match="cannot carry an availability reason"):
+        CatalogResource(
+            placement_id="available-reason", kind="container", name="Available reason",
+            availability_reason="not allowed",
+        )
+    with pytest.raises(ValueError, match="cannot carry URI or columns"):
+        CatalogResource(
+            placement_id="bad-dataset",
+            parent_placement_id="folder",
+            dataset_id="canonical-bad",
+            kind="dataset",
+            name="Bad dataset",
+            uri="file:///fabricated",
+            availability="unsupported",
+            availability_reason="No dataset adapter",
+        )
+    with pytest.raises(ValueError, match="cannot continue"):
+        ProviderPage(state="partial", next_cursor="next")
+
+
 def test_bounded_helpers_enforce_requested_provider_identity():
     occurrence = CatalogResource(
         placement_id="other-placement", kind="container", name="Other",

@@ -1318,6 +1318,7 @@ class WorkspaceResource(Wire):
     can_rename_folder: bool = False
     can_delete_folder: bool = False
     folder_mutation_unavailable_reason: str | None = Field(default=None, max_length=256)
+    unavailable_reason: str | None = Field(default=None, max_length=512)
     # Provider mounts stay source-only.  This explicit false is intentionally independent of the
     # local placement capability so clients cannot mistake a local Canvas move for provider writeback.
     provider_mutation: bool = False

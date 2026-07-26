@@ -205,6 +205,65 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText('observations')).toBeInTheDocument()
   })
 
+  it('keeps degraded provider rows visible while disabling Open and bounded retry actions', async () => {
+    const unavailable = {
+      ...EXTERNAL_DATASET,
+      name: 'cold observations',
+      canonicalReferenceState: 'provider_error' as const,
+      lastKnown: true,
+      unavailableReason: 'Unavailable: Metadata is still indexing',
+    }
+    const unsupported = {
+      ...EXTERNAL_FOLDER,
+      id: 'container:external.unsupported-folder',
+      name: 'archived folder',
+      referenceState: 'provider_error' as const,
+      lastKnown: true,
+      localPlacement: null,
+      unavailableReason: 'Unsupported: Archived folders cannot be browsed',
+    }
+    const healthy = { ...EXTERNAL_DATASET, id: 'dataset:external.healthy', name: 'healthy observations' }
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT,
+      items: [unavailable, unsupported, healthy],
+      nextCursor: 'next-page',
+      hasMore: true,
+      completeness: 'page',
+      sources: [{ ...PROVIDER_COMPLETE, completeness: 'page' }],
+    })
+    render(<WorkspaceExplorer />)
+
+    const unavailableOpen = await screen.findByRole('button', {
+      name: 'Open dataset cold observations from Source-only mount warehouse · fixture',
+    })
+    const unsupportedOpen = screen.getByRole('button', {
+      name: 'Open folder archived folder from Source-only mount warehouse · fixture',
+    })
+    expect(unavailableOpen).toBeDisabled()
+    expect(unsupportedOpen).toBeDisabled()
+    expect(within(unavailableOpen.parentElement!).getByText('Unavailable')).toBeVisible()
+    expect(unavailableOpen.parentElement).toHaveTextContent('Metadata is still indexing')
+    expect(within(unsupportedOpen.parentElement!).getByText('Unsupported')).toBeVisible()
+    expect(unsupportedOpen.parentElement).toHaveTextContent('Archived folders cannot be browsed')
+    expect(screen.queryByText('Some sources are incomplete')).not.toBeInTheDocument()
+    expect(screen.getByTestId('workspace-load-more')).toBeEnabled()
+    expect(screen.getAllByRole('button', { name: 'Retry' })).toHaveLength(1)
+
+    fireEvent.click(unavailableOpen)
+    fireEvent.click(unsupportedOpen)
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(unavailable.id)
+    expect(store.setWorkspaceResource).not.toHaveBeenCalledWith(unsupported.id)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(mocks.workspaceBrowse).toHaveBeenCalledTimes(2))
+
+    const healthyOpen = screen.getByRole('button', {
+      name: 'Open dataset healthy observations from Source-only mount warehouse · fixture',
+    })
+    expect(healthyOpen).toBeEnabled()
+    fireEvent.click(healthyOpen)
+    expect(store.setWorkspaceResource).toHaveBeenCalledWith(healthy.id)
+  })
+
   it('keeps folder names readable while distinguishing Catalog authority without a second hierarchy', async () => {
     const catalogFolder = { ...FOLDER, id: 'container:catalog-research', catalogFolderId: 'folder-stable-1', catalogFolderPath: 'research' }
     const catalogDataset = { ...DATASET, name: 'Research' }

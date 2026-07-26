@@ -434,6 +434,8 @@ export interface WorkspaceResource {
   canRenameFolder?: boolean
   canDeleteFolder?: boolean
   folderMutationUnavailableReason?: string | null
+  /** Bounded provider reason when this occurrence or its canonical dataset is not usable. */
+  unavailableReason?: string | null
 }
 export interface WorkspaceSourceStatus {
   id: string

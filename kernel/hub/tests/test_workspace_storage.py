@@ -642,6 +642,399 @@ class _MultiPlacementWorkspaceProvider:
         return ProviderSearchPage(items=items, next_cursor=next_cursor)
 
 
+def test_unavailable_provider_items_preserve_identity_without_source_admission(
+        workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    mount_id = f"item-availability-{token}"
+    root = metadb.local_workspace_root()
+    unavailable = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture",
+        container_id=root["id"],
+        provider_placement_id="dataset-placement",
+        kind="dataset",
+        name="Cold dataset",
+        parent_provider_placement_id="parent",
+        provider_dataset_id="canonical-dataset",
+        availability="unavailable",
+        availability_reason="Metadata is still indexing",
+    )
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert canonical is not None
+    assert unavailable["referenceState"] == "current"
+    assert unavailable["canonicalReferenceState"] == "provider_error"
+    assert canonical["uri"] is None and canonical["columns"] is None
+    assert metadb.workspace_provider_source_binding(unavailable["bindingId"]) is None
+    mounted = workspace_providers._MountedProvider(
+        CatalogMount(id=mount_id, provider="fixture"),
+        root["id"],
+        "",
+    )
+    public = workspace_providers._binding_resource(unavailable, mounted)
+    assert public["unavailableReason"] == "Unavailable: Metadata is still indexing"
+    assert public["referenceState"] == "current"
+    assert public["canonicalReferenceState"] == "provider_error"
+
+    crafted_uri = workspace_providers.provider_dataset_uri(
+        mount_id, canonical["sourceBindingId"])
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="metadata is unavailable"):
+        workspace_providers.provider_dataset_identity(crafted_uri)
+
+    recovered = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture",
+        container_id=root["id"],
+        provider_placement_id="dataset-placement",
+        kind="dataset",
+        name="Cold dataset",
+        parent_provider_placement_id="parent",
+        provider_dataset_id="canonical-dataset",
+        uri="file:///cold.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    recovered_canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert recovered_canonical is not None
+    assert recovered["bindingId"] == unavailable["bindingId"]
+    assert recovered["referenceState"] == "current"
+    assert recovered["canonicalReferenceState"] == "current"
+    assert recovered_canonical["sourceBindingId"] == canonical["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(recovered["bindingId"]) == {
+        "mountId": mount_id,
+        "sourceBindingId": canonical["sourceBindingId"],
+    }
+
+    unavailable_container = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture",
+        container_id=root["id"],
+        provider_placement_id="unavailable-container",
+        kind="container",
+        name="Cold folder",
+        availability="unsupported",
+        availability_reason="This resource type cannot be browsed",
+    )
+    public_container = workspace_providers._binding_resource(
+        unavailable_container, mounted)
+    assert public_container["referenceState"] == "provider_error"
+    assert public_container["unavailableReason"] == (
+        "Unsupported: This resource type cannot be browsed")
+    assert public_container["localPlacement"] is None
+    healthy_container = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture",
+        container_id=root["id"],
+        provider_placement_id="unavailable-container",
+        kind="container",
+        name="Cold folder",
+    )
+    assert workspace_providers._binding_resource(
+        healthy_container, mounted)["localPlacement"] is not None
+    degraded_again = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture",
+        container_id=root["id"],
+        provider_placement_id="unavailable-container",
+        kind="container",
+        name="Cold folder",
+        availability="unsupported",
+        availability_reason="This resource type cannot be browsed",
+    )
+    assert workspace_providers._binding_resource(
+        degraded_again, mounted)["localPlacement"] is None
+    assert metadb.workspace_provider_reconcile_children(
+        mount_id=mount_id,
+        parent_provider_placement_id=None,
+        seen_provider_placement_ids={"unavailable-container"},
+    ) == []
+
+
+def _browse_provider_root_item(mount_id: str, provider_placement_id: str) -> dict:
+    cursor = None
+    while True:
+        page = workspace_providers.browse(
+            metadb.LOCAL_WORKSPACE_ROOT_ID,
+            uid=metadb.DEFAULT_USER_ID,
+            limit=50,
+            cursor=cursor,
+        )
+        item = next((
+            resource for resource in page["items"]
+            if resource.get("mountId") == mount_id
+            and resource.get("providerPlacementId") == provider_placement_id
+        ), None)
+        if item is not None:
+            return item
+        cursor = page["nextCursor"]
+        if cursor is None:
+            raise AssertionError("provider resource was not returned by Workspace browse")
+
+
+def test_healthy_provider_dataset_degrades_and_recovers_same_canonical_generation(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    mount_id = f"degraded-recovery-{token}"
+    provider = _WorkspaceFixtureProvider()
+    resources = [CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset",
+        uri="file:///stable.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )]
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id,
+        "provider": "fixture",
+    }]))
+
+    healthy = _browse_provider_root_item(mount_id, "dataset")
+    first_source = metadb.workspace_provider_source_binding(healthy["bindingId"])
+    assert first_source is not None
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert canonical is not None
+    assert canonical["referenceState"] == "current"
+    canonical_columns = canonical["columns"]
+
+    resources[0] = CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset",
+        availability="unavailable",
+        availability_reason="Metadata is temporarily unavailable",
+    )
+    degraded = _browse_provider_root_item(mount_id, "dataset")
+    degraded_canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert degraded_canonical is not None
+    assert degraded["id"] == healthy["id"]
+    assert degraded["bindingId"] == healthy["bindingId"]
+    assert degraded["referenceState"] == "current"
+    assert degraded["canonicalReferenceState"] == "provider_error"
+    assert "uri" not in degraded and "columns" not in degraded
+    assert degraded_canonical["uri"] == "file:///stable.parquet"
+    assert degraded_canonical["columns"] == canonical_columns
+    assert degraded_canonical["sourceBindingId"] == canonical["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(degraded["bindingId"]) is None
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="metadata is unavailable"):
+        workspace_providers.provider_dataset_source(
+            degraded["id"],
+            uid=metadb.DEFAULT_USER_ID,
+            resolve_physical=lambda _uri: object(),
+        )
+
+    resources[0] = CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset recovered",
+        uri="file:///stable.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )
+    recovered = _browse_provider_root_item(mount_id, "dataset")
+    recovered_canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert recovered_canonical is not None
+    assert recovered["id"] == healthy["id"]
+    assert recovered["bindingId"] == healthy["bindingId"]
+    assert recovered["referenceState"] == "current"
+    assert recovered["canonicalReferenceState"] == "current"
+    assert recovered_canonical["sourceBindingId"] == canonical["sourceBindingId"]
+    assert metadb.workspace_provider_source_binding(recovered["bindingId"]) == first_source
+
+
+def test_degraded_provider_dataset_rejects_conflicting_recovery_without_retargeting(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    mount_id = f"degraded-conflict-{token}"
+    provider = _WorkspaceFixtureProvider()
+    resources = [CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset",
+        uri="file:///stable.parquet",
+        columns=[{"name": "value", "type": "int64"}],
+    )]
+    monkeypatch.setattr(provider, "_resources", lambda _mount_id: resources)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id,
+        "provider": "fixture",
+    }]))
+
+    healthy = _browse_provider_root_item(mount_id, "dataset")
+    canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert canonical is not None
+    source_binding_id = canonical["sourceBindingId"]
+    canonical_columns = canonical["columns"]
+
+    resources[0] = CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset",
+        availability="unavailable",
+        availability_reason="Metadata is temporarily unavailable",
+    )
+    degraded = _browse_provider_root_item(mount_id, "dataset")
+    assert degraded["canonicalReferenceState"] == "provider_error"
+
+    resources[0] = CatalogResource(
+        placement_id="dataset",
+        dataset_id="canonical-dataset",
+        kind="dataset",
+        name="Dataset changed",
+        uri="file:///retargeted.parquet",
+        columns=[{"name": "other", "type": "string"}],
+    )
+    conflict = _browse_provider_root_item(mount_id, "dataset")
+    conflicted_canonical = metadb.workspace_provider_dataset(
+        mount_id=mount_id, provider_dataset_id="canonical-dataset")
+    assert conflicted_canonical is not None
+    assert conflict["id"] == healthy["id"]
+    assert conflict["bindingId"] == healthy["bindingId"]
+    assert conflict["referenceState"] == "provider_error"
+    assert conflict["canonicalReferenceState"] == "provider_error"
+    assert "uri" not in conflict and "columns" not in conflict
+    assert conflicted_canonical["uri"] == "file:///stable.parquet"
+    assert conflicted_canonical["columns"] == canonical_columns
+    assert conflicted_canonical["sourceBindingId"] == source_binding_id
+    assert metadb.workspace_provider_source_binding(conflict["bindingId"]) is None
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="metadata is unavailable"):
+        workspace_providers.provider_dataset_identity(
+            workspace_providers.provider_dataset_uri(mount_id, source_binding_id))
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="metadata is unavailable"):
+        workspace_providers.provider_dataset_source(
+            conflict["id"],
+            uid=metadb.DEFAULT_USER_ID,
+            resolve_physical=lambda _uri: object(),
+        )
+
+
+def test_workspace_pages_keep_degraded_items_and_continue_enumeration(
+        workspace_scope, monkeypatch):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    mount_id = f"degraded-page-{token}"
+    parent = CatalogResource(
+        placement_id="parent", kind="container", name="Remote folder")
+    resources = [
+        CatalogResource(
+            placement_id="healthy-a",
+            parent_placement_id="parent",
+            dataset_id="healthy-a",
+            kind="dataset",
+            name="A healthy",
+            uri="file:///healthy-a.parquet",
+        ),
+        CatalogResource(
+            placement_id="cold-b",
+            parent_placement_id="parent",
+            dataset_id="cold-b",
+            kind="dataset",
+            name="B cold",
+            availability="unavailable",
+            availability_reason="Metadata is still indexing",
+        ),
+        CatalogResource(
+            placement_id="healthy-c",
+            parent_placement_id="parent",
+            dataset_id="healthy-c",
+            kind="dataset",
+            name="C healthy",
+            uri="file:///healthy-c.parquet",
+        ),
+    ]
+
+    class Provider(_WorkspaceFixtureProvider):
+        def _resources(self, _mount_id):
+            return [parent, *resources]
+
+        def ancestors(self, _mount, placement_id):
+            if placement_id == "parent":
+                return ProviderAncestors()
+            return ProviderAncestors(items=[parent])
+
+    provider = Provider()
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id,
+        "provider": "fixture",
+    }]))
+
+    root = workspace_providers.browse(
+        metadb.LOCAL_WORKSPACE_ROOT_ID,
+        uid=metadb.DEFAULT_USER_ID,
+        limit=50,
+    )
+    remote_parent = next(
+        item for item in root["items"]
+        if item.get("mountId") == mount_id and item["providerPlacementId"] == "parent")
+    parent_identity = remote_parent["id"].split(":", 1)[1]
+    first = workspace_providers.browse(
+        parent_identity, uid=metadb.DEFAULT_USER_ID, limit=2)
+    assert [item["name"] for item in first["items"]] == ["A healthy", "B cold"]
+    assert first["hasMore"] is True
+    assert first["completeness"] == "page"
+    assert first["sources"][-1]["completeness"] == "page"
+    unavailable = first["items"][1]
+    assert unavailable["referenceState"] == "current"
+    assert unavailable["canonicalReferenceState"] == "provider_error"
+    assert unavailable["unavailableReason"] == "Unavailable: Metadata is still indexing"
+    assert metadb.workspace_provider_source_binding(unavailable["bindingId"]) is None
+    with pytest.raises(
+            workspace_providers.ProviderDatasetUnavailable,
+            match="metadata is unavailable"):
+        workspace_providers.provider_dataset_source(
+            unavailable["id"],
+            uid=metadb.DEFAULT_USER_ID,
+            resolve_physical=lambda _uri: object(),
+        )
+
+    second = workspace_providers.browse(
+        parent_identity,
+        uid=metadb.DEFAULT_USER_ID,
+        limit=2,
+        cursor=first["nextCursor"],
+    )
+    assert [item["name"] for item in second["items"]] == ["C healthy"]
+    assert second["hasMore"] is False
+    assert second["completeness"] == "complete"
+    assert second["sources"][-1]["completeness"] == "complete"
+
+    resources[1] = CatalogResource(
+        placement_id="cold-b",
+        parent_placement_id="parent",
+        dataset_id="cold-b",
+        kind="dataset",
+        name="B recovered",
+        uri="file:///cold-b.parquet",
+    )
+    recovered_page = workspace_providers.browse(
+        parent_identity, uid=metadb.DEFAULT_USER_ID, limit=10)
+    recovered = next(
+        item for item in recovered_page["items"]
+        if item["providerPlacementId"] == "cold-b")
+    assert recovered["id"] == unavailable["id"]
+    assert recovered["bindingId"] == unavailable["bindingId"]
+    assert recovered["canonicalReferenceState"] == "current"
+    assert recovered["unavailableReason"] is None
+
+
 @pytest.mark.parametrize("mutation", ["deleted", "moved"])
 def test_complete_provider_traversal_reconciles_all_paginated_occurrences(
         workspace_scope, monkeypatch, mutation):
