@@ -625,6 +625,7 @@ def test_region_cut_lineage_parents_survive_job_artifact_reconstruction(
     from hub import graph as graph_ops
     from hub.planner import Region
     from hub.plugins import catalog as catalog_plugin
+    from hub.workload_env import restore_workload_graph
 
     module, deps, runner, _client, _store = _runner(jobs_config)
     original_source = f"s3://shared/original-{uuid.uuid4().hex}.parquet"
@@ -672,6 +673,11 @@ def test_region_cut_lineage_parents_survive_job_artifact_reconstruction(
     assert job["publication_context"]["lineage_parents"] == {
         "write": [original_source],
     }
+    generated = next(node.id for node in subgraph.nodes if node.type == "source")
+    assert job["graph"]["_controllerGeneratedSourceIds"] == [generated]
+    worker_graph = restore_workload_graph(job["graph"], "write")
+    assert worker_graph._controller_generated_source_ids == {generated}
+    assert worker_graph._publication_source_uris == {}
 
     rebuilt = Graph.model_validate(job["graph"])
     assert graph_ops.all_upstream_publication_uris(rebuilt, "write") == [materialized_region]

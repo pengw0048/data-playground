@@ -131,6 +131,7 @@ def is_core_workload_env_key(key: str) -> bool:
 
 EPHEMERAL_OBJECT_STORE_CRED_ID = "ephemeral-workload-object-store"
 _PROMOTED_SIDECAR_KEY = "_promotedTransformDefinitions"
+_GENERATED_SOURCE_SIDECAR_KEY = "_controllerGeneratedSourceIds"
 _MAX_PROMOTED_SIDECAR_DEFINITIONS = 512
 _MAX_PROMOTED_SIDECAR_BYTES = 8 * 1024 * 1024
 
@@ -364,14 +365,47 @@ def _attach_promoted_transform_definitions(
     payload[_PROMOTED_SIDECAR_KEY] = definitions
 
 
+def _attach_generated_source_ids(payload: dict, graph: Graph) -> None:
+    """Carry only parent-classified generated Source identities to the disposable worker."""
+    payload.pop(_GENERATED_SOURCE_SIDECAR_KEY, None)
+    generated = (
+        set(getattr(graph, "_publication_source_uris", {}))
+        | set(getattr(graph, "_controller_generated_source_ids", ()))
+    )
+    if not generated:
+        return
+    by_id = {node.id: node for node in graph.nodes}
+    if any(node_id not in by_id or by_id[node_id].type != "source"
+           for node_id in generated):
+        raise RuntimeError("workload generated Source classification is invalid")
+    payload[_GENERATED_SOURCE_SIDECAR_KEY] = sorted(generated)
+
+
+def _restore_generated_source_ids(graph: Graph, raw_ids: Any) -> None:
+    """Validate and restore the bounded generated-Source classification on one worker Graph."""
+    if raw_ids is None:
+        return
+    if (not isinstance(raw_ids, list)
+            or len(raw_ids) > len(graph.nodes)
+            or any(not isinstance(node_id, str) for node_id in raw_ids)
+            or raw_ids != sorted(set(raw_ids))):
+        raise RuntimeError("workload generated Source classification is malformed")
+    by_id = {node.id: node for node in graph.nodes}
+    if any(node_id not in by_id or by_id[node_id].type != "source"
+           for node_id in raw_ids):
+        raise RuntimeError("workload generated Source classification does not match the graph")
+    graph._controller_generated_source_ids = set(raw_ids)
+
+
 def restore_workload_graph(
         payload: Any, target: str | None = None) -> Graph:
-    """Validate a private promoted-definition sidecar and restore only the worker's graph copy.
+    """Validate private workload sidecars and restore only the worker's graph copy.
 
     The returned Graph contains ordinary ad-hoc code for the one-shot execution engine, but the parent
     Graph, persisted Canvas, execution manifest, run state, and history remain exact ``id + version``
     references. There is no latest-version or inline-code fallback: every restored body is hash-checked
-    against the complete immutable definition attached by the trusted parent.
+    against the complete immutable definition attached by the trusted parent. Controller-generated
+    Source classification crosses this boundary as node IDs only; publication URIs remain parent-only.
     """
     from hub.promoted_transforms import (
         PROMOTED_TRANSFORM_ID, promoted_transform_definition,
@@ -381,7 +415,9 @@ def restore_workload_graph(
         raise RuntimeError("workload graph is malformed")
     graph_doc = dict(payload)
     raw_definitions = graph_doc.pop(_PROMOTED_SIDECAR_KEY, None)
+    raw_generated_source_ids = graph_doc.pop(_GENERATED_SOURCE_SIDECAR_KEY, None)
     graph = Graph.model_validate(graph_doc)
+    _restore_generated_source_ids(graph, raw_generated_source_ids)
     node_refs = _reachable_promoted_transform_nodes(graph, target)
     expected_refs = set(node_refs.values())
     if not expected_refs:
@@ -459,6 +495,7 @@ def public_workload_graph(payload: Any) -> Graph:
         raise RuntimeError("workload graph is malformed")
     graph_doc = dict(payload)
     graph_doc.pop(_PROMOTED_SIDECAR_KEY, None)
+    graph_doc.pop(_GENERATED_SOURCE_SIDECAR_KEY, None)
     return Graph.model_validate(graph_doc)
 
 
@@ -469,7 +506,8 @@ def prepare_workload_graph(
     Named schema contracts are control-plane references. Resolve them in the hub before dispatch and
     carry only their column value into the job, so schema enforcement keeps working without granting the
     worker the metadata identity. Missing references stay unresolved and therefore still fail closed in
-    the worker instead of silently disabling enforcement.
+    the worker instead of silently disabling enforcement. Generated Source classification is carried as
+    a private, bounded node-ID sidecar without its parent-only publication lineage.
     """
     if not isinstance(graph, Graph):
         graph = Graph.model_validate(graph)
@@ -486,4 +524,5 @@ def prepare_workload_graph(
         if contract and contract.get("columns"):
             config["outputSchema"] = contract["columns"]
     _attach_promoted_transform_definitions(payload, graph, target, registry)
+    _attach_generated_source_ids(payload, graph)
     return payload

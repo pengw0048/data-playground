@@ -36,6 +36,11 @@ wide input through as a deceptive sidecar. Its output is only a candidate. Core 
 sidecar/base identities, coverage, schema, current head, and final receipt when the researcher
 separately configures the managed-sidecar merge.
 
+The fixture always requires exactly one directly wired `source`; a transform, generated handle, or
+Section-bound relation is not treated as that Source merely because its rows originated there. When
+the sidecar must also be tied to one known base, set optional `sourceDatasetId` to the canonical
+dataset id. That additional check rejects an unproved or different identity before building work.
+
 ## The shape of a plugin
 
 A plugin is a Python package with a `register(reg)` function. Each process that loads the plugin calls
@@ -88,6 +93,16 @@ on a preview sample or at full scale.
   CTE `input` (no textual placeholder substitution)
 - `ctx.arrow_map(rel, fn)` — `fn(pa.RecordBatch) -> RecordBatch | list[dict]` over Arrow batches
 - `ctx.polars(rel, fn)` — `fn(polars.DataFrame) -> polars.DataFrame`
+- `ctx.immediate_inputs(engine, node)` — a read-only snapshot of the node's declared input ports.
+  Each port gives its direct input count and, for each wired input, only the producing node `kind` and
+  a `dataset` binding (`dataset_id`, optional `revision_id`) when core has already proved one. A
+  provider Source uses the same canonical `workspace-provider:*` identity used by Source admission;
+  a URI, display name, mutable revision, or another node's configuration is never exposed or used as
+  an identity. A controller-generated cross-region input retains its count but has `kind=None` and no
+  dataset binding; it is not relabeled as a directly wired Source.
+  Use this for a narrowly documented shape check and raise `UnsupportedUpstreamError` before work when
+  it is not met. It is deliberately not graph traversal: it exposes no graph, edges, node data, or
+  transitive ancestry, so plugins do not need to import `hub.graph`.
 - `ctx.resource(key, factory)` — a warm handle built once by `factory()` and reused across batches and
   runs on the same per-canvas kernel. Namespace `key` (for example `f"{pack}:{model}"`). Thread-safe.
   For plugin nodes with an explicit resource lifecycle, not transform cells; neither is a security

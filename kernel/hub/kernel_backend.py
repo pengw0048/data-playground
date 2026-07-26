@@ -210,7 +210,11 @@ class KernelBackend:
         endpoint, token = self._ensure_kernel(canvas_id)
         # ``None`` is semantically meaningful: execute the complete topological graph. Never replace it
         # with the sole public output target, which would drop an independent branch.
-        body = {"run_id": run_id, "graph": graph.model_dump(), "target": execution_target,
+        from hub.workload_env import prepare_workload_graph
+        body = {"run_id": run_id,
+                "graph": prepare_workload_graph(
+                    graph, execution_target, getattr(self.base, "registry", None)),
+                "target": execution_target,
                 "placement": placement, "request_id": request_id, "attempt_id": attempt_id,
                 "input_manifest": manifest}
         status = RunStatus(**_post(endpoint, "/run", token, body))

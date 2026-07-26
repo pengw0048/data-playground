@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from types import SimpleNamespace
@@ -272,6 +273,48 @@ def test_kernel_backend_does_not_spawn_before_a_matching_admission(monkeypatch):
             None, "local", run_id="run-missing", input_manifest=[],
         )
     assert spawned == []
+
+
+def test_kernel_workload_transport_restores_controller_generated_source_ids(monkeypatch):
+    from hub import local_run_inputs
+
+    graph = _source_graph("fixture://region-ref", canvas_id="_region")
+    graph._publication_source_uris["source"] = ("fixture://original",)
+    admission = {
+        "run_id": "run-generated-source",
+        "canvas_id": graph.id,
+        "target_node_id": None,
+        "manifest": [],
+    }
+    monkeypatch.setattr(metadb, "local_run_input_admission", lambda _run_id: admission)
+    monkeypatch.setattr(
+        local_run_inputs, "validate_manifest_graph", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        local_run_inputs, "bind_manifest", lambda bound, *_args, **_kwargs: bound)
+
+    backend = KernelBackend(
+        SimpleNamespace(node_specs={}, workspace="/tmp", registry={}), SimpleNamespace())
+    monkeypatch.setattr(backend, "_ensure_kernel", lambda _canvas_id: ("kernel", "token"))
+
+    def post(_endpoint, path, _token, body):
+        assert path == "/run"
+        assert body["graph"]["_controllerGeneratedSourceIds"] == ["source"]
+        assert "fixture://original" not in json.dumps(body["graph"])
+        worker_graph, manifest = _admitted_kernel_graph(
+            RunBody.model_validate(body), kernel_canvas=graph.id,
+            deps=SimpleNamespace(resolve_adapter=lambda _uri: None), metadata=metadb)
+        assert manifest == []
+        assert worker_graph._controller_generated_source_ids == {"source"}
+        assert worker_graph._publication_source_uris == {}
+        return RunStatus(
+            run_id=body["run_id"], status="queued", per_node=[]).model_dump()
+
+    monkeypatch.setattr("hub.kernel_backend._post", post)
+    status = backend.run(
+        CompilePlan(target_node_id=None, steps=[]), graph, None, "local",
+        run_id=admission["run_id"], input_manifest=[],
+    )
+    assert status.run_id == admission["run_id"]
 
 
 def test_isolated_local_job_carries_and_revalidates_manifest_identity(tmp_path, monkeypatch):
