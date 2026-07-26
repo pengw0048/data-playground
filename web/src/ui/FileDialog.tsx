@@ -7,16 +7,16 @@ import { Input } from '@/components/ui/input'
 import { Icon } from './Icon'
 
 // A browser over configured kernel-accessible destinations (local dirs + object-store prefixes).
-// Open mode selects a file; save mode configures the managed destination and logical dataset name.
+// Open mode selects a file; save mode chooses a destination and logical output name. Only a fresh
+// write admission can say whether that selection publishes a managed revision.
 export interface OpenResult { uri: string; name: string }
 export interface SaveResult { destId: string; destName: string; path: string; filename: string }
 
 export function FileDialog(props:
   | { mode: 'open'; onPick: (r: OpenResult) => void | Promise<void>; onClose: () => void; title?: string }
-  | { mode: 'save'; defaultName?: string; managed?: boolean; onPick: (r: SaveResult) => void; onClose: () => void; title?: string },
+  | { mode: 'save'; defaultName?: string; onPick: (r: SaveResult) => void; onClose: () => void; title?: string },
 ) {
   const { mode, onClose } = props
-  const managedSave = mode === 'save' && props.managed === true
   const [dests, setDests] = useState<DestinationPreset[]>([])
   const [destId, setDestId] = useState('')
   const [path, setPath] = useState('')
@@ -84,7 +84,7 @@ export function FileDialog(props:
     void refresh()
     return () => { browseRequest.current += 1 }
   }, [refresh])
-  // Select the proposed logical name once when a managed-destination dialog opens.
+  // Select the proposed logical name once when an output-destination dialog opens.
   useEffect(() => {
     if (mode !== 'save') return
     const el = fileRef.current
@@ -93,9 +93,6 @@ export function FileDialog(props:
   }, [])
 
   const dest = dests.find((d) => d.id === destId)
-  const destinationLabel = (name: string) => managedSave && name === 'Workspace outputs'
-    ? 'Default managed storage'
-    : name
   const segs = path ? path.split('/').filter(Boolean) : []
   const pickOpenFile = async (entry: BrowseEntry) => {
     if (mode !== 'open' || pickingUri) return
@@ -116,7 +113,7 @@ export function FileDialog(props:
         <div className="flex items-center gap-2 border-b border-border px-[14px] py-[11px]">
           <span className="flex items-center text-muted-foreground"><Icon name={mode === 'save' ? 'export' : 'db'} size={14} /></span>
           <span className="text-[13.5px] font-semibold">
-            {props.title ?? (mode === 'save' ? managedSave ? 'Choose managed destination' : 'Choose output destination' : 'Open a file')}
+            {props.title ?? (mode === 'save' ? 'Choose output destination' : 'Open a file')}
           </span>
           <span className="flex-1" />
           <button onClick={onClose} disabled={pickingUri !== null} aria-label="Close" className="grid h-6 w-[26px] place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"><Icon name="close" size={13} /></button>
@@ -126,52 +123,51 @@ export function FileDialog(props:
           {/* left sidebar — switch configured destination */}
           <div className="w-[168px] shrink-0 overflow-y-auto border-r border-border bg-muted/30 p-1.5">
             <div className="px-2 py-1 text-[9.5px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
-              {mode === 'save' ? managedSave ? 'Managed destinations' : 'Destinations' : 'Places'}
+              {mode === 'save' ? 'Destinations' : 'Places'}
             </div>
             {dests.map((d) => (
               <button key={d.id} onClick={() => { setDestId(d.id); setPath('') }}
                 className={cn('flex w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors',
                   d.id === destId ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-accent/50')}>
                 <span className="flex items-center text-muted-foreground"><Icon name={d.backend === 'local' ? 'grid' : 'link'} size={13} /></span>
-                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{destinationLabel(d.name)}</span>
+                <span className="flex-1 overflow-hidden text-ellipsis whitespace-nowrap">{d.name}</span>
               </button>
             ))}
             {loadingDests && dests.length === 0 && <div className="p-2 text-[11px] text-muted-foreground">
-              {mode === 'save' ? managedSave ? 'Loading managed destinations…' : 'Loading destinations…' : 'Loading places…'}
+              {mode === 'save' ? 'Loading destinations…' : 'Loading places…'}
             </div>}
             {destError && (
               <div role="alert" className="m-1 flex flex-col gap-1 rounded border border-destructive/30 p-2 text-[10.5px] text-destructive">
-                <span>{mode === 'save' ? managedSave ? "Couldn't load managed destinations" : "Couldn't load destinations" : "Couldn't load places"}: {destError}</span>
+                <span>{mode === 'save' ? "Couldn't load destinations" : "Couldn't load places"}: {destError}</span>
                 <button onClick={() => void loadDestinations()} data-testid="file-dialog-destinations-retry" className="self-start font-semibold underline">Retry</button>
               </div>
             )}
             {!loadingDests && !destError && dests.length === 0 && <div className="p-2 text-[11px] text-muted-foreground">
-              {mode === 'save' && managedSave ? 'No managed destinations.' : 'No destinations.'}
+              No destinations.
             </div>}
           </div>
 
           {mode === 'save' ? (
             <div className="flex min-w-0 flex-1 items-center justify-center p-6">
               {dest ? (
-                <div aria-label={managedSave ? 'Selected managed destination' : 'Selected destination'}
+                <div aria-label="Selected destination"
                   className="max-w-sm rounded-md border border-border bg-muted/30 p-4">
                   <div className="text-[10px] font-bold uppercase tracking-[0.5px] text-muted-foreground">
-                    {managedSave ? 'Selected managed destination' : 'Selected destination'}
+                    Selected destination
                   </div>
-                  <div className="mt-1 text-sm font-semibold text-foreground">{destinationLabel(dest.name)}</div>
+                  <div className="mt-1 text-sm font-semibold text-foreground">{dest.name}</div>
                   <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                    {managedSave
-                      ? 'Data Playground chooses the physical storage path and publishes the dataset name below as a versioned revision.'
-                      : 'The execution backend writes the output name below to this configured destination.'}
+                    The execution backend writes the output name below to this configured destination.
+                    Publication semantics are confirmed after the selection is admitted.
                   </p>
                 </div>
               ) : (
                 <div className="text-xs text-muted-foreground">
                   {loadingDests
-                    ? managedSave ? 'Loading managed destinations…' : 'Loading destinations…'
+                    ? 'Loading destinations…'
                     : destError
-                      ? managedSave ? 'Managed destinations are unavailable. Retry from the sidebar.' : 'Destinations are unavailable. Retry from the sidebar.'
-                      : managedSave ? 'No managed destinations configured.' : 'No destinations configured.'}
+                      ? 'Destinations are unavailable. Retry from the sidebar.'
+                      : 'No destinations configured.'}
                 </div>
               )}
             </div>
@@ -222,9 +218,9 @@ export function FileDialog(props:
         {mode === 'save' && (
           <div className="flex items-center gap-2 border-t border-border px-[14px] py-2.5">
             {!writable
-              ? <span className="flex-1 text-[11px] text-amber-600">This destination can't publish managed revisions — install its plugin or choose another destination.</span>
+              ? <span className="flex-1 text-[11px] text-amber-600">This destination can't accept this output — install its plugin or choose another destination.</span>
               : <>
-                  <span className="text-[11.5px] text-muted-foreground">{managedSave ? 'Dataset name' : 'Output name'}</span>
+                  <span className="text-[11.5px] text-muted-foreground">Output name</span>
                   <Input ref={fileRef} value={filename} onChange={(e) => setFilename(e.target.value)}
                     className="dp-mono min-w-0 flex-1 text-[12.5px]" />
                 </>}

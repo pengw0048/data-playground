@@ -64,18 +64,24 @@ describe('FileDialog request and open-mutation truth', () => {
     expect(register).toHaveBeenCalledTimes(2)
   })
 
-  it('uses managed-publication language in save mode without changing the destination identity', async () => {
+  it('keeps save selection capability-neutral until the chosen destination is admitted', async () => {
     mocks.destinations.mockResolvedValueOnce({
-      destinations: [{ id: 'managed', name: 'Workspace outputs', backend: 'local', root: '/outputs' }],
-      backends: ['local'],
+      destinations: [
+        { id: 'managed', name: 'Workspace outputs', backend: 'local', root: '/outputs' },
+        { id: 'external', name: 'External provider', backend: 'plugin', root: 'provider://exports' },
+      ],
+      backends: ['local', 'plugin'],
     })
     const pick = vi.fn()
-    render(<FileDialog mode="save" managed defaultName="results" onClose={vi.fn()} onPick={pick} />)
+    render(<FileDialog mode="save" defaultName="results" onClose={vi.fn()} onPick={pick} />)
 
-    expect(await screen.findByText('Managed destinations')).toBeVisible()
-    expect(screen.getByText('Choose managed destination')).toBeVisible()
-    expect(screen.getAllByText('Default managed storage')).toHaveLength(2)
-    expect(screen.getByText('Dataset name')).toBeVisible()
+    expect(await screen.findByText('Destinations')).toBeVisible()
+    expect(screen.getByText('Choose output destination')).toBeVisible()
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('Workspace outputs')
+    fireEvent.click(screen.getByRole('button', { name: 'External provider' }))
+    expect(screen.getByLabelText('Selected destination')).toHaveTextContent('External provider')
+    expect(screen.queryByText(/managed revision|versioned revision/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Output name')).toBeVisible()
     expect(screen.queryByText('orders.csv')).not.toBeInTheDocument()
     expect(screen.queryByTitle('New folder')).not.toBeInTheDocument()
     expect(mocks.browseDestination).not.toHaveBeenCalled()
@@ -83,7 +89,7 @@ describe('FileDialog request and open-mutation truth', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Use destination' }))
 
     expect(pick).toHaveBeenCalledWith({
-      destId: 'managed', destName: 'Workspace outputs', path: '', filename: 'results',
+      destId: 'external', destName: 'External provider', path: '', filename: 'results',
     })
   })
 })

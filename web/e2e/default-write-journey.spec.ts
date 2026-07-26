@@ -111,7 +111,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await page.locator('.react-flow__node[data-id="write"]').click()
     const inspector = page.getByTestId('inspector')
     const publication = inspector.getByLabel('Write publication')
-    await expect(publication.getByText('Publication mode').locator('..')).toContainText('Create a new dataset')
+    await expect(publication.getByText('Revision mode').locator('..')).toContainText('Create a new dataset')
     await expect(publication.getByLabel('Write readiness')).toContainText('Ready to publish')
     const publicationDetails = publication.locator('details')
     await expect(publicationDetails).not.toHaveAttribute('open')
@@ -123,7 +123,8 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await inspector.getByRole('button', { name: 'Run', exact: true }).click()
     const started = await ok<{ runId: string }>(await runResponse, 'submit default-kernel write')
     const runId = started.runId
-    await expect(publication.getByLabel('Published result')).toContainText(`${filename} published`, { timeout: 30_000 })
+    await expect(publication.getByLabel('Published result')).toContainText('Managed dataset published', { timeout: 30_000 })
+    await expect(publication.getByLabel('Published result')).toContainText(filename)
     await expect(publication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     await expect(publicationDetails).toContainText('Durable: yes')
     type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
@@ -232,7 +233,8 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await setTheme(page, 'dark')
     await page.locator('.react-flow__node[data-id="write"]').click()
     const darkPublication = inspector.getByLabel('Write publication')
-    await expect(darkPublication.getByLabel('Published result')).toContainText(`${filename} published`)
+    await expect(darkPublication.getByLabel('Published result')).toContainText('Managed dataset published')
+    await expect(darkPublication.getByLabel('Published result')).toContainText(filename)
     await expect(darkPublication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     const darkPublicationDetails = darkPublication.locator('details')
     await darkPublicationDetails.locator('summary').click()

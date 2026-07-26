@@ -417,10 +417,10 @@ function WriteDestination({ nodeId }: { nodeId: string }) {
         outcomeAdmission={outcomeAdmission} receipt={publicationReceipt}
         outputs={outputs} completed={phase === 'done'} publishing={managed && phase === 'running'} />
       <div className="mt-2">
-        <CodeBtn icon="export" label={managed ? 'Choose managed destination…' : 'Choose destination…'} onClick={() => setDlg(true)} />
+        <CodeBtn icon="export" label="Choose destination…" onClick={() => setDlg(true)} />
       </div>
       {dlg && (
-        <FileDialog mode="save" managed={managed} defaultName={filename} onClose={() => setDlg(false)}
+        <FileDialog mode="save" defaultName={filename} onClose={() => setDlg(false)}
           onPick={(r) => { updateConfig(nodeId, { destId: r.destId, destName: r.destName, destPath: r.path, filename: r.filename }); setDlg(false) }} />
       )}
     </Section>
