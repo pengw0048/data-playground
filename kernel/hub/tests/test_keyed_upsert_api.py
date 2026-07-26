@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -249,9 +250,11 @@ def test_status_and_cancel_are_owner_scoped(tmp_path, monkeypatch):
 def test_postgres_submission_serializes_on_the_owner_row(tmp_path, monkeypatch):
     import threading
 
-    deps, base = _dataset(tmp_path, monkeypatch)
+    owner = f"keyed-submission-{uuid.uuid4().hex}"
+    deps, base = _dataset(tmp_path, monkeypatch, owner_id=owner)
     payload = _payload(deps, _table([2, 4], ["B", "D"]))
-    request = _request(base, payload)
+    request = _request(
+        base, payload, submission_id=f"keyed-submission-{uuid.uuid4().hex}")
     gate = threading.Event()
     original = metadb.submit_keyed_upsert_task
 
@@ -261,12 +264,54 @@ def test_postgres_submission_serializes_on_the_owner_row(tmp_path, monkeypatch):
 
     monkeypatch.setattr(api.metadb, "submit_keyed_upsert_task", barrier)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(api.submit, request, "owner")
-        second = pool.submit(api.submit, request, "owner")
+        first = pool.submit(api.submit, request, owner)
+        second = pool.submit(api.submit, request, owner)
         gate.set()
         results = [first.result(timeout=15), second.result(timeout=15)]
     assert results[0].task_id == results[1].task_id
     assert _revisions(deps, base["dataset_id"]) == 1
+    task_id = results[0].task_id
+    keyed_upsert_tasks._worker(task_id, deps)
+    done = api.status(task_id, owner)
+    assert done.status == "done" and done.receipt is not None
+    assert task_id not in metadb.recoverable_keyed_upsert_task_ids()
+
+
+def test_postgres_runtime_claim_recovers_and_fences_expired_owner(
+        tmp_path, monkeypatch):
+    owner = f"keyed-runtime-{uuid.uuid4().hex}"
+    deps, base = _dataset(tmp_path, monkeypatch, owner_id=owner)
+    payload = _payload(deps, _table([2, 4], ["B", "D"]))
+    request = _request(
+        base, payload, submission_id=f"keyed-runtime-{uuid.uuid4().hex}")
+    task = api.submit(request, owner)
+
+    stale_owner = f"stale-keyed-owner-{uuid.uuid4().hex}"
+    claimed = metadb.claim_keyed_upsert_task(task.task_id, stale_owner)
+    assert claimed is not None
+    stale_attempt = claimed["attempts"][-1]["id"]
+    with metadb.session() as session:
+        attempt = session.get(
+            metadb.DurableTaskAttempt, stale_attempt, with_for_update=True)
+        assert attempt is not None
+        attempt.lease_until = metadb._durable_task_db_now(session) - timedelta(seconds=1)
+
+    assert task.task_id in metadb.recoverable_keyed_upsert_task_ids()
+    keyed_upsert_tasks._worker(task.task_id, deps)
+
+    done = api.status(task.task_id, owner)
+    assert done.status == "done" and done.receipt is not None
+    assert metadb.heartbeat_durable_task(task.task_id, stale_attempt, stale_owner) is False
+    assert metadb.finish_durable_task_attempt(
+        task.task_id, stale_attempt, stale_owner,
+        {"run_id": task.task_id, "status": "failed",
+         "target_node_id": "keyed-upsert"}) is False
+    with metadb.session() as session:
+        attempts = list(session.scalars(
+            select(metadb.DurableTaskAttempt)
+            .where(metadb.DurableTaskAttempt.task_id == task.task_id)
+            .order_by(metadb.DurableTaskAttempt.attempt_number)))
+    assert [attempt.status for attempt in attempts] == ["fenced", "done"]
 
 
 def test_keyed_upsert_task_surfaces_in_jobs_and_inbox_for_owner_only(tmp_path, monkeypatch):

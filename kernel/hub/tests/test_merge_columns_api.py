@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -88,7 +89,9 @@ def _request(
     )
 
 
-def _managed_sidecar_request(tmp_path, monkeypatch, *, submission_id: str | None = None):
+def _managed_sidecar_request(
+        tmp_path, monkeypatch, *, owner_id: str = "owner",
+        submission_id: str | None = None):
     deps = Deps(str(tmp_path / "workspace"), str(tmp_path / "data"), maintain_storage=False)
     monkeypatch.setattr(api, "get_deps", lambda: deps)
 
@@ -126,8 +129,8 @@ def _managed_sidecar_request(tmp_path, monkeypatch, *, submission_id: str | None
     sidecar = {"kind": "exact", "datasetId": sidecar_publication["dataset_id"],
                "revisionId": sidecar_publication["revision_id"]}
     with metadb.session() as session:
-        if session.get(metadb.User, "owner") is None:
-            session.add(metadb.User(id="owner", name="Owner"))
+        if session.get(metadb.User, owner_id) is None:
+            session.add(metadb.User(id=owner_id, name="Owner"))
     return api.ManagedSidecarMergeTaskRequestV1(
         submission_id=submission_id or f"managed-sidecar-{uuid.uuid4().hex}",
         base=base, sidecar=sidecar, expected_head=base,
@@ -139,16 +142,17 @@ def _managed_sidecar_request(tmp_path, monkeypatch, *, submission_id: str | None
 
 def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
         tmp_path, monkeypatch):
-    request = _managed_sidecar_request(tmp_path, monkeypatch)
-    preflight = api.managed_sidecar_preflight(request, "owner")
+    owner = f"sidecar-e2e-{uuid.uuid4().hex}"
+    request = _managed_sidecar_request(tmp_path, monkeypatch, owner_id=owner)
+    preflight = api.managed_sidecar_preflight(request, owner)
     assert preflight.eligible is True
     assert [column.name for column in preflight.output_schema] == ["id", "value", "keep", "derived"]
     assert "uri" not in preflight.model_dump_json().lower()
 
-    task = api.submit_managed_sidecar_merge(request, "owner")
+    task = api.submit_managed_sidecar_merge(request, owner)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        current = api.managed_sidecar_status(task.task_id, "owner")
+        current = api.managed_sidecar_status(task.task_id, owner)
         if current.status in ("done", "failed", "cancelled"):
             break
         time.sleep(0.02)
@@ -156,23 +160,23 @@ def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
     assert current.child_revision_id == current.receipt.revision_id
     assert current.coverage["status"] == "complete"
     assert current.identity_columns == ["id"]
-    assert api.submit_managed_sidecar_merge(request, "owner").task_id == task.task_id
+    assert api.submit_managed_sidecar_merge(request, owner).task_id == task.task_id
     with metadb.session() as session:
         assert not list(session.scalars(select(metadb.LocalResultReference).where(
             metadb.LocalResultReference.owner_kind == "durable_task",
             metadb.LocalResultReference.owner_key == task.task_id,
         )))
 
-    jobs = metadb.list_workspace_runs("owner", run_id=task.task_id)["items"]
+    jobs = metadb.list_workspace_runs(owner, run_id=task.task_id)["items"]
     assert len(jobs) == 1 and jobs[0]["mergeColumns"]["baseDatasetId"] == request.base.dataset_id
     assert jobs[0]["mergeColumns"]["producerKind"] == "managed-sidecar"
-    inbox = metadb.list_durable_task_inbox_items("owner")["items"]
+    inbox = metadb.list_durable_task_inbox_items(owner)["items"]
     assert any(item["task_id"] == task.task_id and item["completed_write"] for item in inbox)
 
     with TestClient(app) as client:
         jobs_response = client.get("/api/jobs", params={"run_id": task.task_id},
-                                   headers={"x-dp-user": "owner"})
-        inbox_response = client.get("/api/inbox", headers={"x-dp-user": "owner"})
+                                   headers={"x-dp-user": owner})
+        inbox_response = client.get("/api/inbox", headers={"x-dp-user": owner})
     assert jobs_response.status_code == inbox_response.status_code == 200
     job = jobs_response.json()["items"][0]
     assert job["datasetContext"]["taskKind"] == "merge_columns_write"
@@ -182,13 +186,83 @@ def test_postgres_compatible_managed_sidecar_task_replays_jobs_and_inbox(
     changed = request.model_copy(deep=True)
     changed.rules[0].target = "keep"
     with pytest.raises(APIError) as conflict:
-        api.submit_managed_sidecar_merge(changed, "owner")
+        api.submit_managed_sidecar_merge(changed, owner)
     assert conflict.value.status_code == 409
     changed_identity = request.model_copy(deep=True)
     changed_identity.identity_columns = ["value"]
     with pytest.raises(APIError) as identity_conflict:
-        api.submit_managed_sidecar_merge(changed_identity, "owner")
+        api.submit_managed_sidecar_merge(changed_identity, owner)
     assert identity_conflict.value.status_code == 409
+
+
+def test_postgres_managed_sidecar_recovers_and_fences_expired_owner(
+        tmp_path, monkeypatch):
+    owner = f"sidecar-recovery-{uuid.uuid4().hex}"
+    request = _managed_sidecar_request(
+        tmp_path, monkeypatch, owner_id=owner,
+        submission_id=f"sidecar-recovery-{uuid.uuid4().hex}")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    task = api.submit_managed_sidecar_merge(request, owner)
+
+    stale_owner = f"stale-sidecar-owner-{uuid.uuid4().hex}"
+    claimed = metadb.claim_merge_columns_task(task.task_id, stale_owner)
+    assert claimed is not None
+    stale_attempt = claimed["attempts"][-1]["id"]
+    with metadb.session() as session:
+        attempt = session.get(
+            metadb.DurableTaskAttempt, stale_attempt, with_for_update=True)
+        assert attempt is not None
+        attempt.lease_until = metadb._durable_task_db_now(session) - timedelta(seconds=1)
+
+    assert task.task_id in metadb.recoverable_merge_columns_task_ids()
+    deps = api.get_deps()
+    monkeypatch.setattr(
+        merge_columns_tasks, "dispatch",
+        lambda task_id, _deps: merge_columns_tasks._worker(task_id, deps))
+    merge_columns_tasks.recover(deps)
+
+    done = api.managed_sidecar_status(task.task_id, owner)
+    assert done.status == "done" and done.receipt is not None
+    assert metadb.heartbeat_durable_task(task.task_id, stale_attempt, stale_owner) is False
+    assert metadb.finish_durable_task_attempt(
+        task.task_id, stale_attempt, stale_owner,
+        {"run_id": task.task_id, "status": "failed",
+         "target_node_id": "managed-sidecar-merge"}) is False
+    with metadb.session() as session:
+        attempts = list(session.scalars(
+            select(metadb.DurableTaskAttempt)
+            .where(metadb.DurableTaskAttempt.task_id == task.task_id)
+            .order_by(metadb.DurableTaskAttempt.attempt_number)))
+    assert [attempt.status for attempt in attempts] == ["fenced", "done"]
+
+
+def test_postgres_managed_sidecar_worker_observes_cancellation(
+        tmp_path, monkeypatch):
+    owner = f"sidecar-cancel-{uuid.uuid4().hex}"
+    request = _managed_sidecar_request(
+        tmp_path, monkeypatch, owner_id=owner,
+        submission_id=f"sidecar-cancel-{uuid.uuid4().hex}")
+    monkeypatch.setattr(api, "dispatch", lambda *_args: None)
+    task = api.submit_managed_sidecar_merge(request, owner)
+    original_merge = merge_columns_tasks.merge_managed_sidecar_candidate
+
+    def merge_then_cancel(*args, **kwargs):
+        candidate = original_merge(*args, **kwargs)
+        api.cancel_managed_sidecar_merge(task.task_id, owner)
+        return candidate
+
+    monkeypatch.setattr(
+        merge_columns_tasks, "merge_managed_sidecar_candidate", merge_then_cancel)
+    merge_columns_tasks._worker(task.task_id, api.get_deps())
+
+    cancelled = api.managed_sidecar_status(task.task_id, owner)
+    assert cancelled.status == "cancelled" and cancelled.receipt is None
+    head = metadb.catalog_managed_local_head_for_dataset(request.base.dataset_id)
+    assert head is not None and head["revision_id"] == request.base.revision_id
+    with metadb.session() as session:
+        attempts = list(session.scalars(select(metadb.DurableTaskAttempt).where(
+            metadb.DurableTaskAttempt.task_id == task.task_id)))
+    assert len(attempts) == 1 and attempts[0].status == "cancelled"
 
 
 def test_managed_sidecar_invalid_or_moved_head_creates_no_task(tmp_path, monkeypatch):

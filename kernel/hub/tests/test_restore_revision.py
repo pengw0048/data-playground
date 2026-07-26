@@ -69,13 +69,17 @@ def _run(deps, task_id: str) -> None:
 
 
 def test_restore_old_revision_publishes_new_head_and_keeps_history(tmp_path, monkeypatch):
-    deps, dataset_id, old_revision, head_revision = _dataset(tmp_path, monkeypatch)
+    owner = f"restore-publish-{os.urandom(16).hex()}"
+    deps, dataset_id, old_revision, head_revision = _dataset(
+        tmp_path, monkeypatch, owner_id=owner)
     task = api.submit(dataset_id, old_revision,
-                      RestoreRevisionRequestV1(submission_id="s1", expected_head_revision_id=head_revision),
-                      "owner")
+                      RestoreRevisionRequestV1(
+                          submission_id=f"restore-publish-{os.urandom(16).hex()}",
+                          expected_head_revision_id=head_revision),
+                      owner)
     assert task.status == "queued"
     _run(deps, task.task_id)
-    done = api.status(task.task_id, "owner")
+    done = api.status(task.task_id, owner)
     assert done.status == "done" and done.receipt is not None
     child = done.child_revision_id
     assert child not in (None, old_revision, head_revision)
@@ -146,15 +150,19 @@ def test_unavailable_source_revision_is_rejected(tmp_path, monkeypatch):
 
 
 def test_restart_recovery_publishes_a_pending_task(tmp_path, monkeypatch):
-    deps, dataset_id, old_revision, head_revision = _dataset(tmp_path, monkeypatch)
+    owner = f"restore-recovery-{os.urandom(16).hex()}"
+    deps, dataset_id, old_revision, head_revision = _dataset(
+        tmp_path, monkeypatch, owner_id=owner)
     task = api.submit(dataset_id, old_revision,
-                      RestoreRevisionRequestV1(submission_id="s1", expected_head_revision_id=head_revision),
-                      "owner")
+                      RestoreRevisionRequestV1(
+                          submission_id=f"restore-recovery-{os.urandom(16).hex()}",
+                          expected_head_revision_id=head_revision),
+                      owner)
     assert task.task_id in metadb.recoverable_restore_revision_task_ids()
     monkeypatch.setattr(restore_revision_tasks, "dispatch",
                         lambda task_id, _deps: restore_revision_tasks._worker(task_id, deps))
     restore_revision_tasks.recover(deps)
-    assert api.status(task.task_id, "owner").status == "done"
+    assert api.status(task.task_id, owner).status == "done"
 
 
 def test_status_is_owner_scoped_and_never_echoes_the_task_id(tmp_path, monkeypatch):
