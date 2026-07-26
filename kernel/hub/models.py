@@ -723,6 +723,8 @@ class RelatedDatasetCandidate(Wire):
     left_columns: list[str]
     right_columns: list[str]
     cardinality: Cardinality = "unknown"
+    cardinality_state: Literal["available", "unmeasured"] = "unmeasured"
+    cardinality_reason: str | None = None
     confidence: Literal["declared", "verified", "inferred"] = "inferred"
     exact_ref: ExactDatasetRef | None = None
     warning: str | None = None

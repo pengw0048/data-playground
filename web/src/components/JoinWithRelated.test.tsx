@@ -38,12 +38,14 @@ const page = {
     name: 'users', folder: 'curated', reason: 'events.user_id references users',
     evidence: 'typed_reference', evidenceStatus: 'proven',
     leftColumns: ['user_id'], rightColumns: ['id'], cardinality: 'unknown',
+    cardinalityState: 'unmeasured',
     confidence: 'verified',
   }, {
     identity: { kind: 'local', registrationId: 'reg-orders', revisionMode: 'current' },
     name: 'orders', folder: '', reason: 'matching key column(s) — cardinality not measurable here',
     evidence: 'schema_match', evidenceStatus: 'inferred',
     leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:N',
+    cardinalityState: 'available',
     confidence: 'verified', warning: 'This join is 1:N: right fans out, so rows may multiply.',
   }],
   excluded: [],
@@ -132,6 +134,8 @@ describe('JoinWithRelated', () => {
       identity: { kind: 'local', registrationId: 'reg-users', revisionMode: 'exact', revisionId: 'rev-2' },
       exactRef: { kind: 'exact', datasetId: 'reg-users', revisionId: 'rev-2' },
       cardinality: 'unknown', confidence: 'inferred',
+      cardinalityState: 'unmeasured',
+      cardinalityReason: 'Fan-out was not measured because this join uses an exact revision; measuring it would require scanning the pinned dataset.',
     })
     render(<JoinWithRelated nodeId="source-1" />)
     fireEvent.click(screen.getByRole('button', { name: 'Join with…' }))
@@ -143,6 +147,7 @@ describe('JoinWithRelated', () => {
       page.source, page.candidates[0], 'rev-2', expect.any(Object),
     ))
     expect(screen.getByText('reg-users@rev-2')).toBeVisible()
+    expect(screen.getByText(/Fan-out was not measured because this join uses an exact revision/)).toBeVisible()
   })
 
   it('keeps a failed exact choice selected and cannot confirm the current candidate by mistake', async () => {

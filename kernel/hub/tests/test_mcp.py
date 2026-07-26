@@ -212,6 +212,7 @@ def test_related_datasets_requires_a_structured_stable_identity():
         "limit": 1,
     })
     assert result["state"] == "available"
+    assert {"cardinalityState", "cardinalityReason"} <= set(result["candidates"][0])
     assert call("related_datasets", {"dataset": table.uri})["isError"] is True
     schema = next(item for item in rpc("tools/list")["result"]["tools"]
                   if item["name"] == "related_datasets")["inputSchema"]

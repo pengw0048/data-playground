@@ -578,6 +578,8 @@ export interface RelatedDatasetCandidate {
   leftColumns: string[]
   rightColumns: string[]
   cardinality: Cardinality
+  cardinalityState: 'available' | 'unmeasured'
+  cardinalityReason?: string | null
   confidence: 'declared' | 'verified' | 'inferred'
   exactRef?: ExactDatasetRef | null
   warning?: string | null

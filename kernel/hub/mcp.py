@@ -1133,7 +1133,7 @@ def _tool_specs(pg: Playground) -> list[dict]:
         {"name": "related_datasets", "handler": pg.related_datasets,
          "description": "Read one bounded, evidence-ranked set of datasets related to a selected "
                         "dataset. Declared relationships lead typed row references and inferred schema "
-                        "matches; only returned candidates have cardinality measured. Read-only.",
+                        "matches; candidates report available or explicitly unmeasured cardinality. Read-only.",
          "inputSchema": _schema({
              "source": {
                  "type": "object", "additionalProperties": False,
