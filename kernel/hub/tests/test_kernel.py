@@ -5211,36 +5211,59 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
     real = resolve(os.path.join(region_root, "probe.parquet"))
     entered = threading.Event()
     release_timeout = threading.Event()
+    virtual_timeout_fired = threading.Event()
     real_monotonic = time.monotonic
     frozen_at = real_monotonic()
+    headless_thread_ids = []
+    headless_real_clock = []
+    handoff_thread_ids = []
+    handoff_real_clock = []
 
-    def virtual_monotonic():
-        # Keep the CLI's timeout clock at submission until the adapter has actually entered the handoff
-        # write. The test then advances time in one causal step instead of racing a 10ms timeout against
-        # _headless_run's 250ms poll interval.
-        return frozen_at + (1 if entered.is_set() or release_timeout.is_set() else 0)
+    def scoped_monotonic():
+        # Only the thread executing _headless_run sees the frozen submission clock. Advance it once after
+        # handoff entry so that the CLI observes its timeout, then restore the real clock for the bounded
+        # cancel-ack wait. RunController and adapter threads always receive the real monotonic clock.
+        if not headless_thread_ids or threading.get_ident() != headless_thread_ids[0]:
+            return real_monotonic()
+        if virtual_timeout_fired.is_set():
+            observed = real_monotonic()
+            headless_real_clock.append(observed)
+            return observed
+        if entered.is_set() or release_timeout.is_set():
+            virtual_timeout_fired.set()
+            return frozen_at + 0.02
+        return frozen_at
 
     class _SlowRegionAdapter:
         def __getattr__(self, name):
             return getattr(real, name)
 
         def write(self, uri, rel, mode="overwrite", partition_by=None, cancelled=None):
-            entered.set()
-            assert cancelled is not None
-            while not cancelled():
-                time.sleep(0.01)
-            return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
+            handoff_thread_ids.append(threading.get_ident())
+            handoff_real_clock.append(time.monotonic())
+            try:
+                entered.set()
+                assert cancelled is not None
+                while not cancelled():
+                    time.sleep(0.01)
+                return real.write(uri, rel, mode, partition_by=partition_by, cancelled=cancelled)
+            finally:
+                handoff_real_clock.append(time.monotonic())
 
     slow = _SlowRegionAdapter()
     monkeypatch.setattr(d, "resolve_adapter",
                         lambda uri: slow if os.path.dirname(str(uri)) == region_root else resolve(uri))
-    monkeypatch.setattr(time, "monotonic", virtual_monotonic)
+    monkeypatch.setattr(time, "monotonic", scoped_monotonic)
     previous_backend = metadb.get_setting("backend", "global", default="") or ""
     metadb.set_setting("backend", "local-out-of-core", "global")
     result = {}
 
     def run_headless():
-        result["code"] = _headless_run(d, cid, "wr", 0.01, as_json=False)
+        headless_thread_ids.append(threading.get_ident())
+        try:
+            result["code"] = _headless_run(d, cid, "wr", 0.01, as_json=False)
+        except BaseException as exc:  # propagate worker failures on the asserting test thread
+            result["error"] = exc
 
     worker = threading.Thread(target=run_headless, daemon=True)
     try:
@@ -5254,6 +5277,13 @@ def test_headless_timeout_cancels_multi_region_handoff(tmp_path, monkeypatch, ca
         metadb.set_setting("backend", previous_backend, "global")
 
     assert not worker.is_alive(), "headless timeout did not finish cancellation"
+    assert "error" not in result, repr(result.get("error"))
+    assert virtual_timeout_fired.is_set(), "test never advanced the headless timeout clock"
+    assert len(headless_real_clock) >= 2 and headless_real_clock[-1] > headless_real_clock[0], (
+        "cancel acknowledgement did not advance on the real headless clock")
+    assert handoff_thread_ids and handoff_thread_ids[0] != headless_thread_ids[0]
+    assert len(handoff_real_clock) == 2 and handoff_real_clock[1] > handoff_real_clock[0], (
+        "virtual headless time leaked into the handoff worker")
     code = result.get("code")
 
     captured = capsys.readouterr()
