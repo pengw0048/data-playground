@@ -713,6 +713,38 @@ def _missing_bounded_schema_blocker(graph: Graph, node_id: str) -> str:
     )
 
 
+def _managed_file_schema_drift(
+        compared_head: ExactDatasetRef,
+        before: list[ColumnSchema],
+        after: list[ColumnSchema],
+):
+    """Freeze existing compatibility evidence while gating only real structural drift."""
+    from hub.models import WriteSchemaDrift
+
+    compatibility = metadb.diff_columns(
+        [column.model_dump(by_alias=True, mode="json") for column in before],
+        [column.model_dump(by_alias=True, mode="json") for column in after],
+    )
+    old_by_name = {column.name: column for column in before}
+    new_by_name = {column.name: column for column in after}
+    structural = False
+    for field in compatibility.fields:
+        if field.kind != "unchanged":
+            structural = True
+            break
+        old = old_by_name.get(field.old_name or "")
+        new = new_by_name.get(field.new_name or "")
+        if (old is None or new is None
+                or not metadb.logical_types_equivalent(old.type, new.type)):
+            structural = True
+            break
+    return WriteSchemaDrift(
+        compared_head=compared_head,
+        compatibility=compatibility,
+        requires_confirmation=structural,
+    )
+
+
 def _write_admission_for_graph(
         deps, graph, node_id: str, uid: str, submission_id: str,
         supplied: WriteIntent | None = None, *, direct_local: bool = False) -> WriteAdmission:
@@ -942,6 +974,35 @@ def _write_admission_for_graph(
                                if recovered is not None else None),
         )
 
+    if supplied is not None:
+        if (supplied.destination.logical_uri != logical_uri
+                or supplied.destination.name != spec.name
+                or supplied.expected_schema != normalized_schema
+                or supplied.idempotency_key != lineage.idempotency_key
+                or supplied.provenance != provenance
+                or supplied.partitions != partitions):
+            raise HTTPException(409, "write admission does not match the submitted graph")
+        try:
+            recovered = metadb.catalog_managed_local_write_receipt(
+                supplied.model_dump(by_alias=True, mode="json"))
+        except metadb.ManagedLocalWriteConflict as exc:
+            raise HTTPException(
+                409, "write admission is stale; re-admit the current destination head and retry"
+            ) from exc
+        if recovered is not None:
+            return WriteAdmission(
+                node_id=node_id,
+                managed=True,
+                destination=logical_uri,
+                mode=supplied.mode,
+                provider="managed-local-file",
+                expected_schema=supplied.expected_schema,
+                partitions=supplied.partitions,
+                expected_head=supplied.expected_head,
+                intent=supplied,
+                recovered_receipt=WriteReceipt.model_validate(recovered),
+            )
+
     head = metadb.catalog_managed_local_write_head(logical_uri)
     replacing = bool(
         head is not None and head.get("state") == "active" and head.get("revision_id"))
@@ -956,6 +1017,28 @@ def _write_admission_for_graph(
         dataset_id=str(head["dataset_id"]),
         revision_id=str(head["revision_id"]),
     ) if replacing else None)
+    schema_drift = None
+    if expected_head is not None and not direct_local:
+        try:
+            previous_schema = metadb.catalog_managed_local_revision_schema(expected_head)
+        except RuntimeError as exc:
+            if supplied is not None:
+                raise HTTPException(
+                    409, "write admission cannot reopen the exact destination schema metadata"
+                ) from exc
+            return WriteAdmission(
+                node_id=node_id,
+                managed=True,
+                destination=logical_uri,
+                mode="replace",
+                provider="managed-local-file",
+                expected_schema=normalized_schema,
+                partitions=partitions,
+                expected_head=expected_head,
+                blocker="the exact destination head has no valid retained schema metadata",
+            )
+        schema_drift = _managed_file_schema_drift(
+            expected_head, previous_schema, normalized_schema)
     intent = supplied or WriteIntent(
         destination=WriteDestination(
             logical_uri=logical_uri,
@@ -968,11 +1051,17 @@ def _write_admission_for_graph(
         idempotency_key=lineage.idempotency_key,
         partitions=partitions,
         provenance=provenance,
+        schema_drift=schema_drift,
     )
     if supplied is not None and (
             intent.destination.logical_uri != logical_uri
             or intent.destination.name != spec.name
             or intent.expected_schema != normalized_schema):
+        raise HTTPException(409, "write admission does not match the submitted graph")
+    if supplied is not None and intent.expected_head != expected_head:
+        raise HTTPException(
+            409, "write admission is stale; re-admit the current destination head and retry")
+    if supplied is not None and intent.schema_drift != schema_drift:
         raise HTTPException(409, "write admission does not match the submitted graph")
     if supplied is not None and (
             intent.idempotency_key != lineage.idempotency_key
@@ -2722,6 +2811,16 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if write_admission.managed:
             if write_admission.blocker or write_admission.intent is None:
                 raise HTTPException(409, write_admission.blocker or "write admission failed")
+            drift = write_admission.intent.schema_drift
+            if drift is not None and drift.requires_confirmation:
+                if write_intent is None:
+                    raise HTTPException(
+                        409,
+                        "schema drift confirmation requires the displayed write admission")
+                if not confirmed:
+                    raise HTTPException(
+                        409,
+                        "schema drift requires explicit confirmation before publication")
             effective_write_intent = write_admission.intent
             _inject_write_intent(graph, target_node_id, write_admission.intent)
             _inject_write_intent(durable_graph, target_node_id, write_admission.intent)

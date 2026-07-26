@@ -769,6 +769,13 @@ export interface WriteIntent {
     publication: { idempotencyKey: string; runId?: string | null; attemptId?: string | null; producer?: string | null; producerVersion?: number | null; stepId?: string | null; provenance: string }
     parents: string[]
   }
+  schemaDrift?: WriteSchemaDrift | null
+}
+
+export interface WriteSchemaDrift {
+  comparedHead: { kind: 'exact'; datasetId: string; revisionId: string }
+  compatibility: SchemaCompatibility
+  requiresConfirmation: boolean
 }
 
 export interface WriteReceipt {
@@ -782,6 +789,7 @@ export interface WriteReceipt {
   schema: { name: string; type: string; capabilities?: string[] }[]
   partitions: { field: string }[]
   publication: { provider: string; logicalUri: string; artifactUri: string; publishSequence: number; idempotencyKey: string; catalogVersion?: string | null; backendVersion?: string | null }
+  schemaDrift?: WriteSchemaDrift | null
   executionManifestSha256?: string | null
   durable: true
 }

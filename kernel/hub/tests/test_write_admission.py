@@ -160,6 +160,37 @@ def _run_allocation_counts() -> tuple[int, int, int, int]:
             ))
 
 
+def _set_exact_revision_schema(revision_id: str, columns: list[dict]) -> None:
+    with metadb.session() as session:
+        row = session.get(metadb.ManagedLocalFileRevision, revision_id)
+        assert row is not None
+        table = json.loads(row.table_doc)
+        table["columns"] = [
+            ColumnSchema.model_validate(column).model_dump(by_alias=True, mode="json")
+            for column in columns
+        ]
+        row.table_doc = json.dumps(table)
+
+
+def _admit_schema_change(contract, monkeypatch, before: list[dict], after: list[dict]):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "schema-create")
+    receipt = _publish(deps, create, [1])
+    _set_exact_revision_schema(receipt.revision_id, before)
+    proposed = [ColumnSchema.model_validate(column) for column in after]
+    monkeypatch.setattr(
+        run_routes,
+        "schema_for_graph",
+        lambda *_args, **_kwargs: {"source": proposed, "write": proposed},
+    )
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "schema-replace")
+    assert admission.intent is not None
+    assert admission.intent.schema_drift is not None
+    return deps, graph, admission
+
+
 @pytest.mark.parametrize(
     ("filename", "reason"),
     [
@@ -372,6 +403,7 @@ def test_preflight_is_metadata_only_and_derives_create_then_replace(contract):
     assert create.managed is True
     assert create.mode == "create"
     assert create.expected_head is None
+    assert create.intent is not None and create.intent.schema_drift is None
     assert [(column.name, column.type) for column in create.expected_schema] == [("value", "int")]
     assert set(os.listdir(deps.storage.result_root)) == before
 
@@ -383,6 +415,195 @@ def test_preflight_is_metadata_only_and_derives_create_then_replace(contract):
     assert replace.expected_head.revision_id == receipt.revision_id
     assert replace.intent is not None
     assert replace.intent.destination.dataset_id == receipt.dataset_id
+    assert replace.intent.schema_drift is not None
+    assert replace.intent.schema_drift.requires_confirmation is False
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected_kind", "expected_status", "requires_confirmation"),
+    [
+        (
+            [{"name": "value", "type": "int", "nullable": None}],
+            [{"name": "value", "type": "int", "nullable": None}],
+            "unchanged", "unknown", False,
+        ),
+        (
+            [{"name": "value", "type": "int", "nullable": True}],
+            [
+                {"name": "value", "type": "int", "nullable": True},
+                {"name": "extra", "type": "string", "nullable": True},
+            ],
+            "added", "compatible", True,
+        ),
+        (
+            [{"name": "value", "type": "int", "nullable": True}],
+            [{"name": "other", "type": "int", "nullable": True}],
+            "removed", "unknown", True,
+        ),
+        (
+            [{"fieldId": "field-1", "name": "value", "type": "int", "nullable": True}],
+            [{"fieldId": "field-1", "name": "amount", "type": "int", "nullable": True}],
+            "renamed", "compatible", True,
+        ),
+        (
+            [{"fieldId": "field-1", "name": "value", "type": "int", "nullable": True}],
+            [{"fieldId": "field-2", "name": "value", "type": "int", "nullable": True}],
+            "changed", "unknown", True,
+        ),
+        (
+            [{"name": "value", "type": "int", "nullable": True}],
+            [{"name": "value", "type": "int32", "nullable": True}],
+            "unchanged", "compatible", False,
+        ),
+        (
+            [{"name": "value", "type": "int", "nullable": True}],
+            [{"name": "value", "type": "bigint", "nullable": True}],
+            "unchanged", "compatible", True,
+        ),
+        (
+            [{"name": "value", "type": "int", "nullable": True}],
+            [{"name": "value", "type": "string", "nullable": True}],
+            "unchanged", "breaking", True,
+        ),
+    ],
+)
+def test_replace_freezes_bounded_exact_head_schema_drift(
+        contract, monkeypatch, before, after, expected_kind, expected_status,
+        requires_confirmation):
+    _deps, _graph, admission = _admit_schema_change(
+        contract, monkeypatch, before, after)
+    evidence = admission.intent.schema_drift
+    assert evidence is not None
+    assert evidence.compared_head == admission.expected_head
+    field = next(item for item in evidence.compatibility.fields
+                 if item.kind == expected_kind and item.status == expected_status)
+    assert field is not None
+    assert evidence.requires_confirmation is requires_confirmation
+
+
+def test_replace_fails_closed_when_exact_head_schema_metadata_is_corrupt(
+        contract, monkeypatch):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "corrupt-schema-create")
+    receipt = _publish(deps, create, [1])
+    with metadb.session() as session:
+        row = session.get(metadb.ManagedLocalFileRevision, receipt.revision_id)
+        assert row is not None
+        row.table_doc = "{not-json"
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "corrupt-schema-replace")
+
+    assert admission.intent is None
+    assert admission.expected_head is not None
+    assert admission.blocker == \
+        "the exact destination head has no valid retained schema metadata"
+
+
+def test_structural_drift_requires_the_displayed_admission_before_allocation(
+        contract, monkeypatch):
+    deps, graph, admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [
+            {"name": "value", "type": "int", "nullable": True},
+            {"name": "extra", "type": "string", "nullable": True},
+        ],
+    )
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(HTTPException, match="explicit confirmation") as unconfirmed:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=False, submission_id="schema-replace",
+            write_intent=admission.intent,
+        )
+    assert unconfirmed.value.status_code == 409
+
+    with pytest.raises(HTTPException, match="displayed write admission") as undisplayed:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="drift-gate-undisplayed",
+        )
+    assert undisplayed.value.status_code == 409
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+    class ConfirmedAdmissionReached(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        run_routes,
+        "_local_run_intent_sha256",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConfirmedAdmissionReached()),
+    )
+    with pytest.raises(ConfirmedAdmissionReached):
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="schema-replace",
+            write_intent=admission.intent,
+        )
+    assert _run_allocation_counts() == before_runs
+
+
+def test_drift_receipt_preserves_exact_comparison_and_recovers_after_response_loss(
+        contract, monkeypatch):
+    deps, graph, admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [
+            {"name": "value", "type": "int", "nullable": True},
+            {"name": "extra", "type": "int", "nullable": True},
+        ],
+    )
+    assert admission.intent is not None
+
+    receipt = write_managed_local_file(
+        storage=deps.storage,
+        catalog=deps.catalog,
+        intent=admission.intent,
+        write_artifact=lambda uri: pq.write_table(
+            pa.table({"value": [1], "extra": [2]}), uri),
+    )
+    recovered = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "schema-replace",
+        supplied=admission.intent,
+    )
+
+    assert receipt.schema_drift == admission.intent.schema_drift
+    assert receipt.parent_head == admission.intent.schema_drift.compared_head
+    assert recovered.recovered_receipt == receipt
+
+
+def test_drift_runtime_schema_mismatch_publishes_nothing(contract, monkeypatch):
+    deps, _graph, admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [
+            {"name": "value", "type": "int", "nullable": True},
+            {"name": "extra", "type": "int", "nullable": True},
+        ],
+    )
+    assert admission.intent is not None
+    before = _managed_publication_counts()
+
+    with pytest.raises(ValueError, match="output schema does not match"):
+        write_managed_local_file(
+            storage=deps.storage,
+            catalog=deps.catalog,
+            intent=admission.intent,
+            write_artifact=lambda uri: pq.write_table(pa.table({"value": [1]}), uri),
+        )
+
+    assert _managed_publication_counts() == before
 
 
 def test_admitted_exact_source_schema_uses_its_revision_without_mutable_scan(tmp_path):
@@ -897,6 +1118,7 @@ def test_lance_append_admission_freezes_registered_exact_head_without_allocation
     assert admission.expected_head is not None
     assert admission.expected_head.revision_id == "1"
     assert admission.intent is not None
+    assert admission.intent.schema_drift is None
     assert admission.intent.destination.logical_uri == table.uri
     assert admission.intent.destination.dataset_id == admission.expected_head.dataset_id
     assert [(column.name, column.type) for column in admission.expected_schema] == [("value", "int")]

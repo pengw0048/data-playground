@@ -71,6 +71,30 @@ describe('WritePublicationSummary exact receipt action', () => {
     expect(screen.getByLabelText('Published result')).toHaveTextContent('published · revision revision-7 · 2 rows')
   })
 
+  it('reloads exact schema comparison evidence from the receipt alone', () => {
+    const withDrift = {
+      ...receipt,
+      parentHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
+      schemaDrift: {
+        comparedHead: { kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-6' },
+        compatibility: { status: 'unknown', fields: [{
+          kind: 'changed', status: 'unknown', fieldId: 'field-1',
+          oldName: 'amount', newName: 'amount',
+          reason: 'field identity is missing or changed, so the name match is not proven stable',
+        }] },
+        requiresConfirmation: true,
+      },
+    } as any
+
+    render(<WritePublicationSummary outputName="output" destination="Workspace outputs"
+      receipt={withDrift} completed />)
+
+    const comparisons = screen.getAllByLabelText('Schema comparison')
+    expect(comparisons[0]).toHaveTextContent('dataset-1@revision-6')
+    expect(comparisons[0]).toHaveTextContent('changed · unknown')
+    expect(comparisons[0]).toHaveTextContent('Structural schema drift requires explicit confirmation')
+  })
+
   it('does not promise a managed revision for provider-neutral admission', () => {
     const admission = {
       nodeId: 'write', managed: false, provider: 'plugin-sink', mode: 'overwrite',

@@ -2172,7 +2172,22 @@ export const useStore = create<Store>((set, get) => ({
       return
     }
     if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
-    if (estimate.needsConfirm) {
+    let writeAdmission: WriteAdmission | undefined
+    if (get().doc.nodes.find((node) => node.id === id)?.type === 'write') {
+      try {
+        writeAdmission = await get().prepareWrite(id)
+        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+      } catch (e) {
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? {}), phase: 'failed', estimate,
+          error: (e as Error).message || 'Could not admit the write',
+        } } }))
+        get().pushToast((e as Error).message || 'Could not admit the write', 'error')
+        return
+      }
+    }
+    const schemaDriftConfirm = writeAdmission?.intent?.schemaDrift?.requiresConfirmation === true
+    if (estimate.needsConfirm || schemaDriftConfirm) {
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate, phase: 'confirm',
       } }, openPanels: { [id]: 'run' } }))
@@ -2290,9 +2305,16 @@ export const useStore = create<Store>((set, get) => ({
           : await api.estimate(doc, id, binding.inputManifest)
         : parameters?.length ? await api.estimate(doc, id, undefined, parameters) : await api.estimate(doc, id)
       if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return
+      let writeAdmission: WriteAdmission | undefined
+      if (doc.nodes.find((node) => node.id === id)?.type === 'write') {
+        writeAdmission = await get().prepareWrite(id)
+        if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
+      }
       set((s) => ({ runs: { ...s.runs, [id]: {
         ...(s.runs[id] ?? {}), estimate,
-        phase: estimate.needsConfirm ? 'confirm' : 'estimated',
+        phase: estimate.needsConfirm
+          || writeAdmission?.intent?.schemaDrift?.requiresConfirmation === true
+          ? 'confirm' : 'estimated',
       } } }))
     } catch (e) {
       if (parameterRequestFingerprint(get().doc, id, get().runs[id]?.parameterBindings) !== requestFingerprint) return

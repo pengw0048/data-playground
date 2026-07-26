@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import { api } from '../api/client'
-import type { DatasetRevisionDetail, RunOutput, WriteAdmission, WriteReceipt } from '../types/api'
+import type {
+  DatasetRevisionDetail, RunOutput, WriteAdmission, WriteReceipt, WriteSchemaDrift,
+} from '../types/api'
 
 export function publicationMode(mode: WriteAdmission['mode'] | undefined): string {
   if (mode === 'create') return 'Create a new dataset'
@@ -52,6 +54,30 @@ function schemaText(fields: { name: string; type: string }[]): string {
 
 function partitionText(partitions: { field: string }[]): string {
   return partitions.length ? partitions.map((partition) => partition.field).join(', ') : 'unpartitioned'
+}
+
+function SchemaDriftEvidence({ evidence }: { evidence: WriteSchemaDrift }) {
+  const visible = evidence.compatibility.fields.slice(0, 12)
+  const hidden = evidence.compatibility.fields.length - visible.length
+  return <div aria-label="Schema comparison" className="rounded border border-border bg-background px-2 py-1.5">
+    <div className="font-semibold text-foreground">
+      Exact schema comparison · {evidence.compatibility.status}
+    </div>
+    <div>
+      Compared head <span className="font-mono">
+        {evidence.comparedHead.datasetId}@{evidence.comparedHead.revisionId}
+      </span>
+    </div>
+    <div className={evidence.requiresConfirmation ? 'font-semibold text-amber-700 dark:text-amber-300' : ''}>
+      {evidence.requiresConfirmation
+        ? 'Structural schema drift requires explicit confirmation.'
+        : 'No structural schema drift requires confirmation.'}
+    </div>
+    {visible.map((field, index) => <div key={`${field.kind}:${field.fieldId ?? ''}:${field.oldName ?? ''}:${field.newName ?? ''}:${index}`}>
+      {field.kind} · {field.status} · {field.oldName ?? '—'} → {field.newName ?? '—'} · {field.reason}
+    </div>)}
+    {hidden > 0 && <div>{hidden} more retained comparison fields are not shown.</div>}
+  </div>
 }
 
 function AdmissionDetails({ label, admission }: { label: string; admission: WriteAdmission }) {
@@ -134,6 +160,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
   const providerNeutral = summaryAdmission?.managed === false
   const acceptedName = receipt?.name ?? summaryAdmission?.intent?.destination.name
   const displayedName = acceptedName ?? outputName
+  const schemaDrift = receipt?.schemaDrift ?? summaryAdmission?.intent?.schemaDrift
   return <section aria-label="Write publication" className={classes}>
     <div className="grid gap-1.5">
       <div>
@@ -157,6 +184,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
         <span className="font-semibold text-foreground">{managed ? 'Revision mode' : 'Write mode'}</span>
         <div className="text-muted-foreground">{managed ? publicationMode(summaryAdmission?.mode) : writeMode(summaryAdmission?.mode)}</div>
       </div>
+      {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
       {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
         <strong>Cannot publish until</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
@@ -164,6 +192,9 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
             {providerNeutral ? 'Provider output completed without a managed revision receipt.' : 'Publication outcome is unknown; no exact receipt was recorded.'}
           </div>
         : publishing ? <div aria-label="Write readiness" role="status" className="text-primary">Publishing this managed revision…</div>
+        : schemaDrift?.requiresConfirmation ? <div aria-label="Write readiness" className="text-amber-700 dark:text-amber-300">
+            Confirm this exact schema comparison before publishing.
+          </div>
         : summaryAdmission ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">
             {managed ? 'Ready to publish a managed revision' : 'Ready to run with provider output'}
           </div>

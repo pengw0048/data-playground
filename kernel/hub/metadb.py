@@ -13711,6 +13711,17 @@ _NUMERIC_TYPE_RANK = {
 }
 
 
+def logical_types_equivalent(before: str, after: str) -> bool:
+    """Whether two logical spellings describe the same type without widening."""
+    before, after = before.strip().lower(), after.strip().lower()
+    if not before or not after:
+        return False
+    if before == after:
+        return True
+    old_rank, new_rank = _NUMERIC_TYPE_RANK.get(before), _NUMERIC_TYPE_RANK.get(after)
+    return old_rank is not None and old_rank == new_rank
+
+
 def _type_change_status(before: str, after: str) -> tuple[str, str]:
     before, after = before.strip().lower(), after.strip().lower()
     if not before or not after:
@@ -18262,8 +18273,9 @@ def _managed_local_write_receipt_in_session(
         raise ManagedLocalWriteConflict(
             f"managed local write idempotency key collision: {idempotency_key}")
     try:
-        from hub.models import WriteReceipt
+        from hub.models import WriteIntent, WriteReceipt
 
+        intent = WriteIntent.model_validate_json(intent_doc)
         receipt = WriteReceipt.model_validate(json.loads(revision.write_receipt_doc or ""))
     except (TypeError, ValueError) as exc:
         raise RuntimeError("managed local write receipt is invalid") from exc
@@ -18283,6 +18295,7 @@ def _managed_local_write_receipt_in_session(
             or receipt.publication.idempotency_key != idempotency_key
             or receipt.provenance.publication.run_id != revision.run_id
             or receipt.execution_manifest_sha256 != revision.execution_manifest_sha256
+            or receipt.schema_drift != intent.schema_drift
             or receipt.name != revision_name
             or ref is None):
         raise RuntimeError("managed local write receipt lost its exact revision evidence")
@@ -18469,6 +18482,22 @@ def catalog_managed_local_write_head(logical_uri: str) -> dict | None:
         raise ValueError("managed local write requires a logical destination URI")
     with session() as s:
         return _managed_local_write_head_in_session(s, normalized)
+
+
+def catalog_managed_local_revision_schema(exact) -> list[ColumnSchema]:
+    """Read one immutable managed-file revision schema without reopening or scanning its artifact."""
+    from hub.models import CatalogTable, ExactDatasetRef
+
+    ref = ExactDatasetRef.model_validate(exact)
+    with session() as s:
+        row = s.get(ManagedLocalFileRevision, ref.revision_id)
+        if row is None or row.logical_id != ref.dataset_id:
+            raise RuntimeError("managed local revision schema metadata is missing")
+        try:
+            table = CatalogTable.model_validate(json.loads(row.table_doc))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("managed local revision schema metadata is invalid") from exc
+        return table.columns
 
 
 def catalog_managed_local_head_for_dataset(dataset_id: str) -> dict | None:
@@ -18951,6 +18980,7 @@ def catalog_publish_managed_local_file(
                     catalog_version=payload.get("version"),
                 ),
                 provenance=typed_intent.provenance,
+                schema_drift=typed_intent.schema_drift,
                 execution_manifest_sha256=execution_manifest_sha256,
             )
             revision.write_idempotency_key = typed_intent.idempotency_key

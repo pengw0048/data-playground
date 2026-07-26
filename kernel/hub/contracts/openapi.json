@@ -13307,6 +13307,16 @@
           },
           "provenance": {
             "$ref": "#/components/schemas/WriteProvenance"
+          },
+          "schemaDrift": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteSchemaDrift"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -13510,6 +13520,16 @@
             "maxItems": 1024,
             "title": "Schema",
             "type": "array"
+          },
+          "schemaDrift": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteSchemaDrift"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -13523,6 +13543,29 @@
           "provenance"
         ],
         "title": "WriteReceipt",
+        "type": "object"
+      },
+      "WriteSchemaDrift": {
+        "additionalProperties": false,
+        "description": "Frozen exact-head schema comparison for one ordinary managed-file replacement.",
+        "properties": {
+          "comparedHead": {
+            "$ref": "#/components/schemas/ExactDatasetRef"
+          },
+          "compatibility": {
+            "$ref": "#/components/schemas/SchemaCompatibility"
+          },
+          "requiresConfirmation": {
+            "title": "Requiresconfirmation",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "comparedHead",
+          "compatibility",
+          "requiresConfirmation"
+        ],
+        "title": "WriteSchemaDrift",
         "type": "object"
       },
       "_RetryRequest": {

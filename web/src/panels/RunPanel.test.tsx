@@ -253,6 +253,44 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByLabelText('Run outputs')).not.toBeInTheDocument()
   })
 
+  it('shows exact schema drift before the confirmation click', () => {
+    mocks.state.doc.nodes = [{
+      id: 'target', type: 'write', position: { x: 0, y: 0 },
+      data: { title: 'Write', status: 'draft', config: { filename: 'results' } },
+    }]
+    mocks.state.doc.parameters = []
+    mocks.state.runs = { target: {
+      phase: 'confirm', estimate: { rows: 2, placement: 'local', needsConfirm: false },
+      writeAdmission: {
+        nodeId: 'target', mode: 'replace', provider: 'managed-local-file',
+        destination: '/outputs/results.parquet', managed: true, expectedSchema: [], partitions: [],
+        intent: {
+          destination: { name: 'results' },
+          schemaDrift: {
+            comparedHead: {
+              kind: 'exact', datasetId: 'dataset-1', revisionId: 'revision-1',
+            },
+            compatibility: { status: 'compatible', fields: [{
+              kind: 'added', status: 'compatible', newName: 'extra',
+              reason: 'nullable field was added',
+            }] },
+            requiresConfirmation: true,
+          },
+        },
+      },
+    } }
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByLabelText('Schema comparison')).toHaveTextContent(
+      'dataset-1@revision-1')
+    expect(screen.getByLabelText('Schema comparison')).toHaveTextContent(
+      'Structural schema drift requires explicit confirmation')
+    expect(screen.getByLabelText('Write readiness')).toHaveTextContent(
+      'Confirm this exact schema comparison before publishing')
+    fireEvent.click(screen.getByRole('button', { name: 'Publish revision' }))
+    expect(mocks.state.run).toHaveBeenCalledWith('target', true)
+  })
+
   it('keeps provider-neutral Write execution in the ordinary Run and output model', () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },
