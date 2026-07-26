@@ -9,8 +9,8 @@ currently owns its lease, heartbeat, and run-state writes.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import re
 from collections.abc import Mapping
 from typing import Any
@@ -71,6 +71,64 @@ _DATA_CREDENTIAL_ENV = frozenset({
     "DP_S3_KEY", "DP_S3_SECRET",
 })
 
+# Core/control-plane names that must never be reclaimed by an installed plugin declaration.  This
+# deny-set complements the positive workload allowlist above: plugin-specific names (including DP_*)
+# remain valid, while auth, agent, deployment, persistence, and process-control identities stay owned
+# by core even though most are intentionally absent from workload environments.
+WORKLOAD_CHILD_MARKER = "DP_WORKLOAD_CHILD"
+CORE_CONTROL_PLANE_ENV = frozenset({
+    WORKLOAD_CHILD_MARKER,
+    "DP_AGENT_API_KEY", "DP_AGENT_BASE_URL", "DP_AGENT_MAX_STEPS", "DP_AGENT_MODEL",
+    "DP_ALLOW_INSECURE_BIND",
+    "DP_ATTEMPT_DELETE_GRACE_SECONDS", "DP_ATTEMPT_INVENTORY_QUIET_SECONDS",
+    "DP_ATTEMPT_RETENTION_SECONDS",
+    "DP_AUTH_DIRECT_TLS", "DP_AUTH_PASSWORD", "DP_AUTH_SECRET", "DP_AUTH_SECURE_COOKIE",
+    "DP_BASE_URL", "DP_CATALOG_MOUNTS", "DP_DEPLOYMENT_MODE", "DP_EXECUTION", "DP_GIT_SHA",
+    "DP_KERNEL_IMAGE", "DP_KERNEL_MEM", "DP_KERNEL_NAMESPACE", "DP_KERNEL_READY_TIMEOUT_S",
+    "DP_KERNEL_SPAWNER",
+    "DP_MANAGED_OBJECT_PROVIDER", "DP_MANAGED_REVISION_RETENTION_SECONDS",
+    "DP_MAX_BODY_BYTES", "DP_MAX_UPLOAD_BYTES", "DP_POOL_WORKERS", "DP_PROFILE_HEARTBEAT_S",
+    "DP_MULTINODE_FAULT", "DP_PUBLIC_URL", "DP_RAY_MODULE",
+    "DP_STALL_S", "DP_STORAGE_NAMESPACE", "DP_TRUSTED_PROXIES",
+    "DP_WORKLOAD_EPHEMERAL",
+    "DP_POSTGRES_PASSWORD", "POSTGRES_PASSWORD",
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_PROFILE",
+    "AWS_EC2_METADATA_DISABLED", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
+    "AWS_SECURITY_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
+})
+
+
+def _workload_child_marker(plugin_names: tuple[str, ...]) -> str:
+    """Encode only Hub-approved plugin identities; the marker never carries credential material."""
+    return json.dumps(plugin_names, separators=(",", ":"))
+
+
+def workload_child_allows_plugin(marker: str, plugin_name: str) -> bool:
+    """Fail closed unless ``marker`` names this Hub-approved installed plugin."""
+    try:
+        names = json.loads(marker)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(names, list)
+        and all(isinstance(name, str) for name in names)
+        and plugin_name in names
+    )
+
+
+def is_core_workload_env_key(key: str) -> bool:
+    """Whether ``key`` belongs to core's workload or control-plane environment contract.
+
+    Plugin declarations may add a narrowly opted-in credential, but must never replace runtime,
+    data-plane, host, or metadata settings that core already owns.
+    """
+    return key in (
+        _HOST_RUNTIME_ENV | _WORKLOAD_RUNTIME_ENV | _DATA_CONNECTION_ENV | _DATA_CREDENTIAL_ENV
+        | CORE_CONTROL_PLANE_ENV | {"DP_DATABASE_URL", "DP_AUTH_MODE"}
+    )
+
 EPHEMERAL_OBJECT_STORE_CRED_ID = "ephemeral-workload-object-store"
 _PROMOTED_SIDECAR_KEY = "_promotedTransformDefinitions"
 _MAX_PROMOTED_SIDECAR_DEFINITIONS = 512
@@ -116,6 +174,24 @@ def build_workload_env(*, include_metadata_db: bool = False, include_host_runtim
     # Auth mode controls filesystem/path confinement, but children never receive material that can sign
     # sessions or bootstrap an administrator. This derived boolean is the only auth value they need.
     _derived_auth_mode(src, env)
+    # A plugin may opt one declared secret config field into this child environment. The hub resolves
+    # an operator SecretRef once. A workload child reuses that already-forwarded target value instead
+    # of trying to read a parent-only env/file reference from its private process/metadata context.
+    if source is None:
+        from hub.deps import get_deps
+        deps = get_deps()
+        inherited_marker = src.get(WORKLOAD_CHILD_MARKER)
+        inherited = src if inherited_marker is not None else None
+        env.update(deps.plugin_workload_env(inherited=inherited))
+        # This marker carries no material and is reserved from plugin declarations. It lets a warm
+        # kernel pass the same vetted values to its isolated subrun without reopening hub SecretRefs.
+        # Its plugin-name payload also stops an ineligible plugin that shares a target from becoming
+        # configured merely because another active plugin supplied that process-wide target.
+        env[WORKLOAD_CHILD_MARKER] = (
+            str(inherited_marker)
+            if inherited_marker is not None
+            else _workload_child_marker(deps.plugin_workload_names())
+        )
     return env
 
 

@@ -54,6 +54,14 @@ Within the profiles above, supported core paths preserve these requirements:
   reference only for its installed provider; supported APIs, logs, backups, and execution manifests do
   not receive the resolved value. One-shot subruns and Ray drivers do not receive the hub's
   session-signing or metadata-database credentials.
+- A plugin `[[config]]` field with `secret = true`, `workload_env = true`, and an explicit `env` name is
+  the narrow operator opt-in for a workload credential. Only a successfully active installed
+  entry-point plugin can forward a conflict-free declaration, and core keeps the material out of
+  Settings/plugin projections, the hash-bound execution manifest, and core-generated resolver or
+  dispatch errors. The workload and plugin can read the credential, and core does not content-redact
+  their logs, results, artifacts, or raised errors. Supported deployments must therefore trust plugin
+  and canvas authors with it. This is not a secret backend, whole-environment passthrough, or per-canvas
+  credential boundary.
 - If a destination selects a Cred, an execution backend must explicitly declare that it can honor that
   selection. Otherwise the run fails before dispatch; ambient identity is used only when no Cred is
   selected.

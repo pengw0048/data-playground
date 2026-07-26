@@ -14,3 +14,4 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel.force-include]
 "__init__.py" = "dp_run_log/__init__.py"
+"dataplay.toml" = "dp_run_log/dataplay.toml"
