@@ -124,11 +124,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     const started = await ok<{ runId: string }>(await runResponse, 'submit default-kernel write')
     const runId = started.runId
     await expect(publication.getByLabel('Published result')).toContainText('Managed dataset published', { timeout: 30_000 })
-    await expect(publication.getByLabel('Published result')).toContainText(filename)
+    await expect(publication.getByLabel('Published result').getByText(outputName, { exact: true })).toBeVisible()
     await expect(publication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     await expect(publicationDetails).toContainText('Durable: yes')
     type Input = { node_id: string; dataset_id: string; revision_id: string; provider: string }
-    type Receipt = { datasetId: string; revisionId: string; rows: number }
+    type Receipt = { datasetId: string; revisionId: string; name: string; rows: number }
     type JobItem = {
       runId: string; status: string; createdAt: string; inputManifest: Input[]
       outputReceipt?: Receipt | null
@@ -143,6 +143,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     }, { timeout: 30_000 }).toBe('done')
     const dataset = job?.outputReceipt
     expect(dataset?.revisionId, 'Jobs surfaces the managed revision id').toBeTruthy()
+    expect(dataset?.name, 'Jobs surfaces the normalized managed dataset name').toBe(outputName)
     expect(job?.inputManifest).toEqual([
       expect.objectContaining({ node_id: 'source', dataset_id: expect.any(String), revision_id: expect.any(String), provider: expect.any(String) }),
     ])
@@ -216,10 +217,11 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await page.getByText('Technical evidence', { exact: true }).click()
     await page.getByRole('button', { name: 'Open exact revision' }).click()
     await expect(page.getByLabel('Exact revision detail')).toBeVisible()
-    const detail = await ok<{ revisionId: string; committedAt: string; preview: { columns: Array<{ name: string }> } }>(
+    const detail = await ok<{ revisionId: string; name: string; committedAt: string; preview: { columns: Array<{ name: string }> } }>(
       await page.request.get(`/api/catalog/revisions/${encodeURIComponent(dataset!.datasetId)}/${encodeURIComponent(dataset!.revisionId)}`),
       'reopen exact published revision')
     expect(detail.revisionId).toBe(dataset!.revisionId)
+    expect(detail.name).toBe(dataset!.name)
     offsetInstant(detail.committedAt, 'exact revision committedAt')
     const localRevisionTime = await page.evaluate((stamp) => new Date(stamp).toLocaleString(), detail.committedAt)
     await expect(page.getByLabel('Exact revision detail')).toContainText(localRevisionTime)
@@ -234,7 +236,7 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
     await page.locator('.react-flow__node[data-id="write"]').click()
     const darkPublication = inspector.getByLabel('Write publication')
     await expect(darkPublication.getByLabel('Published result')).toContainText('Managed dataset published')
-    await expect(darkPublication.getByLabel('Published result')).toContainText(filename)
+    await expect(darkPublication.getByLabel('Published result').getByText(dataset!.name, { exact: true })).toBeVisible()
     await expect(darkPublication.getByRole('button', { name: 'Open exact revision' })).toBeVisible()
     const darkPublicationDetails = darkPublication.locator('details')
     await darkPublicationDetails.locator('summary').click()
