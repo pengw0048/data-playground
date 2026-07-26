@@ -12,10 +12,13 @@ release must prove the complete artifact, UX, and optional distributed-execution
 | UX golden-workflow smoke | Required inside normal browser CI | Repeated inside the integration run | Manual | Included in core CI on the exact candidate SHA |
 | Full researcher UX fixture matrix and P0/P1 issue gate | No | No | Daily or manual | Required before publish |
 | Wheel and application-image clean-install smoke | No | No | Manual | Required before publish |
+| In-place upgrade drill (SQLite and PostgreSQL) | No | No | Weekly or manual | Required before publish |
 | Real multi-container Ray differential | Relevant execution-contract PRs | No | Weekly or manual | Required before publish |
 | Ray Jobs restart/cancel/result acceptance | Relevant lifecycle-contract PRs | No | Weekly or manual | Required before publish |
 | CodeQL and Gitleaks | Required | Required integration run | Scheduled/manual where configured | Required on the exact candidate SHA |
-| Dependency review and path-gated image scan | Relevant PRs | Path/workflow-specific | Scheduled/manual where configured | A release does not bypass an unresolved result |
+| Dependency review | Every PR | No | No | Advisory evidence; not invoked by the release |
+| Path-gated image scan | Relevant PRs | No | Scheduled or manual | Advisory evidence; not invoked by the release |
+| Performance envelope | No | No | Daily or manual | Evidence only; no release workflow calls it |
 
 Direct changes to `main` remain blocked, but pull requests do not have to be rebased after every
 unrelated merge. Core CI, CodeQL, and Gitleaks therefore run again on `main` to validate the integrated
@@ -24,8 +27,9 @@ tree. This default-branch run does not start environment-heavy acceptance workfl
 ## Pull-request feedback
 
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is the required functional gate. Its browser
-job runs the tagged `@ux-smoke` scenarios first for a focused failure, then runs the remaining browser
-suite. Release builds and the full UX fixture matrix are deliberately absent from the PR event.
+job runs a serialized five-stage chain: the fresh-workspace `@first-run` journey, tagged `@ux-smoke`
+scenarios, the remaining non-overlapping suite, the minimum-viewport proof, and the reference-viewport
+proof. Release builds and the full UX fixture matrix are deliberately absent from the PR event.
 
 Ray and Ray Jobs use explicit `pull_request.paths` ownership instead of running for every change. Both
 suites run when the shared image, `dp_ray`, execution, storage, destination, or plugin contracts change.
@@ -36,6 +40,12 @@ the required core CI remains the stable merge gate when a Ray workflow is legiti
 
 CodeQL and Gitleaks also run on the integrated `main` tree. Superseded PR heads use
 `cancel-in-progress` so only the current revision consumes runners.
+
+Dependency review fails every PR run for newly introduced HIGH or CRITICAL findings, and image scan
+fails its relevant PR run for fixable HIGH or CRITICAL CVEs. Image scan also has scheduled and manual
+runs. Neither workflow is called by `release.yml`, so neither is release-blocking today; their results
+are PR/advisory evidence rather than a publishing prerequisite. This is the current boundary, not a plan
+to add release wiring in this documentation change.
 
 ## Writable local-overlay release evidence
 
@@ -61,11 +71,13 @@ DP_CATALOG_MOUNTS='[{"id":"browser-provider","provider":"dp-file-catalog","confi
 npm run e2e -- --no-deps --project=chromium e2e/workspace-provider.spec.ts
 ```
 
-The journey records sanitized evidence only: local Canvas/placement and provider-binding/anchor identity
-survive restart and restore; an explicit same-ID relink gets a new binding. The fixture checks that the
-provider root did not change during Data Playground actions. It does not claim provider write-back,
-provider configuration or bytes in backups, background synchronization, a failure/relink Playwright
-matrix, public conformance expansion, Ray coverage, or organization-specific integration.
+The journey records sanitized evidence only: provider placements share one canonical exact Source
+binding without losing their Workspace shortcuts; typed related data is reviewed at a retained revision
+before an explicit Join; and retrying an already-present canonical Source is a no-op. It also proves
+preview, run-history evidence, and distinct unavailable, detached, and canonical-offline Workspace
+states without changing the provider root. It does not claim provider write-back, provider configuration
+or bytes in backups, background synchronization, public-conformance expansion, Ray coverage, or
+organization-specific integration.
 
 The existing restore gates supply the storage profiles rather than a new CI matrix:
 
@@ -87,8 +99,17 @@ have scheduled health runs because external services and base images can drift:
 
 - [`ux-acceptance.yml`](../.github/workflows/ux-acceptance.yml)
 - [`release-artifacts.yml`](../.github/workflows/release-artifacts.yml)
+- [`upgrade-drill.yml`](../.github/workflows/upgrade-drill.yml)
 - [`ray-validation.yml`](../.github/workflows/ray-validation.yml)
 - [`ray-jobs-acceptance.yml`](../.github/workflows/ray-jobs-acceptance.yml)
+
+`upgrade-drill.yml` upgrades a real v0.1.0 workspace to the candidate wheel on both SQLite and
+PostgreSQL. Its weekly run is health evidence; when `release.yml` calls it with the candidate SHA, it is
+a publishing prerequisite.
+
+`perf-envelope.yml` exposes `workflow_call`, but no workflow currently calls it. Its scheduled or manual
+artifact measures the local performance and memory envelope; it is explicit evidence, not a release
+gate. Keeping it outside the release graph is the current decision, not an unrecorded bypass.
 
 `ux-acceptance.yml` runs the browser suite at the `full` fixture profile. That profile gates the
 default fresh-workspace write-journey certification (`web/e2e/default-write-journey.spec.ts`,
@@ -129,7 +150,7 @@ heavy gate against the exact release revision regardless of changed paths.
 
 A `v*` tag starts [`.github/workflows/release.yml`](../.github/workflows/release.yml). It first records
 the tag target in the run summary, then passes that SHA to the ordinary core CI, CodeQL, and Gitleaks
-checkouts and calls all four heavy acceptance workflows from the same immutable revision. Publishing
+checkouts and calls all five heavy acceptance workflows from the same immutable revision. Publishing
 the wheel, image, SBOMs, checksums, and attestations cannot start until every called gate succeeds; a
 passing result on a later `main` commit is not substituted for tag evidence. A manual run records the
 selected commit and exercises the same non-publishing gate graph.

@@ -66,6 +66,8 @@ Start with [plugin onboarding](docs/PLUGIN_ONBOARDING.md) and the tested package
 Data Playground's supported baseline is a local workstation or a trusted shared team service. It is not a hostile multi-tenant isolation boundary: operators, installed plugins, workers, and people allowed to run arbitrary Python are trusted within a workspace. Optional distributed backends have their own documented support matrices.
 
 Read the exact [support and trust boundary](docs/SUPPORT.md) before deploying beyond a local workspace. Report vulnerabilities through the [security policy](.github/SECURITY.md).
+The [CI and release matrix](docs/CI.md) distinguishes exact-candidate publishing gates from PR feedback
+and scheduled or manual advisory evidence.
 
 ## Documentation
 
