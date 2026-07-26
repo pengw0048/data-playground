@@ -16,7 +16,10 @@ vi.mock('../api/client', () => ({
   api: mocks,
   KernelError: class KernelError extends Error {
     status: number
-    constructor(status: number, message: string) { super(message); this.status = status }
+    code?: string
+    constructor(status: number, message: string, code?: string) {
+      super(message); this.status = status; this.code = code
+    }
   },
 }))
 vi.mock('../store/graph', () => ({ useStore: (select: (state: typeof store) => unknown) => select(store) }))
@@ -290,6 +293,42 @@ describe('DatasetRevisionHistory', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
     expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
     expect(mocks.openMediaCell).not.toHaveBeenCalled()
+  })
+
+  it('refreshes the same exact revision before reopening certification for a stale retained identity', async () => {
+    const certified = detail('rev-media', {
+      preview: {
+        columns: [{ fieldId: 'frame', name: 'frame', type: 'binary', nullable: false, provenance: 'provider', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [{ frame: '<4 bytes>' }],
+        rowIdentities: [[{ name: 'id', arrowType: 'int64', value: '1' }]],
+        hasMore: false,
+        rowLimit: 100,
+      },
+      rowIdentity: {
+        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'certified',
+        certificationSupported: true, fields: [{ name: 'id', arrowType: 'int64' }], encodingVersion: 'row-identity-v1',
+      },
+    })
+    const unavailable = detail('rev-media', {
+      preview: certified.preview,
+      rowIdentity: {
+        datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable',
+        certificationSupported: true, fields: [], encodingVersion: null,
+      },
+    })
+    mocks.datasetRevisions.mockResolvedValue({ items: [revision('rev-media')], nextCursor: null, hasMore: false })
+    mocks.datasetRevision.mockResolvedValueOnce(certified).mockResolvedValueOnce(unavailable)
+    mocks.openMediaCell.mockRejectedValue(
+      new KernelError(409, 'identity unavailable', 'media_cell_identity_unavailable'),
+    )
+
+    render(<DatasetRevisionHistory table={TABLE} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Open certification' }))
+
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledTimes(2))
+    expect(mocks.datasetRevision).toHaveBeenLastCalledWith('dataset-stable', 'rev-media')
+    expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(expect.stringContaining('rowIdentityAction=certify'))
   })
 
   it('never falls back to latest when the selected exact revision was compacted', async () => {

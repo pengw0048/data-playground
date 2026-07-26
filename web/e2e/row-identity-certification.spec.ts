@@ -120,6 +120,15 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
         && response.request().method() === "GET"
         && response.ok(),
     );
+    const mediaRequest = (column: "image" | "video") => page.waitForRequest(
+      (request) => {
+        if (!request.url().endsWith(`${exactDetailUrl}/media-cell`) || request.method() !== "POST") return false;
+        return (request.postDataJSON() as { column?: string } | null)?.column === column;
+      },
+      { timeout: 30_000 },
+    );
+    const imageRequest = mediaRequest("image");
+    const videoRequest = mediaRequest("video");
     await history
       .getByRole("button", {
         name: /Start certification|Confirm and start full scan/,
@@ -137,40 +146,55 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await expect(history.getByLabel("Certified row identity")).toBeVisible({ timeout: 30_000 });
 
     // These are bytes inside the managed output, not direct URL fixtures. Read them only through
-    // the certified exact endpoint and prove that this browser can decode the returned Blobs.
-    await expect(history.getByText("Exact revision preview")).toBeVisible({ timeout: 30_000 });
-    const decoded = await page.evaluate(async ({ datasetId, revisionId, identity }) => {
-      const endpoint = `/api/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/media-cell`;
-      const open = async (column: string) => {
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ identity, column }),
-        });
-        if (!response.ok) throw new Error(`media endpoint returned ${response.status}`);
-        return response.blob();
-      };
-      const imageUrl = URL.createObjectURL(await open("image"));
-      const videoUrl = URL.createObjectURL(await open("video"));
-      try {
-        const image = new Image();
-        image.src = imageUrl;
-        await image.decode();
-        const video = document.createElement("video");
-        video.preload = "metadata";
-        video.src = videoUrl;
-        await new Promise<void>((resolve, reject) => {
-          video.addEventListener("loadedmetadata", () => resolve(), { once: true });
-          video.addEventListener("error", () => reject(video.error), { once: true });
-        });
-        return { imageWidth: image.naturalWidth, videoReadyState: video.readyState };
-      } finally {
-        URL.revokeObjectURL(imageUrl);
-        URL.revokeObjectURL(videoUrl);
+    // the certified exact endpoint. Assert the shipped renderer, rather than issuing a parallel
+    // fetch in the test that could pass while the product UI remains broken.
+    const exactPreview = history.getByText("Exact revision preview");
+    await expect(exactPreview).toBeVisible({ timeout: 30_000 });
+    await exactPreview.scrollIntoViewIfNeeded();
+    const image = history.getByRole("img", { name: "Media image" });
+    const video = history.getByLabel("Media video");
+    await expect(image).toBeVisible({ timeout: 30_000 });
+    await expect(video).toBeVisible({ timeout: 30_000 });
+    await expect.poll(() => image.evaluate((element) => {
+      const media = element as HTMLImageElement;
+      return media.complete && media.naturalWidth > 0;
+    })).toBe(true);
+    await expect.poll(() => video.evaluate((element) => (element as HTMLVideoElement).readyState))
+      .toBeGreaterThanOrEqual(1);
+
+    const imageBody = imageRequest.then((request) => request.postDataJSON() as {
+      identity: Array<{ name: string; arrowType: string; value: unknown }>;
+      column: string;
+    });
+    const videoBody = videoRequest.then((request) => request.postDataJSON() as {
+      identity: Array<{ name: string; arrowType: string; value: unknown }>;
+      column: string;
+    });
+    await expect(imageBody).resolves.toEqual({ identity, column: "image" });
+    await expect(videoBody).resolves.toEqual({ identity, column: "video" });
+
+    // The same rendered cells remain usable at the documented minimum and reference desktop
+    // viewports in both themes; resizing or retheming must not replace them with placeholders.
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport);
+      for (const theme of ["dark", "light"] as const) {
+        const html = page.locator("html");
+        // The Workspace route intentionally has no Canvas TopBar theme button. Apply the same
+        // persisted root contract used by the theme controller so this exact-revision dialog stays
+        // open while its token-driven renderer is checked in both modes.
+        await page.evaluate((next) => {
+          localStorage.setItem("dp-theme", next);
+          if (next === "dark") document.documentElement.setAttribute("data-theme", "dark");
+          else document.documentElement.removeAttribute("data-theme");
+          window.dispatchEvent(new Event("dp-theme-change"));
+        }, theme);
+        if (theme === "dark") await expect(html).toHaveAttribute("data-theme", "dark");
+        else await expect(html).not.toHaveAttribute("data-theme", "dark");
+        await image.scrollIntoViewIfNeeded();
+        await expect(image).toBeVisible();
+        await expect(video).toBeVisible();
       }
-    }, { datasetId: receipt.datasetId, revisionId: receipt.revisionId, identity });
-    expect(decoded.imageWidth).toBeGreaterThan(0);
-    expect(decoded.videoReadyState).toBeGreaterThanOrEqual(1);
+    }
 
     await page.reload();
     await expect(history.getByText("Certified row identity")).toBeVisible();
