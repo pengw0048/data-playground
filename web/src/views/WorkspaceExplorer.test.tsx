@@ -205,6 +205,21 @@ describe('WorkspaceExplorer', () => {
     expect(await screen.findByText('observations')).toBeInTheDocument()
   })
 
+  it('continues an empty Workspace browse page without presenting it as a final empty location', async () => {
+    mocks.workspaceBrowse
+      .mockResolvedValueOnce({ container: ROOT, items: [], nextCursor: 'sparse-page-2', hasMore: true, completeness: 'page' })
+      .mockResolvedValueOnce({ container: ROOT, items: [DATASET], nextCursor: null, hasMore: false, completeness: 'complete' })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('This page has no items yet. Load more to continue browsing this location.')).toBeVisible()
+    fireEvent.click(screen.getByTestId('workspace-load-more'))
+
+    expect(await screen.findByText('observations')).toBeVisible()
+    expect(mocks.workspaceBrowse).toHaveBeenLastCalledWith('workspace-local-root', {
+      limit: 50, cursor: 'sparse-page-2',
+    })
+  })
+
   it('keeps degraded provider rows visible while disabling Open and bounded retry actions', async () => {
     const unavailable = {
       ...EXTERNAL_DATASET,
@@ -514,6 +529,34 @@ describe('WorkspaceExplorer', () => {
     )
     expect(result).toBeVisible()
     expect(screen.getByRole('button', { name: 'Retry load more' })).toBeVisible()
+  })
+
+  it('continues an empty Workspace search page without presenting it as a final empty result', async () => {
+    store.workspaceSearchQuery = 'observations'
+    mocks.workspaceSearch
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'page', hasMore: true, nextCursor: 'sparse-page-2',
+        groups: [{
+          source: { id: 'local', kind: 'local', completeness: 'page', freshness: 'current', searchMode: 'native' },
+          items: [],
+        }],
+      })
+      .mockResolvedValueOnce({
+        query: 'observations', completeness: 'complete', hasMore: false, nextCursor: null,
+        groups: [{
+          source: { id: 'local', kind: 'local', completeness: 'complete', freshness: 'current', searchMode: 'native' },
+          items: [DATASET],
+        }],
+      })
+    render(<WorkspaceExplorer />)
+
+    expect(await screen.findByText('This page has no matches yet. Load more results to continue searching.')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Load more results' }))
+
+    expect(await screen.findByRole('button', { name: 'Open dataset observations' })).toBeVisible()
+    expect(mocks.workspaceSearch).toHaveBeenLastCalledWith('observations', {
+      limit: 25, cursor: 'sparse-page-2',
+    })
   })
 
   it('creates a canvas in the exact visible destination', async () => {

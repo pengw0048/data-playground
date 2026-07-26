@@ -560,6 +560,164 @@ class _WorkspaceFixtureProvider:
         return ProviderSearchPage(items=items, next_cursor=next_cursor)
 
 
+class _SparsePageWorkspaceProvider:
+    """Neutral provider fixture with one truthful empty page before one matching item."""
+
+    def __init__(self, *, repeat_cursor: bool = False):
+        self.list_calls = 0
+        self.repeat_cursor = repeat_cursor
+        self.container = CatalogResource(
+            placement_id="sparse-container", kind="container", name="Sparse container")
+        self.dataset = CatalogResource(
+            placement_id="sparse-dataset", dataset_id="sparse-dataset", kind="dataset",
+            name="Sparse dataset", parent_placement_id=self.container.placement_id,
+            uri="file:///sparse-dataset.parquet")
+
+    def list_children(self, _mount, parent_placement_id, *, limit, cursor=None):
+        self.list_calls += 1
+        next_cursor = "same" if self.repeat_cursor else f"after:{parent_placement_id or 'root'}"
+        if cursor is None or self.repeat_cursor:
+            return ProviderPage(items=[], next_cursor=next_cursor)
+        if cursor != next_cursor:
+            return ProviderPage(state="unavailable", reason="unknown sparse cursor")
+        item = self.container if parent_placement_id is None else self.dataset
+        return ProviderPage(items=[item])
+
+    def resolve(self, _mount, placement_id):
+        item = next(
+            (item for item in (self.container, self.dataset) if item.placement_id == placement_id),
+            None,
+        )
+        return ProviderResourceResult(item=item) if item is not None else ProviderResourceResult(
+            state="unavailable", reason="resource not found", failure="not_found")
+
+    def ancestors(self, _mount, placement_id):
+        return ProviderAncestors(items=[self.container] if placement_id == self.dataset.placement_id else [])
+
+    def dataset_detail(self, _mount, dataset_id):
+        if dataset_id != self.dataset.dataset_id:
+            return ProviderDatasetDetailResult(
+                state="unavailable", reason="dataset not found", failure="not_found")
+        assert self.dataset.dataset_id is not None and self.dataset.uri is not None
+        return ProviderDatasetDetailResult(item=CatalogDatasetDetail(
+            dataset_id=self.dataset.dataset_id, uri=self.dataset.uri, columns=[]))
+
+    def capabilities(self, _mount):
+        return ProviderCapabilities(search=True)
+
+    def search(self, _mount, _query, *, limit, cursor=None):
+        if cursor is None:
+            return ProviderSearchPage(items=[], next_cursor="after:search")
+        if cursor != "after:search":
+            return ProviderSearchPage(state="unavailable", reason="unknown sparse cursor")
+        return ProviderSearchPage(items=[self.dataset])
+
+
+def test_workspace_preserves_advancing_empty_provider_pages(workspace_scope, monkeypatch):
+    root = metadb.local_workspace_root()
+    mount_id = f"sparse-{uuid.uuid4().hex}"
+    provider = _SparsePageWorkspaceProvider()
+    local_browse = metadb.workspace_browse
+
+    def empty_root_local(container_id, *args, **kwargs):
+        page = local_browse(container_id, *args, **kwargs)
+        return ({**page, "items": [], "nextCursor": None}
+                if container_id == root["id"] else page)
+
+    monkeypatch.setattr(workspace_providers.metadb, "workspace_browse", empty_root_local)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": root["id"],
+    }]))
+
+    with TestClient(app) as client:
+        root_first = client.get(f"/api/workspace/containers/{root['id']}", params={"limit": 10})
+        assert root_first.status_code == 200, root_first.text
+        root_page = root_first.json()
+        assert root_page["items"] == []
+        assert root_page["completeness"] == "page"
+        assert root_page["hasMore"] is True
+        assert root_page["sources"][-1]["completeness"] == "page"
+        assert provider.list_calls == 1  # Workspace must not drain sparse provider pages itself.
+
+        root_second = client.get(f"/api/workspace/containers/{root['id']}", params={
+            "limit": 10, "cursor": root_page["nextCursor"],
+        })
+        assert root_second.status_code == 200, root_second.text
+        container = root_second.json()["items"][0]
+        assert container["name"] == "Sparse container"
+
+        external_first = client.get(
+            f"/api/workspace/containers/{container['id'].removeprefix('container:')}",
+            params={"limit": 10},
+        )
+        assert external_first.status_code == 200, external_first.text
+        external_page = external_first.json()
+        assert external_page["items"] == []
+        assert external_page["completeness"] == "page"
+        assert external_page["hasMore"] is True
+        assert external_page["sources"][-1]["completeness"] == "page"
+
+        external_second = client.get(
+            f"/api/workspace/containers/{container['id'].removeprefix('container:')}",
+            params={"limit": 10, "cursor": external_page["nextCursor"]},
+        )
+        assert external_second.status_code == 200, external_second.text
+        assert [item["name"] for item in external_second.json()["items"]] == ["Sparse dataset"]
+
+        search_first = client.get("/api/workspace/search", params={"q": "sparse", "limit": 10})
+        assert search_first.status_code == 200, search_first.text
+        search_page = search_first.json()
+        sparse_group = next(group for group in search_page["groups"]
+                            if group["source"]["mountId"] == mount_id)
+        assert sparse_group["items"] == []
+        assert sparse_group["source"]["completeness"] == "page"
+        assert search_page["completeness"] == "page"
+        assert search_page["hasMore"] is True
+
+        search_second = client.get("/api/workspace/search", params={
+            "q": "sparse", "limit": 10, "cursor": search_page["nextCursor"],
+        })
+        assert search_second.status_code == 200, search_second.text
+        sparse_group = next(group for group in search_second.json()["groups"]
+                            if group["source"]["mountId"] == mount_id)
+        assert [item["name"] for item in sparse_group["items"]] == ["Sparse dataset"]
+
+
+def test_workspace_rejects_reused_sparse_provider_cursor(workspace_scope, monkeypatch):
+    root = metadb.local_workspace_root()
+    mount_id = f"sparse-stuck-{uuid.uuid4().hex}"
+    provider = _SparsePageWorkspaceProvider(repeat_cursor=True)
+    local_browse = metadb.workspace_browse
+
+    def empty_root_local(container_id, *args, **kwargs):
+        page = local_browse(container_id, *args, **kwargs)
+        return ({**page, "items": [], "nextCursor": None}
+                if container_id == root["id"] else page)
+
+    monkeypatch.setattr(workspace_providers.metadb, "workspace_browse", empty_root_local)
+    monkeypatch.setattr(workspace_providers, "_load_provider", lambda _name: provider)
+    monkeypatch.setenv("DP_CATALOG_MOUNTS", json.dumps([{
+        "id": mount_id, "provider": "fixture", "containerId": root["id"],
+    }]))
+
+    with TestClient(app) as client:
+        first = client.get(f"/api/workspace/containers/{root['id']}", params={"limit": 10})
+        assert first.status_code == 200, first.text
+        first_page = first.json()
+        assert first_page["items"] == [] and first_page["hasMore"] is True
+
+        rejected = client.get(f"/api/workspace/containers/{root['id']}", params={
+            "limit": 10, "cursor": first_page["nextCursor"],
+        })
+        assert rejected.status_code == 200, rejected.text
+        rejected_page = rejected.json()
+        assert rejected_page["hasMore"] is False
+        assert rejected_page["sources"][-1]["completeness"] == "unavailable"
+        assert rejected_page["sources"][-1]["error"] == "provider list result is invalid"
+        assert provider.list_calls == 2
+
+
 class _MultiPlacementWorkspaceProvider:
     """Mutable provider fixture with two occurrences of one canonical dataset."""
 
