@@ -73,6 +73,7 @@ vi.mock('../api/client', () => ({
 
 import {
   canvasViewportDocumentIdentity, currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
+  writeAdmissionRequestIdentity,
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
@@ -524,46 +525,6 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.writeAdmission.mock.calls[0][2]).not.toBe('old-submission')
   })
 
-  it('accepts only the refreshed admission after an indirect upstream edge changes in flight', async () => {
-    const sourceA = NODE('source-a')
-    const sourceB = NODE('source-b')
-    const transform = NODE('transform', 'filter')
-    const write = NODE('write', 'write')
-    const stale = {
-      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
-      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
-    }
-    const fresh = { ...stale, expectedSchema: [{ name: 'replacement', type: 'string' }] }
-    let resolveStale!: (value: typeof stale) => void
-    apiMocks.writeAdmission
-      .mockImplementationOnce(() => new Promise<typeof stale>((resolve) => { resolveStale = resolve }))
-      .mockResolvedValueOnce(fresh)
-    useStore.setState({
-      doc: {
-        id: 'c', version: 1, name: 'test', requirements: [],
-        nodes: [sourceA, sourceB, transform, write],
-        edges: [
-          { id: 'source-transform', source: 'source-a', target: 'transform' },
-          { id: 'transform-write', source: 'transform', target: 'write' },
-        ],
-      },
-      runs: {},
-    } as any)
-
-    const first = useStore.getState().prepareWrite('write')
-    useStore.getState().reconnectEdge('source-transform', {
-      id: 'replacement-edge-id', source: 'source-b', target: 'transform',
-    })
-    const second = useStore.getState().prepareWrite('write')
-
-    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
-    expect(useStore.getState().runs.write.writeAdmissionGeneration).toBe(1)
-    resolveStale(stale)
-    await expect(first).resolves.toBeUndefined()
-    await expect(second).resolves.toEqual(fresh)
-    expect(useStore.getState().runs.write.writeAdmission).toEqual(fresh)
-  })
-
   it('keeps a running managed Write identity across an upstream edge edit', () => {
     const source = NODE('source')
     const write = NODE('write', 'write')
@@ -579,7 +540,7 @@ describe('graph store — core authority ops', () => {
       },
       runs: { write: {
         phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
-        writeAdmissionFingerprint: 'admitted-graph', writeAdmissionGeneration: 4,
+        writeAdmissionFingerprint: 'admitted-graph',
       } },
     } as any)
 
@@ -587,13 +548,14 @@ describe('graph store — core authority ops', () => {
 
     expect(useStore.getState().runs.write).toMatchObject({
       phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
-      writeAdmissionFingerprint: 'admitted-graph', writeAdmissionGeneration: 4,
+      writeAdmissionFingerprint: 'admitted-graph',
     })
   })
 
   it('does not fence an in-flight Write admission on presentation-only canvas changes', async () => {
     const source = NODE('source')
     const write = NODE('write', 'write')
+    const unrelated = NODE('unrelated', 'filter')
     const admission = {
       nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
       mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
@@ -604,7 +566,7 @@ describe('graph store — core authority ops', () => {
     }))
     useStore.setState({
       doc: {
-        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write, unrelated],
         edges: [{ id: 'source-write', source: 'source', target: 'write' }],
       },
     } as any)
@@ -619,6 +581,8 @@ describe('graph store — core authority ops', () => {
             ...node.data, status: 'latest', history: [{ label: 'run · 1 output' }],
             lastRun: { outputCount: 1, ms: 12, placement: 'local' },
           },
+        } : node.id === 'unrelated' ? {
+          ...node, data: { ...node.data, config: { predicate: 'value > 100' } },
         } : node),
         edges: state.doc.edges.map((edge) => ({ ...edge, id: 'renamed-presentation-edge' })),
       },
@@ -628,6 +592,85 @@ describe('graph store — core authority ops', () => {
     await expect(pending).resolves.toEqual(admission)
     expect(useStore.getState().runs.write.writeAdmission).toEqual(admission)
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+  })
+
+  it('identifies Write admission by target parameters, bindings, and current input manifest', () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = {
+      filename: { parameterRef: 'output' }, writeMode: { parameterRef: 'mode' },
+    }
+    const unrelated = NODE('unrelated', 'filter')
+    unrelated.data.config = { threshold: { parameterRef: 'unused' } }
+    const parameters = [
+      { name: 'output', type: 'string' as const, default: 'first', label: 'Output', constraints: { minLength: 1 } },
+      { name: 'mode', type: 'string' as const, default: 'overwrite' },
+      { name: 'unused', type: 'integer' as const, default: 10 },
+    ]
+    const bindings = [{ name: 'output', value: 'result' }, { name: 'mode', value: 'overwrite' }]
+    const manifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'local', resolved_at: 'now',
+    }]
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], parameters,
+      nodes: [source, write, unrelated], edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    useStore.setState({
+      doc, runs: { write: { phase: 'idle', parameterBindings: bindings } },
+      previewBindings: { write: {
+        canvasId: 'c', nodeId: 'write', planIdentity: previewPlanIdentity(doc, 'write'),
+        parameterBindings: bindings, inputManifest: manifest,
+      } },
+    } as any)
+    const initial = writeAdmissionRequestIdentity(useStore.getState(), 'write')
+
+    const reorderedParameters = [
+      parameters[1], { ...parameters[0], label: 'Renamed for display' },
+      { ...parameters[2], default: 999 },
+    ]
+    const reorderedBindings = [bindings[1], bindings[0]]
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc, parameters: reorderedParameters,
+        nodes: state.doc.nodes.map((node) => node.id === 'unrelated'
+          ? { ...node, data: { ...node.data, config: { threshold: 999 } } } : node),
+        edges: state.doc.edges.map((edge) => ({ ...edge, id: 'presentation-only-edge-id' })),
+      },
+      runs: { ...state.runs, write: { ...state.runs.write, parameterBindings: reorderedBindings } },
+      previewBindings: { write: {
+        ...state.previewBindings.write!, parameterBindings: reorderedBindings,
+      } },
+    }))
+    expect(writeAdmissionRequestIdentity(useStore.getState(), 'write')).toBe(initial)
+
+    useStore.setState((state) => ({ previewBindings: { write: {
+      ...state.previewBindings.write!, inputManifest: [{ ...manifest[0], resolved_at: 'later' }],
+    } } }))
+    expect(writeAdmissionRequestIdentity(useStore.getState(), 'write')).toBe(initial)
+
+    useStore.setState((state) => ({ doc: {
+      ...state.doc,
+      parameters: state.doc.parameters?.map((parameter) => parameter.name === 'output'
+        ? { ...parameter, default: 'second' } : parameter),
+    } }))
+    expect(writeAdmissionRequestIdentity(useStore.getState(), 'write')).not.toBe(initial)
+
+    useStore.setState({
+      doc: { ...doc, parameters: reorderedParameters },
+      runs: { write: { phase: 'idle', parameterBindings: [bindings[1], { name: 'output', value: 'other' }] } },
+      previewBindings: {},
+    } as any)
+    expect(writeAdmissionRequestIdentity(useStore.getState(), 'write')).not.toBe(initial)
+
+    useStore.setState({
+      doc, runs: { write: { phase: 'idle', parameterBindings: bindings } },
+      previewBindings: { write: {
+        canvasId: 'c', nodeId: 'write', planIdentity: previewPlanIdentity(doc, 'write'),
+        parameterBindings: bindings,
+        inputManifest: [{ ...manifest[0], revision_id: '2' }],
+      } },
+    } as any)
+    expect(writeAdmissionRequestIdentity(useStore.getState(), 'write')).not.toBe(initial)
   })
 
   it('does not treat a non-Section config.outputs field as a port declaration', () => {

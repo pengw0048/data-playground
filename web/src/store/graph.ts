@@ -429,14 +429,41 @@ export function writeAdmissionFingerprint(
   doc: CanvasDoc,
   nodeId: string,
   parameterBindings?: CanvasParameterBinding[],
+  inputManifest?: RunInputManifestItem[],
 ): string {
   // Write admission certifies one executable target cone.  Match the existing preview/profile
   // identity rather than fencing a response on canvas presentation (positions, run history,
   // transient status, edge ids) or unrelated branches.
   return JSON.stringify({
     plan: targetExecutionPlanIdentity(doc, nodeId),
+    declarations: targetParameterDeclarations(doc, nodeId)
+      .map((declaration) => canonicalIdentityValue({
+        name: declaration.name,
+        type: declaration.type,
+        required: declaration.required === true,
+        default: declaration.default,
+        constraints: declaration.constraints,
+      }))
+      .sort((left, right) => compareIdentityText(JSON.stringify(left), JSON.stringify(right))),
     parameterBindings: parameterBindingsIdentity(parameterBindings),
+    inputManifest: inputManifest === undefined ? null : inputManifest
+      // `resolved_at` is observation metadata; the server's execution-manifest identity likewise
+      // binds only the exact dataset/revision/provider source identity.
+      .map((item) => canonicalIdentityValue({
+        node_id: item.node_id,
+        dataset_id: item.dataset_id,
+        revision_id: item.revision_id,
+        provider: item.provider,
+      }))
+      .sort((left, right) => compareIdentityText(JSON.stringify(left), JSON.stringify(right))),
   })
+}
+
+export function writeAdmissionRequestIdentity(state: Store, nodeId: string): string {
+  const binding = currentPreviewBinding(state, nodeId)
+  return writeAdmissionFingerprint(
+    state.doc, nodeId, state.runs[nodeId]?.parameterBindings, binding?.inputManifest,
+  )
 }
 
 function sameInputManifest(
@@ -476,14 +503,15 @@ interface RunState {
   writeOutcomeAdmission?: WriteAdmission
   writeSubmissionId?: string
   writeAdmissionFingerprint?: string
-  // Bumped whenever a non-running Write's executable inputs change. The Write card consumes this
-  // explicit signal so an indirect upstream edit cannot strand an in-flight admission request.
-  writeAdmissionGeneration?: number
   parameterBindings?: CanvasParameterBinding[]
   parametersReady?: boolean
   parameterContractFingerprint?: string
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
 }
+
+// A Write card and the Run flow may observe the same semantic change in one render turn. Share the
+// request by its complete admission identity so they cannot mint competing submission ids.
+const _pendingWriteAdmissions = new Map<string, Promise<WriteAdmission | undefined>>()
 
 export function targetParameterDeclarations(doc: CanvasDoc, targetNodeId: string): CanvasParameterDeclaration[] {
   const incoming = new Map<string, string[]>()
@@ -1322,7 +1350,6 @@ function invalidateWriteAdmissions(
       writeAdmission: undefined,
       writeSubmissionId: undefined,
       writeAdmissionFingerprint: undefined,
-      writeAdmissionGeneration: (current.writeAdmissionGeneration ?? 0) + 1,
     }
   }
   return next
@@ -2369,15 +2396,21 @@ export const useStore = create<Store>((set, get) => ({
 
   prepareWrite: async (id) => {
     if (!hubExecutionAvailable(get)) return undefined
-    const doc = get().doc
+    const initial = get()
+    const doc = initial.doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
-    const parameterBindings = get().runs[id]?.parameterBindings
-    const fingerprint = writeAdmissionFingerprint(doc, id, parameterBindings)
-    const existing = get().runs[id]
+    const parameterBindings = initial.runs[id]?.parameterBindings
+    const binding = currentPreviewBinding(initial, id)
+    const fingerprint = writeAdmissionFingerprint(
+      doc, id, parameterBindings, binding?.inputManifest,
+    )
+    const existing = initial.runs[id]
     if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
       return existing.writeAdmission
     }
+    const pending = _pendingWriteAdmissions.get(fingerprint)
+    if (pending) return pending
     const submissionId = globalThis.crypto.randomUUID()
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? { phase: 'idle' as const }),
@@ -2385,19 +2418,32 @@ export const useStore = create<Store>((set, get) => ({
       writeAdmissionFingerprint: fingerprint,
       writeAdmission: undefined,
     } } }))
-    const binding = currentPreviewBinding(get(), id)
-    const admission = parameterBindings?.length
-      ? await api.writeAdmission(doc, id, submissionId, binding?.inputManifest, parameterBindings)
-      : await api.writeAdmission(doc, id, submissionId, binding?.inputManifest)
-    const current = get().runs[id]
-    if (current?.writeSubmissionId !== submissionId
-        || current.writeAdmissionFingerprint !== fingerprint
-        || writeAdmissionFingerprint(
-          get().doc, id, get().runs[id]?.parameterBindings) !== fingerprint) return undefined
-    set((s) => ({ runs: { ...s.runs, [id]: {
-      ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
-    } } }))
-    return admission
+    let request!: Promise<WriteAdmission | undefined>
+    request = (async () => {
+      try {
+        const admission = parameterBindings?.length
+          ? await api.writeAdmission(doc, id, submissionId, binding?.inputManifest, parameterBindings)
+          : await api.writeAdmission(doc, id, submissionId, binding?.inputManifest)
+        if (writeAdmissionRequestIdentity(get(), id) !== fingerprint) return undefined
+        const currentRun = get().runs[id]
+        if (currentRun?.phase === 'running' && currentRun.writeSubmissionId !== submissionId) {
+          return undefined
+        }
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? { phase: 'idle' as const }),
+          writeSubmissionId: submissionId,
+          writeAdmissionFingerprint: fingerprint,
+          writeAdmission: admission,
+        } } }))
+        return admission
+      } finally {
+        if (_pendingWriteAdmissions.get(fingerprint) === request) {
+          _pendingWriteAdmissions.delete(fingerprint)
+        }
+      }
+    })()
+    _pendingWriteAdmissions.set(fingerprint, request)
+    return request
   },
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {

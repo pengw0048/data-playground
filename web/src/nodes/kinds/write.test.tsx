@@ -86,7 +86,7 @@ describe('Write card — typed local mode truth', () => {
     },
   )
 
-  it('refreshes an in-flight admission when an indirect upstream edge changes', async () => {
+  it('shares identity-keyed requests across a raw edge replacement and undo', async () => {
     const sourceA = {
       id: 'source-a', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'source-a', status: 'draft', config: {} },
@@ -108,28 +108,87 @@ describe('Write card — typed local mode truth', () => {
         { id: 'transform-write', source: 'transform', target: 'write' },
       ],
     }
-    const stale = {
+    const admissionA = {
       nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
       mode: 'append' as const, provider: 'managed-local-lance', expectedSchema: [], partitions: [],
     }
-    const fresh = { ...stale, expectedSchema: [{ name: 'replacement', type: 'string' }] }
-    let resolveStale!: (value: typeof stale) => void
+    const admissionB = { ...admissionA, expectedSchema: [{ name: 'replacement', type: 'string' }] }
+    let resolveA!: (value: typeof admissionA) => void
+    let resolveB!: (value: typeof admissionB) => void
     apiMocks.writeAdmission
-      .mockImplementationOnce(() => new Promise<typeof stale>((resolve) => { resolveStale = resolve }))
-      .mockResolvedValueOnce(fresh)
-    useStore.setState({ doc, runs: {} } as any)
+      .mockImplementationOnce(() => new Promise<typeof admissionA>((resolve) => { resolveA = resolve }))
+      .mockImplementationOnce(() => new Promise<typeof admissionB>((resolve) => { resolveB = resolve }))
+    useStore.setState({ doc, runs: {}, past: [], future: [] } as any)
+    useStore.getState().commit()
     const Write = getComponent('write')!
 
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
 
     await act(async () => {
-      useStore.getState().reconnectEdge('source-transform', {
-        id: 'replacement-edge-id', source: 'source-b', target: 'transform',
-      })
+      useStore.getState().setEdges([
+        { id: 'replacement-edge-id', source: 'source-b', target: 'transform' },
+        { id: 'transform-write', source: 'transform', target: 'write' },
+      ])
     })
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2))
-    await act(async () => { resolveStale(stale) })
+    await act(async () => { useStore.getState().undo() })
+    expect(useStore.getState().doc.edges[0]).toMatchObject({ source: 'source-a', target: 'transform' })
+    await Promise.resolve()
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      resolveA(admissionA)
+      resolveB(admissionB)
+    })
+
+    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toEqual(admissionA))
+  })
+
+  it('hides a cached admission as soon as its semantic identity changes', async () => {
+    const sourceA = {
+      id: 'source-a', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'source-a', status: 'draft', config: {} },
+    }
+    const sourceB = {
+      id: 'source-b', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'source-b', status: 'draft', config: {} },
+    }
+    const write = useStore.getState().doc.nodes[0]
+    const doc = {
+      id: 'c', version: 1, name: 'write', requirements: [], nodes: [sourceA, sourceB, write],
+      edges: [{ id: 'source-write', source: 'source-a', target: 'write' }],
+    }
+    const stale = {
+      nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
+      mode: 'append' as const, provider: 'managed-local-lance', expectedSchema: [], partitions: [],
+      blocker: 'Old source is unavailable.',
+    }
+    const fresh = { ...stale, blocker: undefined, expectedSchema: [{ name: 'value', type: 'string' }] }
+    let resolveFresh!: (value: typeof fresh) => void
+    apiMocks.writeAdmission.mockImplementationOnce(
+      () => new Promise<typeof fresh>((resolve) => { resolveFresh = resolve }),
+    )
+    useStore.setState({
+      doc,
+      runs: { write: {
+        phase: 'idle', writeAdmission: stale,
+        writeAdmissionFingerprint: writeAdmissionFingerprint(doc, 'write'),
+        writeSubmissionId: 'stale-submission',
+      } },
+    } as any)
+    const Write = getComponent('write')!
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
+    expect(screen.getByText(/Old source is unavailable/)).toBeInTheDocument()
+
+    await act(async () => {
+      useStore.getState().setEdges([{ id: 'replacement', source: 'source-b', target: 'write' }])
+    })
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText(/Old source is unavailable/)).not.toBeInTheDocument()
+    expect(screen.getByText(/checking destination/)).toBeInTheDocument()
+
+    await act(async () => { resolveFresh(fresh) })
 
     await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toEqual(fresh))
   })
