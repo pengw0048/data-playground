@@ -864,14 +864,25 @@ type = "password"
 env = "DP_MY_PLUGIN_SERVICE_TOKEN"
 secret = true
 workload_env = true
+headless_secret_ref_env = "DP_MY_PLUGIN_SERVICE_TOKEN_REF"
 ```
 
-The operator enables it by setting `plugin.<entry-point-name>.service_token` to an `env:` or `file:`
-SecretRef in Settings, or headlessly by setting `DP_MY_PLUGIN_SERVICE_TOKEN`. At launch, core resolves the
-reference once in the hub and forwards the material under that declared name. A kernel reuses only that
-target value for an isolated subrun; it does not reopen the hub's `env:` or `file:` reference. The UI
-setting takes precedence over the headless target fallback, and an unset field does not cross the
-boundary.
+`env` is the child-process target only; it is never an ambient Hub fallback. The operator enables it by
+setting `plugin.<entry-point-name>.service_token` to an `env:` or `file:` SecretRef in Settings, or
+headlessly by setting the separately declared `DP_MY_PLUGIN_SERVICE_TOKEN_REF` to that **reference**
+(for example, `env:MY_SERVICE_TOKEN` or `file:/run/secrets/service-token`). At launch, core resolves the
+reference once in the hub and forwards the material under the declared target name. A kernel reuses only
+that target value for an isolated subrun; it does not reopen the hub's `env:` or `file:` reference. The
+UI setting takes precedence over the headless reference binding, and an unset field simply does not cross
+the boundary.
+
+`headless_secret_ref_env` is optional when Settings is the only deployment path, but if present it must
+be an environment-variable name distinct from `env`. Its value must be a built-in `env:` or `file:`
+SecretRef, never a raw token; workload bindings use the portable built-in schemes rather than a
+plugin-defined resolver. This is a deliberate migration from older manifests: a bare target variable such as
+`DP_MY_PLUGIN_SERVICE_TOKEN=...` no longer activates a workload credential. Set the Settings value or add
+an explicit `headless_secret_ref_env` binding instead. Startup logs only the bound field names, never the
+reference or material.
 
 Only a successfully active installed entry-point plugin is eligible to forward its declaration.
 Registration failures, plugins with no effective capability, drop-ins, and configured modules do not

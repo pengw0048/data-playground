@@ -188,6 +188,46 @@ def test_plugin_workload_manifest_rejects_duplicate_keys_targets_and_defaults():
             "secret": invalid_secret,
             "workload_env": True,
         }]) == "workload_env config 'token' must set secret = true"
+    assert _validate_workload_env_config([{
+        "key": "token",
+        "env": "DP_REFERENCE_PLUGIN_TOKEN",
+        "headless_secret_ref_env": "DP_REFERENCE_PLUGIN_TOKEN",
+        **base,
+    }]) == (
+        "workload_env config 'token' headless_secret_ref_env must differ from its workload target")
+    assert _validate_workload_env_config([{
+        "key": "token",
+        "env": "DP_REFERENCE_PLUGIN_TOKEN",
+        "headless_secret_ref_env": "not-a-variable-name",
+        **base,
+    }]) == (
+        "workload_env config 'token' must declare headless_secret_ref_env as an environment variable name")
+    assert _validate_workload_env_config([
+        {"key": "first", "env": "DP_FIRST_PLUGIN_TOKEN", **base},
+        {"key": "second", "env": "DP_SECOND_PLUGIN_TOKEN",
+         "headless_secret_ref_env": "DP_FIRST_PLUGIN_TOKEN_REF", **base},
+        {"key": "third", "env": "DP_THIRD_PLUGIN_TOKEN",
+         "headless_secret_ref_env": "DP_FIRST_PLUGIN_TOKEN_REF", **base},
+    ]) == (
+        "workload_env config 'third' headless_secret_ref_env is declared more than once")
+    assert _validate_workload_env_config([
+        {"key": "first", "env": "DP_FIRST_PLUGIN_TOKEN", **base},
+        {"key": "second", "env": "DP_SECOND_PLUGIN_TOKEN",
+         "headless_secret_ref_env": "DP_FIRST_PLUGIN_TOKEN", **base},
+    ]) == (
+        "workload_env config 'second' headless_secret_ref_env cannot reuse another config environment name")
+    assert _validate_workload_env_config([{
+        "key": "token",
+        "env": "DP_REFERENCE_PLUGIN_TOKEN",
+        "headless_secret_ref_env": "DP_DATABASE_URL",
+        **base,
+    }]) == (
+        "workload_env config 'token' headless_secret_ref_env cannot use core environment 'DP_DATABASE_URL'")
+    assert _validate_workload_env_config([{
+        "key": "ordinary",
+        "headless_secret_ref_env": "DP_REFERENCE_PLUGIN_TOKEN_REF",
+    }]) == (
+        "config 'ordinary' may declare headless_secret_ref_env only with workload_env = true")
 
 
 def test_blank_auth_secret_does_not_put_open_local_workloads_in_auth_mode():

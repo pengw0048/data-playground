@@ -55,8 +55,10 @@ Within the profiles above, supported core paths preserve these requirements:
   reference only for its installed provider; supported APIs, logs, backups, and execution manifests do
   not receive the resolved value. One-shot subruns and Ray drivers do not receive the hub's
   session-signing or metadata-database credentials.
-- A plugin `[[config]]` field with `secret = true`, `workload_env = true`, and an explicit `env` name is
-  the narrow operator opt-in for a workload credential. Only a successfully active installed
+- A plugin `[[config]]` field with `secret = true`, `workload_env = true`, an explicit `env` target, and
+  either a persisted `env:`/`file:` SecretRef or a separately declared `headless_secret_ref_env` binding
+  is the narrow operator opt-in for a workload credential. A target-name environment variable is never implicitly
+  claimed. Only a successfully active installed
   entry-point plugin can forward a conflict-free declaration, and core keeps the material out of
   Settings/plugin projections, the hash-bound execution manifest, and core-generated resolver or
   dispatch errors. The workload and plugin can read the credential, and core does not content-redact

@@ -212,6 +212,25 @@ def plugin_secret_setting_keys() -> set[str]:
     return out
 
 
+def plugin_workload_secret_setting_keys() -> set[str]:
+    """Plugin secret setting keys whose values may be forwarded into workload processes."""
+    out: set[str] = set()
+    try:
+        from hub.deps import get_deps
+        for plugin in get_deps().plugins:
+            for field in plugin.get("config") or []:
+                if (
+                    isinstance(field, dict)
+                    and field.get("secret") is True
+                    and field.get("workload_env") is True
+                    and field.get("key")
+                ):
+                    out.add(f"plugin.{plugin['name']}.{field['key']}")
+    except Exception:  # noqa: BLE001 — settings must not crash when plugins are mid-load
+        pass
+    return out
+
+
 def validate_secret_reference(value: Any, *, field: str) -> str:
     """Validate one Cred field or plugin secret setting before persistence.
 
@@ -224,6 +243,17 @@ def validate_secret_reference(value: Any, *, field: str) -> str:
         raise ValueError(
             f"{field} must be a secret reference (env:VAR or file:/path), not a raw credential")
     return value
+
+
+def validate_workload_secret_reference(value: Any, *, field: str) -> str:
+    """Validate the portable SecretRef subset accepted by workload environment bindings."""
+    reference = validate_secret_reference(value, field=field)
+    if not reference:
+        return reference
+    scheme, _rest = parse_secret_ref(reference)
+    if scheme not in {"env", "file"}:
+        raise ValueError(f"{field} must be an env: or file: secret reference")
+    return reference
 
 
 # Install builtins at import so the first resolve works without an explicit ensure call.

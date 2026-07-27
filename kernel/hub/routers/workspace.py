@@ -1680,10 +1680,16 @@ def _plugin_secret_keys() -> set[str]:
     return plugin_secret_setting_keys()
 
 
+def _plugin_workload_secret_keys() -> set[str]:
+    """Secret setting keys whose configured reference may cross into a workload."""
+    from hub.secrets import plugin_workload_secret_setting_keys
+    return plugin_workload_secret_setting_keys()
+
+
 def _prepare_setting_changes(
-        changes: list[SettingBody], plugin_secrets: set[str]) \
+        changes: list[SettingBody], plugin_secrets: set[str], workload_secrets: set[str]) \
         -> tuple[list[tuple[str, str, object]], bool]:
-    from hub.secrets import validate_secret_reference
+    from hub.secrets import validate_secret_reference, validate_workload_secret_reference
 
     prepared: list[tuple[str, str, object]] = []
     sensitive = False
@@ -1695,7 +1701,11 @@ def _prepare_setting_changes(
         is_secret = change.scope == "global" and change.key in plugin_secrets
         if is_secret:
             try:
-                value = validate_secret_reference(value, field=change.key)
+                validator = (
+                    validate_workload_secret_reference
+                    if change.key in workload_secrets else validate_secret_reference
+                )
+                value = validator(value, field=change.key)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
         try:
@@ -1759,7 +1769,8 @@ def put_setting(body: SettingBody, uid: str = Depends(current_user)) -> dict:
                        resource_type="setting", resource_id=body.key, attrs={"scope": body.scope})
             raise
     plugin_secrets = _plugin_secret_keys()
-    prepared, _sensitive = _prepare_setting_changes([body], plugin_secrets)
+    prepared, _sensitive = _prepare_setting_changes(
+        [body], plugin_secrets, _plugin_workload_secret_keys())
     _scope, _key, value = prepared[0]
     scope_id = uid if body.scope == "user" else ""
     metadb.set_setting(body.key, value, scope=body.scope, scope_id=scope_id)
@@ -1786,7 +1797,8 @@ def put_settings_batch(
     if any(change.scope == "global" for change in body.changes) and not _can_manage_global(uid):
         _settings_batch_audit(AuditOutcome.DENIED, uid=uid, changes=body.changes)
         raise HTTPException(403, "admin only")
-    prepared, sensitive = _prepare_setting_changes(body.changes, _plugin_secret_keys())
+    prepared, sensitive = _prepare_setting_changes(
+        body.changes, _plugin_secret_keys(), _plugin_workload_secret_keys())
     try:
         revision = metadb.set_settings_batch(
             prepared, body.expected_revision.as_dict(), uid)

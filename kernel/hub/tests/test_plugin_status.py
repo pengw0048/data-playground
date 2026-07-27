@@ -146,14 +146,17 @@ def test_plugins_api_removes_internal_status_bookkeeping(tmp_path, monkeypatch):
     assert not any(key.startswith("_") for key in entry.model_dump())
 
 
-def _workload_field(key: str, target: str) -> dict:
-    return {
+def _workload_field(key: str, target: str, *, headless_ref_env: str | None = None) -> dict:
+    field = {
         "key": key,
         "type": "password",
         "env": target,
         "secret": True,
         "workload_env": True,
     }
+    if headless_ref_env is not None:
+        field["headless_secret_ref_env"] = headless_ref_env
+    return field
 
 
 def _workload_status_deps() -> Deps:
@@ -235,6 +238,62 @@ def test_cross_plugin_workload_target_conflicts_fail_all_owners_deterministicall
     assert deps._plugin_workload_fields == (("safe-pack", safe_field),)
     inherited = {shared_target: "conflicted", "DP_SAFE_PLUGIN_TOKEN": "safe"}
     assert deps.plugin_workload_env(inherited=inherited) == {"DP_SAFE_PLUGIN_TOKEN": "safe"}
+
+
+def test_ambient_workload_target_never_activates_a_plugin_binding(monkeypatch):
+    """A manifest target is not an implicit claim on the Hub environment."""
+    from hub import metadb
+
+    deps = _workload_status_deps()
+    active, field = _workload_plugin(
+        deps, "ambient-pack", "DP_AMBIENT_PLUGIN_TOKEN", active=True)
+    monkeypatch.setenv("DP_AMBIENT_PLUGIN_TOKEN", "ambient-material")
+    monkeypatch.setattr(metadb, "get_setting", lambda *_args, **_kwargs: None)
+    deps._finalize_plugin_workload_env()
+
+    assert active["state"] == "active"
+    assert deps._plugin_workload_fields == (("ambient-pack", field),)
+    assert deps.plugin_workload_env() == {}
+
+
+def test_headless_workload_binding_requires_a_secret_reference(monkeypatch):
+    from hub import metadb
+
+    deps = _workload_status_deps()
+    field = _workload_field(
+        "token", "DP_HEADLESS_PLUGIN_TOKEN", headless_ref_env="DP_HEADLESS_PLUGIN_TOKEN_REF")
+    entry = deps._new_plugin_status("headless-pack", "entry_point", config=[field])
+    entry["effective_capabilities"] = ["telemetry:headless-pack"]
+    entry["_placements"]["telemetry:headless-pack"] = "hub"
+    deps._refresh_plugin_status(entry)
+    deps._manifests["headless-pack"] = {"config": [field]}
+    monkeypatch.setattr(metadb, "get_setting", lambda *_args, **_kwargs: None)
+
+    monkeypatch.setenv("DP_HEADLESS_PLUGIN_TOKEN_REF", "raw-material")
+    deps._finalize_plugin_workload_env()
+    assert entry["state"] == "degraded"
+    assert "raw-material" not in entry["failure_summary"]
+    assert deps.plugin_workload_env() == {}
+    assert deps.plugin_workload_names() == ()
+
+    # Correcting the environment in place does not reactivate a plugin whose explicit binding already
+    # failed. Parent and inherited child paths remain in sync until normal plugin restart/registration.
+    monkeypatch.setenv("DP_HEADLESS_PLUGIN_TOKEN_REF", "env:DP_HEADLESS_PLUGIN_SOURCE")
+    monkeypatch.setenv("DP_HEADLESS_PLUGIN_SOURCE", "headless-material")
+    assert deps.plugin_workload_env() == {}
+    assert deps.plugin_workload_env(
+        inherited={"DP_HEADLESS_PLUGIN_TOKEN": "must-not-forward"}) == {}
+
+    restarted = _workload_status_deps()
+    restarted_entry = restarted._new_plugin_status(
+        "headless-pack", "entry_point", config=[field])
+    restarted_entry["effective_capabilities"] = ["telemetry:headless-pack"]
+    restarted_entry["_placements"]["telemetry:headless-pack"] = "hub"
+    restarted._refresh_plugin_status(restarted_entry)
+    restarted._manifests["headless-pack"] = {"config": [field]}
+    restarted._finalize_plugin_workload_env()
+    assert restarted.plugin_workload_env() == {
+        "DP_HEADLESS_PLUGIN_TOKEN": "headless-material"}
 
 
 def test_duplicate_installed_entry_point_names_fail_before_loading(tmp_path, monkeypatch):
