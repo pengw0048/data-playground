@@ -210,7 +210,13 @@ class Playground:
             if e.status_code == 409:
                 # The exact CAS read lost.  Re-read only enough state to tell the MCP client which
                 # version it must base a new operation on; never return the competing document.
-                current_version = ws.get_canvas(canvas_id, uid=self.user_id)["version"]
+                try:
+                    current_version = ws.get_canvas(canvas_id, uid=self.user_id)["version"]
+                except HTTPException:
+                    # A delete or authorization change can win between the failed PUT and this
+                    # diagnostic read. Preserve the typed conflict contract without guessing a
+                    # replacement version or leaking the secondary failure.
+                    current_version = None
                 raise ToolError(
                     f"canvas '{canvas_id}' changed; re-read it before retrying",
                     code="conflict",

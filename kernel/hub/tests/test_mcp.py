@@ -421,6 +421,45 @@ def test_mcp_mutation_conflicts_when_another_mcp_mutation_wins(monkeypatch):
     assert [node["type"] for node in persisted["nodes"]] == ["source"]
 
 
+def test_mcp_mutation_keeps_typed_conflict_when_canvas_disappears_before_diagnostic_read(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from hub.routers import workspace as ws
+
+    cid = data("create_canvas", {"name": "deleted during conflict"})["canvasId"]
+    real_get_canvas = ws.get_canvas
+    reads = 0
+
+    def disappears_after_initial_read(canvas_id, *, uid):
+        nonlocal reads
+        reads += 1
+        if canvas_id == cid and reads > 1:
+            raise HTTPException(status_code=404, detail="not found")
+        return real_get_canvas(canvas_id, uid=uid)
+
+    def stale_write(*_args, **_kwargs):
+        raise HTTPException(status_code=409, detail="version conflict")
+
+    monkeypatch.setattr(ws, "get_canvas", disappears_after_initial_read)
+    monkeypatch.setattr(ws, "put_canvas", stale_write)
+
+    conflict = call(
+        "add_node",
+        {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}},
+    )
+
+    assert conflict["isError"] is True
+    assert conflict["structuredContent"] == {
+        "detail": f"canvas '{cid}' changed; re-read it before retrying",
+        "code": "conflict",
+        "retryable": False,
+        "canvasId": cid,
+        "currentVersion": None,
+    }
+
+
 def test_mcp_mutation_uses_the_read_version_and_preserves_unrelated_fields():
     cid = data("create_canvas", {"name": "CAS success"})["canvasId"]
     before = client.get(f"/api/canvas/{cid}").json()
