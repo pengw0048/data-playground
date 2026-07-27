@@ -3735,7 +3735,7 @@ def test_workspace_provider_deadlines_keep_browse_fast_and_explicit_actions_boun
     page = workspace_providers.browse(folder["id"], uid=metadb.DEFAULT_USER_ID, limit=100)
     resource_ref = next(
         item["id"] for item in page["items"] if item.get("resourceId") == "dataset-a")
-    assert observed["list"] == [workspace_providers._PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS]
+    assert observed["list"] == [2.0]
 
     workspace_providers.search("shared", uid=metadb.DEFAULT_USER_ID)
     workspace_providers.resolve(resource_ref, uid=metadb.DEFAULT_USER_ID)
