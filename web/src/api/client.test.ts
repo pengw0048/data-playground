@@ -22,8 +22,10 @@ describe('API error recovery contract', () => {
 
     expect(blob.type).toBe('image/png')
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/catalog/revisions/dataset%20%2F%20one/revision%2Fone/media-cell',
-      expect.objectContaining({ method: 'POST', body: JSON.stringify({ identity, column: 'frame' }),
+      '/api/catalog/revision-media-cell',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({
+        datasetId: 'dataset / one', revisionId: 'revision/one', identity, column: 'frame',
+      }),
         headers: expect.objectContaining({ 'X-DP-User': 'media researcher' }) }),
     )
   })
@@ -50,6 +52,25 @@ describe('API error recovery contract', () => {
       status: 503, message: 'dataset_revision_provider_offline',
       code: 'service_unavailable', retryable: true,
     })
+  })
+
+  it('sends opaque exact revision IDs in the request body', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      detail: 'dataset_revision_unavailable', code: 'resource_gone', retryable: false,
+    }), { status: 410, headers: { 'Content-Type': 'application/json' } }))
+
+    await api.datasetRevision(
+      'luma-data-api://table/1530',
+      'luma-data-exact://table/1530/revision/2/identity/73cb',
+    ).catch(() => undefined)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/catalog/revision-details',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({
+        datasetId: 'luma-data-api://table/1530',
+        revisionId: 'luma-data-exact://table/1530/revision/2/identity/73cb',
+      }) }),
+    )
   })
 
   it('preserves field-specific managed-name diagnostics without parsing detail', async () => {

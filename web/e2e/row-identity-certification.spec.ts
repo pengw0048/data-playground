@@ -113,16 +113,24 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await history.getByRole("checkbox", { name: /^id/ }).check();
     await history.getByRole("button", { name: "Check scan cost" }).click();
     await expect(history.getByText("Ordered key schema:")).toBeVisible();
-    const exactDetailUrl = `/api/catalog/revisions/${encodeURIComponent(receipt.datasetId)}/${encodeURIComponent(receipt.revisionId)}`;
     const certifiedDetail = page.waitForResponse(
-      (response) => response.url().endsWith(exactDetailUrl)
-        && response.request().method() === "GET"
-        && response.ok(),
+      (response) => {
+        if (!response.url().endsWith("/api/catalog/revision-details")
+          || response.request().method() !== "POST" || !response.ok()) return false;
+        const body = response.request().postDataJSON() as {
+          datasetId?: string; revisionId?: string;
+        } | null;
+        return body?.datasetId === receipt.datasetId && body.revisionId === receipt.revisionId;
+      },
     );
     const mediaRequest = (column: "image" | "video") => page.waitForRequest(
       (request) => {
-        if (!request.url().endsWith(`${exactDetailUrl}/media-cell`) || request.method() !== "POST") return false;
-        return (request.postDataJSON() as { column?: string } | null)?.column === column;
+        if (!request.url().endsWith("/api/catalog/revision-media-cell") || request.method() !== "POST") return false;
+        const body = request.postDataJSON() as {
+          datasetId?: string; revisionId?: string; column?: string;
+        } | null;
+        return body?.datasetId === receipt.datasetId
+          && body.revisionId === receipt.revisionId && body.column === column;
       },
       { timeout: 30_000 },
     );
@@ -162,15 +170,20 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
       .toBeGreaterThanOrEqual(1);
 
     const imageBody = imageRequest.then((request) => request.postDataJSON() as {
+      datasetId: string;
+      revisionId: string;
       identity: Array<{ name: string; arrowType: string; value: unknown }>;
       column: string;
     });
     const videoBody = videoRequest.then((request) => request.postDataJSON() as {
+      datasetId: string;
+      revisionId: string;
       identity: Array<{ name: string; arrowType: string; value: unknown }>;
       column: string;
     });
-    await expect(imageBody).resolves.toEqual({ identity, column: "image" });
-    await expect(videoBody).resolves.toEqual({ identity, column: "video" });
+    const exactIdentity = { datasetId: receipt.datasetId, revisionId: receipt.revisionId };
+    await expect(imageBody).resolves.toEqual({ ...exactIdentity, identity, column: "image" });
+    await expect(videoBody).resolves.toEqual({ ...exactIdentity, identity, column: "video" });
 
     // The same rendered cells remain usable at the documented minimum and reference desktop
     // viewports in both themes; resizing or retheming must not replace them with placeholders.

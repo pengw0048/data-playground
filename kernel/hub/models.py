@@ -601,6 +601,22 @@ class MediaCellRequest(Wire):
     column: str = Field(min_length=1, max_length=256)
 
 
+class ExactDatasetRevisionRequest(Wire):
+    """One opaque exact-revision identity carried in a request body, not a path."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    dataset_id: str = Field(min_length=1, max_length=512)
+    revision_id: str = Field(min_length=1, max_length=256)
+
+
+class ExactMediaCellRequest(ExactDatasetRevisionRequest):
+    """One bounded media read plus its opaque exact-revision identity."""
+
+    identity: list[MediaCellIdentityValue] = Field(min_length=1, max_length=32)
+    column: str = Field(min_length=1, max_length=256)
+
+
 class DatasetRevisionDetail(Wire):
     """Inspectable facts and a bounded preview for one retained exact revision."""
     dataset_id: str = Field(min_length=1, max_length=512)

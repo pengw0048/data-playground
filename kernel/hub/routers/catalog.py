@@ -63,7 +63,9 @@ from hub.models import (
     DatasetRevisionPreview,
     DatasetRevisionResolution,
     DatasetRevisionSummary,
+    ExactDatasetRevisionRequest,
     ExactDatasetRef,
+    ExactMediaCellRequest,
     Facets,
     FieldLineagePage,
     ImportRequest,
@@ -716,6 +718,13 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
     )
 
 
+@router.post("/catalog/revision-details", response_model=DatasetRevisionDetail)
+def open_dataset_revision_by_identity(
+        request: ExactDatasetRevisionRequest) -> DatasetRevisionDetail:
+    """Open one exact revision whose opaque IDs may contain path separators."""
+    return open_dataset_revision(request.dataset_id, request.revision_id)
+
+
 @router.post(
     "/catalog/revisions/{dataset_id}/{revision_id}/media-cell",
     response_class=Response,
@@ -796,6 +805,32 @@ def open_media_cell(
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
         },
+    )
+
+
+@router.post(
+    "/catalog/revision-media-cell",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "The exact bounded media cell bytes.",
+            "content": {
+                media_type: {"schema": {"type": "string", "format": "binary"}}
+                for media_type in (
+                    "image/png", "image/jpeg", "image/gif", "image/webp",
+                    "image/avif", "image/heic", "image/heif",
+                    "video/webm", "video/x-matroska", "video/mp4", "video/quicktime",
+                )
+            },
+        },
+    },
+)
+def open_media_cell_by_identity(request: ExactMediaCellRequest) -> Response:
+    """Read one exact media cell when dataset and revision IDs are opaque strings."""
+    return open_media_cell(
+        MediaCellRequest(identity=request.identity, column=request.column),
+        request.dataset_id,
+        request.revision_id,
     )
 
 

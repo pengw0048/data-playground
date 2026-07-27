@@ -400,12 +400,14 @@ export const api = {
     return req<DatasetRevisionResolution>(`/catalog/tables/${encodeURIComponent(tableId)}/revisions/resolve${query}`)
   },
   datasetRevision: (datasetId: string, revisionId: string) =>
-    req<DatasetRevisionDetail>(`/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}`),
+    req<DatasetRevisionDetail>('/catalog/revision-details', {
+      method: 'POST', body: JSON.stringify({ datasetId, revisionId }),
+    }),
   openMediaCell: (
     datasetId: string, revisionId: string, body: MediaCellRequest, options?: { signal?: AbortSignal },
   ) => reqBlob(
-    `/catalog/revisions/${encodeURIComponent(datasetId)}/${encodeURIComponent(revisionId)}/media-cell`,
-    { method: 'POST', body: JSON.stringify(body), signal: options?.signal },
+    '/catalog/revision-media-cell',
+    { method: 'POST', body: JSON.stringify({ datasetId, revisionId, ...body }), signal: options?.signal },
   ),
   rowIdentityCertificationPreflight: (body: { datasetId: string; revisionId: string; keyColumns: string[] }) =>
     req<RowIdentityCertificationPreflight>('/catalog/row-identity-certifications/preflight', {
