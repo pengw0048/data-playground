@@ -3950,10 +3950,10 @@ def test_local_dataset_path_confined_in_auth_mode(monkeypatch):
 def test_canvas_crud_is_per_user():
     doc = {"id": "cv1", "name": "My Canvas", "version": 3, "nodes": [], "edges": []}
     r = client.put("/api/canvas/cv1", json=doc).json()
-    assert r["ok"]
+    assert r == {"ok": True, "id": "cv1", "version": 1}
     listing = client.get("/api/canvas").json()
-    assert any(c["id"] == "cv1" and c["name"] == "My Canvas" and c["version"] == 3 for c in listing)
-    assert client.get("/api/canvas/cv1").json()["name"] == "My Canvas"
+    assert any(c["id"] == "cv1" and c["name"] == "My Canvas" and c["version"] == 1 for c in listing)
+    assert client.get("/api/canvas/cv1").json() == {**doc, "version": 1}
     # a different user cannot see it
     other = client.post("/api/users", json={"name": "Bob"}).json()["id"]
     assert client.get("/api/canvas", headers={"X-DP-User": other}).json() == []
@@ -3970,12 +3970,12 @@ def test_canvas_create_reports_new_insert_without_claiming_an_existing_id():
 
     created = client.post("/api/canvas", json=original)
     assert created.status_code == 200
-    assert created.json() == {"ok": True, "id": canvas_id, "created": True}
+    assert created.json() == {"ok": True, "id": canvas_id, "version": 1, "created": True}
 
     # Retrying the same client-generated ID is not evidence of ownership and must not mutate the row.
     collision = client.post("/api/canvas", json={**original, "name": "Replacement"})
     assert collision.status_code == 200
-    assert collision.json() == {"ok": True, "id": canvas_id, "created": False}
+    assert collision.json() == {"ok": True, "id": canvas_id, "version": 1, "created": False}
     assert client.get(f"/api/canvas/{canvas_id}").json()["name"] == "Original"
 
     # The same evidence contract holds across users: a collision neither transfers ownership nor grants access.
@@ -3984,7 +3984,9 @@ def test_canvas_create_reports_new_insert_without_claiming_an_existing_id():
         "/api/canvas", json={**original, "name": "Foreign replacement"},
         headers={"X-DP-User": other},
     )
-    assert foreign_collision.json() == {"ok": True, "id": canvas_id, "created": False}
+    assert foreign_collision.json() == {
+        "ok": True, "id": canvas_id, "version": 1, "created": False,
+    }
     assert client.get(f"/api/canvas/{canvas_id}", headers={"X-DP-User": other}).status_code == 404
     assert client.get(f"/api/canvas/{canvas_id}").json()["name"] == "Original"
     client.delete(f"/api/canvas/{canvas_id}")

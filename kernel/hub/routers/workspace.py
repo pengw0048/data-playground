@@ -1158,21 +1158,24 @@ def _validate_canvas_execution_contract(doc: dict) -> None:
 
 @router.post("/canvas")
 def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
-    _validate_canvas_execution_contract(doc)
+    # The route owns persisted identity. Raw clients may omit these fields or submit stale values;
+    # neither should leak into the document later returned to every other Canvas consumer.
+    cid = doc.get("id") or metadb._uid()
+    persisted_doc = {**doc, "id": cid, "version": 1}
+    _validate_canvas_execution_contract(persisted_doc)
     try:
-        metadb.require_promoted_transform_use(uid, doc)
+        metadb.require_promoted_transform_use(uid, persisted_doc)
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     with metadb.session() as s:
         # honor the client's id so the canvas exists under it immediately (no orphan row, and
         # sharing/opening works without waiting for the first autosave to PUT it).
-        cid = doc.get("id") or metadb._uid()
         values = {
             "id": cid,
             "owner_id": uid,
-            "name": doc.get("name") or "untitled",
-            "version": doc.get("version", 1),
-            "doc": json.dumps(doc),
+            "name": persisted_doc.get("name") or "untitled",
+            "version": 1,
+            "doc": json.dumps(persisted_doc),
         }
         dialect = s.get_bind().dialect.name
         if dialect == "postgresql":
@@ -1192,11 +1195,17 @@ def create_canvas(doc: dict, uid: str = Depends(current_user)) -> dict:
             # Materialize the durable owner row before the local-result registry lock.  Autoflush is
             # deliberately disabled inside that lock so every ownership path has one global order.
             s.flush()
-            metadb.sync_local_result_owner(s, "canvas", cid, doc)
-            metadb._replace_promoted_transform_refs(s, "canvas", cid, doc)
+            metadb.sync_local_result_owner(s, "canvas", cid, persisted_doc)
+            metadb._replace_promoted_transform_refs(s, "canvas", cid, persisted_doc)
         metadb._workspace_ensure_root_placement_in_session(
             s, target_kind="canvas", target_id=cid, name=values["name"])
-        return {"ok": True, "id": cid, "created": created}
+        canvas = s.get(metadb.Canvas, cid)
+        return {
+            "ok": True,
+            "id": cid,
+            "version": canvas.version if canvas is not None else 1,
+            "created": created,
+        }
 
 
 @router.get("/canvas/{canvas_id}")
@@ -1345,6 +1354,10 @@ def put_canvas(canvas_id: str, doc: dict,
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     with metadb.session() as s:
+        if metadb._is_sqlite_database():
+            # SQLite ignores SELECT FOR UPDATE. Reserve its writer slot before reading the current
+            # version so concurrent unconditional writes cannot both derive the same successor.
+            s.connection().exec_driver_sql("BEGIN IMMEDIATE")
         c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         previous_name = c.name if c is not None else None
         if c and role not in ("owner", "editor"):
@@ -1364,10 +1377,11 @@ def put_canvas(canvas_id: str, doc: dict,
                     code=APIErrorCode.CONFLICT,
                     retryable=False,
                 )
-        if not c:
+        current_version = c.version if c is not None else 0
+        if c is None:
             c = metadb.Canvas(id=canvas_id, owner_id=uid)  # first save → the creator owns it
             s.add(c)
-        version = expected_version + 1 if expected_version is not None else doc.get("version", 1)
+        version = expected_version + 1 if expected_version is not None else current_version + 1
         persisted_doc = {**doc, "id": canvas_id, "version": version}
         doc_json = json.dumps(persisted_doc)
         c.name = doc.get("name") or c.name or "untitled"
