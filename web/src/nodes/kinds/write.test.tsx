@@ -47,8 +47,9 @@ describe('Write card — typed local mode truth', () => {
     const fingerprint = JSON.stringify({
       ...executionDoc,
       nodes: doc.nodes.map((node) => {
+        const { position: _position, ...executionNode } = node
         const { status: _status, ...data } = node.data
-        return { ...node, data }
+        return { ...executionNode, data }
       }),
       parameterBindings: [],
     })
@@ -101,8 +102,9 @@ describe('Write card — typed local mode truth', () => {
     const fingerprint = JSON.stringify({
       ...executionDoc,
       nodes: doc.nodes.map((node) => {
+        const { position: _position, ...executionNode } = node
         const { status: _status, ...nodeData } = node.data
-        return { ...node, data: nodeData }
+        return { ...executionNode, data: nodeData }
       }),
       parameterBindings: [],
     })
@@ -209,24 +211,31 @@ describe('Write card — typed local mode truth', () => {
       doc: { ...useStore.getState().doc, nodes: [unrelated, write], edges: [] },
       runs: { write: { phase: 'idle' } },
     } as any)
-    apiMocks.writeAdmission.mockResolvedValue({
+    const admission = {
       nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
       mode: 'append', provider: 'managed-local-lance',
       expectedSchema: [{ name: 'value', type: 'int' }], partitions: [],
-    })
+    }
+    let resolveAdmission!: (value: typeof admission) => void
+    apiMocks.writeAdmission.mockImplementation(
+      () => new Promise((resolve) => { resolveAdmission = resolve }),
+    )
 
     const Write = getComponent('write')!
     render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
     await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
-    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toBeDefined())
 
     act(() => {
       useStore.getState().setNodes(useStore.getState().doc.nodes.map((node) =>
         node.id === 'unrelated' ? { ...node, position: { x: -100, y: 75 } } : node))
     })
-    await act(async () => { await Promise.resolve() })
+    await act(async () => {
+      resolveAdmission(admission)
+      await Promise.resolve()
+    })
 
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().runs.write.writeAdmission).toEqual(admission)
   })
 
   it('shows the typed managed-name reason beside the filename field', async () => {

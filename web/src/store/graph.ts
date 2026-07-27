@@ -430,8 +430,9 @@ function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasPar
   return JSON.stringify({
     ...executionDoc,
     nodes: doc.nodes.map((node) => {
+      const { position: _position, ...executionNode } = node
       const { status: _status, ...data } = node.data
-      return { ...node, data }
+      return { ...executionNode, data }
     }),
     parameterBindings: parameterBindings ?? [],
   })
