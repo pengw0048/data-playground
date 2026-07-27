@@ -355,6 +355,36 @@ def test_build_is_persisted_and_visible_through_the_http_api():
     assert {n["type"] for n in gc["nodes"]} == {"source", "filter"}
 
 
+def test_mcp_mutation_cannot_regress_a_newer_server_version(monkeypatch):
+    from hub.routers import workspace as ws
+
+    cid = data("create_canvas", {"name": "stale MCP edit"})
+    cid = cid["canvasId"]
+    stale_doc = client.get(f"/api/canvas/{cid}").json()
+    current = stale_doc
+    for expected_version in range(1, 4):
+        current = {**current, "name": f"browser edit {expected_version}"}
+        saved = client.put(
+            f"/api/canvas/{cid}?expectedVersion={expected_version}",
+            json=current,
+        )
+        assert saved.status_code == 200
+        current = client.get(f"/api/canvas/{cid}").json()
+    assert current["version"] == 4
+
+    real_get_canvas = ws.get_canvas
+    monkeypatch.setattr(
+        ws,
+        "get_canvas",
+        lambda canvas_id, uid: stale_doc if canvas_id == cid else real_get_canvas(canvas_id, uid),
+    )
+    data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
+
+    persisted = client.get(f"/api/canvas/{cid}").json()
+    assert persisted["version"] == 5
+    assert len(persisted["nodes"]) == 1
+
+
 def test_structural_edit_preserves_section_child_positions():
     # a canvas with a `section` uses parent-RELATIVE child positions; a structural MCP edit must not
     # relayout them into absolute coords (which would fling them out of the frame). Seed such a canvas

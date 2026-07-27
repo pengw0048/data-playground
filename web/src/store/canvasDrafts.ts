@@ -52,19 +52,31 @@ function storageMessage(action: string, error: unknown): string {
   return `Could not ${action} local Canvas draft: ${detail}. The draft is not saved in this browser.`
 }
 
-function readIndex(principalId: string): { index: DraftIndex; error?: string } {
+function readIndex(principalId: string): { index: DraftIndex; errors: string[]; error?: string } {
   try {
     const raw = localStorage.getItem(INDEX_KEY(principalId))
-    if (!raw) return { index: { version: INDEX_VERSION, ids: [] } }
+    if (!raw) return { index: { version: INDEX_VERSION, ids: [] }, errors: [] }
     const parsed = JSON.parse(raw) as Partial<DraftIndex>
-    if (parsed.version !== INDEX_VERSION || !Array.isArray(parsed.ids)
-      || parsed.ids.some((id) => typeof id !== 'string' || !id)) {
+    if (parsed.version !== INDEX_VERSION || !Array.isArray(parsed.ids)) {
       throw new Error('draft index is corrupt')
     }
-    return { index: { version: INDEX_VERSION, ids: Array.from(new Set(parsed.ids)) } }
+    const errors: string[] = []
+    const validIds: string[] = []
+    for (const id of parsed.ids) {
+      if (typeof id !== 'string' || !id) {
+        errors.push(storageMessage('read one indexed identity', new Error('draft identity is corrupt')))
+      } else {
+        validIds.push(id)
+      }
+    }
+    return {
+      index: { version: INDEX_VERSION, ids: Array.from(new Set(validIds)) },
+      errors,
+    }
   } catch (error) {
     return {
       index: { version: INDEX_VERSION, ids: [] },
+      errors: [],
       error: storageMessage('read the', error),
     }
   }
@@ -94,8 +106,9 @@ function parseDraft(raw: string, principalId: string, draftId: string): LocalCan
 }
 
 export function readCanvasDrafts(principalId: string): DraftReadResult {
-  const { index, error } = readIndex(principalId)
-  const errors = error ? [error] : []
+  const { index, errors: indexErrors, error } = readIndex(principalId)
+  const errors = [...indexErrors]
+  if (error) errors.push(error)
   const drafts: LocalCanvasDraft[] = []
   if (error) return { drafts, errors }
   for (const draftId of index.ids) {

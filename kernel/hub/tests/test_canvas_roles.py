@@ -161,3 +161,50 @@ def test_canvas_put_expected_version_prevents_stale_or_deleted_draft_overwrite(m
             )
             assert deleted.status_code == 409
             assert deleted.json()["code"] == "conflict"
+
+
+def test_raw_canvas_create_and_unconditional_put_use_authoritative_identity_and_version(monkeypatch):
+    seed_canvas_id = "canvas_raw_identity_seed"
+    created_id = None
+    with _canvas(seed_canvas_id, "private"):
+        monkeypatch.setenv("DP_AUTH_SECRET", AUTH_SECRET)
+        owner_headers = {"Cookie": f"dp_session={auth.sign(OWNER_ID)}"}
+        with TestClient(app) as client:
+            created = client.post(
+                "/api/canvas",
+                json={"name": "raw create", "version": 99, "nodes": [], "edges": []},
+                headers=owner_headers,
+            )
+            assert created.status_code == 200
+            created_id = created.json()["id"]
+            assert created.json() == {
+                "ok": True, "id": created_id, "version": 1, "created": True,
+            }
+            assert client.get(f"/api/canvas/{created_id}", headers=owner_headers).json() == {
+                "id": created_id, "name": "raw create", "version": 1, "nodes": [], "edges": [],
+            }
+
+            updated = client.put(
+                f"/api/canvas/{created_id}",
+                json={
+                    "id": "wrong-client-id",
+                    "name": "unconditional update",
+                    "version": 0,
+                    "nodes": [],
+                    "edges": [],
+                },
+                headers=owner_headers,
+            )
+            assert updated.status_code == 200
+            assert updated.json() == {
+                "ok": True, "id": created_id, "version": 2,
+            }
+            assert client.get(f"/api/canvas/{created_id}", headers=owner_headers).json() == {
+                "id": created_id,
+                "name": "unconditional update",
+                "version": 2,
+                "nodes": [],
+                "edges": [],
+            }
+    if created_id is not None:
+        metadb.delete_canvas_cascade(created_id)
