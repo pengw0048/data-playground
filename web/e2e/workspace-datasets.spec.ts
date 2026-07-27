@@ -25,8 +25,8 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
   await writeFile(registeredPath, 'id,value\n1,registered\n2,ready\n', 'utf8')
   try {
     await page.goto('/#/workspace')
-    await page.getByRole('tab', { name: 'Datasets' }).click()
-    await expect(page.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
+    await page.getByRole('tab', { name: 'Local catalog' }).click()
+    await expect(page.getByRole('tab', { name: 'Local catalog' })).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/#\/workspace\?scope=datasets/)
 
     await page.getByTestId('register-dataset').click()
@@ -51,7 +51,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page).toHaveURL(/#\/workspace\/container%3A/)
     await page.reload()
     await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
-    await page.getByRole('tab', { name: 'Datasets' }).click()
+    await page.getByRole('tab', { name: 'Local catalog' }).click()
     await page.getByRole('button', { name: 'All datasets' }).click()
 
     const uploadedResponse = page.waitForResponse((response) => response.url().endsWith('/api/catalog/upload') && response.request().method() === 'POST')
@@ -91,7 +91,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await expect(page).toHaveURL(/#\/workspace\/container%3A/)
     await expect(await workspaceResource(page, 'dataset', registeredName)).toBeVisible()
     await expect(page.getByText('Folder organization comes from this catalog. Canvases stored here are local to Data Playground.')).toBeVisible()
-    await page.getByRole('tab', { name: 'Datasets' }).click()
+    await page.getByRole('tab', { name: 'Local catalog' }).click()
     const folderQuery = `folder=${encodeURIComponent(registeredFolder)}`
     await expect(page).toHaveURL(new RegExp(`scope=datasets.*${folderQuery}`))
     await page.reload()
@@ -139,7 +139,7 @@ test('discovers, previews, batch-uses, runs, and safely unregisters local datase
     await page.getByText('Back to Workspace').click()
     await expect(page.getByRole('tab', { name: 'All Workspace' })).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/#\/workspace\/container%3Aworkspace-local-root$/)
-    await page.getByRole('tab', { name: 'Datasets' }).click()
+    await page.getByRole('tab', { name: 'Local catalog' }).click()
     await expect(search).toHaveValue('')
     await search.fill('issue497_')
     await page.getByRole('checkbox', { name: `Select ${registeredName}` }).check()

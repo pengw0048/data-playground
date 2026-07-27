@@ -876,7 +876,7 @@ function WorkspaceScopeTabs({ active, onChange, disabled = false, disabledTitle 
   disabled?: boolean; disabledTitle?: string
 }) {
   return <div role="tablist" aria-label="Workspace scope" className="flex shrink-0 items-center rounded-lg border border-border bg-card p-0.5 text-[11.5px]">
-    {([['all', 'All Workspace'], ['datasets', 'Datasets']] as const).map(([scope, label]) => (
+    {([['all', 'All Workspace'], ['datasets', 'Local catalog']] as const).map(([scope, label]) => (
       <button key={scope} role="tab" aria-selected={active === scope}
         disabled={scope !== active && disabled} title={scope !== active ? disabledTitle : undefined}
         onClick={() => onChange(scope)}
@@ -1057,11 +1057,11 @@ function WorkspaceDatasets() {
       {activeFolderContext.state === 'unavailable' && activeFolderContext.retryable
         && <button type="button" onClick={() => { void switchToAll() }}
           className="text-[11px] font-semibold text-primary hover:underline">Retry Workspace location</button>}
-      <span className="ml-auto text-[11px] text-muted-foreground">Open a dataset’s folder in All Workspace to work beside its local Canvases.</span>
+      <span className="ml-auto text-[11px] text-muted-foreground">Datasets registered in Data Playground. Mounted provider datasets appear in All Workspace.</span>
     </div>
     <div className="min-h-0 flex-1">
       <CatalogDiscovery sourceIdentity={catalogSource} foldersMutable={foldersMutable}
-        title="Datasets" queryState={query}
+        title="Local catalog" queryState={query}
         initialRevisionId={initialRevisionId}
         initialRevisionDatasetId={initialRevisionDatasetId}
         onQueryStateChange={(next) => {
