@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import threading
 from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
 
 from hub import auth, metadb
 from hub.main import app
@@ -161,6 +163,66 @@ def test_canvas_put_expected_version_prevents_stale_or_deleted_draft_overwrite(m
             )
             assert deleted.status_code == 409
             assert deleted.json()["code"] == "conflict"
+
+
+def test_concurrent_unconditional_canvas_puts_advance_distinct_sqlite_versions(monkeypatch):
+    from hub.routers import workspace
+
+    if not metadb._is_sqlite_database():
+        pytest.skip("SQLite writer-reservation regression")
+    canvas_id = "canvas_concurrent_unconditional_versions"
+    first_read = threading.Event()
+    second_read = threading.Event()
+    first_done = threading.Event()
+    results: dict[str, dict | Exception] = {}
+    real_get = Session.get
+
+    def coordinated_get(session, entity, identity, **kwargs):
+        row = real_get(session, entity, identity, **kwargs)
+        if entity is metadb.Canvas and identity == canvas_id and kwargs.get("with_for_update"):
+            if threading.current_thread().name == "canvas-put-first":
+                first_read.set()
+                second_read.wait(timeout=0.25)
+            elif threading.current_thread().name == "canvas-put-second":
+                second_read.set()
+                assert first_done.wait(timeout=5)
+        return row
+
+    monkeypatch.setattr(Session, "get", coordinated_get)
+    monkeypatch.setattr(metadb, "snapshot_canvas", lambda *_args, **_kwargs: None)
+
+    def put(label: str) -> None:
+        try:
+            results[label] = workspace.put_canvas(
+                canvas_id,
+                {**_doc(canvas_id, label), "version": 0},
+                expected_version=None,
+                uid=OWNER_ID,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced in the result assertions below
+            results[label] = exc
+        finally:
+            if label == "first":
+                first_done.set()
+
+    with _canvas(canvas_id, "private"):
+        first = threading.Thread(target=put, args=("first",), name="canvas-put-first")
+        second = threading.Thread(target=put, args=("second",), name="canvas-put-second")
+        first.start()
+        assert first_read.wait(timeout=5)
+        second.start()
+        for thread in (first, second):
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert sorted(
+            result["version"] for result in results.values() if isinstance(result, dict)
+        ) == [2, 3]
+        assert all(isinstance(result, dict) for result in results.values())
+        with metadb.session() as session:
+            persisted = session.get(metadb.Canvas, canvas_id)
+            assert persisted is not None
+            assert persisted.version == json.loads(persisted.doc)["version"] == 3
 
 
 def test_raw_canvas_create_and_unconditional_put_use_authoritative_identity_and_version(monkeypatch):

@@ -1354,6 +1354,10 @@ def put_canvas(canvas_id: str, doc: dict,
     except PermissionError as exc:
         raise HTTPException(403, str(exc)) from exc
     with metadb.session() as s:
+        if metadb._is_sqlite_database():
+            # SQLite ignores SELECT FOR UPDATE. Reserve its writer slot before reading the current
+            # version so concurrent unconditional writes cannot both derive the same successor.
+            s.connection().exec_driver_sql("BEGIN IMMEDIATE")
         c = s.get(metadb.Canvas, canvas_id, with_for_update=True)
         previous_name = c.name if c is not None else None
         if c and role not in ("owner", "editor"):
