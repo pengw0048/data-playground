@@ -460,6 +460,35 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().runs.write.writeAdmissionFingerprint).toBeUndefined()
   })
 
+  it('invalidates a downstream ready Write admission when removing its source node', () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: { write: {
+        phase: 'idle',
+        writeAdmission: {
+          nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+          mode: 'create', provider: 'managed-local-file',
+          expectedSchema: [{ name: 'value', type: 'int' }], partitions: [],
+        },
+        writeSubmissionId: 'ready-submission', writeAdmissionFingerprint: 'ready-graph',
+      } },
+    } as any)
+
+    useStore.getState().removeNode('source')
+
+    expect(useStore.getState().doc.nodes.map((node) => node.id)).toEqual(['write'])
+    expect(useStore.getState().doc.edges).toEqual([])
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+    expect(useStore.getState().runs.write.writeAdmissionFingerprint).toBeUndefined()
+  })
+
   it('re-admits a Write against the replacement upstream after reconnect', async () => {
     const oldSource = NODE('old-source')
     const newSource = NODE('new-source')

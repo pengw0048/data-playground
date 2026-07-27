@@ -1,9 +1,14 @@
 import { useEffect, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
-import { useStore, writeAdmissionFingerprint } from '../../store/graph'
+import { useStore } from '../../store/graph'
 import { Field, MiniInput, MiniSelect } from '../../ui/controls'
 import { managedDatasetNameErrorMessage } from '../../api/client'
+import type { CanvasEdge } from '../../types/graph'
+
+function writeInputEdgeSignature(edges: CanvasEdge[], nodeId: string): string {
+  return JSON.stringify(edges.filter((edge) => edge.target === nodeId))
+}
 
 function Write({ id, data }: NodeComponentProps) {
   const updateConfig = useStore((s) => s.updateConfig)
@@ -14,8 +19,7 @@ function Write({ id, data }: NodeComponentProps) {
   const admission = useStore((s) => s.runs[id]?.writeAdmission
     ?? (s.runs[id]?.phase === 'done' ? s.runs[id]?.writeOutcomeAdmission : undefined))
   const runPhase = useStore((s) => s.runs[id]?.phase)
-  const currentAdmissionFingerprint = useStore((s) =>
-    writeAdmissionFingerprint(s.doc, s.runs[id]?.parameterBindings))
+  const inputEdgeSignature = useStore((s) => writeInputEdgeSignature(s.doc.edges, id))
   const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
@@ -38,7 +42,7 @@ function Write({ id, data }: NodeComponentProps) {
   // cannot reuse a completed request. Re-run the existing preflight when that happens: config is
   // unchanged, but the card still needs a truthful current destination summary. Active run intent
   // owns admission while it estimates, waits at a gate, or executes; the card must not race it.
-  }, [id, data.config, admission, runPhase, prepareWrite, currentAdmissionFingerprint])
+  }, [id, data.config, admission, runPhase, prepareWrite, inputEdgeSignature])
   const displayName = admission?.intent?.destination.name ?? name
   const semantics = receipt
     ? `published revision ${receipt.revisionId}`

@@ -196,6 +196,39 @@ describe('Write card — typed local mode truth', () => {
     expect(screen.getByText(/append · 1 cols/)).toBeInTheDocument()
   })
 
+  it('does not re-admit when an unrelated node moves', async () => {
+    const write = useStore.getState().doc.nodes[0]
+    const unrelated = {
+      id: 'unrelated', type: 'source', position: { x: -200, y: 0 },
+      data: {
+        title: 'unrelated', status: 'draft' as const, history: [],
+        config: { uri: '/data/unrelated.parquet' },
+      },
+    }
+    useStore.setState({
+      doc: { ...useStore.getState().doc, nodes: [unrelated, write], edges: [] },
+      runs: { write: { phase: 'idle' } },
+    } as any)
+    apiMocks.writeAdmission.mockResolvedValue({
+      nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
+      mode: 'append', provider: 'managed-local-lance',
+      expectedSchema: [{ name: 'value', type: 'int' }], partitions: [],
+    })
+
+    const Write = getComponent('write')!
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toBeDefined())
+
+    act(() => {
+      useStore.getState().setNodes(useStore.getState().doc.nodes.map((node) =>
+        node.id === 'unrelated' ? { ...node, position: { x: -100, y: 75 } } : node))
+    })
+    await act(async () => { await Promise.resolve() })
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+  })
+
   it('shows the typed managed-name reason beside the filename field', async () => {
     useStore.setState({
       runs: { write: { phase: 'idle' } },

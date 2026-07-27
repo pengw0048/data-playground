@@ -425,7 +425,7 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId, parameterBindings) ? retained : undefined
 }
 
-export function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
+function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
   const { version: _version, ...executionDoc } = doc
   return JSON.stringify({
     ...executionDoc,
@@ -1739,7 +1739,8 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((s) => {
       const previews = { ...s.previews }; delete previews[id]
-      const runs = { ...s.runs }; delete runs[id]
+      const runs = invalidateWriteAdmissions(s.doc, s.runs, downstream(s.doc, id))
+      delete runs[id]
       const profileJobs = Object.fromEntries(
         Object.entries(s.profileJobs).filter(([, job]) => job.nodeId !== id),
       )
