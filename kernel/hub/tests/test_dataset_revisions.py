@@ -169,7 +169,7 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
         "datasetId": dataset_id,
         "revisionId": exact,
         "proofStatus": "unavailable",
-        "certificationSupported": False,
+        "certificationSupported": True,
         "fields": [],
         "encodingVersion": None,
     }
@@ -466,6 +466,33 @@ def test_exact_revision_normalizes_recoverable_provider_failures(
     response = client.get("/api/catalog/revisions/dataset/revision")
     assert response.status_code == status
     assert response.json() == {"detail": detail, "code": code, "retryable": retryable}
+
+
+@pytest.mark.parametrize(("failure", "status", "detail", "code", "retryable"), [
+    (RevisionPermissionLost("denied"), 403, "dataset_revision_permission_lost",
+     "permission_denied", False),
+    (RevisionProviderOffline("offline"), 503, "dataset_revision_provider_offline",
+     "service_unavailable", True),
+    (RevisionUnavailable("gone"), 410, "dataset_revision_unavailable",
+     "resource_gone", False),
+])
+def test_lance_identity_fence_preserves_exact_revision_access_taxonomy(
+        tmp_path, monkeypatch, failure, status, detail, code, retryable):
+    _uri, table = _register_lance(tmp_path)
+    selected = client.get(
+        f"/api/catalog/tables/{table['id']}/revisions").json()["items"][0]
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(LanceAdapter, "exact_revision_incarnation", fail)
+    response = client.get(
+        f"/api/catalog/revisions/{selected['datasetId']}/{selected['revisionId']}")
+
+    assert response.status_code == status
+    assert response.json() == {
+        "detail": detail, "code": code, "retryable": retryable,
+    }
 
 
 @pytest.mark.parametrize(("wrapped", "expected"), [

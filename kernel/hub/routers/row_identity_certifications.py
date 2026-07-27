@@ -20,8 +20,10 @@ from hub.models import (
     DatasetRevisionRowIdentity, ExactDatasetRef, PlanDigest,
     ROW_IDENTITY_FIELD_NAME_MAX, Wire,
 )
+from hub.plugins.adapters import LanceAdapter
 from hub.row_identity import (
     RowIdentityUnavailable, RowIdentityValidationError,
+    freeze_managed_local_lance_row_identity_fence,
     freeze_row_identity_spec_from_parquet_fileno,
     row_identity_spec_is_supported,
 )
@@ -76,6 +78,8 @@ RowIdentityCertificationOutcome = Literal[
     "duplicate_key",
     "null_key",
     "unsupported_type",
+    "identity_value_over_limit",
+    "preview_identity_evidence_over_budget",
     "stale_or_unavailable_revision",
     "cancelled",
     "failed",
@@ -106,23 +110,55 @@ class RowIdentityCertificationTaskV1(Wire):
     receipt: RowIdentityCertificationReceiptV1 | None = None
 
 
-def _preflight(request: RowIdentityCertificationRequestV1, storage) -> tuple[
+def _preflight(request: RowIdentityCertificationRequestV1, deps) -> tuple[
         RowIdentityCertificationPreflightV1, dict]:
     exact = ExactDatasetRef(
         kind="exact", dataset_id=request.dataset_id, revision_id=request.revision_id)
     try:
-        facts = metadb.catalog_managed_local_revision_certification_facts(exact)
-        with source_read_scope(
-                storage, [facts["artifact_uri"]],
-                owner=f"row-identity-preflight:{uuid.uuid4().hex}") as guards:
-            if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
-                raise ManagedSourceUnavailable(
-                    "row identity preflight source is unavailable")
-            artifact_info = os.fstat(guards[0].artifact_fileno())
-            spec = freeze_row_identity_spec_from_parquet_fileno(
-                exact, request.key_columns, guards[0].artifact_fileno())
-            rows = facts["row_count"]
-            total_bytes = int(artifact_info.st_size)
+        try:
+            facts = metadb.catalog_managed_local_revision_certification_facts(exact)
+        except KeyError:
+            facts = None
+        if facts is not None:
+            with source_read_scope(
+                    deps.storage, [facts["artifact_uri"]],
+                    owner=f"row-identity-preflight:{uuid.uuid4().hex}") as guards:
+                if len(guards) != 1 or not hasattr(guards[0], "artifact_fileno"):
+                    raise ManagedSourceUnavailable(
+                        "row identity preflight source is unavailable")
+                artifact_info = os.fstat(guards[0].artifact_fileno())
+                spec = freeze_row_identity_spec_from_parquet_fileno(
+                    exact, request.key_columns, guards[0].artifact_fileno())
+                rows = facts["row_count"]
+                total_bytes = int(artifact_info.st_size)
+            facts = {
+                **facts,
+                "source_kind": "parquet",
+                "physical_incarnation_sha256": None,
+            }
+        else:
+            binding = metadb.managed_local_lance_row_identity_binding(exact.dataset_id)
+            if binding is None:
+                raise KeyError(exact.dataset_id)
+            adapter = deps.resolve_adapter(binding["uri"])
+            if type(adapter) is not LanceAdapter:
+                raise RowIdentityValidationError(
+                    "row identity certification adapter is not admissible")
+            spec, fence = freeze_managed_local_lance_row_identity_fence(
+                exact, request.key_columns,
+                owner=f"row-identity-preflight:{uuid.uuid4().hex}")
+            try:
+                rows, total_bytes = adapter.exact_revision_estimate(
+                    binding["uri"], exact.revision_id)
+            except Exception as exc:
+                raise RowIdentityUnavailable(
+                    "exact row identity source is unavailable") from exc
+            facts = {
+                "dataset_name": binding["dataset_name"],
+                "artifact_uri": binding["uri"],
+                "source_kind": "lance",
+                "physical_incarnation_sha256": fence.physical_incarnation_sha256,
+            }
     except KeyError as exc:
         raise APIError(
             410, "Exact managed-local revision is unavailable",
@@ -182,7 +218,7 @@ def preflight(
     uid: str = Depends(current_user),
 ) -> RowIdentityCertificationPreflightV1:
     del uid
-    return _preflight(request, get_deps().storage)[0]
+    return _preflight(request, get_deps())[0]
 
 
 @router.post(
@@ -215,7 +251,7 @@ def submit(
         dispatch(task_id, get_deps())
         return RowIdentityCertificationTaskV1.model_validate(prior)
     deps = get_deps()
-    estimate, facts = _preflight(request, deps.storage)
+    estimate, facts = _preflight(request, deps)
     if estimate.needs_confirmation:
         if request.confirmation_sha256 != estimate.confirmation_sha256:
             raise APIError(
@@ -236,7 +272,9 @@ def submit(
             confirmation_sha256=estimate.confirmation_sha256,
             estimated_rows=estimate.estimated_scan_rows,
             estimated_bytes=estimate.estimated_scan_bytes,
-            artifact_uri=facts["artifact_uri"])
+            artifact_uri=facts["artifact_uri"],
+            source_kind=facts["source_kind"],
+            physical_incarnation_sha256=facts["physical_incarnation_sha256"])
     except metadb.DurableTaskSubmissionConflict as exc:
         raise APIError(
             409, str(exc), code=APIErrorCode.CONFLICT, retryable=False) from exc

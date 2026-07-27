@@ -36,7 +36,7 @@ from hub.backends import (
 from hub.deps import get_deps
 from hub.executors.engine import _table_to_rows
 from hub.plugins.adapters import (
-    BoundedPreviewUnsupported, RevisionPermissionLost, RevisionProviderOffline,
+    BoundedPreviewUnsupported, LanceAdapter, RevisionPermissionLost, RevisionProviderOffline,
     RevisionResolutionAmbiguous, RevisionUnavailable, is_object_uri, path_of, relation_columns,
     revision_adapter_for_uri,
 )
@@ -87,7 +87,11 @@ from hub.models import (
     SampleResult,
     normalize_column_schemas,
 )
-from hub.row_identity import canonicalize_preview_row_identities
+from hub.row_identity import (
+    RowIdentityError,
+    canonicalize_preview_row_identities,
+    managed_local_lance_revision_incarnation,
+)
 from hub.security import current_user
 
 
@@ -589,6 +593,15 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
         adapter = _revision_adapter(binding["uri"])
         exact = ExactDatasetRef(
             kind="exact", dataset_id=binding["dataset_id"], revision_id=revision_id)
+        lance_binding = metadb.managed_local_lance_row_identity_binding(
+            binding["dataset_id"])
+        lance_supported = (
+            type(adapter) is LanceAdapter
+            and lance_binding is not None
+            and lance_binding["uri"] == binding["uri"])
+        lance_fence_before = (
+            managed_local_lance_revision_incarnation(exact)
+            if lance_supported else None)
         try:
             certification_facts = metadb.catalog_managed_local_revision_certification_facts(exact)
         except (KeyError, RuntimeError, TypeError, ValueError):
@@ -623,27 +636,41 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             if (certification_facts is not None
                     and resolved_revision_id != certification_facts["revision_id"]):
                 raise RevisionUnavailable("revision_unavailable")
-            certificate = (
-                metadb.managed_local_row_identity_certificate_for_artifact(
-                    binding["dataset_id"], resolved_revision_id, artifact_uri,
-                    artifact_dev=int(artifact_info.st_dev),
-                    artifact_ino=int(artifact_info.st_ino),
+            if lance_supported and resolved_revision_id != exact.revision_id:
+                raise RevisionUnavailable("revision_unavailable")
+            if lance_supported:
+                lance_fence_after = managed_local_lance_revision_incarnation(exact)
+                if lance_fence_after != lance_fence_before:
+                    raise RevisionUnavailable("revision_unavailable")
+                certificate = (
+                    metadb.managed_local_lance_row_identity_certificate_for_incarnation(
+                        binding["dataset_id"], resolved_revision_id,
+                        schema_sha256=lance_fence_after[0],
+                        physical_incarnation_sha256=lance_fence_after[1]))
+            else:
+                certificate = (
+                    metadb.managed_local_row_identity_certificate_for_artifact(
+                        binding["dataset_id"], resolved_revision_id, artifact_uri,
+                        artifact_dev=int(artifact_info.st_dev),
+                        artifact_ino=int(artifact_info.st_ino),
+                    )
+                    if certification_facts is not None and artifact_info is not None else None
                 )
-                if certification_facts is not None and artifact_info is not None else None
-            )
             row_identities = (
                 canonicalize_preview_row_identities(preview_table, certificate)
                 if certificate is not None else None
             )
             certificate_valid = certificate is not None and row_identities is not None
             from hub.media_cells import supports_exact_media_cell
-            media_cell_supported = supports_exact_media_cell(
-                adapter, binding["uri"], resolved_revision_id)
+            media_cell_supported = (
+                False if lance_supported else supports_exact_media_cell(
+                    adapter, binding["uri"], resolved_revision_id))
             row_identity = {
                 "datasetId": binding["dataset_id"],
                 "revisionId": resolved_revision_id,
                 "proofStatus": "certified" if certificate_valid else "unavailable",
-                "certificationSupported": certification_facts is not None,
+                "certificationSupported": (
+                    certification_facts is not None or lance_supported),
                 "fields": ([
                     {"name": field.name, "arrowType": field.arrow_type}
                     for field in certificate.spec.fields
@@ -658,7 +685,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             workspace_providers.ProviderDatasetOffline):
         raise APIError(503, "dataset_revision_provider_offline",
                        code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
-    except (RevisionUnavailable, ManagedSourceReadError, OSError,
+    except (RevisionUnavailable, RowIdentityError, ManagedSourceReadError, OSError,
             workspace_providers.ProviderDatasetGone,
             workspace_providers.ProviderDatasetUnavailable):
         raise APIError(410, "dataset_revision_unavailable",

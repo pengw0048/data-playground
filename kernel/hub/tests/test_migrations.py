@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0051_lance_identity_task", "0050_receipt_names"),
         ("0050_receipt_names", "0049_lance_row_identity_cert"),
         ("0049_lance_row_identity_cert", "0048_row_identity_task"),
         ("0048_row_identity_task", "0047_row_identity_cert"),
@@ -106,8 +107,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0050_receipt_names"]
-    assert metadb.expected_schema_head() == "0050_receipt_names"
+    assert scripts.get_heads() == ["0051_lance_identity_task"]
+    assert metadb.expected_schema_head() == "0051_lance_identity_task"
 
 
 def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
@@ -135,6 +136,20 @@ def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
             connection.commit()
             with pytest.raises(RuntimeError, match="cannot downgrade"):
                 command.downgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
+
+
+def test_lance_identity_task_migration_rejects_a_null_physical_fence(tmp_path):
+    db_path = tmp_path / "lance-identity-task-constraint.db"
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            constraints = {
+                row["name"]: " ".join(str(row["sqltext"]).lower().split())
+                for row in inspect(connection).get_check_constraints(
+                    "row_identity_certification_task_envelopes")
+            }
+    assert "physical_incarnation_sha256 is not null" in constraints[
+        "ck_row_identity_task_source_fence"]
 
 
 def _legacy_receipt(*, provider: str, dataset_id: str, revision_id: str,
@@ -750,6 +765,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0051_lance_identity_task.py": (
+            "f331815f35690973bae6002da4fcf419032d8770b338cb71d873632abd251e94"
+        ),
         "0050_backfill_receipt_names.py": (
             "47ad43fa39ebfad6f2ee265dd2e4aa6bff45e3b01e3bc9e8ad986378ab3c13dd"
         ),

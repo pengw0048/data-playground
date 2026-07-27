@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import datetime
 import os
+import shutil
 import threading
 import uuid
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,6 +24,8 @@ from hub.api_errors import APIError
 from hub.deps import Deps
 from hub.main import app
 from hub.models import DurableTaskInboxPage, ExactDatasetRef, WorkspaceRunPage
+from hub.plugins.adapters import LanceAdapter
+from hub.routers import catalog as catalog_routes
 from hub.routers import row_identity_certifications as api
 from hub.row_identity import (
     RowIdentityValidationError,
@@ -79,6 +83,38 @@ def dataset(tmp_path, monkeypatch):
     deps.storage.close()
 
 
+@pytest.fixture
+def lance_dataset(tmp_path, monkeypatch):
+    lance = pytest.importorskip("lance")
+    token = uuid.uuid4().hex
+    deps = Deps(
+        str(tmp_path / f"lance-workspace-{token}"),
+        str(tmp_path / f"lance-data-{token}"),
+        maintain_storage=False)
+    monkeypatch.setattr(api, "get_deps", lambda: deps)
+    monkeypatch.setattr(api, "dispatch", lambda _task_id, _deps: None)
+    monkeypatch.setattr(catalog_routes, "get_deps", lambda: deps)
+    with metadb.session() as session:
+        if session.get(metadb.User, "owner") is None:
+            session.add(metadb.User(id="owner", name="Owner"))
+
+    def publish(table: pa.Table, *, name: str = "lance-observations") -> dict:
+        uri = str(tmp_path / f"{name}-{uuid.uuid4().hex}.lance")
+        lance.write_dataset(table, uri)
+        deps.catalog._add(name=name, uri=uri, strict_probe=True)
+        binding = metadb.catalog_revision_binding_for_uri(uri)
+        assert binding is not None
+        revision_id = LanceAdapter().resolve_revision(uri)["revision_id"]
+        return {
+            "dataset_id": binding["dataset_id"],
+            "revision_id": revision_id,
+            "uri": uri,
+        }
+
+    yield deps, publish
+    deps.storage.close()
+
+
 def _request(published: dict, keys=("id",), *, submission_id: uuid.UUID | None = None):
     return api.RowIdentityCertificationSubmitV1(
         submission_id=submission_id or uuid.uuid4(),
@@ -94,6 +130,29 @@ def _submit(request, uid: str = "owner"):
 
 def _run(deps, task_id: str) -> None:
     row_identity_tasks._worker(task_id, deps)
+
+
+def _confirmed_lance_request(published: dict, keys=("id",)):
+    request = _request(published, keys)
+    estimate = api.preflight(request, "owner")
+    assert estimate.needs_confirmation is True
+    assert estimate.reason == "unknown_size"
+    assert estimate.estimated_scan_rows is not None
+    assert estimate.estimated_scan_bytes is None
+    return request.model_copy(update={
+        "confirmation_sha256": estimate.confirmation_sha256,
+    }), estimate
+
+
+def _exact_lance_data_file(lance, uri: str, revision_id: str) -> Path:
+    rows = lance.dataset(
+        uri, version=int(revision_id)).tracked_files().read_all().to_pylist()
+    matches = [
+        row for row in rows
+        if row["version"] == int(revision_id) and row["type"] == "data file"
+    ]
+    assert len(matches) == 1
+    return Path(str(matches[0]["base_uri"])) / str(matches[0]["path"])
 
 
 def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
@@ -143,6 +202,274 @@ def test_preflight_submit_worker_replay_and_exact_jobs_inbox_deep_link(
         metadb.list_durable_task_inbox_items("owner", limit=50))
     item = next(item for item in inbox.items if item.task_id == task.task_id)
     assert item.outcome == "completed" and item.dataset_context == job.dataset_context
+
+
+def test_lance_task_certifies_exact_preview_and_replays_without_rescan(
+        lance_dataset, monkeypatch):
+    deps, publish = lance_dataset
+    published = publish(pa.table({
+        "signed": pa.array([-(2**63), 2**63 - 1], pa.int64()),
+        "unsigned": pa.array([0, 2**64 - 1], pa.uint64()),
+        "label": pa.array(["first", "second"], pa.string()),
+    }))
+    request, estimate = _confirmed_lance_request(
+        published, ("signed", "unsigned", "label"))
+    projections = 0
+    original_projection = LanceAdapter.open_revision_projection
+
+    def counted_projection(*args, **kwargs):
+        nonlocal projections
+        projections += 1
+        return original_projection(*args, **kwargs)
+
+    monkeypatch.setattr(LanceAdapter, "open_revision_projection", counted_projection)
+    task, status_code = _submit(request)
+    assert status_code == 201
+    assert task.schema_sha256 == estimate.schema_sha256
+    assert task.spec_sha256 == estimate.spec_sha256
+    _run(deps, task.task_id)
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "done"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == "certified"
+    assert terminal.receipt.certificate is not None
+    assert projections == 2  # one whole key scan plus one bounded preview gate
+
+    detail = catalog_routes.open_dataset_revision(
+        published["dataset_id"], published["revision_id"])
+    assert detail.row_identity.proof_status == "certified"
+    assert detail.row_identity.certification_supported is True
+    assert detail.media_cell_supported is False
+    assert detail.preview.row_identities is not None
+    assert len(detail.preview.row_identities) == len(detail.preview.rows) == 2
+    assert [field.value for field in detail.preview.row_identities[0]] == [
+        str(-(2**63)), "0", "first",
+    ]
+    assert [field.value for field in detail.preview.row_identities[1]] == [
+        str(2**63 - 1), str(2**64 - 1), "second",
+    ]
+
+    replay, replay_status = _submit(request)
+    assert replay_status == 200
+    assert replay.receipt == terminal.receipt
+    assert projections == 2
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 1
+        assert session.scalar(select(func.count()).select_from(
+            metadb.DurableTaskInboxItem).where(
+                metadb.DurableTaskInboxItem.task_id == task.task_id)) == 1
+
+
+@pytest.mark.parametrize(("table", "keys", "outcome"), [
+    pytest.param(
+        pa.table({"id": pa.array([1, 1], pa.int64())}),
+        ("id",), "duplicate_key", id="duplicate"),
+    pytest.param(
+        pa.table({"id": pa.array([1, None], pa.int64())}),
+        ("id",), "null_key", id="null"),
+    pytest.param(
+        pa.table({"id": pa.array([1.0, 2.0], pa.float64())}),
+        ("id",), "unsupported_type", id="unsupported"),
+    pytest.param(
+        pa.table({"id": pa.array(["x" * 8193], pa.string())}),
+        ("id",), "identity_value_over_limit", id="value-over-limit"),
+    pytest.param(
+        pa.table({
+            "left": pa.array(
+                [f"{index:03d}" + "a" * 6997 for index in range(100)],
+                pa.string()),
+            "right": pa.array(
+                [f"{index:03d}" + "b" * 6997 for index in range(100)],
+                pa.string()),
+        }),
+        ("left", "right"), "preview_identity_evidence_over_budget",
+        id="preview-over-budget"),
+])
+def test_lance_invalid_evidence_has_typed_receipt_and_no_certificate(
+        lance_dataset, table, keys, outcome, monkeypatch):
+    deps, publish = lance_dataset
+    published = publish(table, name=f"invalid-{outcome}")
+    request, estimate = _confirmed_lance_request(published, keys)
+    if outcome == "unsupported_type":
+        assert estimate.supported is False
+        monkeypatch.setattr(
+            row_identity_tasks, "certify_and_commit_managed_local_lance_row_identity",
+            lambda *_args, **_kwargs: pytest.fail(
+                "unsupported Lance types must not scan"))
+    task, status_code = _submit(request)
+    assert status_code == 201
+    _run(deps, task.task_id)
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "failed"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == outcome
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 0
+
+
+def test_lance_admission_requires_the_exact_core_adapter(lance_dataset, monkeypatch):
+    deps, publish = lance_dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+
+    class LanceSubclass(LanceAdapter):
+        pass
+
+    monkeypatch.setattr(deps, "resolve_adapter", lambda _uri: LanceSubclass())
+    with pytest.raises(APIError) as caught:
+        api.preflight(_request(published), "owner")
+    assert caught.value.status_code == 422
+
+
+def test_lance_registration_loss_after_admission_fails_without_publication(
+        lance_dataset):
+    deps, publish = lance_dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    request, _estimate = _confirmed_lance_request(published)
+    task, status_code = _submit(request)
+    assert status_code == 201
+    assert metadb.catalog_delete_entry(published["uri"], report_result=True) is True
+
+    _run(deps, task.task_id)
+
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status == "failed"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == "stale_or_unavailable_revision"
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 0
+
+
+def test_lance_finish_rechecks_physical_incarnation_after_worker_scan(
+        lance_dataset, tmp_path, monkeypatch):
+    lance = pytest.importorskip("lance")
+    deps, publish = lance_dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    request, _estimate = _confirmed_lance_request(published)
+    task, status_code = _submit(request)
+    assert status_code == 201
+
+    replacement_uri = str(tmp_path / f"finish-replacement-{uuid.uuid4().hex}.lance")
+    lance.write_dataset(
+        pa.table({"id": pa.array([9, 10], pa.int64())}), replacement_uri)
+    target = _exact_lance_data_file(
+        lance, published["uri"], published["revision_id"])
+    replacement = _exact_lance_data_file(lance, replacement_uri, "1")
+    original_finish = (
+        metadb.finish_managed_local_lance_row_identity_certification_scan)
+    replaced = False
+
+    def replace_after_worker_fence(*args, **kwargs):
+        nonlocal replaced
+        assert replaced is False
+        shutil.copyfile(replacement, target)
+        replaced = True
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        row_identity_tasks.metadb,
+        "finish_managed_local_lance_row_identity_certification_scan",
+        replace_after_worker_fence)
+    _run(deps, task.task_id)
+
+    terminal = api.status(task.task_id, "owner")
+    assert replaced is True
+    assert terminal.status == "failed"
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome == "stale_or_unavailable_revision"
+    assert terminal.receipt.certificate is None
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityFence).where(
+                metadb.ManagedLocalLanceRowIdentityFence.registration_id
+                == published["dataset_id"])) == 0
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 0
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires a dedicated PostgreSQL Lance certificate race")
+def test_postgres_lance_concurrent_first_certification_publishes_one_certificate(
+        lance_dataset):
+    deps, publish = lance_dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    first_request, _estimate = _confirmed_lance_request(published)
+    second_request = first_request.model_copy(update={
+        "submission_id": uuid.uuid4(),
+    })
+    first, _ = _submit(first_request)
+    second, _ = _submit(second_request)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda task_id: _run(deps, task_id), (
+            first.task_id, second.task_id)))
+
+    first_receipt = api.status(first.task_id, "owner").receipt
+    second_receipt = api.status(second.task_id, "owner").receipt
+    assert first_receipt is not None and second_receipt is not None
+    outcomes = {first_receipt.outcome, second_receipt.outcome}
+    assert outcomes == {"certified", "already_certified_same_spec"}
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 1
+
+
+@pytest.mark.skipif(
+    not os.environ.get("DP_TEST_DATABASE_URL"),
+    reason="requires a dedicated PostgreSQL registration ABA race")
+def test_postgres_lance_finish_vs_reregistration_fails_closed(lance_dataset):
+    deps, publish = lance_dataset
+    published = publish(pa.table({"id": pa.array([1, 2], pa.int64())}))
+    request, _estimate = _confirmed_lance_request(published)
+    task, _ = _submit(request)
+    start = threading.Barrier(2)
+
+    def finish():
+        start.wait(timeout=5)
+        _run(deps, task.task_id)
+
+    def reregister():
+        start.wait(timeout=5)
+        assert metadb.catalog_delete_entry(
+            published["uri"], report_result=True) is True
+        deps.catalog._add(
+            name="registered-again", uri=published["uri"], strict_probe=True)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finished = pool.submit(finish)
+        rebound = pool.submit(reregister)
+        finished.result(timeout=20)
+        rebound.result(timeout=20)
+
+    current = metadb.catalog_revision_binding_for_uri(published["uri"])
+    assert current is not None
+    assert current["dataset_id"] != published["dataset_id"]
+    terminal = api.status(task.task_id, "owner")
+    assert terminal.status in {"done", "failed"}
+    assert terminal.receipt is not None
+    assert terminal.receipt.outcome in {
+        "certified", "stale_or_unavailable_revision",
+    }
+    with metadb.session() as session:
+        assert session.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityCertificate).where(
+                metadb.ManagedLocalLanceRowIdentityCertificate.registration_id
+                == published["dataset_id"])) == 0
 
 
 def test_list_column_uses_one_schema_digest_from_preflight_through_worker(dataset):

@@ -9415,6 +9415,8 @@
               "duplicate_key",
               "null_key",
               "unsupported_type",
+              "identity_value_over_limit",
+              "preview_identity_evidence_over_budget",
               "stale_or_unavailable_revision",
               "cancelled",
               "failed"
