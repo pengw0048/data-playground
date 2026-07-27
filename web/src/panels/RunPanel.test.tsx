@@ -173,7 +173,7 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.edit).toHaveBeenCalledWith('target')
   })
 
-  it('explains unknown binary byte size in confirmation copy without exposing opaque source IDs', () => {
+  it('explains a large unknown binary pass without exposing opaque source IDs', () => {
     const datasetId = 'workspace-provider-opaque-dataset-should-not-appear'
     const revisionId = 'provider-revision-opaque-value-should-not-appear'
     mocks.state.doc.nodes = [{
@@ -187,18 +187,18 @@ describe('RunPanel typed parameter gate', () => {
     mocks.state.runs.target = {
       phase: 'confirm',
       estimate: {
-        rows: 2,
+        rows: 2_001,
         bytes: null,
         placement: 'local',
         needsConfirm: true,
-        breakdown: 'size unknown · 2 rows · confirmation required: Binary column "payload" has no fixed-width byte-size evidence; Data Playground did not scan values to guess.',
+        breakdown: 'size unknown · 2,001 rows · confirmation required: Binary column "payload" has no fixed-width byte-size evidence; Data Playground did not scan values to guess.',
       },
     }
     render(<RunPanel nodeId="target" />)
 
     expect(screen.getByText('HEADS UP')).toBeVisible()
-    expect(screen.getByText('2 rows')).toBeVisible()
-    expect(screen.getByText(/This full run will process 2 rows/)).toBeVisible()
+    expect(screen.getByText('2,001 rows')).toBeVisible()
+    expect(screen.getByText(/This full run will process 2,001 rows/)).toBeVisible()
     expect(screen.getByText(/"payload" contains variable-length binary data/)).toBeVisible()
     expect(screen.getByText(/actual read may be much larger than the row count suggests/)).toBeVisible()
     expect(screen.getByLabelText('Pinned run inputs')).toHaveTextContent('Uses the pinned exact Source version shown on this Canvas.')

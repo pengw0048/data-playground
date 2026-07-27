@@ -3389,8 +3389,17 @@ def test_estimate_reports_real_rows_and_gates_only_large_runs(tmp_path):
     plan = compiler.compile_plan(g, "s", deps.registry, deps.node_specs)
     r = deps.runner
     assert r.estimate(plan, None).rows is None and r.estimate(plan, None).needs_confirm is False  # unknown → no fake, no gate
-    assert r.estimate(plan, 10).needs_confirm is True and r.estimate(plan, 10).rows == 10  # known rows, unknown bytes
+    assert r.estimate(plan, 10).needs_confirm is False and r.estimate(plan, 10).rows == 10  # bounded rows, unknown bytes
+    assert r.estimate(plan, 2_000).needs_confirm is False                          # preview-sized envelope
+    assert r.estimate(plan, 2_001).needs_confirm is True                           # wider unknown pass → gate
     assert r.estimate(plan, 6_000_000).needs_confirm is True                              # big rows, no bytes → gate
+    # The production isolated runner uses the same admission boundary as the in-process one.
+    from hub.subprocess_runner import SubprocessRunner
+    isolated = object.__new__(SubprocessRunner)
+    assert isolated.estimate(plan, 10).needs_confirm is False
+    assert isolated.estimate(plan, 2_000).needs_confirm is False
+    assert isolated.estimate(plan, 2_001).needs_confirm is True
+    assert isolated.estimate(plan, 6_000_000).needs_confirm is True
     # the cost model gates on EITHER signal: large bytes OR a large row count (neither subsumes the other) —
     assert r.estimate(plan, 200_000, 3 << 30).needs_confirm is True       # 200k WIDE rows = ~3GB → byte gate (row count wouldn't)
     assert r.estimate(plan, 6_000_000, 20 << 20).needs_confirm is True    # 6M rows (only ~20MB) → row floor still gates
@@ -10567,7 +10576,7 @@ def test_binary_width_unknown_propagates_without_scanning_values(tmp_path):
     assert "sort" in get_deps().controller._cost_requires(graph, "sort", estimate)
 
 
-def test_binary_run_estimate_requires_confirmation_and_explains_missing_evidence(tmp_path):
+def test_small_binary_run_estimate_runs_without_confirmation(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -10585,14 +10594,11 @@ def test_binary_run_estimate_requires_confirmation_and_explains_missing_evidence
     estimate = response.json()
     assert estimate["rows"] == 2
     assert estimate["bytes"] is None
-    assert estimate["needsConfirm"] is True
-    assert 'Binary column "payload" has no fixed-width byte-size evidence' in estimate["breakdown"]
-    assert "did not scan values to guess" in estimate["breakdown"]
+    assert estimate["needsConfirm"] is False
     unconfirmed = client.post(
         "/api/run", json={"graph": graph, "targetNodeId": "s", "confirmed": False},
     )
-    assert unconfirmed.status_code == 409
-    assert "unknown size" in unconfirmed.json()["detail"]
+    assert unconfirmed.status_code == 200
 
 
 def test_latest_actuals_feeds_estimator_only_for_latest_nodes():

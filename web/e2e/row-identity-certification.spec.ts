@@ -62,15 +62,14 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
     await page.goto(`/#/canvas/${canvasId}`);
     await page.locator('.react-flow__node[data-id="write"]').click();
     const inspector = page.getByTestId("inspector");
-    await inspector.getByRole("button", { name: "Run", exact: true }).click();
-    // Binary fields have no fixed-width estimate, so normal admission truthfully asks for the
-    // existing explicit publication confirmation before it starts the managed Write.
+    // This one-row binary input is inside the bounded direct-run envelope. Observe the request
+    // before clicking because the managed Write starts without an extra size confirmation.
     const runResponse = page.waitForResponse(
       (response) =>
         response.url().endsWith("/api/run") &&
         response.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "Publish revision" }).click();
+    await inspector.getByRole("button", { name: "Run", exact: true }).click();
     const started = await runResponse;
     expect(started.ok()).toBeTruthy();
     const { runId } = (await started.json()) as { runId: string };

@@ -11,6 +11,9 @@ vi.mock('../../api/client', () => ({
 vi.mock('../../ui/CodeEditor', () => ({
   CodeEditor: () => <div data-testid="code-editor" />,
 }))
+vi.mock('../../ui/CodeSnippet', () => ({
+  CodeSnippet: () => <div data-testid="code-snippet" />,
+}))
 vi.mock('../../panels/DataPanel', () => ({ DataPanel: () => null }))
 
 import './transform'
@@ -77,5 +80,41 @@ describe('Transform exact processor labels', () => {
 
     expect(await screen.findByText(new RegExp(`${PROCESSOR_ID}@v1`))).toBeInTheDocument()
     expect(screen.queryByText(/Latest version/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the run scope out of the canvas card', () => {
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, config: { source: 'adhoc', mode: 'map', scope: 'dataset', code: 'def fn(row): return row' } },
+    }
+    useStore.setState({
+      doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [adhocNode], edges: [] },
+    } as any)
+    const Transform = getComponent('transform')!
+    render(
+      <TooltipProvider><ReactFlowProvider>
+        <Transform id={adhocNode.id} data={adhocNode.data} />
+      </ReactFlowProvider></TooltipProvider>,
+    )
+
+    expect(screen.queryByRole('button', { name: 'dataset' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'sample' })).not.toBeInTheDocument()
+  })
+
+  it('edits the run scope from the fullscreen ad-hoc editor', async () => {
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, config: { source: 'adhoc', mode: 'map', scope: 'dataset', code: 'def fn(row): return row' } },
+    }
+    useStore.setState({
+      doc: { id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [adhocNode], edges: [] },
+      fullscreenCode: { nodeId: adhocNode.id, param: 'code', lang: 'python' },
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    const scope = await screen.findByRole('combobox', { name: /runs over/ })
+    fireEvent.change(scope, { target: { value: 'sample' } })
+    expect(useStore.getState().doc.nodes[0].data.config.scope).toBe('sample')
   })
 })
