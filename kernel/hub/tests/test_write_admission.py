@@ -996,7 +996,41 @@ def test_write_admission_validates_only_the_target_execution_cone(
     })
 
     assert response.status_code == 400, response.text
+    assert response.json()["code"] == APIErrorCode.INVALID_GRAPH
     assert "duplicate edge id 'source-write'" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("edges", [
+    pytest.param(
+        [{"id": "missing-write", "source": "missing", "target": "write"}],
+        id="dangling-source",
+    ),
+    pytest.param(
+        [{"id": "write-loop", "source": "write", "target": "write"}],
+        id="target-self-loop",
+    ),
+    pytest.param(
+        [{"id": "write-source", "source": "write", "target": "source"}],
+        id="target-cycle",
+    ),
+])
+def test_write_admission_target_malformed_edges_return_invalid_graph(
+        contract, monkeypatch, edges):
+    deps, graph = contract
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    payload = graph.model_dump(by_alias=True, mode="json")
+    payload["edges"].extend(edges)
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61444444-4444-4444-8444-444444444444",
+    })
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["code"] == APIErrorCode.INVALID_GRAPH
+    assert body["retryable"] is False
 
 
 def test_local_runner_consumes_frozen_intent_and_publishes_receipt(

@@ -138,13 +138,31 @@ def _resolve_parameters(
 
 
 def _target_execution_graph(graph: Graph, target: str | None) -> Graph:
-    """Restrict one internal inspection pass to its Section-aware execution cone."""
+    """Restrict one inspection pass to its Section-aware cone without hiding malformed edges."""
     if target is None:
         return graph
     scoped = graph.model_copy(deep=True)
     all_nodes = list(scoped.nodes)
-    roots = graph_mod.upstream_chain(scoped, target)
-    selected = {node.id for node in graph_mod.execution_nodes(scoped, roots)}
+    incoming: dict[str, list[str]] = {}
+    for edge in scoped.edges:
+        incoming.setdefault(edge.target, []).append(edge.source)
+
+    # Walk raw edge ids iteratively: unlike topological traversal this is cycle-safe, the visited set
+    # bounds the queue to distinct ids in the request, and retaining a missing source id keeps its
+    # dangling edge visible to the authoritative graph validator.
+    selected = {target}
+    queue = [target]
+    cursor = 0
+    while cursor < len(queue):
+        current = queue[cursor]
+        cursor += 1
+        for source in incoming.get(current, []):
+            if source not in selected:
+                selected.add(source)
+                queue.append(source)
+
+    roots = [node for node in all_nodes if node.id in selected]
+    selected.update(node.id for node in graph_mod.execution_nodes(scoped, roots))
     scoped.nodes = [node for node in all_nodes if node.id in selected]
     scoped.edges = [
         edge for edge in scoped.edges
