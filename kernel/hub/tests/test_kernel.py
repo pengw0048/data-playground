@@ -6923,17 +6923,19 @@ def test_plugin_workload_secret_is_absent_from_core_generated_surfaces(monkeypat
         client.put("/api/settings", json={
             "scope": "global", "key": "plugin.dp_workloadpk.service_token",
             "value": "env:DP_MISSING_PLUGIN_TOKEN"})
-        for resolve in (lambda: registry.config("service_token"), build_workload_env):
-            with pytest.raises(RuntimeError) as exc:
-                resolve()
-            rendered = "".join(_traceback.format_exception(exc.value))
-            assert str(exc.value) == (
-                "workload configuration for plugin 'dp_workloadpk' could not be resolved"
-            )
-            assert exc.value.__cause__ is None
-            assert exc.value.__suppress_context__ is True
-            assert "DP_MISSING_PLUGIN_TOKEN" not in rendered
-            assert secret not in rendered
+        with pytest.raises(RuntimeError) as exc:
+            registry.config("service_token")
+        rendered = "".join(_traceback.format_exception(exc.value))
+        assert str(exc.value) == (
+            "workload configuration for plugin 'dp_workloadpk' could not be resolved"
+        )
+        assert exc.value.__cause__ is None
+        assert exc.value.__suppress_context__ is True
+        assert "DP_MISSING_PLUGIN_TOKEN" not in rendered
+        assert secret not in rendered
+        # A stale optional binding is rejected as a plugin problem but does not stop unrelated
+        # Canvas workloads from starting.
+        assert "DP_TEST_PLUGIN_TOKEN" not in build_workload_env()
     finally:
         deps.plugins.remove(fake)
         deps._manifests.pop("dp_workloadpk", None)

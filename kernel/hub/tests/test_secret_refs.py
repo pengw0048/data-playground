@@ -299,3 +299,59 @@ def test_put_settings_rejects_removed_credential_keys_and_plaintext_plugin_secre
     finally:
         deps.plugins.remove(fake)
         metadb.set_setting("plugin.dp_secretreject.token", "", "global")
+
+
+def test_workload_secret_settings_reject_custom_resolvers_in_single_and_batch_writes():
+    from hub.deps import get_deps
+
+    deps = get_deps()
+    plugin = {
+        "name": "dp_workload_secretrefs",
+        "source": "entry_point",
+        "config": [
+            {"key": "ordinary", "type": "password", "secret": True},
+            {
+                "key": "workload",
+                "type": "password",
+                "env": "DP_WORKLOAD_SECRETREF_TARGET",
+                "secret": True,
+                "workload_env": True,
+            },
+        ],
+    }
+    ordinary_key = "plugin.dp_workload_secretrefs.ordinary"
+    workload_key = "plugin.dp_workload_secretrefs.workload"
+    sentinel = "custom-review-reference-must-not-leak"
+    register_resolver("vault-review", lambda path: path)
+    deps.plugins.append(plugin)
+    try:
+        ordinary = client.put("/api/settings", json={
+            "scope": "global", "key": ordinary_key, "value": f"vault-review:{sentinel}",
+        })
+        assert ordinary.status_code == 200
+        assert metadb.get_setting(ordinary_key, "global") == f"vault-review:{sentinel}"
+
+        rejected = client.put("/api/settings", json={
+            "scope": "global", "key": workload_key, "value": f"vault-review:{sentinel}",
+        })
+        assert rejected.status_code == 400
+        assert "env: or file: secret reference" in rejected.json()["detail"]
+        assert sentinel not in rejected.text
+        assert metadb.get_setting(workload_key, "global") is None
+
+        snapshot = client.get("/api/settings").json()
+        batch = client.put("/api/settings/batch", json={
+            "expectedRevision": snapshot["revision"],
+            "changes": [{
+                "scope": "global", "key": workload_key, "value": f"vault-review:{sentinel}",
+            }],
+        })
+        assert batch.status_code == 400
+        assert "env: or file: secret reference" in batch.json()["detail"]
+        assert sentinel not in batch.text
+        assert metadb.get_setting(workload_key, "global") is None
+    finally:
+        deps.plugins.remove(plugin)
+        unregister_resolver("vault-review")
+        metadb.set_setting(ordinary_key, "", "global")
+        metadb.set_setting(workload_key, "", "global")

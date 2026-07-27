@@ -55,6 +55,7 @@ def test_run_log_wheel_conformance_uses_only_its_entry_point(tmp_path):
         env = "DP_WORKLOAD_PROBE_TOKEN"
         secret = true
         workload_env = true
+        headless_secret_ref_env = "DP_WORKLOAD_PROBE_TOKEN_REF"
     """))
     (probe_plugin / "__init__.py").write_text(textwrap.dedent("""
         import json
@@ -140,11 +141,13 @@ workspace.mkdir(parents=True, exist_ok=True)
 data_dir.mkdir(parents=True, exist_ok=True)
 probe_log = workspace / "subrun-token-presence.jsonl"
 target = "DP_WORKLOAD_PROBE_TOKEN"
+headless_ref_env = "DP_WORKLOAD_PROBE_TOKEN_REF"
 source = "DP_PARENT_ONLY_WORKLOAD_PROBE_TOKEN"
 setting = "plugin.dp-workload-probe.token"
 env_secret = os.environ.pop("TEST_ONLY_ENV_WORKLOAD_SECRET")
 file_secret = os.environ.pop("TEST_ONLY_FILE_WORKLOAD_SECRET")
 os.environ.pop(target, None)
+os.environ.pop(headless_ref_env, None)
 os.environ.pop(source, None)
 
 metadb.init_db()
@@ -262,6 +265,7 @@ try:
 
     # The source key is parent-only and differs from the plugin's declared child target.
     os.environ[source] = env_secret
+    os.environ[headless_ref_env] = f"env:{source}"
     assert target not in os.environ
     metadb.set_setting(setting, f"env:{source}", "global")
     run_actual_scenario("env", True)
@@ -279,7 +283,8 @@ try:
     secrets.ensure_builtin_resolvers()
     secrets.unregister_resolver("file")
     secrets.register_resolver("file", consume_file)
-    os.environ[target] = "wrong-headless-fallback"
+    os.environ[target] = "wrong-ambient-target"
+    os.environ[headless_ref_env] = f"file:{secret_file}"
     metadb.set_setting(setting, f"file:{secret_file}", "global")
     run_actual_scenario("file", True)
     assert not secret_file.exists()

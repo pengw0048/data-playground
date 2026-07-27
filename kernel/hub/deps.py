@@ -89,11 +89,14 @@ class Registry:
         return hashlib.sha256(os.path.abspath(self.deps.workspace).encode()).hexdigest()[:16]
 
     def config(self, key: str, default=None):
-        """Read a config value for the CURRENTLY-registering pack. Precedence: a UI-set value (metadb
-        setting `plugin.<pack>.<key>`) > the field's declared `env` var > its declared `default` > the
-        `default` arg. Fields are declared in the pack's dataplay.toml `[[config]]`. Call this inside
-        register() to configure the pack; a value changed in the UI takes effect on the next kernel
-        start (plugins register once at startup — same as the env vars it falls back to).
+        """Read a config value for the CURRENTLY-registering pack. Ordinary fields use a UI-set value
+        (metadb setting `plugin.<pack>.<key>`) > declared `env` var > declared `default` > `default`
+        arg. A ``secret = true, workload_env = true`` field is the narrow exception: its ``env`` names
+        only the child target, and it uses a persisted SecretRef or an explicit
+        ``headless_secret_ref_env`` SecretRef binding instead. Fields are declared in the pack's
+        dataplay.toml `[[config]]`. Call this inside register() to configure the pack; a value changed
+        in the UI takes effect on the next kernel start (plugins register once at startup — same as the
+        env vars it falls back to).
 
         When the field is ``secret``, the stored setting is a secret reference (``env:…`` / ``file:…``)
         and is resolved here; the material value never lives in the settings row.
@@ -120,6 +123,30 @@ class Registry:
                     inherited = os.environ.get(str(field["env"]))
                     return inherited if inherited not in (None, "") else default
                 return default
+            # A workload target is a child-process capability name, not an ambient Hub binding.
+            # The first process may use either the persisted SecretRef or the explicitly declared
+            # headless *reference* environment variable. Never consult ``field['env']`` here: doing
+            # so would let a manifest claim an unrelated Hub credential by target name alone.
+            if not pack:
+                return default
+            from hub import metadb
+            from hub.secrets import resolve_secret_value
+            reference = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
+            if reference in (None, ""):
+                headless_ref_env = field.get("headless_secret_ref_env")
+                reference = (
+                    os.environ.get(headless_ref_env)
+                    if isinstance(headless_ref_env, str) else None
+                )
+            if reference in (None, ""):
+                return default
+            try:
+                if not _is_workload_secret_ref(reference):
+                    raise ValueError("workload bindings require env: or file: references")
+                return resolve_secret_value(reference, allow_plaintext=False)
+            except Exception:
+                raise RuntimeError(
+                    f"workload configuration for plugin '{pack}' could not be resolved") from None
         if pack:
             from hub import metadb
             v = metadb.get_setting(f"plugin.{pack}.{key}", "global", default=None)
@@ -430,10 +457,27 @@ _CONFIG_TYPES = {"string", "text", "int", "float", "bool", "select", "password"}
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _is_workload_secret_ref(value: object) -> bool:
+    """Whether one workload binding uses the supported portable ``env:`` / ``file:`` model.
+
+    Plugin-defined resolvers remain available to ordinary in-process secret settings. Workload
+    forwarding intentionally stays on the two built-in reference types so a child receives material
+    only after the Hub has resolved an inspectable operator binding.
+    """
+    from hub.secrets import SecretResolveError, parse_secret_ref
+
+    try:
+        scheme, _rest = parse_secret_ref(str(value))
+    except (SecretResolveError, TypeError):
+        return False
+    return scheme in {"env", "file"}
+
+
 def _normalize_config(raw) -> list[dict]:
     """dataplay.toml `[[config]]` → a clean list of UI fields. Keeps only entries with a non-empty string
     `key`; fills `type` (default 'string'; unknown → 'string') and `label` (default = key); passes through
-    default/env/secret/workload_env/options/help/placeholder. Malformed entries are dropped (never fatal)."""
+    default/env/secret/workload_env/headless_secret_ref_env/options/help/placeholder. Malformed entries
+    are dropped (never fatal)."""
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
@@ -442,7 +486,8 @@ def _normalize_config(raw) -> list[dict]:
             continue
         field = {"key": f["key"], "type": f.get("type") if f.get("type") in _CONFIG_TYPES else "string",
                  "label": str(f.get("label") or f["key"])}
-        for k in ("default", "env", "secret", "workload_env", "options", "help", "placeholder"):
+        for k in ("default", "env", "secret", "workload_env", "headless_secret_ref_env", "options",
+                  "help", "placeholder"):
             if k in f:
                 field[k] = f[k]
         out.append(field)
@@ -455,6 +500,10 @@ def _validate_workload_env_config(config: list[dict]) -> str | None:
 
     keys: set[str] = set()
     env_targets: set[str] = set()
+    all_declared_envs = {
+        field["env"] for field in config if isinstance(field.get("env"), str)
+    }
+    headless_ref_envs: set[str] = set()
     for field in config:
         key = str(field["key"])
         if key in keys:
@@ -465,7 +514,11 @@ def _validate_workload_env_config(config: list[dict]) -> str | None:
             if declared_env in env_targets:
                 return f"config environment target '{declared_env}' is declared more than once"
             env_targets.add(declared_env)
+        headless_ref_env = field.get("headless_secret_ref_env")
         if "workload_env" not in field:
+            if headless_ref_env is not None:
+                return (
+                    f"config '{key}' may declare headless_secret_ref_env only with workload_env = true")
             continue
         if field["workload_env"] is not True:
             return f"workload_env config '{key}' must be true"
@@ -478,6 +531,28 @@ def _validate_workload_env_config(config: list[dict]) -> str | None:
             return f"workload_env config '{key}' must declare an environment variable name"
         if is_core_workload_env_key(env):
             return f"workload_env config '{key}' cannot override core environment '{env}'"
+        if headless_ref_env is not None:
+            if (not isinstance(headless_ref_env, str)
+                    or not _ENVIRONMENT_NAME.fullmatch(headless_ref_env)):
+                return (
+                    f"workload_env config '{key}' must declare headless_secret_ref_env as an "
+                    "environment variable name")
+            if headless_ref_env == env:
+                return (
+                    f"workload_env config '{key}' headless_secret_ref_env must differ from its "
+                    "workload target")
+            if headless_ref_env in all_declared_envs:
+                return (
+                    f"workload_env config '{key}' headless_secret_ref_env cannot reuse another "
+                    "config environment name")
+            if headless_ref_env in headless_ref_envs:
+                return (
+                    f"workload_env config '{key}' headless_secret_ref_env is declared more than once")
+            if is_core_workload_env_key(headless_ref_env):
+                return (
+                    f"workload_env config '{key}' headless_secret_ref_env cannot use core environment "
+                    f"'{headless_ref_env}'")
+            headless_ref_envs.add(headless_ref_env)
     return None
 
 
@@ -780,7 +855,12 @@ class Deps:
         return chosen
 
     def _finalize_plugin_workload_env(self) -> None:
-        """Freeze conflict-free declarations from successfully active installed plugins."""
+        """Freeze conflict-free declarations from successfully active installed plugins.
+
+        A declaration is eligible independently of whether an operator currently binds it: changing a
+        Settings SecretRef takes effect for the next workload launch without a Hub restart.  Startup
+        records only the names of bindings that are present, never their references or material.
+        """
         candidates: list[tuple[str, dict, dict]] = []
         for entry in self.plugins:
             if entry.get("source") != "entry_point" or entry.get("state") != "active":
@@ -811,6 +891,38 @@ class Deps:
                 candidates, key=lambda item: (item[0], str(item[1]["key"])))
             if str(field["env"]) not in conflicts and entry.get("state") == "active"
         )
+        bound_names: list[str] = []
+        for pack, field in self._plugin_workload_fields:
+            reference = self._plugin_workload_secret_ref(pack, field)
+            if reference in (None, ""):
+                continue
+            if _is_workload_secret_ref(reference):
+                bound_names.append(f"{pack}.{field['key']}")
+                continue
+            entry = next((item for item in self.plugins if item.get("name") == pack), None)
+            if entry is not None:
+                self._record_plugin_problem(
+                    entry,
+                    f"Workload secret binding for plugin '{pack}' must be an env: or file: SecretRef.",
+                )
+        if bound_names:
+            print("[deps] workload secret bindings enabled: " + ", ".join(sorted(bound_names)))
+
+    @staticmethod
+    def _plugin_workload_secret_ref(pack: str, field: Mapping[str, object]) -> object:
+        """Return the explicit SecretRef configured for one workload field, never its material.
+
+        ``env`` is intentionally absent from this lookup: it names the allowed child target only.
+        ``headless_secret_ref_env`` names a Hub environment variable whose *value* is a SecretRef.
+        """
+        from hub import metadb
+
+        reference = metadb.get_setting(
+            f"plugin.{pack}.{field['key']}", "global", default=None)
+        if reference not in (None, ""):
+            return reference
+        headless_ref_env = field.get("headless_secret_ref_env")
+        return os.environ.get(headless_ref_env) if isinstance(headless_ref_env, str) else None
 
     def plugin_workload_env(
         self,
@@ -821,35 +933,46 @@ class Deps:
 
         This is deliberately not a general environment bridge: only a manifest field that is both
         ``secret = true`` and ``workload_env = true`` may contribute, under its declared ``env`` name.
-        UI values remain SecretRefs in hub metadata and are resolved only at the first parent-side
+        UI values remain SecretRefs in hub metadata; a manifest can alternatively declare a dedicated
+        headless variable whose value is that SecretRef. Both resolve only at the first parent-side
         boundary. A marked workload child reuses only the already-forwarded declared target values.
         """
-        from hub import metadb
         from hub.secrets import resolve_secret_value
 
         forwarded: dict[str, str] = {}
+        entries = {str(entry["name"]): entry for entry in self.plugins}
         for pack, field in self._plugin_workload_fields:
+            entry = entries.get(pack)
+            if entry is None or entry.get("state") != "active":
+                continue
             target = str(field["env"])
             if inherited is not None:
                 value = inherited.get(target)
             else:
-                value = metadb.get_setting(
-                    f"plugin.{pack}.{field['key']}", "global", default=None)
+                value = self._plugin_workload_secret_ref(pack, field)
                 if value not in (None, ""):
                     try:
+                        if not _is_workload_secret_ref(value):
+                            raise ValueError("workload bindings require env: or file: references")
                         value = resolve_secret_value(value, allow_plaintext=False)
                     except Exception:  # never retain a resolver exception chain or configured reference
-                        raise RuntimeError(
-                            f"workload configuration for plugin '{pack}' could not be resolved") from None
-                else:
-                    value = os.environ.get(target)
+                        # An optional plugin binding must not make every Canvas unable to start. Reject
+                        # this field, surface a sanitized plugin-status problem, and leave the workload
+                        # without the target instead of leaking its reference/material in an exception.
+                        summary = (
+                            f"Workload secret binding for plugin '{pack}' could not be resolved; "
+                            "set a valid env: or file: SecretRef.")
+                        if summary not in entry.get("_problems", []):
+                            self._record_plugin_problem(entry, summary)
+                        value = None
             if value not in (None, ""):
                 forwarded[target] = str(value)
         return forwarded
 
     def plugin_workload_names(self) -> tuple[str, ...]:
         """Installed plugin identities authorized by the hub marker for this workload."""
-        return tuple(sorted({pack for pack, _field in self._plugin_workload_fields}))
+        active = {str(entry["name"]) for entry in self.plugins if entry.get("state") == "active"}
+        return tuple(sorted({pack for pack, _field in self._plugin_workload_fields if pack in active}))
 
     def kernel_backend(self):
         """The registered per-canvas KernelBackend (for preview/profile routing), or None."""
