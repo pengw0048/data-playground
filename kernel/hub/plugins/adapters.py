@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import glob
 import hashlib
+import json
 import os
 import threading
 import uuid
@@ -39,6 +40,8 @@ from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
 Relation = duckdb.DuckDBPyRelation
 CancelCheck = Callable[[], bool]
+_LANCE_TRACKED_EVIDENCE_MAX_ROWS = 100_000
+_LANCE_TRACKED_EVIDENCE_PATH_MAX_BYTES = 16_384
 
 
 class BoundedPreviewUnsupported(RuntimeError):
@@ -1191,6 +1194,81 @@ class LanceAdapter:
         except Exception as exc:
             raise_revision_access_error_from_os(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
+
+    def open_revision_projection(
+            self, uri: str, revision_id: str, *, columns: list[str]) -> Relation:
+        """Stream only declared columns from one exact Lance revision into DuckDB.
+
+        This is deliberately a core-private helper rather than an expansion of the generic
+        revision-adapter protocol: whole-revision identity certification must never open every
+        payload column merely to inspect its ordered logical key.
+        """
+        if not isinstance(columns, list) or not columns:
+            raise ValueError("exact Lance projection requires columns")
+        try:
+            native_revision = int(self._revision_id(revision_id))
+            dataset = self._dataset(uri, version=native_revision)
+            selected = [identifier(name, dataset.schema.names, label="projection column")
+                        for name in columns]
+            return db.conn().from_arrow(dataset.scanner(columns=selected).to_reader())
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+
+    def exact_revision_incarnation(self, uri: str, revision_id: str) -> tuple[object, str]:
+        """Return exact schema and a bounded digest of the native tracked-file incarnation.
+
+        The digest is derived from the exact version's tracked manifest/data-file records but never
+        returns their paths.  Sorting happens in DuckDB, whose configured temp directory lets a
+        large manifest spill rather than Python-materialize.  A hard row cap keeps this private
+        attestation boundary explicitly bounded.
+        """
+        try:
+            native_revision = int(self._revision_id(revision_id))
+            dataset = self._dataset(uri, version=native_revision)
+            schema = dataset.schema
+            reader = dataset.tracked_files()
+            relation = db.conn().from_arrow(reader)
+            expected = {"version", "base_uri", "path", "type"}
+            if set(relation.columns) != expected:
+                raise ValueError("tracked Lance evidence has an unexpected shape")
+            # pylance returns the table's tracked-file history, not only the opened version. The
+            # native version filter is therefore part of the exact-incarnation contract.
+            ordered = relation.filter(f"version = {native_revision}").project(
+                'version, path, type').order(
+                'version, type, path').limit(_LANCE_TRACKED_EVIDENCE_MAX_ROWS + 1)
+            hasher = hashlib.sha256(b"managed-lance-incarnation-v1\\0")
+            manifest_rows = 0
+            rows = 0
+            for batch in ordered.to_arrow_reader(batch_size=65_536):
+                for index in range(batch.num_rows):
+                    rows += 1
+                    if rows > _LANCE_TRACKED_EVIDENCE_MAX_ROWS:
+                        raise ValueError("tracked Lance evidence exceeds its bound")
+                    version = batch.column(0)[index].as_py()
+                    path = batch.column(1)[index].as_py()
+                    member_type = batch.column(2)[index].as_py()
+                    if (isinstance(version, bool) or not isinstance(version, int)
+                            or version != native_revision
+                            or not isinstance(path, str) or not path
+                            or len(path.encode("utf-8")) > _LANCE_TRACKED_EVIDENCE_PATH_MAX_BYTES
+                            or not isinstance(member_type, str) or not member_type):
+                        raise ValueError("tracked Lance evidence is invalid")
+                    if member_type == "manifest":
+                        manifest_rows += 1
+                    encoded = json.dumps(
+                        [version, member_type, path], ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8")
+                    hasher.update(len(encoded).to_bytes(8, "big"))
+                    hasher.update(encoded)
+            if rows == 0 or manifest_rows != 1:
+                raise ValueError("tracked Lance evidence is incomplete")
+            return schema, hasher.hexdigest()
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
 
     def open_revision_native_rows(
             self, uri: str, revision_id: str, *,

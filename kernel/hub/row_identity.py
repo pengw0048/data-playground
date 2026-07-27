@@ -1,9 +1,10 @@
-"""Revision-scoped logical row identity and exact coverage for managed local Parquet.
+"""Revision-scoped logical row identity and exact coverage for managed local data.
 
 This is deliberately a small internal contract.  It has one source shape: a retained,
 core-owned managed-local Parquet revision, and one candidate relation already owned by
-the caller's DuckDB connection.  It does not create a durable sidecar or resolve a
-catalog head; later leaves may consume the certificate it returns.
+the caller's DuckDB connection.  The Lance foundation below deliberately keeps its
+registration-incarnation fence separate from that retained-file lifecycle.  Neither path creates
+a durable sidecar or resolves a catalog head; later leaves may consume a certificate it returns.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
@@ -20,7 +22,7 @@ import pyarrow.parquet as pq
 
 from hub import db, metadb
 from hub.models import ExactDatasetRef, MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH
-from hub.plugins.adapters import DuckDBAdapter
+from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.sqlpolicy import identifier, quote_identifier
 from hub.storage import ManagedSourceUnavailable, source_read_scope
 
@@ -52,6 +54,12 @@ class RowIdentityRevisionMismatch(RowIdentityError):
 
 class RowIdentityValidationError(RowIdentityError):
     """The declaration, schema, or evidence violates the V1 contract."""
+
+
+class RowIdentityValueTooLarge(RowIdentityValidationError):
+    """One identity value cannot fit the bounded public row-reference representation."""
+
+    reason = "identity_value_over_limit"
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,17 @@ class RowIdentityCoverageV1:
     missing_identities: int
     extra_identities: int
     status: Literal["complete", "partial", "invalid"]
+
+
+@dataclass(frozen=True)
+class ManagedLocalLanceRowIdentityFenceV1:
+    """Private exact-Lance authority retained alongside one row-identity certificate."""
+
+    dataset_id: str
+    revision_id: str
+    schema_sha256: str
+    row_identity_spec_sha256: str
+    physical_incarnation_sha256: str
 
 
 def serialize_row_identity_coverage(
@@ -389,6 +408,144 @@ def certify_and_commit_exact_row_identity(
         raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
 
 
+def freeze_managed_local_lance_row_identity_fence(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        owner: str = "managed-lance-row-identity",
+) -> tuple[RowIdentitySpecV1, ManagedLocalLanceRowIdentityFenceV1]:
+    """Freeze one registered Lance exact version without exposing its URI or tracked files.
+
+    Catalog registration is the dataset incarnation fence.  The native tracked-file digest gives a
+    second, physical-incarnation fence for the exact version; only that digest crosses into metadata.
+    """
+    exact = _exact_ref(dataset_ref)
+    declared = _declared_keys(key_columns)
+    binding = metadb.managed_local_lance_row_identity_binding(exact[0])
+    if binding is None or binding.get("dataset_id") != exact[0]:
+        raise RowIdentityUnavailable("exact row identity source is unavailable")
+    try:
+        with db.base_guard():
+            adapter = LanceAdapter()
+            schema, physical = adapter.exact_revision_incarnation(
+                str(binding["uri"]), exact[1])
+            if not isinstance(schema, pa.Schema):
+                raise RowIdentityUnavailable("exact row identity source is unavailable")
+            spec = freeze_row_identity_spec_from_schema(dataset_ref, declared, schema)
+    except RowIdentityError:
+        raise
+    except Exception as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
+    if not isinstance(physical, str) or len(physical) != 64:
+        raise RowIdentityUnavailable("exact row identity source is unavailable")
+    return spec, ManagedLocalLanceRowIdentityFenceV1(
+        dataset_id=exact[0], revision_id=exact[1], schema_sha256=spec.schema_digest,
+        row_identity_spec_sha256=spec.digest, physical_incarnation_sha256=physical)
+
+
+def certify_and_commit_managed_local_lance_row_identity(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        commit: Callable[[RowIdentityCoverageV1, ManagedLocalLanceRowIdentityFenceV1], _CommitResult],
+        owner: str = "managed-lance-row-identity",
+        expected_fence: ManagedLocalLanceRowIdentityFenceV1 | None = None,
+) -> _CommitResult:
+    """Scan one exact registered Lance key projection and commit only after a fresh fence recheck."""
+    exact = _exact_ref(dataset_ref)
+    declared = _declared_keys(key_columns)
+    binding = metadb.managed_local_lance_row_identity_binding(exact[0])
+    if binding is None or binding.get("dataset_id") != exact[0]:
+        raise RowIdentityUnavailable("exact row identity source is unavailable")
+    try:
+        with db.base_guard():
+            adapter = LanceAdapter()
+            schema, physical = adapter.exact_revision_incarnation(
+                str(binding["uri"]), exact[1])
+            if not isinstance(schema, pa.Schema):
+                raise RowIdentityUnavailable("exact row identity source is unavailable")
+            spec = freeze_row_identity_spec_from_schema(dataset_ref, declared, schema)
+            fence = ManagedLocalLanceRowIdentityFenceV1(
+                dataset_id=exact[0], revision_id=exact[1], schema_sha256=spec.schema_digest,
+                row_identity_spec_sha256=spec.digest, physical_incarnation_sha256=physical)
+            if expected_fence is not None and fence != expected_fence:
+                raise RowIdentityRevisionMismatch("exact row identity source no longer matches admission")
+            if not row_identity_spec_is_supported(spec):
+                raise RowIdentityValidationError("row identity schema is invalid")
+            streamed_keys = adapter.open_revision_projection(
+                str(binding["uri"]), exact[1], columns=list(declared))
+            # Lance exposes an Arrow reader. Materialize only the declared key projection into a
+            # temporary DuckDB table so the aggregate, duplicate check, and ordered digest can all
+            # replay it; DuckDB's configured temp directory lets that relation spill to disk.
+            temp_name = f"dp_lance_row_identity_{uuid.uuid4().hex}"
+            try:
+                streamed_keys.create(temp_name)
+                base = db.conn().table(temp_name)
+                fields = _key_fields(_relation_schema(base), declared)
+                if fields != spec.fields:
+                    raise RowIdentityRevisionMismatch(
+                        "exact row identity source no longer matches admission")
+                evidence = _scan_evidence(
+                    _key_relation(base, declared), fields,
+                    string_value_max_bytes=MEDIA_CELL_IDENTITY_VALUE_MAX_LENGTH)
+                status: Literal["complete", "invalid"] = (
+                    "invalid" if evidence.null_rows or evidence.duplicate_groups else "complete")
+                certificate = RowIdentityCoverageV1(
+                    spec=spec, base=evidence, candidate=evidence,
+                    matched_identities=evidence.unique_identities, missing_identities=0,
+                    extra_identities=0, status=status)
+                validate_row_identity_coverage(certificate, dataset_ref, spec.digest)
+                if certificate.status != "complete":
+                    raise RowIdentityValidationError("row identity evidence is invalid")
+            finally:
+                db.conn().execute(f'DROP TABLE IF EXISTS "{temp_name}"')
+            # The second exact metadata read is deliberately after all lazy relation evaluation. It
+            # catches an in-place physical replacement before the metadata transaction can retain it.
+            after_schema, after_physical = adapter.exact_revision_incarnation(
+                str(binding["uri"]), exact[1])
+            if (not isinstance(after_schema, pa.Schema)
+                    or _schema_digest(after_schema) != fence.schema_sha256
+                    or after_physical != fence.physical_incarnation_sha256):
+                raise RowIdentityRevisionMismatch("exact row identity source no longer matches admission")
+            return commit(certificate, fence)
+    except (RowIdentityError, metadb.ManagedLocalLanceRowIdentityCertificateConflict):
+        raise
+    except Exception as exc:
+        raise RowIdentityUnavailable("exact row identity source is unavailable") from exc
+
+
+def certify_and_persist_managed_local_lance_row_identity(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        owner: str = "managed-lance-row-identity",
+) -> dict:
+    """Run the private whole-revision Lance proof and retain its exact registration fence."""
+    exact = _exact_ref(dataset_ref)
+
+    def persist(certificate: RowIdentityCoverageV1,
+                fence: ManagedLocalLanceRowIdentityFenceV1) -> dict:
+        return metadb.managed_local_lance_row_identity_certificate_store(
+            exact[0], exact[1],
+            serialize_row_identity_coverage(certificate, dataset_ref, fence.row_identity_spec_sha256),
+            physical_incarnation_sha256=fence.physical_incarnation_sha256,
+            schema_sha256=fence.schema_sha256,
+            row_identity_spec_sha256=fence.row_identity_spec_sha256)
+
+    return certify_and_commit_managed_local_lance_row_identity(
+        dataset_ref, key_columns, commit=persist, owner=owner)
+
+
+def managed_local_lance_row_identity_certificate(
+        dataset_ref: ExactDatasetRef, key_columns: Sequence[str], *,
+        owner: str = "managed-lance-row-identity",
+) -> RowIdentityCoverageV1 | None:
+    """Load a retained Lance proof only after re-deriving its exact physical fence, without a scan."""
+    spec, fence = freeze_managed_local_lance_row_identity_fence(
+        dataset_ref, key_columns, owner=owner)
+    if not row_identity_spec_is_supported(spec):
+        return None
+    return metadb.managed_local_lance_row_identity_certificate_for_fence(
+        fence.dataset_id, fence.revision_id,
+        physical_incarnation_sha256=fence.physical_incarnation_sha256,
+        schema_sha256=fence.schema_sha256,
+        row_identity_spec_sha256=fence.row_identity_spec_sha256)
+
+
 def freeze_row_identity_spec_from_schema(
         dataset_ref: ExactDatasetRef, key_columns: Sequence[str], schema: pa.Schema,
 ) -> RowIdentitySpecV1:
@@ -639,7 +796,10 @@ def _key_relation(relation, keys: tuple[str, ...]):
     return relation.project(", ".join(quote_identifier(name) for name in selected))
 
 
-def _scan_evidence(relation, fields: tuple[RowIdentityFieldV1, ...]) -> RowIdentityScanEvidenceV1:
+def _scan_evidence(
+        relation, fields: tuple[RowIdentityFieldV1, ...], *,
+        string_value_max_bytes: int | None = None,
+) -> RowIdentityScanEvidenceV1:
     keys = tuple(field.name for field in fields)
     quoted = tuple(quote_identifier(name) for name in keys)
     null_condition = " OR ".join(f"{name} IS NULL" for name in quoted)
@@ -661,7 +821,8 @@ def _scan_evidence(relation, fields: tuple[RowIdentityFieldV1, ...]) -> RowIdent
         duplicate_groups=duplicate_groups,
         duplicate_rows=duplicate_rows,
         key_set_digest=None if null_rows else _key_set_digest(groups.project(
-            ", ".join(quoted)), fields),
+            ", ".join(quoted)), fields,
+            string_value_max_bytes=string_value_max_bytes),
     )
 
 
@@ -682,18 +843,25 @@ def _raw_coverage(base, candidate, keys: tuple[str, ...]) -> tuple[int, int, int
                  for relation in (matched, missing, extra))
 
 
-def _key_set_digest(relation, fields: tuple[RowIdentityFieldV1, ...]) -> str:
+def _key_set_digest(
+        relation, fields: tuple[RowIdentityFieldV1, ...], *,
+        string_value_max_bytes: int | None = None,
+) -> str:
     ordered = relation.order(", ".join(quote_identifier(field.name) for field in fields))
     hasher = hashlib.sha256(b"row-identity-key-set-v1\\0")
     reader = ordered.to_arrow_reader(batch_size=65_536)
     for batch in reader:
         for row_index in range(batch.num_rows):
             values = tuple(batch.column(index)[row_index].as_py() for index in range(batch.num_columns))
-            hasher.update(_encode_identity(fields, values))
+            hasher.update(_encode_identity(
+                fields, values, string_value_max_bytes=string_value_max_bytes))
     return hasher.hexdigest()
 
 
-def _encode_identity(fields: tuple[RowIdentityFieldV1, ...], values: tuple[object, ...]) -> bytes:
+def _encode_identity(
+        fields: tuple[RowIdentityFieldV1, ...], values: tuple[object, ...], *,
+        string_value_max_bytes: int | None = None,
+) -> bytes:
     if len(fields) != len(values):  # defensive; this is never user-facing data
         raise RowIdentityValidationError("row identity evidence is invalid")
     encoded = bytearray(b"RI1" + len(fields).to_bytes(2, "big"))
@@ -705,6 +873,8 @@ def _encode_identity(fields: tuple[RowIdentityFieldV1, ...], values: tuple[objec
             if not isinstance(value, str):
                 raise RowIdentityValidationError("row identity evidence is invalid")
             payload = value.encode("utf-8")
+            if string_value_max_bytes is not None and len(payload) > string_value_max_bytes:
+                raise RowIdentityValueTooLarge("row identity value exceeds its bounded public limit")
         else:
             if isinstance(value, bool) or not isinstance(value, int):
                 raise RowIdentityValidationError("row identity evidence is invalid")
