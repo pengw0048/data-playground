@@ -73,6 +73,7 @@ vi.mock('../api/client', () => ({
 
 import {
   canvasViewportDocumentIdentity, currentPreviews, previewPlanIdentity, profileJobKey, profilePlanIdentity, useStore,
+  writeAdmissionFingerprint,
 } from './graph'
 import { KernelError } from '../api/client'
 import { register } from '../nodes/registry'
@@ -392,6 +393,136 @@ describe('graph store — core authority ops', () => {
       id: 'rerouted', source: 'source', target: 'new-target',
     })
     expect(useStore.getState().past).toHaveLength(1)
+  })
+
+  it('keeps a running managed Write identity across an upstream edge edit', () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
+      intent: { idempotencyKey: 'managed-write-key' },
+    }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: { write: {
+        phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
+        writeAdmissionFingerprint: 'admitted-graph',
+      } },
+    } as any)
+
+    useStore.getState().removeEdge('source-write')
+
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
+      writeAdmissionFingerprint: 'admitted-graph',
+    })
+  })
+
+  it('identifies Write admission by target status, edge id, parameters, bindings, and inputs', () => {
+    const source = NODE('source')
+    source.data.status = 'latest'
+    const write = NODE('write', 'write')
+    write.data.config = {
+      filename: { parameterRef: 'output' }, writeMode: { parameterRef: 'mode' },
+    }
+    const unrelated = NODE('unrelated', 'filter')
+    unrelated.data.config = { threshold: { parameterRef: 'unused' } }
+    const parameters = [
+      { name: 'output', type: 'string' as const, default: 'first', label: 'Output', constraints: { minLength: 1 } },
+      { name: 'mode', type: 'string' as const, default: 'overwrite' },
+      { name: 'unused', type: 'integer' as const, default: 10 },
+    ]
+    const bindings = [{ name: 'output', value: 'result' }, { name: 'mode', value: 'overwrite' }]
+    const manifest = [{
+      node_id: 'source', dataset_id: 'dataset', revision_id: '1', provider: 'local', resolved_at: 'now',
+    }]
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], parameters,
+      nodes: [source, write, unrelated], edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    const initial = writeAdmissionFingerprint(doc, 'write', bindings, manifest)
+    const presentationOnly = {
+      ...doc,
+      parameters: [
+        parameters[1], { ...parameters[0], label: 'Renamed for display' },
+        { ...parameters[2], default: 999 },
+      ],
+      nodes: doc.nodes.map((node) => node.id === 'write'
+        ? {
+            ...node, position: { x: 400, y: 200 },
+            data: {
+              ...node.data, history: [{ label: 'run · 1 output' }],
+              lastRun: { outputCount: 1, ms: 12, placement: 'local' },
+            },
+          }
+        : node.id === 'unrelated'
+          ? { ...node, data: { ...node.data, config: { threshold: 999 } } }
+          : node),
+    }
+    expect(writeAdmissionFingerprint(
+      presentationOnly, 'write', [bindings[1], bindings[0]],
+      [{ ...manifest[0], resolved_at: 'later' }],
+    )).toBe(initial)
+
+    const withStatusChange = {
+      ...doc,
+      nodes: doc.nodes.map((node) => node.id === 'source'
+        ? { ...node, data: { ...node.data, status: 'stale' as const } } : node),
+    }
+    expect(writeAdmissionFingerprint(withStatusChange, 'write', bindings, manifest)).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      { ...doc, edges: [{ ...doc.edges[0], id: 'replacement-id' }] },
+      'write', bindings, manifest,
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      {
+        ...doc,
+        parameters: parameters.map((parameter) => parameter.name === 'output'
+          ? { ...parameter, default: 'second' } : parameter),
+      },
+      'write', bindings, manifest,
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      doc, 'write', [bindings[1], { name: 'output', value: 'other' }], manifest,
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      doc, 'write', bindings, [{ ...manifest[0], revision_id: '2' }],
+    )).not.toBe(initial)
+  })
+
+  it('preserves union edge and admitted input order in Write admission identity', () => {
+    const sourceA = NODE('source-a')
+    const sourceB = NODE('source-b')
+    const union = NODE('union', 'union')
+    const write = NODE('write', 'write')
+    const edges = [
+      { id: 'a-union', source: 'source-a', target: 'union' },
+      { id: 'b-union', source: 'source-b', target: 'union' },
+      { id: 'union-write', source: 'union', target: 'write' },
+    ]
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [],
+      nodes: [sourceA, sourceB, union, write], edges,
+    }
+    const manifest = [
+      { node_id: 'source-a', dataset_id: 'a', revision_id: '1', provider: 'local', resolved_at: 'first' },
+      { node_id: 'source-b', dataset_id: 'b', revision_id: '1', provider: 'local', resolved_at: 'second' },
+    ]
+    const initial = writeAdmissionFingerprint(doc, 'write', undefined, manifest)
+
+    expect(writeAdmissionFingerprint(
+      { ...doc, edges: [edges[1], edges[0], edges[2]] }, 'write', undefined, manifest,
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      doc, 'write', undefined, [manifest[1], manifest[0]],
+    )).not.toBe(initial)
+    expect(writeAdmissionFingerprint(
+      doc, 'write', undefined, manifest.map((item) => ({ ...item, resolved_at: 'later' })),
+    )).toBe(initial)
   })
 
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
@@ -1496,6 +1627,84 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.run.mock.calls[1][0].nodes[0].data.config).toEqual(doc.nodes[0].data.config)
     expect(apiMocks.run.mock.calls[1][0].version).toBe(2)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+  })
+
+  it('freezes running Write parameters and admission identity across declaration edits and response loss', async () => {
+    const parameters = [{
+      name: 'output', type: 'string' as const, default: 'output.parquet',
+    }]
+    const bindings = [{ name: 'output', value: 'output.parquet' }]
+    const write = NODE('write', 'write')
+    write.data.config = {
+      filename: { parameterRef: 'output' }, writeMode: 'overwrite',
+    }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], parameters,
+      nodes: [write], edges: [],
+    }
+    useStore.setState({ doc, runs: { write: {
+      phase: 'idle', parameterBindings: bindings, parametersReady: true,
+      parameterContractFingerprint: JSON.stringify(parameters),
+    } } })
+    const intent = {
+      destination: {
+        logicalUri: '/outputs/output.parquet', name: 'output',
+        provider: 'managed-local-file' as const,
+      },
+      mode: 'create' as const, expectedSchema: [], expectedHead: null,
+      idempotencyKey: 'parameter-write-key', partitions: [],
+      provenance: { publication: {
+        idempotencyKey: 'parameter-write-key', runId: 'run-write',
+        producer: 'c', producerVersion: 1, stepId: 'write', provenance: 'run',
+      }, parents: [] },
+    }
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file',
+      expectedSchema: [], partitions: [], intent,
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(admission)
+    let rejectRun!: (reason: Error) => void
+    apiMocks.run.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectRun = reject
+    }))
+
+    const pending = useStore.getState().run('write')
+    await vi.waitFor(() => expect(apiMocks.run).toHaveBeenCalledTimes(1))
+    const running = useStore.getState().runs.write
+    expect(running.phase).toBe('running')
+
+    expect(useStore.getState().setParameters([{
+      ...parameters[0], default: 'next-output.parquet',
+    }])).toBeNull()
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'running',
+      parameterBindings: running.parameterBindings,
+      parametersReady: running.parametersReady,
+      parameterContractFingerprint: running.parameterContractFingerprint,
+      writeAdmission: running.writeAdmission,
+      writeSubmissionId: running.writeSubmissionId,
+      writeAdmissionFingerprint: running.writeAdmissionFingerprint,
+    })
+
+    rejectRun(new Error('network response lost'))
+    await pending
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'failed',
+      parameterBindings: bindings,
+      parameterContractFingerprint: JSON.stringify(parameters),
+      writeAdmission: admission,
+      writeSubmissionId: running.writeSubmissionId,
+      writeAdmissionFingerprint: running.writeAdmissionFingerprint,
+    })
+
+    await useStore.getState().requestRun('write')
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'parameters',
+      parametersReady: false,
+      parameterContractFingerprint: JSON.stringify(useStore.getState().doc.parameters),
+    })
+    expect(apiMocks.estimate).not.toHaveBeenCalled()
   })
 
   it('does not turn provider-neutral sink retries into typed write recovery', async () => {

@@ -257,11 +257,15 @@ function compareIdentityText(a: string, b: string): number {
 }
 
 // Preview and profile requests execute the same target-scoped graph cone on the server. Keep one
-// canonical document identity for every client-side consumer: unrelated branches, array ordering,
-// positions, edge ids, selection, and transient node status are presentation-only; requirements,
-// executable node data, wiring, and section containment affect execution. Titles are included because
-// metric output and section-child aliases execute from them.
-function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: string): string {
+// canonical document identity for every client-side consumer. Write admission additionally observes
+// ordered edge ids and upstream node status because structural validation and placement ownership
+// use them. The target Write's own transient lifecycle status is not an input to its retry identity.
+function targetExecutionPlanIdentity(
+  doc: CanvasDoc,
+  nodeId: string,
+  portId?: string,
+  writeAdmission = false,
+): string {
   const executableNodes = doc.nodes.filter((node) => node.type !== 'note' && node.type !== 'code')
   const byId = new Map(executableNodes.map((node) => [node.id, node]))
   const incoming = new Map<string, string[]>()
@@ -305,19 +309,23 @@ function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: st
       config: node.data.config,
       bypassed: !!node.data.bypassed,
       disabled: !!node.data.disabled,
+      ...(writeAdmission && node.id !== nodeId ? { status: node.data.status } : {}),
     }))
   const edges = doc.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
     .map((edge) => ({
+      ...(writeAdmission ? { id: edge.id } : {}),
       source: edge.source,
       target: edge.target,
       sourceHandle: edge.sourceHandle ?? null,
       targetHandle: edge.targetHandle ?? null,
       wire: edge.data?.wire ?? 'dataset',
     }))
-    .sort((a, b) => compareIdentityText(
+  if (!writeAdmission) {
+    edges.sort((a, b) => compareIdentityText(
       [a.source, a.target, a.sourceHandle ?? '', a.targetHandle ?? '', a.wire].join('\u0000'),
       [b.source, b.target, b.sourceHandle ?? '', b.targetHandle ?? '', b.wire].join('\u0000'),
     ))
+  }
 
   return JSON.stringify(canonicalIdentityValue({
     schema: 1,
@@ -425,16 +433,44 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId, parameterBindings) ? retained : undefined
 }
 
-function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
-  const { version: _version, ...executionDoc } = doc
+export function writeAdmissionFingerprint(
+  doc: CanvasDoc,
+  nodeId: string,
+  parameterBindings?: CanvasParameterBinding[],
+  inputManifest?: RunInputManifestItem[],
+): string {
+  // Write admission certifies one ordered executable target cone. Include upstream node status and
+  // edge ids because backend ownership planning and structural validation observe them; ignore the
+  // target Write's lifecycle status, canvas presentation, and unrelated branches.
   return JSON.stringify({
-    ...executionDoc,
-    nodes: doc.nodes.map((node) => {
-      const { status: _status, ...data } = node.data
-      return { ...node, data }
-    }),
-    parameterBindings: parameterBindings ?? [],
+    plan: targetExecutionPlanIdentity(doc, nodeId, undefined, true),
+    declarations: targetParameterDeclarations(doc, nodeId)
+      .map((declaration) => canonicalIdentityValue({
+        name: declaration.name,
+        type: declaration.type,
+        required: declaration.required === true,
+        default: declaration.default,
+        constraints: declaration.constraints,
+      }))
+      .sort((left, right) => compareIdentityText(JSON.stringify(left), JSON.stringify(right))),
+    parameterBindings: parameterBindingsIdentity(parameterBindings),
+    inputManifest: inputManifest === undefined ? null : inputManifest
+      // `resolved_at` is observation metadata; the server's execution-manifest identity likewise
+      // binds only the exact dataset/revision/provider source identity.
+      .map((item) => canonicalIdentityValue({
+        node_id: item.node_id,
+        dataset_id: item.dataset_id,
+        revision_id: item.revision_id,
+        provider: item.provider,
+      })),
   })
+}
+
+export function writeAdmissionRequestIdentity(state: Store, nodeId: string): string {
+  const binding = currentPreviewBinding(state, nodeId)
+  return writeAdmissionFingerprint(
+    state.doc, nodeId, state.runs[nodeId]?.parameterBindings, binding?.inputManifest,
+  )
 }
 
 function sameInputManifest(
@@ -479,6 +515,10 @@ interface RunState {
   parameterContractFingerprint?: string
   parameterContinuation?: { kind: 'run' | 'estimate' } | { kind: 'profile'; portId?: string }
 }
+
+// A Write card and the Run flow may observe the same semantic change in one render turn. Share the
+// request by its complete admission identity so they cannot mint competing submission ids.
+const _pendingWriteAdmissions = new Map<string, Promise<WriteAdmission | undefined>>()
 
 export function targetParameterDeclarations(doc: CanvasDoc, targetNodeId: string): CanvasParameterDeclaration[] {
   const incoming = new Map<string, string[]>()
@@ -1298,6 +1338,30 @@ function downstream(doc: CanvasDoc, id: string): Set<string> {
   return out
 }
 
+function invalidateWriteAdmissions(
+  doc: CanvasDoc,
+  runs: Store['runs'],
+  affectedNodeIds: Iterable<string>,
+): Store['runs'] {
+  const next = { ...runs }
+  for (const nodeId of affectedNodeIds) {
+    if (doc.nodes.find((node) => node.id === nodeId)?.type !== 'write') continue
+    const current = next[nodeId]
+    if (!current) continue
+    // A managed run may have reached the server even if its response is lost. Keep its certified
+    // admission/submission identity intact while it is in flight so the explicit retry path stays
+    // idempotent; a later terminal retry will re-admit against the edited graph if necessary.
+    if (current.phase === 'running') continue
+    next[nodeId] = {
+      ...current,
+      writeAdmission: undefined,
+      writeSubmissionId: undefined,
+      writeAdmissionFingerprint: undefined,
+    }
+  }
+  return next
+}
+
 async function superviseTrackedProfileCancellation(
   get: () => Store,
   set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
@@ -1685,17 +1749,9 @@ export const useStore = create<Store>((set, get) => ({
             : []
         })
       }
-      const runs = { ...s.runs }
-      for (const node of nodes) {
-        if (node.type !== 'write' || (!stale.has(node.id) && node.id !== id)) continue
-        const current = runs[node.id]
-        if (current) runs[node.id] = {
-          ...current,
-          writeAdmission: undefined,
-          writeSubmissionId: undefined,
-          writeAdmissionFingerprint: undefined,
-        }
-      }
+      const runs = invalidateWriteAdmissions(
+        s.doc, s.runs, [id, ...stale],
+      )
       return { doc: { ...s.doc, nodes, edges }, runs }
     })
   },
@@ -1727,7 +1783,8 @@ export const useStore = create<Store>((set, get) => ({
     get().commit()
     set((s) => {
       const previews = { ...s.previews }; delete previews[id]
-      const runs = { ...s.runs }; delete runs[id]
+      const runs = invalidateWriteAdmissions(s.doc, s.runs, downstream(s.doc, id))
+      delete runs[id]
       const profileJobs = Object.fromEntries(
         Object.entries(s.profileJobs).filter(([, job]) => job.nodeId !== id),
       )
@@ -1757,7 +1814,10 @@ export const useStore = create<Store>((set, get) => ({
           ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
           : n,
       )
-      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes } }
+      const runs = invalidateWriteAdmissions(
+        s.doc, s.runs, [edge.target, ...stale],
+      )
+      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes }, runs }
     })
   },
 
@@ -1766,7 +1826,13 @@ export const useStore = create<Store>((set, get) => ({
     if (!get().doc.edges.some((candidate) => candidate.id === id)) return
     get().commit()
     set((s) => {
+      const previous = s.doc.edges.find((candidate) => candidate.id === id)
       const stale = downstream(s.doc, edge.target)
+      const affected = new Set<string>([edge.target, ...stale])
+      if (previous) {
+        affected.add(previous.target)
+        for (const nodeId of downstream(s.doc, previous.target)) affected.add(nodeId)
+      }
       const nodes = s.doc.nodes.map((n) =>
         (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
           ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
@@ -1778,6 +1844,7 @@ export const useStore = create<Store>((set, get) => ({
           edges: s.doc.edges.map((candidate) => candidate.id === id ? { ...edge, id } : candidate),
           nodes,
         },
+        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
       }
     })
   },
@@ -1785,7 +1852,16 @@ export const useStore = create<Store>((set, get) => ({
   removeEdge: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     get().commit()
-    set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } }))
+    set((s) => {
+      const removed = s.doc.edges.find((edge) => edge.id === id)
+      const affected = removed
+        ? [removed.target, ...downstream(s.doc, removed.target)]
+        : []
+      return {
+        doc: { ...s.doc, edges: s.doc.edges.filter((edge) => edge.id !== id) },
+        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
+      }
+    })
   },
 
   // Move a node into a section (parentId set, position now relative to the section) or back out to
@@ -2327,15 +2403,21 @@ export const useStore = create<Store>((set, get) => ({
 
   prepareWrite: async (id) => {
     if (!hubExecutionAvailable(get)) return undefined
-    const doc = get().doc
+    const initial = get()
+    const doc = initial.doc
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
-    const parameterBindings = get().runs[id]?.parameterBindings
-    const fingerprint = writeAdmissionFingerprint(doc, parameterBindings)
-    const existing = get().runs[id]
+    const parameterBindings = initial.runs[id]?.parameterBindings
+    const binding = currentPreviewBinding(initial, id)
+    const fingerprint = writeAdmissionFingerprint(
+      doc, id, parameterBindings, binding?.inputManifest,
+    )
+    const existing = initial.runs[id]
     if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
       return existing.writeAdmission
     }
+    const pending = _pendingWriteAdmissions.get(fingerprint)
+    if (pending) return pending
     const submissionId = globalThis.crypto.randomUUID()
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? { phase: 'idle' as const }),
@@ -2343,19 +2425,32 @@ export const useStore = create<Store>((set, get) => ({
       writeAdmissionFingerprint: fingerprint,
       writeAdmission: undefined,
     } } }))
-    const binding = currentPreviewBinding(get(), id)
-    const admission = parameterBindings?.length
-      ? await api.writeAdmission(doc, id, submissionId, binding?.inputManifest, parameterBindings)
-      : await api.writeAdmission(doc, id, submissionId, binding?.inputManifest)
-    const current = get().runs[id]
-    if (current?.writeSubmissionId !== submissionId
-        || current.writeAdmissionFingerprint !== fingerprint
-        || writeAdmissionFingerprint(
-          get().doc, get().runs[id]?.parameterBindings) !== fingerprint) return undefined
-    set((s) => ({ runs: { ...s.runs, [id]: {
-      ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
-    } } }))
-    return admission
+    let request!: Promise<WriteAdmission | undefined>
+    request = (async () => {
+      try {
+        const admission = parameterBindings?.length
+          ? await api.writeAdmission(doc, id, submissionId, binding?.inputManifest, parameterBindings)
+          : await api.writeAdmission(doc, id, submissionId, binding?.inputManifest)
+        if (writeAdmissionRequestIdentity(get(), id) !== fingerprint) return undefined
+        const currentRun = get().runs[id]
+        if (currentRun?.phase === 'running' && currentRun.writeSubmissionId !== submissionId) {
+          return undefined
+        }
+        set((s) => ({ runs: { ...s.runs, [id]: {
+          ...(s.runs[id] ?? { phase: 'idle' as const }),
+          writeSubmissionId: submissionId,
+          writeAdmissionFingerprint: fingerprint,
+          writeAdmission: admission,
+        } } }))
+        return admission
+      } finally {
+        if (_pendingWriteAdmissions.get(fingerprint) === request) {
+          _pendingWriteAdmissions.delete(fingerprint)
+        }
+      }
+    })()
+    _pendingWriteAdmissions.set(fingerprint, request)
+    return request
   },
 
   run: async (id, confirmed = false, acceptPreviewDrift = false) => {
@@ -3344,18 +3439,20 @@ export const useStore = create<Store>((set, get) => ({
           } }))
         : s.doc.nodes
       const runs = executionChanged
-        ? Object.fromEntries(Object.entries(s.runs).map(([nodeId, run]) => [nodeId, {
-            ...run,
-            parametersReady: false,
-            estimate: undefined,
-            parameterBindings: run.parameterBindings?.flatMap((binding) => {
-              const renamed = mutation.renames.get(binding.name) ?? binding.name
-              return mutation.changedTypes.has(renamed) ? [] : [{ ...binding, name: renamed }]
-            }),
-            writeAdmission: undefined,
-            writeSubmissionId: undefined,
-            writeAdmissionFingerprint: undefined,
-          }]))
+        ? Object.fromEntries(Object.entries(s.runs).map(([nodeId, run]) => run.phase === 'running'
+          ? [nodeId, run]
+          : [nodeId, {
+              ...run,
+              parametersReady: false,
+              estimate: undefined,
+              parameterBindings: run.parameterBindings?.flatMap((binding) => {
+                const renamed = mutation.renames.get(binding.name) ?? binding.name
+                return mutation.changedTypes.has(renamed) ? [] : [{ ...binding, name: renamed }]
+              }),
+              writeAdmission: undefined,
+              writeSubmissionId: undefined,
+              writeAdmissionFingerprint: undefined,
+            }]))
         : s.runs
       return {
         doc: { ...s.doc, nodes, parameters }, runs,

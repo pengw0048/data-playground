@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { register, type NodeComponentProps } from '../registry'
 import { NodeCard } from '../NodeCard'
-import { useStore } from '../../store/graph'
+import { useStore, writeAdmissionRequestIdentity } from '../../store/graph'
 import { Field, MiniInput, MiniSelect } from '../../ui/controls'
 import { managedDatasetNameErrorMessage } from '../../api/client'
 
@@ -11,9 +11,18 @@ function Write({ id, data }: NodeComponentProps) {
   const mode = (data.config.writeMode as 'append' | 'overwrite') ?? 'overwrite'
   const dest = (data.config.destName as string | undefined) ?? 'Workspace outputs'
   const prepareWrite = useStore((s) => s.prepareWrite)
-  const admission = useStore((s) => s.runs[id]?.writeAdmission
-    ?? (s.runs[id]?.phase === 'done' ? s.runs[id]?.writeOutcomeAdmission : undefined))
+  const admissionIdentity = useStore((s) => writeAdmissionRequestIdentity(s, id))
+  const admission = useStore((s) => {
+    const run = s.runs[id]
+    if (run?.phase === 'running') return run.writeAdmission
+    if (run?.phase === 'done') return run.writeOutcomeAdmission
+    return run?.writeAdmissionFingerprint === writeAdmissionRequestIdentity(s, id)
+      ? run.writeAdmission : undefined
+  })
   const runPhase = useStore((s) => s.runs[id]?.phase)
+  const inFlightAdmissionRequests = useRef(
+    new Map<string, ReturnType<typeof prepareWrite>>(),
+  )
   const [nameError, setNameError] = useState<string | null>(null)
   const receipt = useStore((s) => s.runs[id]?.status?.outputs
     .find((output) => output.writeReceipt)?.writeReceipt)
@@ -24,8 +33,19 @@ function Write({ id, data }: NodeComponentProps) {
   useEffect(() => {
     if (runPhase === 'estimating' || runPhase === 'confirm'
         || runPhase === 'drift' || runPhase === 'running') return
+    let request = inFlightAdmissionRequests.current.get(admissionIdentity)
+    if (!request) {
+      let tracked!: ReturnType<typeof prepareWrite>
+      tracked = prepareWrite(id).finally(() => {
+        if (inFlightAdmissionRequests.current.get(admissionIdentity) === tracked) {
+          inFlightAdmissionRequests.current.delete(admissionIdentity)
+        }
+      })
+      inFlightAdmissionRequests.current.set(admissionIdentity, tracked)
+      request = tracked
+    }
     let active = true
-    void prepareWrite(id).then(() => {
+    void request.then(() => {
       if (active) setNameError(null)
     }).catch((error: unknown) => {
       if (active) setNameError(managedDatasetNameErrorMessage(error))
@@ -36,7 +56,7 @@ function Write({ id, data }: NodeComponentProps) {
   // cannot reuse a completed request. Re-run the existing preflight when that happens: config is
   // unchanged, but the card still needs a truthful current destination summary. Active run intent
   // owns admission while it estimates, waits at a gate, or executes; the card must not race it.
-  }, [id, data.config, admission, runPhase, prepareWrite])
+  }, [id, admission, admissionIdentity, runPhase, prepareWrite])
   const displayName = admission?.intent?.destination.name ?? name
   const semantics = receipt
     ? `published revision ${receipt.revisionId}`

@@ -714,6 +714,18 @@ def test_missing_schema_blocker_names_the_direct_upstream_transform(contract, mo
         "Output schema (contract) → Infer from sample.")
 
 
+def test_missing_schema_blocker_guides_a_write_without_upstream(contract, monkeypatch):
+    deps, graph = contract
+    graph.edges = []
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111118")
+
+    assert admission.intent is None
+    assert admission.blocker == "Connect a dataset-producing node to this Write."
+
+
 def test_direct_local_admission_uses_write_predecessor_regardless_of_node_order(contract):
     deps, graph = contract
     source, write = graph.nodes
@@ -952,6 +964,73 @@ def test_write_admission_api_returns_the_frozen_camel_case_contract(
     assert body["intent"]["mode"] == "create"
     assert body["intent"]["destination"]["logicalUri"] == body["destination"]
     assert body["intent"]["expectedSchema"] == body["expectedSchema"]
+
+
+def test_write_admission_validates_only_the_target_execution_cone(
+        contract, monkeypatch):
+    deps, graph = contract
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    payload = graph.model_dump(by_alias=True, mode="json")
+    payload["nodes"].append({
+        "id": "unrelated", "type": "filter", "data": {"config": {}},
+    })
+    payload["edges"].append({
+        "id": "bad-unrelated", "source": "missing", "target": "unrelated",
+    })
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61222222-2222-4222-8222-222222222222",
+    })
+
+    assert response.status_code == 200, response.text
+
+    payload["edges"].append({
+        "id": "source-write", "source": "source", "target": "write",
+    })
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61333333-3333-4333-8333-333333333333",
+    })
+
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == APIErrorCode.INVALID_GRAPH
+    assert "duplicate edge id 'source-write'" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("edges", [
+    pytest.param(
+        [{"id": "missing-write", "source": "missing", "target": "write"}],
+        id="dangling-source",
+    ),
+    pytest.param(
+        [{"id": "write-loop", "source": "write", "target": "write"}],
+        id="target-self-loop",
+    ),
+    pytest.param(
+        [{"id": "write-source", "source": "write", "target": "source"}],
+        id="target-cycle",
+    ),
+])
+def test_write_admission_target_malformed_edges_return_invalid_graph(
+        contract, monkeypatch, edges):
+    deps, graph = contract
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    payload = graph.model_dump(by_alias=True, mode="json")
+    payload["edges"].extend(edges)
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61444444-4444-4444-8444-444444444444",
+    })
+
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["code"] == APIErrorCode.INVALID_GRAPH
+    assert body["retryable"] is False
 
 
 def test_local_runner_consumes_frozen_intent_and_publishes_receipt(
