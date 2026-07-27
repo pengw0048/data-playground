@@ -66,7 +66,9 @@ describe('Source card — honest counts + empty/offline (UX-14)', () => {
   it('selects the Source when its dataset control receives the click', () => {
     render1({ title: 'source', status: 'draft', config: { tableId: 't1' } })
 
-    fireEvent.click(screen.getByRole('button', { name: /orders/i }))
+    const selector = screen.getByRole('button', { name: 'Change dataset' })
+    expect(selector).toHaveAttribute('title', expect.stringContaining('Click to change dataset'))
+    fireEvent.click(selector)
 
     expect(useStore.getState().selectedIds).toEqual(['s1'])
   })
