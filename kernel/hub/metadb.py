@@ -21049,6 +21049,21 @@ class ManagedLocalLanceRowIdentityCertificateConflict(RuntimeError):
     """A registration incarnation/native revision already owns different identity evidence."""
 
 
+def _managed_local_lance_row_identity_checked_uri(entry: CatalogEntry | None) -> str | None:
+    """Return the checked local Lance path accepted by this private foundation."""
+    if entry is None or entry.logical_id is not None:
+        return None
+    from hub.paths import checked_local_path
+
+    try:
+        checked = checked_local_path(entry.uri)
+    except (OSError, ValueError):
+        return None
+    if checked is None or not checked.lower().rstrip("/").endswith(".lance"):
+        return None
+    return checked
+
+
 def managed_local_lance_row_identity_binding(dataset_id: str) -> dict | None:
     """Resolve only the current registered local Lance access point for an exact identity proof.
 
@@ -21058,10 +21073,10 @@ def managed_local_lance_row_identity_binding(dataset_id: str) -> dict | None:
     with session() as s:
         entry = s.scalars(select(CatalogEntry).where(
             CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
-        if (entry is None or entry.logical_id is not None
-                or not entry.uri.lower().rstrip("/").endswith(".lance")):
+        checked_uri = _managed_local_lance_row_identity_checked_uri(entry)
+        if entry is None or checked_uri is None:
             return None
-        return {"dataset_id": entry.registration_id, "uri": entry.uri}
+        return {"dataset_id": entry.registration_id, "uri": checked_uri}
 
 
 def _lance_row_identity_digests_are_valid(*values: object) -> bool:
@@ -21085,16 +21100,15 @@ def _managed_local_lance_row_identity_certificate_store(
             physical_incarnation_sha256, schema_sha256, row_identity_spec_sha256)
             or not str(dataset_id) or not str(revision_id)):
         raise ValueError("managed Lance row identity fence is invalid")
+    entry = s.scalars(select(CatalogEntry).where(
+        CatalogEntry.registration_id == str(dataset_id)).with_for_update()).first()
+    if _managed_local_lance_row_identity_checked_uri(entry) is None:
+        raise ValueError("managed Lance row identity registration is unavailable")
     decoded, spec_digest, canonical, descriptor = _row_identity_certificate_payload(
         str(dataset_id), str(revision_id), certificate)
     if decoded.spec.schema_digest != schema_sha256 or spec_digest != row_identity_spec_sha256:
         raise ValueError("managed Lance row identity evidence does not match its fence")
     certificate_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
-    entry = s.scalars(select(CatalogEntry).where(
-        CatalogEntry.registration_id == str(dataset_id)).with_for_update()).first()
-    if (entry is None or entry.logical_id is not None
-            or not entry.uri.lower().rstrip("/").endswith(".lance")):
-        raise ValueError("managed Lance row identity registration is unavailable")
     fence_values = {
         "registration_id": str(dataset_id),
         "revision_id": str(revision_id),
@@ -21202,8 +21216,7 @@ def managed_local_lance_row_identity_certificate_for_fence(
             row = s.get(ManagedLocalLanceRowIdentityCertificate, {
                 "registration_id": str(dataset_id), "revision_id": str(revision_id),
             })
-            if (entry is None or entry.logical_id is not None
-                    or not entry.uri.lower().rstrip("/").endswith(".lance")
+            if (_managed_local_lance_row_identity_checked_uri(entry) is None
                     or fence is None or row is None
                     or fence.physical_incarnation_sha256 != physical_incarnation_sha256
                     or fence.schema_sha256 != schema_sha256

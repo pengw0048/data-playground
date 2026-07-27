@@ -70,6 +70,35 @@ def _exact_local_tracked_file(lance, uri: str, revision_id: str, member_type: st
     return Path(str(matches[0]["base_uri"])) / str(matches[0]["path"])
 
 
+def test_lance_certificate_foundation_rejects_a_non_local_registration():
+    registration_id = uuid.uuid4().hex
+    with metadb.session() as s:
+        s.add(metadb.CatalogEntry(
+            uri="s3://example-bucket/remote-table.lance",
+            registration_id=registration_id,
+            name="remote-lance",
+            doc="{}",
+        ))
+    exact = ExactDatasetRef(kind="exact", dataset_id=registration_id, revision_id="1")
+
+    assert metadb.managed_local_lance_row_identity_binding(registration_id) is None
+    with pytest.raises(RowIdentityUnavailable):
+        certify_and_persist_managed_local_lance_row_identity(exact, ["id"])
+    with pytest.raises(ValueError, match="registration is unavailable"):
+        metadb.managed_local_lance_row_identity_certificate_store(
+            registration_id, "1", {},
+            physical_incarnation_sha256="a" * 64,
+            schema_sha256="b" * 64,
+            row_identity_spec_sha256="c" * 64,
+        )
+    assert metadb.managed_local_lance_row_identity_certificate_for_fence(
+        registration_id, "1",
+        physical_incarnation_sha256="a" * 64,
+        schema_sha256="b" * 64,
+        row_identity_spec_sha256="c" * 64,
+    ) is None
+
+
 def test_lance_certificate_replays_exactly_and_persists_no_raw_source_data(tmp_path):
     _lance, _catalog, _registered, binding, exact = _registered_lance(tmp_path, pa.table({
         "id": pa.array([1, 2], type=pa.int64()),
