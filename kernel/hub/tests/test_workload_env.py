@@ -39,6 +39,10 @@ def _source() -> dict[str, str]:
         "DP_STORAGE_URL": "s3://data/output",
         "AWS_ACCESS_KEY_ID": "data-key",
         "AWS_SECRET_ACCESS_KEY": "data-secret",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/data-task",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9911/credentials",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN": "container-token",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/run/secrets/container-token",
         "DP_GCS_ENDPOINT": "http://gcs-emulator:4443",
         **_CONTROL_SECRETS,
     }
@@ -70,6 +74,10 @@ def test_one_shot_workload_environment_is_allowlisted_without_metadata_identity(
     assert env["DP_RAY_LABELS"] == "pool=a100"
     assert env["DP_RAY_GPU_BATCH_ROWS"] == "8192"
     assert env["AWS_SECRET_ACCESS_KEY"] == "data-secret"
+    assert env["AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"] == "/v2/credentials/data-task"
+    assert env["AWS_CONTAINER_CREDENTIALS_FULL_URI"] == "http://127.0.0.1:9911/credentials"
+    assert env["AWS_CONTAINER_AUTHORIZATION_TOKEN"] == "container-token"
+    assert env["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] == "/run/secrets/container-token"
     assert env["DP_GCS_ENDPOINT"] == "http://gcs-emulator:4443"
     assert "DP_DATABASE_URL" not in env
     assert env["DP_AUTH_MODE"] == "1"  # derived confinement signal, never signing material
@@ -92,6 +100,24 @@ def test_long_lived_kernel_profile_only_adds_the_current_metadata_bridge():
     _assert_control_secrets_absent(env)
     assert env["DP_DATABASE_URL"].startswith("postgresql+")
     assert env["DP_AUTH_MODE"] == "1"
+
+
+def test_long_lived_kernel_inherits_complete_aws_container_credential_selector(monkeypatch):
+    from hub.kernel_backend import _kernel_child_env
+
+    _mock_no_plugin_workload(monkeypatch)
+    expected = {
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/data-task",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9911/credentials",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN": "container-token",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/run/secrets/container-token",
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+
+    child = _kernel_child_env()
+
+    assert {key: child.get(key) for key in expected} == expected
 
 
 def test_declared_plugin_environment_reaches_only_workload_child_profiles(monkeypatch):
@@ -135,10 +161,16 @@ def test_plugin_workload_declarations_reject_every_core_owned_target():
         "DP_POSTGRES_PASSWORD",
         "AWS_SECURITY_TOKEN",
         "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
     }
     assert required_control_names <= CORE_CONTROL_PLANE_ENV
-    reserved = CORE_CONTROL_PLANE_ENV | {
+    container_credential_names = {
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    }
+    assert not (container_credential_names & CORE_CONTROL_PLANE_ENV)
+    reserved = CORE_CONTROL_PLANE_ENV | container_credential_names | {
         "DP_AUTH_MODE",
         "DP_DATABASE_URL",
         "DP_WORKSPACE",
@@ -252,6 +284,10 @@ def test_durable_workload_environment_separates_semantics_from_rotatable_credent
     assert "AWS_SECRET_ACCESS_KEY" not in semantic
     assert credentials == {
         "AWS_ACCESS_KEY_ID": "data-key", "AWS_SECRET_ACCESS_KEY": "data-secret",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/v2/credentials/data-task",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "http://127.0.0.1:9911/credentials",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN": "container-token",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/run/secrets/container-token",
     }
 
 
