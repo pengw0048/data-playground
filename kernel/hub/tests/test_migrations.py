@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0050_receipt_names", "0049_lance_row_identity_cert"),
         ("0049_lance_row_identity_cert", "0048_row_identity_task"),
         ("0048_row_identity_task", "0047_row_identity_cert"),
         ("0047_row_identity_cert", "0046_relationship_incident"),
@@ -105,8 +106,8 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0049_lance_row_identity_cert"]
-    assert metadb.expected_schema_head() == "0049_lance_row_identity_cert"
+    assert scripts.get_heads() == ["0050_receipt_names"]
+    assert metadb.expected_schema_head() == "0050_receipt_names"
 
 
 def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
@@ -134,6 +135,302 @@ def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
             connection.commit()
             with pytest.raises(RuntimeError, match="cannot downgrade"):
                 command.downgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
+
+
+def _legacy_receipt(*, provider: str, dataset_id: str, revision_id: str,
+                    idempotency_key: str, logical_uri: str, artifact_uri: str,
+                    publish_sequence: int = 1) -> dict:
+    return {
+        "datasetId": dataset_id,
+        "revisionId": revision_id,
+        "head": {"datasetId": dataset_id, "revisionId": revision_id},
+        "rows": 1,
+        "bytes": 1,
+        "schema": [],
+        "partitions": [],
+        "publication": {
+            "provider": provider,
+            "logicalUri": logical_uri,
+            "artifactUri": artifact_uri,
+            "publishSequence": publish_sequence,
+            "idempotencyKey": idempotency_key,
+            "catalogVersion": None,
+            "backendVersion": None,
+        },
+        "provenance": {"parents": [], "publication": {"idempotencyKey": idempotency_key}},
+        "durable": True,
+    }
+
+
+def _legacy_output(receipt: dict) -> dict:
+    snake_receipt = {
+        "dataset_id": receipt["datasetId"],
+        "revision_id": receipt["revisionId"],
+        "head": {"dataset_id": receipt["datasetId"], "revision_id": receipt["revisionId"]},
+        "rows": receipt["rows"],
+        "bytes": receipt["bytes"],
+        "schema": [],
+        "partitions": [],
+        "publication": {
+            "provider": receipt["publication"]["provider"],
+            "logical_uri": receipt["publication"]["logicalUri"],
+            "artifact_uri": receipt["publication"]["artifactUri"],
+            "publish_sequence": receipt["publication"]["publishSequence"],
+            "idempotency_key": receipt["publication"]["idempotencyKey"],
+            "catalog_version": receipt["publication"]["catalogVersion"],
+            "backend_version": receipt["publication"]["backendVersion"],
+        },
+        "provenance": {"parents": [], "publication": {
+            "idempotency_key": receipt["publication"]["idempotencyKey"],
+        }},
+        "durable": True,
+    }
+    if "name" in receipt:
+        snake_receipt["name"] = receipt["name"]
+    return {
+        "node_id": "write", "port_id": "output", "wire": "table",
+        "publication_kind": "catalog", "outcome": "committed",
+        "uri": receipt["publication"]["artifactUri"], "table": "upgrade-output",
+        "rows": receipt["rows"], "write_receipt": snake_receipt,
+    }
+
+
+def test_receipt_name_migration_backfills_only_exact_ledger_evidence(tmp_path):
+    db_path = tmp_path / "receipt-names.db"
+    file_receipt = _legacy_receipt(
+        provider="managed-local-file", dataset_id="file-dataset", revision_id="file-revision",
+        idempotency_key="file-key", logical_uri="file:///logical/upgrade-output.parquet",
+        artifact_uri="file:///artifacts/file-revision.parquet",
+    )
+    lance_receipt = _legacy_receipt(
+        provider="managed-local-lance", dataset_id="lance-dataset", revision_id="7",
+        idempotency_key="lance-key", logical_uri="file:///logical/append.lance",
+        artifact_uri="file:///logical/append.lance", publish_sequence=7,
+    )
+    named_receipt = {
+        **_legacy_receipt(
+            provider="managed-local-file", dataset_id="named-dataset", revision_id="named-revision",
+            idempotency_key="named-key", logical_uri="file:///logical/named.parquet",
+            artifact_uri="file:///artifacts/named.parquet",
+        ),
+        "name": "named-output",
+    }
+    named_json = json.dumps(named_receipt, separators=(",", ":"))
+    named_status_json = json.dumps({
+        "run_id": "named-state", "outputs": [_legacy_output(named_receipt)],
+    }, separators=(",", ":"))
+    file_intent = {
+        "idempotencyKey": "file-key",
+        "destination": {
+            "provider": "managed-local-file", "name": "upgrade-output",
+            "logicalUri": "file:///logical/upgrade-output.parquet",
+        },
+    }
+    named_intent = {
+        "idempotencyKey": "named-key",
+        "destination": {
+            "provider": "managed-local-file", "name": "named-output",
+            "logicalUri": "file:///logical/named.parquet",
+        },
+    }
+    lance_intent = {
+        "idempotencyKey": "lance-key",
+        "destination": {
+            "provider": "managed-local-lance", "name": "append-output",
+            "datasetId": "lance-dataset", "logicalUri": "file:///logical/append.lance",
+        },
+    }
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            connection.execute(sa.text("""
+                INSERT INTO managed_local_file_revisions (
+                    revision_id, logical_id, artifact_uri, publish_seq, table_doc,
+                    write_idempotency_key, write_intent_doc, write_receipt_doc, committed_at
+                ) VALUES (
+                    'file-revision', 'file-dataset', 'file:///artifacts/file-revision.parquet', 1,
+                    :table_doc, 'file-key', :intent, :receipt, CURRENT_TIMESTAMP
+                ), (
+                    'named-revision', 'named-dataset', 'file:///artifacts/named.parquet', 1,
+                    :named_table_doc, 'named-key', :named_intent, :named_receipt, CURRENT_TIMESTAMP
+                )
+            """), {
+                "table_doc": json.dumps({"name": "upgrade-output"}),
+                "intent": json.dumps(file_intent), "receipt": json.dumps(file_receipt),
+                "named_table_doc": json.dumps({"name": "named-output"}),
+                "named_intent": json.dumps(named_intent),
+                "named_receipt": named_json,
+            })
+            connection.execute(sa.text("""
+                INSERT INTO managed_local_lance_write_receipts (
+                    idempotency_key, dataset_id, logical_uri, revision_id,
+                    write_intent_doc, write_receipt_doc, committed_at
+                ) VALUES (
+                    'lance-key', 'lance-dataset', 'file:///logical/append.lance', '7',
+                    :intent, :receipt, CURRENT_TIMESTAMP
+                )
+            """), {"intent": json.dumps(lance_intent), "receipt": json.dumps(lance_receipt)})
+            connection.execute(sa.text("""
+                INSERT INTO run_records (
+                    id, canvas_id, run_id, job_type, status, outputs, created_at
+                ) VALUES ('record', 'canvas', 'file-run', 'run', 'done', :outputs, CURRENT_TIMESTAMP)
+            """), {"outputs": json.dumps([_legacy_output(file_receipt)])})
+            connection.execute(sa.text("""
+                INSERT INTO run_states (run_id, status, doc, updated_at)
+                VALUES ('state', 'done', :doc, CURRENT_TIMESTAMP)
+            """), {"doc": json.dumps({"run_id": "state", "outputs": [_legacy_output(lance_receipt)]})})
+            connection.execute(sa.text("""
+                INSERT INTO run_states (run_id, status, doc, updated_at)
+                VALUES ('named-state', 'done', :doc, CURRENT_TIMESTAMP)
+            """), {"doc": named_status_json})
+            connection.execute(sa.text("""
+                INSERT INTO durable_tasks (
+                    id, owner_id, canvas_id, submission_id, intent_sha256, target_node_id,
+                    task_kind, backend_kind, status, status_doc, retry_count, max_attempts,
+                    output_receipt, cancel_requested, created_at, updated_at
+                ) VALUES (
+                    'task', 'owner', 'canvas', 'submission', :digest, 'write',
+                    'managed_local_write', 'local', 'done', :status_doc, 0, 1,
+                    :receipt, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+            """), {
+                "digest": "a" * 64,
+                "status_doc": json.dumps({"run_id": "task-run", "outputs": [_legacy_output(file_receipt)]}),
+                "receipt": json.dumps(lance_receipt),
+            })
+            connection.execute(sa.text("""
+                INSERT INTO durable_task_attempts (
+                    id, task_id, attempt_number, status, output_receipt, created_at
+                ) VALUES ('attempt', 'task', 1, 'done', :receipt, CURRENT_TIMESTAMP)
+            """), {"receipt": json.dumps(file_receipt)})
+            connection.execute(sa.text("""
+                INSERT INTO run_backend_jobs (
+                    run_id, backend, attempt_id, submission_id, job_uri, result_uri,
+                    publication_state, result_doc, updated_at
+                ) VALUES (
+                    'backend-run', 'ray', 'attempt', 'submission', 'job://1', 'result://1',
+                    'done', :result_doc, CURRENT_TIMESTAMP
+                )
+            """), {"result_doc": json.dumps({
+                "run_id": "backend-run", "outputs": [_legacy_output(lance_receipt)],
+            })})
+            connection.commit()
+
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert json.loads(connection.execute(sa.text(
+                "SELECT write_receipt_doc FROM managed_local_file_revisions "
+                "WHERE revision_id = 'file-revision'"
+            )).scalar_one())["name"] == "upgrade-output"
+            assert connection.execute(sa.text(
+                "SELECT write_receipt_doc FROM managed_local_file_revisions "
+                "WHERE revision_id = 'named-revision'"
+            )).scalar_one() == named_json
+            assert connection.execute(sa.text(
+                "SELECT doc FROM run_states WHERE run_id = 'named-state'"
+            )).scalar_one() == named_status_json
+            assert json.loads(connection.execute(sa.text(
+                "SELECT write_receipt_doc FROM managed_local_lance_write_receipts"
+            )).scalar_one())["name"] == "append-output"
+            for table, key, column in (
+                    ("run_records", "id = 'record'", "outputs"),
+                    ("run_states", "run_id = 'state'", "doc"),
+                    ("durable_tasks", "id = 'task'", "status_doc"),
+                    ("run_backend_jobs", "run_id = 'backend-run'", "result_doc")):
+                document = json.loads(connection.execute(sa.text(
+                    f"SELECT {column} FROM {table} WHERE {key}"
+                )).scalar_one())
+                outputs = document if table == "run_records" else document["outputs"]
+                assert outputs[0]["write_receipt"]["name"] in {
+                    "upgrade-output", "append-output"}
+            assert json.loads(connection.execute(sa.text(
+                "SELECT output_receipt FROM durable_tasks WHERE id = 'task'"
+            )).scalar_one())["name"] == "append-output"
+            assert json.loads(connection.execute(sa.text(
+                "SELECT output_receipt FROM durable_task_attempts WHERE id = 'attempt'"
+            )).scalar_one())["name"] == "upgrade-output"
+
+
+def test_receipt_name_migration_refuses_ambiguous_or_mismatched_legacy_evidence(tmp_path):
+    db_path = tmp_path / "receipt-name-conflict.db"
+    receipt = _legacy_receipt(
+        provider="managed-local-lance", dataset_id="dataset", revision_id="1",
+        idempotency_key="key", logical_uri="file:///logical/output.lance",
+        artifact_uri="file:///logical/output.lance",
+    )
+    intent = {
+        "idempotencyKey": "key",
+        "destination": {
+            "provider": "managed-local-lance", "name": "wrong-name",
+            "datasetId": "other-dataset", "logicalUri": "file:///logical/output.lance",
+        },
+    }
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            connection.execute(sa.text("""
+                INSERT INTO managed_local_lance_write_receipts (
+                    idempotency_key, dataset_id, logical_uri, revision_id,
+                    write_intent_doc, write_receipt_doc, committed_at
+                ) VALUES ('key', 'dataset', 'file:///logical/output.lance', '1',
+                          :intent, :receipt, CURRENT_TIMESTAMP)
+            """), {"intent": json.dumps(intent), "receipt": json.dumps(receipt)})
+            connection.commit()
+            with pytest.raises(RuntimeError, match="exact managed-local-lance ledger"):
+                command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert "name" not in json.loads(connection.execute(sa.text(
+                "SELECT write_receipt_doc FROM managed_local_lance_write_receipts"
+            )).scalar_one())
+
+
+@pytest.mark.parametrize("mismatch", ["ledger_sequence", "embedded_backend_version"])
+def test_receipt_name_migration_refuses_publication_identity_mismatch(tmp_path, mismatch):
+    db_path = tmp_path / f"receipt-name-{mismatch}.db"
+    receipt = _legacy_receipt(
+        provider="managed-local-file", dataset_id="dataset", revision_id="revision",
+        idempotency_key="key", logical_uri="file:///logical/output.parquet",
+        artifact_uri="file:///artifacts/revision.parquet",
+        publish_sequence=999 if mismatch == "ledger_sequence" else 1,
+    )
+    intent = {
+        "idempotencyKey": "key",
+        "destination": {
+            "provider": "managed-local-file", "name": "output",
+            "logicalUri": "file:///logical/output.parquet",
+        },
+    }
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0049_lance_row_identity_cert")
+            connection.execute(sa.text("""
+                INSERT INTO managed_local_file_revisions (
+                    revision_id, logical_id, artifact_uri, publish_seq, table_doc,
+                    write_idempotency_key, write_intent_doc, write_receipt_doc, committed_at
+                ) VALUES (
+                    'revision', 'dataset', 'file:///artifacts/revision.parquet', 1,
+                    :table_doc, 'key', :intent, :receipt, CURRENT_TIMESTAMP
+                )
+            """), {
+                "table_doc": json.dumps({"name": "output"}),
+                "intent": json.dumps(intent), "receipt": json.dumps(receipt),
+            })
+            if mismatch == "embedded_backend_version":
+                output = _legacy_output(receipt)
+                output["write_receipt"]["publication"]["backend_version"] = "changed"
+                connection.execute(sa.text("""
+                    INSERT INTO run_records (
+                        id, canvas_id, run_id, job_type, status, outputs, created_at
+                    ) VALUES (
+                        'record', 'canvas', 'run', 'run', 'done', :outputs, CURRENT_TIMESTAMP
+                    )
+                """), {"outputs": json.dumps([output])})
+            connection.commit()
+            with pytest.raises(RuntimeError, match=(
+                    "exact managed-local-file ledger"
+                    if mismatch == "ledger_sequence" else "does not resolve")):
+                command.upgrade(metadb._alembic_cfg(connection), "head")
+            assert "name" not in json.loads(connection.execute(sa.text(
+                "SELECT write_receipt_doc FROM managed_local_file_revisions"
+            )).scalar_one())
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -453,6 +750,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0050_backfill_receipt_names.py": (
+            "47ad43fa39ebfad6f2ee265dd2e4aa6bff45e3b01e3bc9e8ad986378ab3c13dd"
+        ),
         "0049_lance_row_identity_certificates.py": (
             "c96c91cee5f570d9d7dda09d633a9432d635470a80a32b4cba3f7fed3b17773e"
         ),
