@@ -1099,9 +1099,28 @@ def test_lance_exact_native_rows_are_native_range_bounded_and_revision_pinned(
     from hub.plugins.adapters import LanceAdapter
 
     path = str(tmp_path / "multi-fragment.lance")
-    lance.write_dataset(pa.table({"value": ["v1-a", "v1-b"]}), path)
-    lance.write_dataset(pa.table({"value": ["v2-a", "v2-b"]}), path, mode="append")
+    schema = pa.schema([
+        pa.field("value", pa.string()),
+        pa.field("nested", pa.struct([
+            pa.field("tags", pa.list_(pa.string())),
+            pa.field("score", pa.int64()),
+        ])),
+    ])
+    lance.write_dataset(
+        pa.Table.from_pylist([
+            {"value": "v1-a", "nested": {"tags": ["first"], "score": 1}},
+            {"value": "v1-b", "nested": {"tags": ["second"], "score": 2}},
+        ], schema=schema),
+        path,
+        enable_stable_row_ids=True,
+    )
+    lance.write_dataset(pa.Table.from_pylist([
+        {"value": "v2-a", "nested": {"tags": ["third"], "score": 3}},
+        {"value": "v2-b", "nested": {"tags": ["fourth"], "score": 4}},
+    ], schema=schema), path, mode="append")
     exact = lance.dataset(path, version=2)
+    assert exact.has_stable_row_ids is True
+    assert len(exact.get_fragments()) >= 2
     exact_rows = exact.scanner(with_row_id=True).to_table().to_pylist()
     first_id = exact_rows[0]["_rowid"]
     last_id = exact_rows[-1]["_rowid"]
@@ -1115,7 +1134,11 @@ def test_lance_exact_native_rows_are_native_range_bounded_and_revision_pinned(
     statistics = []
     real_scanner = LanceDataset.scanner
 
+    reject_scanner = False
+
     def tracked_scanner(self, *args, **kwargs):
+        if reject_scanner:
+            pytest.fail("an empty native-row probe must not create a Lance scanner")
         scan_calls.append(dict(kwargs))
         if kwargs.get("filter") is not None:
             kwargs["scan_stats_callback"] = statistics.append
@@ -1135,18 +1158,19 @@ def test_lance_exact_native_rows_are_native_range_bounded_and_revision_pinned(
         relation = adapter.open_revision_native_rows(
             path, "2", native_row_ids=candidates)
         rows = relation.order("_rowid").to_arrow_table().to_pylist()
+        reject_scanner = True
         empty = adapter.open_revision_native_rows(
             path, "2", native_row_ids=()).to_arrow_table()
 
     assert rows == [
-        {"value": "v1-a", "_rowid": first_id},
-        {"value": "v2-b", "_rowid": last_id},
+        {"value": "v1-a", "nested": {"tags": ["first"], "score": 1}, "_rowid": first_id},
+        {"value": "v2-b", "nested": {"tags": ["fourth"], "score": 4}, "_rowid": last_id},
     ]
-    assert empty.num_rows == 0 and empty.schema.field("_rowid").type == pa.uint64()
-    assert all(
-        call.get("filter") is not None or call.get("limit") == 0
-        for call in scan_calls
-    )
+    assert empty.num_rows == 0
+    assert empty.schema.names == ["value", "nested", "_rowid"]
+    assert empty.schema.field("nested").type == schema.field("nested").type
+    assert empty.schema.field("_rowid").type == pa.uint64()
+    assert all(call.get("filter") is not None for call in scan_calls)
     assert statistics
     assert sum(item.all_counts.get("rows_scanned", 0) for item in statistics) <= len(candidates)
     assert sum(item.all_counts.get("ranges_scanned", 0) for item in statistics) <= len(candidates)
