@@ -28,9 +28,10 @@ vi.mock('./CatalogDiscovery', () => ({
   CATALOG_BATCH_LIMIT: 50,
   emptyCatalogDiscoveryQuery: () => ({ q: '', folder: '', tags: [], owner: '', hasColumns: [], sort: 'name', order: 'asc', match: 'text' }),
   AddDataModal: ({ onClose }: { onClose: () => void }) => <div role="dialog" aria-label="Add data"><span>Upload a local file</span><span>Register an accessible path or URI</span><button onClick={onClose}>Close</button></div>,
-  CatalogDiscovery: ({ onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
+  CatalogDiscovery: ({ title, onUseTables, onQueryStateChange, onSelectedTableChange, selectedRegistrationId,
     initialRevisionId, initialRevisionDatasetId,
     onOpenInWorkspace, workspaceLocation, onRetryWorkspaceLocation }: {
+    title: string
     onUseTables: (tables: { id: string; registrationId: string; name: string; uri: string; columns: never[] }[]) => void
     onQueryStateChange: (query: object) => void
     onSelectedTableChange: (table: { id: string; registrationId: string; name: string; uri: string; folder?: string; columns: never[] } | null, origin?: 'user' | 'route') => void
@@ -41,6 +42,7 @@ vi.mock('./CatalogDiscovery', () => ({
     workspaceLocation?: { state: 'resolving' | 'available' | 'unavailable'; reason?: string; retryable?: boolean }
     onRetryWorkspaceLocation?: () => void
   }) => <div data-testid="catalog-discovery">
+    <span>Catalog title: {title}</span>
     <span>Selected registration: {selectedRegistrationId ?? 'none'}</span>
     <span>Exact deep link: {initialRevisionDatasetId ?? 'none'}@{initialRevisionId ?? 'none'}</span>
     <button onClick={() => onUseTables([
@@ -725,12 +727,15 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.workspaceAddDatasets).not.toHaveBeenCalled()
   })
 
-  it('renders the shared bounded Catalog inside the Datasets scope and preserves independent URL state', async () => {
+  it('labels the bounded local Catalog scope and preserves independent URL state', async () => {
     store.workspaceScope = 'datasets'
     store.workspaceResourceId = 'dataset:dataset-1'
     render(<WorkspaceExplorer />)
 
     expect(await screen.findByTestId('catalog-discovery')).toHaveTextContent('Selected registration: dataset-1')
+    expect(screen.getByRole('tab', { name: 'Local catalog' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('catalog-discovery')).toHaveTextContent('Catalog title: Local catalog')
+    expect(screen.getByText('Datasets registered in Data Playground. Mounted provider datasets appear in All Workspace.')).toBeVisible()
     expect(screen.queryByLabelText('Workspace search')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Change dataset query' }))
     expect(store.setWorkspaceDatasetQuery).toHaveBeenCalledWith(
@@ -788,7 +793,7 @@ describe('WorkspaceExplorer', () => {
     })
     render(<WorkspaceExplorer />)
 
-    fireEvent.click(await screen.findByRole('tab', { name: 'Datasets' }))
+    fireEvent.click(await screen.findByRole('tab', { name: 'Local catalog' }))
     expect(store.switchWorkspaceScope).toHaveBeenCalledWith('datasets', {
       resourceId: CATALOG_FOLDER.id, datasetQuery: 'folder=robotics',
     })

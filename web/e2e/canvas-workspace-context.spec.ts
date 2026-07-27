@@ -55,7 +55,7 @@ test.describe('Canvas Workspace placement context @ux-smoke', () => {
     // A Datasets filter cannot prove the Canvas is visible in this folder. Returning must reset
     // it atomically to All Workspace at the exact opaque parent location.
     await page.goto('/#/workspace?scope=datasets&dq=not-a-canvas-location')
-    await expect(page.getByRole('tab', { name: 'Datasets' })).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByRole('tab', { name: 'Local catalog' })).toHaveAttribute('aria-selected', 'true')
     await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
     await expect(location).toContainText(child)
     await page.getByTestId('app-menu').click()

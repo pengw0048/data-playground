@@ -16,7 +16,7 @@ test("certifies a browser-uploaded Parquet source after a normal managed Write @
   let uploaded: UploadedDataset | null = null;
   try {
     await page.goto("/#/workspace");
-    await page.getByRole("tab", { name: "Datasets" }).click();
+    await page.getByRole("tab", { name: "Local catalog" }).click();
     const uploadedResponse = page.waitForResponse(
       (response) =>
         response.url().endsWith("/api/catalog/upload") &&
