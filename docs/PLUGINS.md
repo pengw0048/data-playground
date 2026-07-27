@@ -96,10 +96,14 @@ on a preview sample or at full scale.
 - `ctx.immediate_inputs(engine, node)` — a read-only snapshot of the node's declared input ports.
   Each port gives its direct input count and, for each wired input, only the producing node `kind` and
   a `dataset` binding (`dataset_id`, optional `revision_id`) when core has already proved one. A
-  provider Source uses the same canonical `workspace-provider:*` identity used by Source admission;
-  a URI, display name, mutable revision, or another node's configuration is never exposed or used as
-  an identity. A controller-generated cross-region input retains its count but has `kind=None` and no
-  dataset binding; it is not relabeled as a directly wired Source.
+  provider Source uses the same canonical `workspace-provider:*` identity used by Source admission.
+  When that same current admission record is unambiguous, `input.provider` is an immutable projection
+  containing only `provider`, `mount_id`, `provider_dataset_id`, `read_mode` (`exact` or `current`),
+  and an exact `revision_id` where applicable. It is absent for non-provider, stale, detached,
+  ambiguous, disagreeing, and controller-generated inputs. A URI, display name, physical location,
+  mount configuration, credentials, mutable revision, or another node's configuration is never exposed
+  or used as an identity. A controller-generated cross-region input retains its count but has `kind=None`
+  and no dataset or provider binding; it is not relabeled as a directly wired Source.
   Use this for a narrowly documented shape check and raise `UnsupportedUpstreamError` before work when
   it is not met. It is deliberately not graph traversal: it exposes no graph, edges, node data, or
   transitive ancestry, so plugins do not need to import `hub.graph`.
@@ -110,6 +114,21 @@ on a preview sample or at full scale.
   `dp_warm_resource`.
 
 Prefer `ctx.sql` when it suffices — it stays in the engine and spills to disk.
+
+For a provider companion node, inspect this one bounded projection before any provider I/O:
+
+```python
+input = immediate_inputs.port("in")
+if input.count != 1 or input.inputs[0].kind != "source":
+    raise UnsupportedUpstreamError("this node requires one direct provider Source")
+provider = input.inputs[0].provider
+if provider is None or provider.provider != "example-provider":
+    raise UnsupportedUpstreamError("this node requires an admitted example-provider Source")
+dataset_id = provider.provider_dataset_id
+```
+
+This is not a provider client or graph query. The plugin remains responsible for its own provider I/O
+and must reject a missing projection instead of reconstructing facts from a Source URI or config.
 
 ### Prepare one exact-Source native-row read
 
