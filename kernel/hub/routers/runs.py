@@ -724,8 +724,7 @@ def _missing_bounded_schema_blocker(graph: Graph, node_id: str) -> str:
         subject = "one or more direct upstream transforms do not have"
         action = "Select each direct upstream transform, then in the Inspector choose"
     else:
-        subject = "the upstream transform connected to this Write does not have"
-        action = "Select that upstream transform, then in the Inspector choose"
+        return "Connect a dataset-producing node to this Write."
     return (
         f"{subject} a bounded output schema contract. {action} Output schema "
         "(contract) → Infer from sample."

@@ -425,7 +425,7 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId, parameterBindings) ? retained : undefined
 }
 
-function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
+export function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
   const { version: _version, ...executionDoc } = doc
   return JSON.stringify({
     ...executionDoc,
@@ -1298,6 +1298,26 @@ function downstream(doc: CanvasDoc, id: string): Set<string> {
   return out
 }
 
+function invalidateWriteAdmissions(
+  doc: CanvasDoc,
+  runs: Store['runs'],
+  affectedNodeIds: Iterable<string>,
+): Store['runs'] {
+  const next = { ...runs }
+  for (const nodeId of affectedNodeIds) {
+    if (doc.nodes.find((node) => node.id === nodeId)?.type !== 'write') continue
+    const current = next[nodeId]
+    if (!current) continue
+    next[nodeId] = {
+      ...current,
+      writeAdmission: undefined,
+      writeSubmissionId: undefined,
+      writeAdmissionFingerprint: undefined,
+    }
+  }
+  return next
+}
+
 async function superviseTrackedProfileCancellation(
   get: () => Store,
   set: (partial: Partial<Store> | ((state: Store) => Partial<Store>)) => void,
@@ -1685,17 +1705,9 @@ export const useStore = create<Store>((set, get) => ({
             : []
         })
       }
-      const runs = { ...s.runs }
-      for (const node of nodes) {
-        if (node.type !== 'write' || (!stale.has(node.id) && node.id !== id)) continue
-        const current = runs[node.id]
-        if (current) runs[node.id] = {
-          ...current,
-          writeAdmission: undefined,
-          writeSubmissionId: undefined,
-          writeAdmissionFingerprint: undefined,
-        }
-      }
+      const runs = invalidateWriteAdmissions(
+        s.doc, s.runs, [id, ...stale],
+      )
       return { doc: { ...s.doc, nodes, edges }, runs }
     })
   },
@@ -1757,7 +1769,10 @@ export const useStore = create<Store>((set, get) => ({
           ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
           : n,
       )
-      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes } }
+      const runs = invalidateWriteAdmissions(
+        s.doc, s.runs, [edge.target, ...stale],
+      )
+      return { doc: { ...s.doc, edges: [...s.doc.edges, edge], nodes }, runs }
     })
   },
 
@@ -1766,7 +1781,13 @@ export const useStore = create<Store>((set, get) => ({
     if (!get().doc.edges.some((candidate) => candidate.id === id)) return
     get().commit()
     set((s) => {
+      const previous = s.doc.edges.find((candidate) => candidate.id === id)
       const stale = downstream(s.doc, edge.target)
+      const affected = new Set<string>([edge.target, ...stale])
+      if (previous) {
+        affected.add(previous.target)
+        for (const nodeId of downstream(s.doc, previous.target)) affected.add(nodeId)
+      }
       const nodes = s.doc.nodes.map((n) =>
         (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
           ? { ...n, data: { ...n.data, status: 'stale' as NodeStatus } }
@@ -1778,6 +1799,7 @@ export const useStore = create<Store>((set, get) => ({
           edges: s.doc.edges.map((candidate) => candidate.id === id ? { ...edge, id } : candidate),
           nodes,
         },
+        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
       }
     })
   },
@@ -1785,7 +1807,16 @@ export const useStore = create<Store>((set, get) => ({
   removeEdge: (id) => {
     if (!roleCanEdit(get().canvasRole)) return
     get().commit()
-    set((s) => ({ doc: { ...s.doc, edges: s.doc.edges.filter((e) => e.id !== id) } }))
+    set((s) => {
+      const removed = s.doc.edges.find((edge) => edge.id === id)
+      const affected = removed
+        ? [removed.target, ...downstream(s.doc, removed.target)]
+        : []
+      return {
+        doc: { ...s.doc, edges: s.doc.edges.filter((edge) => edge.id !== id) },
+        runs: invalidateWriteAdmissions(s.doc, s.runs, affected),
+      }
+    })
   },
 
   // Move a node into a section (parentId set, position now relative to the section) or back out to

@@ -143,6 +143,59 @@ describe('Write card — typed local mode truth', () => {
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
   })
 
+  it('fences an old edge admission while refreshing for the current graph', async () => {
+    const write = useStore.getState().doc.nodes[0]
+    const source = {
+      id: 'source', type: 'source', position: { x: -200, y: 0 },
+      data: {
+        title: 'source', status: 'draft' as const, history: [],
+        config: { uri: '/data/source.parquet' },
+      },
+    }
+    useStore.setState({
+      doc: { ...useStore.getState().doc, nodes: [source, write], edges: [] },
+      runs: { write: { phase: 'idle' } },
+    } as any)
+    const stale = {
+      nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
+      mode: 'append', provider: 'managed-local-lance', expectedSchema: [], partitions: [],
+      blocker: 'Connect a dataset-producing node to this Write.',
+    }
+    const fresh = {
+      ...stale, expectedSchema: [{ name: 'value', type: 'int' }], blocker: undefined,
+    }
+    let resolveStale!: (value: typeof stale) => void
+    let resolveFresh!: (value: typeof fresh) => void
+    apiMocks.writeAdmission
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveStale = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFresh = resolve }))
+
+    const Write = getComponent('write')!
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      useStore.getState().connect({
+        id: 'source-write', source: 'source', target: 'write', data: { wire: 'dataset' },
+      })
+    })
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      resolveStale(stale)
+      await Promise.resolve()
+    })
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(screen.queryByText(/blocked/)).not.toBeInTheDocument()
+
+    await act(async () => {
+      resolveFresh(fresh)
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toEqual(fresh))
+    expect(screen.getByText(/append · 1 cols/)).toBeInTheDocument()
+  })
+
   it('shows the typed managed-name reason beside the filename field', async () => {
     useStore.setState({
       runs: { write: { phase: 'idle' } },

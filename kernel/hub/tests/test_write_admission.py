@@ -714,6 +714,18 @@ def test_missing_schema_blocker_names_the_direct_upstream_transform(contract, mo
         "Output schema (contract) → Infer from sample.")
 
 
+def test_missing_schema_blocker_guides_a_write_without_upstream(contract, monkeypatch):
+    deps, graph = contract
+    graph.edges = []
+    monkeypatch.setattr(run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+
+    admission = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "11111111-1111-4111-8111-111111111118")
+
+    assert admission.intent is None
+    assert admission.blocker == "Connect a dataset-producing node to this Write."
+
+
 def test_direct_local_admission_uses_write_predecessor_regardless_of_node_order(contract):
     deps, graph = contract
     source, write = graph.nodes

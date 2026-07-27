@@ -394,6 +394,107 @@ describe('graph store — core authority ops', () => {
     expect(useStore.getState().past).toHaveLength(1)
   })
 
+  it('re-admits a blocked Write after connecting its missing upstream', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    const blocked = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file',
+      expectedSchema: [], partitions: [],
+      blocker: 'Connect a dataset-producing node to this Write.',
+    }
+    const ready = {
+      ...blocked, expectedSchema: [{ name: 'value', type: 'int' }], blocker: undefined,
+    }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [source, write], edges: [],
+      },
+      runs: { write: {
+        phase: 'idle', writeAdmission: blocked,
+        writeSubmissionId: 'blocked-submission', writeAdmissionFingerprint: 'blocked-graph',
+      } },
+    } as any)
+    apiMocks.writeAdmission.mockResolvedValueOnce(ready)
+
+    useStore.getState().connect({
+      id: 'source-write', source: 'source', target: 'write', data: { wire: 'dataset' },
+    })
+
+    expect(useStore.getState().runs.write).toMatchObject({ phase: 'idle' })
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+    await expect(useStore.getState().prepareWrite('write')).resolves.toEqual(ready)
+    expect(apiMocks.writeAdmission.mock.calls[0][0].edges).toEqual([
+      expect.objectContaining({ source: 'source', target: 'write' }),
+    ])
+    expect(useStore.getState().runs.write.writeAdmission).toEqual(ready)
+  })
+
+  it('invalidates a ready Write admission when its upstream edge is removed', () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: { write: {
+        phase: 'idle',
+        writeAdmission: {
+          nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+          mode: 'create', provider: 'managed-local-file',
+          expectedSchema: [{ name: 'value', type: 'int' }], partitions: [],
+        },
+        writeSubmissionId: 'ready-submission', writeAdmissionFingerprint: 'ready-graph',
+      } },
+    } as any)
+
+    useStore.getState().removeEdge('source-write')
+
+    expect(useStore.getState().doc.edges).toEqual([])
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    expect(useStore.getState().runs.write.writeSubmissionId).toBeUndefined()
+    expect(useStore.getState().runs.write.writeAdmissionFingerprint).toBeUndefined()
+  })
+
+  it('re-admits a Write against the replacement upstream after reconnect', async () => {
+    const oldSource = NODE('old-source')
+    const newSource = NODE('new-source')
+    const write = NODE('write', 'write')
+    const fresh = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file',
+      expectedSchema: [{ name: 'replacement', type: 'string' }], partitions: [],
+    }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [oldSource, newSource, write],
+        edges: [{ id: 'input-write', source: 'old-source', target: 'write' }],
+      },
+      runs: { write: {
+        phase: 'idle',
+        writeAdmission: { ...fresh, expectedSchema: [{ name: 'old', type: 'int' }] },
+        writeSubmissionId: 'old-submission', writeAdmissionFingerprint: 'old-upstream',
+      } },
+    } as any)
+    apiMocks.writeAdmission.mockResolvedValueOnce(fresh)
+
+    useStore.getState().reconnectEdge('input-write', {
+      id: 'replacement-id', source: 'new-source', target: 'write',
+    })
+
+    expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
+    await expect(useStore.getState().prepareWrite('write')).resolves.toEqual(fresh)
+    expect(apiMocks.writeAdmission.mock.calls[0][0].edges).toEqual([
+      expect.objectContaining({ id: 'input-write', source: 'new-source', target: 'write' }),
+    ])
+    expect(apiMocks.writeAdmission.mock.calls[0][2]).not.toBe('old-submission')
+  })
+
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
     const plugin = NODE('plugin', 'configured-plugin')
     const sink = NODE('sink', 'write')
