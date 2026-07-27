@@ -407,12 +407,23 @@ function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: str
 
 function confirmationCopy(estimate: { rows?: number | null; bytes?: number | null; breakdown?: string | null }): string {
   const rows = estimate.rows == null ? 'This full run has an unknown row count.' : `This full run will process ${estimate.rows.toLocaleString()} rows.`
-  if (estimate.bytes != null) return `${rows} Its estimated data size requires confirmation.`
+  if (estimate.bytes != null) {
+    return `${rows} It is estimated to read ${formatByteEstimate(estimate.bytes)}. Confirm before starting the full pass.`
+  }
   const binaryColumn = estimate.breakdown?.match(/Binary column "([^"]+)"/)?.[1]
   const reason = binaryColumn
     ? `Byte size is unknown because "${binaryColumn}" contains variable-length binary data.`
     : 'Byte size is unknown because this source has no reliable size estimate.'
   return `${rows} ${reason} The actual read may be much larger than the row count suggests.`
+}
+
+function formatByteEstimate(value: number): string {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']
+  const unit = value > 0
+    ? Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1)
+    : 0
+  const amount = (value / 1024 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })
+  return `${amount} ${units[unit]}`
 }
 
 function RunOutputs({ outputs }: { outputs: RunOutput[] }) {

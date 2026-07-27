@@ -208,6 +208,29 @@ describe('RunPanel typed parameter gate', () => {
     expect(screen.queryByText(/did not scan values to guess/)).not.toBeInTheDocument()
   })
 
+  it.each([
+    { rows: 200_000, bytes: 3 * 1024 ** 3, label: 'byte threshold' },
+    { rows: 6_000_000, bytes: 20 * 1024 ** 2, label: 'row threshold' },
+  ])('keeps both known row and byte evidence for a $label confirmation', ({ rows, bytes }) => {
+    mocks.state.runs.target = {
+      phase: 'confirm',
+      estimate: {
+        rows,
+        bytes,
+        placement: 'local',
+        needsConfirm: true,
+        breakdown: 'confirmation required',
+      },
+    }
+
+    render(<RunPanel nodeId="target" />)
+
+    expect(screen.getByText(new RegExp(`This full run will process ${rows.toLocaleString()} rows`))).toBeVisible()
+    expect(screen.getByText(new RegExp(bytes === 3 * 1024 ** 3 ? '3 GiB' : '20 MiB'))).toBeVisible()
+    expect(screen.getByText(/Confirm before starting the full pass/)).toBeVisible()
+    expect(screen.queryByText(/estimated data size requires confirmation/i)).not.toBeInTheDocument()
+  })
+
   it('shows configured column merges only through their certified admission control', async () => {
     mocks.state.doc.nodes = [{
       id: 'target', type: 'write', position: { x: 0, y: 0 },
