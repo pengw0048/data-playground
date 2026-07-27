@@ -64,9 +64,14 @@ _DATA_CONNECTION_ENV = frozenset({
 # semantics. Durable jobs snapshot the semantic environment into their hash-bound envelope, while a
 # replay receives the operator's current credential values so normal key rotation does not change the
 # logical attempt.
+# AWS container credentials are one SDK selector contract: ECS commonly supplies the relative URI,
+# while full-URI endpoints may require either the token value or token-file selector. Keep the complete
+# set core-owned and forward it together; the SDK retains its standard alternative/precedence rules.
 _DATA_CREDENTIAL_ENV = frozenset({
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
     "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "DP_S3_KEY", "DP_S3_SECRET",
 })
@@ -93,8 +98,7 @@ CORE_CONTROL_PLANE_ENV = frozenset({
     "DP_WORKLOAD_EPHEMERAL",
     "DP_POSTGRES_PASSWORD", "POSTGRES_PASSWORD",
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_DEFAULT_PROFILE",
+    "AWS_DEFAULT_PROFILE",
     "AWS_EC2_METADATA_DISABLED", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
     "AWS_SECURITY_TOKEN", "AWS_WEB_IDENTITY_TOKEN_FILE",
 })
