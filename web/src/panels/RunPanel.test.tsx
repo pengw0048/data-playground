@@ -173,7 +173,17 @@ describe('RunPanel typed parameter gate', () => {
     expect(mocks.edit).toHaveBeenCalledWith('target')
   })
 
-  it('explains why a known-row run with unknown byte width needs confirmation', () => {
+  it('explains unknown binary byte size in confirmation copy without exposing opaque source IDs', () => {
+    const datasetId = 'workspace-provider-opaque-dataset-should-not-appear'
+    const revisionId = 'provider-revision-opaque-value-should-not-appear'
+    mocks.state.doc.nodes = [{
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Source', status: 'ready', config: { datasetRef: { kind: 'exact', datasetId, revisionId } } },
+    }, {
+      id: 'target', type: 'filter', position: { x: 200, y: 0 },
+      data: { title: 'Target', status: 'draft', config: {} },
+    }]
+    mocks.state.doc.edges = [{ id: 'source-target', source: 'source', target: 'target' }]
     mocks.state.runs.target = {
       phase: 'confirm',
       estimate: {
@@ -188,8 +198,14 @@ describe('RunPanel typed parameter gate', () => {
 
     expect(screen.getByText('HEADS UP')).toBeVisible()
     expect(screen.getByText('2 rows')).toBeVisible()
-    expect(screen.getByText(/Binary column "payload" has no fixed-width byte-size evidence/)).toBeVisible()
-    expect(screen.getByText(/did not scan values to guess/)).toBeVisible()
+    expect(screen.getByText(/This full run will process 2 rows/)).toBeVisible()
+    expect(screen.getByText(/"payload" contains variable-length binary data/)).toBeVisible()
+    expect(screen.getByText(/actual read may be much larger than the row count suggests/)).toBeVisible()
+    expect(screen.getByLabelText('Pinned run inputs')).toHaveTextContent('Uses the pinned exact Source version shown on this Canvas.')
+    expect(screen.queryByText(datasetId)).not.toBeInTheDocument()
+    expect(screen.queryByText(revisionId)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Run' })).toBeVisible()
+    expect(screen.queryByText(/did not scan values to guess/)).not.toBeInTheDocument()
   })
 
   it('shows configured column merges only through their certified admission control', async () => {

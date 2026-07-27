@@ -9,7 +9,7 @@ import { UpsertControl } from '../components/UpsertControl'
 import { WritePublicationSummary } from '../components/WritePublicationSummary'
 import { cn } from '@/lib/utils'
 import type { InputDrift, RunOutput } from '../types/api'
-import { datasetRefIdentity, isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
+import { isParameterRef, type CanvasDoc, type CanvasParameterDeclaration, type DatasetRef } from '../types/graph'
 
 export function RunPanel({ nodeId }: { nodeId: string }) {
   const run = useStore((s) => s.runs[nodeId])
@@ -125,18 +125,13 @@ export function RunPanel({ nodeId }: { nodeId: string }) {
               {est.rows != null ? `${est.rows.toLocaleString()} rows` : 'Size unknown'}
             </span>
           </div>
-          {est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
+          {phase === 'confirm'
+            ? <div className="mt-2 text-[11px] text-muted-foreground">{confirmationCopy(est)}</div>
+            : est.breakdown && <div className="mt-2 text-[11px] text-muted-foreground">{est.breakdown}</div>}
           {isWrite && <WritePublicationSummary compact outputName={outputName} destination={destination} admission={writeAdmission} receipt={receipt} />}
           {pinnedInputs.length > 0 && (
             <div aria-label="Pinned run inputs" className="mt-2 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-[10.5px] text-muted-foreground">
-              <div className="font-semibold text-foreground">Pinned exact inputs for this run</div>
-              {pinnedInputs.map((input) => {
-                const exact = datasetRefIdentity(input.ref)
-                return <div key={input.nodeId} className="mt-0.5 break-all">
-                  {input.title} · dataset {exact.datasetId} · revision {exact.revisionId}
-                  {input.ref.kind === 'as_of' ? ` · as of ${new Date(input.ref.asOf).toLocaleString()}` : ''}
-                </div>
-              })}
+              Uses the pinned exact Source version{pinnedInputs.length === 1 ? '' : 's'} shown on this Canvas.
             </div>
           )}
           {phase === 'confirm' ? (
@@ -408,6 +403,16 @@ function pinnedSourceInputs(doc: CanvasDoc, targetNodeId: string): { nodeId: str
       ? [{ nodeId: node.id, title: node.data.title, ref }]
       : []
   })
+}
+
+function confirmationCopy(estimate: { rows?: number | null; bytes?: number | null; breakdown?: string | null }): string {
+  const rows = estimate.rows == null ? 'This full run has an unknown row count.' : `This full run will process ${estimate.rows.toLocaleString()} rows.`
+  if (estimate.bytes != null) return `${rows} Its estimated data size requires confirmation.`
+  const binaryColumn = estimate.breakdown?.match(/Binary column "([^"]+)"/)?.[1]
+  const reason = binaryColumn
+    ? `Byte size is unknown because "${binaryColumn}" contains variable-length binary data.`
+    : 'Byte size is unknown because this source has no reliable size estimate.'
+  return `${rows} ${reason} The actual read may be much larger than the row count suggests.`
 }
 
 function RunOutputs({ outputs }: { outputs: RunOutput[] }) {
