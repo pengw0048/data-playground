@@ -6224,6 +6224,28 @@ def workspace_provider_dataset_for_source_binding(
         return _workspace_provider_dataset_doc(row)
 
 
+def workspace_provider_usable_dataset_for_source_binding(
+        *, mount_id: str, source_binding_id: str) -> dict | None:
+    """Read one usable canonical Source generation and its facts as one snapshot.
+
+    Retained detail on a provider-error or detached row is recovery evidence, not an admitted
+    plugin-facing binding.  Keep the state and detail predicates in this single query so a state
+    transition between an earlier identity check and this final projection fails closed.
+    """
+    if (not isinstance(mount_id, str) or not mount_id or len(mount_id) > 128
+            or re.fullmatch(r"[0-9a-f]{32}", str(source_binding_id)) is None):
+        return None
+    with session() as s:
+        row = s.scalar(select(WorkspaceProviderDataset).where(
+            WorkspaceProviderDataset.mount_id == mount_id,
+            WorkspaceProviderDataset.source_binding_id == source_binding_id,
+            WorkspaceProviderDataset.state.in_(("current", "offline", "permission_lost")),
+            WorkspaceProviderDataset.uri.is_not(None),
+            WorkspaceProviderDataset.columns_doc.is_not(None),
+        ))
+        return _workspace_provider_dataset_doc(row) if row is not None else None
+
+
 def workspace_provider_dataset_state_for_source_binding(
         *, mount_id: str, source_binding_id: str) -> dict | None:
     """Resolve canonical state even when item-level unavailability withheld usable facts."""

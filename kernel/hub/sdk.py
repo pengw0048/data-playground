@@ -30,7 +30,7 @@ import re
 import socket
 import threading
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Callable, Literal, TypeVar
 
 import pyarrow as pa
 
@@ -40,7 +40,7 @@ from hub.sqlpolicy import bind_input_ctes, identifier, quote_identifier, validat
 
 __all__ = [
     "NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "identifier", "quote_identifier",
-    "close_resources", "DatasetBinding", "ImmediateInput", "ImmediateInputPort",
+    "close_resources", "DatasetBinding", "ProviderBinding", "ImmediateInput", "ImmediateInputPort",
     "ImmediateInputs", "ExactSourceRowRestriction", "NodePreparation",
     "UnsupportedUpstreamError", "RevisionUnavailable", "RevisionPermissionLost",
     "RevisionProviderOffline", "RevisionResolutionAmbiguous",
@@ -139,11 +139,29 @@ class DatasetBinding:
 
 
 @dataclass(frozen=True)
+class ProviderBinding:
+    """The non-secret provider facts admitted for one immediate provider Source input.
+
+    This projection supplements, and never replaces, the opaque ``workspace-provider:*``
+    :class:`DatasetBinding`.  It is absent unless the current canonical Workspace record agrees
+    with that binding.  It never includes a URI, physical location, mount configuration, or
+    credentials.
+    """
+
+    provider: str
+    mount_id: str
+    provider_dataset_id: str
+    read_mode: Literal["exact", "current"]
+    revision_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ImmediateInput:
     """The deliberately small public description of one directly wired input."""
 
     kind: str | None
     dataset: DatasetBinding | None = None
+    provider: ProviderBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -241,6 +259,62 @@ def _source_dataset_binding(source) -> DatasetBinding | None:
     return DatasetBinding(*identity) if identity is not None else None
 
 
+def _source_provider_binding(source, dataset: DatasetBinding | None) -> ProviderBinding | None:
+    """Project one provider Source's same admitted record only when every identity agrees."""
+    if dataset is None:
+        return None
+    data = source.data if isinstance(source.data, dict) else {}
+    config = data.get("config") if isinstance(data, dict) else None
+    if not isinstance(config, dict):
+        return None
+    uri = config.get("uri")
+    if not isinstance(uri, str):
+        return None
+
+    from hub import metadb, workspace_providers
+
+    if not workspace_providers.is_provider_dataset_uri(uri):
+        return None
+    identity = workspace_providers.provider_dataset_binding_for_identity(dataset.dataset_id)
+    if identity is None:
+        return None
+    mount_id, source_binding_id = identity
+    if workspace_providers.provider_dataset_uri(mount_id, source_binding_id) != uri:
+        return None
+    # State, detail, identity, and projected facts come from this one final database snapshot.
+    # It neither loads a provider nor resolves an adapter.
+    canonical = metadb.workspace_provider_usable_dataset_for_source_binding(
+        mount_id=mount_id, source_binding_id=source_binding_id)
+    if not isinstance(canonical, dict):
+        return None
+    if (canonical.get("mountId") != mount_id
+            or canonical.get("sourceBindingId") != source_binding_id):
+        return None
+    provider = canonical.get("provider")
+    provider_dataset_id = canonical.get("providerDatasetId")
+    if not isinstance(provider, str) or not provider or not isinstance(provider_dataset_id, str) or not provider_dataset_id:
+        return None
+
+    provider_read_mode = config.get("providerReadMode")
+    if provider_read_mode == "exact":
+        if dataset.revision_id is None:
+            return None
+        read_mode: Literal["exact", "current"] = "exact"
+    elif provider_read_mode == "mutable":
+        if dataset.revision_id is not None:
+            return None
+        read_mode = "current"
+    else:
+        return None
+    return ProviderBinding(
+        provider=provider,
+        mount_id=mount_id,
+        provider_dataset_id=provider_dataset_id,
+        read_mode=read_mode,
+        revision_id=dataset.revision_id,
+    )
+
+
 class _Ctx:
     """Safe builders that turn relations into relations without forcing materialization."""
 
@@ -286,10 +360,15 @@ class _Ctx:
             # parent-owned publication sidecar is unforgeable through Graph validation and lets this
             # bounded snapshot report no producer kind without exposing the ref URI or graph data.
             generated_ref = upstream.id in generated_refs
+            dataset = (
+                _source_dataset_binding(upstream)
+                if upstream.type == "source" and not generated_ref else None
+            )
             by_port[port_id].append(ImmediateInput(
                 kind=None if generated_ref else upstream.type,
-                dataset=(
-                    _source_dataset_binding(upstream)
+                dataset=dataset,
+                provider=(
+                    _source_provider_binding(upstream, dataset)
                     if upstream.type == "source" and not generated_ref else None
                 ),
             ))

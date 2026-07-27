@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -274,6 +275,7 @@ def test_generated_region_ref_is_not_reported_as_a_direct_source_after_worker_re
     assert port.count == 1
     assert port.inputs[0].kind is None
     assert port.inputs[0].dataset is None
+    assert port.inputs[0].provider is None
 
     sql_calls: list[str] = []
     monkeypatch.setattr(ctx, "sql", lambda *_args, **_kwargs: sql_calls.append("built"))
@@ -282,12 +284,15 @@ def test_generated_region_ref_is_not_reported_as_a_direct_source_after_worker_re
     assert not sql_calls
 
 
-def test_immediate_inputs_reports_only_canonical_provider_binding(monkeypatch):
-    provider_uri = "workspace-provider://encoded-binding"
-    provider_identity = "workspace-provider:encoded-binding"
+def test_immediate_inputs_projects_only_the_admitted_provider_binding(monkeypatch):
+    mount_id = "fixture-mount"
+    source_binding_id = "a" * 32
+    provider_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    provider_identity = provider_uri.replace("workspace-provider://", "workspace-provider:")
     source = GraphNode.model_validate(_node("source", "source", {
         "uri": provider_uri,
         "datasetRef": {"kind": "exact", "datasetId": provider_identity, "revisionId": "r1"},
+        "providerReadMode": "exact",
     }))
     consumer = GraphNode.model_validate(_node("consumer", "consumer"))
     engine = SimpleNamespace(
@@ -299,6 +304,13 @@ def test_immediate_inputs_reports_only_canonical_provider_binding(monkeypatch):
                                            inputs=[PortSpec(id="in")])},
     )
     monkeypatch.setattr(workspace_providers, "provider_dataset_identity", lambda _uri: provider_identity)
+    monkeypatch.setattr(
+        metadb, "workspace_provider_usable_dataset_for_source_binding",
+        lambda **kwargs: {
+            "mountId": mount_id, "sourceBindingId": source_binding_id,
+            "provider": "fixture-provider", "providerDatasetId": "native-dataset",
+        } if kwargs == {"mount_id": mount_id, "source_binding_id": source_binding_id} else None,
+    )
 
     port = ctx.immediate_inputs(engine, consumer).port("in")
     assert port.count == 1
@@ -306,6 +318,189 @@ def test_immediate_inputs_reports_only_canonical_provider_binding(monkeypatch):
     assert port.inputs[0].dataset is not None
     assert port.inputs[0].dataset.dataset_id == provider_identity
     assert port.inputs[0].dataset.revision_id == "r1"
+    assert port.inputs[0].provider is not None
+    assert port.inputs[0].provider.provider == "fixture-provider"
+    assert port.inputs[0].provider.mount_id == mount_id
+    assert port.inputs[0].provider.provider_dataset_id == "native-dataset"
+    assert port.inputs[0].provider.read_mode == "exact"
+    assert port.inputs[0].provider.revision_id == "r1"
+    assert set(vars(port.inputs[0].provider)) == {
+        "provider", "mount_id", "provider_dataset_id", "read_mode", "revision_id",
+    }
 
-    source.data["config"]["datasetRef"]["datasetId"] = "placement-or-uri-is-not-an-identity"
-    assert ctx.immediate_inputs(engine, consumer).port("in").inputs[0].dataset is None
+    source.data["config"].pop("datasetRef")
+    source.data["config"]["providerReadMode"] = "mutable"
+    current = ctx.immediate_inputs(engine, consumer).port("in").inputs[0]
+    assert current.dataset is not None
+    assert current.dataset.revision_id is None
+    assert current.provider is not None
+    assert current.provider.read_mode == "current"
+    assert current.provider.revision_id is None
+
+    source.data["config"]["datasetRef"] = {
+        "kind": "exact", "datasetId": "placement-or-uri-is-not-an-identity", "revisionId": "r1",
+    }
+    source.data["config"]["providerReadMode"] = "exact"
+    mismatched = ctx.immediate_inputs(engine, consumer).port("in").inputs[0]
+    assert mismatched.dataset is None
+    assert mismatched.provider is None
+
+
+def test_immediate_inputs_omits_provider_projection_for_ambiguous_and_non_provider_sources(
+        monkeypatch):
+    mount_id = "fixture-mount"
+    source_binding_id = "b" * 32
+    provider_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    provider_identity = provider_uri.replace("workspace-provider://", "workspace-provider:")
+    provider_source = GraphNode.model_validate(_node("provider-source", "source", {
+        "uri": provider_uri,
+        "datasetRef": {"kind": "exact", "datasetId": provider_identity, "revisionId": "r1"},
+    }))
+    plain_source = GraphNode.model_validate(_node("plain-source", "source", {
+        "uri": "fixture://plain",
+        "datasetRef": {"kind": "exact", "datasetId": "plain", "revisionId": "r1"},
+    }))
+    consumer = GraphNode.model_validate(_node("consumer", "consumer"))
+    engine = SimpleNamespace(
+        graph=Graph(**{"id": "snapshot", "version": 1,
+                        "nodes": [provider_source, plain_source, consumer], "edges": [
+                            {"id": "provider-edge", "source": "provider-source", "target": "consumer",
+                             "data": {"wire": "dataset"}},
+                            {"id": "plain-edge", "source": "plain-source", "target": "consumer",
+                             "targetHandle": "in", "data": {"wire": "dataset"}},
+                        ]}),
+        _nodes={"provider-source": provider_source, "plain-source": plain_source,
+                "consumer": consumer},
+        node_specs={"consumer": NodeSpec(kind="consumer", title="consumer", category="compute",
+                                           inputs=[PortSpec(id="in", multi=True)])},
+    )
+    monkeypatch.setattr(workspace_providers, "provider_dataset_identity", lambda _uri: provider_identity)
+
+    inputs = ctx.immediate_inputs(engine, consumer).port("in").inputs
+    assert inputs[0].dataset is not None
+    assert inputs[0].provider is None  # no admitted read mode means the projection is ambiguous
+    assert inputs[1].dataset is not None
+    assert inputs[1].provider is None
+
+
+def test_immediate_inputs_omits_detached_and_transformed_provider_sources(monkeypatch):
+    mount_id = "fixture-mount"
+    source_binding_id = "c" * 32
+    provider_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    provider_identity = provider_uri.replace("workspace-provider://", "workspace-provider:")
+    source = GraphNode.model_validate(_node("source", "source", {
+        "uri": provider_uri,
+        "datasetRef": {"kind": "exact", "datasetId": provider_identity, "revisionId": "r1"},
+        "providerReadMode": "exact",
+    }))
+    consumer = GraphNode.model_validate(_node("consumer", "consumer"))
+
+    def engine_for(nodes, edges):
+        return SimpleNamespace(
+            graph=Graph(**{"id": "snapshot", "version": 1, "nodes": nodes, "edges": edges}),
+            _nodes={node.id: node for node in nodes},
+            node_specs={"consumer": NodeSpec(kind="consumer", title="consumer", category="compute",
+                                               inputs=[PortSpec(id="in")])},
+        )
+
+    direct = engine_for([source, consumer], [
+        {"id": "edge", "source": "source", "target": "consumer", "data": {"wire": "dataset"}},
+    ])
+    monkeypatch.setattr(workspace_providers, "provider_dataset_identity", lambda _uri: provider_identity)
+    monkeypatch.setattr(
+        metadb, "workspace_provider_usable_dataset_for_source_binding", lambda **_kwargs: None)
+    detached = ctx.immediate_inputs(direct, consumer).port("in").inputs[0]
+    assert detached.dataset is not None
+    assert detached.provider is None
+
+    transform = GraphNode.model_validate(_node("filter", "filter", {"predicate": "id > 0"}))
+    transformed = engine_for([source, transform, consumer], [
+        {"id": "source-filter", "source": "source", "target": "filter",
+         "data": {"wire": "dataset"}},
+        {"id": "filter-consumer", "source": "filter", "target": "consumer",
+         "data": {"wire": "dataset"}},
+    ])
+    input = ctx.immediate_inputs(transformed, consumer).port("in").inputs[0]
+    assert input.kind == "filter"
+    assert input.dataset is None
+    assert input.provider is None
+
+
+def test_provider_projection_fails_closed_on_real_sqlite_state_race(monkeypatch):
+    metadb.init_db()
+    token = uuid.uuid4().hex
+    mount_id = f"sdk-provider-{token}"
+    provider_dataset_id = f"native-dataset-{token}"
+    cached = metadb.workspace_provider_cache_resource(
+        mount_id=mount_id,
+        provider="fixture-provider",
+        container_id=metadb.LOCAL_WORKSPACE_ROOT_ID,
+        provider_placement_id=f"placement-{token}",
+        provider_dataset_id=provider_dataset_id,
+        uri=f"fixture://{provider_dataset_id}",
+        columns=[{"name": "id", "type": "int64"}],
+        kind="dataset",
+        name="Provider dataset",
+    )
+    source_binding = metadb.workspace_provider_source_binding(cached["bindingId"])
+    assert source_binding is not None
+    source_binding_id = source_binding["sourceBindingId"]
+    provider_uri = workspace_providers.provider_dataset_uri(mount_id, source_binding_id)
+    provider_identity = provider_uri.replace("workspace-provider://", "workspace-provider:")
+    consumer = GraphNode.model_validate(_node("consumer", "consumer"))
+
+    def snapshot(config):
+        source = GraphNode.model_validate(_node("source", "source", config))
+        engine = SimpleNamespace(
+            graph=Graph(**{"id": "snapshot", "version": 1, "nodes": [source, consumer], "edges": [
+                {"id": "edge", "source": "source", "target": "consumer",
+                 "data": {"wire": "dataset"}},
+            ]}),
+            _nodes={"source": source, "consumer": consumer},
+            node_specs={
+                "consumer": NodeSpec(
+                    kind="consumer", title="consumer", category="compute",
+                    inputs=[PortSpec(id="in")],
+                ),
+            },
+        )
+        return ctx.immediate_inputs(engine, consumer).port("in").inputs[0]
+
+    exact_config = {
+        "uri": provider_uri,
+        "datasetRef": {
+            "kind": "exact", "datasetId": provider_identity, "revisionId": "revision-1",
+        },
+        "providerReadMode": "exact",
+    }
+    exact = snapshot(exact_config)
+    assert exact.provider is not None
+    assert exact.provider.provider == "fixture-provider"
+    assert exact.provider.provider_dataset_id == provider_dataset_id
+    assert exact.provider.read_mode == "exact"
+    assert exact.provider.revision_id == "revision-1"
+
+    current = snapshot({"uri": provider_uri, "providerReadMode": "mutable"})
+    assert current.provider is not None
+    assert current.provider.provider_dataset_id == provider_dataset_id
+    assert current.provider.read_mode == "current"
+    assert current.provider.revision_id is None
+
+    real_identity = workspace_providers.provider_dataset_identity
+
+    def degrade_after_identity(uri):
+        identity = real_identity(uri)
+        metadb.workspace_provider_mark_dataset(
+            mount_id=mount_id,
+            provider_dataset_id=provider_dataset_id,
+            state="provider_error",
+            error="provider returned invalid metadata",
+        )
+        return identity
+
+    monkeypatch.setattr(
+        workspace_providers, "provider_dataset_identity", degrade_after_identity)
+    raced = snapshot(exact_config)
+    assert raced.dataset is not None
+    assert raced.dataset.dataset_id == provider_identity
+    assert raced.provider is None
