@@ -639,7 +639,9 @@ def test_database_due_backoff_budget_deadline_and_regressions(identity):
     handle = {"provider_kind": "fixture-local", "job_id": "fixture-job"}
     assert metadb.commit_external_wait_transition(
         task["id"], claim["attempt_id"], "submit", handle=handle)
-    assert task["id"] not in metadb.due_external_wait_task_ids()
+    with metadb.session() as session:
+        wait = session.get(metadb.DurableExternalWait, task["id"])
+        assert wait.next_poll_at - wait.updated_at == datetime.timedelta(milliseconds=50)
 
     _make_due(task["id"])
     transient = metadb.claim_external_wait_transition(task["id"], "transient")
