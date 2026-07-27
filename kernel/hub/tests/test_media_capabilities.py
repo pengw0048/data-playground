@@ -28,9 +28,9 @@ def test_iso_base_media_requires_a_known_major_brand() -> None:
         return b"\x00\x00\x00\x18ftyp" + brand + b"\x00\x00\x00\x00"
 
     assert media_kind_from_value(ftyp(b"mif1")) == "image"
+    assert media_kind_from_value(ftyp(b"isom")) == "video"
     assert media_kind_from_value(ftyp(b"mp42")) == "video"
     assert media_kind_from_value(ftyp(b"qt  ")) == "video"
-    assert media_kind_from_value(ftyp(b"isom")) is None
     assert media_kind_from_value(ftyp(b"M4A ")) is None
     assert media_kind_from_value(ftyp(b"zzzz")) is None
 

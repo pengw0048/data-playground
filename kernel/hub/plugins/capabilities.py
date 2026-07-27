@@ -28,7 +28,7 @@ _IMAGE_FTYP_BRANDS = {
 }
 _VIDEO_FTYP_BRANDS = {
     b"3g2a", b"3g2b", b"3gp4", b"3gp5", b"3gp6", b"3gp7", b"avc1", b"M4V ", b"M4VH", b"M4VP",
-    b"mp41", b"mp42", b"mp71", b"qt  ",
+    b"isom", b"mp41", b"mp42", b"mp71", b"qt  ",
 }
 _MAX_MEDIA_SAMPLE_ROWS = 256
 _MAX_MEDIA_CELL_BYTES = 4096
