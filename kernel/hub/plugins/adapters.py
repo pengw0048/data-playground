@@ -1203,7 +1203,15 @@ class LanceAdapter:
             dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
             dataset.schema  # force the exact retained-version check before scanner construction
             if not native_row_ids:
-                reader = dataset.scanner(limit=0, with_row_id=True).to_reader()
+                # Lance's ``limit=0`` is not a zero-row retention probe: on stable-row-id
+                # datasets it can still plan and return rows.  We already forced the requested
+                # retained version and have its Arrow schema, so construct the typed empty
+                # relation without creating a row scanner at all.  ``_rowid`` is a virtual
+                # Lance column, hence it must be added explicitly to match the non-empty path.
+                import pyarrow as pa
+
+                schema = dataset.schema.append(pa.field("_rowid", pa.uint64()))
+                return db.conn().from_arrow(pa.Table.from_batches([], schema=schema))
             else:
                 # Quoted decimal text avoids DataFusion parsing uint64 values above INT64_MAX as
                 # lossy float literals. Values were validated as uint64 above, so this is not an
