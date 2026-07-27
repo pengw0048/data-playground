@@ -1676,7 +1676,9 @@ test.describe('Data Playground canvas', () => {
     await dialog.locator('input').fill('my_output.parquet')
     await dialog.getByRole('button', { name: 'Use destination', exact: true }).click()
     await expect(page.getByText('Choose output destination', { exact: true })).toHaveCount(0)
-    await expect(inspector.getByText('Workspace outputs')).toBeVisible() // target shown in the inspector
+    const publication = inspector.getByLabel('Write publication')
+    await expect(publication).toContainText('my_output.parquet')
+    await expect(publication).toContainText('Default managed storage')
   })
 
   test('a default-local Write keeps task-first publication and an exact receipt @ux-smoke', async ({ page }) => {
