@@ -287,6 +287,7 @@ describe('DatasetRevisionHistory', () => {
         rows: [{ frame: '<4 bytes>' }], rowIdentities: null, hasMore: false, rowLimit: 100,
       },
       rowIdentity: { datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'unavailable', certificationSupported: true, fields: [], encodingVersion: null },
+      mediaCellSupported: true,
     }))
     render(<DatasetRevisionHistory table={TABLE} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open revision rev-media' }))
@@ -308,6 +309,7 @@ describe('DatasetRevisionHistory', () => {
         datasetId: 'dataset-stable', revisionId: 'rev-media', proofStatus: 'certified',
         certificationSupported: true, fields: [{ name: 'id', arrowType: 'int64' }], encodingVersion: 'row-identity-v1',
       },
+      mediaCellSupported: true,
     })
     const unavailable = detail('rev-media', {
       preview: certified.preview,

@@ -18,7 +18,7 @@ import { MediaCellRenderer } from './MediaCellRenderer'
 
 const exact = (identity = [{ name: 'frame_id', arrowType: 'uint64' as const, value: '18446744073709551615' }]) => ({
   datasetId: 'dataset-1', revisionId: 'revision-1', identity,
-  proofStatus: 'certified' as const, certificationSupported: true,
+  proofStatus: 'certified' as const, certificationSupported: true, mediaCellSupported: true,
 })
 const deferred = <T,>() => {
   let resolve!: (value: T) => void
@@ -99,6 +99,12 @@ describe('MediaCellRenderer', () => {
   it('does not request binary media from a generic surface', () => {
     render(<MediaCellRenderer column="frame" value="<3 bytes>" mediaKind="image" />)
     expect(screen.getByRole('status')).toHaveTextContent('Open an exact certified revision')
+    expect(mocks.openMediaCell).not.toHaveBeenCalled()
+  })
+
+  it('does not request a media endpoint unless the exact revision explicitly supports it', () => {
+    render(<MediaCellRenderer column="frame" value="<3 bytes>" exact={{ ...exact(), mediaCellSupported: false }} />)
+    expect(screen.getByRole('status')).toHaveTextContent('does not support bounded media-cell reads')
     expect(mocks.openMediaCell).not.toHaveBeenCalled()
   })
 

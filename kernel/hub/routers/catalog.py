@@ -636,6 +636,9 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
                 if certificate is not None else None
             )
             certificate_valid = certificate is not None and row_identities is not None
+            from hub.media_cells import supports_exact_media_cell
+            media_cell_supported = supports_exact_media_cell(
+                adapter, binding["uri"], resolved_revision_id)
             row_identity = {
                 "datasetId": binding["dataset_id"],
                 "revisionId": resolved_revision_id,
@@ -679,6 +682,7 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
             columns=preview_columns, rows=preview_rows, row_identities=row_identities,
             has_more=table.num_rows > DATASET_REVISION_PREVIEW_ROWS),
         row_identity=DatasetRevisionRowIdentity.model_validate(row_identity),
+        media_cell_supported=media_cell_supported,
     )
 
 
@@ -708,24 +712,26 @@ def open_media_cell(
     from hub.media_cells import (
         MediaCellIdentityInvalid,
         MediaCellIdentityUnavailable,
+        MediaCellOffline,
         MediaCellRowAmbiguous,
         MediaCellRowNotFound,
         MediaCellSourceDenied,
         MediaCellTooLarge,
         MediaCellUnavailable,
         MediaCellUnsupported,
-        read_managed_local_media_cell,
+        read_exact_media_cell,
     )
 
     binding = _revision_binding_for_dataset_id(dataset_id)
     try:
-        content, content_type = read_managed_local_media_cell(
-            storage=get_deps().storage,
-            dataset_uri=binding["uri"],
-            dataset_id=dataset_id,
-            revision_id=revision_id,
-            request=req,
-        )
+        # Preserve the managed-local route's minimal dependency surface: its adapter is selected
+        # directly from the immutable ledger, while provider adapters still resolve only after
+        # their canonical Workspace binding has been established.
+        from hub.plugins.adapters import managed_local_file_revision_adapter
+        adapter = managed_local_file_revision_adapter(binding["uri"]) or _revision_adapter(binding["uri"])
+        content, content_type = read_exact_media_cell(
+            storage=get_deps().storage, adapter=adapter, dataset_uri=binding["uri"],
+            dataset_id=dataset_id, revision_id=revision_id, request=req)
     except MediaCellIdentityUnavailable:
         raise APIError(409, "media_cell_identity_unavailable",
                        code=APIErrorCode.MEDIA_CELL_IDENTITY_UNAVAILABLE, retryable=False)
@@ -750,6 +756,9 @@ def open_media_cell(
     except MediaCellUnavailable:
         raise APIError(410, "media_cell_unavailable",
                        code=APIErrorCode.RESOURCE_GONE, retryable=False)
+    except MediaCellOffline:
+        raise APIError(503, "media_cell_provider_offline",
+                       code=APIErrorCode.SERVICE_UNAVAILABLE, retryable=True)
     return Response(
         content=content,
         media_type=content_type,

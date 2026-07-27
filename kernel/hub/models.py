@@ -613,6 +613,7 @@ class DatasetRevisionDetail(Wire):
     summary: DatasetRevisionSummary
     preview: DatasetRevisionPreview
     row_identity: DatasetRevisionRowIdentity
+    media_cell_supported: bool = False
 
     @model_validator(mode="after")
     def _validate_row_identity_preview(self) -> "DatasetRevisionDetail":

@@ -340,6 +340,7 @@ function ExactPreview({ detail, onRefresh }: { detail: DatasetRevisionDetail; on
                   identity: detail.preview.rowIdentities?.[index] ?? null,
                   proofStatus: detail.rowIdentity.proofStatus,
                   certificationSupported: detail.rowIdentity.certificationSupported,
+                  mediaCellSupported: detail.mediaCellSupported === true,
                   onOpenCertification: openCertification }} />
             : cell(row[column.name])}</td>)}</tr>)}</tbody>
         </table>
