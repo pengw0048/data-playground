@@ -21242,6 +21242,29 @@ def managed_local_lance_row_identity_binding(dataset_id: str) -> dict | None:
         }
 
 
+def managed_local_lance_row_identity_binding_for_uri(uri: str) -> dict | None:
+    """Resolve the direct current registration only when its checked canonical URI matches."""
+    from hub.paths import checked_local_path
+
+    registered_uri = str(uri).rstrip("/")
+    try:
+        checked = checked_local_path(registered_uri)
+    except (OSError, ValueError):
+        return None
+    if checked is None or not checked.lower().rstrip("/").endswith(".lance"):
+        return None
+    with session() as s:
+        entry = s.get(CatalogEntry, registered_uri)
+        if (entry is None
+                or _managed_local_lance_row_identity_checked_uri(entry) != checked):
+            return None
+        return {
+            "dataset_id": entry.registration_id,
+            "dataset_name": entry.name,
+            "uri": checked,
+        }
+
+
 def _lance_row_identity_digests_are_valid(*values: object) -> bool:
     return all(
         isinstance(value, str) and len(value) == 64

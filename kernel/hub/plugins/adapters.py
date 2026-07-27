@@ -19,6 +19,7 @@ import stat
 import threading
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 import duckdb
 
@@ -43,6 +44,9 @@ Relation = duckdb.DuckDBPyRelation
 CancelCheck = Callable[[], bool]
 _LANCE_TRACKED_EVIDENCE_MAX_ROWS = 100_000
 _LANCE_TRACKED_EVIDENCE_PATH_MAX_BYTES = 16_384
+_LANCE_BLOB_PREVIEW_SNIFF_MAX_CELLS = 32
+_LANCE_BLOB_PREVIEW_SNIFF_MAX_BYTES = 64 * 1024
+_LANCE_BLOB_PREVIEW_SNIFF_BYTES_PER_CELL = 4096
 
 
 class BoundedPreviewUnsupported(RuntimeError):
@@ -76,6 +80,61 @@ def _lance_local_tracked_object_identity(base_uri: str, relative_path: str) -> t
         int(observed.st_dev), int(observed.st_ino), int(observed.st_size),
         int(observed.st_mtime_ns), int(observed.st_ctime_ns),
     )
+
+
+def _lance_schema_digest(schema) -> str:
+    """Match the #932 row-identity schema fence without importing its adapter-dependent module."""
+    facts = [(field.name, str(field.type), bool(field.nullable)) for field in schema]
+    canonical = json.dumps(
+        {"schema": facts}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _lance_expression_identifier(name: str) -> str:
+    """Quote one DataFusion projection identifier without accepting an ambiguous spelling."""
+    if not isinstance(name, str) or not name or "`" in name:
+        raise ValueError("Lance media column cannot be expressed exactly")
+    return f"`{name}`"
+
+
+def _lance_identity_predicate(fields, values: tuple[object, ...]) -> str:
+    """Build one typed, injection-free DataFusion predicate for a certified logical key."""
+    integer_casts = {
+        "int8": "TINYINT",
+        "int16": "SMALLINT",
+        "int32": "INT",
+        "int64": "BIGINT",
+        "uint8": "TINYINT UNSIGNED",
+        "uint16": "SMALLINT UNSIGNED",
+        "uint32": "INT UNSIGNED",
+        "uint64": "BIGINT UNSIGNED",
+    }
+    parts: list[str] = []
+    for field, value in zip(fields, values, strict=True):
+        name = _lance_expression_identifier(field.name)
+        if field.arrow_type == "string":
+            if not isinstance(value, str):
+                raise TypeError("Lance string predicate value must be text")
+            # Only lowercase hex crosses the SQL boundary. This preserves arbitrary UTF-8
+            # (including quotes, control characters, and NUL) without a string-literal surface.
+            encoded = value.encode("utf-8").hex()
+            literal = f"arrow_cast(decode('{encoded}', 'hex'), 'Utf8')"
+        else:
+            cast = integer_casts.get(field.arrow_type)
+            if cast is None or isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError("Lance integer predicate value is invalid")
+            # Core already range-checks the public value against the certified Arrow type. Quoted
+            # decimal text prevents uint64 values above INT64_MAX from becoming lossy float literals.
+            literal = f"CAST('{value}' AS {cast})"
+        parts.append(f"{name} = {literal}")
+    if not parts:
+        raise ValueError("Lance media identity cannot be empty")
+    return " AND ".join(parts)
+
+
+def _is_lance_blob_type(value: object) -> bool:
+    """Recognize Lance's stable Blob V2 extension without importing the optional package."""
+    return getattr(value, "extension_name", None) == "lance.blob.v2"
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -1145,7 +1204,27 @@ class LanceAdapter:
         return rel.project("* EXCLUDE (_distance), (1 - _distance) AS _score")  # Lance ranks by distance asc
 
     def schema(self, uri: str) -> list[ColumnSchema]:
-        return adapter_arrow_schema_columns(self, self._dataset(uri).schema)
+        return self._schema_columns(self._dataset(uri).schema)
+
+    def _schema_columns(
+            self, schema, *, media_kinds: dict[str, str] | None = None,
+    ) -> list[ColumnSchema]:
+        """Expose Blob V2 as bounded bytes while preserving its physical Lance type."""
+        columns = adapter_arrow_schema_columns(self, schema)
+        for index, field in enumerate(schema):
+            is_blob = _is_lance_blob_type(field.type)
+            kind = (media_kinds or {}).get(field.name)
+            if not is_blob and kind is None:
+                continue
+            payload = columns[index].model_dump(by_alias=True, mode="json")
+            if is_blob:
+                payload["type"] = "bytes"
+            if kind is not None:
+                payload["capabilities"] = sorted({
+                    *payload.get("capabilities", []), "media"})
+                payload["mediaKind"] = kind
+            columns[index] = ColumnSchema.model_validate(payload)
+        return columns
 
     def count(self, uri: str) -> int | None:
         try:
@@ -1406,11 +1485,247 @@ class LanceAdapter:
         """Read the requested retained Lance version's schema, never current-head metadata."""
         try:
             dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
-            return adapter_arrow_schema_columns(self, dataset.schema)
+            return self._schema_columns(dataset.schema)
         except RevisionUnavailable:
             raise
         except Exception as exc:
             raise_revision_access_error_from_os(exc)
+
+    def supports_media_cell(self, uri: str, revision_id: str) -> bool:
+        """Advertise the certified exact-cell adapter boundary for one retained local version."""
+        if type(self) is not LanceAdapter:
+            return False
+        from hub import metadb
+
+        binding = metadb.managed_local_lance_row_identity_binding_for_uri(uri)
+        if binding is None:
+            return False
+        try:
+            dataset = self._dataset(
+                str(binding["uri"]), version=int(self._revision_id(revision_id)))
+            dataset.schema  # force the exact retained-version check
+            # This revision-level flag advertises the adapter boundary. Individual ordinary Binary
+            # columns still fail closed in ``read_media_cell``; sibling string and Blob V2 columns
+            # remain usable.
+            return True
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+
+    def _exact_media_cell_certificate(
+            self, uri: str, revision_id: str, *, dataset_id: str | None = None,
+    ) -> tuple[dict, Any, str, Any]:
+        """Load the #932/#933 certificate for one live exact canonical registration fence."""
+        from hub import metadb
+        from hub.media_cells import MediaCellIdentityUnavailable, MediaCellUnavailable
+
+        binding = metadb.managed_local_lance_row_identity_binding_for_uri(uri)
+        if binding is None:
+            raise MediaCellIdentityUnavailable("media cell row identity is unavailable")
+        if dataset_id is not None and binding["dataset_id"] != dataset_id:
+            raise MediaCellUnavailable("media cell revision is unavailable")
+        with db.base_guard():
+            schema, physical = self.exact_revision_incarnation(
+                str(binding["uri"]), revision_id)
+        schema_digest = _lance_schema_digest(schema)
+        certificate = metadb.managed_local_lance_row_identity_certificate_for_incarnation(
+            str(binding["dataset_id"]), revision_id,
+            physical_incarnation_sha256=physical,
+            schema_sha256=schema_digest,
+        )
+        if certificate is None:
+            raise MediaCellIdentityUnavailable("media cell row identity is unavailable")
+        return binding, schema, physical, certificate
+
+    def media_cell_identity_descriptor(self, uri: str, revision_id: str):
+        """Return only the ordered certified logical key for the pinned local version."""
+        if type(self) is not LanceAdapter:
+            from hub.media_cells import MediaCellUnsupported
+
+            raise MediaCellUnsupported("media cell value is unsupported")
+        return self._exact_media_cell_certificate(uri, revision_id)[3]
+
+    def read_media_cell(self, uri: str, request):
+        """Read one certified exact cell through two predicate scanners and a final fence check."""
+        import pyarrow as pa
+
+        from hub.media_cells import (
+            ExactMediaCellRead,
+            ExactMediaCellResult,
+            MediaCellRowAmbiguous,
+            MediaCellRowNotFound,
+            MediaCellTooLarge,
+            MediaCellUnavailable,
+            MediaCellUnsupported,
+            _cell_materialization_limit,
+        )
+        from hub.plugins.capabilities import media_content_type_from_bytes
+
+        if type(self) is not LanceAdapter or not isinstance(request, ExactMediaCellRead):
+            raise MediaCellUnsupported("media cell value is unsupported")
+        if (type(request.max_bytes) is not int or request.max_bytes < 1
+                or not callable(request.source_policy)):
+            raise MediaCellUnsupported("media cell value is unsupported")
+        binding, schema, physical, certificate = self._exact_media_cell_certificate(
+            uri, request.revision_id, dataset_id=request.dataset_id)
+        if (certificate.spec.dataset_id != request.dataset_id
+                or certificate.spec.revision_id != request.revision_id
+                or len(certificate.spec.fields) != len(request.identity)):
+            raise MediaCellUnavailable("media cell revision is unavailable")
+
+        column_indices = schema.get_all_field_indices(request.column)
+        if len(column_indices) != 1:
+            raise MediaCellUnsupported("media cell column is unsupported")
+        column_field = schema.field(column_indices[0])
+        if pa.types.is_string(column_field.type) or pa.types.is_large_string(column_field.type):
+            column_type = "string"
+        elif _is_lance_blob_type(column_field.type):
+            column_type = "blob"
+        else:
+            raise MediaCellUnsupported("media cell column is unsupported")
+
+        key_fields = tuple(certificate.spec.fields)
+        for field in key_fields:
+            indices = schema.get_all_field_indices(field.name)
+            if len(indices) != 1 or str(schema.field(indices[0]).type) != field.arrow_type:
+                raise MediaCellUnavailable("media cell revision is unavailable")
+        if not key_fields:  # pragma: no cover - public requests and certificates are non-empty
+            raise MediaCellUnsupported("media cell value is unsupported")
+        try:
+            predicate = _lance_identity_predicate(key_fields, request.identity)
+            expressed = _lance_expression_identifier(request.column)
+        except (TypeError, ValueError) as exc:
+            raise MediaCellUnsupported("media cell value is unsupported") from exc
+        try:
+            dataset = self._dataset(
+                str(binding["uri"]), version=int(self._revision_id(request.revision_id)))
+            if column_type == "string":
+                facts = dataset.scanner(
+                    columns={
+                        "__dp_media_cell_length": f"octet_length({expressed})",
+                        "__dp_media_cell_data_uri": (
+                            f"starts_with(lower({expressed}), 'data:')"),
+                    },
+                    filter=predicate, limit=2, late_materialization=False,
+                ).to_table()
+            else:
+                facts = dataset.scanner(
+                    columns=[request.column], filter=predicate, limit=2,
+                    blob_handling="blobs_descriptions", late_materialization=False,
+                ).to_table()
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+        if facts.num_rows == 0:
+            raise MediaCellRowNotFound("media cell row was not found")
+        if facts.num_rows != 1:
+            raise MediaCellRowAmbiguous("media cell row identity is ambiguous")
+        if column_type == "string":
+            size = facts.column("__dp_media_cell_length")[0].as_py()
+            data_uri = facts.column("__dp_media_cell_data_uri")[0].as_py()
+            limit = _cell_materialization_limit(
+                column_type, request.max_bytes, data_uri=data_uri is True)
+        else:
+            descriptor = facts.column(0)[0].as_py()
+            size = descriptor.get("size") if isinstance(descriptor, dict) else None
+            limit = request.max_bytes
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise MediaCellUnsupported("media cell value is unsupported")
+        if size > limit:
+            raise MediaCellTooLarge("media cell exceeds the response limit")
+
+        try:
+            if column_type == "string":
+                values = dataset.scanner(
+                    columns=[request.column], filter=predicate, limit=2,
+                    late_materialization=False,
+                ).to_table()
+            else:
+                values = dataset.scanner(
+                    columns=[request.column], filter=predicate, limit=2,
+                    blob_handling="blobs_descriptions", with_row_id=True,
+                    late_materialization=False,
+                ).to_table()
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+        if values.num_rows == 0:
+            raise MediaCellRowNotFound("media cell row was not found")
+        if values.num_rows != 1:
+            raise MediaCellRowAmbiguous("media cell row identity is ambiguous")
+        if column_type == "string":
+            value = values.column(0)[0].as_py()
+        else:
+            final_descriptor = values.column(0)[0].as_py()
+            final_size = (
+                final_descriptor.get("size")
+                if isinstance(final_descriptor, dict) else None)
+            row_id = values.column("_rowid")[0].as_py()
+            if (isinstance(final_size, bool) or not isinstance(final_size, int)
+                    or final_size != size
+                    or isinstance(row_id, bool) or not isinstance(row_id, int) or row_id < 0):
+                raise MediaCellUnavailable("media cell revision is unavailable")
+            try:
+                blobs = dataset.take_blobs(
+                    blob_column=request.column, ids=[row_id])
+                if len(blobs) != 1:
+                    raise MediaCellUnavailable("media cell revision is unavailable")
+                blob = blobs[0]
+                try:
+                    blob_size = blob.size()
+                    if (isinstance(blob_size, bool) or not isinstance(blob_size, int)
+                            or blob_size < 0 or blob_size != size):
+                        raise MediaCellUnavailable("media cell revision is unavailable")
+                    if blob_size > request.max_bytes:
+                        raise MediaCellTooLarge("media cell exceeds the response limit")
+                    value = blob.read(request.max_bytes + 1)
+                finally:
+                    blob.close()
+            except (MediaCellTooLarge, MediaCellUnavailable):
+                raise
+            except Exception as exc:
+                raise_revision_access_error_from_os(exc)
+            if not isinstance(value, (bytes, bytearray, memoryview)):
+                raise MediaCellUnsupported("media cell value is unsupported")
+            value = bytes(value)
+            if len(value) != size:
+                raise MediaCellUnavailable("media cell revision is unavailable")
+        from hub.plugins.capabilities import (
+            media_kind_from_value,
+            private_media_kind_from_value,
+        )
+
+        stored_kind = (
+            media_kind_from_value(value)
+            or private_media_kind_from_value(value)
+        )
+        content = request.source_policy(value)
+        if not isinstance(content, bytes) or len(content) > request.max_bytes:
+            raise MediaCellTooLarge("media cell exceeds the response limit")
+        detected = media_content_type_from_bytes(content)
+        if detected is None:
+            raise MediaCellUnsupported("media cell value is unsupported")
+        expected_kind = stored_kind or request.expected_kind
+        if expected_kind in {"image", "video"} and detected[0] != expected_kind:
+            raise MediaCellUnsupported("media cell value is unsupported")
+
+        from hub.media_cells import MediaCellIdentityUnavailable
+
+        try:
+            final_binding, final_schema, final_physical, final_certificate = (
+                self._exact_media_cell_certificate(
+                    uri, request.revision_id, dataset_id=request.dataset_id))
+        except MediaCellIdentityUnavailable as exc:
+            raise MediaCellUnavailable("media cell revision is unavailable") from exc
+        if (final_binding != binding
+                or _lance_schema_digest(final_schema) != _lance_schema_digest(schema)
+                or final_physical != physical
+                or final_certificate.spec.digest != certificate.spec.digest):
+            raise MediaCellUnavailable("media cell revision is unavailable")
+        return ExactMediaCellResult(content=content, content_type=detected[1])
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded, exact-version facts without consulting the mutable current head."""
@@ -1438,21 +1753,140 @@ class LanceAdapter:
                     return None
 
             bounded = max(1, min(int(preview_limit), 100))
-            reader = dataset.scanner(limit=bounded + 1).to_reader()
-            table = pa.Table.from_batches(list(reader), schema=reader.schema)
-            empty = pa.Table.from_batches([], schema=dataset.schema)
+            source_schema = dataset.schema
+            plain_binary = {
+                field.name for field in source_schema
+                if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type)
+            }
+            blob_fields = [
+                field for field in source_schema if _is_lance_blob_type(field.type)]
+            # Ordinary Binary has no safe non-materializing length expression in pinned Lance, so
+            # never project it into the public revision preview. Blob V2 contributes descriptors
+            # only; the temporary row id is consumed below and removed before returning.
+            scan_options: dict[str, Any] = {
+                "columns": [
+                    field.name for field in source_schema
+                    if field.name not in plain_binary
+                ],
+                "limit": bounded + 1,
+                "late_materialization": False,
+            }
+            if blob_fields:
+                scan_options.update(
+                    blob_handling="blobs_descriptions", with_row_id=True)
+            reader = dataset.scanner(**scan_options).to_reader()
+            scanned = pa.Table.from_batches(list(reader), schema=reader.schema)
+            scanned_rows = scanned.to_pylist()
+
+            from hub.plugins.capabilities import (
+                media_content_type_from_bytes,
+                private_media_kind_from_value,
+            )
+
+            media_kinds: dict[str, str] = {}
+            sniff_cells = 0
+            sniff_bytes_left = _LANCE_BLOB_PREVIEW_SNIFF_MAX_BYTES
+            for field in blob_fields:
+                kinds: set[str] = set()
+                for row in scanned_rows:
+                    if (sniff_cells >= _LANCE_BLOB_PREVIEW_SNIFF_MAX_CELLS
+                            or sniff_bytes_left <= 0):
+                        break
+                    descriptor = row.get(field.name)
+                    size = (
+                        descriptor.get("size")
+                        if isinstance(descriptor, dict) else None)
+                    row_id = row.get("_rowid")
+                    if (isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                            or isinstance(row_id, bool) or not isinstance(row_id, int)
+                            or row_id < 0):
+                        continue
+                    sniff_size = min(
+                        size, _LANCE_BLOB_PREVIEW_SNIFF_BYTES_PER_CELL,
+                        sniff_bytes_left)
+                    sniff_cells += 1
+                    sniff_bytes_left -= sniff_size
+                    try:
+                        blobs = dataset.take_blobs(
+                            blob_column=field.name, ids=[row_id])
+                        if len(blobs) != 1:
+                            continue
+                        blob = blobs[0]
+                        try:
+                            if blob.size() != size:
+                                continue
+                            prefix = blob.read(sniff_size)
+                        finally:
+                            blob.close()
+                    except Exception:  # noqa: BLE001 -- preview evidence fails closed per cell
+                        continue
+                    detected = media_content_type_from_bytes(prefix)
+                    if detected is not None:
+                        kinds.add(detected[0])
+                if kinds:
+                    media_kinds[field.name] = (
+                        next(iter(kinds)) if len(kinds) == 1 else "unknown")
+            for field in source_schema:
+                if not (
+                        pa.types.is_string(field.type)
+                        or pa.types.is_large_string(field.type)):
+                    continue
+                kinds = {
+                    kind for row in scanned_rows
+                    if (kind := private_media_kind_from_value(
+                        row.get(field.name))) is not None
+                }
+                if kinds:
+                    media_kinds[field.name] = (
+                        next(iter(kinds)) if len(kinds) == 1 else "unknown")
+
+            # Keep a private exact-schema view for row-identity evidence, while the public preview
+            # gets only non-sensitive Blob size placeholders. Native descriptors, temporary row
+            # ids, and ordinary Binary payloads never leave the adapter.
+            identity_arrays = []
+            public_arrays = []
+            public_names = []
+            for field in source_schema:
+                if field.name in plain_binary or _is_lance_blob_type(field.type):
+                    identity_arrays.append(
+                        pa.nulls(scanned.num_rows, type=field.type))
+                    if field.name in plain_binary:
+                        public_arrays.append(
+                            pa.nulls(scanned.num_rows, type=field.type))
+                    else:
+                        placeholders: list[str | None] = []
+                        for descriptor in scanned.column(field.name).to_pylist():
+                            size = (
+                                descriptor.get("size")
+                                if isinstance(descriptor, dict) else None)
+                            placeholders.append(
+                                f"<{size} bytes>"
+                                if not isinstance(size, bool)
+                                and isinstance(size, int) and size >= 0
+                                else None)
+                        public_arrays.append(
+                            pa.array(placeholders, type=pa.string()))
+                else:
+                    identity_arrays.append(scanned.column(field.name))
+                    public_arrays.append(scanned.column(field.name))
+                public_names.append(field.name)
+            row_identity_table = pa.Table.from_arrays(
+                identity_arrays, schema=source_schema)
+            table = pa.Table.from_arrays(public_arrays, names=public_names)
             return {
                 "revision_id": exact_id,
                 "committed_at": entry.get("timestamp"),
                 "parent_revision_id": parent,
                 # Lance's version metadata does not identify the producing job/operation.
                 "producer_operation": None,
-                "columns": adapter_arrow_schema_columns(self, empty.schema),
+                "columns": self._schema_columns(
+                    source_schema, media_kinds=media_kinds),
                 "row_count": int(dataset.count_rows()),
                 "data_file_count": metadata_int("total_data_files"),
                 "total_bytes": metadata_int("total_files_size"),
                 "fragment_count": metadata_int("total_fragments"),
                 "preview_table": table,
+                "row_identity_preview_table": row_identity_table,
             }
         except RevisionUnavailable:
             raise
