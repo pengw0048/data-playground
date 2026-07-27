@@ -355,33 +355,84 @@ def test_build_is_persisted_and_visible_through_the_http_api():
     assert {n["type"] for n in gc["nodes"]} == {"source", "filter"}
 
 
-def test_mcp_mutation_cannot_regress_a_newer_server_version(monkeypatch):
+def test_mcp_mutation_conflicts_when_browser_saves_before_mcp_write(monkeypatch):
     from hub.routers import workspace as ws
 
-    cid = data("create_canvas", {"name": "stale MCP edit"})
-    cid = cid["canvasId"]
-    stale_doc = client.get(f"/api/canvas/{cid}").json()
-    current = stale_doc
-    for expected_version in range(1, 4):
-        current = {**current, "name": f"browser edit {expected_version}"}
-        saved = client.put(
-            f"/api/canvas/{cid}?expectedVersion={expected_version}",
-            json=current,
-        )
-        assert saved.status_code == 200
-        current = client.get(f"/api/canvas/{cid}").json()
-    assert current["version"] == 4
+    cid = data("create_canvas", {"name": "browser wins"})["canvasId"]
+    browser_doc = client.get(f"/api/canvas/{cid}").json()
+    real_put_canvas = ws.put_canvas
+    browser_saved = False
 
-    real_get_canvas = ws.get_canvas
-    monkeypatch.setattr(
-        ws,
-        "get_canvas",
-        lambda canvas_id, uid: stale_doc if canvas_id == cid else real_get_canvas(canvas_id, uid),
-    )
+    def browser_wins(canvas_id, doc, *, expected_version, uid):
+        nonlocal browser_saved
+        if canvas_id == cid and not browser_saved:
+            browser_saved = True
+            saved = client.put(
+                f"/api/canvas/{cid}?expectedVersion={browser_doc['version']}",
+                json={**browser_doc, "name": "browser edit"},
+            )
+            assert saved.status_code == 200
+        return real_put_canvas(canvas_id, doc, expected_version=expected_version, uid=uid)
+
+    monkeypatch.setattr(ws, "put_canvas", browser_wins)
+    conflict = call("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
+
+    assert conflict["isError"] is True
+    assert conflict["structuredContent"] == {
+        "detail": f"canvas '{cid}' changed; re-read it before retrying",
+        "code": "conflict", "retryable": False, "canvasId": cid, "currentVersion": 2,
+    }
+    persisted = client.get(f"/api/canvas/{cid}").json()
+    assert persisted["name"] == "browser edit"
+    assert persisted["version"] == 2 and persisted["nodes"] == []
+
+
+def test_mcp_mutation_conflicts_when_another_mcp_mutation_wins(monkeypatch):
+    from hub.routers import workspace as ws
+
+    cid = data("create_canvas", {"name": "MCP race"})["canvasId"]
+    other_server = build_server(base_url="http://test.local")
+    real_put_canvas = ws.put_canvas
+    other_saved = False
+
+    def other_mcp_wins(canvas_id, doc, *, expected_version, uid):
+        nonlocal other_saved
+        if canvas_id == cid and not other_saved:
+            other_saved = True
+            winner = other_server.handle({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "add_node", "arguments": {
+                    "canvasId": cid, "kind": "source", "config": {"uri": _uri("events")},
+                }},
+            })["result"]
+            assert winner["isError"] is False
+        return real_put_canvas(canvas_id, doc, expected_version=expected_version, uid=uid)
+
+    monkeypatch.setattr(ws, "put_canvas", other_mcp_wins)
+    conflict = call("add_node", {"canvasId": cid, "kind": "filter", "config": {"predicate": "amount > 0"}})
+
+    assert conflict["isError"] is True
+    assert conflict["structuredContent"]["code"] == "conflict"
+    assert conflict["structuredContent"]["retryable"] is False
+    assert conflict["structuredContent"]["canvasId"] == cid
+    assert conflict["structuredContent"]["currentVersion"] == 2
+    persisted = client.get(f"/api/canvas/{cid}").json()
+    assert persisted["version"] == 2
+    assert [node["type"] for node in persisted["nodes"]] == ["source"]
+
+
+def test_mcp_mutation_uses_the_read_version_and_preserves_unrelated_fields():
+    cid = data("create_canvas", {"name": "CAS success"})["canvasId"]
+    before = client.get(f"/api/canvas/{cid}").json()
+    configured = {**before, "metadata": {"keep": "this"}}
+    assert client.put(f"/api/canvas/{cid}?expectedVersion={before['version']}", json=configured).status_code == 200
+    prior = client.get(f"/api/canvas/{cid}").json()
+
     data("add_node", {"canvasId": cid, "kind": "source", "config": {"uri": _uri("events")}})
 
     persisted = client.get(f"/api/canvas/{cid}").json()
-    assert persisted["version"] == 5
+    assert persisted["version"] == prior["version"] + 1
+    assert persisted["metadata"] == {"keep": "this"}
     assert len(persisted["nodes"]) == 1
 
 

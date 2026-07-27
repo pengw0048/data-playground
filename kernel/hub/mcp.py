@@ -80,9 +80,11 @@ class ToolError(Exception):
     dispatcher turns it into an MCP `isError` tool result so the model sees the message and can adapt,
     rather than a hard protocol error."""
 
-    def __init__(self, message: str, *, code: str | None = None, retryable: bool | None = None):
+    def __init__(self, message: str, *, code: str | None = None, retryable: bool | None = None,
+                 details: dict | None = None):
         super().__init__(message)
         self.code, self.retryable = code, retryable
+        self.details = details
 
 
 class JsonRpcError(Exception):
@@ -194,16 +196,27 @@ class Playground:
 
     def _put_doc(self, canvas_id: str, doc: dict) -> None:
         """Persist a mutated doc through the SAME authorized write the HTTP API uses (403 → ToolError),
-        bumping the version so the snapshot history records the edit."""
+        using the version read with the document so a stale MCP edit cannot overwrite newer content."""
         from fastapi import HTTPException
 
         from hub.routers import workspace as ws
-        doc["version"] = (doc.get("version") or 1) + 1
+        expected_version = doc["version"]
+        doc["version"] = expected_version + 1
         try:
             # This direct Python call bypasses FastAPI dependency injection, so pass the query default
             # explicitly instead of leaking its Query() FieldInfo object into the persistence path.
-            ws.put_canvas(canvas_id, doc, expected_version=None, uid=self.user_id)
+            ws.put_canvas(canvas_id, doc, expected_version=expected_version, uid=self.user_id)
         except HTTPException as e:
+            if e.status_code == 409:
+                # The exact CAS read lost.  Re-read only enough state to tell the MCP client which
+                # version it must base a new operation on; never return the competing document.
+                current_version = ws.get_canvas(canvas_id, uid=self.user_id)["version"]
+                raise ToolError(
+                    f"canvas '{canvas_id}' changed; re-read it before retrying",
+                    code="conflict",
+                    retryable=False,
+                    details={"canvasId": canvas_id, "currentVersion": current_version},
+                ) from e
             raise ToolError(f"canvas '{canvas_id}': {e.detail}")
         self.changed_canvases.add(canvas_id)  # so the HTTP transport can nudge an open browser tab
 
@@ -1375,6 +1388,8 @@ class MCPServer:
         except ToolError as e:
             payload = ({"detail": str(e), "code": e.code, "retryable": e.retryable}
                        if e.code is not None else None)
+            if payload is not None and e.details is not None:
+                payload.update(e.details)
             return _tool_result(str(e), is_error=True, payload=payload)
         except Exception as e:  # noqa: BLE001 — a tool bug is reported to the model, not crashed on
             return _tool_result(f"{type(e).__name__}: {e}", is_error=True)
