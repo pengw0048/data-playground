@@ -11,11 +11,9 @@ carries its schema so wires are schema-aware.
 from __future__ import annotations
 
 import datetime
-import errno
 import glob
 import hashlib
 import os
-import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -30,6 +28,13 @@ from hub.models import (
     safe_field_annotations,
 )
 from hub.plugins.capabilities import tag_columns
+from hub.sdk import (
+    RevisionPermissionLost as RevisionPermissionLost,
+    RevisionProviderOffline as RevisionProviderOffline,
+    RevisionResolutionAmbiguous,
+    RevisionUnavailable,
+    raise_revision_access_error_from_os,
+)
 from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
 Relation = duckdb.DuckDBPyRelation
@@ -38,68 +43,6 @@ CancelCheck = Callable[[], bool]
 
 class BoundedPreviewUnsupported(RuntimeError):
     """The adapter cannot prove that this URI can be read within the interactive preview budget."""
-
-
-class RevisionUnavailable(RuntimeError):
-    """An exact provider-native revision cannot be opened; callers must never fall back to head."""
-
-
-class RevisionPermissionLost(RuntimeError):
-    """An exact revision still has identity, but the provider now denies access to it."""
-
-
-class RevisionProviderOffline(RuntimeError):
-    """An exact revision could not be checked because its provider is temporarily unreachable."""
-
-
-class RevisionResolutionAmbiguous(RuntimeError):
-    """A provider cannot prove one exact revision for the requested ordering boundary."""
-
-
-_OS_ERROR = re.compile(r"\bos error\s+(\d+)\b", re.IGNORECASE)
-_PERMISSION_ERRNOS = {errno.EACCES, errno.EPERM}
-_OFFLINE_ERRNOS = {
-    errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH,
-    errno.ENETDOWN, errno.ENETRESET, errno.ENETUNREACH, errno.ETIMEDOUT,
-}
-_PERMISSION_MARKERS = ("permission denied", "access denied", "operation not permitted")
-_OFFLINE_MARKERS = (
-    "connection refused", "connection reset", "connection timed out", "host is unreachable",
-    "network is down", "network is unreachable", "temporary failure in name resolution",
-)
-
-
-def _revision_error_chain(exc: BaseException):
-    """Yield one finite provider error chain, including wrappers that preserve only context."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        yield current
-        current = current.__cause__ or current.__context__
-
-
-def _wrapped_os_error(error: BaseException) -> tuple[set[int], str]:
-    """Extract only standard OS evidence from wrappers such as pylance's plain ValueError."""
-    message = str(error).lower()
-    return {int(match) for match in _OS_ERROR.findall(message)}, message
-
-
-def _raise_revision_access_error(exc: Exception) -> None:
-    """Preserve the small public recovery taxonomy across provider exception wrappers."""
-    chain = list(_revision_error_chain(exc))
-    if any(isinstance(error, PermissionError) for error in chain):
-        raise RevisionPermissionLost("revision_permission_lost") from exc
-    if any(isinstance(error, (ConnectionError, TimeoutError)) for error in chain):
-        raise RevisionProviderOffline("revision_provider_offline") from exc
-    evidence = [_wrapped_os_error(error) for error in chain]
-    if any(numbers & _PERMISSION_ERRNOS or any(marker in message for marker in _PERMISSION_MARKERS)
-           for numbers, message in evidence):
-        raise RevisionPermissionLost("revision_permission_lost") from exc
-    if any(numbers & _OFFLINE_ERRNOS or any(marker in message for marker in _OFFLINE_MARKERS)
-           for numbers, message in evidence):
-        raise RevisionProviderOffline("revision_provider_offline") from exc
-    raise RevisionUnavailable("revision_unavailable") from exc
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -946,7 +889,7 @@ class ManagedLocalFileRevisionAdapter:
             artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
             return DuckDBAdapter().scan(artifact_uri)
         except (KeyError, OSError, duckdb.Error) as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
         """Open one ledger-bound artifact through DuckDB's source-bounded preview path."""
@@ -956,7 +899,7 @@ class ManagedLocalFileRevisionAdapter:
             artifact_uri = metadb.managed_local_file_revision_open(uri, revision_id)
             return DuckDBAdapter().preview_scan(artifact_uri, limit=int(limit))
         except (KeyError, OSError, duckdb.Error) as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]:
         """Read the schema persisted with one immutable local revision, without opening rows."""
@@ -967,7 +910,7 @@ class ManagedLocalFileRevisionAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded facts and preview from one exact immutable local Parquet artifact."""
@@ -1001,7 +944,7 @@ class ManagedLocalFileRevisionAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
 
 def managed_local_file_revision_adapter(uri: str) -> ManagedLocalFileRevisionAdapter | None:
@@ -1046,14 +989,14 @@ class LocalFileInputRevisionAdapter:
         try:
             return DuckDBAdapter().scan(binding["artifact_uri"])
         except (OSError, duckdb.Error) as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
         binding = self._binding(uri, revision_id)
         try:
             return DuckDBAdapter().preview_scan(binding["artifact_uri"], limit=int(limit))
         except (OSError, duckdb.Error) as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         del uri, revision_id, preview_limit
@@ -1233,7 +1176,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
 
     def open_revision_native_rows(
@@ -1273,7 +1216,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def preview_revision(self, uri: str, revision_id: str, *, limit: int) -> Relation:
         """Open one retained Lance version with its scanner cap before yielding a relation."""
@@ -1284,7 +1227,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def revision_schema(self, uri: str, revision_id: str) -> list[ColumnSchema]:
         """Read the requested retained Lance version's schema, never current-head metadata."""
@@ -1294,7 +1237,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def revision_detail(self, uri: str, revision_id: str, *, preview_limit: int) -> dict:
         """Read bounded, exact-version facts without consulting the mutable current head."""
@@ -1341,7 +1284,7 @@ class LanceAdapter:
         except RevisionUnavailable:
             raise
         except Exception as exc:
-            _raise_revision_access_error(exc)
+            raise_revision_access_error_from_os(exc)
 
     def write(self, uri: str, rel: Relation, mode: str = "overwrite", partition_by: str | None = None,
               cancelled: CancelCheck | None = None) -> dict:
