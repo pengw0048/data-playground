@@ -340,7 +340,7 @@ describe('Inspector — effective named outputs', () => {
 
     render(<Inspector />)
 
-    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Cannot publish until the upstream transform “Normalize purchases” does not have a bounded output schema contract. Select the upstream transform “Normalize purchases”, then in the Inspector choose Output schema (contract) → Infer from sample.')
+    expect(screen.getByLabelText('Write blocker')).toHaveTextContent('Publication is blocked: the upstream transform “Normalize purchases” does not have a bounded output schema contract. Select the upstream transform “Normalize purchases”, then in the Inspector choose Output schema (contract) → Infer from sample.')
     expect(screen.queryByRole('button', { name: 'Open exact revision' })).not.toBeInTheDocument()
   })
 

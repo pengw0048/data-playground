@@ -186,7 +186,7 @@ export function WritePublicationSummary({ outputName, destination, admission, ou
       </div>
       {schemaDrift && <SchemaDriftEvidence evidence={schemaDrift} />}
       {summaryAdmission?.blocker ? <div aria-label="Write blocker" role="alert" className="rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-destructive">
-        <strong>Cannot publish until</strong> {summaryAdmission.blocker}
+        <strong>Publication is blocked:</strong> {summaryAdmission.blocker}
       </div> : receipt ? <div aria-label="Write readiness" className="text-emerald-700 dark:text-emerald-300">Exact publication receipt recorded.</div>
         : completed ? <div aria-label="Write readiness" role="status" className="text-muted-foreground">
             {providerNeutral ? 'Provider output completed without a managed revision receipt.' : 'Publication outcome is unknown; no exact receipt was recorded.'}
