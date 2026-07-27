@@ -240,7 +240,7 @@ def test_lance_task_certifies_exact_preview_and_replays_without_rescan(
         published["dataset_id"], published["revision_id"])
     assert detail.row_identity.proof_status == "certified"
     assert detail.row_identity.certification_supported is True
-    assert detail.media_cell_supported is False
+    assert detail.media_cell_supported is True
     assert detail.preview.row_identities is not None
     assert len(detail.preview.row_identities) == len(detail.preview.rows) == 2
     assert [field.value for field in detail.preview.row_identities[0]] == [

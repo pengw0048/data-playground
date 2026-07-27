@@ -2,11 +2,16 @@ import gc
 import tracemalloc
 
 import pyarrow as pa
+import pytest
 
 from hub import db
 from hub.executors.preview import PREVIEW_SCAN, preview_node
 from hub.models import ColumnSchema, Graph
-from hub.plugins.capabilities import media_kind_from_value, tag_columns
+from hub.plugins.capabilities import (
+    media_kind_from_value,
+    private_media_kind_from_value,
+    tag_columns,
+)
 
 
 def _tag(name: str, value: object, *, type_: str = "bytes") -> ColumnSchema:
@@ -61,6 +66,41 @@ def test_media_tagging_accepts_supported_url_and_data_evidence() -> None:
 
     assert image.capabilities == ["media"] and image.media_kind == "image"
     assert video.capabilities == ["media"] and video.media_kind == "video"
+
+
+@pytest.mark.parametrize(("value", "kind"), [
+    ("/tmp/asset.png", "image"),
+    ("relative/assets/clip.webm", "video"),
+    ("file:///tmp/asset.jpg", "image"),
+    ("s3://bucket/asset.mp4", "video"),
+    ("r2://bucket/asset.webp", "image"),
+    ("gs://bucket/asset.mov", "video"),
+    ("gcs://bucket/asset.avif", "image"),
+])
+def test_private_reference_classifier_does_not_change_global_media_tagging(
+        value: str, kind: str) -> None:
+    column = _tag("value", value, type_="string")
+
+    assert private_media_kind_from_value(value) == kind
+    assert media_kind_from_value(value) is None
+    assert column.capabilities == [] and column.media_kind is None
+
+
+@pytest.mark.parametrize("value", [
+    "/tmp/asset.pdf",
+    "ftp://example.test/asset.png",
+    "az://bucket/asset.png",
+    "file://remote.example/asset.png",
+    "file:///tmp/asset.png?version=1",
+    "s3:///asset.png",
+])
+def test_private_reference_classifier_rejects_non_media_and_unsupported_shapes(
+        value: str) -> None:
+    column = _tag("image_url", value, type_="string")
+
+    assert private_media_kind_from_value(value) is None
+    assert media_kind_from_value(value) is None
+    assert column.capabilities == [] and column.media_kind is None
 
 
 def test_media_tagging_reports_unknown_for_mixed_supported_kinds() -> None:

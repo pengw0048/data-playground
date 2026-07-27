@@ -33,6 +33,7 @@ _VIDEO_FTYP_BRANDS = {
 _MAX_MEDIA_SAMPLE_ROWS = 256
 _MAX_MEDIA_CELL_BYTES = 4096
 _MAX_MEDIA_URL_LENGTH = 8192
+_PRIVATE_MEDIA_OBJECT_SCHEMES = {"s3", "r2", "gs", "gcs"}
 
 
 def is_media_column(col: ColumnSchema) -> bool:
@@ -85,6 +86,19 @@ def _kind_from_bytes(value: object) -> MediaKind | None:
     return detected[0] if detected is not None else None
 
 
+def _kind_from_extension(path: str) -> MediaKind | None:
+    name = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    suffix = name.rsplit(".", 1)
+    if len(suffix) != 2:
+        return None
+    extension = suffix[1].lower()
+    if extension in _IMAGE_EXTENSIONS:
+        return "image"
+    if extension in _VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
 def _kind_from_url(value: object) -> MediaKind | None:
     if not isinstance(value, str) or len(value) > _MAX_MEDIA_URL_LENGTH:
         return None
@@ -101,15 +115,36 @@ def _kind_from_url(value: object) -> MediaKind | None:
         return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    suffix = parsed.path.rsplit(".", 1)
-    if len(suffix) != 2:
+    return _kind_from_extension(parsed.path)
+
+
+def private_media_kind_from_value(value: object) -> MediaKind | None:
+    """Classify one core-supported private reference without opening or fetching it."""
+    if not isinstance(value, str) or len(value) > _MAX_MEDIA_URL_LENGTH:
         return None
-    extension = suffix[1].lower()
-    if extension in _IMAGE_EXTENSIONS:
-        return "image"
-    if extension in _VIDEO_EXTENSIONS:
-        return "video"
-    return None
+    try:
+        parsed = urlsplit(value)
+    except (TypeError, ValueError):
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme in {"data", "http", "https"}:
+        return None
+    if scheme == "file":
+        if (not value.lower().startswith("file://") or parsed.netloc
+                or "?" in value or "#" in value):
+            return None
+        return _kind_from_extension(parsed.path)
+    if scheme in _PRIVATE_MEDIA_OBJECT_SCHEMES:
+        return (
+            _kind_from_extension(parsed.path)
+            if value[len(parsed.scheme):].startswith("://") and parsed.netloc
+            else None
+        )
+    if scheme and value[len(parsed.scheme):].startswith("://"):
+        return None
+    # Core treats absolute, relative, tilde, and opaque-colon spellings without ``://`` as local
+    # paths. Classification is extension-only and never stats, opens, or fetches the value.
+    return _kind_from_extension(value)
 
 
 def media_kind_from_value(value: object) -> MediaKind | None:

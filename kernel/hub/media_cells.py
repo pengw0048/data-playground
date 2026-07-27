@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -107,6 +108,7 @@ class ExactMediaCellRead:
     column: str
     max_bytes: int
     expected_kind: Literal["image", "video"] | None
+    source_policy: Callable[[object], bytes]
 
 
 @dataclass(frozen=True)
@@ -300,6 +302,20 @@ def _cell_bytes(storage, value: object, max_bytes: int) -> bytes:
     return _uri_bytes(storage, value, max_bytes)
 
 
+def _cell_materialization_limit(
+        column_type: str, max_bytes: int, *, data_uri: bool = False,
+) -> int:
+    """Return the largest cell value an adapter may materialize before source policy runs."""
+    if column_type == "bytes":
+        return max_bytes
+    if column_type != "string":
+        raise MediaCellUnsupported("media cell column is unsupported")
+    if data_uri:
+        encoded_limit = ((max_bytes + 2) // 3) * 4 + 4
+        return _MAX_DATA_URI_HEADER_BYTES + 1 + encoded_limit
+    return _MAX_MEDIA_REFERENCE_BYTES
+
+
 def read_managed_local_media_cell(
         *, storage, dataset_uri: str, dataset_id: str, revision_id: str,
         request: MediaCellRequest, max_bytes: int = MEDIA_CELL_MAX_BYTES,
@@ -436,6 +452,7 @@ def read_exact_media_cell(
         dataset_id=dataset_id, revision_id=revision_id, identity=identity,
         column=column.name, max_bytes=max_bytes,
         expected_kind=column.media_kind if column.media_kind in {"image", "video"} else None,
+        source_policy=lambda value: _cell_bytes(storage, value, max_bytes),
     )
     try:
         result = reader(dataset_uri, read)

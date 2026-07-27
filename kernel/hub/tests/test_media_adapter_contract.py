@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from hub.main import app
 from hub.media_cells import (
+    ExactMediaCellRead,
     ExactMediaCellResult,
     MediaCellOffline,
     MediaCellSourceDenied,
@@ -85,6 +87,7 @@ def test_optional_adapter_is_explicit_and_uses_only_the_requested_exact_revision
     assert read.revision_id == "revision-7"
     assert read.identity == (7,)
     assert read.column == "media" and read.max_bytes == 1024 and read.expected_kind == "image"
+    assert callable(read.source_policy)
 
     # A changed mutable head cannot cause a read of "latest": the dispatcher passes only the
     # caller's exact revision and surfaces the adapter's unavailable result unchanged.
@@ -96,6 +99,37 @@ def test_optional_adapter_is_explicit_and_uses_only_the_requested_exact_revision
     with pytest.raises(MediaCellUnavailable):
         _read(adapter, revision_id="older-revision")
     assert all(call[1][1].revision_id != "latest" for call in adapter.calls if call[0] == "read")
+
+
+def test_source_policy_callback_is_one_value_only_and_exposes_no_source_authority():
+    class PolicyAdapter(_Adapter):
+        def read_media_cell(self, uri: str, request):
+            self.calls.append(("read", (uri, request)))
+            with pytest.raises(TypeError):
+                request.source_policy(PNG, "forbidden-extra-argument")
+            return ExactMediaCellResult(request.source_policy(PNG), "image/png")
+
+    assert {field.name for field in fields(ExactMediaCellRead)} == {
+        "dataset_id", "revision_id", "identity", "column", "max_bytes",
+        "expected_kind", "source_policy",
+    }
+    content, content_type = _read(PolicyAdapter())
+    assert (content, content_type) == (PNG, "image/png")
+
+
+def test_source_policy_callback_reuses_the_core_value_bound():
+    class PolicyAdapter(_Adapter):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+
+        def read_media_cell(self, _uri: str, request):
+            return ExactMediaCellResult(request.source_policy(self.value), "image/png")
+
+    with pytest.raises(MediaCellTooLarge):
+        _read(PolicyAdapter(PNG + b"x" * 2048))
+    with pytest.raises(MediaCellUnsupported):
+        _read(PolicyAdapter(object()))
 
 
 def test_method_absent_and_exact_opt_out_fail_closed_without_reader_invocation():

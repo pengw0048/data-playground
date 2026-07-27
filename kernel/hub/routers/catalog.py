@@ -657,14 +657,17 @@ def open_dataset_revision(dataset_id: str, revision_id: str) -> DatasetRevisionD
                     if certification_facts is not None and artifact_info is not None else None
                 )
             row_identities = (
-                canonicalize_preview_row_identities(preview_table, certificate)
+                canonicalize_preview_row_identities(
+                    raw.get("row_identity_preview_table", preview_table).slice(
+                        0, DATASET_REVISION_PREVIEW_ROWS),
+                    certificate,
+                )
                 if certificate is not None else None
             )
             certificate_valid = certificate is not None and row_identities is not None
             from hub.media_cells import supports_exact_media_cell
-            media_cell_supported = (
-                False if lance_supported else supports_exact_media_cell(
-                    adapter, binding["uri"], resolved_revision_id))
+            media_cell_supported = supports_exact_media_cell(
+                adapter, binding["uri"], resolved_revision_id)
             row_identity = {
                 "datasetId": binding["dataset_id"],
                 "revisionId": resolved_revision_id,
