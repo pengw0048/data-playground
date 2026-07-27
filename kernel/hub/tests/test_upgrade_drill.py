@@ -48,6 +48,27 @@ def test_candidate_identity_uses_wheel_metadata_and_accepts_matching_api(tmp_pat
         {"version": "9.8.7", "sha": "candidate-sha"}, candidate_version, "candidate-sha")
 
 
+def test_candidate_identity_accepts_normalized_development_wheel_metadata(tmp_path) -> None:
+    candidate_version = upgrade_drill.candidate_wheel_version(
+        _candidate_wheel(
+            tmp_path,
+            filename_version="9.8.7.dev0",
+            dist_info_version="9.8.7.dev0",
+            metadata_headers=(
+                ("Metadata-Version", "2.1"),
+                ("Name", "Data.Playground"),
+                ("Version", "9.8.7.dev0"),
+            ),
+        ))
+
+    assert candidate_version == "9.8.7.dev0"
+    upgrade_drill.assert_candidate_identity(
+        {"version": "9.8.7.dev0", "sha": "candidate-sha"}, candidate_version, "candidate-sha")
+    with pytest.raises(RuntimeError, match=r"candidate is not v9\.8\.7\.dev0"):
+        upgrade_drill.assert_candidate_identity(
+            {"version": "9.8.7", "sha": "candidate-sha"}, candidate_version, "candidate-sha")
+
+
 def test_candidate_identity_rejects_api_version_mismatch(tmp_path) -> None:
     candidate_version = upgrade_drill.candidate_wheel_version(_candidate_wheel(tmp_path))
 
@@ -134,11 +155,40 @@ def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
         ("Name", "data-playground"),
         ("Version", "9.8"),
     ),
+    *[
+        (
+            ("Metadata-Version", "2.1"),
+            ("Name", "data-playground"),
+            ("Version", version),
+        )
+        for version in (
+            "9.8.7rc1",
+            "9.8.7.post1",
+            "9.8.7+local",
+            "9.8.7.dev01",
+            "9.8.7.dev",
+        )
+    ],
 ])
 def test_candidate_wheel_metadata_rejects_malformed_headers(tmp_path, metadata_headers) -> None:
     with pytest.raises(RuntimeError) as caught:
         upgrade_drill.candidate_wheel_version(
             _candidate_wheel(tmp_path, metadata_headers=metadata_headers))
+
+    assert str(caught.value) == "candidate wheel has invalid package metadata"
+
+
+def test_candidate_wheel_metadata_rejects_wrong_canonical_name(tmp_path) -> None:
+    with pytest.raises(RuntimeError) as caught:
+        upgrade_drill.candidate_wheel_version(
+            _candidate_wheel(
+                tmp_path,
+                metadata_headers=(
+                    ("Metadata-Version", "2.1"),
+                    ("Name", "another-package"),
+                    ("Version", "9.8.7"),
+                ),
+            ))
 
     assert str(caught.value) == "candidate wheel has invalid package metadata"
 

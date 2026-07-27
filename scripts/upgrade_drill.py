@@ -36,8 +36,8 @@ SOURCE_SUMS_URL = (
     "https://github.com/pengw0048/data-playground/releases/download/v0.1.0/SHA256SUMS"
 )
 _CANDIDATE_METADATA_ERROR = "candidate wheel has invalid package metadata"
-_STRICT_RELEASE_VERSION = re.compile(
-    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+_CANDIDATE_WHEEL_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.dev(?:0|[1-9][0-9]*))?")
 
 
 def run(*command: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -109,7 +109,7 @@ def candidate_wheel_version(wheel: Path) -> str:
     name = headers["Name"][0]
     version = headers["Version"][0]
     canonical_name = re.sub(r"[-_.]+", "-", name).lower()
-    if canonical_name != "data-playground" or not _STRICT_RELEASE_VERSION.fullmatch(version):
+    if canonical_name != "data-playground" or not _CANDIDATE_WHEEL_VERSION.fullmatch(version):
         raise RuntimeError(_CANDIDATE_METADATA_ERROR)
     return version
 
