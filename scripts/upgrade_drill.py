@@ -152,9 +152,11 @@ def assert_candidate_schema(applied_head: str, expected_head: str) -> None:
 def normalize_revision_preview_defaults(preview: dict[str, Any]) -> dict[str, Any]:
     """Fill defaults omitted by older APIs without hiding meaningful schema changes."""
     normalized = json.loads(json.dumps(preview))
+    normalized.setdefault("rowIdentities", None)
     for column in normalized.get("columns", []):
         if isinstance(column, dict):
             column.setdefault("annotations", [])
+            column.setdefault("mediaKind", None)
             column.setdefault("rowReference", None)
     return normalized
 

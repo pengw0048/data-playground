@@ -119,8 +119,10 @@ def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
             "name": "id",
             "type": "int64",
             "annotations": [],
+            "mediaKind": None,
             "rowReference": None,
         }],
+        "rowIdentities": None,
         "rows": [[1]],
     }
     meaningful = {
@@ -128,8 +130,10 @@ def test_revision_preview_normalization_only_fills_missing_defaults() -> None:
             "name": "id",
             "type": "int64",
             "annotations": [{"key": "unit", "value": "meters", "encoding": "utf8"}],
+            "mediaKind": "image",
             "rowReference": {"target": {"kind": "canonical", "datasetId": "owners"}},
         }],
+        "rowIdentities": [{"rowId": "row-1"}],
         "rows": [[1]],
     }
 
