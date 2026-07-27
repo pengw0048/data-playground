@@ -167,6 +167,8 @@ export interface DatasetRevisionDetail extends DatasetRevision {
   summary: DatasetRevisionSummary
   preview: DatasetRevisionPreview
   rowIdentity: DatasetRevisionRowIdentity
+  /** Explicit exact-revision declaration; absent legacy responses fail closed. */
+  mediaCellSupported?: boolean
 }
 
 export interface RowIdentityCertificationPreflight {

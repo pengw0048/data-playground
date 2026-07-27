@@ -866,6 +866,19 @@ class ManagedLocalFileRevisionAdapter:
     revision_as_of_ordering = "latest_committed_at_at_or_before"
     revision_timezone = "UTC"
 
+    def supports_media_cell(self, uri: str, revision_id: str) -> bool:
+        """Declare only a retained immutable managed-local revision as media-readable.
+
+        The later dispatcher still holds the artifact guard and checks the certified identity;
+        this narrow signal is deliberately not inferred from schema annotations or file paths.
+        """
+        from hub import metadb
+
+        try:
+            return metadb.managed_local_file_revision_detail(uri, revision_id) is not None
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return False
+
     def revision_history(self, uri: str, *, limit: int, cursor: str | None = None) -> tuple[list[dict], str | None]:
         from hub import metadb
 

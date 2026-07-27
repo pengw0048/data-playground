@@ -173,6 +173,7 @@ def test_lance_revision_history_resolves_and_opens_an_exact_version(tmp_path):
         "fields": [],
         "encodingVersion": None,
     }
+    assert detail["mediaCellSupported"] is False
     assert LanceAdapter().open_revision(uri, exact).fetchall() == [(1,)]
 
 

@@ -9,18 +9,22 @@ import os
 import re
 import stat
 import uuid
+from dataclasses import dataclass
+from typing import Literal
 
 import duckdb
 
 from hub import db, metadb, paths
 from hub.models import MediaCellRequest
 from hub.plugins.adapters import is_object_uri, object_fs
+from hub.plugins.adapters import RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable
 from hub.plugins.capabilities import (
     media_content_type_from_bytes,
     media_kind_from_value,
 )
 from hub.sqlpolicy import quote_identifier
 from hub.storage import ManagedSourceReadError, source_read_scope
+from hub.workspace_providers import ProviderDatasetGone, ProviderDatasetOffline, ProviderDatasetUnavailable
 
 MEDIA_CELL_MAX_BYTES = 16 * 1024 * 1024
 _INTEGER_RANGES = {
@@ -83,6 +87,34 @@ class MediaCellSourceDenied(MediaCellError):
 
 class MediaCellUnavailable(MediaCellError):
     pass
+
+
+class MediaCellOffline(MediaCellError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExactMediaCellRead:
+    """Core-owned input passed to an opted-in exact media-cell adapter.
+
+    The URI stays in the adapter dispatch argument.  This value deliberately contains no storage
+    location, provider configuration, credential, native row id, or positional row address.
+    """
+
+    dataset_id: str
+    revision_id: str
+    identity: tuple[object, ...]
+    column: str
+    max_bytes: int
+    expected_kind: Literal["image", "video"] | None
+
+
+@dataclass(frozen=True)
+class ExactMediaCellResult:
+    """One claimed media payload; core revalidates both bytes and claimed type."""
+
+    content: bytes
+    content_type: str
 
 
 def _identity_values(request: MediaCellRequest, certificate) -> list[object]:
@@ -312,3 +344,122 @@ def read_managed_local_media_cell(
     if expected_kind in {"image", "video"} and kind != expected_kind:
         raise MediaCellUnsupported("media cell value is unsupported")
     return content, content_type
+
+
+def supports_exact_media_cell(adapter: object, dataset_uri: str, revision_id: str) -> bool:
+    """Return an explicit, revision-scoped capability signal without guessing from metadata."""
+    try:
+        probe = getattr(adapter, "supports_media_cell", None)
+        if not callable(probe):
+            return False
+        return probe(dataset_uri, revision_id) is True
+    except (MediaCellError, PermissionError, ConnectionError, TimeoutError,
+            RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable,
+            ProviderDatasetGone, ProviderDatasetOffline, ProviderDatasetUnavailable):
+        raise
+    except Exception:  # noqa: BLE001 -- malformed optional capabilities fail closed
+        return False
+
+
+def read_exact_media_cell(
+        *, storage, adapter: object, dataset_uri: str, dataset_id: str, revision_id: str,
+        request: MediaCellRequest, max_bytes: int = MEDIA_CELL_MAX_BYTES,
+) -> tuple[bytes, str]:
+    """Dispatch one bounded exact media read while retaining the existing Parquet path unchanged."""
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ValueError("media cell response limit must be positive")
+
+    try:
+        supported = supports_exact_media_cell(adapter, dataset_uri, revision_id)
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise MediaCellSourceDenied("media cell source is not permitted") from exc
+    except (ConnectionError, TimeoutError, RevisionProviderOffline, ProviderDatasetOffline) as exc:
+        raise MediaCellOffline("media cell provider is offline") from exc
+    except (RevisionUnavailable, ProviderDatasetGone, ProviderDatasetUnavailable) as exc:
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+
+    # Managed-local Parquet owns artifact guards, identity certificates, source policy, and the
+    # string-reference path.  Keep that mature implementation intact behind the common dispatcher.
+    from hub.plugins.adapters import ManagedLocalFileRevisionAdapter
+    if isinstance(adapter, ManagedLocalFileRevisionAdapter):
+        if not supported:
+            raise MediaCellUnavailable("media cell revision is unavailable")
+        return read_managed_local_media_cell(
+            storage=storage, dataset_uri=dataset_uri, dataset_id=dataset_id,
+            revision_id=revision_id, request=request, max_bytes=max_bytes)
+    if not supported:
+        raise MediaCellUnsupported("media cell value is unsupported")
+    try:
+        reader = getattr(adapter, "read_media_cell", None)
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise MediaCellSourceDenied("media cell source is not permitted") from exc
+    except (ConnectionError, TimeoutError, RevisionProviderOffline, ProviderDatasetOffline) as exc:
+        raise MediaCellOffline("media cell provider is offline") from exc
+    except (RevisionUnavailable, ProviderDatasetGone, ProviderDatasetUnavailable) as exc:
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 -- malformed optional method discovery fails closed
+        raise MediaCellUnsupported("media cell value is unsupported") from exc
+    if not callable(reader):
+        raise MediaCellUnsupported("media cell value is unsupported")
+    # Generic adapters own their certified identity proof, but core still validates the public
+    # typed representation against the exact schema-derived key descriptor supplied by the adapter.
+    # The descriptor is intentionally returned separately so an adapter cannot reinterpret a client
+    # value as a physical row reference.
+    try:
+        columns = adapter.revision_schema(dataset_uri, revision_id)
+        column = _media_column(columns, request.column)
+    except MediaCellError:
+        raise
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise MediaCellSourceDenied("media cell source is not permitted") from exc
+    except (ConnectionError, TimeoutError, RevisionProviderOffline, ProviderDatasetOffline) as exc:
+        raise MediaCellOffline("media cell provider is offline") from exc
+    except (RevisionUnavailable, ProviderDatasetGone, ProviderDatasetUnavailable) as exc:
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 -- provider schema details stay sanitized
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+    try:
+        descriptor = adapter.media_cell_identity_descriptor(dataset_uri, revision_id)
+        identity = tuple(_identity_values(request, descriptor))
+    except MediaCellError:
+        raise
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise MediaCellSourceDenied("media cell source is not permitted") from exc
+    except (ConnectionError, TimeoutError, RevisionProviderOffline, ProviderDatasetOffline) as exc:
+        raise MediaCellOffline("media cell provider is offline") from exc
+    except (RevisionUnavailable, ProviderDatasetGone, ProviderDatasetUnavailable) as exc:
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 -- provider identity details stay sanitized
+        raise MediaCellIdentityUnavailable("media cell row identity is unavailable") from exc
+
+    read = ExactMediaCellRead(
+        dataset_id=dataset_id, revision_id=revision_id, identity=identity,
+        column=column.name, max_bytes=max_bytes,
+        expected_kind=column.media_kind if column.media_kind in {"image", "video"} else None,
+    )
+    try:
+        result = reader(dataset_uri, read)
+    except MediaCellError:
+        raise
+    except (PermissionError, RevisionPermissionLost) as exc:
+        raise MediaCellSourceDenied("media cell source is not permitted") from exc
+    except (ConnectionError, TimeoutError, RevisionProviderOffline, ProviderDatasetOffline) as exc:
+        raise MediaCellOffline("media cell provider is offline") from exc
+    except (KeyError, LookupError, FileNotFoundError, RevisionUnavailable,
+            ProviderDatasetGone, ProviderDatasetUnavailable) as exc:
+        raise MediaCellUnavailable("media cell revision is unavailable") from exc
+    except Exception as exc:  # noqa: BLE001 -- never expose provider details at the public boundary
+        raise MediaCellUnavailable("media cell is unavailable") from exc
+    if not isinstance(result, ExactMediaCellResult):
+        raise MediaCellUnsupported("media cell value is unsupported")
+    if not isinstance(result.content, bytes) or not isinstance(result.content_type, str):
+        raise MediaCellUnsupported("media cell value is unsupported")
+    if len(result.content) > max_bytes:
+        raise MediaCellTooLarge("media cell exceeds the response limit")
+    detected = media_content_type_from_bytes(result.content)
+    if detected is None:
+        raise MediaCellUnsupported("media cell value is unsupported")
+    kind, content_type = detected
+    if read.expected_kind is not None and kind != read.expected_kind:
+        raise MediaCellUnsupported("media cell value is unsupported")
+    return result.content, content_type

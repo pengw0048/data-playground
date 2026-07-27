@@ -1287,6 +1287,11 @@
             "title": "Datasetid",
             "type": "string"
           },
+          "mediaCellSupported": {
+            "default": false,
+            "title": "Mediacellsupported",
+            "type": "boolean"
+          },
           "name": {
             "anyOf": [
               {

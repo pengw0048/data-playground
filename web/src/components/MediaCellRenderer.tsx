@@ -13,6 +13,7 @@ export interface ExactMediaCellContext {
   identity: MediaCellIdentityValue[] | null
   proofStatus: 'certified' | 'unavailable'
   certificationSupported: boolean
+  mediaCellSupported: boolean
   onOpenCertification?: () => void
 }
 
@@ -145,7 +146,7 @@ export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 
     }
   })()
   const requestKey = requestFingerprint(exact, column)
-  const endpointNeeded = !publicDirect && value != null && !!exact
+  const endpointNeeded = !publicDirect && value != null && exact?.mediaCellSupported === true
   const displayKey = publicDirect ? `direct:${value}` : requestKey
   const [remote, setRemote] = useState<RemoteMedia | null>(null)
   const [failure, setFailure] = useState<Failure | null>(null)
@@ -241,6 +242,7 @@ export function MediaCellRenderer({ value, column, mediaKind, exact, viewport = 
         : failureForRequest ? <State action={failureForRequest.canOpenCertification ? exact?.onOpenCertification : undefined}>{failureForRequest.message}</State>
             : publicDirect ? <State>This public media URL is not a supported image or video.</State>
               : !exact ? <State>Open an exact certified revision to view this media.</State>
+                : !exact.mediaCellSupported ? <State>This exact revision does not support bounded media-cell reads.</State>
             : exact.proofStatus !== 'certified' ? <State action={exact.certificationSupported ? exact.onOpenCertification : undefined}>
               {exact.certificationSupported
                 ? 'Certify row identity to open media from this exact revision.'
