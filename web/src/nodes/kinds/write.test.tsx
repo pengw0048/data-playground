@@ -28,7 +28,7 @@ vi.mock('../../api/client', () => ({
 
 import './write'
 import { getComponent } from '../registry'
-import { useStore } from '../../store/graph'
+import { useStore, writeAdmissionFingerprint } from '../../store/graph'
 import { KernelError } from '../../api/client'
 
 describe('Write card — typed local mode truth', () => {
@@ -43,16 +43,7 @@ describe('Write card — typed local mode truth', () => {
         } },
       }],
     }
-    const { version: _version, ...executionDoc } = doc
-    const fingerprint = JSON.stringify({
-      ...executionDoc,
-      nodes: doc.nodes.map((node) => {
-        const { position: _position, ...executionNode } = node
-        const { status: _status, ...data } = node.data
-        return { ...executionNode, data }
-      }),
-      parameterBindings: [],
-    })
+    const fingerprint = writeAdmissionFingerprint(doc, 'write')
     useStore.setState({
       canvasRole: 'owner', kernelUp: true, doc,
       runs: { write: { phase: 'idle', writeAdmissionFingerprint: fingerprint, writeAdmission: {
@@ -95,19 +86,58 @@ describe('Write card — typed local mode truth', () => {
     },
   )
 
+  it('refreshes an in-flight admission when an indirect upstream edge changes', async () => {
+    const sourceA = {
+      id: 'source-a', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'source-a', status: 'draft', config: {} },
+    }
+    const sourceB = {
+      id: 'source-b', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'source-b', status: 'draft', config: {} },
+    }
+    const transform = {
+      id: 'transform', type: 'filter', position: { x: 0, y: 0 },
+      data: { title: 'transform', status: 'draft', config: {} },
+    }
+    const write = useStore.getState().doc.nodes[0]
+    const doc = {
+      id: 'c', version: 1, name: 'write', requirements: [],
+      nodes: [sourceA, sourceB, transform, write],
+      edges: [
+        { id: 'source-transform', source: 'source-a', target: 'transform' },
+        { id: 'transform-write', source: 'transform', target: 'write' },
+      ],
+    }
+    const stale = {
+      nodeId: 'write', managed: true, destination: '/outputs/existing.lance',
+      mode: 'append' as const, provider: 'managed-local-lance', expectedSchema: [], partitions: [],
+    }
+    const fresh = { ...stale, expectedSchema: [{ name: 'replacement', type: 'string' }] }
+    let resolveStale!: (value: typeof stale) => void
+    apiMocks.writeAdmission
+      .mockImplementationOnce(() => new Promise<typeof stale>((resolve) => { resolveStale = resolve }))
+      .mockResolvedValueOnce(fresh)
+    useStore.setState({ doc, runs: {} } as any)
+    const Write = getComponent('write')!
+
+    render(<TooltipProvider><ReactFlowProvider><Write id="write" data={write.data} /></ReactFlowProvider></TooltipProvider>)
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      useStore.getState().reconnectEdge('source-transform', {
+        id: 'replacement-edge-id', source: 'source-b', target: 'transform',
+      })
+    })
+    await waitFor(() => expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2))
+    await act(async () => { resolveStale(stale) })
+
+    await waitFor(() => expect(useStore.getState().runs.write.writeAdmission).toEqual(fresh))
+  })
+
   it('re-admits after terminal cleanup without reusing the completed submission or polling', async () => {
     const doc = useStore.getState().doc
     const data = doc.nodes[0].data
-    const { version: _version, ...executionDoc } = doc
-    const fingerprint = JSON.stringify({
-      ...executionDoc,
-      nodes: doc.nodes.map((node) => {
-        const { position: _position, ...executionNode } = node
-        const { status: _status, ...nodeData } = node.data
-        return { ...executionNode, data: nodeData }
-      }),
-      parameterBindings: [],
-    })
+    const fingerprint = writeAdmissionFingerprint(doc, 'write')
     useStore.setState({
       runs: { write: {
         phase: 'running', writeSubmissionId: 'completed-submission',

@@ -425,16 +425,17 @@ function currentPreviewBinding(state: Store, nodeId: string): PreviewBindingStat
   return retained && previewBindingIsCurrent(retained, state.doc, nodeId, parameterBindings) ? retained : undefined
 }
 
-function writeAdmissionFingerprint(doc: CanvasDoc, parameterBindings?: CanvasParameterBinding[]): string {
-  const { version: _version, ...executionDoc } = doc
+export function writeAdmissionFingerprint(
+  doc: CanvasDoc,
+  nodeId: string,
+  parameterBindings?: CanvasParameterBinding[],
+): string {
+  // Write admission certifies one executable target cone.  Match the existing preview/profile
+  // identity rather than fencing a response on canvas presentation (positions, run history,
+  // transient status, edge ids) or unrelated branches.
   return JSON.stringify({
-    ...executionDoc,
-    nodes: doc.nodes.map((node) => {
-      const { position: _position, ...executionNode } = node
-      const { status: _status, ...data } = node.data
-      return { ...executionNode, data }
-    }),
-    parameterBindings: parameterBindings ?? [],
+    plan: targetExecutionPlanIdentity(doc, nodeId),
+    parameterBindings: parameterBindingsIdentity(parameterBindings),
   })
 }
 
@@ -475,6 +476,9 @@ interface RunState {
   writeOutcomeAdmission?: WriteAdmission
   writeSubmissionId?: string
   writeAdmissionFingerprint?: string
+  // Bumped whenever a non-running Write's executable inputs change. The Write card consumes this
+  // explicit signal so an indirect upstream edit cannot strand an in-flight admission request.
+  writeAdmissionGeneration?: number
   parameterBindings?: CanvasParameterBinding[]
   parametersReady?: boolean
   parameterContractFingerprint?: string
@@ -1309,11 +1313,16 @@ function invalidateWriteAdmissions(
     if (doc.nodes.find((node) => node.id === nodeId)?.type !== 'write') continue
     const current = next[nodeId]
     if (!current) continue
+    // A managed run may have reached the server even if its response is lost. Keep its certified
+    // admission/submission identity intact while it is in flight so the explicit retry path stays
+    // idempotent; a later terminal retry will re-admit against the edited graph if necessary.
+    if (current.phase === 'running') continue
     next[nodeId] = {
       ...current,
       writeAdmission: undefined,
       writeSubmissionId: undefined,
       writeAdmissionFingerprint: undefined,
+      writeAdmissionGeneration: (current.writeAdmissionGeneration ?? 0) + 1,
     }
   }
   return next
@@ -2364,7 +2373,7 @@ export const useStore = create<Store>((set, get) => ({
     const node = doc.nodes.find((candidate) => candidate.id === id)
     if (node?.type !== 'write') return undefined
     const parameterBindings = get().runs[id]?.parameterBindings
-    const fingerprint = writeAdmissionFingerprint(doc, parameterBindings)
+    const fingerprint = writeAdmissionFingerprint(doc, id, parameterBindings)
     const existing = get().runs[id]
     if (existing?.writeAdmission && existing.writeAdmissionFingerprint === fingerprint) {
       return existing.writeAdmission
@@ -2384,7 +2393,7 @@ export const useStore = create<Store>((set, get) => ({
     if (current?.writeSubmissionId !== submissionId
         || current.writeAdmissionFingerprint !== fingerprint
         || writeAdmissionFingerprint(
-          get().doc, get().runs[id]?.parameterBindings) !== fingerprint) return undefined
+          get().doc, id, get().runs[id]?.parameterBindings) !== fingerprint) return undefined
     set((s) => ({ runs: { ...s.runs, [id]: {
       ...(s.runs[id] ?? { phase: 'idle' as const }), writeAdmission: admission,
     } } }))

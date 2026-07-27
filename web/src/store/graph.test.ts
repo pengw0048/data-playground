@@ -524,6 +524,112 @@ describe('graph store — core authority ops', () => {
     expect(apiMocks.writeAdmission.mock.calls[0][2]).not.toBe('old-submission')
   })
 
+  it('accepts only the refreshed admission after an indirect upstream edge changes in flight', async () => {
+    const sourceA = NODE('source-a')
+    const sourceB = NODE('source-b')
+    const transform = NODE('transform', 'filter')
+    const write = NODE('write', 'write')
+    const stale = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
+    }
+    const fresh = { ...stale, expectedSchema: [{ name: 'replacement', type: 'string' }] }
+    let resolveStale!: (value: typeof stale) => void
+    apiMocks.writeAdmission
+      .mockImplementationOnce(() => new Promise<typeof stale>((resolve) => { resolveStale = resolve }))
+      .mockResolvedValueOnce(fresh)
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [],
+        nodes: [sourceA, sourceB, transform, write],
+        edges: [
+          { id: 'source-transform', source: 'source-a', target: 'transform' },
+          { id: 'transform-write', source: 'transform', target: 'write' },
+        ],
+      },
+      runs: {},
+    } as any)
+
+    const first = useStore.getState().prepareWrite('write')
+    useStore.getState().reconnectEdge('source-transform', {
+      id: 'replacement-edge-id', source: 'source-b', target: 'transform',
+    })
+    const second = useStore.getState().prepareWrite('write')
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().runs.write.writeAdmissionGeneration).toBe(1)
+    resolveStale(stale)
+    await expect(first).resolves.toBeUndefined()
+    await expect(second).resolves.toEqual(fresh)
+    expect(useStore.getState().runs.write.writeAdmission).toEqual(fresh)
+  })
+
+  it('keeps a running managed Write identity across an upstream edge edit', () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
+      intent: { idempotencyKey: 'managed-write-key' },
+    }
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+      runs: { write: {
+        phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
+        writeAdmissionFingerprint: 'admitted-graph', writeAdmissionGeneration: 4,
+      } },
+    } as any)
+
+    useStore.getState().removeEdge('source-write')
+
+    expect(useStore.getState().runs.write).toMatchObject({
+      phase: 'running', writeAdmission: admission, writeSubmissionId: 'managed-submission',
+      writeAdmissionFingerprint: 'admitted-graph', writeAdmissionGeneration: 4,
+    })
+  })
+
+  it('does not fence an in-flight Write admission on presentation-only canvas changes', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    const admission = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet',
+      mode: 'create' as const, provider: 'managed-local-file', expectedSchema: [], partitions: [],
+    }
+    let resolveAdmission!: (value: typeof admission) => void
+    apiMocks.writeAdmission.mockImplementationOnce(() => new Promise<typeof admission>((resolve) => {
+      resolveAdmission = resolve
+    }))
+    useStore.setState({
+      doc: {
+        id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+        edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+      },
+    } as any)
+
+    const pending = useStore.getState().prepareWrite('write')
+    useStore.setState((state) => ({
+      doc: {
+        ...state.doc,
+        nodes: state.doc.nodes.map((node) => node.id === 'write' ? {
+          ...node, position: { x: 400, y: 200 },
+          data: {
+            ...node.data, status: 'latest', history: [{ label: 'run · 1 output' }],
+            lastRun: { outputCount: 1, ms: 12, placement: 'local' },
+          },
+        } : node),
+        edges: state.doc.edges.map((edge) => ({ ...edge, id: 'renamed-presentation-edge' })),
+      },
+    }))
+    resolveAdmission(admission)
+
+    await expect(pending).resolves.toEqual(admission)
+    expect(useStore.getState().runs.write.writeAdmission).toEqual(admission)
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
+  })
+
   it('does not treat a non-Section config.outputs field as a port declaration', () => {
     const plugin = NODE('plugin', 'configured-plugin')
     const sink = NODE('sink', 'write')
