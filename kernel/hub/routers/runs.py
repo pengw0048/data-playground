@@ -1213,6 +1213,7 @@ def write_admission(
     _require_graph_read_access(req.graph, uid)
     deps = get_deps()
     graph = _resolve_parameters(req.graph, req.parameter_bindings, req.node_id, deps)
+    graph = _target_execution_graph(graph, req.node_id)
     graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
     if req.input_manifest is not None:
         graph = _bind_local_run_manifest(graph, req.input_manifest, deps, req.node_id)

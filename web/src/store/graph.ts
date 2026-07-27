@@ -257,11 +257,15 @@ function compareIdentityText(a: string, b: string): number {
 }
 
 // Preview and profile requests execute the same target-scoped graph cone on the server. Keep one
-// canonical document identity for every client-side consumer: unrelated branches, array ordering,
-// positions, edge ids, selection, and transient node status are presentation-only; requirements,
-// executable node data, wiring, and section containment affect execution. Titles are included because
-// metric output and section-child aliases execute from them.
-function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: string): string {
+// canonical document identity for every client-side consumer. Write admission additionally observes
+// ordered edge ids and upstream node status because structural validation and placement ownership
+// use them. The target Write's own transient lifecycle status is not an input to its retry identity.
+function targetExecutionPlanIdentity(
+  doc: CanvasDoc,
+  nodeId: string,
+  portId?: string,
+  writeAdmission = false,
+): string {
   const executableNodes = doc.nodes.filter((node) => node.type !== 'note' && node.type !== 'code')
   const byId = new Map(executableNodes.map((node) => [node.id, node]))
   const incoming = new Map<string, string[]>()
@@ -305,19 +309,23 @@ function targetExecutionPlanIdentity(doc: CanvasDoc, nodeId: string, portId?: st
       config: node.data.config,
       bypassed: !!node.data.bypassed,
       disabled: !!node.data.disabled,
+      ...(writeAdmission && node.id !== nodeId ? { status: node.data.status } : {}),
     }))
   const edges = doc.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
     .map((edge) => ({
+      ...(writeAdmission ? { id: edge.id } : {}),
       source: edge.source,
       target: edge.target,
       sourceHandle: edge.sourceHandle ?? null,
       targetHandle: edge.targetHandle ?? null,
       wire: edge.data?.wire ?? 'dataset',
     }))
-    .sort((a, b) => compareIdentityText(
+  if (!writeAdmission) {
+    edges.sort((a, b) => compareIdentityText(
       [a.source, a.target, a.sourceHandle ?? '', a.targetHandle ?? '', a.wire].join('\u0000'),
       [b.source, b.target, b.sourceHandle ?? '', b.targetHandle ?? '', b.wire].join('\u0000'),
     ))
+  }
 
   return JSON.stringify(canonicalIdentityValue({
     schema: 1,
@@ -431,11 +439,11 @@ export function writeAdmissionFingerprint(
   parameterBindings?: CanvasParameterBinding[],
   inputManifest?: RunInputManifestItem[],
 ): string {
-  // Write admission certifies one executable target cone.  Match the existing preview/profile
-  // identity rather than fencing a response on canvas presentation (positions, run history,
-  // transient status, edge ids) or unrelated branches.
+  // Write admission certifies one ordered executable target cone. Include upstream node status and
+  // edge ids because backend ownership planning and structural validation observe them; ignore the
+  // target Write's lifecycle status, canvas presentation, and unrelated branches.
   return JSON.stringify({
-    plan: targetExecutionPlanIdentity(doc, nodeId),
+    plan: targetExecutionPlanIdentity(doc, nodeId, undefined, true),
     declarations: targetParameterDeclarations(doc, nodeId)
       .map((declaration) => canonicalIdentityValue({
         name: declaration.name,
@@ -454,8 +462,7 @@ export function writeAdmissionFingerprint(
         dataset_id: item.dataset_id,
         revision_id: item.revision_id,
         provider: item.provider,
-      }))
-      .sort((left, right) => compareIdentityText(JSON.stringify(left), JSON.stringify(right))),
+      })),
   })
 }
 
@@ -3432,18 +3439,20 @@ export const useStore = create<Store>((set, get) => ({
           } }))
         : s.doc.nodes
       const runs = executionChanged
-        ? Object.fromEntries(Object.entries(s.runs).map(([nodeId, run]) => [nodeId, {
-            ...run,
-            parametersReady: false,
-            estimate: undefined,
-            parameterBindings: run.parameterBindings?.flatMap((binding) => {
-              const renamed = mutation.renames.get(binding.name) ?? binding.name
-              return mutation.changedTypes.has(renamed) ? [] : [{ ...binding, name: renamed }]
-            }),
-            writeAdmission: undefined,
-            writeSubmissionId: undefined,
-            writeAdmissionFingerprint: undefined,
-          }]))
+        ? Object.fromEntries(Object.entries(s.runs).map(([nodeId, run]) => run.phase === 'running'
+          ? [nodeId, run]
+          : [nodeId, {
+              ...run,
+              parametersReady: false,
+              estimate: undefined,
+              parameterBindings: run.parameterBindings?.flatMap((binding) => {
+                const renamed = mutation.renames.get(binding.name) ?? binding.name
+                return mutation.changedTypes.has(renamed) ? [] : [{ ...binding, name: renamed }]
+              }),
+              writeAdmission: undefined,
+              writeSubmissionId: undefined,
+              writeAdmissionFingerprint: undefined,
+            }]))
         : s.runs
       return {
         doc: { ...s.doc, nodes, parameters }, runs,

@@ -966,6 +966,39 @@ def test_write_admission_api_returns_the_frozen_camel_case_contract(
     assert body["intent"]["expectedSchema"] == body["expectedSchema"]
 
 
+def test_write_admission_validates_only_the_target_execution_cone(
+        contract, monkeypatch):
+    deps, graph = contract
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    payload = graph.model_dump(by_alias=True, mode="json")
+    payload["nodes"].append({
+        "id": "unrelated", "type": "filter", "data": {"config": {}},
+    })
+    payload["edges"].append({
+        "id": "bad-unrelated", "source": "missing", "target": "unrelated",
+    })
+
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61222222-2222-4222-8222-222222222222",
+    })
+
+    assert response.status_code == 200, response.text
+
+    payload["edges"].append({
+        "id": "source-write", "source": "source", "target": "write",
+    })
+    response = TestClient(app).post("/api/run/write-admission", json={
+        "graph": payload,
+        "nodeId": "write",
+        "submissionId": "61333333-3333-4333-8333-333333333333",
+    })
+
+    assert response.status_code == 400, response.text
+    assert "duplicate edge id 'source-write'" in response.json()["detail"]
+
+
 def test_local_runner_consumes_frozen_intent_and_publishes_receipt(
         contract, monkeypatch):
     from hub.compiler import compile_plan
