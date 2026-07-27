@@ -1,0 +1,3 @@
+name = "dp-revision-access-fixture"
+version = "0.1.0"
+min_core_api = 2

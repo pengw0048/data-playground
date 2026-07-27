@@ -232,6 +232,29 @@ is not conformant. Core may call this capability with an empty tuple during full
 rebind to prove the exact revision is still retained without reading rows, when the adapter has no
 `revision_schema` metadata capability. Omit the method when the adapter cannot make that guarantee.
 
+Exact-revision adapters report stable access outcomes through the public SDK:
+
+```python
+from hub.sdk import (
+    RevisionPermissionLost,
+    RevisionProviderOffline,
+    RevisionResolutionAmbiguous,
+    RevisionUnavailable,
+    raise_revision_access_error_from_os,
+)
+```
+
+Raise the exception matching the provider's structured native status directly. Use
+`raise_revision_access_error_from_os(exc)` only for OS/object-store-style failures, including clients
+that erase standard errno evidence into an exception wrapper. The helper preserves a deliberately
+small policy: permission errors become `RevisionPermissionLost`, temporary network and DNS failures
+become `RevisionProviderOffline`, and all other inputs become `RevisionUnavailable`. It does not infer
+meaning from HTTP status codes, define retry policy, or replace provider-native error handling.
+`RevisionResolutionAmbiguous` remains the direct signal for an ordering boundary that cannot prove one
+exact revision. See
+[`dp_revision_access_fixture`](../examples/plugins/dp_revision_access_fixture/) for the minimal
+adapter boundary.
+
 ### Field metadata and typed row references
 
 `schema(uri)` returns the current `ColumnSchema` wire model. An adapter may attach up to 32
@@ -719,6 +742,8 @@ fixtures exercise public contracts without becoming default product services.
   and IR hook share one generated operator, so it runs on Ray too.
 - [`dp_exact_row_fixture`](../examples/plugins/dp_exact_row_fixture/) — `add_node` (+ `prepare`):
   minimal full-pass exact Source native-row restriction.
+- [`dp_revision_access_fixture`](../examples/plugins/dp_revision_access_fixture/) — `add_adapter`:
+  public exact-revision access exceptions and narrow OS/object-store failure translation.
 - [`dp_similarity_dedup`](../examples/plugins/dp_similarity_dedup/) — `add_node`: cluster near-duplicate
   rows by embedding cosine distance; adds `dup_group` + `is_representative`. Brute-force O(n²) —
   preview on a `sample` first.

@@ -24,7 +24,10 @@ Example plugin (`plugins/mypack/__init__.py`):
 
 from __future__ import annotations
 
+import errno
 import logging
+import re
+import socket
 import threading
 from dataclasses import dataclass
 from typing import Callable, TypeVar
@@ -39,13 +42,87 @@ __all__ = [
     "NodeSpec", "ParamSpec", "PortSpec", "WireType", "ctx", "identifier", "quote_identifier",
     "close_resources", "DatasetBinding", "ImmediateInput", "ImmediateInputPort",
     "ImmediateInputs", "ExactSourceRowRestriction", "NodePreparation",
-    "UnsupportedUpstreamError",
+    "UnsupportedUpstreamError", "RevisionUnavailable", "RevisionPermissionLost",
+    "RevisionProviderOffline", "RevisionResolutionAmbiguous",
+    "raise_revision_access_error_from_os",
 ]
 
 _T = TypeVar("_T")
 _RESOURCES: dict[str, object] = {}   # process-global warm handles, kept alive across batches AND runs
 _RESOURCE_LOCK = threading.RLock()   # REENTRANT: a factory may itself call ctx.resource() for another key
 _MISSING = object()                  # sentinel so a factory returning None is still cached (not rebuilt)
+
+
+class RevisionUnavailable(RuntimeError):
+    """An exact provider-native revision cannot be opened; callers must never fall back to head."""
+
+
+class RevisionPermissionLost(RuntimeError):
+    """An exact revision still has identity, but the provider now denies access to it."""
+
+
+class RevisionProviderOffline(RuntimeError):
+    """An exact revision could not be checked because its provider is temporarily unreachable."""
+
+
+class RevisionResolutionAmbiguous(RuntimeError):
+    """A provider cannot prove one exact revision for the requested ordering boundary."""
+
+
+_OS_ERROR = re.compile(r"\bos error\s+(\d+)\b", re.IGNORECASE)
+_PERMISSION_ERRNOS = {errno.EACCES, errno.EPERM}
+_OFFLINE_ERRNOS = {
+    errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET, errno.EHOSTUNREACH,
+    errno.ENETDOWN, errno.ENETRESET, errno.ENETUNREACH, errno.ETIMEDOUT,
+}
+_PERMISSION_MARKERS = ("permission denied", "access denied", "operation not permitted")
+_OFFLINE_MARKERS = (
+    "connection refused", "connection reset", "connection timed out", "host is unreachable",
+    "network is down", "network is unreachable", "temporary failure in name resolution",
+)
+
+
+def _revision_error_chain(exc: BaseException):
+    """Yield one finite provider error chain, including wrappers that preserve only context."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _os_error_evidence(error: BaseException) -> tuple[set[int], str]:
+    """Extract standard OS evidence, including wrappers such as pylance's plain ValueError."""
+    message = str(error).lower()
+    numbers = {int(match) for match in _OS_ERROR.findall(message)}
+    number = getattr(error, "errno", None)
+    if isinstance(number, int):
+        numbers.add(number)
+    return numbers, message
+
+
+def raise_revision_access_error_from_os(exc: Exception) -> None:
+    """Translate one OS/object-store-style failure into the stable revision-access taxonomy.
+
+    This intentionally recognizes only standard exception types, errno evidence, and the small set of
+    messages emitted by OS wrappers used by compatible object-store clients. Providers with structured
+    native status codes must map those codes directly instead of passing them through this helper.
+    """
+    chain = list(_revision_error_chain(exc))
+    if any(isinstance(error, PermissionError) for error in chain):
+        raise RevisionPermissionLost("revision_permission_lost") from exc
+    if any(isinstance(error, (ConnectionError, TimeoutError, socket.gaierror))
+           for error in chain):
+        raise RevisionProviderOffline("revision_provider_offline") from exc
+    evidence = [_os_error_evidence(error) for error in chain]
+    if any(numbers & _PERMISSION_ERRNOS or any(marker in message for marker in _PERMISSION_MARKERS)
+           for numbers, message in evidence):
+        raise RevisionPermissionLost("revision_permission_lost") from exc
+    if any(numbers & _OFFLINE_ERRNOS or any(marker in message for marker in _OFFLINE_MARKERS)
+           for numbers, message in evidence):
+        raise RevisionProviderOffline("revision_provider_offline") from exc
+    raise RevisionUnavailable("revision_unavailable") from exc
 
 
 @dataclass(frozen=True)
