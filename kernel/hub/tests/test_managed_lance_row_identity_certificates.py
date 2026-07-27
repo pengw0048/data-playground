@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -11,6 +13,7 @@ from sqlalchemy import func, select
 
 from hub import metadb
 from hub.models import ExactDatasetRef
+from hub.plugins import adapters as adapter_module
 from hub.plugins.adapters import DuckDBAdapter, LanceAdapter
 from hub.plugins.catalog import InMemoryCatalog
 from hub.row_identity import (
@@ -55,6 +58,16 @@ def _registered_lance(tmp_path, table: pa.Table):
     revision = LanceAdapter().resolve_revision(uri)["revision_id"]
     return lance, catalog, registered, binding, ExactDatasetRef(
         kind="exact", dataset_id=binding["dataset_id"], revision_id=revision)
+
+
+def _exact_local_tracked_file(lance, uri: str, revision_id: str, member_type: str) -> Path:
+    rows = lance.dataset(uri, version=int(revision_id)).tracked_files().read_all().to_pylist()
+    matches = [
+        row for row in rows
+        if row["version"] == int(revision_id) and row["type"] == member_type
+    ]
+    assert len(matches) == 1
+    return Path(str(matches[0]["base_uri"])) / str(matches[0]["path"])
 
 
 def test_lance_certificate_replays_exactly_and_persists_no_raw_source_data(tmp_path):
@@ -143,6 +156,49 @@ def test_lance_certificate_load_revalidates_the_fence_without_a_row_scan(tmp_pat
     monkeypatch.setattr(LanceAdapter, "exact_revision_incarnation", changed_incarnation)
     monkeypatch.setattr(LanceAdapter, "open_revision_projection", must_not_scan)
     assert managed_local_lance_row_identity_certificate(exact, ["id"]) is None
+
+
+def test_lance_certificate_rejects_a_missing_tracked_data_file(tmp_path):
+    lance, _catalog, registered, _binding, exact = _registered_lance(tmp_path, pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+    }))
+    certify_and_persist_managed_local_lance_row_identity(exact, ["id"])
+    _exact_local_tracked_file(lance, registered.uri, exact.revision_id, "data file").unlink()
+
+    with pytest.raises(Exception):
+        lance.dataset(registered.uri, version=int(exact.revision_id)).to_table()
+    with pytest.raises(RowIdentityUnavailable):
+        managed_local_lance_row_identity_certificate(exact, ["id"])
+
+
+def test_lance_certificate_rejects_a_same_path_data_file_rewrite(tmp_path):
+    lance, _catalog, registered, _binding, exact = _registered_lance(tmp_path, pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+    }))
+    certify_and_persist_managed_local_lance_row_identity(exact, ["id"])
+    replacement_uri = str(tmp_path / f"replacement-{uuid.uuid4().hex}.lance")
+    lance.write_dataset(pa.table({"id": pa.array([9, 10], type=pa.int64())}), replacement_uri)
+    target = _exact_local_tracked_file(lance, registered.uri, exact.revision_id, "data file")
+    replacement = _exact_local_tracked_file(lance, replacement_uri, "1", "data file")
+    shutil.copyfile(replacement, target)
+
+    assert lance.dataset(registered.uri, version=int(exact.revision_id)).to_table()["id"].to_pylist() == [9, 10]
+    assert managed_local_lance_row_identity_certificate(exact, ["id"]) is None
+
+
+def test_lance_certificate_rejects_tracked_evidence_over_its_object_bound(tmp_path, monkeypatch):
+    _lance, _catalog, _registered, binding, exact = _registered_lance(tmp_path, pa.table({
+        "id": pa.array([1, 2], type=pa.int64()),
+    }))
+    monkeypatch.setattr(adapter_module, "_LANCE_TRACKED_EVIDENCE_MAX_ROWS", 2)
+
+    with pytest.raises(RowIdentityUnavailable):
+        certify_and_persist_managed_local_lance_row_identity(exact, ["id"])
+    with metadb.session() as s:
+        assert s.scalar(select(func.count()).select_from(
+            metadb.ManagedLocalLanceRowIdentityFence).where(
+                metadb.ManagedLocalLanceRowIdentityFence.registration_id
+                == binding["dataset_id"])) == 0
 
 
 def test_lance_certificate_keeps_retained_old_exact_revision_after_append(tmp_path):
