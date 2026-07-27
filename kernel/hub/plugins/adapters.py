@@ -1226,7 +1226,8 @@ class LanceAdapter:
         return db.conn().from_arrow(dataset.scanner().to_reader())
 
     def open_revision_projection(
-            self, uri: str, revision_id: str, *, columns: list[str]) -> Relation:
+            self, uri: str, revision_id: str, *, columns: list[str],
+            limit: int | None = None) -> Relation:
         """Stream only declared columns from one exact Lance revision into DuckDB.
 
         This is deliberately a core-private helper rather than an expansion of the generic
@@ -1240,7 +1241,22 @@ class LanceAdapter:
             dataset = self._dataset(uri, version=native_revision)
             selected = [identifier(name, dataset.schema.names, label="projection column")
                         for name in columns]
-            return db.conn().from_arrow(dataset.scanner(columns=selected).to_reader())
+            bounded = None if limit is None else max(0, min(int(limit), 100))
+            return db.conn().from_arrow(
+                dataset.scanner(columns=selected, limit=bounded).to_reader())
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+
+    def exact_revision_estimate(
+            self, uri: str, revision_id: str) -> tuple[int | None, int | None]:
+        """Return bounded exact-version admission estimates without reading table rows."""
+        try:
+            dataset = self._dataset(uri, version=int(self._revision_id(revision_id)))
+            dataset.schema
+            rows = int(dataset.count_rows())
+            return (rows if rows >= 0 else None), None
         except RevisionUnavailable:
             raise
         except Exception as exc:

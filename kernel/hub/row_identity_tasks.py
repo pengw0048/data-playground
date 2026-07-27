@@ -11,10 +11,14 @@ from typing import Callable
 from hub import db, metadb
 from hub.models import ExactDatasetRef
 from hub.row_identity import (
+    ManagedLocalLanceRowIdentityFenceV1,
+    RowIdentityPreviewEvidenceTooLarge,
     RowIdentityRevisionMismatch,
     RowIdentityUnavailable,
     RowIdentityValidationError,
+    RowIdentityValueTooLarge,
     certify_and_commit_exact_row_identity,
+    certify_and_commit_managed_local_lance_row_identity,
     serialize_row_identity_coverage,
 )
 
@@ -78,28 +82,67 @@ def _worker(task_id: str, deps) -> None:
                 state.interrupt = scope.interrupt
                 state.check()
 
-                def commit(certificate, artifact_dev: int, artifact_ino: int) -> bool:
-                    state.check()
-                    document = serialize_row_identity_coverage(
-                        certificate, exact, admission["spec_sha256"])
-                    committed = metadb.finish_row_identity_certification_scan(
-                        task_id, attempt_id, owner_token, document,
-                        artifact_dev=artifact_dev, artifact_ino=artifact_ino)
-                    if not committed:
-                        state.lost = True
-                    return committed
+                if admission["source_kind"] == "lance":
+                    expected_fence = ManagedLocalLanceRowIdentityFenceV1(
+                        dataset_id=exact.dataset_id,
+                        revision_id=exact.revision_id,
+                        schema_sha256=admission["schema_sha256"],
+                        row_identity_spec_sha256=admission["spec_sha256"],
+                        physical_incarnation_sha256=admission[
+                            "physical_incarnation_sha256"],
+                    )
 
-                certify_and_commit_exact_row_identity(
-                    deps.storage, exact, keys, commit=commit,
-                    owner=f"row-identity-task:{task_id}",
-                    expected_schema_sha256=admission["schema_sha256"],
-                    expected_spec_sha256=admission["spec_sha256"])
+                    def commit_lance(certificate, fence) -> bool:
+                        state.check()
+                        document = serialize_row_identity_coverage(
+                            certificate, exact, admission["spec_sha256"])
+                        committed = metadb.finish_managed_local_lance_row_identity_certification_scan(
+                            task_id, attempt_id, owner_token, document,
+                            physical_incarnation_sha256=fence.physical_incarnation_sha256)
+                        if not committed:
+                            state.lost = True
+                        return committed
+
+                    certify_and_commit_managed_local_lance_row_identity(
+                        exact, keys, commit=commit_lance,
+                        owner=f"row-identity-task:{task_id}",
+                        expected_fence=expected_fence)
+                else:
+                    def commit_parquet(
+                            certificate, artifact_dev: int, artifact_ino: int) -> bool:
+                        state.check()
+                        document = serialize_row_identity_coverage(
+                            certificate, exact, admission["spec_sha256"])
+                        committed = metadb.finish_row_identity_certification_scan(
+                            task_id, attempt_id, owner_token, document,
+                            artifact_dev=artifact_dev, artifact_ino=artifact_ino)
+                        if not committed:
+                            state.lost = True
+                        return committed
+
+                    certify_and_commit_exact_row_identity(
+                        deps.storage, exact, keys, commit=commit_parquet,
+                        owner=f"row-identity-task:{task_id}",
+                        expected_schema_sha256=admission["schema_sha256"],
+                        expected_spec_sha256=admission["spec_sha256"])
         except (RowIdentityUnavailable, RowIdentityRevisionMismatch):
             if state.lost:
                 return
             metadb.finish_row_identity_certification_failure(
                 task_id, attempt_id, owner_token,
                 "cancelled" if state.cancel else "stale_or_unavailable_revision")
+        except RowIdentityValueTooLarge:
+            if state.lost:
+                return
+            metadb.finish_row_identity_certification_failure(
+                task_id, attempt_id, owner_token,
+                "cancelled" if state.cancel else "identity_value_over_limit")
+        except RowIdentityPreviewEvidenceTooLarge:
+            if state.lost:
+                return
+            metadb.finish_row_identity_certification_failure(
+                task_id, attempt_id, owner_token,
+                "cancelled" if state.cancel else "preview_identity_evidence_over_budget")
         except RowIdentityValidationError:
             if state.lost:
                 return

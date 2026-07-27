@@ -918,6 +918,10 @@ class RowIdentityCertificationTaskEnvelope(Base):
         String, ForeignKey("durable_tasks.id"), primary_key=True)
     dataset_id: Mapped[str] = mapped_column(String(128), nullable=False)
     revision_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    source_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="parquet", server_default="parquet")
+    physical_incarnation_sha256: Mapped[str | None] = mapped_column(
+        String(64), nullable=True)
     dataset_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     keys_doc: Mapped[str] = mapped_column(Text, nullable=False)
     schema_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -942,6 +946,11 @@ class RowIdentityCertificationTaskEnvelope(Base):
         CheckConstraint(
             "estimated_bytes IS NULL OR estimated_bytes >= 0",
             name="ck_row_identity_task_estimated_bytes"),
+        CheckConstraint(
+            "(source_kind = 'parquet' AND physical_incarnation_sha256 IS NULL) "
+            "OR (source_kind = 'lance' AND physical_incarnation_sha256 IS NOT NULL "
+            "AND length(physical_incarnation_sha256) = 64)",
+            name="ck_row_identity_task_source_fence"),
     )
 
 
@@ -7439,13 +7448,23 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
             input_manifest = json.loads(task.input_manifest)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("row identity certification durable admission is invalid") from exc
+        provider = (
+            "managed-local-file" if envelope.source_kind == "parquet"
+            else "managed-local-lance")
+        source_fence_valid = (
+            (envelope.source_kind == "parquet"
+             and envelope.physical_incarnation_sha256 is None)
+            or (envelope.source_kind == "lance"
+                and _lance_row_identity_digests_are_valid(
+                    envelope.physical_incarnation_sha256)))
         if (not isinstance(keys, list) or not keys
                 or any(not isinstance(key, str) or not key for key in keys)
+                or not source_fence_valid
                 or input_manifest != [{
                     "node_id": "row-identity-certification",
                     "dataset_id": envelope.dataset_id,
                     "revision_id": envelope.revision_id,
-                    "provider": "managed-local-file",
+                    "provider": provider,
                 }]):
             raise RuntimeError("row identity certification durable admission is invalid")
         return {
@@ -7459,6 +7478,8 @@ def _durable_task_admission(s, task: DurableTask) -> dict:
                 "spec_sha256": envelope.spec_sha256,
                 "supported": envelope.supported,
                 "confirmation_sha256": envelope.confirmation_sha256,
+                "source_kind": envelope.source_kind,
+                "physical_incarnation_sha256": envelope.physical_incarnation_sha256,
             },
         }
     if task.task_kind == "merge_columns_write":
@@ -8149,7 +8170,9 @@ def submit_row_identity_certification_task(
         dataset_name: str | None, keys: list[str], schema_sha256: str, spec_sha256: str,
         supported: bool, confirmation_sha256: str,
         estimated_rows: int | None, estimated_bytes: int | None,
-        artifact_uri: str, max_attempts: int = 3) -> tuple[dict, bool]:
+        artifact_uri: str | None, source_kind: str = "parquet",
+        physical_incarnation_sha256: str | None = None,
+        max_attempts: int = 3) -> tuple[dict, bool]:
     """Atomically admit one frozen exact managed-local certification on generic Task primitives."""
     submission = str(submission_id).lower()
     uid, dataset_id, revision_id = str(uid), str(dataset_id), str(revision_id)
@@ -8168,6 +8191,12 @@ def submit_row_identity_certification_task(
     if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (
             schema_sha256, spec_sha256, confirmation_sha256)):
         raise ValueError("row identity certification digest is invalid")
+    if (source_kind not in {"parquet", "lance"}
+            or (source_kind == "parquet" and physical_incarnation_sha256 is not None)
+            or (source_kind == "lance" and (
+                physical_incarnation_sha256 is None
+                or re.fullmatch(r"[0-9a-f]{64}", physical_incarnation_sha256) is None))):
+        raise ValueError("row identity certification source fence is invalid")
     if type(supported) is not bool:
         raise ValueError("row identity certification support fact is invalid")
     if any(value is not None and (
@@ -8182,7 +8211,9 @@ def submit_row_identity_certification_task(
         "node_id": "row-identity-certification",
         "dataset_id": dataset_id,
         "revision_id": revision_id,
-        "provider": "managed-local-file",
+        "provider": (
+            "managed-local-file" if source_kind == "parquet"
+            else "managed-local-lance"),
     }]
     input_doc = json.dumps(input_manifest, sort_keys=True, separators=(",", ":"))
     request_sha = hashlib.sha256(json.dumps({
@@ -8190,6 +8221,8 @@ def submit_row_identity_certification_task(
         "schemaSha256": schema_sha256, "specSha256": spec_sha256,
         "supported": supported,
         "confirmationSha256": confirmation_sha256,
+        "sourceKind": source_kind,
+        "physicalIncarnationSha256": physical_incarnation_sha256,
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
     task_id = row_identity_certification_submission_id(uid, submission)
     target = "row-identity-certification"
@@ -8210,6 +8243,8 @@ def submit_row_identity_certification_task(
                     or existing.intent_sha256 != request_sha
                     or envelope.dataset_id != dataset_id
                     or envelope.revision_id != revision_id
+                    or envelope.source_kind != source_kind
+                    or envelope.physical_incarnation_sha256 != physical_incarnation_sha256
                     or envelope.keys_doc != keys_doc
                     or envelope.schema_sha256 != schema_sha256
                     or envelope.spec_sha256 != spec_sha256
@@ -8222,12 +8257,19 @@ def submit_row_identity_certification_task(
         # lifecycle registry before the artifact; taking these in the opposite order deadlocks a
         # concurrent request still finishing preflight. The sync below takes the canonical
         # registry -> revision -> artifact order and revalidates readiness before admission commits.
-        revision = s.get(ManagedLocalFileRevision, revision_id)
-        artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
-                    if revision is not None and revision.logical_id == dataset_id else None)
-        if (revision is None or artifact is None or artifact.state != "ready"
-                or revision.artifact_uri != str(artifact_uri)):
-            raise ValueError("row identity certification exact revision is unavailable")
+        if source_kind == "parquet":
+            revision = s.get(ManagedLocalFileRevision, revision_id)
+            artifact = (s.get(LocalResultArtifact, revision.artifact_uri)
+                        if revision is not None and revision.logical_id == dataset_id else None)
+            if (revision is None or artifact is None or artifact.state != "ready"
+                    or revision.artifact_uri != str(artifact_uri)):
+                raise ValueError("row identity certification exact revision is unavailable")
+        else:
+            entry = s.scalars(select(CatalogEntry).where(
+                CatalogEntry.registration_id == dataset_id).with_for_update()).first()
+            checked_uri = _managed_local_lance_row_identity_checked_uri(entry)
+            if checked_uri is None or checked_uri != artifact_uri:
+                raise ValueError("row identity certification exact revision is unavailable")
         task = DurableTask(
             id=task_id, owner_id=uid, canvas_id=None, dataset_view_id=None,
             submission_id=submission, intent_sha256=request_sha, target_node_id=target,
@@ -8237,6 +8279,8 @@ def submit_row_identity_certification_task(
             max_attempts=max_attempts, created_at=now, updated_at=now)
         envelope = RowIdentityCertificationTaskEnvelope(
             task_id=task_id, dataset_id=dataset_id, revision_id=revision_id,
+            source_kind=source_kind,
+            physical_incarnation_sha256=physical_incarnation_sha256,
             dataset_name=dataset_name, keys_doc=keys_doc, schema_sha256=schema_sha256,
             spec_sha256=spec_sha256, supported=supported,
             confirmation_sha256=confirmation_sha256,
@@ -8249,7 +8293,8 @@ def submit_row_identity_certification_task(
             status="queued", created_at=now), envelope))
         try:
             s.flush()
-            sync_local_result_owner(s, "durable_task", task_id, input_manifest)
+            if source_kind == "parquet":
+                sync_local_result_owner(s, "durable_task", task_id, input_manifest)
         except IntegrityError as exc:
             raise DurableTaskSubmissionConflict(
                 "row identity certification submission conflicts") from exc
@@ -8698,7 +8743,8 @@ def _terminalize_hidden_task_envelope(s, task: DurableTask, now: datetime.dateti
             envelope.receipt_doc = _row_identity_certification_receipt(
                 task, envelope, outcome)
         envelope.updated_at = envelope.completed_at = now
-        _drop_local_result_owner(s, "durable_task", task.id)
+        if envelope.source_kind == "parquet":
+            _drop_local_result_owner(s, "durable_task", task.id)
 
 
 def _claim_durable_task_kind(
@@ -9016,6 +9062,7 @@ def finish_row_identity_certification_scan(
             lease = lease.replace(tzinfo=datetime.timezone.utc)
         if (task is None or attempt is None or envelope is None
                 or task.task_kind != "row_identity_certification"
+                or envelope.source_kind != "parquet"
                 or task.status in _TERMINAL_RUN
                 or attempt.owner_token != str(owner_token) or attempt.status != "running"
                 or lease is None or lease <= now):
@@ -9054,11 +9101,123 @@ def finish_row_identity_certification_scan(
             diagnostic_code=None, certificate=descriptor)
 
 
+def finish_managed_local_lance_row_identity_certification_scan(
+        task_id: str, attempt_id: str, owner_token: str, certificate: object, *,
+        physical_incarnation_sha256: str) -> bool:
+    """Atomically retain a fenced exact-Lance proof and its one terminal Task receipt."""
+    from hub.models import ExactDatasetRef
+    from hub.plugins.adapters import (
+        RevisionPermissionLost, RevisionProviderOffline, RevisionUnavailable,
+    )
+    from hub.row_identity import (
+        RowIdentityError,
+        decode_row_identity_coverage,
+        freeze_managed_local_lance_row_identity_fence_for_checked_uri,
+    )
+
+    with session() as s:
+        task = _lock_durable_task_for_write(s, str(task_id))
+        attempt = s.get(DurableTaskAttempt, str(attempt_id), with_for_update=True)
+        envelope = s.get(
+            RowIdentityCertificationTaskEnvelope, str(task_id), with_for_update=True)
+        now = _durable_task_db_now(s)
+        lease = attempt.lease_until if attempt is not None else None
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=datetime.timezone.utc)
+        if (task is None or attempt is None or envelope is None
+                or task.task_kind != "row_identity_certification"
+                or envelope.source_kind != "lance"
+                or task.status in _TERMINAL_RUN
+                or attempt.owner_token != str(owner_token) or attempt.status != "running"
+                or lease is None or lease <= now):
+            return False
+        if task.cancel_requested:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="cancelled",
+                outcome="cancelled", diagnostic_code=None)
+        if (envelope.physical_incarnation_sha256 != physical_incarnation_sha256
+                or not _lance_row_identity_digests_are_valid(
+                    physical_incarnation_sha256, envelope.schema_sha256,
+                    envelope.spec_sha256)):
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        expected = ExactDatasetRef(
+            kind="exact", dataset_id=envelope.dataset_id, revision_id=envelope.revision_id)
+        decoded = decode_row_identity_coverage(
+            certificate, expected, envelope.spec_sha256)
+        if decoded.spec.schema_digest != envelope.schema_sha256:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        if decoded.status != "complete":
+            outcome = "null_key" if decoded.base.null_rows else "duplicate_key"
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome=outcome, diagnostic_code=outcome)
+        entry = s.scalars(select(CatalogEntry).where(
+            CatalogEntry.registration_id == envelope.dataset_id).with_for_update()).first()
+        checked_uri = _managed_local_lance_row_identity_checked_uri(entry)
+        if checked_uri is None:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        try:
+            _spec, current_fence = (
+                freeze_managed_local_lance_row_identity_fence_for_checked_uri(
+                    expected, json.loads(envelope.keys_doc), checked_uri))
+        except (
+            RowIdentityError,
+            RevisionPermissionLost,
+            RevisionProviderOffline,
+            RevisionUnavailable,
+            TypeError,
+            ValueError,
+        ):
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        if (current_fence.physical_incarnation_sha256
+                != envelope.physical_incarnation_sha256
+                or current_fence.schema_sha256 != envelope.schema_sha256
+                or current_fence.row_identity_spec_sha256 != envelope.spec_sha256):
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        try:
+            descriptor, created = _managed_local_lance_row_identity_certificate_store(
+                s, envelope.dataset_id, envelope.revision_id, certificate,
+                physical_incarnation_sha256=physical_incarnation_sha256,
+                schema_sha256=envelope.schema_sha256,
+                row_identity_spec_sha256=envelope.spec_sha256)
+        except ValueError:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="stale_or_unavailable_revision",
+                diagnostic_code="stale_or_unavailable_revision")
+        except ManagedLocalLanceRowIdentityCertificateConflict:
+            return _finish_row_identity_certification_in_session(
+                s, task, attempt, envelope, status="failed",
+                outcome="conflicting_retained_spec",
+                diagnostic_code="conflicting_retained_spec")
+        return _finish_row_identity_certification_in_session(
+            s, task, attempt, envelope, status="done",
+            outcome=("certified" if created else "already_certified_same_spec"),
+            diagnostic_code=None, certificate=descriptor)
+
+
 def finish_row_identity_certification_failure(
         task_id: str, attempt_id: str, owner_token: str, outcome: str) -> bool:
     """Terminalize one owned proof attempt without ever writing certificate state."""
     allowed = frozenset({
-        "unsupported_type", "stale_or_unavailable_revision", "cancelled", "failed",
+        "unsupported_type", "identity_value_over_limit",
+        "preview_identity_evidence_over_budget",
+        "stale_or_unavailable_revision", "cancelled", "failed",
     })
     if outcome not in allowed:
         raise ValueError("row identity certification outcome is invalid")
@@ -21076,7 +21235,11 @@ def managed_local_lance_row_identity_binding(dataset_id: str) -> dict | None:
         checked_uri = _managed_local_lance_row_identity_checked_uri(entry)
         if entry is None or checked_uri is None:
             return None
-        return {"dataset_id": entry.registration_id, "uri": checked_uri}
+        return {
+            "dataset_id": entry.registration_id,
+            "dataset_name": entry.name,
+            "uri": checked_uri,
+        }
 
 
 def _lance_row_identity_digests_are_valid(*values: object) -> bool:
@@ -21229,6 +21392,46 @@ def managed_local_lance_row_identity_certificate_for_fence(
                 kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
             certificate = decode_row_identity_coverage(
                 json.loads(row.certificate_doc), exact, row_identity_spec_sha256)
+            if (certificate.status != "complete"
+                    or certificate.spec.schema_digest != schema_sha256):
+                return None
+            return certificate
+    except (KeyError, RuntimeError, TypeError, ValueError, RowIdentityValidationError):
+        return None
+
+
+def managed_local_lance_row_identity_certificate_for_incarnation(
+        dataset_id: str, revision_id: str, *, physical_incarnation_sha256: str,
+        schema_sha256: str):
+    """Load one retained proof by its live exact incarnation when the caller does not know its spec."""
+    from hub.models import ExactDatasetRef
+    from hub.row_identity import RowIdentityValidationError, decode_row_identity_coverage
+
+    if not _lance_row_identity_digests_are_valid(
+            physical_incarnation_sha256, schema_sha256):
+        return None
+    try:
+        with session() as s:
+            entry = s.scalars(select(CatalogEntry).where(
+                CatalogEntry.registration_id == str(dataset_id)).limit(1)).first()
+            fence = s.get(ManagedLocalLanceRowIdentityFence, {
+                "registration_id": str(dataset_id), "revision_id": str(revision_id),
+            })
+            row = s.get(ManagedLocalLanceRowIdentityCertificate, {
+                "registration_id": str(dataset_id), "revision_id": str(revision_id),
+            })
+            if (_managed_local_lance_row_identity_checked_uri(entry) is None
+                    or fence is None or row is None
+                    or fence.physical_incarnation_sha256 != physical_incarnation_sha256
+                    or fence.schema_sha256 != schema_sha256
+                    or row.certificate_sha256 != hashlib.sha256(
+                        row.certificate_doc.encode()).hexdigest()
+                    or _canonical_document(json.loads(row.certificate_doc)) != row.certificate_doc):
+                return None
+            exact = ExactDatasetRef(
+                kind="exact", dataset_id=str(dataset_id), revision_id=str(revision_id))
+            certificate = decode_row_identity_coverage(
+                json.loads(row.certificate_doc), exact, fence.row_identity_spec_sha256)
             if (certificate.status != "complete"
                     or certificate.spec.schema_digest != schema_sha256):
                 return None
