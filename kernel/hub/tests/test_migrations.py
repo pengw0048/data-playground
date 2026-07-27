@@ -55,6 +55,7 @@ def test_migration_graph_has_one_linear_head():
     revisions = list(scripts.walk_revisions())
 
     assert [(revision.revision, revision.down_revision) for revision in revisions] == [
+        ("0049_lance_row_identity_cert", "0048_row_identity_task"),
         ("0048_row_identity_task", "0047_row_identity_cert"),
         ("0047_row_identity_cert", "0046_relationship_incident"),
         ("0046_relationship_incident", "0045_canvas_dataset_add_replays"),
@@ -104,8 +105,35 @@ def test_migration_graph_has_one_linear_head():
         ("0002_managed_file_revs", "0001_schema_baseline"),
         ("0001_schema_baseline", None),
     ]
-    assert scripts.get_heads() == ["0048_row_identity_task"]
-    assert metadb.expected_schema_head() == "0048_row_identity_task"
+    assert scripts.get_heads() == ["0049_lance_row_identity_cert"]
+    assert metadb.expected_schema_head() == "0049_lance_row_identity_cert"
+
+
+def test_lance_row_identity_migration_refuses_nonempty_downgrade(tmp_path):
+    db_path = tmp_path / "lance-row-identity-downgrade.db"
+    with _isolated_metadata(f"sqlite:///{db_path}"):
+        with metadb.engine().connect() as connection:
+            command.upgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
+            command.upgrade(metadb._alembic_cfg(connection), "head")
+            tables = set(inspect(connection).get_table_names())
+            assert {
+                "managed_local_lance_row_identity_fences",
+                "managed_local_lance_row_identity_certificates",
+            } <= tables
+            connection.execute(sa.text(
+                "INSERT INTO catalog_entries (uri, registration_id, name, doc, updated_at) VALUES "
+                "('file:///migration.lance', 'lance-registration', 'migration', '{}', "
+                "CURRENT_TIMESTAMP)"))
+            connection.execute(sa.text(
+                "INSERT INTO managed_local_lance_row_identity_fences "
+                "(registration_id, revision_id, physical_incarnation_sha256, schema_sha256, "
+                "row_identity_spec_sha256, created_at) VALUES "
+                "('lance-registration', '1', :incarnation, :schema, :spec, CURRENT_TIMESTAMP)"), {
+                    "incarnation": "a" * 64, "schema": "b" * 64, "spec": "c" * 64,
+                })
+            connection.commit()
+            with pytest.raises(RuntimeError, match="cannot downgrade"):
+                command.downgrade(metadb._alembic_cfg(connection), "0048_row_identity_task")
 
 
 def test_field_lineage_forward_migration_preserves_evidence_poor_facts(tmp_path):
@@ -425,6 +453,9 @@ def test_remove_temporal_state_upgrade_preserves_ordinary_managed_revision(tmp_p
 def test_committed_migration_revisions_are_immutable():
     versions_path = Path(metadb._MIGRATIONS_DIR) / "versions"
     expected_hashes = {
+        "0049_lance_row_identity_certificates.py": (
+            "c96c91cee5f570d9d7dda09d633a9432d635470a80a32b4cba3f7fed3b17773e"
+        ),
         "0048_row_identity_task.py": (
             "c3c7b6c5c81ca9a88707207bb3cacfbcb9b07bbad99083f8ff534dbad9812ea9"
         ),

@@ -13,7 +13,9 @@ from __future__ import annotations
 import datetime
 import glob
 import hashlib
+import json
 import os
+import stat
 import threading
 import uuid
 from collections.abc import Callable
@@ -39,10 +41,41 @@ from hub.sqlpolicy import identifier, identifier_list, quote_identifier
 
 Relation = duckdb.DuckDBPyRelation
 CancelCheck = Callable[[], bool]
+_LANCE_TRACKED_EVIDENCE_MAX_ROWS = 100_000
+_LANCE_TRACKED_EVIDENCE_PATH_MAX_BYTES = 16_384
 
 
 class BoundedPreviewUnsupported(RuntimeError):
     """The adapter cannot prove that this URI can be read within the interactive preview budget."""
+
+
+def _lance_local_tracked_object_identity(base_uri: str, relative_path: str) -> tuple[int, ...] | None:
+    """Return an ephemeral local-object identity for a native tracked file.
+
+    The native ``all_files`` evidence supplies the provider-neutral existence, size, and modified
+    facts.  A local table can additionally bind an object to its inode and change timestamp, which
+    closes same-path replacement without reading table data.  This tuple is folded into a digest and
+    never leaves the adapter.
+    """
+    base = paths.checked_local_path(base_uri)
+    if base is None:
+        return None
+    if (not relative_path or relative_path.startswith(("/", "\\"))
+            or "\\" in relative_path):
+        raise ValueError("tracked Lance object path is invalid")
+    parts = relative_path.split("/")
+    if any(not part or part in (".", "..") for part in parts):
+        raise ValueError("tracked Lance object path is invalid")
+    # Every component above is non-empty, relative, and neither dot nor dot-dot; `base` crossed the
+    # normal local-root check, so the native tracked member cannot escape that checked dataset root.
+    # codeql[py/path-injection]
+    observed = os.stat(os.path.join(base, *parts), follow_symlinks=False)
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError("tracked Lance object is not a regular file")
+    return (
+        int(observed.st_dev), int(observed.st_ino), int(observed.st_size),
+        int(observed.st_mtime_ns), int(observed.st_ctime_ns),
+    )
 
 
 def _raise_if_cancelled(cancelled: CancelCheck | None) -> None:
@@ -1191,6 +1224,109 @@ class LanceAdapter:
         except Exception as exc:
             raise_revision_access_error_from_os(exc)
         return db.conn().from_arrow(dataset.scanner().to_reader())
+
+    def open_revision_projection(
+            self, uri: str, revision_id: str, *, columns: list[str]) -> Relation:
+        """Stream only declared columns from one exact Lance revision into DuckDB.
+
+        This is deliberately a core-private helper rather than an expansion of the generic
+        revision-adapter protocol: whole-revision identity certification must never open every
+        payload column merely to inspect its ordered logical key.
+        """
+        if not isinstance(columns, list) or not columns:
+            raise ValueError("exact Lance projection requires columns")
+        try:
+            native_revision = int(self._revision_id(revision_id))
+            dataset = self._dataset(uri, version=native_revision)
+            selected = [identifier(name, dataset.schema.names, label="projection column")
+                        for name in columns]
+            return db.conn().from_arrow(dataset.scanner(columns=selected).to_reader())
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+
+    def exact_revision_incarnation(self, uri: str, revision_id: str) -> tuple[object, str]:
+        """Return exact schema and a bounded digest of the native tracked-file incarnation.
+
+        The digest joins exact tracked records to currently observable object facts (existence,
+        byte size, and modification identity), then folds in local inode/change evidence when
+        available. It never returns a path. The bounded join runs in DuckDB without scanning table
+        rows or hashing data files.
+        """
+        tracked_name = f"dp_lance_tracked_{uuid.uuid4().hex}"
+        available_name = f"dp_lance_available_{uuid.uuid4().hex}"
+        try:
+            native_revision = int(self._revision_id(revision_id))
+            dataset = self._dataset(uri, version=native_revision)
+            schema = dataset.schema
+            tracked_source = db.conn().from_arrow(dataset.tracked_files())
+            if set(tracked_source.columns) != {"version", "base_uri", "path", "type"}:
+                raise ValueError("tracked Lance evidence has an unexpected shape")
+            available_source = db.conn().from_arrow(dataset.all_files())
+            if set(available_source.columns) != {
+                    "base_uri", "path", "size_bytes", "last_modified"}:
+                raise ValueError("available Lance evidence has an unexpected shape")
+            # pylance returns the table's tracked-file history, not only the opened version. The
+            # native version filter is therefore part of the exact-incarnation contract.
+            tracked_source.filter(f"version = {native_revision}").project(
+                "version, base_uri, path, type").order(
+                "base_uri, path, type").limit(_LANCE_TRACKED_EVIDENCE_MAX_ROWS + 1).create(
+                tracked_name)
+            available_source.project(
+                "base_uri, path, size_bytes, epoch_us(last_modified) AS modified_us").order(
+                "base_uri, path").limit(_LANCE_TRACKED_EVIDENCE_MAX_ROWS + 1).create(
+                available_name)
+            tracked = db.conn().table(tracked_name)
+            available = db.conn().table(available_name)
+            if (int(tracked.aggregate("count(*)").fetchone()[0]) > _LANCE_TRACKED_EVIDENCE_MAX_ROWS
+                    or int(available.aggregate("count(*)").fetchone()[0])
+                    > _LANCE_TRACKED_EVIDENCE_MAX_ROWS):
+                raise ValueError("tracked Lance evidence exceeds its bound")
+            ordered = tracked.join(available, "base_uri, path", how="left").project(
+                "version, base_uri, path, type, size_bytes, modified_us").order(
+                "base_uri, path, type")
+            hasher = hashlib.sha256(b"managed-lance-incarnation-v1\\0")
+            manifest_rows = 0
+            rows = 0
+            for batch in ordered.to_arrow_reader(batch_size=65_536):
+                for index in range(batch.num_rows):
+                    rows += 1
+                    version = batch.column(0)[index].as_py()
+                    base_uri = batch.column(1)[index].as_py()
+                    path = batch.column(2)[index].as_py()
+                    member_type = batch.column(3)[index].as_py()
+                    size_bytes = batch.column(4)[index].as_py()
+                    modified_us = batch.column(5)[index].as_py()
+                    if (isinstance(version, bool) or not isinstance(version, int)
+                            or version != native_revision
+                            or not isinstance(base_uri, str) or not base_uri
+                            or not isinstance(path, str) or not path
+                            or len(path.encode("utf-8")) > _LANCE_TRACKED_EVIDENCE_PATH_MAX_BYTES
+                            or not isinstance(member_type, str) or not member_type
+                            or isinstance(size_bytes, bool) or not isinstance(size_bytes, int)
+                            or size_bytes < 0
+                            or isinstance(modified_us, bool) or not isinstance(modified_us, int)):
+                        raise ValueError("tracked Lance evidence is invalid")
+                    if member_type == "manifest":
+                        manifest_rows += 1
+                    local_identity = _lance_local_tracked_object_identity(base_uri, path)
+                    encoded = json.dumps(
+                        [version, base_uri, member_type, path, size_bytes, modified_us, local_identity],
+                        ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8")
+                    hasher.update(len(encoded).to_bytes(8, "big"))
+                    hasher.update(encoded)
+            if rows == 0 or manifest_rows != 1:
+                raise ValueError("tracked Lance evidence is incomplete")
+            return schema, hasher.hexdigest()
+        except RevisionUnavailable:
+            raise
+        except Exception as exc:
+            raise_revision_access_error_from_os(exc)
+        finally:
+            for name in (tracked_name, available_name):
+                db.conn().execute(f'DROP TABLE IF EXISTS "{name}"')
 
     def open_revision_native_rows(
             self, uri: str, revision_id: str, *,
