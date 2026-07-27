@@ -38,7 +38,7 @@ _MAX_RECONCILIATION_CURSOR_BYTES = 6 * 1024
 _MAX_CONFIG_BYTES = 1024 * 1024
 # Passive Workspace browse must stay responsive even when a remote mount is slow. Explicit user
 # actions may wait a little longer, but remain bounded and use the same isolated provider workers.
-_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 1.0
+_PASSIVE_PROVIDER_READ_TIMEOUT_SECONDS = 2.0
 _INTERACTIVE_PROVIDER_READ_TIMEOUT_SECONDS = 5.0
 _SOURCE_STATES = {
     "complete", "page", "pending", "partial", "unavailable", "unsupported",
