@@ -3411,7 +3411,9 @@ export const useStore = create<Store>((set, get) => ({
       if (selectedId && doc.nodes.some((node) => node.id === selectedId)) get().select(selectedId)
       const uid = get().currentUser?.id
       if (uid) localStorage.setItem(OPEN_KEY(uid), id)
-      set({ view: 'canvas' })  // opening a file navigates to the editor
+      // Opening any authoritative Canvas resolves first-run choice, including a Canvas created by
+      // Workspace "Use data" rather than one of the banner's own buttons.
+      set({ view: 'canvas', firstRunChoice: false })
       // A saved graph is otherwise mounted at React Flow's default viewport. Request one fit for
       // this freshly opened, non-empty document; Canvas consumes it after card measurement, so
       // later saves, collaboration updates, and ordinary rerenders stay out of the user's way.
