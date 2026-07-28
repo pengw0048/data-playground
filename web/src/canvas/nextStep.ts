@@ -1,5 +1,5 @@
 import { canConnect, getSpec, nodeOutputs } from '../nodes/registry'
-import type { CanvasNode, PortSpec } from '../types/graph'
+import type { CanvasEdge, CanvasNode, PortSpec } from '../types/graph'
 import type { WireType } from '../theme/tokens'
 
 export type NextStepConnection = {
@@ -13,7 +13,12 @@ export type NextStepConnection = {
  * concrete output-to-input connection. Keeping this stricter than the port-started
  * picker avoids silently choosing a branch or a target input for the researcher.
  */
-export function uniqueNextStepConnection(source: CanvasNode, targetKind: string): NextStepConnection | null {
+export function uniqueNextStepConnection(
+  source: CanvasNode,
+  targetKind: string,
+  edges: readonly CanvasEdge[] = [],
+): NextStepConnection | null {
+  if (edges.some((edge) => edge.source === source.id)) return null
   const target = getSpec(targetKind)
   if (!target) return null
   const pairs: Array<{ output: PortSpec; input: PortSpec }> = []

@@ -67,7 +67,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
     ? doc.nodes.find((node) => node.id === selectedIds[0]) ?? null
     : null
   const nextStepKinds = new Set(selectedNode
-    ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind)).map((spec) => spec.kind)
+    ? specs.filter((spec) => uniqueNextStepConnection(selectedNode, spec.kind, doc.edges)).map((spec) => spec.kind)
     : [])
   const nextStepSource = nextStepKinds.size ? selectedNode : null
   const addNext = (kind: string, asNextStep?: boolean) => {
@@ -79,7 +79,7 @@ export function Toolbar({ inspectorCollapsed, onInspectorToggle }: {
     const source = currentSelection.length === 1
       ? current.nodes.find((node) => node.id === currentSelection[0]) ?? null
       : null
-    const connection = source && uniqueNextStepConnection(source, kind)
+    const connection = source && uniqueNextStepConnection(source, kind, current.edges)
     if (!source || !connection) return
     const pos = freePosition(current.nodes, { x: source.position.x + 300, y: source.position.y })
     addConnectedNode(kind, pos, { source: source.id, ...connection })

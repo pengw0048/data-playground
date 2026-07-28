@@ -395,7 +395,12 @@ test.describe('Data Playground canvas', () => {
   })
 
   test('selected-node Add explicitly creates the next connected step at 1280x720', async ({ page }) => {
-    await fresh(page)
+    const canvasId = `selected-next-step-${Date.now()}`
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Selected next step', version: 1, requirements: [], nodes: [], edges: [],
+    } })
+    expect(created.ok()).toBe(true)
+    await page.goto(`/#/canvas/${canvasId}`)
     await page.setViewportSize({ width: 1280, height: 720 })
     await addNode(page, 'Sources & sinks', 'source')
 
@@ -408,6 +413,19 @@ test.describe('Data Playground canvas', () => {
     await expect(page.locator('.react-flow__node')).toHaveCount(2)
     await expect(page.locator('.react-flow__edge')).toHaveCount(1)
 
+    await page.locator('.react-flow__node-source').click()
+    await expect(page.getByRole('button', { name: 'Add operation', exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Add operation', exact: true }).click()
+    const ambiguousPicker = page.getByRole('dialog', { name: 'Add an operation' })
+    await ambiguousPicker.getByRole('textbox', { name: 'Search operations' }).fill('join')
+    const join = ambiguousPicker.getByRole('option', { name: /join/i })
+    await expect(join).not.toContainText('Add next step')
+    await join.click()
+    await expect(page.locator('.react-flow__node')).toHaveCount(3)
+    await expect(page.locator('.react-flow__edge')).toHaveCount(1)
+    await page.getByRole('button', { name: 'Undo', exact: true }).click()
+
+    await page.locator('.react-flow__node-filter').click()
     await page.getByRole('button', { name: 'Add next step', exact: true }).click()
     const secondPicker = page.getByRole('dialog', { name: 'Add an operation' })
     await secondPicker.getByRole('textbox', { name: 'Search operations' }).fill('transform')

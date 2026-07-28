@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { register } from '../nodes/registry'
-import type { CanvasNode } from '../types/graph'
+import type { CanvasEdge, CanvasNode } from '../types/graph'
 import { uniqueNextStepConnection } from './nextStep'
 
 const Empty = () => null
@@ -56,5 +56,21 @@ describe('uniqueNextStepConnection', () => {
   it('refuses to guess a multiple-output or multiple-input connection', () => {
     expect(uniqueNextStepConnection(node('split', 'next-ambiguous-output-test'), 'next-sample-test')).toBeNull()
     expect(uniqueNextStepConnection(node('source', 'next-source-test'), 'next-ambiguous-input-test')).toBeNull()
+  })
+
+  it('refuses to guess another branch after the selected node already has a downstream edge', () => {
+    const edge: CanvasEdge = {
+      id: 'existing-branch',
+      source: 'source',
+      target: 'existing-target',
+      sourceHandle: 'out',
+      targetHandle: 'in',
+      data: { wire: 'dataset' },
+    }
+    expect(uniqueNextStepConnection(
+      node('source', 'next-source-test'),
+      'next-sample-test',
+      [edge],
+    )).toBeNull()
   })
 })
