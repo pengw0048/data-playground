@@ -52,7 +52,9 @@ test.describe('Workspace Source next-step flow @ux-smoke', () => {
     const finder = page.getByRole('dialog', { name: 'Add an operation' })
     await finder.getByRole('textbox', { name: 'Search operations' }).fill('transform')
     const transform = finder.getByRole('option', { name: /^transform/i }).first()
-    await expect(transform).toContainText('Add next step after events')
+    await expect(finder.getByLabel('Next-step context')).toContainText('Add next step after events')
+    await expect(transform).not.toContainText('Adds unconnected')
+    await expect(transform).not.toContainText('Add next step after events')
     await transform.click()
 
     await expect.poll(async () => {

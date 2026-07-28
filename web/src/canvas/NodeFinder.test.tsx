@@ -127,6 +127,28 @@ describe('node finder', () => {
     expect(onClose).toHaveBeenCalledOnce()
   })
 
+  it('states selected-node context once and marks only choices that cannot connect', () => {
+    render(<NodeFinder
+      specs={[
+        node({ kind: 'filter', title: 'Filter' }),
+        node({ kind: 'metric-only', title: 'Metric only', inputs: [{ id: 'metric', wire: 'metric', accepts: ['metric'] }] }),
+      ]}
+      nextStepKinds={new Set(['filter'])}
+      nextStepLabel="events"
+      onPick={vi.fn()}
+      onClose={vi.fn()}
+    />)
+
+    const context = screen.getByLabelText('Next-step context')
+    expect(context).toHaveTextContent('Add next step after events')
+    expect(screen.getByRole('dialog').textContent?.match(/Add next step after events/g)).toHaveLength(1)
+    const filter = screen.getByRole('option', { name: /filter/i })
+    expect(filter).not.toHaveTextContent('Adds unconnected')
+    expect(filter).not.toHaveTextContent('Add next step after events')
+    expect(screen.getByRole('option', { name: /metric only/i })).toHaveTextContent('Adds unconnected')
+    expect(screen.getByRole('textbox', { name: 'Search operations' })).toHaveFocus()
+  })
+
   it('renders only the first 100 results while reporting a truncated full search', () => {
     const specs = Array.from({ length: 101 }, (_, index) => node({ kind: `plugin-${index}`, title: `Plugin ${index}` }))
     render(<NodeFinder specs={specs} onPick={vi.fn()} onClose={vi.fn()} />)
