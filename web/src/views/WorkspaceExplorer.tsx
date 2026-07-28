@@ -1856,7 +1856,7 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
       <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
         className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
-        className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
+        className="mt-5 grid min-h-0 flex-1 content-start gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
         <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Location</div>
           <div className="break-words">Mount <strong>{resource.mountId ?? 'external'}</strong>{placementPath ? ` / ${placementPath}` : ''}</div>
           {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
