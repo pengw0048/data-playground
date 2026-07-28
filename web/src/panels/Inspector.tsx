@@ -25,6 +25,7 @@ import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
+import { requestSourceEntryAction } from '../nodes/kinds/source'
 
 export const INSPECTOR_W = 300
 export const INSPECTOR_COLLAPSED_W = 44
@@ -51,6 +52,10 @@ const schemaContractStale = (kind: string, cfg: Record<string, unknown>): boolea
   return Array.isArray(cfg.outputSchema) && cfg.outputSchema.length > 0
     && contractText != null && typeof pinnedHash === 'string' && pinnedHash.length > 0
     && pinnedHash !== codeHash(String(contractText))
+}
+
+function isUnboundSource(config: Record<string, unknown>): boolean {
+  return !config.tableId && !config.datasetRef && !config.providerResourceRef
 }
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
@@ -144,6 +149,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const cfg = node.data.config as Record<string, unknown>
   const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
+  const unboundSource = kind === 'source' && isUnboundSource(cfg)
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const schemaCapableKind = canDeclareSchemaKind(kind)
@@ -199,18 +205,19 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
       </div>
 
       {/* properties (reused generic param editor) */}
-      <EditOnly enabled={canEdit}>
-        <Section title="Properties">
-          <NodeParamFields nodeId={nodeId} omitNames={kind === 'write' ? ['writeMode'] : []} />
-          {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
-            <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
-          )}
-        </Section>
-      </EditOnly>
+      {unboundSource ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit} /> : <>
+        <EditOnly enabled={canEdit}>
+          <Section title="Properties">
+            <NodeParamFields nodeId={nodeId} omitNames={kind === 'write' ? ['writeMode'] : []} />
+            {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
+              <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
+            )}
+          </Section>
+        </EditOnly>
+        {kind === 'source' && <SourceConnectionDetails nodeId={nodeId} />}
+      </>}
 
-      {kind === 'source' && <SourceConnectionDetails nodeId={nodeId} />}
-
-      {(kind === 'source' || kind === 'join') && <EditOnly enabled={canEdit}>
+      {!unboundSource && (kind === 'source' || kind === 'join') && <EditOnly enabled={canEdit}>
         <Section title="Related data">
           <JoinWithRelated nodeId={nodeId} />
         </Section>
@@ -264,12 +271,12 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
 
       {/* run plan: appears only when placement actually splits/routes this run (a cluster backend, an
           engine label, or a checkpoint) — makes the cost-aware scheduler + tiering visible before running */}
-      {kind !== 'note' && <RunPlan nodeId={nodeId} />}
+      {!unboundSource && kind !== 'note' && <RunPlan nodeId={nodeId} />}
 
       {/* ports — a real port label (join left/right, metric value) shows as a name; the default
           in/out ports show their wire type + a typed/untyped schema badge (click "N cols" to expand
           the columns). Input badges reflect the upstream's output schema. */}
-      <Section title="Ports">
+      {!unboundSource && <Section title="Ports">
         <div className="flex flex-col gap-1 text-[11.5px] text-muted-foreground">
           {(spec?.inputs ?? []).map((p) => <PortRow key={`in-${p.id}`} dir="in" name={portName(p)} wire={p.wire} schema={inputSchemaFor(p.id)} />)}
           {outputPorts.map((p) => (
@@ -281,7 +288,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         {/* editable output ports: only on the section (its driver script emit()s to named ports) —
             fixed-port ops (filter/sort/join) keep their ports as a type contract the wires rely on */}
         {kind === 'section' && <><Separator className="my-1" /><EditOnly enabled={canEdit}><OutputPortsEditor nodeId={nodeId} /></EditOnly></>}
-      </Section>
+      </Section>}
 
       {/* schema contract: a code op (transform/plugin/vector-search) is untyped until it runs — let the
           user DECLARE its output columns, or infer them from a sample. Either way types it + downstream. */}
@@ -303,14 +310,14 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
         ))}
         <div className="flex flex-wrap gap-1.5">
           {/* a note never runs — only offer duplicate / delete for annotations */}
-          {kind !== 'note' && <>
+          {!unboundSource && kind !== 'note' && <>
             <Action icon="eye" label={!kernelUp ? 'Hub offline — preview unavailable' : 'View data'} disabled={!kernelUp || !runnable || !!invalid} onClick={() => runPreview(nodeId)} />
           <Action icon={runState === 'running' ? 'stop' : 'play'} label={!kernelUp ? 'Hub offline — run unavailable' : kind === 'source' ? 'Count rows' : runState === 'running' ? 'Stop' : configuredManagedSidecarMerge ? 'Review sidecar merge' : configuredMerge ? 'Review column merge' : configuredUpsert ? 'Review keyed upsert' : 'Run'} disabled={!canEdit || !kernelUp || ((!runnable || !!invalid) && runState !== 'running')}
               onClick={() => (runState === 'running' ? cancelRun(nodeId) : requestRun(nodeId))} />
             {spec?.canBypass && <Action icon="power" label="Bypass" disabled={!canEdit} onClick={() => bypass(nodeId)} />}
             <Action icon="mute" label={node.data.disabled ? 'Enable' : 'Disable'} disabled={!canEdit} onClick={() => disable(nodeId)} />
           </>}
-          <Action icon="duplicate" label="Duplicate" disabled={!canEdit} onClick={() => duplicate(nodeId)} />
+          {!unboundSource && <Action icon="duplicate" label="Duplicate" disabled={!canEdit} onClick={() => duplicate(nodeId)} />}
           <Action icon="trash" label="Delete" disabled={!canEdit} danger onClick={() => removeNode(nodeId)} />
         </div>
       </Section>
@@ -665,7 +672,51 @@ function sourceTable(catalog: CatalogTable[], config: Record<string, unknown>): 
   return catalog.find((table) => (tableId && table.id === tableId) || table.uri === uri || table.name === uri)
 }
 
-function SourceConnectionDetails({ nodeId }: { nodeId: string }) {
+function DraftSourceInspector({ nodeId, canEdit }: { nodeId: string; canEdit: boolean }) {
+  const config = useStore((s) => (s.doc.nodes.find((node) => node.id === nodeId)?.data.config ?? {}) as Record<string, unknown>)
+  const updateConfig = useStore((s) => s.updateConfig)
+  return <>
+    <Section title="Choose data">
+      <div className="text-[11.5px] leading-relaxed text-muted-foreground">
+        Choose a dataset in Workspace, upload a local file, or register a path the kernel can access.
+      </div>
+      <div className="grid gap-1.5">
+        <CodeBtn icon="db" label="Select dataset" disabled={!canEdit}
+          onClick={() => requestSourceEntryAction(nodeId, 'select')} />
+        <CodeBtn icon="export" label="Upload a file…" disabled={!canEdit}
+          onClick={() => requestSourceEntryAction(nodeId, 'upload')} />
+        <CodeBtn icon="search" label="Register or browse an accessible path…" disabled={!canEdit}
+          onClick={() => requestSourceEntryAction(nodeId, 'browse')} />
+      </div>
+    </Section>
+    <details className="mx-3.5 mt-3 rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]">
+      <summary className="cursor-pointer font-semibold text-foreground">Advanced source configuration</summary>
+      <div className="mt-2 grid gap-3">
+        <EditOnly enabled={canEdit}>
+          <div className="grid gap-2">
+            <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-uri-${nodeId}`}>Dataset URI</Label>
+            <Input id={`source-uri-${nodeId}`} aria-label="Dataset URI" value={String(config.uri ?? '')}
+              onChange={(event) => updateConfig(nodeId, { uri: event.target.value })}
+              className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
+            <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-delimiter-${nodeId}`}>CSV delimiter</Label>
+            <Input id={`source-delimiter-${nodeId}`} aria-label="CSV delimiter" value={String(config.delimiter ?? '')}
+              onChange={(event) => updateConfig(nodeId, { delimiter: event.target.value })}
+              className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
+            <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-header-${nodeId}`}>CSV header row</Label>
+            <select id={`source-header-${nodeId}`} aria-label="CSV header row" value={String(config.header ?? 'auto')}
+              onChange={(event) => updateConfig(nodeId, { header: event.target.value })}
+              className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
+              <option value="auto">auto</option><option value="yes">yes</option><option value="no">no</option>
+            </select>
+          </div>
+        </EditOnly>
+        <SourceConnectionDetails nodeId={nodeId} embedded />
+      </div>
+    </details>
+  </>
+}
+
+function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string; embedded?: boolean }) {
   const node = useStore((s) => s.doc.nodes.find((candidate) => candidate.id === nodeId))
   const catalog = useStore((s) => s.catalog)
   const [open, setOpen] = useState(false)
@@ -718,9 +769,8 @@ function SourceConnectionDetails({ nodeId }: { nodeId: string }) {
 
   if (!node) return null
 
-  return (
-    <Section title="Data source">
-      <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
+  const details = (
+    <details className="rounded-md border border-border bg-muted/20 px-2 py-1.5 text-[10.5px]" onToggle={(event) => setOpen(event.currentTarget.open)}>
         <summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
         <div aria-label="Source connection details" className="mt-2 grid gap-2">
           <div className="text-[10px] leading-relaxed text-muted-foreground">Identifiers are shown here for inspection and copying; they do not replace the selected version.</div>
@@ -739,9 +789,9 @@ function SourceConnectionDetails({ nodeId }: { nodeId: string }) {
             </div> : <div className="text-muted-foreground">No fields were supplied for this version.</div>}
           </div>}
         </div>
-      </details>
-    </Section>
+    </details>
   )
+  return embedded ? details : <Section title="Data source">{details}</Section>
 }
 
 function ConnectionFact({ label, value }: { label: string; value: string }) {

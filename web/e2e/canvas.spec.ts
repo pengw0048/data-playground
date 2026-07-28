@@ -2253,6 +2253,37 @@ test.describe('Data Playground canvas', () => {
     }
   })
 
+  test('a draft Source Inspector leads with data entry and keeps manual parsing advanced @ux-smoke', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await fresh(page)
+    await addNode(page, 'Sources & sinks', 'source')
+    const inspector = page.getByTestId('inspector')
+
+    await expect(inspector.getByRole('button', { name: 'Select dataset' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'Upload a file…' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'Register or browse an accessible path…' })).toBeVisible()
+    await expect(inspector.getByRole('button', { name: 'View data' })).toHaveCount(0)
+    await expect(inspector.getByRole('button', { name: 'Count rows' })).toHaveCount(0)
+    await expect(inspector.getByRole('button', { name: 'Delete' })).toBeVisible()
+    await expect(inspector.getByLabel('Dataset URI')).toBeHidden()
+
+    await inspector.getByText('Advanced source configuration', { exact: true }).click()
+    await expect(inspector.getByLabel('Dataset URI')).toBeVisible()
+    await expect(inspector.getByLabel('CSV delimiter')).toBeVisible()
+    await expect(inspector.getByLabel('CSV header row')).toBeVisible()
+
+    await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
+    await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByText('Open a dataset', { exact: true })).toHaveCount(0)
+
+    await inspector.getByRole('button', { name: 'Select dataset' }).click()
+    await page.getByText('events', { exact: true }).first().click()
+    await expect(inspector.getByRole('button', { name: 'Count rows' })).toBeVisible()
+    await expect(inspector.getByText('Related data')).toBeVisible()
+    await expect(inspector.getByText('Ports')).toBeVisible()
+  })
+
   test('a post-startup local input registers and retries its formal run without restart @ux-smoke', async ({ page }) => {
     const filename = `issue-956-${Date.now()}.parquet`
     const uri = resolve('.e2e-workspace/outputs', filename)

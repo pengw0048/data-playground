@@ -552,6 +552,71 @@ describe('Inspector — Source connection details', () => {
   })
 })
 
+describe('Inspector — draft Source entry', () => {
+  const selectSource = (config: Record<string, unknown>) => {
+    useStore.setState({
+      selectedIds: ['source'], canvasRole: 'owner', runs: {}, schemas: {}, catalog: [],
+      doc: { id: 'source-entry', name: 'Source entry', version: 1, requirements: [], edges: [],
+        nodes: [{ id: 'source', type: 'source', position: { x: 0, y: 0 }, data: {
+          title: 'Source', status: 'draft', history: [], config,
+        } }],
+      },
+    } as any)
+  }
+
+  it('leads an unbound Source with its three entry actions and keeps unavailable controls out', () => {
+    selectSource({})
+    const events: string[] = []
+    const receive = (event: Event) => events.push((event as CustomEvent<string>).detail)
+    window.addEventListener('dataplay:source-entry:source', receive)
+    render(<Inspector />)
+
+    expect(screen.getByText('Choose data')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Select dataset' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Upload a file…' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Register or browse an accessible path…' })).toBeInTheDocument()
+    expect(screen.getByText('Connection details')).not.toBeVisible()
+    expect(screen.queryByText('Related data')).not.toBeInTheDocument()
+    expect(screen.queryByText('Ports')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'View data' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Count rows' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Disable' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Duplicate' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select dataset' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Upload a file…' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Register or browse an accessible path…' }))
+    expect(events).toEqual(['select', 'upload', 'browse'])
+    window.removeEventListener('dataplay:source-entry:source', receive)
+  })
+
+  it('keeps manual URI and CSV settings behind a non-mutating advanced disclosure', () => {
+    selectSource({})
+    render(<Inspector />)
+    const before = JSON.stringify(useStore.getState().doc.nodes[0].data.config)
+    expect(screen.getByLabelText('Dataset URI')).not.toBeVisible()
+    fireEvent.click(screen.getByText('Advanced source configuration'))
+    expect(screen.getByLabelText('Dataset URI')).toBeVisible()
+    expect(screen.getByLabelText('CSV delimiter')).toBeVisible()
+    expect(screen.getByLabelText('CSV header row')).toBeVisible()
+    expect(JSON.stringify(useStore.getState().doc.nodes[0].data.config)).toBe(before)
+  })
+
+  it.each([
+    ['a local binding', { tableId: 'events', uri: 'events.parquet' }],
+    ['a provider binding', { providerResourceRef: 'provider://datasets/events', providerName: 'Provider' }],
+  ])('preserves the normal Inspector for %s', (_case, config) => {
+    selectSource(config)
+    render(<Inspector />)
+    expect(screen.getByText('Properties')).toBeInTheDocument()
+    expect(screen.getByText('Data source')).toBeInTheDocument()
+    expect(screen.getByText('Related data')).toBeInTheDocument()
+    expect(screen.getByText('Ports')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Count rows' })).toBeInTheDocument()
+  })
+})
+
 describe('Inspector — row-reference join diagnosis', () => {
   it('renders a configured blocking code and never describes unknown evidence as safe', async () => {
     const joinAnalysis = vi.spyOn(api, 'joinAnalysis').mockResolvedValue({

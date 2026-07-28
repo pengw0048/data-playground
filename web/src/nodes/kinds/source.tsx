@@ -63,6 +63,14 @@ const localDatasetBinding = (table: CatalogTable) => ({
   providerReadMode: undefined,
 })
 
+export type SourceEntryAction = 'select' | 'upload' | 'browse'
+
+// The Inspector uses the same picker that powers the Source card. Keeping the action at the
+// Source component preserves the existing catalog, upload, and destination-registration paths.
+export function requestSourceEntryAction(nodeId: string, action: SourceEntryAction) {
+  window.dispatchEvent(new CustomEvent<SourceEntryAction>(`dataplay:source-entry:${nodeId}`, { detail: action }))
+}
+
 function Source({ id, data }: NodeComponentProps) {
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState(false)
@@ -116,6 +124,19 @@ function Source({ id, data }: NodeComponentProps) {
   useEffect(() => {
     if (!canEdit) { setOpen(false); setDialog(false) }
   }, [canEdit])
+
+  useEffect(() => {
+    const eventName = `dataplay:source-entry:${id}`
+    const handleEntryAction = (event: Event) => {
+      const action = (event as CustomEvent<SourceEntryAction>).detail
+      if (!canEdit) return
+      if (action === 'select') setOpen(true)
+      if (action === 'upload') fileRef.current?.click()
+      if (action === 'browse') { setOpen(false); setDialog(true) }
+    }
+    window.addEventListener(eventName, handleEntryAction)
+    return () => window.removeEventListener(eventName, handleEntryAction)
+  }, [canEdit, id])
 
   // Server-side search picker — the catalog can be thousands of tables, so we never render them all.
   // Empty query shows the working-set recents PLUS a top-usage page from the server (a fresh session
