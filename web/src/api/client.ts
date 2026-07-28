@@ -646,7 +646,7 @@ export const api = {
 
   run: async (doc: CanvasDoc, targetNodeId: string | undefined, confirmed: boolean, submissionId: string,
     inputManifest?: RunInputManifestItem[], writeIntent?: WriteIntent,
-    parameterBindings?: CanvasParameterBinding[]) => {
+    parameterBindings?: CanvasParameterBinding[], confirmedWriteIntent?: WriteIntent) => {
     // Keep the same client-owned id across a lost HTTP response: the hub adopts the one immutable
     // admission instead of starting another full pass against a moved source head.
     const admittedProducerVersion = writeIntent?.provenance.publication.producerVersion
@@ -657,7 +657,7 @@ export const api = {
       try {
         return await req<RunStatus>('/run', {
           method: 'POST',
-          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent, parameterBindings }),
+          body: JSON.stringify({ graph: toGraph(submittedDoc), targetNodeId, confirmed, submissionId, inputManifest, writeIntent, parameterBindings, confirmedWriteIntent }),
         })
       } catch (error) {
         if (error instanceof KernelError || attempt >= 2) throw error

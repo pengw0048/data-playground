@@ -9105,44 +9105,47 @@ def test_plan_hash_ignores_legacy_transform_scope():
         graph_with("dataset", "def fn(row): return {**row, 'changed': True}"), "xf")
 
 
-def test_completed_run_result_is_db_cached(tmp_path):
-    # A2: a finished run persists its result pointer to the shared DB (result_cache), so it's reused
-    # across a kernel restart / another stateless instance — not just the accepting process's dict.
+def test_direct_managed_write_invocations_publish_distinct_revisions(tmp_path):
+    # A direct call without a caller-owned submission identity is a new invocation. Managed writes
+    # must consume a fresh exact-head admission instead of returning an older publication from the
+    # generic result cache.
     from hub import metadb
-    from hub.models import Graph
-    from hub.run_outputs import sole_committed_document_output
     p = _seq_parquet(tmp_path)
     gd = {"id": "c", "version": 1, "nodes": [N("src", "source", {"uri": p}), N("wr", "write", {"name": "a2cache"})],
           "edges": [E("src", "wr")]}
+    with metadb.session() as session:
+        durable_tasks_before = set(session.scalars(select(metadb.DurableTask.id)))
     first = _poll(client.post(
         "/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}
     ).json()["runId"])
     assert first["status"] == "done"
     first_output = _sole_output(first, outcome="committed")
     assert first_output["version"]
-    phash = get_deps().runner._plan_hash(Graph(**gd), "wr")
-    c = metadb.get_result(phash)
-    cached_output = sole_committed_document_output(c)
-    assert cached_output and cached_output.uri and cached_output.table  # persisted to the shared DB
-    assert cached_output.version == first_output["version"]
-    fresh_output = sole_committed_document_output(get_deps().runner._cache_get(phash))
-    assert fresh_output and fresh_output.table == cached_output.table  # a fresh instance reads the same pointer
 
     second = _poll(client.post(
         "/api/run", json={"graph": gd, "targetNodeId": "wr", "confirmed": True}
     ).json()["runId"])
     assert second["status"] == "done"
     second_output = _sole_output(second, outcome="committed")
-    assert (second_output["uri"], second_output["version"]) == (
+    assert (second_output["uri"], second_output["version"]) != (
         first_output["uri"], first_output["version"])
+    assert (
+        second_output["writeReceipt"]["parentHead"]["revisionId"]
+        == first_output["writeReceipt"]["revisionId"]
+    )
 
     with metadb.session() as session:
+        assert set(session.scalars(select(metadb.DurableTask.id))) == durable_tasks_before
         facts = list(session.scalars(select(metadb.CatalogLineageFact).where(
-            metadb.CatalogLineageFact.destination_uri == first_output["uri"],
+            metadb.CatalogLineageFact.destination_uri.in_([
+                first_output["uri"], second_output["uri"],
+            ]),
             metadb.CatalogLineageFact.run_id.in_([first["runId"], second["runId"]]),
         ).order_by(metadb.CatalogLineageFact.id)))
     assert [fact.run_id for fact in facts] == [first["runId"], second["runId"]]
-    assert all(fact.destination_version == first_output["version"] for fact in facts)
+    assert [fact.destination_version for fact in facts] == [
+        first_output["version"], second_output["version"],
+    ]
 
 
 def test_plan_cacheable_opt_out():

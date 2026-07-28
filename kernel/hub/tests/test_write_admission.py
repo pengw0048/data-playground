@@ -139,13 +139,14 @@ def _publish(deps, admission, values):
     )
 
 
-def _managed_publication_counts() -> tuple[int, int, int]:
+def _managed_publication_counts() -> tuple[int, int, int, int]:
     with metadb.session() as session:
         return tuple(int(session.scalar(
             select(func.count()).select_from(model)) or 0) for model in (
                 metadb.CatalogEntry,
                 metadb.CatalogLogicalDataset,
                 metadb.ManagedLocalFileRevision,
+                metadb.LocalResultArtifact,
             ))
 
 
@@ -258,6 +259,82 @@ def test_direct_run_returns_the_same_name_error_before_run_allocation(
     assert _run_allocation_counts() == before_runs
     assert _managed_publication_counts() == before_publications
     assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+@pytest.mark.parametrize("failed_probe", ["runner_adapter", "controller_ownership"])
+def test_direct_managed_schema_change_fails_closed_when_admission_probe_recovers(
+        contract, monkeypatch, failed_probe):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", f"{failed_probe}-create")
+    receipt = _publish(deps, create, [1])
+    _set_exact_revision_schema(receipt.revision_id, [
+        {"name": "value", "type": "int64", "physicalType": "BIGINT"},
+    ])
+    proposed = [
+        ColumnSchema(name="value", type="string", physical_type="VARCHAR"),
+    ]
+    monkeypatch.setattr(
+        run_routes,
+        "schema_for_graph",
+        lambda *_args, **_kwargs: {"source": proposed, "write": proposed},
+    )
+
+    class RecoveringRunner:
+        def __init__(self):
+            self.resolve_calls = 0
+
+        @staticmethod
+        def supports_managed_local_write_intents():
+            return True
+
+        def resolve_adapter(self, uri):
+            self.resolve_calls += 1
+            if failed_probe == "runner_adapter" and self.resolve_calls == 1:
+                raise ConnectionError("transient admission adapter failure")
+            return deps.resolve_adapter(uri)
+
+    class RecoveringController:
+        def __init__(self):
+            self.plan_calls = 0
+
+        def plan_for_run(self, *_args, **_kwargs):
+            self.plan_calls += 1
+            if failed_probe == "controller_ownership" and self.plan_calls == 1:
+                raise ConnectionError("transient admission ownership failure")
+            return []
+
+    runner = RecoveringRunner()
+    controller = RecoveringController()
+    deps.runner = runner
+    deps.runners = []
+    deps.node_ir = {}
+    deps.pick_runner = lambda _plan, _uid: runner
+    deps.controller = controller
+    monkeypatch.setattr(run_routes, "get_deps", lambda: deps)
+    before_head = metadb.catalog_managed_local_write_head(create.destination)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    response = TestClient(app).post("/api/run", json={
+        "graph": graph.model_dump(by_alias=True, mode="json"),
+        "targetNodeId": "write",
+        "confirmed": True,
+    })
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == APIErrorCode.SERVICE_UNAVAILABLE
+    assert response.json()["retryable"] is True
+    assert "write admission" in response.json()["detail"]
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+    assert metadb.catalog_managed_local_write_head(create.destination) == before_head
+    # The injected dependency is healthy after the admission probe; failure, rather than a lasting
+    # inability to write, is what must prevent provider-neutral fallback.
+    assert runner.resolve_adapter(create.destination) is deps.resolve_adapter(create.destination)
+    assert controller.plan_for_run(graph, "write", sizes={}) == []
 
 
 def test_sink_config_treats_injected_null_filename_as_absent():
@@ -550,8 +627,213 @@ def test_structural_drift_requires_the_displayed_admission_before_allocation(
             deps, graph.model_copy(deep=True), "write", "researcher",
             confirmed=True, submission_id="schema-replace",
             write_intent=admission.intent,
+            confirmed_write_intent=admission.intent,
         )
     assert _run_allocation_counts() == before_runs
+
+
+def test_direct_and_mcp_runs_cannot_bypass_drift_without_an_admission(
+        contract, monkeypatch):
+    from hub.mcp import Playground, ToolError
+
+    deps, graph, _admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [{"name": "replacement", "type": "int", "nullable": True}],
+    )
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(HTTPException, match="displayed write admission") as direct:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+    assert direct.value.status_code == 409
+
+    with pytest.raises(HTTPException, match="displayed write admission") as implicit:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), None, "researcher", confirmed=True)
+    assert implicit.value.status_code == 409
+
+    playground = Playground(deps, "researcher", "http://test.local")
+    payload = graph.model_dump(by_alias=True, mode="json")
+    monkeypatch.setattr(playground, "_get_doc", lambda _canvas_id: payload)
+    with pytest.raises(ToolError, match="displayed write admission"):
+        playground.run_canvas({
+            "canvasId": graph.id, "nodeId": "write", "confirm": True,
+        })
+
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_unsubmitted_replace_consumes_the_probed_head_and_loses_a_dispatch_race(
+        contract, monkeypatch):
+    from hub.plugins.runner import LocalRunner
+
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "dispatch-race-create")
+    _publish(deps, create, [0])
+    winner = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "dispatch-race-winner")
+
+    runner = LocalRunner(
+        deps.resolve_adapter,
+        deps.registry,
+        deps.catalog,
+        deps.workspace,
+        node_builders=deps.node_builders,
+        node_specs=deps.node_specs,
+        storage=deps.storage,
+    )
+
+    class Controller:
+        @staticmethod
+        def plan_for_run(_graph, _target_node_id, *, sizes):
+            assert isinstance(sizes, dict)
+            return []
+
+        @staticmethod
+        def run(*_args, **_kwargs):
+            return None
+
+    deps.runner = runner
+    deps.runners = []
+    deps.node_ir = {}
+    deps.pick_runner = lambda _plan, _uid: runner
+    deps.controller = Controller()
+    deps.run_index = {}
+    deps.run_owner = {}
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+
+    original_admission = run_routes._write_admission_for_graph
+    winner_receipt = None
+    raced_publications = None
+    raced_artifacts = None
+
+    def move_head_after_probe(*args, **kwargs):
+        nonlocal winner_receipt, raced_publications, raced_artifacts
+        admission = original_admission(*args, **kwargs)
+        assert admission.intent is not None
+        winner_receipt = _publish(deps, winner, [1])
+        raced_publications = _managed_publication_counts()
+        raced_artifacts = set(os.listdir(deps.storage.result_root))
+        return admission
+
+    monkeypatch.setattr(
+        run_routes, "_write_admission_for_graph", move_head_after_probe)
+
+    status, owner = run_routes.start_run(
+        deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+    assert owner is runner
+    for _ in range(200):
+        status = owner.status(status.run_id)
+        if status.status in ("done", "failed", "cancelled"):
+            break
+        time.sleep(0.01)
+
+    assert winner_receipt is not None
+    assert raced_publications is not None and raced_artifacts is not None
+    assert status.status == "failed"
+    assert "replace expected head is stale" in (status.error or "")
+    assert metadb.catalog_managed_local_write_head(
+        winner_receipt.publication.logical_uri)["revision_id"] == winner_receipt.revision_id
+    assert _managed_publication_counts() == raced_publications
+    assert set(os.listdir(deps.storage.result_root)) == raced_artifacts
+
+
+def test_unsubmitted_replace_fails_closed_when_existing_head_schema_is_unbounded(
+        contract, monkeypatch):
+    deps, graph = contract
+    create = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "unbounded-replace-create")
+    receipt = _publish(deps, create, [0])
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        run_routes, "schema_for_graph", lambda *_args, **_kwargs: {})
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(HTTPException, match="bounded output schema") as caught:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+
+    assert caught.value.status_code == 409
+    assert metadb.catalog_managed_local_write_head(
+        receipt.publication.logical_uri)["revision_id"] == receipt.revision_id
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
+def test_confirmation_cannot_reuse_admission_after_schema_or_head_changes(
+        contract, monkeypatch):
+    deps, graph, admission_a = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [
+            {"name": "value", "type": "int", "nullable": True},
+            {"name": "extra", "type": "string", "nullable": True},
+        ],
+    )
+    assert admission_a.intent is not None
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+
+    # Another writer moves the destination to the schema A was compared against. The next graph
+    # changes its structural field again, so its exact head, proposed schema, and drift evidence are
+    # all distinct from the evidence the user originally saw.
+    receipt = write_managed_local_file(
+        storage=deps.storage,
+        catalog=deps.catalog,
+        intent=admission_a.intent,
+        write_artifact=lambda uri: pq.write_table(
+            pa.table({"value": [1], "extra": ["a"]}), uri),
+    )
+    proposed_b = [
+        ColumnSchema(name="value", type="int", nullable=True),
+        ColumnSchema(name="replacement", type="string", nullable=True),
+    ]
+    monkeypatch.setattr(
+        run_routes,
+        "schema_for_graph",
+        lambda *_args, **_kwargs: {"source": proposed_b, "write": proposed_b},
+    )
+    graph.nodes[0].data["config"]["confirmationTest"] = "replacement"
+    admission_b = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "schema-confirmation-b")
+    assert admission_b.intent is not None
+    assert admission_b.expected_head is not None
+    assert admission_b.expected_head.revision_id == receipt.revision_id
+    assert admission_b.intent != admission_a.intent
+
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    with pytest.raises(HTTPException, match="requires the displayed") as generic:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="schema-confirmation-b",
+            write_intent=admission_b.intent,
+        )
+    assert generic.value.status_code == 409
+    with pytest.raises(HTTPException, match="confirmation is stale") as stale:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="schema-confirmation-b",
+            write_intent=admission_b.intent,
+            confirmed_write_intent=admission_a.intent,
+        )
+
+    assert stale.value.status_code == 409
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
 def test_drift_receipt_preserves_exact_comparison_and_recovers_after_response_loss(

@@ -1480,7 +1480,7 @@ describe('graph store — core authority ops', () => {
 
     const submissionId = apiMocks.writeAdmission.mock.calls[0][2]
     expect(apiMocks.run).toHaveBeenCalledWith(
-      doc, 'write', false, submissionId, undefined, intent)
+      doc, 'write', false, submissionId, undefined, intent, undefined, undefined)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
     expect(useStore.getState().runs.write.writeAdmission).toBeUndefined()
     expect(useStore.getState().runs.write.writeOutcomeAdmission).toMatchObject({
@@ -1538,7 +1538,7 @@ describe('graph store — core authority ops', () => {
     await useStore.getState().requestRun('write')
 
     expect(apiMocks.run).toHaveBeenCalledWith(
-      doc, 'write', false, expect.any(String), undefined, intent)
+      doc, 'write', false, expect.any(String), undefined, intent, undefined, undefined)
     expect(useStore.getState().runs.write.phase).not.toBe('confirm')
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
     useStore.setState({ runs: {} })
@@ -1601,7 +1601,89 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
     expect(apiMocks.run).toHaveBeenCalledWith(
-      doc, 'write', true, submissionId, undefined, intent)
+      doc, 'write', true, submissionId, undefined, intent, undefined, intent)
+    await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
+    useStore.setState({ runs: {} })
+  })
+
+  it('replaces stale schema-drift evidence instead of reusing its confirmation', async () => {
+    const source = NODE('source')
+    const write = NODE('write', 'write')
+    write.data.config = { filename: 'output.parquet', writeMode: 'overwrite' }
+    const doc = {
+      id: 'c', version: 1, name: 'test', requirements: [], nodes: [source, write],
+      edges: [{ id: 'source-write', source: 'source', target: 'write' }],
+    }
+    useStore.setState({ doc, runs: {} })
+    const intentA = {
+      destination: {
+        logicalUri: '/outputs/output.parquet', name: 'output',
+        datasetId: 'dataset-1', provider: 'managed-local-file' as const,
+      },
+      mode: 'replace' as const, expectedSchema: [{ name: 'id', type: 'int' }],
+      expectedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-1' },
+      idempotencyKey: 'drift-a', partitions: [], provenance: {
+        publication: { idempotencyKey: 'drift-a', provenance: 'run' }, parents: [],
+      },
+      schemaDrift: {
+        comparedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-1' },
+        compatibility: { status: 'breaking' as const, fields: [{
+          kind: 'removed' as const, status: 'breaking' as const, oldName: 'user_id',
+          reason: 'field was removed',
+        }] },
+        requiresConfirmation: true,
+      },
+    }
+    const intentB = {
+      ...intentA,
+      expectedSchema: [{ name: 'user_id', type: 'int' }],
+      expectedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-2' },
+      idempotencyKey: 'drift-b',
+      provenance: { publication: { idempotencyKey: 'drift-b', provenance: 'run' }, parents: [] },
+      schemaDrift: {
+        comparedHead: { kind: 'exact' as const, datasetId: 'dataset-1', revisionId: 'revision-2' },
+        compatibility: { status: 'breaking' as const, fields: [{
+          kind: 'removed' as const, status: 'breaking' as const, oldName: 'id',
+          reason: 'field was removed',
+        }] },
+        requiresConfirmation: true,
+      },
+    }
+    const admissionA = {
+      nodeId: 'write', managed: true, destination: '/outputs/output.parquet', mode: 'replace' as const,
+      provider: 'managed-local-file', expectedSchema: intentA.expectedSchema, partitions: [],
+      expectedHead: intentA.expectedHead, intent: intentA,
+    }
+    const admissionB = {
+      ...admissionA, expectedSchema: intentB.expectedSchema, expectedHead: intentB.expectedHead, intent: intentB,
+    }
+    apiMocks.writeAdmission.mockResolvedValueOnce(admissionA).mockResolvedValueOnce(admissionB)
+
+    await useStore.getState().requestRun('write')
+    const changedDoc = {
+      ...doc,
+      nodes: doc.nodes.map((node) => node.id === 'source'
+        ? { ...node, data: { ...node.data, config: { ...node.data.config, filter: 'value > 0' } } }
+        : node),
+    }
+    // Simulate the click racing with graph invalidation: the displayed A is still retained when
+    // the fresh admission observes B.
+    useStore.setState({ doc: changedDoc })
+
+    await useStore.getState().run('write', true)
+
+    expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(2)
+    expect(apiMocks.run).not.toHaveBeenCalled()
+    expect(useStore.getState().runs.write).toMatchObject({ phase: 'confirm', writeAdmission: admissionB })
+
+    apiMocks.runStatus.mockResolvedValueOnce({
+      runId: 'run-store-test', status: 'done', jobType: 'run', targetNodeId: 'write',
+      rowsProcessed: 1, totalRows: 1, ms: 1, placement: 'local', perNode: [], outputs: [],
+    })
+    await useStore.getState().run('write', true)
+
+    expect(apiMocks.run).toHaveBeenCalledWith(
+      changedDoc, 'write', true, expect.any(String), undefined, intentB, undefined, intentB)
     await vi.waitFor(() => expect(useStore.getState().runs.write.phase).toBe('done'))
     useStore.setState({ runs: {} })
   })
@@ -1695,7 +1777,7 @@ describe('graph store — core authority ops', () => {
 
     expect(apiMocks.writeAdmission).toHaveBeenCalledTimes(1)
     expect(apiMocks.run.mock.calls[1].slice(1)).toEqual([
-      'write', false, submissionId, undefined, intent,
+      'write', false, submissionId, undefined, intent, undefined, undefined,
     ])
     expect(apiMocks.run.mock.calls[1][0].nodes[0].data.config).toEqual(doc.nodes[0].data.config)
     expect(apiMocks.run.mock.calls[1][0].version).toBe(2)

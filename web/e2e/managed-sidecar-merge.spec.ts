@@ -16,7 +16,10 @@ async function publish(page: Page, graph: any, filename: string): Promise<Exact>
     data: { graph, nodeId: 'write', submissionId },
   }), `admit ${filename}`)
   const started = await json<Run>(await page.request.post('/api/run', {
-    data: { graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent },
+    data: {
+      graph, targetNodeId: 'write', confirmed: true, submissionId,
+      writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
+    },
   }), `run ${filename}`)
   await expect.poll(async () => {
     const run = await json<Run>(await page.request.get(`/api/run/${encodeURIComponent(started.runId)}`), `read ${filename} task`)

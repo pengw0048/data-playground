@@ -76,7 +76,10 @@ test.describe('keyed-upsert release acceptance @acceptance-keyed-upsert', () => 
     await ok(await request.post(`${base}/api/canvas`, { data: graph }), 'save bootstrap canvas')
     const submissionId = randomUUID()
     const admission = await ok<{ intent: unknown }>(await request.post(`${base}/api/run/write-admission`, { data: { graph, nodeId: 'write', submissionId } }), 'admit bootstrap')
-    const started = await ok<{ runId: string }>(await request.post(`${base}/api/run`, { data: { graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent } }), 'run bootstrap')
+    const started = await ok<{ runId: string }>(await request.post(`${base}/api/run`, { data: {
+      graph, targetNodeId: 'write', confirmed: true, submissionId,
+      writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
+    } }), 'run bootstrap')
     await expect.poll(async () => {
       const status = await ok<{ status: string; error?: string | null }>(await request.get(`${base}/api/run/${encodeURIComponent(started.runId)}`), 'poll bootstrap')
       if (status.status === 'failed') throw new Error(status.error ?? 'bootstrap failed')
