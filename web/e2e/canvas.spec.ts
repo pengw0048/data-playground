@@ -1665,14 +1665,29 @@ test.describe('Data Playground canvas', () => {
 
   test('a failing run surfaces an error toast (not a silent failure)', async ({ page }) => {
     await fresh(page)
-    await addNode(page, 'Sources & sinks', 'source') // auto-selected → editable in the inspector
+    await addWorkspaceDatasetToCurrentCanvas(page, 'events')
     const inspector = page.getByTestId('inspector')
-    // point the source at a dataset that doesn't exist → the run fails and must surface a toast
-    await inspector.getByText('Advanced source configuration', { exact: true }).click()
-    await inspector.getByLabel('Dataset URI').fill('does-not-exist.parquet')
-    // a source's run is a full count/scan — the Inspector labels it "Count rows"
+    const failure = 'Deterministic estimate failure'
+    let exactRunReadiness: unknown
+    await page.route('**/api/run/estimate', async (route) => {
+      const response = await route.fetch()
+      expect(response.ok(), await response.text()).toBeTruthy()
+      const estimate = await response.json() as {
+        exactRunReadiness?: { ready: boolean; reason: string }
+      }
+      exactRunReadiness = estimate.exactRunReadiness
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: failure }),
+      })
+    })
+
     await inspector.getByRole('button', { name: 'Count rows' }).click()
-    await expect(page.getByTestId('toast')).toBeVisible({ timeout: 15_000 })
+    const errorToast = page.getByTestId('toast').filter({ hasText: failure })
+    await expect(errorToast).toBeVisible({ timeout: 15_000 })
+    await expect(errorToast).toHaveClass(/text-destructive/)
+    expect(exactRunReadiness).toMatchObject({ ready: true, reason: 'ready' })
     // #118 error-state axe gate — colocated with the stable toast path (the duplicate a11y.spec
     // copy flaked under CI parallelism even though this test passed in the same job).
     const axe = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).disableRules(['color-contrast']).analyze()
