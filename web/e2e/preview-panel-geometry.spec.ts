@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Page, type TestInfo } from '@playwright/test'
+import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 
 type CatalogTable = { id: string; name: string; uri: string; registrationId: string }
 
@@ -52,6 +53,66 @@ async function removeCanvas(page: Page, canvasId: string) {
   expect((await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)).ok()).toBeTruthy()
 }
 
+async function openFullResult(page: Page, suffix: string) {
+  const doc = goldenCanvas(`result-maximize-${suffix}-${Date.now()}`, 'Result maximize', 'Result maximize source')
+  await installCanvas(page.request, doc)
+  const graph = {
+    id: doc.id, version: doc.version, requirements: doc.requirements ?? [],
+    nodes: doc.nodes.map((node) => ({
+      id: node.id, type: node.type, position: node.position, parentId: node.parentId ?? null,
+      data: { title: node.data.title, config: node.data.config, status: node.data.status,
+        bypassed: node.data.bypassed, disabled: node.data.disabled },
+    })),
+    edges: doc.edges,
+  }
+  const started = await page.request.post('/api/run', { data: { graph, targetNodeId: 'filter', confirmed: true } })
+  expect(started.ok(), started.ok() ? '' : await started.text()).toBe(true)
+  const runId = (await started.json()).runId as string
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/run/${encodeURIComponent(runId)}`)
+    return (await response.json()).status
+  }, { timeout: 30_000 }).toBe('done')
+  await page.goto(`/#/canvas/${doc.id}`)
+  const filter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
+  await filter.click()
+  await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
+  const panel = page.getByTestId('panel-data')
+  await expect(panel.getByTestId('full-result-status')).toBeVisible()
+  return { canvasId: doc.id, panel }
+}
+
+async function expectMaximizedResultGeometry(page: Page, panel: ReturnType<Page['getByTestId']>, testInfo: TestInfo) {
+  await panel.getByRole('button', { name: 'Maximize' }).click()
+  await expect(panel).toHaveAttribute('data-presentation', 'maximized')
+  await expect(panel.getByRole('button', { name: 'Restore' })).toBeVisible()
+  const geometry = await panel.evaluate((element) => {
+    const card = element.firstElementChild as HTMLElement | null
+    const body = element.querySelector<HTMLElement>('[data-testid="full-result-body"]')
+    const table = body?.querySelector('table')
+    if (!card || !body || !table) return null
+    const overlay = element.getBoundingClientRect()
+    const cardBox = card.getBoundingClientRect()
+    const bodyBox = body.getBoundingClientRect()
+    const tableBox = table.getBoundingClientRect()
+    return {
+      overlay: { left: overlay.left, top: overlay.top, right: overlay.right, bottom: overlay.bottom },
+      card: { left: cardBox.left, top: cardBox.top, right: cardBox.right, bottom: cardBox.bottom },
+      body: { top: bodyBox.top, bottom: bodyBox.bottom, clientHeight: body.clientHeight, scrollHeight: body.scrollHeight },
+      table: { top: tableBox.top, bottom: tableBox.bottom },
+    }
+  })
+  expect(geometry).not.toBeNull()
+  expect(geometry!.overlay).toEqual({ left: 0, top: 0, right: page.viewportSize()!.width, bottom: page.viewportSize()!.height })
+  expect(geometry!.card.left).toBeGreaterThan(0)
+  expect(geometry!.card.right).toBeLessThan(page.viewportSize()!.width)
+  expect(geometry!.body.clientHeight).toBeGreaterThan(500)
+  expect(Math.abs(geometry!.body.bottom - geometry!.card.bottom)).toBeLessThanOrEqual(1)
+  expect(Math.abs(geometry!.table.top - geometry!.body.top)).toBeLessThanOrEqual(1)
+  await page.screenshot({ path: testInfo.outputPath(`result-maximized-${page.viewportSize()!.width}x${page.viewportSize()!.height}.png`) })
+  await panel.getByRole('button', { name: 'Restore' }).click()
+  await expect(panel).not.toHaveAttribute('data-presentation', 'maximized')
+}
+
 test('docks a rightmost Transform preview above the toolbar at 1280x720', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 })
   const { canvasId, panel } = await openNodePreview(page, 'minimum')
@@ -94,6 +155,18 @@ test('keeps an anchored data preview and restores it after maximize at 1440x900'
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'maximized')
     await page.getByTestId('panel-data').getByRole('button', { name: 'Restore' }).click()
     await expect(page.getByTestId('panel-data')).toHaveAttribute('data-presentation', 'anchored')
+  } finally {
+    await removeCanvas(page, canvasId)
+  }
+})
+
+test('maximizes a full result to the viewport and gives its table the remaining height', async ({ page }, testInfo) => {
+  const { canvasId, panel } = await openFullResult(page, 'full')
+  try {
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expectMaximizedResultGeometry(page, panel, testInfo)
+    }
   } finally {
     await removeCanvas(page, canvasId)
   }
