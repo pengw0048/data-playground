@@ -1239,7 +1239,8 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                 </div>
               ) : null}
               {preview ? <div className="flex flex-col gap-1">
-                {!preview.error && !preview.notPreviewable && <CatalogPreviewScope preview={preview} stale={Boolean(previewError)} />}
+                {!preview.error && !preview.notPreviewable && <CatalogPreviewScope
+                  preview={preview} stale={Boolean(previewError)} visibleRows={Math.min(4, preview.rows.length)} />}
                 {preview.error || preview.notPreviewable || !preview.rows.length
                   ? <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">{preview.reason || emptyCatalogPreviewMessage(preview)}</div>
                   : <><div tabIndex={0} aria-label="Row preview table" data-testid="detail-preview-scroll"
@@ -1247,7 +1248,7 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
                     <th key={c.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{c.name}</th>
                   ))}</tr></thead><tbody>{preview.rows.slice(0, 4).map((r, i) => (
                     <tr key={i}>{preview.columns.map((c) => <td key={c.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{cell(r[c.name])}</td>)}</tr>
-                  ))}</tbody></table></div>{preview.rows.length > 4 && <div className="text-[10.5px] text-muted-foreground">Showing the first 4 of {preview.rows.length} preview rows.</div>}</>}
+                  ))}</tbody></table></div></>}
               </div> : null}
             </>}
           </section>
@@ -1352,10 +1353,21 @@ export function CatalogDetail({ table, onClose, onUse, onChanged, onFolder, onDe
   )
 }
 
-function CatalogPreviewScope({ preview, stale }: { preview: SampleResult; stale: boolean }) {
+function CatalogPreviewScope({ preview, stale, visibleRows }: {
+  preview: SampleResult
+  stale: boolean
+  visibleRows: number
+}) {
+  const fetchedRows = preview.rows.length
+  const visibleLabel = fetchedRows === 0
+    ? null
+    : visibleRows < fetchedRows
+      ? `Showing ${visibleRows.toLocaleString()} of ${fetchedRows.toLocaleString()} preview rows.`
+      : `Showing ${visibleRows.toLocaleString()} preview ${visibleRows === 1 ? 'row' : 'rows'}.`
   return (
     <div className="rounded-md bg-muted/50 px-2 py-1">
-      <PreviewSummary data={preview} surface="catalog" />
+      {visibleLabel && <div role="status" className="text-[10.5px] text-muted-foreground">{visibleLabel}</div>}
+      <PreviewSummary data={preview} surface="catalog" showRange={false} />
       <PreviewDetails provenance={preview.sampleProvenance} stale={stale} />
     </div>
   )

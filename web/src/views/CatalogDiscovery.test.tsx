@@ -377,7 +377,7 @@ describe('Catalog discovery request and mutation truth', () => {
     expect(await screen.findByText(/Couldn't load preview: Failed to fetch/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('detail-preview-retry'))
     expect(await screen.findByRole('cell', { name: '1' })).toBeInTheDocument()
-    expect(screen.getByText('rows 1–1')).toBeInTheDocument()
+    expect(screen.getByText('Showing 1 preview row.')).toBeInTheDocument()
 
     openCatalogMaintenance()
     const folder = screen.getByTestId('detail-folder') as HTMLInputElement
@@ -403,9 +403,10 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    expect(await screen.findByText('rows 1–50')).toBeInTheDocument()
+    expect(await screen.findByText('Showing 4 of 50 preview rows.')).toBeInTheDocument()
+    expect(screen.queryByText('rows 1–50')).not.toBeInTheDocument()
     expect(screen.getAllByRole('cell')).toHaveLength(4)
-    expect(screen.getByText('Showing the first 4 of 50 preview rows.')).toBeInTheDocument()
+    expect(screen.getAllByText('Showing 4 of 50 preview rows.')).toHaveLength(1)
   })
 
   it('keeps default schema evidence and scrollable preview inspection keyboard reachable', async () => {
@@ -454,7 +455,7 @@ describe('Catalog discovery request and mutation truth', () => {
     })
     render(<CatalogDiscoveryFixture />)
     fireEvent.click(await screen.findByText('orders'))
-    expect(await screen.findByText('rows 1–1')).toBeInTheDocument()
+    expect(await screen.findByText('Showing 1 preview row.')).toBeInTheDocument()
     expect(screen.getByTestId('preview-details')).not.toHaveAttribute('open')
     fireEvent.click(screen.getByText('Preview details'))
     expect(screen.getByText(/Requested 50 rows.*scanned unknown.*returned 1.*total 2/i)).toBeInTheDocument()
