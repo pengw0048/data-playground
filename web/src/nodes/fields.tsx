@@ -188,11 +188,11 @@ export function SortBuilder({ nodeId }: { nodeId: string }) {
 
 // ---- filter: rows of {column, op, value} joined by AND ------------------- //
 export function FilterBuilder({ nodeId }: { nodeId: string }) {
-  const config = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config ?? {})
-  const pred = String(config.predicate ?? '')
+  const config = useStore((s) => s.doc.nodes.find((n) => n.id === nodeId)?.data.config)
+  const pred = String(config?.predicate ?? '')
   const updateConfig = useStore((s) => s.updateConfig)
   const columns = useInputColumns(nodeId)
-  const saved = filterBuilderConditions(config)
+  const saved = config ? filterBuilderConditions(config) : null
   const parsed = saved ?? parseFilterConditions(pred)
   // stick in advanced mode if the current predicate can't be represented as simple AND conditions
   const [advanced, setAdvanced] = useState(parsed === null)
