@@ -16,6 +16,7 @@ const apiMock = vi.hoisted(() => ({
   datasetRevision: vi.fn(),
   sample: vi.fn(),
   runOutputSample: vi.fn(),
+  retainedResult: vi.fn(),
   preview: vi.fn(),
   profile: vi.fn(),
   profileEstimate: vi.fn(),
@@ -48,6 +49,9 @@ beforeEach(() => {
   apiMock.datasetRevision.mockReset()
   apiMock.sample.mockReset()
   apiMock.runOutputSample.mockReset()
+  apiMock.retainedResult.mockReset().mockRejectedValue(
+    Object.assign(new Error('retained result not found'), { status: 404 }),
+  )
   apiMock.preview.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({
     columns: [], rowCount: 10, sampled: true, completeness: 'sample',
@@ -837,6 +841,131 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Full result' }))
     await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith('run-real', 'target', 'out', 50, 0))
     expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+  })
+
+  it('recovers the current retained full result when an in-memory run is absent', async () => {
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'persisted-run',
+      executionManifestSha256: 'a'.repeat(64),
+      output: committedOutput('/outputs/persisted.parquet', 105),
+    })
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {},
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledWith(
+      doc, 'target', 'out', undefined,
+    ))
+    await waitFor(() => expect(apiMock.runOutputSample).toHaveBeenCalledWith(
+      'persisted-run', 'target', 'out', 50, 0,
+    ))
+    expect(screen.getByText('Full result artifact')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Preview sample' })).toBeInTheDocument()
+  })
+
+  it('does not use default bindings when a fresh session cannot prove run parameters', async () => {
+    const requestRun = vi.fn()
+    const doc = {
+      id: 'history-canvas', name: 'History', version: 1, requirements: [],
+      parameters: [{ name: 'predicate', type: 'string' as const, default: "event = 'purchase'" }],
+      edges: [], nodes: [{
+        id: 'target', type: 'filter', position: { x: 0, y: 0 },
+        data: {
+          title: 'target', status: 'latest' as const,
+          config: { predicate: { parameterRef: 'predicate' } }, history: [],
+        },
+      }],
+    }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {},
+      canvasRole: 'owner',
+      requestRun,
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('status', { name: 'Retained result parameters unavailable' }))
+      .toBeInTheDocument()
+    expect(apiMock.retainedResult).not.toHaveBeenCalled()
+    expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run this step' }))
+    expect(requestRun).toHaveBeenCalledWith('target')
+  })
+
+  it('does not recover an old retained result after the node becomes stale', async () => {
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'persisted-run',
+      executionManifestSha256: 'a'.repeat(64),
+      output: committedOutput('/outputs/persisted.parquet', 105),
+    })
+    apiMock.runOutputSample.mockResolvedValue(sample(0, 50, true))
+    const latest = {
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: { uri: 'events' }, history: [] },
+    }
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [latest] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {},
+    } as any)
+    const { rerender } = render(<DataPanel nodeId="target" />)
+    await screen.findByText('Full result artifact')
+
+    const staleDoc = {
+      ...doc,
+      nodes: [{ ...latest, data: { ...latest.data, status: 'stale' as const, config: { uri: 'movies' } } }],
+    }
+    useStore.setState({
+      doc: staleDoc,
+      previews: { target: boundPreview(staleDoc, 'target', sample(0, 1, false)) },
+    } as any)
+    rerender(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(screen.queryByText('Full result artifact')).not.toBeInTheDocument())
+    expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers a new run when the recovered artifact has expired', async () => {
+    apiMock.retainedResult.mockResolvedValue({
+      runId: 'expired-run',
+      executionManifestSha256: 'a'.repeat(64),
+      output: committedOutput('/outputs/expired.parquet', 105),
+    })
+    apiMock.runOutputSample.mockRejectedValue(Object.assign(
+      new Error('full-result artifact is missing or expired'), { status: 410 },
+    ))
+    const requestRun = vi.fn()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', sample(0, 50, true)) },
+      runs: {},
+      requestRun,
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
+    expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Run this step' }))
+    expect(requestRun).toHaveBeenCalledWith('target')
   })
 
   it('keeps the Sample escape hatch when loading Full fails temporarily', async () => {

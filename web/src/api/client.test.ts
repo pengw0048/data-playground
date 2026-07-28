@@ -11,6 +11,40 @@ afterEach(() => {
 })
 
 describe('API error recovery contract', () => {
+  it('asks the server to resolve a current retained result without accepting result identity', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      runId: 'retained-run',
+      executionManifestSha256: 'a'.repeat(64),
+      output: {
+        nodeId: 'transform', portId: 'out', wire: 'dataset',
+        publicationKind: 'result', outcome: 'committed', uri: '/private/result.parquet', rows: 2,
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    const doc: CanvasDoc = {
+      id: 'canvas', version: 1, nodes: [{
+        id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+        data: { title: 'Transform', status: 'latest', config: {
+          source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+        } },
+      }], edges: [],
+    }
+
+    await api.retainedResult(doc, 'transform', 'out')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/run/retained-result',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          graph: toGraph(doc), nodeId: 'transform', portId: 'out',
+        }),
+      }),
+    )
+    const body = String((fetchMock.mock.calls[0]?.[1] as RequestInit).body)
+    expect(body).not.toContain('runId')
+    expect(body).not.toContain('uri')
+  })
+
   it('asks the server to discover retained editor input without sending a run id or artifact URI', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       columns: [], rows: [], truncated: false,

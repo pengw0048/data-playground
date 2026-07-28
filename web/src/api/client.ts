@@ -3,7 +3,7 @@ import type {
   CanvasKernelStatus,
   CatalogBrowse, CatalogEdit, CatalogFolder, CatalogMetadata, CatalogPage, CatalogQueryParams, CatalogTable, CompilePlan, DatasetRevisionCapabilities, DatasetRevisionDetail, DatasetRevisionPage, DatasetRevisionResolution, DatasetViewCreateRequest, DatasetViewDefinition, DatasetViewPreview, DistributionReportEnvelope, DistributionReportEstimate, Facets,
   InputDrift, JoinAnalysis, JoinSuggestion, KernelInfo, LineageResult, PipelineImport, DistributionReportComparison, DistributionReportBucketExamples, RelatedDatasetCandidate, RelatedDatasetIdentity, RelatedDatasetPage,
-  CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
+  CanvasCopyValidation, CanvasTransformReference, NativeCanvasValidation, PerNodeStatus, PluginInfo, ProcessorDescriptor, ProfileEstimate, ProfileIdentity, ProfileResult, RegisterRequest, Relationship, ResourceSpec, RetainedResultIdentity, RunEstimate, RunInputManifestItem, RunOutput, RunStatus, SampleResult, TransformLibraryDetail, TransformLibraryPage, WriteAdmission, WriteIntent, WriteReceipt,
   CatalogUnregisterResult, WorkspaceAddDatasetResult, WorkspaceBrowsePage, WorkspaceCreateCanvasResult,
   WorkspaceCanonicalDatasetContext, WorkspaceFolderActionResult, WorkspaceMoveCanvasResult,
   WorkspaceProviderRelinkResult, WorkspaceResourceResolution, WorkspaceSearchPage,
@@ -428,6 +428,15 @@ export const api = {
     req<SampleResult>(`/run/${encodeURIComponent(runId)}/sample`, {
       method: 'POST', body: JSON.stringify({ nodeId, portId, k, offset }),
     }),
+  retainedResult: (
+    doc: CanvasDoc, nodeId: string, portId?: string,
+    parameterBindings?: CanvasParameterBinding[],
+  ) => req<RetainedResultIdentity>('/run/retained-result', {
+    method: 'POST',
+    body: JSON.stringify({
+      graph: toGraph(doc), nodeId, portId, parameterBindings,
+    }),
+  }),
   retainedEditorPreview: (
     doc: CanvasDoc, nodeId: string, k = 50, offset = 0,
     portId?: string, parameterBindings?: CanvasParameterBinding[],

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import datetime
 import json
 import os
 import shutil
@@ -170,6 +171,110 @@ def _preview(graph: dict, port_id: str = "out"):
         "k": 2,
         "offset": 0,
     })
+
+
+def _retained_result(graph: dict, node_id: str = "sample", port_id: str = "out"):
+    return client.post("/api/run/retained-result", json={
+        "graph": graph,
+        "nodeId": node_id,
+        "portId": port_id,
+    })
+
+
+def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_sample):
+    graph, run_id, output = retained_sample
+    history_before = metadb.list_runs(graph["id"])
+
+    response = _retained_result(graph)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "runId": run_id,
+        "executionManifestSha256": history_before[0]["executionManifestSha256"],
+        "output": output,
+    }
+    page = client.post(f"/api/run/{run_id}/sample", json={
+        "nodeId": "sample", "portId": "out", "k": 2, "offset": 0,
+    })
+    assert page.status_code == 200, page.text
+    assert len(page.json()["rows"]) == 2
+    assert metadb.list_runs(graph["id"]) == history_before
+
+    changed = copy.deepcopy(graph)
+    changed["nodes"][1]["data"]["config"]["seed"] = 99
+    stale = _retained_result(changed)
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["code"] == "retained_upstream_stale"
+
+    os.unlink(output["uri"])
+    retained_identity = _retained_result(graph)
+    assert retained_identity.status_code == 200, retained_identity.text
+    expired = client.post(f"/api/run/{run_id}/sample", json={
+        "nodeId": "sample", "portId": "out", "k": 2, "offset": 0,
+    })
+    assert expired.status_code == 410, expired.text
+    assert expired.json()["code"] == "resource_gone"
+
+
+def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_path):
+    with _retained_sample(tmp_path) as (graph, run_id, _output):
+        graph["nodes"][0]["data"]["config"].pop("datasetRef")
+
+        response = _retained_result(graph)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["runId"] == run_id
+
+
+def test_canvas_does_not_treat_missing_bindings_as_defaults_or_fall_back(tmp_path):
+    def configure(graph):
+        graph["parameters"] = [{
+            "name": "sample_size",
+            "type": "integer",
+            "default": 3,
+        }]
+        graph["nodes"][1]["data"]["config"]["n"] = {
+            "parameterRef": "sample_size",
+        }
+
+    with _retained_sample(tmp_path, configure) as (graph, default_run_id, _output):
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "targetNodeId": "sample",
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+            "parameterBindings": [{"name": "sample_size", "value": 2}],
+        })
+        assert started.status_code == 200, started.text
+        bound = _wait(started.json()["runId"])
+        assert bound["status"] == "done", bound
+        _wait_for_history_projection(bound["runId"])
+        assert bound["runId"] != default_run_id
+        history_before = metadb.list_runs(graph["id"])
+
+        unknown = _retained_result(graph)
+        assert unknown.status_code == 409, unknown.text
+        assert unknown.json()["code"] == "retained_upstream_stale"
+        assert "parameter bindings" in unknown.json()["detail"]
+
+        exact = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "sample",
+            "portId": "out",
+            "parameterBindings": [{"name": "sample_size", "value": 2}],
+        })
+        assert exact.status_code == 200, exact.text
+        assert exact.json()["runId"] == bound["runId"]
+
+        defaults = client.post("/api/run/retained-result", json={
+            "graph": graph,
+            "nodeId": "sample",
+            "portId": "out",
+            "parameterBindings": [],
+        })
+        assert defaults.status_code == 200, defaults.text
+        assert defaults.json()["runId"] == default_run_id
+        assert metadb.list_runs(graph["id"]) == history_before
 
 
 def test_retained_editor_preview_reuses_current_upstream_without_freezing_transform(
@@ -501,6 +606,56 @@ def test_retained_editor_preview_uses_terminal_state_before_history_projection(t
         response = _preview(graph)
         assert response.status_code == 200, response.text
         assert response.json()["editorTestInput"]["runId"] == run_id
+
+
+def test_canvas_prefers_newer_terminal_result_before_history_projection(tmp_path):
+    """A committed live result stays ahead of older projected history."""
+    with _retained_sample(
+            tmp_path, logical_source=True) as (graph, older_run_id, _output):
+        started = client.post("/api/run", json={
+            "graph": graph,
+            "targetNodeId": "sample",
+            "confirmed": True,
+            "submissionId": str(uuid.uuid4()),
+        })
+        assert started.status_code == 200, started.text
+        newer = _wait(started.json()["runId"])
+        assert newer["status"] == "done", newer
+        newer_run_id = newer["runId"]
+        _wait_for_history_projection(newer_run_id)
+
+        # Model the real publication window deterministically: B's committed RunState is newer, while
+        # its asynchronous RunRecord projection has not landed and A remains in projected history.
+        with metadb.session() as session:
+            older_state = session.get(metadb.RunState, older_run_id)
+            newer_state = session.get(metadb.RunState, newer_run_id)
+            assert older_state is not None and newer_state is not None
+            older_state.updated_at = datetime.datetime(
+                2026, 1, 1, tzinfo=datetime.timezone.utc)
+            newer_state.updated_at = datetime.datetime(
+                2026, 1, 2, tzinfo=datetime.timezone.utc)
+            newer_record = session.scalar(
+                metadb.select(metadb.RunRecord).where(
+                    metadb.RunRecord.run_id == newer_run_id))
+            assert newer_record is not None
+            session.delete(newer_record)
+
+        history_before = metadb.list_runs(graph["id"])
+        assert [item["runId"] for item in history_before] == [older_run_id]
+        response = _retained_result(graph)
+        assert response.status_code == 200, response.text
+        assert response.json()["runId"] == newer_run_id
+        assert metadb.list_runs(graph["id"]) == history_before
+
+        # Without comparable terminal evidence for A, choosing either candidate would be a guess.
+        with metadb.session() as session:
+            older_state = session.get(metadb.RunState, older_run_id)
+            assert older_state is not None
+            session.delete(older_state)
+        ambiguous = _retained_result(graph)
+        assert ambiguous.status_code == 404, ambiguous.text
+        assert ambiguous.json()["code"] == "retained_upstream_unavailable"
+        assert metadb.list_runs(graph["id"]) == history_before
 
 
 def test_terminal_state_does_not_outlive_history_retention_for_editor_reuse(tmp_path):

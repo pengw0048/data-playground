@@ -1429,6 +1429,27 @@ class RetainedEditorPreviewRequest(BaseModel):
     parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
 
 
+class RetainedResultRequest(BaseModel):
+    """Current Canvas result lookup; the server selects the retained run and artifact."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+    node_id: str = Field(min_length=1, max_length=256)
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
+
+
+class RetainedResultIdentity(BaseModel):
+    """Server-proved durable identity for one exact current Canvas result."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    run_id: str
+    execution_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    output: RunOutput
+
+
 class ExampleRowsEditorPreviewRequest(BaseModel):
     """Editor-only Transform preview over one bounded, non-persisted JSON fixture."""
 
@@ -3947,9 +3968,9 @@ def _retained_editor_target(
     return edge, upstream, upstream_port, _target_execution_graph(graph, upstream.id)
 
 
-def _retained_editor_output(
-        candidate: dict, upstream, current_cone: Graph, deps) -> RunOutput:
-    """Prove one server-selected retained candidate matches the current upstream cone."""
+def _retained_current_output(
+        candidate: dict, target, current_cone: Graph, deps) -> RunOutput:
+    """Prove one server-selected retained candidate matches the current target cone."""
     try:
         output = RunOutput.model_validate(candidate["output"])
     except ValueError as exc:
@@ -3974,14 +3995,14 @@ def _retained_editor_output(
             409, "retained upstream execution plan is invalid",
             APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
     if (
-        admission["target_node_id"] != upstream.id
+        admission["target_node_id"] != target.id
         or admission["target_port_id"] is not None
     ):
         raise _retained_editor_error(
             409, "retained result targets a different execution plan",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
 
-    retained_cone = _target_execution_graph(retained_graph, upstream.id)
+    retained_cone = _target_execution_graph(retained_graph, target.id)
     retained_source_ids = {
         node.id for node in retained_cone.nodes if node.type == "source"}
     retained_inputs = [
@@ -3995,10 +4016,10 @@ def _retained_editor_output(
     def current_source_matches_admission(node_id: str, admitted: dict[str, str]) -> bool:
         """Prove current Source intent still names this retained admission.
 
-        Workspace Sources normally retain their immutable catalog registration, not a caller-owned
-        exact DatasetRef.  The admitted manifest remains the exact historical input; matching that
-        registration permits a catalog head to advance without recasting this retained result as
-        latest data.  An explicit DatasetRef remains the stricter legacy/exact form.
+        Workspace Sources normally retain their immutable catalog registration or logical URI, not
+        a caller-owned exact DatasetRef. The admitted manifest remains the exact historical input;
+        matching that registration permits a catalog head to advance without recasting this retained
+        result as latest data. An explicit DatasetRef remains the stricter legacy/exact form.
         """
         current = current_sources.get(node_id)
         retained_source = retained_sources.get(node_id)
@@ -4016,11 +4037,32 @@ def _retained_editor_output(
             except (TypeError, ValueError):
                 return False
         registration_id = current_config.get("registrationId")
-        return (
+        if (
             isinstance(registration_id, str)
             and bool(registration_id)
             and registration_id == admitted["dataset_id"]
             and retained_config.get("registrationId") == registration_id
+        ):
+            return True
+        current_uri = current_config.get("uri")
+        binding = (
+            metadb.catalog_revision_binding_for_uri(current_uri)
+            if isinstance(current_uri, str) and current_uri else None
+        )
+        try:
+            revision_adapter = (
+                revision_adapter_for_uri(current_uri, deps.resolve_adapter)
+                if isinstance(current_uri, str) and current_uri else None
+            )
+        except Exception:
+            revision_adapter = None
+        retained_ref = retained_config.get("datasetRef")
+        return bool(
+            binding
+            and isinstance(revision_adapter, DatasetRevisionAdapter)
+            and binding["dataset_id"] == admitted["dataset_id"]
+            and isinstance(retained_ref, dict)
+            and retained_ref.get("datasetId") == admitted["dataset_id"]
         )
 
     if (
@@ -4037,7 +4079,7 @@ def _retained_editor_output(
     try:
         rebuilt_retained_digest, _ = build_execution_manifest(
             retained_graph,
-            target_node_id=upstream.id,
+            target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
             write_intent=None,
@@ -4045,7 +4087,7 @@ def _retained_editor_output(
         )
         current_digest, _ = build_execution_manifest(
             current_cone,
-            target_node_id=upstream.id,
+            target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
             write_intent=None,
@@ -4053,7 +4095,7 @@ def _retained_editor_output(
         )
         retained_digest, _ = build_execution_manifest(
             retained_cone,
-            target_node_id=upstream.id,
+            target_node_id=target.id,
             target_port_id=None,
             input_manifest=retained_inputs,
             write_intent=None,
@@ -4071,6 +4113,12 @@ def _retained_editor_output(
             409, "the immediate upstream execution plan changed",
             APIErrorCode.RETAINED_UPSTREAM_STALE)
     return output
+
+
+def _retained_editor_output(
+        candidate: dict, upstream, current_cone: Graph, deps) -> RunOutput:
+    """Prove one server-selected retained candidate matches the current upstream cone."""
+    return _retained_current_output(candidate, upstream, current_cone, deps)
 
 
 def _retained_editor_graph(
@@ -4164,7 +4212,7 @@ def preview_transform_with_retained_upstream(
     current_cone = _target_execution_graph(upstream_graph, upstream.id)
     _reject_invalid(graph, deps, req.node_id)
     port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
-    candidates = metadb.retained_run_editor_candidates(
+    candidates = metadb.retained_run_output_candidates(
         canvas_id, upstream.id, upstream_port)
     if not candidates:
         raise _retained_editor_error(
@@ -4229,6 +4277,54 @@ def preview_transform_with_retained_upstream(
             APIErrorCode.RETAINED_UPSTREAM_EXPIRED)
     raise _retained_editor_error(
         409, "no retained result matches the current upstream execution plan",
+        APIErrorCode.RETAINED_UPSTREAM_STALE)
+
+
+@router.post("/run/retained-result", response_model=RetainedResultIdentity)
+def retained_canvas_result(
+        req: RetainedResultRequest, uid: str = Depends(current_user)) -> RetainedResultIdentity:
+    """Resolve the newest retained result whose execution plan exactly matches the current node."""
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
+        raise _retained_editor_error(
+            404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    deps = get_deps()
+    graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
+    if "parameter_bindings" not in req.model_fields_set and graph._parameter_bindings:
+        raise _retained_editor_error(
+            409, "current result parameter bindings are unavailable",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+    _reject_invalid(graph, deps, req.node_id)
+    target = graph_mod.node_map(graph).get(req.node_id)
+    if target is None:
+        raise _retained_editor_error(
+            409, "current result target is missing", APIErrorCode.RETAINED_UPSTREAM_STALE)
+    port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
+    current_cone = _target_execution_graph(graph, req.node_id)
+    candidates = metadb.retained_run_output_candidates(
+        canvas_id, req.node_id, port_id)
+    if not candidates:
+        raise _retained_editor_error(
+            404, "retained current result not found",
+            APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    for candidate in candidates:
+        run_id = str(candidate["run_id"])
+        if not _run_read_access(run_id, uid):
+            continue
+        try:
+            output = _retained_current_output(candidate, target, current_cone, deps)
+        except APIError:
+            continue
+        return RetainedResultIdentity(
+            run_id=run_id,
+            execution_manifest_sha256=str(candidate["execution_manifest_sha256"]),
+            output=output,
+        )
+    raise _retained_editor_error(
+        409, "no retained result matches the current execution plan",
         APIErrorCode.RETAINED_UPSTREAM_STALE)
 
 
