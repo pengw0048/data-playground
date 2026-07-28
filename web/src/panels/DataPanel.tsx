@@ -155,11 +155,14 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
 
   const columns = res.columns
   const resultColumns = columns as ColumnSchema[]
-  // DataPanel has no exact-revision media-cell context. Do not expose a Media tab merely because
-  // a binary column was tagged: it must contain a value the browser can actually render directly.
-  const hasDirectMedia = resultColumns.some((column) => column.capabilities.includes('media')
-    && res.rows.some((row) => canRenderDirectMedia(row[column.name], column.mediaKind)))
-  const caps = capabilitiesFor(resultColumns).filter((capability) => capability.id !== 'media' || hasDirectMedia)
+  // DataPanel has no exact-revision media-cell context. Strip only the unsupported media claim from
+  // columns with no directly renderable value; the viewer then selects an actually usable column
+  // instead of blindly choosing the first binary column tagged by the schema.
+  const viewerColumns = resultColumns.map((column) => column.capabilities.includes('media')
+    && !res.rows.some((row) => canRenderDirectMedia(row[column.name], column.mediaKind))
+    ? { ...column, capabilities: column.capabilities.filter((capability) => capability !== 'media') }
+    : column)
+  const caps = capabilitiesFor(viewerColumns)
   // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
   // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
   const special = isMetric || isChart
@@ -245,7 +248,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
           const Tab = cap?.viewerTab
-          return Tab ? <Tab columns={resultColumns} rows={res.rows} /> : null
+          return Tab ? <Tab columns={viewerColumns} rows={res.rows} /> : null
         })()
       )}
     </div>,
