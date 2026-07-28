@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { ReactFlowProvider } from '@xyflow/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
@@ -14,11 +14,17 @@ vi.mock('../../ui/CodeEditor', () => ({
 vi.mock('../../ui/CodeSnippet', () => ({
   CodeSnippet: () => <div data-testid="code-snippet" />,
 }))
-vi.mock('../../panels/DataPanel', () => ({ DataPanel: () => null }))
+vi.mock('../../panels/DataPanel', () => ({
+  DataPanel: ({ editorPreview }: { editorPreview?: { onRunUpstream?: () => void } }) => (
+    editorPreview?.onRunUpstream
+      ? <button type="button" onClick={editorPreview.onRunUpstream}>Run upstream</button>
+      : null
+  ),
+}))
 
 import './transform'
 import { getComponent } from '../registry'
-import { useStore } from '../../store/graph'
+import { previewPlanIdentity, useStore } from '../../store/graph'
 import { CodeFullscreen } from '../../panels/CodeFullscreen'
 
 const PROCESSOR_ID = `tr_${'a'.repeat(29)}`
@@ -196,5 +202,163 @@ describe('Transform exact processor labels', () => {
     const row = JSON.parse((fixture as HTMLTextAreaElement).value)[0]
     expect(row).toEqual({ id: 1, user_id: 1 })
     expect(row.id + 1).toBe(2)
+  })
+
+  it('keeps upstream run confirmation, progress, success, and failure in the fullscreen editor', async () => {
+    const source = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Source input', status: 'draft' as const, config: { uri: 'events.parquet' } },
+    }
+    const upstream = {
+      id: 'sample', type: 'sample', position: { x: 0, y: 0 },
+      data: { title: 'Sample input', status: 'draft' as const, config: { n: 8, seed: 42 } },
+    }
+    const adhocNode = {
+      ...node,
+      data: { ...node.data, status: 'draft' as const, config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      } },
+    }
+    const requestRun = vi.fn().mockResolvedValue(undefined)
+    const run = vi.fn().mockResolvedValue(undefined)
+    const runEditorPreview = vi.fn().mockResolvedValue(undefined)
+    const doc = {
+      id: 'canvas', name: 'canvas', version: 1, requirements: [], nodes: [source, upstream, adhocNode],
+      edges: [
+        { id: 'source-sample', source: 'source', sourceHandle: 'out', target: 'sample', targetHandle: 'in', data: { wire: 'dataset' as const } },
+        { id: 'sample-transform', source: 'sample', sourceHandle: 'out', target: 'transform', targetHandle: 'in', data: { wire: 'sample' as const } },
+      ],
+    }
+    useStore.setState({
+      doc,
+      kernelUp: true,
+      fullscreenCode: { nodeId: 'transform', param: 'code', lang: 'python' },
+      requestRun, run, runEditorPreview, runs: {},
+    } as any)
+
+    render(<CodeFullscreen />)
+
+    const runUpstream = await screen.findByRole('button', { name: 'Run upstream' })
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    fireEvent.click(runUpstream)
+    fireEvent.click(runUpstream)
+    expect(requestRun).toHaveBeenCalledWith('sample')
+    expect(requestRun).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument()
+    expect(screen.queryByRole('status', { name: 'Upstream run cancelled' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } } } as any)
+    })
+    const confirmation = screen.getByRole('region', { name: 'Confirm upstream run' })
+    expect(confirmation).toHaveTextContent('2,001 rows')
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('status', { name: 'Upstream run cancelled' })).toBeInTheDocument()
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run upstream' }))
+    expect(requestRun).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'confirm', estimate: { rows: 2_001 } } } } as any)
+    })
+    const retriedConfirmation = screen.getByRole('region', { name: 'Confirm upstream run' })
+    const confirmRun = within(retriedConfirmation).getByRole('button', { name: 'Run upstream' })
+    fireEvent.click(confirmRun)
+    fireEvent.click(confirmRun)
+    expect(run).toHaveBeenCalledWith('sample', true)
+    expect(run).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'running', status: { runId: 'upstream-run', rowsProcessed: 4, totalRows: 8, progress: 0.5 } } } } as any)
+    })
+    expect(screen.getByRole('status', { name: 'Upstream run progress' })).toHaveTextContent('4 / 8 rows')
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'done', status: { runId: 'upstream-run' } } } } as any)
+    })
+    expect(screen.getByRole('status', { name: 'Upstream run progress' })).toHaveTextContent('Selecting fresh upstream result')
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+    await waitFor(() => expect(runEditorPreview).toHaveBeenCalledWith('transform'))
+    await act(async () => {
+      useStore.setState({ editorPreviews: { transform: {
+        canvasId: doc.id,
+        nodeId: 'transform',
+        planIdentity: previewPlanIdentity(doc, 'transform'),
+        parameterBindings: [],
+        requestGeneration: 1,
+        offset: 0,
+        result: {
+          columns: [], rows: [], truncated: false,
+          editorTestInput: {
+            runId: 'upstream-run', nodeId: 'sample', portId: 'out', label: 'Sample input', rows: 8,
+          },
+        },
+      } } } as any)
+    })
+    expect(screen.getByRole('status', { name: 'Upstream result ready' })).toHaveTextContent('Test code is available')
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+    useStore.getState().updateConfig('transform', { code: 'def fn(row): return {**row, "edited": True}' })
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeEnabled()
+
+    await act(async () => {
+      useStore.setState({ runs: { sample: { phase: 'failed', error: 'upstream fixture failed' } } } as any)
+    })
+    expect(screen.getByRole('alert', { name: 'Upstream run failed' })).toHaveTextContent('upstream fixture failed')
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test code' })).toBeDisabled()
+  })
+
+  it('does not apply an upstream completion after the fullscreen editor changes nodes', async () => {
+    const source = {
+      id: 'source', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Source input', status: 'draft' as const, config: { uri: 'events.parquet' } },
+    }
+    const upstream = {
+      id: 'sample', type: 'sample', position: { x: 0, y: 0 },
+      data: { title: 'Sample input', status: 'draft' as const, config: { n: 8, seed: 42 } },
+    }
+    const transform = (id: string) => ({
+      ...node,
+      id,
+      data: { ...node.data, status: 'draft' as const, config: {
+        source: 'adhoc', mode: 'map', code: `def fn(row): return {**row, "${id}": True}`,
+      } },
+    })
+    const first = transform('first-transform')
+    const second = transform('second-transform')
+    const doc = {
+      id: 'canvas', name: 'canvas', version: 1, requirements: [],
+      nodes: [source, upstream, first, second],
+      edges: [
+        { id: 'source-sample', source: 'source', sourceHandle: 'out', target: 'sample', targetHandle: 'in', data: { wire: 'dataset' as const } },
+        { id: 'sample-first', source: 'sample', sourceHandle: 'out', target: first.id, targetHandle: 'in', data: { wire: 'sample' as const } },
+        { id: 'sample-second', source: 'sample', sourceHandle: 'out', target: second.id, targetHandle: 'in', data: { wire: 'sample' as const } },
+      ],
+    }
+    const requestRun = vi.fn().mockResolvedValue(undefined)
+    const runEditorPreview = vi.fn().mockResolvedValue(undefined)
+    useStore.setState({
+      doc,
+      kernelUp: true,
+      fullscreenCode: { nodeId: first.id, param: 'code', lang: 'python' },
+      requestRun,
+      runEditorPreview,
+      runs: {},
+    } as any)
+
+    render(<CodeFullscreen />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Run upstream' }))
+    await act(async () => {
+      useStore.setState({
+        fullscreenCode: { nodeId: second.id, param: 'code', lang: 'python' },
+        runs: { sample: { phase: 'done', status: { runId: 'late-first-run' } } },
+      } as any)
+    })
+
+    await waitFor(() => expect(screen.getByTestId('code-editor')).toBeInTheDocument())
+    expect(runEditorPreview).not.toHaveBeenCalled()
+    expect(screen.queryByRole('status', { name: 'Upstream result ready' })).not.toBeInTheDocument()
   })
 })
