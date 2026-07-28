@@ -9,14 +9,38 @@ const node = (overrides: Partial<NodeSpec>): NodeSpec => ({
 })
 
 describe('node finder', () => {
-  it('searches registry metadata, prefers compatible exact results, and stays deterministic', () => {
+  it('keeps exact name matches ahead of compatibility and hides weaker metadata matches', () => {
     const specs = [
       node({ kind: 'same-plugin', title: 'Filter', source: 'plugin:quality-pack', inputs: [{ id: 'in', wire: 'metric', accepts: ['metric'] }] }),
       node({ kind: 'filter', title: 'Filter', source: 'builtin' }),
       node({ kind: 'profile', title: 'Profile', category: 'inspect', blurb: 'filter diagnostics' }),
     ]
-    expect(findNodeSpecs(specs, 'filter', 'dataset').map((result) => result.spec.kind)).toEqual(['filter', 'profile', 'same-plugin'])
+    expect(findNodeSpecs(specs, 'filter', 'dataset').map((result) => result.spec.kind)).toEqual(['filter', 'same-plugin'])
     expect(findNodeSpecs(specs, 'metric').map((result) => result.spec.kind)).toEqual(['same-plugin'])
+  })
+
+  it('narrows operation-name prefixes while keeping intentional category and port searches discoverable', () => {
+    const specs = [
+      node({ kind: 'sample', title: 'Sample', blurb: 'choose representative rows' }),
+      node({ kind: 'sample-balanced', title: 'Balanced sample', blurb: 'choose by label' }),
+      node({ kind: 'profile', title: 'Profile', blurb: 'sample diagnostics' }),
+      node({ kind: 'inspect', title: 'Inspect', blurb: 'choose representative rows' }),
+    ]
+
+    expect(findNodeSpecs(specs, 'sam').map((result) => result.spec.kind)).toEqual(['sample', 'sample-balanced'])
+    expect(findNodeSpecs(specs, 'representative').map((result) => result.spec.kind)).toEqual(['inspect', 'sample'])
+    expect(findNodeSpecs(specs, 'not-present')).toEqual([])
+  })
+
+  it('prefers exact category matches over incidental internal-name substrings', () => {
+    const specs = [
+      node({ kind: 'source', title: 'Source', category: 'io', inputs: [], outputs: [{ id: 'out', wire: 'dataset' }] }),
+      node({ kind: 'write', title: 'Write', category: 'io' }),
+      node({ kind: 'union', title: 'Union', category: 'compute' }),
+      node({ kind: 'section', title: 'Section', category: 'compute' }),
+    ]
+
+    expect(findNodeSpecs(specs, 'io').map((result) => result.spec.kind)).toEqual(['source', 'write'])
   })
 
   it('uses case-normalized code-point ordering for title and kind ties', () => {
@@ -46,6 +70,21 @@ describe('node finder', () => {
     expect(onPick).toHaveBeenCalledWith('filter')
     fireEvent.keyDown(search, { key: 'Escape' })
     expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
+  it('adds the top exact match with Enter even when a compatible prefix match exists', () => {
+    const onPick = vi.fn()
+    render(<NodeFinder specs={[
+      node({ kind: 'sample', title: 'Sample', inputs: [{ id: 'in', wire: 'metric', accepts: ['metric'] }] }),
+      node({ kind: 'sample-rows', title: 'Sample rows' }),
+    ]} wire="dataset" onPick={onPick} onClose={vi.fn()} />)
+
+    const search = screen.getByRole('textbox', { name: 'Search operations' })
+    fireEvent.change(search, { target: { value: 'sample' } })
+    expect(screen.getAllByRole('option')).toHaveLength(2)
+    expect(screen.getAllByRole('option')[0]).toHaveTextContent('Sample')
+    fireEvent.keyDown(search, { key: 'Enter' })
+    expect(onPick).toHaveBeenCalledWith('sample')
   })
 
   it('shows a concise cue only when duplicate human titles need distinction', () => {

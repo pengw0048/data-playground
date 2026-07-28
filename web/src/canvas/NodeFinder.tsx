@@ -22,35 +22,50 @@ function codePointCompare(left: string, right: string): number {
   return a.length - b.length
 }
 
-function haystack(spec: NodeSpec): string[] {
+function structuredTerms(spec: NodeSpec): string[] {
   return [
-    spec.blurb,
     spec.category,
-    spec.source ?? 'builtin',
     ...spec.inputs.flatMap((port) => [port.id, port.label ?? '', port.wire, ...(port.accepts ?? [])]),
     ...spec.outputs.flatMap((port) => [port.id, port.label ?? '', port.wire]),
   ].map(normalized)
+}
+
+function descriptiveTerms(spec: NodeSpec): string[] {
+  return [spec.blurb, spec.source ?? 'builtin'].map(normalized)
 }
 
 /** Stable operation-search ordering: title/kind matches lead secondary metadata matches. A connection
  * context may restrict the same effective registry to specs with an accepting input port. */
 export function findNodeSpecs(specs: NodeSpec[], query: string, wire?: WireType, compatibleOnly = false): FinderResult[] {
   const q = normalized(query)
-  return specs.flatMap((spec) => {
+  const matches = specs.flatMap((spec) => {
     const title = normalized(spec.title)
     const kind = normalized(spec.kind)
-    const match = !q ? 3
+    // Exact/prefix matches on the operation's name are direct commands, while exact/prefix
+    // category and port matches are also intentional searches. A substring in an internal name
+    // is only a weak match: `io` must still find the I/O category instead of just union/section.
+    const match = !q ? 5
       : title === q || kind === q ? 0
-        : title.startsWith(q) || kind.startsWith(q) ? 1
-          : title.includes(q) || kind.includes(q) ? 2
-            : haystack(spec).some((field) => field.includes(q)) ? 3 : -1
+        : title.startsWith(q) ? 1
+          : kind.startsWith(q) ? 2
+            : structuredTerms(spec).some((field) => field === q || field.startsWith(q)) ? 3
+              : title.includes(q) || kind.includes(q) ? 4
+                : structuredTerms(spec).some((field) => field.includes(q)) || descriptiveTerms(spec).some((field) => field.includes(q)) ? 5 : -1
     if (match < 0) return []
     const compatible = !wire || spec.inputs.some((port) => (port.accepts ?? [port.wire]).includes(wire))
     if (compatibleOnly && !compatible) return []
     return [{ spec, compatible, match }]
-  }).sort((a, b) => (
-    Number(b.compatible) - Number(a.compatible)
-    || a.match - b.match
+  })
+  // A direct operation command wins over a category/port match ("sample" should not turn into a
+  // generic sample-wire browse list). If there is no direct command, a deliberate structured
+  // search wins over weak internal-name substrings and prose.
+  const nameMatches = q ? matches.filter((result) => result.match < 3) : []
+  const structuredMatches = q ? matches.filter((result) => result.match === 3) : []
+  const focusedMatches = nameMatches.length > 0 ? nameMatches
+    : structuredMatches.length > 0 ? structuredMatches : matches
+  return focusedMatches.sort((a, b) => (
+    a.match - b.match
+    || Number(b.compatible) - Number(a.compatible)
     || codePointCompare(normalized(a.spec.title), normalized(b.spec.title))
     || codePointCompare(normalized(a.spec.kind), normalized(b.spec.kind))
   ))
