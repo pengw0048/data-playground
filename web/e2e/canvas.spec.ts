@@ -2333,9 +2333,16 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByLabel('Dataset URI')).toBeHidden()
 
     await inspector.getByText('Advanced source configuration', { exact: true }).click()
-    await expect(inspector.getByLabel('Dataset URI')).toBeVisible()
+    const manualUri = inspector.getByLabel('Dataset URI')
+    await expect(manualUri).toBeVisible()
+    await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
+    await expect(inspector.getByLabel('CSV header row')).toHaveCount(0)
+    await manualUri.fill('file:///data/manual-input.csv')
     await expect(inspector.getByLabel('CSV delimiter')).toBeVisible()
     await expect(inspector.getByLabel('CSV header row')).toBeVisible()
+    await manualUri.fill('')
+    await expect(inspector.getByLabel('CSV delimiter')).toHaveCount(0)
+    await expect(inspector.getByLabel('CSV header row')).toHaveCount(0)
 
     await inspector.getByRole('button', { name: 'Register or browse an accessible path…' }).click()
     await expect(page.getByText('Open a dataset', { exact: true })).toBeVisible()

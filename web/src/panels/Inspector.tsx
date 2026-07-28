@@ -54,11 +54,28 @@ const schemaContractStale = (kind: string, cfg: Record<string, unknown>): boolea
     && pinnedHash !== codeHash(String(contractText))
 }
 
+function hasBoundSourceIdentity(config: Record<string, unknown>): boolean {
+  return !!config.tableId
+    || !!config.registrationId
+    || !!config.datasetRef
+    || !!config.providerResourceRef
+}
+
+function sourceUri(config: Record<string, unknown>): string {
+  return typeof config.uri === 'string' ? config.uri.trim() : ''
+}
+
+function isManualSource(config: Record<string, unknown>): boolean {
+  return !hasBoundSourceIdentity(config) && !!sourceUri(config)
+}
+
+function isDelimitedTextUri(uri: string): boolean {
+  const path = uri.split(/[?#]/, 1)[0]?.toLowerCase() ?? ''
+  return path.endsWith('.csv') || path.endsWith('.tsv')
+}
+
 function isUnboundSource(config: Record<string, unknown>): boolean {
-  return !config.tableId
-    && !config.datasetRef
-    && !config.providerResourceRef
-    && !(typeof config.uri === 'string' && config.uri.trim())
+  return !hasBoundSourceIdentity(config) && !isManualSource(config)
 }
 
 // Figma-style right property panel: shows the SELECTED node's properties (params reused from the
@@ -136,6 +153,7 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const edges = useStore((s) => s.doc.edges)
   const warnings = useSchemaWarnings(nodeId)   // config references a column not in the (known) input
   const inputColumns = useInputColumns(nodeId)
+  const catalog = useStore((s) => s.catalog)
   const numericDrafts = useStore((s) => s.numericParamDrafts[nodeId])
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
   const kernelUp = useStore((s) => s.kernelUp)
@@ -159,7 +177,17 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
   const invalid = nodeInvalidReason(node, inputColumns, numericDrafts)
   const outputPorts = nodeOutputs(node)
   const unboundSource = kind === 'source' && isUnboundSource(cfg)
+  const boundSource = kind === 'source' && hasBoundSourceIdentity(cfg)
+  const manualSource = kind === 'source' && isManualSource(cfg)
+  const manualDelimitedSource = manualSource && isDelimitedTextUri(sourceUri(cfg))
   const showDraftSourceEntry = unboundSource || (kind === 'source' && editingDraftSourceUri)
+  const sourceSummary = kind === 'source' ? sourceInspectorSummary(catalog, cfg) : null
+  const inspectorBlurb = sourceSummary ?? spec?.blurb
+  const omittedParamNames = kind === 'write'
+    ? ['writeMode']
+    : kind === 'source' && !manualDelimitedSource
+      ? ['delimiter', 'header']
+      : []
 
   // Code ops and backend-owned plugin kinds can carry a declared/inferred schema contract.
   const canDeclareSchema = canDeclareNodeSchema(kind, outputPorts.length)
@@ -210,25 +238,25 @@ function NodeInspector({ nodeId }: { nodeId: string }) {
             {(spec?.tag ?? kind).toUpperCase()}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 text-[11.5px] text-muted-foreground">
+        <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
           {/* a note is an annotation — it never runs, so a run status (draft/stale/…) is meaningless */}
           {kind === 'note' ? <span>annotation</span>
             : <><span style={{ color: st.color }}>{st.glyph}</span> {st.label}</>}
-          {spec?.blurb && <span className="text-muted-foreground/70">· {spec.blurb}</span>}
+          {inspectorBlurb && <span title={inspectorBlurb} className="min-w-0 leading-relaxed text-muted-foreground/70">· {inspectorBlurb}</span>}
         </div>
       </div>
 
       {/* properties (reused generic param editor) */}
       {showDraftSourceEntry ? <DraftSourceInspector nodeId={nodeId} canEdit={canEdit}
         onUriEditingChange={setEditingDraftSourceUri} /> : <>
-        <EditOnly enabled={canEdit}>
+        {!boundSource && <EditOnly enabled={canEdit}>
           <Section title="Properties">
-            <NodeParamFields nodeId={nodeId} omitNames={kind === 'write' ? ['writeMode'] : []} />
+            <NodeParamFields nodeId={nodeId} omitNames={omittedParamNames} />
             {codeParams.length === 0 && (bspec?.params ?? []).length === 0 && kind !== 'write' && (
               <div className="text-[11.5px] text-muted-foreground">No editable parameters.</div>
             )}
           </Section>
-        </EditOnly>
+        </EditOnly>}
         {kind === 'source' && <SourceConnectionDetails nodeId={nodeId} />}
       </>}
 
@@ -755,6 +783,37 @@ function sourceTable(catalog: CatalogTable[], config: Record<string, unknown>): 
   return catalog.find((table) => (tableId && table.id === tableId) || table.uri === uri || table.name === uri)
 }
 
+function sourceInspectorSummary(catalog: CatalogTable[], config: Record<string, unknown>): string | null {
+  const table = sourceTable(catalog, config)
+  const datasetRef = config.datasetRef
+  const parameter = isParameterRef(datasetRef)
+  const selectedRef = datasetRef && !parameter ? datasetRef as DatasetRef : null
+  const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
+  const provider = typeof config.providerResourceRef === 'string'
+  const source = provider
+    ? (typeof config.providerName === 'string' ? config.providerName : 'Mounted provider')
+    : 'Local catalog'
+
+  if (hasBoundSourceIdentity(config)) {
+    if (parameter) return `${source} · Run-time dataset parameter`
+    const version = exact
+      ? exact.revisionId.length > 24 ? 'Selected exact version' : `Exact version ${exact.revisionId}`
+      : 'Current version'
+    if (!exact && table) {
+      const rows = table.rowCount == null
+        ? 'Rows unknown'
+        : `${table.rowCount.toLocaleString()} ${table.rowCount === 1 ? 'row' : 'rows'}`
+      const columns = `${table.columns.length} ${table.columns.length === 1 ? 'column' : 'columns'}`
+      return `${source} · ${version} · ${rows} · ${columns}`
+    }
+    return `${source} · ${version}`
+  }
+
+  const uri = sourceUri(config)
+  if (uri) return isDelimitedTextUri(uri) ? 'Manual URI · Delimited text' : 'Manual URI'
+  return null
+}
+
 function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
   nodeId: string
   canEdit: boolean
@@ -792,16 +851,18 @@ function DraftSourceInspector({ nodeId, canEdit, onUriEditingChange }: {
               // click, so the user's first Count/View action is silently lost.
               onBlur={() => window.setTimeout(() => onUriEditingChange(false), 0)}
               className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
-            <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-delimiter-${nodeId}`}>CSV delimiter</Label>
-            <Input id={`source-delimiter-${nodeId}`} aria-label="CSV delimiter" value={String(config.delimiter ?? '')}
-              onChange={(event) => updateConfig(nodeId, { delimiter: event.target.value })}
-              className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
-            <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-header-${nodeId}`}>CSV header row</Label>
-            <select id={`source-header-${nodeId}`} aria-label="CSV header row" value={String(config.header ?? 'auto')}
-              onChange={(event) => updateConfig(nodeId, { header: event.target.value })}
-              className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
-              <option value="auto">auto</option><option value="yes">yes</option><option value="no">no</option>
-            </select>
+            {isDelimitedTextUri(sourceUri(config)) && <>
+              <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-delimiter-${nodeId}`}>CSV delimiter</Label>
+              <Input id={`source-delimiter-${nodeId}`} aria-label="CSV delimiter" value={String(config.delimiter ?? '')}
+                onChange={(event) => updateConfig(nodeId, { delimiter: event.target.value })}
+                className={cn(miniInputClass, 'text-[11px] md:text-[11px]')} />
+              <Label className="text-[9.5px] font-bold uppercase tracking-[0.4px] text-muted-foreground" htmlFor={`source-header-${nodeId}`}>CSV header row</Label>
+              <select id={`source-header-${nodeId}`} aria-label="CSV header row" value={String(config.header ?? 'auto')}
+                onChange={(event) => updateConfig(nodeId, { header: event.target.value })}
+                className={cn(miniInputClass, 'bg-background text-[11px] md:text-[11px]')}>
+                <option value="auto">auto</option><option value="yes">yes</option><option value="no">no</option>
+              </select>
+            </>}
           </div>
         </EditOnly>
         <SourceConnectionDetails nodeId={nodeId} embedded />
@@ -825,6 +886,13 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
   const exact = selectedRef ? datasetRefIdentity(selectedRef) : null
   const provider = typeof config.providerResourceRef === 'string'
   const providerName = typeof config.providerName === 'string' ? config.providerName : undefined
+  const sourceLabel = provider
+    ? (providerName ?? 'Mounted provider')
+    : hasBoundSourceIdentity(config)
+      ? 'Local catalog'
+      : sourceUri(config)
+        ? 'Manual URI'
+        : 'Not bound'
 
   useEffect(() => {
     let live = true
@@ -842,7 +910,7 @@ function SourceConnectionDetails({ nodeId, embedded = false }: { nodeId: string;
 
   const columns = exact ? detail?.preview.columns : table?.columns
   const values: Array<[string, string]> = [
-    ['Source', provider ? (providerName ?? 'Mounted provider') : 'Local catalog'],
+    ['Source', sourceLabel],
   ]
   const stringValue = (key: string) => typeof config[key] === 'string' ? config[key] as string : undefined
   const add = (label: string, value: string | null | undefined) => { if (value) values.push([label, value]) }
