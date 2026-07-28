@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import {
-  ReactFlow, Background, BackgroundVariant, Controls, Handle, Position, MarkerType,
+  ReactFlow, Background, BackgroundVariant, ControlButton, Controls, Handle, Position, MarkerType,
+  useReactFlow,
   type Node, type Edge, type Connection, type NodeChange,
 } from '@xyflow/react'
 import { useStore } from '../store/graph'
@@ -50,6 +51,51 @@ function EntityNode({ data }: { data: EntityData }) {
 }
 
 const nodeTypes = { entity: EntityNode }
+
+// The catalog rail is outside React Flow, but these controls are overlays inside its pane. Reserve
+// the whole top strip rather than only the panel's left corner so every entity title remains
+// directly usable after fitting. The left inset also keeps nodes clear of the viewport buttons.
+const ER_FIT_PADDING = { top: '164px', right: '16px', bottom: '16px', left: '344px' } as const
+const ER_FIT_OPTIONS = { padding: ER_FIT_PADDING, maxZoom: 1 }
+
+function ERViewportControls({ layoutKey, container }: { layoutKey: string; container: RefObject<HTMLDivElement | null> }) {
+  const { fitView } = useReactFlow()
+  const [size, setSize] = useState({ width: 0, height: 0 })
+  const fitSafely = useCallback(() => fitView(ER_FIT_OPTIONS), [fitView])
+
+  // A relationship query can replace the node set after React Flow's mount-only `fitView` has
+  // already run. Reapply the same safe fit after React Flow has laid out the replacement query and
+  // whenever the pane resizes.
+  useEffect(() => {
+    if (size.width === 0 || size.height === 0) return
+    const frame = requestAnimationFrame(() => { void fitSafely() })
+    return () => cancelAnimationFrame(frame)
+  }, [fitSafely, layoutKey, size])
+
+  useEffect(() => {
+    const element = container.current
+    if (!element) return
+    const updateSize = ({ width, height }: { width: number; height: number }) => {
+      setSize((current) => current.width === width && current.height === height ? current : { width, height })
+    }
+    const { width, height } = element.getBoundingClientRect()
+    updateSize({ width, height })
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(([entry]) => {
+      updateSize(entry.contentRect)
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [container])
+
+  return (
+    <Controls showInteractive={false} showFitView={false}>
+      <ControlButton className="react-flow__controls-fitview" onClick={() => { void fitSafely() }} title="Fit view" aria-label="Fit view">
+        <Icon name="maximize" size={15} />
+      </ControlButton>
+    </Controls>
+  )
+}
 
 const _POS_KEY = 'dp-er-positions'
 function loadPositions(): Record<string, { x: number; y: number }> {
@@ -125,6 +171,7 @@ export function ERDiagram() {
   } | null>(null)
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>(loadPositions)
   const [reloadKey, setReloadKey] = useState(0)
+  const graphContainer = useRef<HTMLDivElement>(null)
   const dataReq = useRef(0)
   const relsReq = useRef(0)
 
@@ -268,10 +315,11 @@ export function ERDiagram() {
   }, [])
 
   const capped = !focus && total > visible.length
+  const layoutKey = useMemo(() => JSON.stringify(nodes.map((node) => node.id)), [nodes])
 
   return (
-    <div className="relative h-full w-full">
-      <div className="absolute left-3 top-3 z-10 flex w-[320px] flex-col gap-2 rounded-lg border border-border bg-card/95 px-3 py-2.5 text-[11px] text-muted-foreground shadow-sm backdrop-blur">
+    <div ref={graphContainer} className="relative h-full w-full">
+      <div data-testid="er-controls-panel" className="absolute left-3 top-3 z-10 flex w-[320px] flex-col gap-2 rounded-lg border border-border bg-card/95 px-3 py-2.5 text-[11px] text-muted-foreground shadow-sm backdrop-blur">
         <div className="flex items-center gap-2">
           <span className="text-[12.5px] font-semibold text-foreground">Relationships</span>
           <span className="flex-1" />
@@ -354,10 +402,10 @@ export function ERDiagram() {
       )}
 
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
-        onConnect={onConnect} onEdgeClick={onEdgeClick} fitView minZoom={0.2} colorMode={resolvedTheme()}
+        onConnect={onConnect} onEdgeClick={onEdgeClick} minZoom={0.2} colorMode={resolvedTheme()}
         proOptions={{ hideAttribution: true }}>
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="var(--dots)" />
-        <Controls showInteractive={false} />
+        <ERViewportControls layoutKey={layoutKey} container={graphContainer} />
       </ReactFlow>
       {pending && (
         <RelationshipDialog key={`${pending.left.id}|${pending.right.id}`}
