@@ -6,7 +6,7 @@ import type { ComponentType } from 'react'
 import { registerCapability } from './registry'
 import { Icon } from '../ui/Icon'
 import type { ColumnSchema } from '../types/graph'
-import { MediaCellRenderer } from '../components/MediaCellRenderer'
+import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCellRenderer'
 
 type TabProps = { columns: ColumnSchema[]; rows: Record<string, unknown>[] }
 
@@ -23,12 +23,19 @@ function gridTab(capId: string): ComponentType<TabProps> {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 10, padding: 12 }}>
         {rows.slice(0, 60).map((r, i) => {
           const value = r[col]
-          const label = value == null ? 'empty media' : String(value)
+          const directMediaValue = capId === 'media' && canRenderDirectMedia(value, mediaColumn.mediaKind)
+          const label = labelCol ? String(r[labelCol])
+            : directMediaValue ? String(value).split('/').slice(-2).join('/')
+              : capId === 'media' ? '' : String(value ?? '')
           return (
             <div key={i} style={{ background: 'var(--viewer-2)', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--viewer-line)' }}>
               <div style={{ position: 'relative', aspectRatio: '4/3', background: 'hsl(var(--muted))', display: 'grid', placeItems: 'center' }}>
-                {capId === 'media' ? <MediaCellRenderer column={col} value={value}
-                  mediaKind={mediaColumn.mediaKind} viewport="grid" /> : <>
+                {capId === 'media' ? directMediaValue
+                  ? <MediaCellRenderer column={col} value={value}
+                    mediaKind={mediaColumn.mediaKind} viewport="grid" />
+                  : <div className="max-w-full break-all px-2 text-center text-[10px] text-muted-foreground">
+                    {value == null ? 'No media value' : String(value)}
+                  </div> : <>
                     <img src={label} loading="lazy" style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                       onError={(e) => { (e.currentTarget.style.display = 'none') }} />
                     <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: '#c2c6cd', pointerEvents: 'none' }}>
@@ -36,9 +43,9 @@ function gridTab(capId: string): ComponentType<TabProps> {
                     </div>
                   </>}
               </div>
-              <div style={{ padding: '6px 8px', fontSize: 10.5, color: 'var(--viewer-text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {labelCol ? String(r[labelCol]) : label.split('/').slice(-2).join('/')}
-              </div>
+              {label && <div style={{ padding: '6px 8px', fontSize: 10.5, color: 'var(--viewer-text-2)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {label}
+              </div>}
             </div>
           )
         })}

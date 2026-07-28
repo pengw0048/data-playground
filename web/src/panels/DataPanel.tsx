@@ -12,7 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { FieldEvidenceButton } from '../components/FieldEvidenceDetail'
-import { MediaCellRenderer } from '../components/MediaCellRenderer'
+import { canRenderDirectMedia, MediaCellRenderer } from '../components/MediaCellRenderer'
 import type { ColumnSchema, PortSpec } from '../types/graph'
 import type { ProfileResult, RunOutput, RunState, SampleProvenance, SampleResult } from '../types/api'
 
@@ -154,7 +154,15 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
   }
 
   const columns = res.columns
-  const caps = capabilitiesFor(columns as ColumnSchema[])
+  const resultColumns = columns as ColumnSchema[]
+  // DataPanel has no exact-revision media-cell context. Strip only the unsupported media claim from
+  // columns with no directly renderable value; the viewer then selects an actually usable column
+  // instead of blindly choosing the first binary column tagged by the schema.
+  const viewerColumns = resultColumns.map((column) => column.capabilities.includes('media')
+    && !res.rows.some((row) => canRenderDirectMedia(row[column.name], column.mediaKind))
+    ? { ...column, capabilities: column.capabilities.filter((capability) => capability !== 'media') }
+    : column)
+  const caps = capabilitiesFor(viewerColumns)
   // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
   // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
   const special = isMetric || isChart
@@ -220,7 +228,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
       ) : isMetric ? (
         <MetricValue rows={res.rows} />
       ) : detail != null && res.rows[detail] ? (
-        <RowDetail columns={columns as ColumnSchema[]} row={res.rows[detail]} />
+        <RowDetail columns={resultColumns} row={res.rows[detail]} />
       ) : activeTab === 'rows' ? (
         <>
           {/* an empty result over a PREVIEWED SAMPLE isn't necessarily 'nothing matches' — a selective
@@ -231,7 +239,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
               run this node to check the full dataset.
             </div>
           )}
-          <RowsTable columns={columns as ColumnSchema[]} rows={res.rows} onRowClick={setDetail} />
+          <RowsTable columns={resultColumns} rows={res.rows} onRowClick={setDetail} />
         </>
       ) : activeTab === 'stats' ? (
         <StatsView key={`${nodeId}:${selectedPortId ?? ''}:${outputPorts.length > 1 ? 'multi' : 'single'}`}
@@ -240,7 +248,7 @@ export function DataPanel({ nodeId }: { nodeId: string }) {
         (() => {
           const cap = caps.find((c) => c.id === activeTab)
           const Tab = cap?.viewerTab
-          return Tab ? <Tab columns={columns as ColumnSchema[]} rows={res.rows} /> : null
+          return Tab ? <Tab columns={viewerColumns} rows={res.rows} /> : null
         })()
       )}
     </div>,
@@ -732,7 +740,7 @@ function RowDetail({ columns, row }: { columns: ColumnSchema[]; row: Record<stri
             <div className="text-[9.5px] text-muted-foreground">{c.type}</div>
           </div>
           <div className="min-w-0 flex-1 text-[11.5px]">
-            {c.capabilities.includes('media') && row[c.name] != null && (
+            {c.capabilities.includes('media') && canRenderDirectMedia(row[c.name], c.mediaKind) && (
               <div className="mb-1.5"><MediaCellRenderer column={c.name} value={row[c.name]}
                 mediaKind={c.mediaKind} viewport="detail" /></div>
             )}
@@ -827,7 +835,7 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
                 <th key={c.name} className={cn('sticky top-0 whitespace-nowrap border-b border-border bg-muted px-2.5 py-[6px] font-semibold text-muted-foreground', num ? 'text-right' : 'text-left')}>
                   <div className={cn('flex items-center', num && 'justify-end')}>
                     <FieldEvidenceButton column={c} marker className="rounded px-0.5 text-left hover:bg-accent" />
-                    {c.capabilities.includes('media') && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
+                    {c.capabilities.includes('media') && rows.some((row) => canRenderDirectMedia(row[c.name], c.mediaKind)) && <span title="media column — thumbnails in the Media tab" className="ml-[5px] cursor-help opacity-60">▦</span>}
                     {c.capabilities.includes('vector') && <span title="vector / embedding column" className="ml-[5px] cursor-help opacity-60">⋮⋮</span>}
                   </div>
                   <div className="dp-mono text-[9px] font-normal lowercase tracking-tight opacity-55" title={c.type}>{c.type}</div>
@@ -855,7 +863,7 @@ function RowsTable({ columns, rows, onRowClick }: { columns: ColumnSchema[]; row
 
 function Cell({ col, value }: { col: ColumnSchema; value: unknown }) {
   if (value == null) return <span className="text-muted-foreground/60">·</span>
-  if (col.capabilities.includes('media')) {
+  if (col.capabilities.includes('media') && canRenderDirectMedia(value, col.mediaKind)) {
     return <MediaCellRenderer column={col.name} value={value} mediaKind={col.mediaKind} viewport="compact" />
   }
   if (col.capabilities.includes('vector') && Array.isArray(value)) {

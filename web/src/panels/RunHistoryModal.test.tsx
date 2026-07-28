@@ -7,6 +7,7 @@ import { RunHistoryModal } from './RunHistoryModal'
 import { DataPanel, FullResult } from './DataPanel'
 import { previewPlanIdentity, profilePlanIdentity, useStore } from '../store/graph'
 import { register } from '../nodes/registry'
+import '../nodes/capabilities'
 
 const apiMock = vi.hoisted(() => ({
   listRuns: vi.fn(),
@@ -605,6 +606,84 @@ describe('durable full results', () => {
     expect(screen.getByText('Preview failed')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
     expect(screen.queryByText('Your Python transform raised an exception')).not.toBeInTheDocument()
+  })
+
+  it('keeps unsupported binary media as raw data instead of advertising an unusable Media tab', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Provider images', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [
+          { name: 'image_bytes', type: 'binary', capabilities: ['media'], mediaKind: 'image' },
+          { name: '_rowid', type: 'int64', capabilities: [] },
+        ],
+        rows: [{ image_bytes: '<3 bytes>', _rowid: 0 }], rowCount: 1, hasMore: false,
+        truncated: false, completeness: 'complete',
+      }) },
+    } as any)
+    const user = userEvent.setup()
+    render(<DataPanel nodeId="target" />)
+
+    expect(screen.queryByRole('button', { name: 'Media' })).not.toBeInTheDocument()
+    expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
+
+    await user.click(screen.getByText('<3 bytes>'))
+    expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
+  })
+
+  it('selects the media column that actually has a directly renderable current-result value', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Public images', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [
+          { name: 'provider_bytes', type: 'binary', capabilities: ['media'], mediaKind: 'image' },
+          { name: 'image_url', type: 'string', capabilities: ['media'], mediaKind: 'image' },
+        ],
+        rows: [{ provider_bytes: '<3 bytes>', image_url: 'https://example.test/image.png' }], rowCount: 1, hasMore: false,
+        truncated: false, completeness: 'complete',
+      }) },
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Media' }))
+    expect(screen.getByRole('img', { name: 'Media image' })).toHaveAttribute('src', 'https://example.test/image.png')
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
+  })
+
+  it('renders mixed cells in a usable media column without impossible certification guidance', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'source', position: { x: 0, y: 0 },
+      data: { title: 'Mixed images', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        columns: [{ name: 'image', type: 'string', capabilities: ['media'], mediaKind: 'image' }],
+        rows: [
+          { image: 'https://example.test/image.png' },
+          { image: '<3 bytes>' },
+        ], rowCount: 2, hasMore: false, truncated: false, completeness: 'complete',
+      }) },
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    await user.click(screen.getByRole('button', { name: 'Media' }))
+    expect(screen.getByRole('img', { name: 'Media image' })).toHaveAttribute('src', 'https://example.test/image.png')
+    expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
+    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
   })
 
   it('offers sample/full switching for previewable nodes after a full run', async () => {
