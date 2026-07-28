@@ -1,6 +1,6 @@
 [project]
 name = "dp-descriptor-contract"
-version = "0.1.0"
+version = "0.2.0"
 description = "Installed fixture for the Data Playground node descriptor contract"
 requires-python = ">=3.11"
 dependencies = ["data-playground>=0.1.0"]

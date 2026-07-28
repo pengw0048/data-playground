@@ -1073,6 +1073,8 @@ interface Store {
   viewportFitRequest: CanvasViewportFitRequest | null // successful example open only; consumed once after measurement
   openPanels: Record<string, PanelKind>
   previews: Record<string, PreviewState>
+  // Fullscreen Transform tests use retained rows without changing the Canvas preview/input binding.
+  editorPreviews: Record<string, PreviewState>
   previewBindings: Record<string, PreviewBindingState>
   runs: Record<string, RunState>
   profileJobs: Record<string, ProfileJobState>
@@ -1132,6 +1134,7 @@ interface Store {
 
   // -- execution --
   runPreview: (id: string, offset?: number, portId?: string, refreshLatest?: boolean) => Promise<void>
+  runEditorPreview: (id: string, offset?: number, portId?: string) => Promise<void>
   refreshPreviewInputs: (id: string) => Promise<void>
   requestRun: (id: string) => Promise<void>
   setRunParameterBinding: (id: string, binding: CanvasParameterBinding) => void
@@ -1616,8 +1619,10 @@ export const useStore = create<Store>((set, get) => ({
     set({ view: 'canvas' })
   },
   fullscreenCode: null,
-  openCodeFullscreen: (nodeId, param, lang) => set({ fullscreenCode: { nodeId, param, lang } }),
-  closeCodeFullscreen: () => set({ fullscreenCode: null }),
+  openCodeFullscreen: (nodeId, param, lang) => set({
+    fullscreenCode: { nodeId, param, lang }, editorPreviews: {},
+  }),
+  closeCodeFullscreen: () => set({ fullscreenCode: null, editorPreviews: {} }),
   peers: {},
   setPeer: (id, p) => set((s) => ({ peers: { ...s.peers, [id]: p } })),
   dropPeer: (id) => set((s) => { const peers = { ...s.peers }; delete peers[id]; return { peers } }),
@@ -1650,6 +1655,7 @@ export const useStore = create<Store>((set, get) => ({
   viewportFitRequest: null,
   openPanels: {},
   previews: {},
+  editorPreviews: {},
   previewBindings: {},
   runs: {},
   profileJobs: {},
@@ -2170,6 +2176,98 @@ export const useStore = create<Store>((set, get) => ({
           [id]: refreshLatest && previousPreview
             ? { ...previousPreview, requestGeneration, error: (e as Error).message, loading: false }
             : { canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings, requestGeneration, error: (e as Error).message, offset },
+        },
+      }))
+    }
+  },
+
+  runEditorPreview: async (id: string, offset = 0, requestedPortId?: string) => {
+    if (!hubExecutionAvailable(get)) return
+    const doc = get().doc
+    const node = doc.nodes.find((candidate) => candidate.id === id)
+    if (!node || node.type !== 'transform') return
+    if (hasInvalidUpstream(doc, id, get().numericParamDrafts)) {
+      get().pushToast('Fix invalid upstream parameters before testing this code.', 'error')
+      return
+    }
+    const incoming = doc.edges.filter((edge) => edge.target === id)
+    const edge = incoming.length === 1 ? incoming[0] : undefined
+    const upstream = edge ? doc.nodes.find((candidate) => candidate.id === edge.source) : undefined
+    const ports = nodeOutputs(node)
+    const previous = get().editorPreviews[id]
+    const defaultPortId = ports.find((port) => port.id === 'out')?.id ?? ports[0]?.id
+    const portId = requestedPortId ?? (ports.length > 1
+      ? ports.find((port) => port.id === previous?.portId)?.id ?? defaultPortId
+      : undefined)
+    const planIdentity = previewPlanIdentity(doc, id, portId)
+    const parameterBindings = get().runs[id]?.parameterBindings ?? []
+    const parameterIdentity = parameterBindingsIdentity(parameterBindings)
+    const requestGeneration = ++_previewRequestGeneration
+    const current = () => {
+      const state = get()
+      const preview = state.editorPreviews[id]
+      return preview?.requestGeneration === requestGeneration
+        && previewIsCurrent(preview, state.doc, id, portId)
+        && parameterBindingsIdentity(state.runs[id]?.parameterBindings) === parameterIdentity
+    }
+    const installResult = (result: SampleResult) => set((state) => ({
+      editorPreviews: {
+        ...state.editorPreviews,
+        [id]: {
+          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+          requestGeneration, result, offset,
+        },
+      },
+    }))
+    set((state) => ({
+      editorPreviews: {
+        ...state.editorPreviews,
+        [id]: {
+          canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+          requestGeneration, loading: true, offset,
+        },
+      },
+    }))
+    if (!edge || !upstream) {
+      installResult({
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true,
+        reason: 'No immediate upstream result can be identified. Connect one upstream output, then run it.',
+        wire: 'dataset',
+      })
+      return
+    }
+    try {
+      // Candidate discovery and proof are server-owned; no run id or artifact URI crosses this seam.
+      const result = await api.retainedEditorPreview(
+        doc, id, 50, offset, portId, parameterBindings,
+      )
+      if (!current()) return
+      installResult(result)
+    } catch (error) {
+      if (!current()) return
+      if (error instanceof KernelError && (
+        error.code === 'retained_upstream_stale'
+        || error.code === 'retained_upstream_unavailable'
+        || error.code === 'retained_upstream_expired'
+      )) {
+        installResult({
+          columns: [], rows: [], truncated: false, completeness: 'unknown',
+          notPreviewable: true,
+          reason: `No current retained ${String(upstream.data.title || upstream.id)} result is available.`,
+          wire: 'dataset',
+        })
+        return
+      }
+      set((state) => ({
+        editorPreviews: {
+          ...state.editorPreviews,
+          [id]: {
+            canvasId: doc.id, nodeId: id, portId, planIdentity, parameterBindings,
+            requestGeneration,
+            error: (error as Error).message || 'Could not verify a retained upstream result',
+            offset,
+          },
         },
       }))
     }
@@ -3931,7 +4029,7 @@ export const useStore = create<Store>((set, get) => ({
         // Agent requests are independent. A record from another canvas must never be displayed as
         // context for this one (or suggest that it will be sent with a future request).
         agentLog,
-        previews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
+        previews: {}, editorPreviews: {}, previewBindings, runs: retainedRuns, profileJobs: {}, numericParamDrafts: {}, openPanels: {}, selectedId: null, selectedIds: [], nodeRevealRequest: null, viewportFitRequest: null, past: [], future: [],
         canvasTransformReferences: [],
       })
     } finally {

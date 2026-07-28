@@ -658,6 +658,13 @@ export interface SampleResult {
   limitScope?: 'each-source' | 'result-window' | null
   sampleProvenance?: SampleProvenance | null
   previewRef?: string | null
+  editorTestInput?: {
+    runId: string
+    nodeId: string
+    portId: string
+    label: string
+    rows?: number | null
+  } | null
   inputManifest?: RunInputManifestItem[] | null
   notPreviewable: boolean
   error?: boolean

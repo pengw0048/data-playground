@@ -59,6 +59,7 @@ from hub.models import (
     CompilePlan,
     CompileRequest,
     ColumnSchema,
+    EditorTestInput,
     EstimateRequest,
     ExactDatasetRef,
     ExactRunReadiness,
@@ -68,6 +69,7 @@ from hub.models import (
     InputDriftRequest,
     InputDriftSource,
     JoinAnalysis,
+    ParameterBinding,
     PreviewRequest,
     ProfileEstimate,
     ProfileEstimateRequest,
@@ -1407,6 +1409,19 @@ class RunOutputSampleRequest(BaseModel):
     port_id: str = Field(min_length=1, max_length=128)
     k: int = Field(default=50, ge=0, le=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
     offset: int = Field(default=0, ge=0, lt=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+
+
+class RetainedEditorPreviewRequest(BaseModel):
+    """Editor-only preview request; the server selects the retained run and artifact."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+
+    graph: Graph
+    node_id: str = Field(min_length=1, max_length=256)
+    port_id: str | None = Field(default=None, min_length=1, max_length=128)
+    k: int = Field(default=50, ge=0, le=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+    offset: int = Field(default=0, ge=0, lt=_RUN_OUTPUT_SAMPLE_ROW_BUDGET)
+    parameter_bindings: list[ParameterBinding] = Field(default_factory=list, max_length=128)
 
 
 class _ExportNotAcceptable(RuntimeError):
@@ -3742,6 +3757,247 @@ def _open_run_result_export(
         raise HTTPException(409, "run output row metadata does not match its committed manifest")
     return resources, stream, _EXPORT_MEDIA_TYPES[extension], _export_headers(
         filename, extension, size)
+
+
+def _retained_editor_error(status: int, detail: str, code: APIErrorCode) -> APIError:
+    return APIError(status, detail, code=code, retryable=False)
+
+
+def _retained_editor_target(
+        graph: Graph, transform_id: str, deps) -> tuple[object, Graph, str, Graph]:
+    """Resolve the current immediate-upstream target without touching any Source."""
+    target = graph_mod.node_map(graph).get(transform_id)
+    if target is None or target.type != "transform":
+        raise _retained_editor_error(
+            409, "editor preview requires a current Transform",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    incoming = graph_mod.incoming(graph, transform_id)
+    if len(incoming) != 1:
+        raise _retained_editor_error(
+            409, "Transform must have exactly one immediate upstream input",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    edge = incoming[0]
+    upstream = graph_mod.node_map(graph).get(edge.source)
+    if upstream is None:
+        raise _retained_editor_error(
+            409, "Transform upstream node is missing",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    try:
+        upstream_port = graph_mod.require_output_port(
+            graph, upstream.id, deps.node_specs, edge.source_handle).id
+    except (KeyError, ValueError) as exc:
+        raise _retained_editor_error(
+            409, str(exc).strip("'"), APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    return edge, upstream, upstream_port, _target_execution_graph(graph, upstream.id)
+
+
+def _retained_editor_output(
+        candidate: dict, upstream, current_cone: Graph, deps) -> RunOutput:
+    """Prove one server-selected retained candidate matches the current upstream cone."""
+    try:
+        output = RunOutput.model_validate(candidate["output"])
+    except ValueError as exc:
+        raise _retained_editor_error(
+            409, "retained upstream output metadata is invalid",
+            APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE) from exc
+    manifest_sha256 = candidate["execution_manifest_sha256"]
+    retained = (
+        metadb.execution_manifest(str(manifest_sha256))
+        if manifest_sha256 is not None else None)
+    if retained is None:
+        raise _retained_editor_error(
+            409, "retained upstream execution plan is unavailable",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    payload = json.dumps(
+        retained["document"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    try:
+        admission = execution_manifest_admission(str(manifest_sha256), payload)
+        retained_graph = Graph.model_validate(admission["graph_doc"])
+    except (ExecutionManifestError, ValueError) as exc:
+        raise _retained_editor_error(
+            409, "retained upstream execution plan is invalid",
+            APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    if (
+        admission["target_node_id"] != upstream.id
+        or admission["target_port_id"] is not None
+    ):
+        raise _retained_editor_error(
+            409, "retained result targets a different execution plan",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+
+    retained_cone = _target_execution_graph(retained_graph, upstream.id)
+    retained_source_ids = {
+        node.id for node in retained_cone.nodes if node.type == "source"}
+    retained_inputs = [
+        item for item in admission["input_manifest"]
+        if item["node_id"] in retained_source_ids
+    ]
+    retained_by_node = {item["node_id"]: item for item in retained_inputs}
+    current_sources = [node for node in current_cone.nodes if node.type == "source"]
+    try:
+        exact_current = {
+            node.id: dataset_ref_identity(node.data.get("config", {}).get("datasetRef"))
+            for node in current_sources
+        }
+    except (TypeError, ValueError) as exc:
+        raise _retained_editor_error(
+            409, "current upstream Source is not pinned to an exact revision",
+            APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    if (
+        len(retained_by_node) != len(retained_source_ids)
+        or set(exact_current) != set(retained_by_node)
+        or any(
+            exact_current[node_id] != (
+                retained_by_node[node_id]["dataset_id"],
+                retained_by_node[node_id]["revision_id"],
+            )
+            for node_id in exact_current
+        )
+    ):
+        raise _retained_editor_error(
+            409, "the immediate upstream exact Source binding changed",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    retained_graph._parameter_bindings = copy.deepcopy(admission.get("parameters") or [])
+    retained_cone._parameter_bindings = copy.deepcopy(retained_graph._parameter_bindings)
+    try:
+        current_digest, _ = build_execution_manifest(
+            current_cone,
+            target_node_id=upstream.id,
+            target_port_id=None,
+            input_manifest=retained_inputs,
+            write_intent=None,
+            deps=deps,
+        )
+        retained_digest, _ = build_execution_manifest(
+            retained_cone,
+            target_node_id=upstream.id,
+            target_port_id=None,
+            input_manifest=retained_inputs,
+            write_intent=None,
+            deps=deps,
+        )
+    except ExecutionManifestError as exc:
+        raise _retained_editor_error(
+            409, "current upstream execution plan cannot be verified",
+            APIErrorCode.RETAINED_UPSTREAM_STALE) from exc
+    if current_digest != retained_digest:
+        raise _retained_editor_error(
+            409, "the immediate upstream execution plan changed",
+            APIErrorCode.RETAINED_UPSTREAM_STALE)
+    return output
+
+
+def _retained_editor_graph(
+        graph: Graph, transform_id: str, upstream, edge, artifact_uri: str) -> Graph:
+    """Build a request-local Source -> Transform graph; the artifact URI never crosses this scope."""
+    target = graph_mod.node_map(graph)[transform_id].model_copy(deep=True)
+    target.parent_id = None
+    source = upstream.model_copy(deep=True)
+    source.type = "source"
+    source.parent_id = None
+    source.data = {
+        "title": str(upstream.data.get("title") or upstream.id),
+        "config": {"uri": artifact_uri},
+    }
+    return Graph.model_validate({
+        "id": graph.id,
+        "version": graph.version,
+        "requirements": graph.requirements,
+        "nodes": [
+            source.model_dump(by_alias=True, mode="json"),
+            target.model_dump(by_alias=True, mode="json"),
+        ],
+        "edges": [{
+            "id": f"editor-retained-{uuid.uuid4().hex}",
+            "source": source.id,
+            "target": target.id,
+            "sourceHandle": "out",
+            "targetHandle": edge.target_handle,
+            "data": {"wire": "dataset"},
+        }],
+    })
+
+
+@router.post("/run/editor-preview", response_model=SampleResult)
+def preview_transform_with_retained_upstream(
+        req: RetainedEditorPreviewRequest, uid: str = Depends(current_user)) -> SampleResult:
+    """Test one Transform against its newest current retained immediate-upstream result."""
+    authorized_canvas, _role = _require_graph_read_access(req.graph, uid)
+    canvas_id = authorized_canvas or str(getattr(req.graph, "id", "") or "")
+    if not canvas_id or metadb.canvas_role(canvas_id, uid) is None:
+        raise _retained_editor_error(
+            404, "canvas not found", APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    deps = get_deps()
+    graph = _resolve_parameters(
+        req.graph, req.parameter_bindings, req.node_id, deps, freeze_latest=False)
+    graph_mod.resolve_source_refs(graph, deps.catalog.resolve_ref)
+    edge, upstream, upstream_port, current_cone = _retained_editor_target(
+        graph, req.node_id, deps)
+    _reject_invalid(graph, deps, req.node_id)
+    port_id = _inspection_port(graph, req.node_id, req.port_id, deps)
+    candidates = metadb.retained_run_editor_candidates(
+        canvas_id, upstream.id, upstream_port)
+    if not candidates:
+        raise _retained_editor_error(
+            404, "retained immediate-upstream result not found",
+            APIErrorCode.RETAINED_UPSTREAM_UNAVAILABLE)
+    saw_expired = False
+    for candidate in candidates:
+        run_id = candidate["run_id"]
+        if not _run_read_access(run_id, uid):
+            continue
+        try:
+            output = _retained_editor_output(
+                candidate, upstream, current_cone, deps)
+        except APIError:
+            continue
+        try:
+            uri = output.uri or ""
+            with source_read_scope(
+                    deps.storage, [uri],
+                    owner=f"editor-preview:{run_id}:{uuid.uuid4().hex}"):
+                member = _object_attempt_member(uri)
+                target_uri = member[0] if member is not None else uri
+                if (member is not None and output.rows is not None
+                        and member[2] != output.rows):
+                    continue
+                editor_graph = _retained_editor_graph(
+                    graph, req.node_id, upstream, edge, target_uri)
+                _reject_invalid(editor_graph, deps, req.node_id)
+                if deps.chosen_backend(uid) == "kernel" and (kb := deps.kernel_backend()):
+                    result = SampleResult(**kb.preview(
+                        editor_graph, req.node_id, req.k, req.offset, port_id))
+                else:
+                    result = preview_node(
+                        editor_graph, req.node_id, req.k,
+                        deps.resolve_adapter, deps.registry, deps.node_builders, deps.node_specs,
+                        offset=req.offset, storage=deps.storage, port_id=port_id,
+                    )
+        except _ExportNotAcceptable:
+            continue
+        except PermissionError as exc:
+            raise APIError(
+                403, "retained upstream artifact access denied",
+                code=APIErrorCode.PERMISSION_DENIED, retryable=False) from exc
+        except (FileNotFoundError, ManagedSourceReadError):
+            saw_expired = True
+            continue
+        result.editor_test_input = EditorTestInput(
+            run_id=run_id,
+            node_id=output.node_id,
+            port_id=output.port_id,
+            label=str(upstream.data.get("title") or upstream.id),
+            rows=output.rows,
+        )
+        result.input_manifest = None
+        return result
+    if saw_expired:
+        raise _retained_editor_error(
+            410, "retained upstream artifact is missing or expired",
+            APIErrorCode.RETAINED_UPSTREAM_EXPIRED)
+    raise _retained_editor_error(
+        409, "no retained result matches the current upstream execution plan",
+        APIErrorCode.RETAINED_UPSTREAM_STALE)
 
 
 @router.post("/run/{run_id}/sample", response_model=SampleResult)

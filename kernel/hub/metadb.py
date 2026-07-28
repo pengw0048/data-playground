@@ -12499,6 +12499,56 @@ def get_run_record_outputs(run_id: str) -> list[dict] | None:
     return [dict(output) for output in outputs]
 
 
+def retained_run_editor_candidates(
+        canvas_id: str, target_node_id: str, port_id: str) -> list[dict]:
+    """Return newest retained results for one exact Canvas target/output.
+
+    Run history is capped at 500 rows per Canvas, so filtering the bounded relation here prevents
+    unrelated recent Jobs from hiding a still-retained editor input.
+    """
+    with session() as s:
+        rows = s.execute(
+            select(
+                RunRecord.run_id,
+                RunRecord.execution_manifest_sha256,
+                RunRecord.outputs,
+            )
+            .where(
+                RunRecord.canvas_id == str(canvas_id),
+                RunRecord.target_node_id == str(target_node_id),
+                RunRecord.status == "done",
+                RunRecord.job_type == "run",
+            )
+            .order_by(RunRecord.created_at.desc(), RunRecord.id.desc())
+        ).all()
+    candidates: list[dict] = []
+    for row in rows:
+        if row.run_id is None:
+            continue
+        try:
+            outputs = json.loads(row.outputs)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(outputs, list):
+            continue
+        output = next((
+            item for item in outputs
+            if isinstance(item, dict)
+            and item.get("node_id") == target_node_id
+            and item.get("port_id") == port_id
+            and item.get("outcome") == "committed"
+            and item.get("publication_kind") == "result"
+            and item.get("uri")
+        ), None)
+        if output is not None:
+            candidates.append({
+                "run_id": str(row.run_id),
+                "execution_manifest_sha256": row.execution_manifest_sha256,
+                "output": dict(output),
+            })
+    return candidates
+
+
 def get_run_record_output(run_id: str, node_id: str, port_id: str) -> dict | None:
     """Return one history output by logical run id and declared port identity."""
     outputs = get_run_record_outputs(run_id)

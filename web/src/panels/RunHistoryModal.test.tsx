@@ -608,6 +608,60 @@ describe('durable full results', () => {
     expect(screen.queryByText('Your Python transform raised an exception')).not.toBeInTheDocument()
   })
 
+  it('labels retained rows in the editor without exposing the formal full-result surface', () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      }, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        ...sample(0, 1, false),
+        editorTestInput: {
+          runId: 'retained-run', nodeId: 'sample', portId: 'out',
+          label: 'Clean events', rows: 1_234,
+        },
+      }) },
+      runs: { target: { phase: 'done', status: {
+        runId: 'formal-run', status: 'done', targetNodeId: 'target',
+        rowsProcessed: 10, totalRows: 10, ms: 1, placement: 'local', perNode: [],
+        outputs: [committedOutput('/outputs/formal.parquet', 10)],
+      } } },
+    } as any)
+
+    render(<DataPanel nodeId="target" editorPreview={{}} />)
+
+    expect(screen.getByText(
+      'Testing with Clean events result · 1,234 rows')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()
+  })
+
+  it('offers only Run upstream when no current retained editor input exists', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'adhoc', mode: 'map', code: 'def fn(row): return row',
+      }, history: [] },
+    }] }
+    const onRunUpstream = vi.fn()
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', {
+        columns: [], rows: [], truncated: false, completeness: 'unknown',
+        notPreviewable: true, reason: 'No current retained Sample result is available.',
+      }) },
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" editorPreview={{ onRunUpstream }} />)
+
+    await user.click(screen.getByRole('button', { name: 'Run upstream →' }))
+    expect(onRunUpstream).toHaveBeenCalledOnce()
+    expect(screen.queryByText(/Run a full pass/)).not.toBeInTheDocument()
+  })
+
   it('keeps unsupported binary media as raw data instead of advertising an unusable Media tab', async () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
