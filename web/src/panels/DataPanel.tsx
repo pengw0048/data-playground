@@ -4,7 +4,7 @@ import {
   roleCanEdit, targetParameterDeclarations, useStore,
 } from '../store/graph'
 import { capabilitiesFor, nodeOutputs } from '../nodes/registry'
-import { api } from '../api/client'
+import { api, KernelError } from '../api/client'
 import { Icon } from '../ui/Icon'
 import { Button } from '@/components/ui/button'
 import {
@@ -23,6 +23,12 @@ import type {
 
 const PAGE = 50
 const CHART_DISPLAY_LIMIT = 2_000
+
+function isDefinitivelyUnavailableRetainedResult(error: unknown): boolean {
+  // The retained-result endpoint promises a structured KernelError. Only its definitive HTTP
+  // outcomes mean an exact saved result cannot be opened; transport failures stay retryable.
+  return error instanceof KernelError && (error.status === 404 || error.status === 409 || error.status === 410)
+}
 
 export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }: {
   nodeId: string
@@ -85,6 +91,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
     bindingsIdentity: string
     identity: RetainedResultIdentity
   } | null>(null)
+  const [retainedResultUnavailable, setRetainedResultUnavailable] = useState(false)
   const planIdentity = previewPlanIdentity(doc, nodeId, selectedPortId)
   const bindingsIdentity = parameterBindingsIdentity(parameterBindings)
   const recoveredResult = !editorPreview && node?.data.status === 'latest'
@@ -114,6 +121,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   useEffect(() => {
     const requestGeneration = ++retainedRequestGeneration.current
     setRetainedResult(null)
+    setRetainedResultUnavailable(false)
     if (editorPreview || node?.data.status !== 'latest' || committedRunOutput
         || retainedBindingsUnavailable
         || retainedPortId === undefined) return
@@ -137,9 +145,22 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
           bindingsIdentity: requestBindingsIdentity, identity,
         })
       })
-      .catch(() => {
-        // No exact retained result is a normal state. The bounded preview remains available and the
-        // user can run this step; never substitute a merely newer or older artifact client-side.
+      .catch((error: unknown) => {
+        const current = useStore.getState()
+        const currentNode = current.doc.nodes.find((candidate) => candidate.id === nodeId)
+        const currentBindings = current.runs[nodeId]?.parameterBindings
+        if (
+          retainedRequestGeneration.current !== requestGeneration
+          || currentNode?.data.status !== 'latest'
+          || (currentBindings !== undefined) !== parameterBindingsKnown
+          || previewPlanIdentity(current.doc, nodeId, selectedPortId) !== requestPlanIdentity
+          || parameterBindingsIdentity(currentBindings) !== requestBindingsIdentity
+        ) return
+        if (isDefinitivelyUnavailableRetainedResult(error)) {
+          setRetainedResultUnavailable(true)
+        }
+        // Never substitute a merely newer or older artifact client-side. Transport and temporary
+        // server failures deliberately stay indeterminate so the result view can be retried.
       })
   // `doc` and bindings are represented by their canonical identities so position-only edits and
   // equivalent binding order do not issue another durable lookup.
@@ -234,6 +255,10 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
   if (res.failureCategory === 'syntax_error' && res.syntaxError) {
     return withOutputPorts(<SyntaxFailure failure={res.syntaxError} />)
   }
+  if (!editorPreview && node?.data.status === 'latest' && retainedResultUnavailable && res.notPreviewable) {
+    return withOutputPorts(<CurrentResultUnavailable
+      onRerun={canEdit ? () => requestRun(nodeId) : undefined} />)
+  }
   if (res.failureCategory === 'user_code_exception' && res.userCodeException) {
     const failureNodeId = res.userCodeException.nodeId ?? nodeId
     const failureNode = doc.nodes.find((candidate) => candidate.id === failureNodeId)
@@ -278,7 +303,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation}
         fillAvailableHeight={fillAvailableHeight}
-        onRunUnavailable={() => requestRun(nodeId)} />)
+        onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
     }
     if (editorPreview) {
       return withOutputPorts(<NotPreviewable
@@ -309,7 +334,7 @@ export function DataPanel({ nodeId, editorPreview, fillAvailableHeight = false }
       name={String(node?.data.title || node?.id || 'result')}
       modeToggle={resultModeToggle} presentation={artifactPresentation}
       fillAvailableHeight={fillAvailableHeight}
-      onRunUnavailable={() => requestRun(nodeId)} />)
+      onRunUnavailable={() => requestRun(nodeId)} currentResult={node?.data.status === 'latest'} />)
   }
 
   const columns = res.columns
@@ -1271,7 +1296,7 @@ type ArtifactPresentation =
 
 export function FullResult({
   uri, total, runId, nodeId, portId, publicationKind, name = 'result', modeToggle, presentation,
-  onRunUnavailable, fillAvailableHeight = false,
+  onRunUnavailable, currentResult = false, fillAvailableHeight = false,
 }: {
   uri: string
   total: number | null
@@ -1284,6 +1309,7 @@ export function FullResult({
   presentation?: ArtifactPresentation
   onRunUnavailable?: () => void
   fillAvailableHeight?: boolean
+  currentResult?: boolean
 }) {
   const [data, setData] = useState<import('../types/api').SampleResult | null>(null)
   const [err, setErr] = useState<(Error & { status?: number }) | null>(null)
@@ -1374,12 +1400,14 @@ export function FullResult({
       modeToggle={modeToggle} />
   )
   const runAction = onRunUnavailable ? (
-    <Button variant="outline" size="sm" onClick={onRunUnavailable}>Run this step</Button>
+    <Button variant="outline" size="sm" onClick={onRunUnavailable}>
+      {currentResult ? 'Rerun and save result' : 'Run this step'}
+    </Button>
   ) : undefined
 
   if (err) return <ArtifactUnavailable error={err} chrome={technicalChrome}
     label={viewLabel} action={exportAction} missingAction={runAction}
-    onRetry={() => setRetry((n) => n + 1)} />
+    onRetry={() => setRetry((n) => n + 1)} currentResult={currentResult} />
   if (!data) return <div className="dp-dark text-foreground">
     {technicalChrome}
     <Skeleton />
@@ -1515,7 +1543,7 @@ function FullResultMessage({ title, reason, onRetry, modeToggle, action, chrome 
   )
 }
 
-function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction, label, chrome }: {
+function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction, label, chrome, currentResult }: {
   error: Error & { status?: number }
   onRetry: () => void
   modeToggle?: ReactNode
@@ -1523,14 +1551,21 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction
   missingAction?: ReactNode
   label: string
   chrome?: ReactNode
+  currentResult?: boolean
 }) {
   const status = error.status
   const denied = status === 401 || status === 403
-  const missing = !denied && (status === 404 || status === 410 || /no such file|not found|missing|expired/i.test(error.message))
-  const title = denied ? `${label} access denied` : missing ? `${label} expired or removed` : `Couldn’t load ${label.toLowerCase()}`
+  // HTTP outcomes are the durable contract. Do not mistake a network error or diagnostic prose for
+  // evidence that the exact saved artifact is gone.
+  const missing = !denied && (status === 404 || status === 409 || status === 410)
+  const title = denied ? `${label} access denied`
+    : missing && currentResult ? 'Current result unavailable'
+      : missing ? `${label} expired or removed` : `Couldn’t load ${label.toLowerCase()}`
   const note = denied
     ? 'You no longer have access to this artifact. Switch back to the sample or ask the owner for access.'
-    : missing
+    : missing && currentResult
+      ? 'This calculation is still up to date, but its saved result is no longer available. Rerun this step to calculate and save a new result.'
+      : missing
       ? 'The stored artifact is no longer available. Run the node again to create a new full result.'
       : 'The artifact may still exist. Check the connection and retry, or switch back to the sample.'
   return (
@@ -1549,6 +1584,22 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, missingAction
           {missing && missingAction ? missingAction : action}
         </div>
       </div>
+    </div>
+  )
+}
+
+function CurrentResultUnavailable({ onRerun }: { onRerun?: () => void }) {
+  return (
+    <div data-testid="current-result-unavailable" role="status"
+      aria-label="Current result unavailable" className="px-5 py-7 text-center text-muted-foreground">
+      <div className="mb-3 inline-grid h-10 w-10 place-items-center rounded-[10px] bg-amber-100 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300">
+        <Icon name="clock" size={18} />
+      </div>
+      <div className="text-[13px] font-semibold text-foreground">Current result unavailable</div>
+      <div className="mx-auto mt-[5px] max-w-[360px] text-[11.5px] leading-normal">
+        This calculation is still up to date, but its saved result is no longer available. Rerun this step to calculate and save a new result.
+      </div>
+      {onRerun && <Button variant="outline" size="sm" onClick={onRerun} className="mt-3.5">Rerun and save result</Button>}
     </div>
   )
 }

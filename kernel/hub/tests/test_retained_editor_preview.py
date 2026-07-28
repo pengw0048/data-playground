@@ -214,6 +214,7 @@ def test_canvas_recovers_exact_retained_result_without_creating_a_run(retained_s
     })
     assert expired.status_code == 410, expired.text
     assert expired.json()["code"] == "resource_gone"
+    assert expired.json()["retryable"] is False
 
 
 def test_canvas_recovers_retained_result_from_its_registered_logical_uri(tmp_path):

@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
 import { goldenCanvas, installCanvas } from './support/ux-fixtures'
 import { goToWorkspace, workspaceResource } from './support/workspace'
 
@@ -250,7 +250,7 @@ test.describe('researcher golden workflow @ux-smoke', () => {
     }
   })
 
-  test('keeps one complete-result header and table space from Canvas through Jobs', async ({ page }) => {
+  test('keeps one complete-result header and table space from Canvas through Jobs', async ({ page }, testInfo) => {
     const doc = goldenCanvas('ux-full-result-header', 'UX full result header', 'UX full result source')
     await installCanvas(page.request, doc)
     const graph = {
@@ -313,26 +313,40 @@ test.describe('researcher golden workflow @ux-smoke', () => {
       await expectBoundedFullResultEvidence(jobsResult, runId, 'filter:out')
     }
 
-    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
-    await page.route(sampleRoute, async (route) => {
-      await route.fulfill({
-        status: 410,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          detail: 'run output artifact is missing or expired',
-          code: 'resource_gone',
-        }),
-      })
-    })
+    const historyResponse = await page.request.get(`/api/canvas/${encodeURIComponent(doc.id)}/runs`)
+    expect(historyResponse.ok(), await historyResponse.text()).toBe(true)
+    const history = await historyResponse.json() as Array<{
+      runId?: string
+      outputs?: Array<{ nodeId?: string; portId?: string; uri?: string }>
+    }>
+    const exactOutput = history.find((entry) => entry.runId === runId)?.outputs?.find((output) => (
+      output.nodeId === 'filter' && output.portId === 'out'
+    ))
+    expect(exactOutput?.uri).toBeTruthy()
+    // Retire only the exact run artifact reported by Canvas history. The re-open flow must not
+    // substitute any other result when this retained output is unavailable.
+    rmSync(exactOutput!.uri!)
     await page.goto(`/#/canvas/${doc.id}`)
     const expiredFilter = page.locator('.react-flow__node', { hasText: 'UX golden filter' })
     await expiredFilter.click()
     await page.getByTestId('inspector').getByRole('button', { name: 'View data' }).click()
     const expiredResult = page.getByTestId('panel-data')
-    await expect(expiredResult.getByText('Full result expired or removed')).toBeVisible()
+    await expect(expiredFilter.getByTitle('latest')).toBeVisible()
+    await expect(expiredResult.getByText('Current result unavailable')).toBeVisible()
+    await expect(expiredResult.getByText(/calculation is still up to date/i)).toBeVisible()
+    await expect(expiredResult.getByRole('button', { name: 'Rerun and save result' })).toBeVisible()
+    await expect(expiredResult.getByText('Run this step to see results')).toHaveCount(0)
+    await expect(expiredResult.getByText('Full result expired or removed')).toHaveCount(0)
+    for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+      await page.setViewportSize(viewport)
+      await expect(expiredResult).toBeVisible()
+      await expiredResult.screenshot({ path: testInfo.outputPath(
+        `issue-1109-current-result-unavailable-${viewport.width}x${viewport.height}.png`,
+      ) })
+    }
     await expectBoundedFullResultEvidence(expiredResult, runId, 'filter:out')
 
-    await page.unroute(sampleRoute)
+    const sampleRoute = `**/api/run/${encodeURIComponent(runId)}/sample`
     await page.route(sampleRoute, async (route) => {
       await route.fulfill({
         status: 200,
