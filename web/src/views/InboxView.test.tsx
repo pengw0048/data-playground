@@ -40,10 +40,20 @@ describe('InboxView', () => {
     useStore.setState({ view: 'inbox', inboxQuery: '', jobsQuery: '', toasts: [] } as never)
   })
 
-  it('scopes Inbox outcomes to durable background work', () => {
+  it('describes Inbox scope without internal task terminology', () => {
     render(<InboxView />)
-    expect(screen.getByText('Outcomes from your durable background work')).toBeInTheDocument()
+    expect(screen.getByText('Completed background tasks assigned to you')).toBeInTheDocument()
     expect(screen.queryByText('Completed work and failures assigned to you')).toBeNull()
+    expect(screen.queryByText(/durable/i)).toBeNull()
+  })
+
+  it('keeps the empty-state promise limited to durable tasks', async () => {
+    mocks.inboxList.mockResolvedValue({ items: [], hasMore: false, nextCursor: null })
+    render(<InboxView />)
+    expect(await screen.findByText(
+      'No completed background work yet. Completed background tasks will appear here.',
+    )).toBeInTheDocument()
+    expect(screen.queryByText(/finished runs/i)).toBeNull()
   })
 
   it('loads items, marks read, and opens an authorized job', async () => {
