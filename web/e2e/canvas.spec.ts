@@ -2769,7 +2769,7 @@ test.describe('Data Playground canvas', () => {
       await goToWorkspace(page)
       await openWorkspaceDataset(page, original.name)
 
-      await page.getByText('Catalog maintenance', { exact: true }).click()
+      await page.getByText('Edit catalog details', { exact: true }).click()
       await page.getByTestId('detail-name').fill('my staged catalog edit')
       await page.getByTestId('detail-pk-id').click()
       const concurrent = await page.request.put(`/api/catalog/tables/${encodeURIComponent(original.id)}/edit`, {

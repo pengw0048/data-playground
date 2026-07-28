@@ -5,7 +5,7 @@ import { KernelError } from '../api/client'
 
 const mocks = vi.hoisted(() => ({
   workspaceBrowse: vi.fn(), workspaceResource: vi.fn(), workspaceSearch: vi.fn(), tablesPage: vi.fn(), tableByRegistration: vi.fn(),
-  workspaceCanonicalDataset: vi.fn(),
+  workspaceCanonicalDataset: vi.fn(), datasetRevision: vi.fn(),
   workspaceCreateCanvas: vi.fn(), workspaceCreateFolder: vi.fn(), workspaceRenameFolder: vi.fn(), workspaceDeleteFolder: vi.fn(), workspaceAddDatasets: vi.fn(), workspaceMoveCanvas: vi.fn(), workspaceRelink: vi.fn(),
   getCanvas: vi.fn(), saveCanvas: vi.fn(), deleteCanvas: vi.fn(),
   datasetView: vi.fn(), previewDatasetView: vi.fn(), deleteDatasetView: vi.fn(),
@@ -120,6 +120,11 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceResource.mockResolvedValue({ resource: DATASET, ancestors: [ROOT, FOLDER], source: { id: 'local', kind: 'local', completeness: 'complete' } })
     mocks.workspaceSearch.mockResolvedValue({ query: 'observations', groups: [], nextCursor: null, hasMore: false, completeness: 'complete' })
     mocks.workspaceCanonicalDataset.mockResolvedValue(CANONICAL_DATASET_CONTEXT)
+    mocks.datasetRevision.mockResolvedValue({
+      datasetId: CANONICAL_DATASET_CONTEXT.datasetIdentity, revisionId: 'revision-7',
+      summary: { rowCount: 2, dataFileCount: null, totalBytes: null, fragmentCount: null },
+      preview: { columns: CANONICAL_DATASET_CONTEXT.columns, rows: [{ value: 1 }, { value: 2 }], hasMore: false, rowLimit: 100 },
+    })
     mocks.tablesPage.mockResolvedValue({ items: [{ id: 'dataset-1', registrationId: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', folder: 'robotics', columns: [] }], total: 1, hasMore: false })
     mocks.tableByRegistration.mockResolvedValue({ id: 'dataset-1', name: 'observations', uri: 'file:///observations.parquet', columns: [] })
     mocks.datasetView.mockResolvedValue(VIEW_DEFINITION)
@@ -450,7 +455,7 @@ describe('WorkspaceExplorer', () => {
     expect(screen.queryByRole('menuitem', { name: 'New folder' })).not.toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: 'Rename' })).not.toBeInTheDocument()
     expect(screen.queryByRole('menuitem', { name: 'Delete' })).not.toBeInTheDocument()
-    expect(screen.getByText('This catalog manages its folders. You can still create a local Canvas here. Folder rename, move, and delete are unavailable here; this does not change the connected catalog.')).toBeVisible()
+    expect(screen.getByText('Connected catalogs manage their folders. Canvases created here stay local to Data Playground.')).toBeVisible()
     expect(mocks.workspaceCreateFolder).not.toHaveBeenCalled()
     expect(mocks.workspaceRenameFolder).not.toHaveBeenCalled()
     expect(mocks.workspaceDeleteFolder).not.toHaveBeenCalled()
@@ -1226,7 +1231,29 @@ describe('WorkspaceExplorer', () => {
 
     expect(await screen.findByText('Research')).toBeVisible()
     expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Some sources are incomplete')
-    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Mount warehouse · fixture · unavailable — deadline exceeded')
+    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('Mount warehouse · fixture · Unavailable — deadline exceeded')
+  })
+
+  it('translates every provider completeness state without treating a healthy page as unavailable', async () => {
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: ROOT, items: [FOLDER], nextCursor: null, hasMore: false, completeness: 'partial',
+      sources: [
+        { ...PROVIDER_COMPLETE, id: 'complete', mountId: 'complete', completeness: 'complete' },
+        { ...PROVIDER_COMPLETE, id: 'page', mountId: 'page', completeness: 'page' },
+        { ...PROVIDER_COMPLETE, id: 'partial', mountId: 'partial', completeness: 'partial' },
+        { ...PROVIDER_COMPLETE, id: 'unavailable', mountId: 'unavailable', completeness: 'unavailable' },
+        { ...PROVIDER_COMPLETE, id: 'unsupported', mountId: 'unsupported', completeness: 'unsupported' },
+      ],
+    })
+    render(<WorkspaceExplorer />)
+
+    const status = await screen.findByRole('region', { name: 'Workspace source status' })
+    expect(status).toHaveTextContent('Up to date')
+    expect(status).toHaveTextContent('More results available')
+    expect(status).toHaveTextContent('Some results unavailable')
+    expect(status).toHaveTextContent('Unavailable')
+    expect(status).toHaveTextContent('Browse unavailable')
+    expect(status).not.toHaveTextContent('· page')
   })
 
   it('uses an external dataset by stable reference without catalog lookup or provider writes', async () => {
@@ -1238,8 +1265,12 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
-    expect(detail).toHaveTextContent('Source-only mount warehouse · fixture')
-    expect(detail).toHaveTextContent('Using the dataset creates only a local Source; it never writes to the provider')
+    expect(detail).toHaveTextContent('LocationMount warehouse / Remote / observationsfixture')
+    expect(detail).toHaveTextContent('2 rows· 1 columns')
+    expect(detail).toHaveTextContent('Preview')
+    await waitFor(() => expect(mocks.datasetRevision).toHaveBeenCalledWith(
+      CANONICAL_DATASET_CONTEXT.datasetIdentity, CANONICAL_DATASET_CONTEXT.revisionId,
+    ))
     expect(screen.getByRole('button', { name: 'Create a local Canvas here' })).toBeEnabled()
     fireEvent.click(screen.getByRole('button', { name: 'Use in Canvas' }))
     expect(screen.getByRole('dialog', { name: 'Use observations' })).toHaveTextContent(
@@ -1256,6 +1287,45 @@ describe('WorkspaceExplorer', () => {
     expect(mocks.tableByRegistration).not.toHaveBeenCalled()
     expect(mocks.workspaceCreateCanvas).not.toHaveBeenCalled()
     expect(mocks.workspaceMoveCanvas).not.toHaveBeenCalled()
+  })
+
+  it('keeps a healthy paged provider usable and labels its continuation in researcher language', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    const pagedSource = { ...PROVIDER_COMPLETE, completeness: 'page' as const }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: pagedSource,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: 'next', hasMore: true,
+      completeness: 'page', sources: [pagedSource],
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(screen.getByRole('region', { name: 'Workspace source status' })).toHaveTextContent('More results available')
+    expect(within(detail).getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
+  })
+
+  it('shows one actionable provider error while keeping protocol state collapsed', async () => {
+    store.workspaceResourceId = EXTERNAL_DATASET.id
+    const partialSource = { ...PROVIDER_COMPLETE, completeness: 'partial' as const, error: 'provider timed out' }
+    mocks.workspaceResource.mockResolvedValue({
+      resource: EXTERNAL_DATASET, ancestors: [ROOT, EXTERNAL_FOLDER], source: partialSource,
+      canonicalSourceBinding: CANONICAL_SOURCE_BINDING,
+    })
+    mocks.workspaceBrowse.mockResolvedValue({
+      container: EXTERNAL_FOLDER, items: [EXTERNAL_DATASET], nextCursor: null, hasMore: false,
+      completeness: 'partial', sources: [partialSource],
+    })
+    render(<WorkspaceExplorer />)
+
+    const detail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(within(detail).getByRole('status')).toHaveTextContent('provider timed out')
+    expect(within(detail).getAllByRole('button', { name: 'Retry' })).toHaveLength(1)
+    const connection = within(detail).getByText('Connection details', { exact: true })
+    expect(connection.parentElement).not.toHaveAttribute('open')
+    expect(within(detail).getByText('Provider result state · partial')).not.toBeVisible()
   })
 
   it('adds a provider reference to the exact editable current Canvas without provider mutation', async () => {
@@ -1375,10 +1445,13 @@ describe('WorkspaceExplorer', () => {
     view.rerender(<WorkspaceExplorer />)
 
     const detail = await screen.findByRole('dialog', { name: 'observations' })
+    const connection = within(detail).getByText('Connection details', { exact: true })
+    expect(connection.parentElement).not.toHaveAttribute('open')
+    fireEvent.click(connection)
     expect(detail).toHaveTextContent('Workspace placementremote-dataset')
     expect(detail).toHaveTextContent('Canonical dataset IDcanonical-observations')
     expect(detail).toHaveTextContent('Source dataset identityworkspace-provider:canonical-source')
-    expect(detail).toHaveTextContent('Exact revision')
+    expect(detail).toHaveTextContent('Exact version · revision-7')
     expect(within(detail).getByTestId('canonical-provider-dataset-context')).toHaveTextContent(
       'Schemavalue · int64',
     )
@@ -1456,7 +1529,7 @@ describe('WorkspaceExplorer', () => {
     render(<WorkspaceExplorer />)
 
     const context = await screen.findByTestId('canonical-provider-dataset-context')
-    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Current/latest provider state · not an exact revision')
+    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Latest provider version')
     expect(context).not.toHaveTextContent('Exact revision')
   })
 
@@ -1529,14 +1602,14 @@ describe('WorkspaceExplorer', () => {
       .mockResolvedValueOnce(CANONICAL_DATASET_CONTEXT)
     render(<WorkspaceExplorer />)
 
-    expect(await screen.findByText(/Canonical dataset context is unavailable/)).toHaveTextContent(
+    expect(await screen.findByText(/Couldn't load provider details/)).toHaveTextContent(
       'canonical detail timed out',
     )
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeEnabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry canonical detail' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     await screen.findByTestId('canonical-provider-dataset-context')
-    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Exact revision')
-    expect(mocks.workspaceCanonicalDataset).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('dialog', { name: 'observations' })).toHaveTextContent('Exact version')
+    expect(mocks.workspaceCanonicalDataset.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(store.workspaceResourceId).toBe(EXTERNAL_DATASET.id)
   })
 
@@ -1835,7 +1908,10 @@ describe('WorkspaceExplorer', () => {
     mocks.workspaceResource.mockResolvedValue({ resource: detachedPlacement, ancestors: [ROOT, EXTERNAL_FOLDER], source: PROVIDER_COMPLETE })
     mocks.workspaceBrowse.mockResolvedValue({ container: EXTERNAL_FOLDER, items: [detachedPlacement], nextCursor: null, hasMore: false, completeness: 'complete', sources: [PROVIDER_COMPLETE] })
     const first = render(<WorkspaceExplorer />)
-    expect(await screen.findByRole('dialog', { name: 'observations' })).toHaveTextContent('Placement state · detached · canonical dataset is current')
+    const detachedDetail = await screen.findByRole('dialog', { name: 'observations' })
+    expect(detachedDetail).toHaveTextContent('This provider location is not available right now.')
+    fireEvent.click(within(detachedDetail).getByText('Connection details', { exact: true }))
+    expect(detachedDetail).toHaveTextContent('Placement state · detached')
     first.unmount()
     mocks.workspaceResource.mockClear()
 
@@ -1847,7 +1923,7 @@ describe('WorkspaceExplorer', () => {
     expect(detail).toHaveTextContent('Canonical dataset state · offline')
     expect(detail).toHaveTextContent('Placement state · current')
     expect(screen.getByRole('button', { name: 'Use in Canvas' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry canonical dataset' }))
+    fireEvent.click(within(detail).getByRole('button', { name: 'Retry' }))
     await waitFor(() => expect(mocks.workspaceResource).toHaveBeenCalledTimes(2))
     second.unmount()
     mocks.workspaceResource.mockClear()

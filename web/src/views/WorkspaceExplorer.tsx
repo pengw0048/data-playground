@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, KernelError, type CanvasFile } from '../api/client'
 import { useStore } from '../store/graph'
 import type {
-  CatalogTable, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
+  CatalogTable, DatasetRevisionDetail, DatasetViewDefinition, WorkspaceMoveCanvasResult, WorkspaceResource, WorkspaceSearchGroup,
   WorkspaceCanonicalDatasetContext, WorkspaceSourceStatus,
 } from '../types/api'
 import { Icon } from '../ui/Icon'
@@ -169,6 +169,7 @@ function WorkspaceOverflowMenuProvider({ children }: { children: ReactNode }) {
 }
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error)
+const previewCell = (value: unknown) => value == null ? '' : typeof value === 'object' ? JSON.stringify(value) : String(value)
 const identity = (resource: WorkspaceResource) => resource.id.slice(resource.id.indexOf(':') + 1)
 const isExternal = (resource: WorkspaceResource | null) => resource?.source === 'provider'
 const isCatalogFolder = (resource: WorkspaceResource | null) => !!resource?.catalogFolderId
@@ -233,6 +234,21 @@ const statusMessage = (status: WorkspaceSourceStatus) => status.error
   ?? (status.completeness === 'unavailable' ? 'source is offline'
     : status.completeness === 'unsupported' ? 'browse is not supported'
       : status.completeness === 'partial' ? 'source returned partial results' : null)
+
+function sourceCompletenessLabel(completeness: WorkspaceSourceStatus['completeness']): string {
+  switch (completeness) {
+    case 'complete': return 'Up to date'
+    case 'page': return 'More results available'
+    case 'pending': return 'Loading results'
+    case 'partial': return 'Some results unavailable'
+    case 'unavailable': return 'Unavailable'
+    case 'unsupported': return 'Browse unavailable'
+  }
+}
+
+function sourceIsUsable(status: WorkspaceSourceStatus | null): boolean {
+  return status?.completeness === 'complete' || status?.completeness === 'page'
+}
 
 const DATASET_SORTS = new Set<CatalogDiscoveryQueryState['sort']>(['name', 'rows', 'updated', 'usage', 'folder'])
 
@@ -843,7 +859,7 @@ function WorkspaceMixedExplorer() {
       }} />}
       {selectedDataset && isExternal(selectedDataset) && <ExternalDatasetDetail resource={selectedDataset} source={selectedSource}
         canonicalSourceBinding={selectedCanonicalSourceBinding} onClose={closeDetail} onRetry={reload}
-        onRelink={() => setRelinkResource(selectedDataset)} onUse={() => useProviderDataset(selectedDataset)} />}
+        onUse={() => useProviderDataset(selectedDataset)} />}
       {selectedDetached && <DetachedResource resource={selectedDetached} onClose={closeDetail} />}
       {addDataOpen && <AddDataModal onClose={() => setAddDataOpen(false)} onUploadDataset={uploadDataset}
         onCompleted={reload} />}
@@ -1301,7 +1317,7 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
     source.provider,
     source.searchMode === 'native' ? 'native search' : source.searchMode,
     source.freshness,
-    source.completeness,
+    sourceCompletenessLabel(source.completeness),
   ].filter(Boolean).join(' · ')
   return <section aria-label={`Search source ${name}`} className="grid gap-2">
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-[11px] text-muted-foreground">
@@ -1321,7 +1337,7 @@ function SearchSourceGroup({ group, onOpen, onAction, files }: {
         ? () => onAction(resource, 'delete-canvas') : undefined} />)}
     {!group.items.length && <div className="rounded-md border border-dashed border-border px-3 py-2 text-[11px] text-muted-foreground">
       {source.completeness === 'complete' ? 'No matches from this source.'
-        : error ?? `This source is ${source.completeness}.`}
+        : error ?? sourceCompletenessLabel(source.completeness)}
     </div>}
   </section>
 }
@@ -1340,9 +1356,12 @@ function SourceStatusBar({ sources, completeness }: {
       const detail = source.provider ? ` · ${source.provider}` : ''
       const message = statusMessage(source)
       return <span key={source.id} title={message ?? undefined} className="min-w-0 max-w-full truncate">
-        {name}{detail} · <strong>{source.completeness}</strong>{message ? ` — ${message}` : ''}
+        {name}{detail} · <strong>{sourceCompletenessLabel(source.completeness)}</strong>{message ? ` — ${message}` : ''}
       </span>
     })}
+    {sources.some((source) => source.kind === 'provider') && <span className="basis-full text-muted-foreground">
+      Connected catalogs manage their folders. Canvases created here stay local to Data Playground.
+    </span>}
   </section>
 }
 
@@ -1723,18 +1742,12 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
         : resource.kind === 'canvas' ? 'Local'
           : 'Local'
   const openLabel = `Open ${kind.toLowerCase()} ${resource.name}${isExternal(resource) ? ` from ${source}` : ''}`
-  const providerFolderExplanation = resource.kind === 'container' && isExternal(resource)
-    && !resource.canCreateFolder && !resource.canRenameFolder && !folderDeleteMode(resource)
-    ? canvasDestination(resource, 'create')
-      ? 'This catalog manages its folders. You can still create a local Canvas here. Folder rename, move, and delete are unavailable here; this does not change the connected catalog.'
-      : 'This catalog manages its folders. Folder rename, move, and delete are unavailable here. No local Canvas placement is available here.'
-    : null
   return <div className={`flex min-w-0 items-center rounded-lg border border-border bg-card ${unavailable ? '' : 'hover:border-primary/40 hover:bg-accent'}`}>
     <button type="button" onClick={onOpen} aria-label={openLabel} disabled={!!unavailable}
       title={unavailable?.reason}
       className="flex min-w-0 flex-1 items-center gap-3 px-3 py-3 text-left disabled:cursor-not-allowed">
       <Icon name={icon} size={16} style={{ color: 'hsl(var(--muted-foreground))' }} />
-      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}{providerFolderExplanation && <span className="block text-[11px] leading-4 text-muted-foreground">{providerFolderExplanation}</span>}</span>
+      <span className="min-w-0 flex-1"><span title={resource.name} className="flex items-center gap-2 truncate text-[13px] font-semibold text-foreground"><span className="truncate">{resource.name}</span>{unavailable && <span className="shrink-0 rounded-full border border-amber-300/70 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{unavailable.label}</span>}</span><span className="block truncate text-[11px] text-muted-foreground">{kind} · {source}{resource.detached ? ' · detached' : ''}</span>{unavailable && <span className="block truncate text-[11px] text-amber-700 dark:text-amber-300">{unavailable.reason}</span>}{isExternal(resource) && resource.kind === 'dataset' && providerPlacementObservations.placementPath(resource) && <span className="block truncate text-[11px] text-muted-foreground">Placement path · {providerPlacementObservations.placementPath(resource)}</span>}</span>
       {resource.kind === 'container' && !unavailable && <Icon name="chevronRight" size={14} style={{ color: 'hsl(var(--muted-foreground))' }} />}
     </button>
     {unavailable?.state === 'unavailable' && onRetry && <button type="button" onClick={onRetry}
@@ -1760,15 +1773,18 @@ function ResourceRow({ resource, onOpen, onRetry, onNewFolder, onRenameFolder, o
   </div>
 }
 
-function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onRelink, onUse }: {
+function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClose, onRetry, onUse }: {
   resource: WorkspaceResource; source: WorkspaceSourceStatus | null; onClose: () => void
   canonicalSourceBinding: { mountId: string; sourceBindingId: string } | null
-  onRetry: () => void; onRelink: () => void; onUse: () => void
+  onRetry: () => void; onUse: () => void
 }) {
   const providerPlacementObservations = useContext(ProviderPlacementObservationsContext)
   const [canonicalContext, setCanonicalContext] = useState<WorkspaceCanonicalDatasetContext | null>(null)
   const [canonicalContextError, setCanonicalContextError] = useState<string | null>(null)
   const [canonicalContextRevision, setCanonicalContextRevision] = useState(0)
+  const [preview, setPreview] = useState<DatasetRevisionDetail | null>(null)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [previewRevision, setPreviewRevision] = useState(0)
   const placementId = providerPlacementId(resource)
   const placementPath = providerPlacementObservations.placementPath(resource)
   const alternatePlacements = providerPlacementObservations.alternatePlacements(resource)
@@ -1776,6 +1792,26 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
   const canonicalState = resource.canonicalReferenceState
   const canonicalUnavailable = canonicalState != null && canonicalState !== 'current'
   const unavailable = itemAvailability(resource)
+  const providerIssue = canonicalContextError
+    ? `Couldn't load provider details: ${canonicalContextError}`
+    : previewError
+      ? `Couldn't load the selected version preview: ${previewError}`
+    : source && !sourceIsUsable(source)
+      ? statusMessage(source) ?? 'This provider is not available right now.'
+      : placementState !== 'current'
+        ? 'This provider location is not available right now.'
+        : canonicalUnavailable
+          ? unavailable?.reason ?? 'This provider dataset is not available right now.'
+          : resource.lastKnown
+            ? 'This provider has only last-known dataset information right now.'
+            : !canonicalSourceBinding && resource.providerDatasetId
+              ? 'This provider could not verify the dataset connection.'
+              : null
+  const retryProviderDetails = () => {
+    setCanonicalContextRevision((current) => current + 1)
+    setPreviewRevision((current) => current + 1)
+    onRetry()
+  }
   useEffect(() => {
     const controller = new AbortController()
     setCanonicalContext(null)
@@ -1801,58 +1837,68 @@ function ExternalDatasetDetail({ resource, source, canonicalSourceBinding, onClo
     resource.id, resource.providerDatasetId, resource.lastKnown, placementState,
     canonicalUnavailable, canonicalSourceBinding, canonicalContextRevision,
   ])
+  useEffect(() => {
+    const controller = new AbortController()
+    setPreview(null)
+    setPreviewError(null)
+    if (!canonicalContext || canonicalContext.readMode !== 'exact' || !canonicalContext.revisionId) {
+      return () => controller.abort()
+    }
+    void api.datasetRevision(canonicalContext.datasetIdentity, canonicalContext.revisionId).then((detail) => {
+      if (!controller.signal.aborted) setPreview(detail)
+    }).catch((caught) => {
+      if (!controller.signal.aborted) setPreviewError(errorMessage(caught))
+    })
+    return () => controller.abort()
+  }, [canonicalContext, previewRevision])
   return <div className="fixed inset-0 z-40 flex justify-end bg-black/20" onClick={onClose}>
     <div role="dialog" aria-modal="true" aria-label={resource.name} onClick={(event) => event.stopPropagation()} className="flex h-full w-[420px] max-w-full flex-col border-l border-border bg-card p-5 shadow-xl">
-      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={source?.completeness !== 'complete' || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
+      <div className="flex items-center gap-2"><Icon name="db" size={16} /><div title={resource.name} className="min-w-0 flex-1 truncate text-[14px] font-bold">{resource.name}</div><button onClick={onUse} disabled={!sourceIsUsable(source) || resource.lastKnown || placementState !== 'current' || canonicalUnavailable}
         className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-[11.5px] font-semibold text-primary disabled:opacity-50">Use in Canvas</button><button onClick={onClose} aria-label="Close"><Icon name="close" size={15} /></button></div>
       <div tabIndex={0} aria-label="Provider dataset detail content" data-testid="provider-dataset-detail-content"
         className="mt-5 grid min-h-0 flex-1 gap-3 overflow-y-auto overscroll-contain text-[12px] focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">
-        <section><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Dataset</div><div>Source-only mount <strong>{resource.mountId ?? 'external'}</strong>{resource.provider ? ` · ${resource.provider}` : ''}</div>
-          <div className="mt-1 text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
-            ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact revision · {canonicalContext.revisionId ?? 'identity unavailable'}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
-            : canonicalContext ? 'Current/latest provider state · not an exact revision' : 'Loading version and schema when available…'}</div></section>
+        <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Location</div>
+          <div className="break-words">Mount <strong>{resource.mountId ?? 'external'}</strong>{placementPath ? ` / ${placementPath}` : ''}</div>
+          {resource.provider && <div className="text-[11px] text-muted-foreground">{resource.provider}</div>}
+        </section>
+        <section className="grid gap-1"><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Version</div>
+          <div className="text-[11px] text-muted-foreground">{canonicalContext?.readMode === 'exact'
+            ? <><span className="block truncate" title={canonicalContext.revisionId ?? undefined}>Exact version · {canonicalContext.revisionId}</span>{canonicalContext.committedAt && <span>Committed {new Date(canonicalContext.committedAt).toLocaleString()}</span>}</>
+            : canonicalContext ? 'Latest provider version' : 'Checking provider version…'}</div>
+        </section>
         {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
           && canonicalSourceBinding && !canonicalContext && !canonicalContextError && <div role="status" className="text-[11px] text-muted-foreground">Loading canonical dataset context…</div>}
-        {resource.providerDatasetId && placementState === 'current' && !canonicalUnavailable && !resource.lastKnown
-          && !canonicalSourceBinding && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-            Canonical Source binding is unavailable.
-            <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>
-          </div>}
-        {canonicalContext && <section data-testid="canonical-provider-dataset-context" className="rounded-md border border-border p-2 text-[11px]">
-          <div><span className="text-muted-foreground">Schema</span>
+        {canonicalContext && <section data-testid="canonical-provider-dataset-context" className="grid gap-2">
+          <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground"><span>{preview?.summary.rowCount == null ? 'Rows not reported' : `${preview.summary.rowCount.toLocaleString()} rows`}</span><span>· {canonicalContext.columns.length} columns</span></div>
+          <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Schema</div>
             {canonicalContext.columns.length
-              ? <div className="mt-0.5 grid gap-0.5">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
+              ? <div tabIndex={0} aria-label="Provider dataset schema" className="mt-1 grid max-h-[140px] gap-0.5 overflow-y-auto overscroll-contain rounded-md border border-border p-2 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring">{canonicalContext.columns.slice(0, CANONICAL_CONTEXT_COLUMN_LIMIT).map((column) => <div key={column.fieldId ?? column.name}><span className="font-mono">{column.name}</span> · {column.type}</div>)}
                 {canonicalContext.columns.length > CANONICAL_CONTEXT_COLUMN_LIMIT
                   && <div className="text-muted-foreground">{canonicalContext.columns.length - CANONICAL_CONTEXT_COLUMN_LIMIT} more columns</div>}
               </div>
               : <div>No canonical columns were reported.</div>}
           </div>
+          {canonicalContext.readMode === 'exact' && <div><div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
+            {!preview && !previewError && <div className="mt-1 text-[11px] text-muted-foreground">Loading preview…</div>}
+            {preview && (preview.preview.rows.length
+              ? <div className="mt-1 overflow-x-auto rounded-md border border-border"><table className="dp-mono w-max min-w-full text-[10.5px]"><thead><tr>{preview.preview.columns.map((column) => <th key={column.name} className="border-b border-border bg-muted px-2 py-1 text-left font-semibold">{column.name}</th>)}</tr></thead><tbody>{preview.preview.rows.slice(0, 4).map((row, index) => <tr key={index}>{preview.preview.columns.map((column) => <td key={column.name} className="max-w-[180px] truncate whitespace-nowrap border-b border-border/40 px-2 py-0.5 last:border-0">{previewCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
+              : <div className="mt-1 rounded-md border border-border px-2 py-1.5 text-[11px] text-muted-foreground">No rows in this version.</div>)}</div>}
         </section>}
-        {canonicalContextError && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-          Canonical dataset context is unavailable. {canonicalContextError}
-          <button type="button" onClick={() => setCanonicalContextRevision((current) => current + 1)} className="ml-2 font-semibold underline">Retry canonical detail</button>
+        {providerIssue && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          {providerIssue}<button type="button" onClick={retryProviderDetails} className="ml-2 font-semibold underline">Retry</button>
         </div>}
-        {placementState !== 'current' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-          Placement state · {placementState.replace('_', ' ')}{canonicalState === 'current' ? ' · canonical dataset is current' : ''}{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}
-          <div className="mt-2 flex gap-3"><button onClick={onRetry} className="font-semibold underline">Retry</button><button onClick={onRelink} className="font-semibold underline">Relink</button></div>
-        </div>}
-        {canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Canonical dataset state · {canonicalState.replace('_', ' ')}. {unavailable ? `${unavailable.label}: ${unavailable.reason}` : 'This placement remains distinct for navigation and recovery, but its Source action is unavailable.'}
-          {unavailable?.state !== 'unsupported' && <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry canonical dataset</button>}
-        </div>}
-        {resource.lastKnown && placementState === 'current' && !canonicalUnavailable && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Last-known placement metadata{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
-        {source && source.completeness !== 'complete' && <div role="status" className="rounded-md border border-amber-300/50 bg-amber-50 p-2 text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">Source state: {source.completeness}{statusMessage(source) ? ` — ${statusMessage(source)}` : ''}</div>}
         <details className="rounded-md border border-border px-2 py-2 text-[11px]"><summary className="cursor-pointer font-semibold text-foreground">Connection details</summary>
           <div className="mt-2 grid gap-2"><div><div className="text-muted-foreground">Workspace placement</div><div className="break-all font-mono">{placementId ?? resource.id}</div>{placementPath && <div className="mt-0.5 text-muted-foreground">{placementPath}</div>}</div>
             {resource.providerDatasetId && <div><div className="text-muted-foreground">Canonical dataset ID</div><div className="break-all font-mono">{resource.providerDatasetId}</div></div>}
-            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div><div className="mt-1 text-muted-foreground">Revision</div><div className="break-all font-mono">{canonicalContext.revisionId}</div></div>}
+            {canonicalSourceBinding && <div><div className="text-muted-foreground">Source binding</div><div className="break-all font-mono">{canonicalSourceBinding.sourceBindingId}</div></div>}
+            {canonicalContext && <div><div className="text-muted-foreground">Source dataset identity</div><div className="break-all font-mono">{canonicalContext.datasetIdentity}</div><div className="mt-1 text-muted-foreground">Read mode</div><div>{canonicalContext.readMode}</div></div>}
             <div className="text-muted-foreground">Placement state · {placementState.replace('_', ' ')}</div>
             {resource.providerDatasetId && canonicalState && <div className="text-muted-foreground">Canonical dataset state · {canonicalState.replace('_', ' ')}</div>}
+            {resource.lastKnown && <div className="text-muted-foreground">Retained placement facts{resource.lastResolvedAt ? ` · last resolved ${new Date(resource.lastResolvedAt).toLocaleString()}` : ''}</div>}
+            {source && <div className="text-muted-foreground">Provider result state · {source.completeness}</div>}
             {alternatePlacements.length > 0 && <div><div className="font-semibold text-foreground">Also observed at</div><div className="mt-1 grid gap-1">{alternatePlacements.map((placement) => <div key={placement.placementId} className="truncate" title={placement.path}>{placement.path}</div>)}</div><div className="mt-1 text-muted-foreground">Only placements already loaded in this Workspace session are shown.</div></div>}
           </div>
         </details>
-      </div>
-      <div className="mt-4 shrink-0 rounded-lg border border-border bg-muted/35 p-3 text-[11.5px] leading-5 text-muted-foreground">
-        This provider placement is source-only. Using the dataset creates only a local Source; it never writes to the provider. Other Workspace placements use that same canonical Source.
       </div>
     </div>
   </div>

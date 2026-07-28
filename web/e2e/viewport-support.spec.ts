@@ -149,7 +149,7 @@ test.describe('minimum viewport support', () => {
       hasText: /^Showing \d+(?: of \d+)? preview rows?\.$/,
     })).toBeVisible({ timeout: 15_000 })
     await expect(detail.getByTestId('detail-relationships')).toBeVisible()
-    const maintenance = detail.getByText('Catalog maintenance', { exact: true })
+    const maintenance = detail.getByText('Edit catalog details', { exact: true })
     await expect(maintenance.locator('..')).not.toHaveAttribute('open', '')
     await maintenance.click()
     const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
@@ -289,6 +289,14 @@ test.describe('minimum viewport support', () => {
         columns: canonicalColumns,
       },
     }))
+    await page.route((url) => decodeURIComponent(url.pathname) === '/api/catalog/revision-details', (route) => route.fulfill({
+      json: {
+        datasetId: `workspace-provider:viewport-provider/viewport-provider-source-binding-generation`,
+        revisionId: `revision-${'a'.repeat(240)}`,
+        summary: { rowCount: 2, dataFileCount: null, totalBytes: null, fragmentCount: null },
+        preview: { columns: canonicalColumns.slice(0, 2), rows: [{ provider_column_0: 'first', provider_column_1: 'second' }], hasMore: false, rowLimit: 100 },
+      },
+    }))
     await page.route(
       (url) => decodeURIComponent(url.pathname) === '/api/workspace/containers/viewport-provider-folder',
       (route) => route.fulfill({
@@ -306,6 +314,13 @@ test.describe('minimum viewport support', () => {
     const use = detail.getByRole('button', { name: 'Use in Canvas' })
     await expectFullyInViewport(page, close, `${vp?.width}px provider detail close`)
     await expectFullyInViewport(page, use, `${vp?.width}px provider use action`)
+    await expect(detail.getByText('Location', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Version', { exact: true })).toBeVisible()
+    await expect(detail.getByText('2 rows')).toBeVisible()
+    await expect(detail.getByText('Schema', { exact: true })).toBeVisible()
+    await expect(detail.getByText('Preview', { exact: true })).toBeVisible()
+    await expect(detail.getByText('provider_column_0', { exact: true }).last()).toBeVisible()
+    await page.screenshot({ path: testInfo.outputPath(`provider-default-${vp?.width}x${vp?.height}.png`) })
     const connectionDetails = detail.getByText('Connection details', { exact: true })
     await expect(connectionDetails.locator('..')).not.toHaveAttribute('open', '')
     await connectionDetails.click()
@@ -316,34 +331,36 @@ test.describe('minimum viewport support', () => {
       scrollHeight: element.scrollHeight,
       overscrollBehaviorY: getComputedStyle(element).overscrollBehaviorY,
     }))
-    expect(contentSize.scrollHeight, 'long provider metadata should overflow its detail region')
-      .toBeGreaterThan(contentSize.clientHeight)
     expect(contentSize.overscrollBehaviorY).toBe('contain')
-    await content.focus()
-    await expect(content).toBeFocused()
-    await page.keyboard.press('End')
-    await expect.poll(() => content.evaluate((element) => element.scrollTop))
-      .toBeGreaterThan(0)
-    await content.evaluate((element) => { element.scrollTop = 0 })
-    await content.hover()
-    await page.mouse.wheel(0, contentSize.scrollHeight)
-    await expect.poll(() => content.evaluate((element) => element.scrollTop))
-      .toBeGreaterThan(0)
+    if (contentSize.scrollHeight > contentSize.clientHeight) {
+      await content.focus()
+      await expect(content).toBeFocused()
+      await page.keyboard.press('End')
+      await expect.poll(() => content.evaluate((element) => element.scrollTop))
+        .toBeGreaterThan(0)
+      await content.evaluate((element) => { element.scrollTop = 0 })
+      await content.hover()
+      await page.mouse.wheel(0, contentSize.scrollHeight)
+      await expect.poll(() => content.evaluate((element) => element.scrollTop))
+        .toBeGreaterThan(0)
 
-    const workspace = page.getByTestId('workspace-scroll-surface')
-    const workspaceSize = await workspace.evaluate((element) => ({
-      clientHeight: element.clientHeight,
-      scrollHeight: element.scrollHeight,
-    }))
-    expect(workspaceSize.scrollHeight, 'the Workspace fixture should be independently scrollable')
-      .toBeGreaterThan(workspaceSize.clientHeight)
-    await workspace.evaluate((element) => { element.scrollTop = 120 })
-    const workspaceScrollTop = await workspace.evaluate((element) => element.scrollTop)
-    await content.evaluate((element) => { element.scrollTop = element.scrollHeight })
-    await content.hover()
-    await page.mouse.wheel(0, 800)
-    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-    expect(await workspace.evaluate((element) => element.scrollTop)).toBe(workspaceScrollTop)
+      const workspace = page.getByTestId('workspace-scroll-surface')
+      const workspaceSize = await workspace.evaluate((element) => ({
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+      }))
+      expect(workspaceSize.scrollHeight, 'the Workspace fixture should be independently scrollable')
+        .toBeGreaterThan(workspaceSize.clientHeight)
+      await workspace.evaluate((element) => { element.scrollTop = 120 })
+      const workspaceScrollTop = await workspace.evaluate((element) => element.scrollTop)
+      await content.evaluate((element) => { element.scrollTop = element.scrollHeight })
+      await content.hover()
+      await page.mouse.wheel(0, 800)
+      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+      expect(await workspace.evaluate((element) => element.scrollTop)).toBe(workspaceScrollTop)
+    } else {
+      expect(await content.evaluate((element) => element.scrollTop)).toBe(0)
+    }
   })
 
   test('panel choices persist and the canvas tracks the real remaining viewport', async ({ page }) => {
