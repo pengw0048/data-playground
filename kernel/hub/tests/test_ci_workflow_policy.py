@@ -1,6 +1,7 @@
 """Regression tests for the repository's fast-PR / heavy-release workflow boundary."""
 
 import re
+from collections import Counter
 from pathlib import Path
 
 import yaml
@@ -9,6 +10,13 @@ from hub import metadb
 
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+_KERNEL_SHARD_ENV = {
+    "kernel": "KERNEL_FILES",
+    "lifecycle": "LIFECYCLE_FILES",
+    "remainder-0": "GROUP_0_FILES",
+    "remainder-1": "GROUP_1_FILES",
+}
 
 _RAY_SHARED_PATHS = {
     ".dockerignore",
@@ -113,6 +121,14 @@ def _workflow(name: str) -> dict:
     return parsed
 
 
+def _kernel_shard_step() -> dict:
+    return next(
+        step
+        for step in _workflow("ci.yml")["jobs"]["kernel-shards"]["steps"]
+        if step.get("name") == "Run shard ${{ matrix.shard }}"
+    )
+
+
 def _pull_request_paths(name: str) -> set[str]:
     return set(_workflow(name)["on"]["pull_request"]["paths"])
 
@@ -146,6 +162,73 @@ def test_lean_validation_runs_on_pull_requests_and_main() -> None:
         events = _workflow(name)["on"]
         assert "pull_request" in events
         assert events["push"]["branches"] == ["main"]
+
+
+def test_kernel_pytest_shards_form_an_exact_complement_partition() -> None:
+    job = _workflow("ci.yml")["jobs"]["kernel-shards"]
+    expected_shards = [*_KERNEL_SHARD_ENV, "remainder-2"]
+    assert job["strategy"]["matrix"]["shard"] == expected_shards
+
+    step = _kernel_shard_step()
+    explicit_groups = {
+        shard: tuple(step["env"][variable].split())
+        for shard, variable in _KERNEL_SHARD_ENV.items()
+    }
+    explicit_names = [
+        name for group in explicit_groups.values() for name in group
+    ]
+
+    tests_dir = _ROOT / "kernel" / "hub" / "tests"
+    test_paths = sorted(tests_dir.rglob("test_*.py"))
+    relative_paths = [path.relative_to(tests_dir).as_posix() for path in test_paths]
+    nested_paths = [path for path in relative_paths if "/" in path]
+    assert not nested_paths, (
+        "kernel shard selection uses basenames and cannot address nested tests: "
+        f"{nested_paths}"
+    )
+
+    test_names = [path.name for path in test_paths]
+    basename_counts = Counter(test_names)
+    basename_collisions = {
+        name: count for name, count in basename_counts.items() if count != 1
+    }
+    assert not basename_collisions
+
+    all_tests = set(test_names)
+    missing_explicit = set(explicit_names) - all_tests
+    assert not missing_explicit, f"kernel shards name missing tests: {missing_explicit}"
+
+    explicit_counts = Counter(explicit_names)
+    duplicate_explicit = {
+        name: count for name, count in explicit_counts.items() if count != 1
+    }
+    assert not duplicate_explicit, (
+        f"kernel explicit shard groups overlap: {duplicate_explicit}"
+    )
+
+    complement = all_tests - set(explicit_names)
+    assert complement, "remainder-2 must remain a non-empty catch-all"
+
+    selected_counts = Counter(explicit_names)
+    selected_counts.update(complement)
+    assert selected_counts == basename_counts
+
+    command = step["run"]
+    normalized_command = " ".join(command.split())
+    assert "set -euo pipefail" in normalized_command
+    assert (
+        'explicit="$KERNEL_FILES $LIFECYCLE_FILES $GROUP_0_FILES $GROUP_1_FILES"'
+        in normalized_command
+    )
+    for shard, variable in _KERNEL_SHARD_ENV.items():
+        assert f'{shard}) names="${variable}" ;;' in normalized_command
+    assert "remainder-2) names=$(comm -23" in normalized_command
+    assert (
+        "find hub/tests -name 'test_*.py' -exec basename {} \\; | sort"
+        in normalized_command
+    )
+    assert "<(printf '%s\\n' $explicit | sort)" in normalized_command
+    assert 'test -n "$names"' in normalized_command
 
 
 def test_every_admitted_durable_task_kind_has_a_postgres_ci_selector() -> None:
