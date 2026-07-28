@@ -22,7 +22,7 @@ register(
     kind: 'select', title: 'select', category: 'shape', tag: 'select',
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: true,
-    blurb: 'project / rename / derive columns',
+    blurb: 'Choose, rename, or derive columns',
     defaultData: () => ({ title: 'select', status: 'draft', config: { select: '' }, meta: 'all columns' }),
   },
   Select,

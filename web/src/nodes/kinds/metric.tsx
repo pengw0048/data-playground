@@ -34,7 +34,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'metric', label: 'value' }],
     canBypass: false,
-    blurb: 'reduce to a scalar',
+    blurb: 'Calculate one summary value',
     defaultData: () => ({ title: 'metric', status: 'draft', config: { agg: 'count' }, meta: 'count · scalar' }),
   },
   Metric,

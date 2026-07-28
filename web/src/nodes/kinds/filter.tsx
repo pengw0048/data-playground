@@ -23,7 +23,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: true,
-    blurb: 'row predicate',
+    blurb: 'Keep rows that match a condition',
     defaultData: () => ({ title: 'filter', status: 'draft', config: { predicate: '' }, meta: 'row predicate' }),
   },
   Filter,

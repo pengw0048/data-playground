@@ -29,7 +29,7 @@ register(
     // one input port that accepts MANY edges — stack N datasets vertically
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample'], multi: true }],
     outputs: [{ id: 'out', wire: 'dataset' }], canBypass: false,
-    blurb: 'stack datasets row-wise (append) — UNION [ALL] BY NAME',
+    blurb: 'Stack datasets into one table',
     defaultData: () => ({ title: 'union', status: 'draft', config: { mode: 'all', align: 'name' }, meta: 'union all · by name' }),
   },
   Union,

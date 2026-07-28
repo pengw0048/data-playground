@@ -101,7 +101,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample', 'selection'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: true,
-    blurb: 'the operator — library preset or ad-hoc cell',
+    blurb: 'Apply a Python transform to rows',
     defaultData: () => ({
       title: 'transform', status: 'draft',
       config: { source: 'adhoc', mode: 'map', code: DEFAULT_CODE, onError: 'raise' },

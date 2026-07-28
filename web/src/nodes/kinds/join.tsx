@@ -115,7 +115,7 @@ register(
     ],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'combine two datasets on a key',
+    blurb: 'Combine two datasets by matching rows',
     defaultData: () => ({ title: 'join', status: 'draft', config: { how: 'inner', on: '' }, meta: 'inner' }),
   },
   Join,

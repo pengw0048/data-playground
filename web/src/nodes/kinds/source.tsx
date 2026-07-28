@@ -546,7 +546,7 @@ register(
     inputs: [],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'read a registered dataset',
+    blurb: 'Choose a registered dataset',
     defaultData: () => ({ title: 'source', status: 'draft', config: {}, meta: 'pick a table' }),
   },
   Source,

@@ -93,7 +93,7 @@ register(
     inputs: [{ id: 'in', wire: 'dataset', accepts: ['dataset', 'sample', 'selection'] }],
     outputs: [{ id: 'out', wire: 'dataset' }],
     canBypass: false,
-    blurb: 'write provider output or publish a managed dataset revision',
+    blurb: 'Save data to a file or managed dataset — scans all rows',
     defaultData: () => ({ title: 'write', status: 'draft', config: { writeMode: 'overwrite', filename: 'output' }, meta: 'sink · needs full pass', needsFullPass: true }),
   },
   Write,
