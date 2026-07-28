@@ -334,7 +334,10 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
 
       const runOnce = async (): Promise<string> => {
         const started = await ok<{ runId: string }>(await page.request.post('/api/run', {
-          data: { graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent },
+          data: {
+            graph, targetNodeId: 'write', confirmed: true, submissionId,
+            writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
+          },
         }), 'run managed lance append')
         await expect.poll(async () => {
           const status = await ok<{ status: string; error?: string | null }>(
@@ -399,7 +402,10 @@ test.describe('default fresh-workspace write journey @acceptance-default-journey
         data: { graph, nodeId: 'write', submissionId },
       }), 'admit restart write')
       const started = await ok<{ runId: string }>(await page.request.post(`${base}/api/run`, {
-        data: { graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent },
+        data: {
+          graph, targetNodeId: 'write', confirmed: true, submissionId,
+          writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
+        },
       }), 'submit restart write')
 
       // Kill the hub as soon as the durable write is submitted, then bring a replacement up on the same DB.

@@ -1879,6 +1879,7 @@ test.describe('Data Playground canvas', () => {
         const competingRunResponse = await page.request.post('/api/run', { data: {
           graph: captured!.graph, targetNodeId: captured!.nodeId, confirmed: true,
           submissionId: competingSubmission, writeIntent: competingAdmission.intent,
+          confirmedWriteIntent: competingAdmission.intent,
         } })
         expect(competingRunResponse.ok()).toBeTruthy()
         const competingRun = await competingRunResponse.json()

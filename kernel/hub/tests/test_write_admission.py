@@ -555,6 +555,39 @@ def test_structural_drift_requires_the_displayed_admission_before_allocation(
     assert _run_allocation_counts() == before_runs
 
 
+def test_direct_and_mcp_runs_cannot_bypass_drift_without_an_admission(
+        contract, monkeypatch):
+    from hub.mcp import Playground, ToolError
+
+    deps, graph, _admission = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [{"name": "replacement", "type": "int", "nullable": True}],
+    )
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+
+    with pytest.raises(HTTPException, match="displayed write admission") as direct:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher", confirmed=True)
+    assert direct.value.status_code == 409
+
+    playground = Playground(deps, "researcher", "http://test.local")
+    payload = graph.model_dump(by_alias=True, mode="json")
+    monkeypatch.setattr(playground, "_get_doc", lambda _canvas_id: payload)
+    with pytest.raises(ToolError, match="displayed write admission"):
+        playground.run_canvas({
+            "canvasId": graph.id, "nodeId": "write", "confirm": True,
+        })
+
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
+
+
 def test_confirmation_cannot_reuse_admission_after_schema_or_head_changes(
         contract, monkeypatch):
     deps, graph, admission_a = _admit_schema_change(

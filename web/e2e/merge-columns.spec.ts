@@ -45,7 +45,10 @@ async function bootstrapManagedBase(page: Page, canvasId: string, filename: stri
     data: { graph, nodeId: 'write', submissionId },
   }), 'admit managed-local base')
   const started = await json<RunStatus>(await page.request.post('/api/run', {
-    data: { graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent },
+    data: {
+      graph, targetNodeId: 'write', confirmed: true, submissionId,
+      writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
+    },
   }), 'write managed-local base')
   await expect.poll(async () => {
     const status = await json<RunStatus>(await page.request.get(`/api/run/${encodeURIComponent(started.runId)}`), 'load managed-local base')

@@ -2598,6 +2598,11 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         raise HTTPException(400, "writeIntent requires a Write target")
     if write_intent is not None and submission_id is None:
         raise HTTPException(400, "writeIntent requires a submissionId")
+    # Every supported Write entry point crosses the same admission/CAS boundary. The browser keeps
+    # its UUID for response-loss replay; direct Python, MCP, and CLI calls get a one-shot identity
+    # before any destination or schema evidence is inspected.
+    if submission_id is None and submitted_target is not None and submitted_target.type == "write":
+        submission_id = str(uuid.uuid4())
     graph_canvas = str(getattr(graph, "id", "") or "") or None
     operational_canvas = auth_canvas or (
         graph_canvas if graph_canvas is not None and metadb.canvas_exists(graph_canvas) else None)
@@ -2943,8 +2948,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
             _inject_write_intent(graph, target_node_id, write_admission.intent)
             _inject_write_intent(durable_graph, target_node_id, write_admission.intent)
     elif target is not None and target.type == "write":
-        # No submissionId (direct API / MCP), so the admission gate above was skipped; still reject an
-        # unknown destination with a typed 4xx before the dispatch claim exists.
+        # Defensive fallback for a target that changed type during parameter resolution.
         _preflight_write_target_destination(deps, graph, str(target_node_id))
     intent_sha256 = _local_run_intent_sha256(
         intent_graph, target_node_id, input_manifest, effective_write_intent)

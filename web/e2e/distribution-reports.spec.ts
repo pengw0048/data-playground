@@ -63,7 +63,8 @@ async function createManagedRevision(page: Page, canvasId: string, filename: str
   expect(admission.intent).toBeTruthy()
 
   const started = await json<RunStatus>(await page.request.post('/api/run', { data: {
-    graph, targetNodeId: 'write', confirmed: true, submissionId, writeIntent: admission.intent,
+    graph, targetNodeId: 'write', confirmed: true, submissionId,
+    writeIntent: admission.intent, confirmedWriteIntent: admission.intent,
   } }), 'start managed-local fixture write')
   await expect.poll(async () => {
     const status = await json<RunStatus>(
