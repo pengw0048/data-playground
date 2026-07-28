@@ -190,9 +190,9 @@ def test_schema_match_reason_tracks_current_version_measurement(
     assert candidate.cardinality == expected
     assert candidate.cardinality_state == "available"
     assert "not measurable" not in candidate.reason
-    assert candidate.reason == (
-        f"matching key column(s); {expected} measured from both current dataset versions"
-    )
+    assert candidate.reason == "Matching key columns"
+    assert candidate.cardinality_reason == "Measured across both current dataset versions."
+    assert candidate.confidence == "inferred"
 
 
 def test_schema_match_keeps_unmeasured_reason_when_one_side_is_unknown(monkeypatch):
@@ -213,7 +213,8 @@ def test_schema_match_keeps_unmeasured_reason_when_one_side_is_unknown(monkeypat
 
     assert candidate.cardinality == "unknown"
     assert candidate.cardinality_state == "unmeasured"
-    assert candidate.reason == "matching key column(s) — cardinality not measurable here"
+    assert candidate.reason == "Matching key columns"
+    assert candidate.cardinality_reason is None
 
 
 def test_no_relationship_or_schema_candidate_is_honestly_empty():
@@ -821,8 +822,15 @@ def test_retained_revision_picker_uses_bounded_history_and_rechecks_exact_schema
     monkeypatch.setattr(related.metadb, "catalog_revision_binding_for_uri",
                         lambda uri: {"dataset_id": "logical-users"} if uri == target.uri else None)
     catalog = _Catalog([source, target])
+    monkeypatch.setattr(
+        related.relationships,
+        "measure_unique",
+        lambda uri, *_args: ((uri == source.uri), 2),
+    )
     page = related_datasets(catalog, lambda _uri: _UnavailableAdapter(), None, source.registration_id)
     candidate = next(item for item in _reviewable_candidates(page) if item.name == "users")
+    assert candidate.cardinality == "1:N"
+    assert candidate.cardinality_reason == "Measured across both current dataset versions."
     revisions = related.related_dataset_revisions(
         catalog, lambda _uri: _UnavailableAdapter(),
         RelatedDatasetIdentity(kind="local", registration_id=target.registration_id), limit=20)
@@ -842,6 +850,8 @@ def test_retained_revision_picker_uses_bounded_history_and_rechecks_exact_schema
     assert exact.cardinality == "unknown"
     assert exact.cardinality_state == "unmeasured"
     assert exact.cardinality_reason and "exact revision" in exact.cardinality_reason
+    assert "current dataset" not in exact.reason
+    assert "current dataset" not in exact.cardinality_reason
 
 
 def test_exact_review_keeps_declared_cardinality_without_measuring(monkeypatch):

@@ -400,11 +400,9 @@ def _fanout(cardinality: str) -> str | None:
     return "This join may multiply rows; inspect the resulting Join analysis before running."
 
 
-def _reason_with_measured_cardinality(seed: _Seed, cardinality: str) -> str:
-    """Keep relationship evidence and the later bounded measurement in one coherent explanation."""
-    evidence = ("matching key column(s)"
-                if seed.evidence == "schema_match" else seed.reason)
-    return f"{evidence}; {cardinality} measured from both current dataset versions"
+def _relationship_evidence_reason(seed: _Seed) -> str:
+    """Keep relationship evidence separate from the independently measured join risk."""
+    return "Matching key columns" if seed.evidence == "schema_match" else seed.reason
 
 
 def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDatasetIdentity, *,
@@ -559,7 +557,7 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
             cardinality = seed.declared_cardinality
             cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
             cardinality_reason = None
-            reason = seed.reason
+            reason = _relationship_evidence_reason(seed)
             # A current-head measurement must never be presented as evidence for an exact review.
             # Keep an owner-declared cardinality, but do not scan an exact revision merely to fill
             # a missing value. The explicit state makes that intentional omission visible.
@@ -579,7 +577,7 @@ def related_datasets(catalog, resolve_adapter, storage, dataset: str | RelatedDa
                     cardinality = "unknown"
                 cardinality_state = "available" if cardinality != "unknown" else "unmeasured"
                 if cardinality_state == "available":
-                    reason = _reason_with_measured_cardinality(seed, cardinality)
+                    cardinality_reason = "Measured across both current dataset versions."
             candidate = RelatedDatasetCandidate(
                 identity=seed.identity, name=seed.table.name,
                 folder=seed.table.folder, reason=reason, evidence=seed.evidence,

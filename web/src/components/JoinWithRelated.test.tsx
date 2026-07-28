@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -43,10 +43,11 @@ const page = {
   }],
   possibleMatches: [{
     identity: { kind: 'local', registrationId: 'reg-orders', revisionMode: 'current' },
-    name: 'orders', folder: '', reason: 'matching key column(s); 1:N measured from both current dataset versions',
+    name: 'orders', folder: '', reason: 'Matching key columns',
     evidence: 'schema_match', evidenceStatus: 'inferred',
     leftColumns: ['id'], rightColumns: ['id'], cardinality: '1:N',
     cardinalityState: 'available',
+    cardinalityReason: 'Measured across both current dataset versions.',
     confidence: 'inferred', warning: 'This join is 1:N: right fans out, so rows may multiply.',
   }],
   excluded: [],
@@ -103,9 +104,38 @@ describe('JoinWithRelated', () => {
     await screen.findByText('Related data')
     fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
 
-    expect(screen.getByText(/1:N measured from both current dataset versions/)).toBeVisible()
+    expect(screen.getByText('Matching key columns')).toBeVisible()
+    expect(screen.getByText(/Measured across both current dataset versions/)).toBeVisible()
     expect(screen.queryByText(/cardinality not measurable here/)).toBeNull()
     expect(screen.getByText(/joined rows may multiply/)).toBeVisible()
+  })
+
+  it('orients measured cardinality without embedding the opposite direction in its evidence', async () => {
+    mocks.state.doc = {
+      ...mocks.state.doc,
+      nodes: [
+        ...mocks.state.doc.nodes,
+        { id: 'join-1', type: 'join', position: { x: 100, y: 0 },
+          data: { title: 'Join', status: 'draft', config: {} } },
+      ],
+      edges: [{
+        id: 'source-b', source: 'source-1', sourceHandle: 'out',
+        target: 'join-1', targetHandle: 'b', data: { wire: 'dataset' },
+      }],
+    }
+
+    render(<JoinWithRelated nodeId="join-1" surface="canvas" />)
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Join with related data on left input',
+    }))
+    await screen.findByText('Related data')
+    fireEvent.click(screen.getByRole('button', { name: 'Show possible matches (1)' }))
+
+    const candidate = screen.getByRole('button', { name: /orders/ })
+    expect(within(candidate).getByText('N:1', { exact: true })).toBeVisible()
+    expect(within(candidate).getByText('Matching key columns')).toBeVisible()
+    expect(within(candidate).getByText(/Measured across both current dataset versions/)).toBeVisible()
+    expect(within(candidate).queryByText('1:N', { exact: true })).toBeNull()
   })
 
   it('keeps the review after a conflict and installs only a confirmed server document', async () => {
@@ -160,7 +190,7 @@ describe('JoinWithRelated', () => {
     await waitFor(() => expect(mocks.reviewRevision).toHaveBeenCalledWith(
       page.source, page.candidates[0], 'rev-2', expect.any(Object),
     ))
-    expect(screen.getByText(/Cardinality is unknown because it was not measured/)).toBeVisible()
+    expect(screen.getByText(/Cardinality is unknown.*exact revision/)).toBeVisible()
   })
 
   it('keeps a failed exact choice selected and cannot confirm the current candidate by mistake', async () => {
