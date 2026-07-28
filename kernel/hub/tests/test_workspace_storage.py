@@ -3850,6 +3850,74 @@ def test_workspace_create_and_explore_are_atomic_stable_and_allow_duplicate_name
                    and "catalog_" in statement for statement in statements)
 
 
+def test_workspace_create_places_batch_sources_separately(workspace_scope):
+    token = workspace_scope["canvas_id"].removeprefix("workspace-canvas-")
+    second_uri = f"file:///workspace-create-second-{token}.parquet"
+    metadb.catalog_upsert_entry(second_uri, "Second create dataset", {
+        "id": f"tbl_create_second_{token}", "name": "Second create dataset",
+        "uri": second_uri, "version": "v1",
+    })
+    second_dataset_id = metadb.workspace_builtin_dataset_identity(second_uri)
+    root = metadb.local_workspace_root()
+    created_id: str | None = None
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/workspace/canvases", json={
+                "containerId": root["id"],
+                "expectedContainerVersion": root["version"],
+                "name": "Batch placement",
+                "datasetIds": [workspace_scope["dataset_id"], second_dataset_id],
+            })
+            assert response.status_code == 200, response.text
+            created_id = response.json()["id"]
+
+        with metadb.session() as session:
+            canvas = session.get(metadb.Canvas, created_id)
+            assert canvas is not None
+            doc = json.loads(canvas.doc)
+            assert [node["position"] for node in doc["nodes"]] == [
+                {"x": 160, "y": 160},
+                {"x": 440, "y": 160},
+            ]
+    finally:
+        if created_id is not None:
+            metadb.delete_canvas_cascade(created_id)
+        metadb.catalog_delete_entry(second_uri)
+
+
+def test_workspace_source_placement_avoids_sections_and_is_bounded_and_deterministic():
+    def existing_nodes() -> list[dict]:
+        return [
+            {"id": "existing", "type": "write", "position": {"x": 160, "y": 160}},
+            {"id": "section", "type": "section", "position": {"x": 440, "y": 160}},
+            # Child coordinates are relative to the Section and must not reserve top-level space.
+            {"id": "child", "type": "source", "parentId": "section",
+             "position": {"x": 10_000, "y": 10_000}},
+        ]
+
+    def sources() -> list[dict]:
+        return [
+            {"id": f"source-{index}", "type": "source", "position": {"x": 0, "y": 0}}
+            for index in range(50)
+        ]
+
+    first_nodes, first_sources = existing_nodes(), sources()
+    metadb._workspace_place_sources(first_nodes, first_sources)
+    second_nodes, second_sources = existing_nodes(), sources()
+    metadb._workspace_place_sources(second_nodes, second_sources)
+
+    positions = [source["position"] for source in first_sources]
+    assert positions == [source["position"] for source in second_sources]
+    assert positions[:4] == [
+        {"x": 1000, "y": 160},
+        {"x": 160, "y": 435},
+        {"x": 440, "y": 435},
+        {"x": 720, "y": 435},
+    ]
+    assert positions[-1] == {"x": 160, "y": 3735}
+    assert len({(position["x"], position["y"]) for position in positions}) == 50
+
+
 def test_workspace_add_deduplicates_provider_canonical_uri_without_binding_lookup(
         workspace_scope, monkeypatch):
     canvas_id = workspace_scope["canvas_id"]
