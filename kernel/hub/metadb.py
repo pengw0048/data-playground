@@ -12532,10 +12532,19 @@ def retained_run_editor_candidates(
                 RunState.execution_manifest_sha256,
                 RunState.doc,
             )
+            .join(
+                RunInputAdmission,
+                RunInputAdmission.run_id == RunState.run_id,
+            )
             .where(
                 RunState.canvas_id == str(canvas_id),
                 RunState.status == "done",
                 RunState.job_type == "run",
+                RunInputAdmission.canvas_id == str(canvas_id),
+                RunInputAdmission.target_node_id == str(target_node_id),
+                RunInputAdmission.dispatched_at.is_not(None),
+                RunInputAdmission.execution_manifest_sha256
+                == RunState.execution_manifest_sha256,
             )
             .order_by(RunState.updated_at.desc(), RunState.run_id.desc())
         ).all()
@@ -12544,6 +12553,7 @@ def retained_run_editor_candidates(
     for row in rows:
         if row.run_id is None:
             continue
+        seen_run_ids.add(str(row.run_id))
         try:
             outputs = json.loads(row.outputs)
         except (TypeError, ValueError):
@@ -12565,7 +12575,6 @@ def retained_run_editor_candidates(
                 "execution_manifest_sha256": row.execution_manifest_sha256,
                 "output": dict(output),
             })
-            seen_run_ids.add(str(row.run_id))
     for row in live_rows:
         run_id = str(row.run_id)
         if run_id in seen_run_ids:

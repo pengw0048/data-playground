@@ -489,6 +489,36 @@ def test_retained_editor_preview_uses_terminal_state_before_history_projection(t
         assert response.json()["editorTestInput"]["runId"] == run_id
 
 
+def test_terminal_state_does_not_outlive_history_retention_for_editor_reuse(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        # Normal history pruning removes the admission together with the RunRecord. A still-retained
+        # operational RunState must not resurrect that older result as editor history.
+        with metadb.session() as session:
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            admission = session.get(metadb.RunInputAdmission, run_id)
+            assert record is not None and admission is not None
+            session.delete(record)
+            session.delete(admission)
+
+        response = _preview(graph)
+        assert response.status_code == 404, response.text
+        assert response.json()["code"] == "retained_upstream_unavailable"
+
+
+def test_projected_history_is_never_overridden_by_live_state(tmp_path):
+    with _retained_sample(tmp_path, logical_source=True) as (graph, run_id, _output):
+        with metadb.session() as session:
+            record = session.scalar(
+                metadb.select(metadb.RunRecord).where(metadb.RunRecord.run_id == run_id))
+            assert record is not None
+            record.outputs = "[]"
+
+        response = _preview(graph)
+        assert response.status_code == 404, response.text
+        assert response.json()["code"] == "retained_upstream_unavailable"
+
+
 def test_logical_workspace_source_registration_change_invalidates_reuse(tmp_path):
     with _retained_sample(tmp_path, logical_source=True) as (graph, _run_id, _output):
         changed = copy.deepcopy(graph)
