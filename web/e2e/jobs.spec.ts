@@ -83,7 +83,7 @@ test('filters, deep-links, and preserves a partial Jobs page at the supported vi
 
   await page.goto('/#/jobs')
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible()
-  await expect(page.getByRole('heading', { name: 'Node and Canvas runs · Durable tasks' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Runs and background tasks' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Open run run-failed in Climate analysis', expanded: false })).toBeVisible()
   await page.getByText('Advanced filters', { exact: true }).click()
   for (const width of [1024, 1280, 1440]) {
@@ -159,7 +159,7 @@ test('a completed Jobs row stays concise and opens human-named retained results 
     name: 'Open run run-complete in Climate analysis', expanded: false,
   })
   await expect(row).toContainText('done')
-  await expect(row).toContainText('2 outputs retained')
+  await expect(row).toContainText('2 outputs available')
   await expect(row).toContainText('1 row')
   await expect(row).not.toContainText('100%')
   await expect(row).not.toContainText('●')
