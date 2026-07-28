@@ -1434,6 +1434,9 @@ test.describe('Data Playground canvas', () => {
     await expect(advanced.locator('..')).not.toHaveAttribute('open')
     await expect(inspector.getByText('Resources (placement)')).not.toBeVisible()
     await expect(inspector.getByText('Materialization')).not.toBeVisible()
+    const advancedOutputSchema = inspector.getByText('Advanced output schema')
+    await expect(advancedOutputSchema.locator('..')).not.toHaveAttribute('open')
+    await expect(inspector.getByText('Output schema (contract)')).not.toBeVisible()
     await advanced.click()
     await expect(inspector.getByText('Resources (placement)')).toBeVisible()
     const gpus = inspector.locator('label').filter({ hasText: 'GPUs' }).locator('input')
@@ -1443,6 +1446,51 @@ test.describe('Data Playground canvas', () => {
     await expect(inspector.getByText('8 GPUs')).toBeVisible()
     await inspector.getByRole('button', { name: 'Edit resources' }).click()
     await expect(gpus).toHaveValue('8')
+  })
+
+  test('the Inspector summarizes configured output schemas and exposes stale ones for review', async ({ page }) => {
+    const configuredId = `output-schema-configured-${Date.now()}`
+    const staleId = `output-schema-stale-${Date.now()}`
+    try {
+      for (const canvas of [{
+        id: configuredId, name: 'Configured output schema',
+        config: {
+          code: 'return input',
+          outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
+        },
+      }, {
+        id: staleId, name: 'Stale output schema',
+        config: {
+          code: 'return current_input',
+          outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
+          outputSchemaCodeHash: 'outdated-contract-hash',
+        },
+      }]) {
+        const created = await page.request.post('/api/canvas', { data: {
+          id: canvas.id, name: canvas.name, version: 1, requirements: [], edges: [], nodes: [{
+            id: 'transform', type: 'transform', position: { x: 160, y: 120 },
+            data: { title: 'Transform', status: 'draft', config: canvas.config },
+          }],
+        } })
+        expect(created.ok()).toBe(true)
+      }
+
+      await page.goto(`/#/canvas/${configuredId}`)
+      const inspector = page.getByTestId('inspector')
+      await page.getByTestId('rf__node-transform').getByText('TRANSFORM', { exact: true }).click()
+      await expect(inspector.getByText('1 declared column')).toBeVisible()
+      await inspector.getByRole('button', { name: 'Edit output schema' }).click()
+      await expect(inspector.locator('input[value="clean_id"]')).toBeVisible()
+
+      await page.goto(`/#/canvas/${staleId}`)
+      await page.getByTestId('rf__node-transform').getByText('TRANSFORM', { exact: true }).click()
+      await expect(inspector.getByText('Needs review')).toBeVisible()
+      await inspector.getByRole('button', { name: 'Review output schema' }).click()
+      await expect(inspector.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(configuredId)}`)
+      await page.request.delete(`/api/canvas/${encodeURIComponent(staleId)}`)
+    }
   })
 
   test('checkpoint controls prevent unsupported graphs and allow the linear checkpoint route', async ({ page }) => {

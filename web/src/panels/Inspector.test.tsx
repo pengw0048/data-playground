@@ -7,6 +7,7 @@ import { codeHash } from '../nodes/schema'
 import { useStore } from '../store/graph'
 import { api } from '../api/client'
 import '../nodes/kinds/source'
+import '../nodes/kinds/transform'
 
 const cols: ColumnSchema[] = [
   { name: 'id', type: 'int', capabilities: [] },
@@ -85,6 +86,8 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     } as any)
 
     render(<Inspector />)
+    expect(screen.getByText(/Needs review/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
     expect(screen.getByText(/SQL changed since this contract was pinned/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     expect(screen.getByText('actual')).toBeInTheDocument()
@@ -129,6 +132,8 @@ describe('canDeclareSchemaKind — which kinds can carry a schema contract', () 
     } as any)
 
     render(<Inspector />)
+    expect(screen.getByText(/Needs review/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
     expect(screen.getByText(/changed since this contract was pinned/i)).toBeInTheDocument()
     fireEvent.click(screen.getByTitle('Show columns'))
     fireEvent.click(screen.getByRole('button', { name: 'Inspect evidence for copied' }))
@@ -438,6 +443,55 @@ describe('Inspector — advanced execution', () => {
     expect(gpu).toHaveValue(8)
     fireEvent.change(gpu, { target: { value: '4' } })
     expect((useStore.getState().doc.nodes[0].data.config as any).requires).toEqual({ gpu: 4, gpuType: 'a100', cpu: 4 })
+  })
+})
+
+describe('Inspector — output schema disclosure', () => {
+  const selectTransform = (config: Record<string, unknown>) => {
+    useStore.setState({
+      selectedIds: ['transform'], canvasRole: 'owner', runs: {}, schemas: {},
+      doc: { id: 'output-schema', version: 1, requirements: [], edges: [], nodes: [{
+        id: 'transform', type: 'transform', position: { x: 0, y: 0 },
+        data: { title: 'transform', status: 'draft', history: [], config },
+      }] },
+    } as any)
+  }
+
+  it('keeps an unconfigured contract under Advanced output schema', () => {
+    selectTransform({})
+    render(<Inspector />)
+
+    const advanced = screen.getByText('Advanced output schema').closest('details')
+    expect(advanced).not.toHaveAttribute('open')
+    expect(screen.getByText('Output schema (contract)')).not.toBeVisible()
+    expect(screen.queryByRole('button', { name: 'Edit output schema' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Advanced output schema'))
+    expect(advanced).toHaveAttribute('open')
+    expect(screen.getByText('Untyped until it runs. Declare a contract, infer it, or reference a named one. Leave empty to stay dynamic.')).toBeVisible()
+  })
+
+  it('summarizes a configured contract and opens its editor directly', () => {
+    selectTransform({ outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }] })
+    render(<Inspector />)
+
+    expect(screen.getByText('1 declared column')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit output schema' }))
+    expect(screen.getByDisplayValue('clean_id')).toBeVisible()
+  })
+
+  it('keeps a stale contract discoverable and directly reviewable', () => {
+    selectTransform({
+      code: 'return current_input',
+      outputSchema: [{ name: 'clean_id', type: 'int', capabilities: [] }],
+      outputSchemaCodeHash: codeHash('return previous_input'),
+    })
+    render(<Inspector />)
+
+    expect(screen.getByText(/Needs review/)).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: 'Review output schema' }))
+    expect(screen.getByText(/cell changed since this contract was pinned/i)).toBeVisible()
+    expect(screen.getByDisplayValue('clean_id')).toBeVisible()
   })
 })
 
