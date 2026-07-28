@@ -91,6 +91,7 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, nextStepKinds,
   // Search and rank the complete effective registry. Rendering remains bounded for large plugin packs.
   const shownResults = results.slice(0, MAX_RENDERED_RESULTS)
   const truncated = results.length > shownResults.length
+  const hasNextStepContext = !!nextStepKinds?.size
 
   useEffect(() => { input.current?.focus() }, [])
   useEffect(() => { setActive(0) }, [query, wire])
@@ -119,6 +120,9 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, nextStepKinds,
           {compatibleOnly && wire && <span className="rounded bg-accent px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">For {wire} output</span>}
           <kbd className="text-[10px] text-muted-foreground">Esc</kbd>
         </div>
+        {hasNextStepContext && <div aria-label="Next-step context" className="border-b border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
+          Add next step after <strong className="font-semibold text-foreground">{nextStepLabel || 'the selected node'}</strong>. Compatible choices connect automatically.
+        </div>}
         <div role="listbox" aria-label="Matching nodes" className="max-h-[min(480px,66vh)] overflow-y-auto p-1.5">
           {shownResults.map((result, index) => {
             const cue = secondaryCue(result, shownResults)
@@ -127,9 +131,11 @@ export function NodeFinder({ specs, wire, compatibleOnly = false, nextStepKinds,
               className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left ${index === active ? 'bg-accent' : 'hover:bg-accent/60'}`}>
               <span className="mt-0.5 h-8 w-1 shrink-0 rounded-sm" style={{ background: kindAccent[result.spec.kind] ?? color.text3 }} />
               <span className="min-w-0 flex-1">
-                <span className="text-[13px] font-semibold text-foreground">{result.spec.title}</span>
+                <span className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+                  <span>{result.spec.title}</span>
+                  {hasNextStepContext && !nextStepKinds?.has(result.spec.kind) && <span className="rounded bg-muted px-1.5 py-0.5 text-[9.5px] font-medium text-muted-foreground">Adds unconnected</span>}
+                </span>
                 <span className="mt-0.5 block text-[11px] text-muted-foreground">{result.spec.blurb || 'No description.'}</span>
-                {nextStepKinds?.has(result.spec.kind) && <span className="mt-1 block text-[10px] font-medium text-primary">Add next step{nextStepLabel ? ` after ${nextStepLabel}` : ''}</span>}
                 {cue && <span className="mt-1 block text-[10px] text-muted-foreground">{cue}</span>}
               </span>
             </button>
