@@ -116,8 +116,9 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
     from hub import auth
     if auth.auth_enabled() and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id)):
         return SampleResult(not_previewable=True, reason=(
-            "preview of a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
-            "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
+            "Python previews are disabled in multi-user mode. Run this step to use an isolated, "
+            "deadline-bounded process."),
+            suggested_action="run")
 
     adapters: dict[str, _PreviewAdapter] = {}
     fingerprints: dict[str, Any] = {}
@@ -226,6 +227,10 @@ def preview_node(graph: Graph, node_id: str, k: int, resolve_adapter, registry,
             },
         )
     except NotPreviewable as e:
-        return SampleResult(not_previewable=True, reason=e.reason)     # honest P8 state
+        return SampleResult(                                        # honest P8 state
+            not_previewable=True,
+            reason=e.reason,
+            suggested_action=e.suggested_action,
+        )
     except Exception as e:  # noqa: BLE001
         return SampleResult(error=True, reason=f"{type(e).__name__}: {e}")  # a real failure

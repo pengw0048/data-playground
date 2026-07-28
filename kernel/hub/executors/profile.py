@@ -164,8 +164,9 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             and any(n.type in _CODE_CELL_KINDS for n in g.upstream_chain(graph, node_id))
             and not (full and process_isolated)):
         return ProfileResult(not_previewable=True, reason=(
-            "profiling a Python cell is disabled in multi-user mode — the in-process timeout can't kill "
-            "a runaway cell; run it (runs execute in a killable, deadline-bounded child)"))
+            "Python cells cannot be profiled in-process in multi-user mode. Use a full-dataset "
+            "profile to run this work in an isolated, deadline-bounded process."),
+            suggested_action="full_profile")
 
     if full:
         # a full-dataset profile is an intentional full pass (like a run) — no short preview budget, but
@@ -214,7 +215,15 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
             return ProfileResult(target_port_id=selected_port, error=True, reason=str(e))
         except NotPreviewable as e:
             return ProfileResult(
-                target_port_id=selected_port, not_previewable=True, reason=e.reason)
+                target_port_id=selected_port,
+                not_previewable=True,
+                reason=(
+                    "Sample-based statistics would be misleading for this step. Use the full dataset "
+                    "to profile it."
+                    if e.suggested_action == "run" else e.reason
+                ),
+                suggested_action="full_profile" if e.suggested_action == "run" else None,
+            )
         except Exception as e:  # noqa: BLE001
             return ProfileResult(
                 target_port_id=selected_port,
@@ -265,7 +274,15 @@ def profile_node(graph: Graph, node_id: str, resolve_adapter, registry,
         return ProfileResult(target_port_id=selected_port, error=True, reason=str(e))
     except NotPreviewable as e:
         return ProfileResult(
-            target_port_id=selected_port, not_previewable=True, reason=e.reason)
+            target_port_id=selected_port,
+            not_previewable=True,
+            reason=(
+                "Sample-based statistics would be misleading for this step. Use the full dataset "
+                "to profile it."
+                if e.suggested_action == "run" else e.reason
+            ),
+            suggested_action="full_profile" if e.suggested_action == "run" else None,
+        )
     except Exception as e:  # noqa: BLE001
         return ProfileResult(
             target_port_id=selected_port,

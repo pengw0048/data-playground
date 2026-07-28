@@ -184,15 +184,25 @@ export function DataPanel({ nodeId, editorPreview }: {
         name={String(node?.data.title || node?.id || 'result')}
         modeToggle={resultModeToggle} presentation={artifactPresentation} />)
     }
+    if (editorPreview) {
+      return withOutputPorts(<NotPreviewable
+        title={editorPreview.onRunUpstream
+          ? 'Run upstream to test this code'
+          : 'Input needed to test this code'}
+        reason={res.reason ?? 'A current upstream result is not available.'}
+        onRun={editorPreview.onRunUpstream}
+        runLabel="Run upstream"
+        modeToggle={resultModeToggle} />)
+    }
+    if (res.suggestedAction === 'run') {
+      return withOutputPorts(<NotPreviewable
+        reason={res.reason ?? undefined}
+        onRun={() => requestRun(nodeId)}
+        modeToggle={resultModeToggle} />)
+    }
     return withOutputPorts(<NotPreviewable
-      title={editorPreview ? 'Run upstream to test this code' : undefined}
-      reason={editorPreview
-        ? 'The upstream result is not available yet. Run the upstream step, then test again.'
-        : undefined}
-      onRun={editorPreview
-        ? editorPreview.onRunUpstream
-        : () => requestRun(nodeId)}
-      runLabel={editorPreview ? 'Run upstream' : undefined}
+      title="Preview unavailable"
+      reason={res.reason ?? 'This result cannot be previewed in its current state.'}
       modeToggle={resultModeToggle} />)
   }
   if (selectedOutput?.uri && resultMode === 'full') {
@@ -657,10 +667,15 @@ function StatsView({ nodeId, portId, multiOutput }: { nodeId: string; portId?: s
   if (st.err) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={st.err} onRetry={loadSample} /></div>
   const res = st.res!
   if (res.error) return <div><div className="flex justify-end px-[11px] py-1.5">{toggle}</div><ErrorState reason={res.reason ?? 'profile failed'} onRetry={loadSample} /></div>
-  if (res.notPreviewable) return <NotPreviewable
-    title="Use the full dataset for this profile"
-    reason="Sample-based statistics would be misleading for this step."
-    modeToggle={toggle} />
+  if (res.notPreviewable) return res.suggestedAction === 'full_profile'
+    ? <NotPreviewable
+        title="Use the full dataset for this profile"
+        reason={res.reason ?? 'Use the full dataset to profile this step.'}
+        modeToggle={toggle} />
+    : <NotPreviewable
+        title="Sample profile unavailable"
+        reason={res.reason ?? 'Statistics cannot be estimated from the current preview.'}
+        modeToggle={toggle} />
   return <ProfileTable res={res} toggle={toggle} />
 }
 
@@ -1369,7 +1384,7 @@ function ArtifactUnavailable({ error, onRetry, modeToggle, action, label }: {
 
 function NotPreviewable({
   title = 'Run this step to see results',
-  reason = 'A bounded preview would be misleading because this step needs all of its input.',
+  reason = 'A bounded preview cannot safely produce this result. Run this step to continue.',
   onRun,
   runLabel = 'Run this step',
   modeToggle,
