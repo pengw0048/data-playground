@@ -24,9 +24,16 @@ const apiMock = vi.hoisted(() => ({
   cancelRun: vi.fn(),
   fullResultExportUrl: vi.fn(),
   preflightFullResultExport: vi.fn(),
+  KernelError: class KernelError extends Error {
+    status: number
+    constructor(status: number, message: string) {
+      super(message)
+      this.status = status
+    }
+  },
 }))
 
-vi.mock('../api/client', () => ({ api: apiMock }))
+vi.mock('../api/client', () => ({ api: apiMock, KernelError: apiMock.KernelError }))
 
 afterEach(() => {
   document.querySelectorAll('iframe[data-full-result-download]').forEach((frame) => frame.remove())
@@ -50,7 +57,7 @@ beforeEach(() => {
   apiMock.sample.mockReset()
   apiMock.runOutputSample.mockReset()
   apiMock.retainedResult.mockReset().mockRejectedValue(
-    Object.assign(new Error('retained result not found'), { status: 404 }),
+    new apiMock.KernelError(404, 'retained result not found'),
   )
   apiMock.preview.mockReset()
   apiMock.profile.mockReset().mockResolvedValue({
@@ -438,7 +445,7 @@ describe('durable full results', () => {
   })
 
   it('labels a missing or expired artifact explicitly', async () => {
-    apiMock.runOutputSample.mockRejectedValue(new Error('404: no such file'))
+    apiMock.runOutputSample.mockRejectedValue(Object.assign(new Error('artifact gone'), { status: 410 }))
     const user = userEvent.setup()
     render(<FullResult uri="/outputs/missing.parquet" total={105} {...fullIdentity} />)
     expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
@@ -971,7 +978,7 @@ describe('durable full results', () => {
     expect(apiMock.retainedResult).toHaveBeenCalledTimes(1)
   })
 
-  it('offers a new run when the recovered artifact has expired', async () => {
+  it('keeps latest calculation status separate when the recovered artifact has expired', async () => {
     apiMock.retainedResult.mockResolvedValue({
       runId: 'expired-run',
       executionManifestSha256: 'a'.repeat(64),
@@ -995,10 +1002,55 @@ describe('durable full results', () => {
 
     render(<DataPanel nodeId="target" />)
 
-    expect(await screen.findByText('Full result expired or removed')).toBeInTheDocument()
-    expect(screen.getByText(/stored artifact is no longer available/i)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Run this step' }))
+    expect(await screen.findByText('Current result unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/calculation is still up to date/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Rerun and save result' }))
     expect(requestRun).toHaveBeenCalledWith('target')
+  })
+
+  it.each([404, 409, 410])('states a latest aggregate has no retained result for retained lookup HTTP %i', async (status) => {
+    apiMock.retainedResult.mockRejectedValueOnce(new apiMock.KernelError(status, 'structured retained result outcome'))
+    const requestRun = vi.fn()
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'aggregate', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        notPreviewable: true, suggestedAction: 'run', reason: 'Aggregate requires a materialized result',
+      }) },
+      runs: {}, canvasRole: 'owner', requestRun,
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" />)
+
+    expect(await screen.findByRole('status', { name: 'Current result unavailable' })).toBeInTheDocument()
+    expect(screen.getByText(/calculation is still up to date/i)).toBeInTheDocument()
+    expect(screen.queryByText('Run this step to see results')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Rerun and save result' }))
+    expect(requestRun).toHaveBeenCalledWith('target')
+  })
+
+  it('does not treat a retained-result transport failure as definitive absence', async () => {
+    apiMock.retainedResult.mockRejectedValueOnce(new TypeError('network unavailable'))
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'aggregate', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'latest', config: {}, history: [] },
+    }] }
+    useStore.setState({
+      doc,
+      previews: { target: boundPreview(doc, 'target', {
+        notPreviewable: true, suggestedAction: 'run', reason: 'Aggregate requires a materialized result',
+      }) },
+      runs: {}, canvasRole: 'owner',
+    } as any)
+
+    render(<DataPanel nodeId="target" />)
+
+    await waitFor(() => expect(apiMock.retainedResult).toHaveBeenCalledTimes(1))
+    expect(screen.queryByRole('status', { name: 'Current result unavailable' })).not.toBeInTheDocument()
   })
 
   it('keeps the Sample escape hatch when loading Full fails temporarily', async () => {
