@@ -766,11 +766,9 @@ describe('durable full results', () => {
 
     expect(screen.queryByRole('button', { name: 'Media' })).not.toBeInTheDocument()
     expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
-    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
 
     await user.click(screen.getByText('<3 bytes>'))
     expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
-    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
   })
 
   it('selects the media column that actually has a directly renderable current-result value', async () => {
@@ -795,10 +793,9 @@ describe('durable full results', () => {
 
     await user.click(screen.getByRole('button', { name: 'Media' }))
     expect(screen.getByRole('img', { name: 'Media image' })).toHaveAttribute('src', 'https://example.test/image.png')
-    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
   })
 
-  it('renders mixed cells in a usable media column without impossible certification guidance', async () => {
+  it('renders mixed cells in a usable media column without adding an unsupported media viewer', async () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'source', position: { x: 0, y: 0 },
       data: { title: 'Mixed images', status: 'latest', config: {}, history: [] },
@@ -820,7 +817,6 @@ describe('durable full results', () => {
     await user.click(screen.getByRole('button', { name: 'Media' }))
     expect(screen.getByRole('img', { name: 'Media image' })).toHaveAttribute('src', 'https://example.test/image.png')
     expect(screen.getByText('<3 bytes>')).toBeInTheDocument()
-    expect(screen.queryByText(/Open an exact certified revision/i)).not.toBeInTheDocument()
   })
 
   it('offers sample/full switching for previewable nodes after a full run', async () => {

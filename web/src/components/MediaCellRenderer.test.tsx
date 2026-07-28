@@ -18,7 +18,7 @@ import { MediaCellRenderer } from './MediaCellRenderer'
 
 const exact = (identity = [{ name: 'frame_id', arrowType: 'uint64' as const, value: '18446744073709551615' }]) => ({
   datasetId: 'dataset-1', revisionId: 'revision-1', identity,
-  proofStatus: 'certified' as const, certificationSupported: true, mediaCellSupported: true,
+  mediaCellSupported: true,
 })
 const deferred = <T,>() => {
   let resolve!: (value: T) => void
@@ -77,28 +77,16 @@ describe('MediaCellRenderer', () => {
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(text))
   })
 
-  it('reopens the existing certification action when the endpoint reports an unavailable identity', async () => {
-    const open = vi.fn()
+  it('reports an unavailable exact identity without offering a recovery ceremony', async () => {
     mocks.openMediaCell.mockRejectedValue(new KernelError(409, 'kernel detail', 'media_cell_identity_unavailable'))
-    render(<MediaCellRenderer column="frame" value="<3 bytes>" exact={{ ...exact(), onOpenCertification: open }} />)
+    render(<MediaCellRenderer column="frame" value="<3 bytes>" exact={exact()} />)
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('identity is no longer available'))
-    fireEvent.click(screen.getByRole('button', { name: 'Open certification' }))
-    expect(open).toHaveBeenCalledOnce()
-  })
-
-  it('opens the existing certification action only for an exact supported but uncertified revision', () => {
-    const open = vi.fn()
-    render(<MediaCellRenderer column="frame" value="<3 bytes>" exact={{
-      ...exact(), identity: null, proofStatus: 'unavailable', certificationSupported: true, onOpenCertification: open,
-    }} />)
-    expect(screen.getByRole('status')).toHaveTextContent('Certify row identity')
-    fireEvent.click(screen.getByRole('button', { name: 'Open certification' }))
-    expect(open).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
   })
 
   it('does not request binary media from a generic surface', () => {
     render(<MediaCellRenderer column="frame" value="<3 bytes>" mediaKind="image" />)
-    expect(screen.getByRole('status')).toHaveTextContent('Open an exact certified revision')
+    expect(screen.getByRole('status')).toHaveTextContent('Open an exact revision')
     expect(mocks.openMediaCell).not.toHaveBeenCalled()
   })
 
@@ -135,7 +123,7 @@ describe('MediaCellRenderer', () => {
     expect(screen.getByRole('status')).toHaveTextContent('could not display')
   })
 
-  it('does not suggest certification for an unclassifiable public URL', () => {
+  it('reports an unclassifiable public URL without requesting the exact endpoint', () => {
     render(<MediaCellRenderer column="frame" value="https://example.test/media" mediaKind="unknown" />)
     expect(screen.getByRole('status')).toHaveTextContent('public media URL is not a supported image or video')
     expect(mocks.openMediaCell).not.toHaveBeenCalled()

@@ -203,14 +203,14 @@ describe('InboxView', () => {
     expect(link).toHaveAttribute('href', '#/workspace/dataset%3Ads-logical-7')
   })
 
-  it('uses the server-provided exact certification deep-link', async () => {
+  it('does not render retired row-identity task items', async () => {
     mocks.inboxList.mockResolvedValue({ items: [item({
       taskKind: 'row_identity_certification', canvasId: null, canvasName: null,
-      datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Media', deepLink: '#/workspace/dataset%3Ads-1?scope=datasets&revision=rev-1&revisionDataset=ds-1&rowIdentityAction=certify&rowIdentityTask=ric_1' },
+      datasetContext: { taskKind: 'row_identity_certification', datasetId: 'ds-1', revisionId: 'rev-1', name: 'Media' },
     })], hasMore: false, nextCursor: null })
     render(<InboxView />)
-    const link = await screen.findByRole('link', { name: 'Open certification' })
-    expect(link).toHaveAttribute('href', expect.stringContaining('rowIdentityTask=ric_1'))
+    expect(await screen.findByText(/No completed background work yet/)).toBeInTheDocument()
+    expect(screen.queryByTestId('inbox-item-item-1')).not.toBeInTheDocument()
   })
 })
 

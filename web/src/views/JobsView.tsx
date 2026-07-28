@@ -70,10 +70,9 @@ function selectedQuickView(params: URLSearchParams): QuickView | null {
   return null
 }
 
-const DATASET_TASK_LABELS: Record<DatasetTaskKind, string> = {
+const DATASET_TASK_LABELS: Omit<Record<DatasetTaskKind, string>, 'row_identity_certification'> = {
   restore_revision_write: 'Dataset restore',
   keyed_upsert_write: 'Keyed upsert',
-  row_identity_certification: 'Row identity certification',
   merge_columns_write: 'Column merge',
 }
 
@@ -154,16 +153,17 @@ export function JobsView() {
     try {
       const page = await api.workspaceJobs(queryFrom(new URLSearchParams(filterKey), nextCursor))
       if (sequence !== request.current) return
+      const visibleItems = page.items.filter((item) => item.datasetContext?.taskKind !== 'row_identity_certification')
       if (!nextCursor) {
         setError('')
         setRefreshError('')
-        setHasActiveFirstPage(page.items.some((item) => item.status === 'queued' || item.status === 'running'))
+        setHasActiveFirstPage(visibleItems.some((item) => item.status === 'queued' || item.status === 'running'))
         setLastSuccessfulRefresh(Date.now())
         setLoadedMore(false)
       }
       setItems((current) => nextCursor
-        ? [...current, ...page.items.filter((item) => !current.some((row) => row.id === item.id))]
-        : page.items)
+        ? [...current, ...visibleItems.filter((item) => !current.some((row) => row.id === item.id))]
+        : visibleItems)
       setCursor(page.nextCursor ?? null); setHasMore(page.hasMore)
     } catch (caught) {
       if (sequence !== request.current) return
@@ -197,7 +197,7 @@ export function JobsView() {
     void api.workspaceJobs({ ...queryFrom(new URLSearchParams(filterKey)), limit: 1, runId })
       .then((page) => {
         if (!live) return
-        const exact = page.items.find((item) => jobKey(item) === runId)
+        const exact = page.items.find((item) => item.datasetContext?.taskKind !== 'row_identity_certification' && jobKey(item) === runId)
         if (exact) setItems((current) => [exact, ...current.filter((item) => item.id !== exact.id)])
         else setSelectedRunUnavailable(true)
       })
@@ -254,11 +254,7 @@ export function JobsView() {
     const runId = item.runId ?? item.id
     setActing(`${runId}:${action}`); setActionError('')
     try {
-      if (item.datasetContext?.taskKind === 'row_identity_certification' && item.taskId) {
-        // Certification has its own owner-scoped durable-task endpoint; it deliberately has no
-        // retry endpoint, so Jobs only dispatches cancellation through that existing contract.
-        if (action === 'cancel') await api.cancelRowIdentityCertificationTask(item.taskId)
-      } else if (item.mergeColumns && item.taskId) {
+      if (item.mergeColumns && item.taskId) {
         const managed = item.mergeColumns.producerKind === 'managed-sidecar'
         if (action === 'cancel') {
           if (managed) await api.cancelManagedSidecarMergeTask(item.taskId)
@@ -465,7 +461,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
   const dataset = item.datasetContext
   const mergeNeedsReadmission = item.mergeColumns?.diagnosticCode === 'stale_expected_head'
   const subject = report ? `Distribution report · ${item.nodeLabel || report.datasetViewId}`
-    : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind]} · ${dataset.name || dataset.datasetId}`
+    : dataset ? `${DATASET_TASK_LABELS[dataset.taskKind as Exclude<DatasetTaskKind, 'row_identity_certification'>]} · ${dataset.name || dataset.datasetId}`
     : item.canvasName || 'Unavailable canvas'
   const context = report ? report.complete == null ? 'Coverage pending' : report.complete ? 'Complete retained report' : 'Sample retained report'
     : dataset ? `Dataset ${dataset.name || dataset.datasetId}`
@@ -497,7 +493,7 @@ function JobRow({ item, expanded, onSelect, onOutput, selectedOutput, onAction, 
         {item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId)}>Open canvas</a>}
         {item.targetNodeId && item.canvasId && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={routeHash('canvas', item.canvasId, undefined, undefined, undefined, item.targetNodeId)}>{mergeNeedsReadmission ? 'Re-admit in Canvas' : 'Open node'}</a>}
         {report && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={`#/distribution-reports/${encodeURIComponent(report.reportId)}`}>Open report</a>}
-        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>{dataset.taskKind === 'row_identity_certification' ? 'Open certification' : 'Open revision history'}</a>}
+        {dataset && <a className="rounded-md border border-border bg-background px-2 py-1 font-semibold hover:bg-accent" href={dataset.deepLink ?? routeHash('workspace', undefined, `dataset:${dataset.datasetId}`)}>Open revision history</a>}
         {committed.map((output) => <button key={outputKey(output.nodeId, output.portId)} className={`rounded-md border px-2 py-1 font-semibold ${selectedOutput === outputKey(output.nodeId, output.portId) ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-accent'}`} onClick={() => onOutput(outputKey(output.nodeId, output.portId))}>Open {output.portLabel || output.portId}</button>)}
         {item.taskId && (item.canCancel ?? (item.status === 'queued' || item.status === 'running')) && <Button size="sm" variant="outline" disabled={acting || item.cancelRequested} onClick={() => onAction('cancel')}>Cancel task</Button>}
         {item.taskId && item.canRetry && <Button size="sm" variant="outline" disabled={acting} onClick={() => onAction('retry')}>{item.checkpoint?.retryLabel || 'Retry task'}</Button>}
