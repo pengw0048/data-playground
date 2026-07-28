@@ -224,14 +224,24 @@ class KernelBackend:
 
     def preview(
             self, graph: Graph, node_id: str, k: int, offset: int,
-            port_id: str | None = None) -> dict:
+            port_id: str | None = None, *,
+            example_rows_json: str | None = None,
+            example_uri: str | None = None) -> dict:
         """Run a sample preview on the canvas's warm kernel (so it shares the kernel's engine + cache)."""
         from hub.graph import require_output_port
         selected = require_output_port(graph, node_id, self.base.node_specs, port_id)
         endpoint, token = self._ensure_kernel(getattr(graph, "id", None) or "canvas")
-        return _post(endpoint, "/preview", token,
-                     {"graph": graph.model_dump(), "node_id": node_id, "port_id": selected.id,
-                      "k": k, "offset": offset})
+        body = {
+            "graph": graph.model_dump(),
+            "node_id": node_id,
+            "port_id": selected.id,
+            "k": k,
+            "offset": offset,
+        }
+        if example_rows_json is not None or example_uri is not None:
+            body["example_rows_json"] = example_rows_json
+            body["example_uri"] = example_uri
+        return _post(endpoint, "/preview", token, body)
 
     def profile(
             self, graph: Graph, node_id: str, full: bool = False,

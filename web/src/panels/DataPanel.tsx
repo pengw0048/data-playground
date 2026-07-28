@@ -21,14 +21,24 @@ const CHART_DISPLAY_LIMIT = 2_000
 
 export function DataPanel({ nodeId, editorPreview }: {
   nodeId: string
-  editorPreview?: { onRunUpstream?: () => void }
+  editorPreview?: {
+    onRunUpstream?: () => void
+    onPreview?: (offset: number, portId?: string) => void | Promise<void>
+    autoLoad?: boolean
+    emptyState?: ReactNode
+    allowStats?: boolean
+  }
 }) {
   const preview = useStore((s) => (
     editorPreview ? s.editorPreviews[nodeId] : s.previews[nodeId]
   ))
   const runPreview = useStore((s) => s.runPreview)
   const runEditorPreview = useStore((s) => s.runEditorPreview)
-  const previewAction = editorPreview ? runEditorPreview : runPreview
+  const previewAction = editorPreview?.onPreview
+    ? (_nodeId: string, nextOffset = 0, portId?: string) => (
+        editorPreview.onPreview?.(nextOffset, portId)
+      )
+    : editorPreview ? runEditorPreview : runPreview
   const requestRun = useStore((s) => s.requestRun)
   const openCodeFullscreen = useStore((s) => s.openCodeFullscreen)
   const canEdit = useStore((s) => roleCanEdit(s.canvasRole))
@@ -64,9 +74,12 @@ export function DataPanel({ nodeId, editorPreview }: {
   const offset = preview?.offset ?? 0  // the page is owned by the store, so an external Refresh can't desync it
 
   useEffect(() => {
-    if (!preview || preview.portId !== requestPortId) previewAction(nodeId, 0, requestPortId)
+    if (editorPreview?.autoLoad !== false
+        && (!preview || preview.portId !== requestPortId)) {
+      previewAction(nodeId, 0, requestPortId)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodeId, requestPortId, preview?.portId])
+  }, [nodeId, requestPortId, preview?.portId, editorPreview?.autoLoad])
   useEffect(() => setResultMode('sample'), [nodeId])
   useEffect(() => { previousOffsets.current = [] }, [nodeId, requestPortId])
   useEffect(() => {
@@ -112,7 +125,9 @@ export function DataPanel({ nodeId, editorPreview }: {
     </>
   )
 
-  if (!preview || preview.portId !== requestPortId) return withOutputPorts(<Skeleton />)
+  if (!preview || preview.portId !== requestPortId) {
+    return withOutputPorts(editorPreview?.emptyState ?? <Skeleton />)
+  }
   if (!previewIsCurrent(preview, doc, nodeId, requestPortId)) {
     return withOutputPorts(<StalePreview onRefresh={() => previewAction(nodeId, 0, requestPortId)} />)
   }
@@ -192,9 +207,17 @@ export function DataPanel({ nodeId, editorPreview }: {
   // gate the scalar/chart views on the NODE TYPE, not a column-name heuristic — otherwise any
   // 2-column dataset that happens to have columns named 'metric'+'value' was hijacked (F42).
   const special = isMetric || isChart
-  const tabs = [{ id: 'rows', label: 'Rows' }, ...caps.map((c) => ({ id: c.id, label: c.label })), { id: 'stats', label: 'Stats' }]
+  const tabs = [
+    { id: 'rows', label: 'Rows' },
+    ...caps.map((c) => ({ id: c.id, label: c.label })),
+    ...(editorPreview?.allowStats === false ? [] : [{ id: 'stats', label: 'Stats' }]),
+  ]
   // a refresh may drop the capability whose tab was selected — fall back to Rows
-  const activeTab = tab === 'rows' || tab === 'stats' || caps.some((c) => c.id === tab) ? tab : 'rows'
+  const activeTab = tab === 'rows'
+    || (tab === 'stats' && editorPreview?.allowStats !== false)
+    || caps.some((c) => c.id === tab)
+    ? tab
+    : 'rows'
   const canTryNext = res.hasMore === true || (res.hasMore == null && res.rows.length > 0)
 
   return withOutputPorts(

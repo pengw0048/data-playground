@@ -638,6 +638,32 @@ describe('durable full results', () => {
     expect(screen.queryByRole('button', { name: 'Full result' })).not.toBeInTheDocument()
   })
 
+  it('uses the editor-supplied preview action for Example rows pagination', async () => {
+    const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
+      id: 'target', type: 'transform', position: { x: 0, y: 0 },
+      data: { title: 'target', status: 'draft', config: {
+        source: 'adhoc', mode: 'flat_map', code: 'def fn(row): return [row, row]',
+      }, history: [] },
+    }] }
+    const onPreview = vi.fn()
+    useStore.setState({
+      doc,
+      editorPreviews: { target: boundPreview(doc, 'target', sample(0, 2, true)) },
+    } as any)
+    const user = userEvent.setup()
+
+    render(<DataPanel nodeId="target" editorPreview={{
+      autoLoad: false,
+      allowStats: false,
+      onPreview,
+    }} />)
+
+    expect(onPreview).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Stats' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Next page' }))
+    expect(onPreview).toHaveBeenCalledWith(2, undefined)
+  })
+
   it('offers only Run upstream when no current retained editor input exists', async () => {
     const doc = { id: 'history-canvas', name: 'History', version: 1, requirements: [], edges: [], nodes: [{
       id: 'target', type: 'transform', position: { x: 0, y: 0 },
