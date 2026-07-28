@@ -137,6 +137,9 @@ test.describe('minimum viewport support', () => {
     await expectFullyInViewport(page, detail, 'dataset detail')
     await expectFullyInViewport(page, detail.getByTestId('detail-use'), 'dataset use action')
     await expectFullyInViewport(page, detail.getByRole('button', { name: 'Close' }), 'dataset detail close')
+    const keyAction = detail.getByRole('button', { name: /Mark .* as a key/ }).first()
+    await keyAction.scrollIntoViewIfNeeded()
+    await expectFullyInViewport(page, keyAction, 'column key action')
     await detail.getByRole('button', { name: 'Close' }).click()
 
     // Canvas with at least one node, inspector, data panel, run controls.
