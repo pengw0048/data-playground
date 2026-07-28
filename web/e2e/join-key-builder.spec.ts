@@ -61,6 +61,13 @@ test.describe('Join key builder', () => {
       await expect(page.getByLabel('Right key 1')).toHaveValue('shared')
       await expect(page.getByLabel('Left key 1')).not.toHaveText(/original_row_id/)
       await expect(page.getByLabel('Right key 1')).not.toHaveText(/_rowid/)
+      await page.locator('.react-flow__node[data-id="join"]').click({ position: { x: 35, y: 25 } })
+      const inspector = page.getByTestId('inspector')
+      await expect(inspector.getByText('Join configuration')).toBeVisible()
+      await expect(inspector.getByText('a.shared = b.shared')).toBeVisible()
+      await expect(inspector.getByText('shared key(s)')).toHaveCount(0)
+      await expect(inspector.getByText(/ON expression/)).toHaveCount(0)
+      await expect(inspector.getByRole('button', { name: 'Edit keys on Join card' })).toBeVisible()
 
       await page.getByRole('button', { name: 'Advanced condition' }).click()
       await expect(page.getByLabel('advanced ON condition')).toHaveValue('a.shared = b.shared')
