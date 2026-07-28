@@ -52,6 +52,13 @@ async function canvasFor(page: Page, canvasId: string): Promise<{ nodes: unknown
   }, canvasId)
 }
 
+async function canvasZoom(page: Page): Promise<number> {
+  const style = await page.locator('.react-flow__viewport').getAttribute('style')
+  const match = /scale\(([\d.]+)\)/.exec(style ?? '')
+  if (!match) throw new Error(`Canvas viewport has no scale: ${style ?? '<missing style>'}`)
+  return Number(match[1])
+}
+
 // Open a bottom-toolbar category by its aria-label and click a node kind inside the menu.
 async function addNode(page: Page, category: string, kindTitle: string) {
   await page.getByRole('button', { name: category, exact: true }).click()
@@ -310,6 +317,75 @@ test.describe('Data Playground canvas', () => {
     } finally {
       await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
       await page.request.delete(`/api/canvas/${encodeURIComponent(otherCanvasId)}`)
+    }
+  })
+
+  test('Fit view keeps dense graphs readable and reachable at both desktop sizes @canvas-viewport', async ({ page }) => {
+    const canvasId = `dense-readable-fit-${Date.now()}`
+    const nodes = Array.from({ length: 14 }, (_, index) => {
+      const firstRow = index < 3
+      return {
+        id: `dense-${index}`,
+        type: index === 0 ? 'source' : 'filter',
+        position: {
+          x: 80 + (firstRow ? index : index - 3) * 330,
+          y: firstRow ? 100 : 460,
+        },
+        data: {
+          title: index === 0 ? 'events' : `Filter stage ${String(index).padStart(2, '0')}`,
+          status: 'idle',
+          config: index === 0 ? { uri: 'events' } : { predicate: 'value IS NOT NULL' },
+        },
+      }
+    })
+    const edges = nodes.slice(1).map((node, index) => ({
+      id: `dense-edge-${index + 1}`,
+      source: nodes[index].id,
+      target: node.id,
+    }))
+    const created = await page.request.post('/api/canvas', { data: {
+      id: canvasId, name: 'Dense readable fit', version: 1, requirements: [], nodes, edges,
+    } })
+    expect(created.ok()).toBe(true)
+
+    try {
+      for (const viewport of [{ width: 1280, height: 720 }, { width: 1440, height: 900 }]) {
+        await page.setViewportSize(viewport)
+        await page.goto(`/#/canvas/${encodeURIComponent(canvasId)}`)
+        await expect(page.locator('.react-flow__node')).toHaveCount(14)
+        const fit = page.getByRole('button', { name: 'Fit view', exact: true })
+        await fit.click()
+        await page.waitForTimeout(350)
+
+        expect(await canvasZoom(page)).toBeCloseTo(0.6, 5)
+        const firstFit = await page.locator('.react-flow__viewport').getAttribute('style')
+        await fit.click()
+        await page.waitForTimeout(350)
+        expect(await page.locator('.react-flow__viewport').getAttribute('style')).toBe(firstFit)
+
+        const flow = await boxOf(page.locator('.react-flow'))
+        const fittedBoxes = await page.locator('.react-flow__node').evaluateAll((elements) =>
+          elements.map((element) => {
+            const box = element.getBoundingClientRect()
+            return { x: box.x, y: box.y, width: box.width, height: box.height }
+          }))
+        expect(
+          fittedBoxes.some((box) => box.x < flow.x || box.x + box.width > flow.x + flow.width),
+          'dense Fit should preserve readability instead of shrinking every card into the viewport',
+        ).toBe(true)
+        expect(fittedBoxes[6]?.width ?? 0).toBeGreaterThanOrEqual(139)
+        await expect(page.locator('.react-flow__minimap')).toBeVisible()
+
+        // Horizontal pan-on-scroll remains the direct way to reach cards outside the readable fit.
+        await page.locator('.react-flow__pane').hover()
+        await page.mouse.wheel(1200, 0)
+        await page.waitForTimeout(350)
+        const last = await boxOf(page.locator('[data-id="dense-13"]'))
+        expect(last.x).toBeLessThan(flow.x + flow.width)
+        expect(last.x + last.width).toBeGreaterThan(flow.x)
+      }
+    } finally {
+      await page.request.delete(`/api/canvas/${encodeURIComponent(canvasId)}`)
     }
   })
 
