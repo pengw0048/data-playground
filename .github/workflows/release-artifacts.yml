@@ -37,11 +37,10 @@ jobs:
       - name: Build SPA
         run: cd web && npm ci && npm run build
 
-      - name: Build wheel
+      - name: Build and verify wheel packaging paths
         run: |
-          cd kernel
-          uv build --wheel --out-dir dist
-          ls -la dist
+          python3 scripts/test_wheel_spa_packaging.py --artifact-dir kernel/dist
+          ls -la kernel/dist
 
       - name: Reject placeholder SPA in wheel
         run: python3 scripts/check_wheel_has_spa.py kernel/dist/*.whl
