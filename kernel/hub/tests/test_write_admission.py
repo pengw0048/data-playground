@@ -550,8 +550,74 @@ def test_structural_drift_requires_the_displayed_admission_before_allocation(
             deps, graph.model_copy(deep=True), "write", "researcher",
             confirmed=True, submission_id="schema-replace",
             write_intent=admission.intent,
+            confirmed_write_intent=admission.intent,
         )
     assert _run_allocation_counts() == before_runs
+
+
+def test_confirmation_cannot_reuse_admission_after_schema_or_head_changes(
+        contract, monkeypatch):
+    deps, graph, admission_a = _admit_schema_change(
+        contract,
+        monkeypatch,
+        [{"name": "value", "type": "int", "nullable": True}],
+        [
+            {"name": "value", "type": "int", "nullable": True},
+            {"name": "extra", "type": "string", "nullable": True},
+        ],
+    )
+    assert admission_a.intent is not None
+    monkeypatch.setattr(run_routes.auth, "auth_enabled", lambda: False)
+
+    # Another writer moves the destination to the schema A was compared against. The next graph
+    # changes its structural field again, so its exact head, proposed schema, and drift evidence are
+    # all distinct from the evidence the user originally saw.
+    receipt = write_managed_local_file(
+        storage=deps.storage,
+        catalog=deps.catalog,
+        intent=admission_a.intent,
+        write_artifact=lambda uri: pq.write_table(
+            pa.table({"value": [1], "extra": ["a"]}), uri),
+    )
+    proposed_b = [
+        ColumnSchema(name="value", type="int", nullable=True),
+        ColumnSchema(name="replacement", type="string", nullable=True),
+    ]
+    monkeypatch.setattr(
+        run_routes,
+        "schema_for_graph",
+        lambda *_args, **_kwargs: {"source": proposed_b, "write": proposed_b},
+    )
+    graph.nodes[0].data["config"]["confirmationTest"] = "replacement"
+    admission_b = _write_admission_for_graph(
+        deps, graph, "write", "researcher", "schema-confirmation-b")
+    assert admission_b.intent is not None
+    assert admission_b.expected_head is not None
+    assert admission_b.expected_head.revision_id == receipt.revision_id
+    assert admission_b.intent != admission_a.intent
+
+    before_runs = _run_allocation_counts()
+    before_publications = _managed_publication_counts()
+    before_artifacts = set(os.listdir(deps.storage.result_root))
+    with pytest.raises(HTTPException, match="requires the displayed") as generic:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="schema-confirmation-b",
+            write_intent=admission_b.intent,
+        )
+    assert generic.value.status_code == 409
+    with pytest.raises(HTTPException, match="confirmation is stale") as stale:
+        run_routes.start_run(
+            deps, graph.model_copy(deep=True), "write", "researcher",
+            confirmed=True, submission_id="schema-confirmation-b",
+            write_intent=admission_b.intent,
+            confirmed_write_intent=admission_a.intent,
+        )
+
+    assert stale.value.status_code == 409
+    assert _run_allocation_counts() == before_runs
+    assert _managed_publication_counts() == before_publications
+    assert set(os.listdir(deps.storage.result_root)) == before_artifacts
 
 
 def test_drift_receipt_preserves_exact_comparison_and_recovers_after_response_loss(

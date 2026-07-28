@@ -191,11 +191,12 @@ describe('run-scoped result access', () => {
       }, parents: [] },
     }
 
-    await api.run(doc, 'write', true, 'submission', undefined, intent)
+    await api.run(doc, 'write', true, 'submission', undefined, intent, undefined, intent)
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body))
     expect(body.graph.version).toBe(7)
     expect(body.writeIntent).toEqual(intent)
+    expect(body.confirmedWriteIntent).toEqual(intent)
     expect(doc.version).toBe(8)
   })
 

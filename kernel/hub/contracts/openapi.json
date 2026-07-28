@@ -10442,6 +10442,16 @@
             "title": "Confirmed",
             "type": "boolean"
           },
+          "confirmedWriteIntent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WriteIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "graph": {
             "$ref": "#/components/schemas/Graph"
           },

@@ -3045,6 +3045,10 @@ class RunRequest(Wire):
     # The default local Write card obtains this frozen, side-effect-free admission before execution.
     # The server revalidates it against the submitted graph and current destination head.
     write_intent: WriteIntent | None = None
+    # A confirmation must name the immutable Write admission the user was shown.  This stays
+    # separate from ``write_intent`` so a stale confirmation cannot be reused for a newly admitted
+    # graph, schema, or destination head.
+    confirmed_write_intent: WriteIntent | None = None
     parameter_bindings: list[ParameterBinding] = []
 
 

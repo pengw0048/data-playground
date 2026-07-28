@@ -2542,12 +2542,21 @@ export const useStore = create<Store>((set, get) => ({
       get().pushToast('Preview inputs changed; preview again before running.', 'info')
       return
     }
+    // Capture the evidence behind this click before a fresh admission observes a concurrently
+    // edited graph. A boolean confirmation must never authorize replacement evidence.
+    const confirmedWriteIntent = confirmed ? get().runs[id]?.writeAdmission?.intent ?? undefined : undefined
     let writeAdmission: WriteAdmission | undefined
     if (doc.nodes.find((node) => node.id === id)?.type === 'write') {
       try {
         writeAdmission = await get().prepareWrite(id)
         if (!writeAdmission) throw new Error('Write configuration changed during admission; retry.')
         if (writeAdmission.blocker) throw new Error(writeAdmission.blocker)
+        if (confirmed && writeAdmission.managed && writeAdmission.intent !== confirmedWriteIntent) {
+          set((s) => ({ runs: { ...s.runs, [id]: {
+            ...(s.runs[id] ?? {}), phase: 'confirm', error: undefined,
+          } }, openPanels: { [id]: 'run' } }))
+          return
+        }
       } catch (e) {
         set((s) => ({ runs: { ...s.runs, [id]: {
           ...(s.runs[id] ?? {}), phase: 'failed', error: (e as Error).message,
@@ -2570,11 +2579,11 @@ export const useStore = create<Store>((set, get) => ({
         ? get().runs[id]?.parameterBindings?.length
           ? await api.run(
             doc, id, confirmed, submissionId, binding?.inputManifest,
-            writeAdmission.intent ?? undefined, get().runs[id]?.parameterBindings,
+            writeAdmission.intent ?? undefined, get().runs[id]?.parameterBindings, confirmedWriteIntent,
           )
           : await api.run(
             doc, id, confirmed, submissionId, binding?.inputManifest,
-            writeAdmission.intent ?? undefined,
+            writeAdmission.intent ?? undefined, undefined, confirmedWriteIntent,
           )
         : binding
           ? get().runs[id]?.parameterBindings?.length

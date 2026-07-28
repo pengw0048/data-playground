@@ -2570,6 +2570,7 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
               submission_id: str | None = None,
               input_manifest: list[dict[str, str]] | None = None,
               write_intent: WriteIntent | None = None,
+              confirmed_write_intent: WriteIntent | None = None,
               parameter_bindings=None):
     """Start a run — the ONE code path behind both POST /run and the MCP run_canvas tool, so a run an
     agent launches is placed, gated, and owned exactly like one the browser launches. Resolves source
@@ -2919,6 +2920,15 @@ def start_run(deps, graph, target_node_id: str | None, uid: str, confirmed: bool
         if write_admission.managed:
             if write_admission.blocker or write_admission.intent is None:
                 raise HTTPException(409, write_admission.blocker or "write admission failed")
+            if confirmed and write_intent is not None:
+                if confirmed_write_intent is None:
+                    raise HTTPException(
+                        409,
+                        "write confirmation requires the displayed write admission")
+                if confirmed_write_intent != write_admission.intent:
+                    raise HTTPException(
+                        409,
+                        "write confirmation is stale; display and confirm the current write admission")
             drift = write_admission.intent.schema_drift
             if drift is not None and drift.requires_confirmation:
                 if write_intent is None:
@@ -3306,6 +3316,7 @@ def run(req: RunRequest, uid: str = Depends(current_user)) -> RunStatus:
             str(req.submission_id) if req.submission_id is not None else None,
             req.input_manifest,
             req.write_intent,
+            req.confirmed_write_intent,
             req.parameter_bindings,
         )
     except RunNeedsConfirm:
