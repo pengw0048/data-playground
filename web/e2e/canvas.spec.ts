@@ -384,7 +384,7 @@ test.describe('Data Playground canvas', () => {
     await expect(finder.getByRole('option', { name: /descriptor contract/i })).toHaveCount(2)
     await search.fill('filter')
     const filter = finder.getByRole('option', { name: /filter/i }).first()
-    await expect(filter).toContainText('row predicate')
+    await expect(filter).toContainText('Keep rows that match a condition')
     await expect(filter).not.toContainText('Built-in')
     await expect(filter).not.toContainText('in dataset')
     await search.press('Enter')
