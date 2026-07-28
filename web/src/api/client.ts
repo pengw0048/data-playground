@@ -204,7 +204,17 @@ export interface BackendNodeSpec {
   canBypass: boolean; previewable: boolean; requires?: ResourceSpec | null; blurb: string; source?: string
 }
 
-export interface AgentBackendNode { id: string; type: string; position: { x: number; y: number }; data: { title?: string; config?: Record<string, unknown> } }
+export interface AgentBackendNode {
+  id: string
+  type: string
+  position: { x: number; y: number }
+  data: {
+    title?: string
+    config?: Record<string, unknown>
+    // Presentation ownership is the only non-execution field accepted from an agent graph.
+    autoPlaced?: boolean
+  }
+}
 export interface AgentBackendEdge { id: string; source: string; target: string; sourceHandle?: string | null; targetHandle?: string | null; data?: { wire: string } }
 export type SettingScope = 'global' | 'user'
 export interface SettingsRevision { global: number; user: number }

@@ -3562,6 +3562,7 @@ def test_agent_builds_graph_via_tool_loop():
     assert out["summary"] == "Built source -> filter."
     xs = [n["position"]["x"] for n in out["graph"]["nodes"]]
     assert xs[0] != xs[1]  # layout gave distinct columns (source col 0, filter col 1)
+    assert all(n["data"]["autoPlaced"] is True for n in out["graph"]["nodes"])
     assert [t["tool"] for t in out["transcript"]] == ["add_node", "add_node", "connect"]
 
 

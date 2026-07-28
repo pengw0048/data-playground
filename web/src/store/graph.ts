@@ -114,6 +114,27 @@ export function connectedPosition(
   return freePosition(nodes.filter((node) => node.id !== targetId), base)
 }
 
+function spreadAutoPlacedJoinInputs(
+  nodes: CanvasNode[],
+  inputs: CanvasNode[],
+  targetId: string,
+): CanvasNode[] {
+  if (inputs.length !== 2) return nodes
+  const [first, second] = inputs
+  // Horizontally staggered cards in the same lane make the first Bezier pass through the second.
+  if (Math.abs(first.position.x - second.position.x) < 280
+      || Math.abs(first.position.y - second.position.y) >= 180) return nodes
+  const movable = second.data.autoPlaced ? second : first.data.autoPlaced ? first : null
+  if (!movable) return nodes
+  const anchor = movable.id === second.id ? first : second
+  const direction = movable.id === second.id ? 1 : -1
+  const position = freePosition(
+    nodes.filter((node) => node.id !== movable.id && node.id !== targetId),
+    { x: movable.position.x, y: anchor.position.y + direction * 280 },
+  )
+  return nodes.map((node) => node.id === movable.id ? { ...node, position } : node)
+}
+
 /** Whether a node can run/preview: it (or some ancestor) is a source with a configured uri —
  * AND nothing in its upstream chain (including itself) is disabled (disable turns off downstream). */
 export function nodeRunnable(doc: CanvasDoc, id: string): boolean {
@@ -1121,7 +1142,13 @@ interface Store {
   // -- graph mutation --
   setNodes: (nodes: CanvasNode[]) => void
   setEdges: (edges: CanvasEdge[]) => void
-  addNode: (kind: string, position: { x: number; y: number }, config?: Partial<NodeConfig>, title?: string) => CanvasNode | null
+  addNode: (
+    kind: string,
+    position: { x: number; y: number },
+    config?: Partial<NodeConfig>,
+    title?: string,
+    options?: { autoPlaced?: boolean },
+  ) => CanvasNode | null
   addConnectedNode: (kind: string, position: { x: number; y: number }, connection: {
     source: string; sourceHandle: string; targetHandle: string; wire: WireType
   }) => CanvasNode | null
@@ -1704,18 +1731,7 @@ export const useStore = create<Store>((set, get) => ({
   agentLog: [],
 
   setNodes: (nodes) => {
-    if (!roleCanEdit(get().canvasRole)) return
-    set((s) => {
-      const previous = new Map(s.doc.nodes.map((node) => [node.id, node]))
-      // React Flow calls this only for settled user moves. That deliberate move takes ownership of
-      // the card's presentation, so later connections must never auto-nudge it again.
-      const settled = nodes.map((node) => {
-        const old = previous.get(node.id)
-        const moved = old && (old.position.x !== node.position.x || old.position.y !== node.position.y)
-        return moved && node.data.autoPlaced ? { ...node, data: { ...node.data, autoPlaced: false } } : node
-      })
-      return { doc: { ...s.doc, nodes: settled } }
-    })
+    if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, nodes } }))
   },
   setEdges: (edges) => { if (roleCanEdit(get().canvasRole)) set((s) => ({ doc: { ...s.doc, edges } })) },
 
@@ -1751,7 +1767,7 @@ export const useStore = create<Store>((set, get) => ({
     })
   },
 
-  addNode: (kind, position, config, title) => {
+  addNode: (kind, position, config, title, options) => {
     if (!roleCanEdit(get().canvasRole)) return null
     const spec = getSpec(kind)
     if (!spec) return null
@@ -1765,6 +1781,7 @@ export const useStore = create<Store>((set, get) => ({
         ...base,
         title: title ?? base.title,
         config: { ...base.config, ...(config ?? {}) },
+        autoPlaced: options?.autoPlaced ?? true,
       },
     }
     set((s) => ({ doc: { ...s.doc, nodes: [...s.doc.nodes, node] }, selectedId: node.id, selectedIds: [node.id] }))
@@ -1789,7 +1806,7 @@ export const useStore = create<Store>((set, get) => ({
       id: newId(kind), type: kind,
       position: connectedPosition(get().doc.nodes, [source], position),
       // A later second Join input can center this product-created card between its sources. A user
-      // drag clears the marker in setNodes, so this never reshuffles a hand-arranged canvas.
+      // drag clears the marker in Canvas.onNodeDragStop, so this never reshuffles a hand-arranged canvas.
       data: { ...base, title: base.title, config: { ...base.config }, autoPlaced: true },
     }
     set((s) => {
@@ -1934,10 +1951,15 @@ export const useStore = create<Store>((set, get) => ({
         .filter((candidate) => candidate.target === edge.target)
         .map((candidate) => s.doc.nodes.find((node) => node.id === candidate.source))
         .filter((node): node is CanvasNode => !!node)
+      const placementNodes = target?.type === 'join' && target.data.autoPlaced
+        ? spreadAutoPlacedJoinInputs(s.doc.nodes, inputs, target.id)
+        : s.doc.nodes
+      const placedById = new Map(placementNodes.map((node) => [node.id, node]))
+      const placedInputs = inputs.map((node) => placedById.get(node.id) ?? node)
       const autoPosition = target?.data.autoPlaced
-        ? connectedPosition(s.doc.nodes, inputs, target.position, target.id)
+        ? connectedPosition(placementNodes, placedInputs, target.position, target.id)
         : null
-      const nodes = s.doc.nodes.map((n) => {
+      const nodes = placementNodes.map((n) => {
         const staleTarget = (n.id === edge.target || stale.has(n.id)) && n.data.status === 'latest'
         const movedTarget = n.id === edge.target && autoPosition
         return staleTarget || movedTarget
@@ -4259,8 +4281,26 @@ export const useStore = create<Store>((set, get) => ({
       const existing = new Map(s.doc.nodes.map((n) => [n.id, n]))
       const nodes: CanvasNode[] = bg.nodes.map((n) => {
         const prev = existing.get(n.id)
-        if (prev) return { ...prev, position: n.position, data: { ...prev.data, title: n.data.title ?? prev.data.title, config: { ...(n.data.config ?? {}) } as CanvasNode['data']['config'], status: 'stale' } }
-        return { id: n.id, type: n.type, position: n.position, data: { title: n.data.title ?? n.type, config: (n.data.config ?? {}) as CanvasNode['data']['config'], status: 'stale', history: [] } }
+        if (prev) return {
+          ...prev, position: n.position,
+          data: {
+            ...prev.data,
+            title: n.data.title ?? prev.data.title,
+            config: { ...(n.data.config ?? {}) } as CanvasNode['data']['config'],
+            status: 'stale',
+            ...(typeof n.data.autoPlaced === 'boolean' ? { autoPlaced: n.data.autoPlaced } : {}),
+          },
+        }
+        return {
+          id: n.id, type: n.type, position: n.position,
+          data: {
+            title: n.data.title ?? n.type,
+            config: (n.data.config ?? {}) as CanvasNode['data']['config'],
+            status: 'stale',
+            history: [],
+            ...(typeof n.data.autoPlaced === 'boolean' ? { autoPlaced: n.data.autoPlaced } : {}),
+          },
+        }
       })
       const edges: CanvasEdge[] = bg.edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle ?? null, targetHandle: e.targetHandle ?? null, data: { wire: (e.data?.wire ?? 'dataset') as WireType } }))
       return { doc: { ...s.doc, nodes, edges } }
